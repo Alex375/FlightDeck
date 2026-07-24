@@ -72,6 +72,62 @@ pub struct FileContent {
     pub too_large: bool,
     pub binary: bool,
     pub size: u64,
+    /// Last-modified time when these bytes were read — the editor's staleness
+    /// stamp (see [`FileStat`]). `None` when the platform doesn't report one.
+    pub mtime_ms: Option<u64>,
+}
+
+/// What a file looks like on disk WITHOUT reading it: its size and last-modified
+/// time. One `stat` per path, no bytes — which is the whole point. The editor
+/// stamps every loaded buffer with this and re-checks it to decide whether the
+/// content actually needs re-reading, so a 15 MiB PDF that nobody touched costs a
+/// syscall instead of a full base64 round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct FileStat {
+    pub path: String,
+    /// False when the path can't be stat'ed at all — gone, or unreadable. The
+    /// caller must treat this as "re-read it" rather than "unchanged": the real
+    /// reason then surfaces through the normal read path (which reports it to the
+    /// user) instead of being swallowed here.
+    pub exists: bool,
+    pub size: u64,
+    /// Milliseconds since the Unix epoch. `None` when the filesystem or platform
+    /// doesn't report a modification time — callers then compare `size` alone.
+    pub mtime_ms: Option<u64>,
+}
+
+/// Last-modified time of `meta` in ms since the Unix epoch, or `None` when the
+/// platform/filesystem doesn't provide one (or reports a pre-epoch time).
+fn mtime_ms(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Stat several paths in one call — the editor checks every open tab at once, and
+/// one IPC round-trip for N paths beats N round-trips. A path that can't be
+/// stat'ed comes back `exists: false` rather than failing the whole batch: one
+/// deleted file must not blind the caller to the other tabs.
+pub fn stat_files(paths: &[String]) -> Vec<FileStat> {
+    paths
+        .iter()
+        .map(|p| match fs::metadata(p) {
+            Ok(m) => FileStat {
+                path: p.clone(),
+                exists: true,
+                size: m.len(),
+                mtime_ms: mtime_ms(&m),
+            },
+            Err(_) => FileStat {
+                path: p.clone(),
+                exists: false,
+                size: 0,
+                mtime_ms: None,
+            },
+        })
+        .collect()
 }
 
 /// List one directory level, directories first then files, case-insensitive
@@ -108,8 +164,14 @@ pub fn read_dir(path: &str) -> std::io::Result<Vec<FsEntry>> {
 /// [`MAX_FILE_BYTES`] returns `too_large`; one with a NUL byte in its first 8 KiB
 /// returns `binary`; otherwise its bytes are decoded UTF-8 (lossily, so an odd
 /// byte never fails the read). `content` is empty in both guard cases.
+///
+/// The returned `mtime_ms` is sampled BEFORE the bytes, deliberately: a writer
+/// racing us then yields an mtime OLDER than the content we hand back, so the
+/// next staleness check re-reads (harmless, converges). Sampling it after would
+/// pair a NEW mtime with OLD content — a buffer stuck stale with no way to notice.
 pub fn read_file(path: &str) -> std::io::Result<FileContent> {
-    let size = fs::metadata(path)?.len();
+    let meta = fs::metadata(path)?;
+    let (size, mtime_ms) = (meta.len(), mtime_ms(&meta));
     if size > MAX_FILE_BYTES {
         return Ok(FileContent {
             path: path.to_string(),
@@ -117,6 +179,7 @@ pub fn read_file(path: &str) -> std::io::Result<FileContent> {
             too_large: true,
             binary: false,
             size,
+            mtime_ms,
         });
     }
     let bytes = fs::read(path)?;
@@ -127,6 +190,7 @@ pub fn read_file(path: &str) -> std::io::Result<FileContent> {
             too_large: false,
             binary: true,
             size,
+            mtime_ms,
         });
     }
     Ok(FileContent {
@@ -135,6 +199,7 @@ pub fn read_file(path: &str) -> std::io::Result<FileContent> {
         too_large: false,
         binary: false,
         size,
+        mtime_ms,
     })
 }
 
@@ -150,6 +215,9 @@ pub struct ImageContent {
     pub data_base64: String,
     pub too_large: bool,
     pub size: u64,
+    /// Last-modified time when these bytes were read — the editor's staleness
+    /// stamp (see [`FileStat`]). `None` when the platform doesn't report one.
+    pub mtime_ms: Option<u64>,
 }
 
 /// Read an image file for the viewer, base64-encoding its bytes. Same size guard
@@ -157,15 +225,19 @@ pub struct ImageContent {
 /// stall the webview) — over [`MAX_FILE_BYTES`] returns `too_large` with empty
 /// data. No binariness check: the caller already routed here BECAUSE the path is a
 /// known image extension, and the bytes are meant to be binary.
+///
+/// `mtime_ms` is sampled before the bytes for the same reason as [`read_file`].
 pub fn read_image(path: &str) -> std::io::Result<ImageContent> {
     use base64::Engine;
-    let size = fs::metadata(path)?.len();
+    let meta = fs::metadata(path)?;
+    let (size, mtime_ms) = (meta.len(), mtime_ms(&meta));
     if size > MAX_FILE_BYTES {
         return Ok(ImageContent {
             path: path.to_string(),
             data_base64: String::new(),
             too_large: true,
             size,
+            mtime_ms,
         });
     }
     let bytes = fs::read(path)?;
@@ -174,6 +246,7 @@ pub fn read_image(path: &str) -> std::io::Result<ImageContent> {
         data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         too_large: false,
         size,
+        mtime_ms,
     })
 }
 
@@ -498,6 +571,54 @@ mod tests {
             got.data_base64,
             base64::engine::general_purpose::STANDARD.encode(bytes)
         );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn reads_stamp_the_modification_time() {
+        let d = fresh_dir();
+        let f = d.join("stamped.txt");
+        write_file(f.to_str().unwrap(), "one").unwrap();
+        let text = read_file(f.to_str().unwrap()).unwrap();
+        let img = read_image(f.to_str().unwrap()).unwrap();
+        // Both readers must stamp the buffer, or the editor has nothing to compare
+        // a later stat against and would re-read every tab blindly (or never).
+        assert!(text.mtime_ms.is_some());
+        assert_eq!(text.mtime_ms, img.mtime_ms);
+        assert_eq!(text.mtime_ms, stat_files(&[f.to_string_lossy().into_owned()])[0].mtime_ms);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn stat_files_reports_size_and_missing_paths_without_failing_the_batch() {
+        let d = fresh_dir();
+        let there = d.join("there.txt");
+        write_file(there.to_str().unwrap(), "12345").unwrap();
+        let gone = d.join("gone.txt");
+        let stats = stat_files(&[
+            there.to_string_lossy().into_owned(),
+            gone.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(stats.len(), 2);
+        assert!(stats[0].exists);
+        assert_eq!(stats[0].size, 5);
+        // A missing path must not fail the batch — the other tabs still get an answer.
+        assert!(!stats[1].exists);
+        assert_eq!(stats[1].mtime_ms, None);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn stat_files_sees_a_rewrite() {
+        let d = fresh_dir();
+        let f = d.join("rewritten.txt");
+        write_file(f.to_str().unwrap(), "short").unwrap();
+        let before = stat_files(&[f.to_string_lossy().into_owned()]).remove(0);
+        write_file(f.to_str().unwrap(), "a much longer body").unwrap();
+        let after = stat_files(&[f.to_string_lossy().into_owned()]).remove(0);
+        // Size alone catches this one; mtime is the second signal for a same-size
+        // rewrite (its resolution is filesystem-dependent, so it isn't asserted here).
+        assert_ne!(before.size, after.size);
         fs::remove_dir_all(&d).unwrap();
     }
 

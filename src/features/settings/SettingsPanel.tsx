@@ -23,6 +23,7 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string }> = [
   { id: "general", label: "General", icon: "cog" },
   { id: "accounts", label: "Accounts", icon: "key" },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
@@ -141,6 +142,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "accounts" && <AccountsSection />}
 
             {section === "conversation" && <ConversationSection />}
+
+            {section === "reordering" && (
+              <div>
+                <PageHead
+                  title="Reordering"
+                  subtitle="Freeze the automatic order and arrange conversations, cards and repositories by hand — drag them into place."
+                />
+                <OrderingPrefs />
+              </div>
+            )}
 
             {section === "shortcuts" && <ShortcutsSection />}
 
@@ -263,19 +274,110 @@ function DisplayPrefs() {
         label="Show message controls"
       />
       <ToggleRow
-        title="Clickable file paths (Read/Write tools)"
+        title="Clickable filename on Read/Write rows"
         hint={
           <>
-            Makes file paths in <strong>Read/Write</strong> tools and in text clickable: a click{" "}
-            <strong>opens the file</strong> in the side viewer, at the right line.{" "}
-            <strong>On by default.</strong> Off → paths stay plain text.
+            On a <strong>Read/Write/Edit</strong> row, makes the filename{" "}
+            <strong>open the file</strong> instead of just expanding the row.{" "}
+            <strong>On by default.</strong> Off → the row only expands; the file stays one click
+            away from the filename above its snippet. Paths elsewhere (text, links, snippet
+            headers) are always clickable.
           </>
         }
         checked={clickableFileMentions}
         onChange={(v) => set({ clickableFileMentions: v })}
-        label="Make file paths clickable"
+        label="Make the filename on Read/Write rows clickable"
       />
     </SettingsGroup>
+  );
+}
+
+/** Ordering prefs (the "Reordering" tab), split so each surface is its own clear section:
+ *  the conversation sidebar, the Flight Deck, then whether they share one order. Each toggle
+ *  turns the AUTOMATIC reorder on/off for one surface + level. Off = a frozen drag-and-drop
+ *  order that never reshuffles on its own (drag a conversation/card anywhere; repos/swimlanes
+ *  by their header). New items still appear on top; the order survives quit/relaunch. */
+function OrderingPrefs() {
+  const autoSidebarConvs = useDisplay((s) => s.autoOrderSidebarConvs);
+  const autoSidebarRepos = useDisplay((s) => s.autoOrderSidebarRepos);
+  const autoFleetConvs = useDisplay((s) => s.autoOrderFleetConvs);
+  const autoFleetRepos = useDisplay((s) => s.autoOrderFleetRepos);
+  const sharedOrder = useDisplay((s) => s.sharedManualOrder);
+  const set = useDisplay((s) => s.set);
+  return (
+    <>
+      <SettingsGroup title="Conversation order" icon="chat">
+        <ToggleRow
+          title="Conversations"
+          hint={
+            <>
+              On → most recently active first. Off → the order you set by <strong>dragging</strong>{" "}
+              a conversation (anywhere on its row); it never reshuffles on its own and new
+              conversations appear on top. <strong>On by default.</strong>
+            </>
+          }
+          checked={autoSidebarConvs}
+          onChange={(v) => set({ autoOrderSidebarConvs: v })}
+          label="Auto-order sidebar conversations by recency"
+        />
+        <ToggleRow
+          title="Repositories"
+          hint={
+            <>
+              On → by most recent activity. Off → <strong>drag</strong> repositories (by their
+              header) into a fixed order. <strong>On by default.</strong>
+            </>
+          }
+          checked={autoSidebarRepos}
+          onChange={(v) => set({ autoOrderSidebarRepos: v })}
+          label="Auto-order sidebar repositories by recency"
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Flight Deck order" icon="grid">
+        <ToggleRow
+          title="Cards"
+          hint={
+            <>
+              On → attention first (<strong>status then recency</strong>). Off → the fixed order
+              you set by <strong>dragging</strong> a card (anywhere on it); even a card needing
+              attention stays put and new ones appear at the start. <strong>On by default.</strong>
+            </>
+          }
+          checked={autoFleetConvs}
+          onChange={(v) => set({ autoOrderFleetConvs: v })}
+          label="Auto-order Flight Deck cards by status"
+        />
+        <ToggleRow
+          title="Swimlanes"
+          hint={
+            <>
+              On → attention first. Off → <strong>drag</strong> swimlanes (by their header) into a
+              fixed order. <strong>On by default.</strong>
+            </>
+          }
+          checked={autoFleetRepos}
+          onChange={(v) => set({ autoOrderFleetRepos: v })}
+          label="Auto-order Flight Deck swimlanes by status"
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Shared order" icon="link">
+        <ToggleRow
+          title="Share order between the two views"
+          hint={
+            <>
+              On → the sidebar and the Flight Deck use the <strong>same</strong> manual order
+              (dragging in one reorders the other). Off → each view keeps its own arrangement. Only
+              affects levels set to manual. <strong>On by default.</strong>
+            </>
+          }
+          checked={sharedOrder}
+          onChange={(v) => set({ sharedManualOrder: v })}
+          label="Share manual order across sidebar and Flight Deck"
+        />
+      </SettingsGroup>
+    </>
   );
 }
 

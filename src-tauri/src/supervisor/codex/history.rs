@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::codex_home;
+use super::server::CLIENT_NAME_INTERNAL;
 use crate::supervisor::history::{
     self, DiskConversation, IndexedConversation, EXCERPT_CHARS, HEAD_SCAN_LINES, INDEX_BODY_CAP,
 };
@@ -221,7 +222,7 @@ fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
             }
             Some("event_msg") if excerpt.is_none() => {
                 if payload.get("type").and_then(Value::as_str) == Some("user_message") {
-                    let text = message_text(payload.get("message"), payload.get("images"));
+                    let text = message_text(payload);
                     if !text.trim().is_empty() {
                         excerpt = Some(history::flatten_truncate(&text, EXCERPT_CHARS));
                     }
@@ -263,12 +264,19 @@ fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
 /// stays listed — it carries `forked_from_id`, never `parent_thread_id` (verified across a
 /// real `~/.codex`: the two markers are disjoint). Either signal alone is conclusive; we
 /// check both defensively. A `null`-valued key counts as absent.
+///
+/// ALSO covers threads WE started for internal one-shot work (the Codex auto-title): they
+/// carry our internal `originator` marker ([`CLIENT_NAME_INTERNAL`]). Their cleanup is a
+/// best-effort `thread/archive`, so when it fails the rollout stays in `sessions/` and used
+/// to be listed as a real conversation — one whose only "user message" is the title prompt
+/// the app wrote, rendered under the user's own avatar.
 fn is_subagent_meta(payload: &Value) -> bool {
     let has_parent = payload
         .get("parent_thread_id")
         .is_some_and(|v| !v.is_null());
     let structured_source = payload.get("source").is_some_and(Value::is_object);
-    has_parent || structured_source
+    let internal = payload.get("originator").and_then(Value::as_str) == Some(CLIENT_NAME_INTERNAL);
+    has_parent || structured_source || internal
 }
 
 /// The thread id from a `session_meta` payload — its `id` (the current thread, correct even
@@ -339,7 +347,7 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
             }
             Some("event_msg") => match payload.get("type").and_then(Value::as_str) {
                 Some("user_message") => {
-                    let text = message_text(payload.get("message"), payload.get("images"));
+                    let text = message_text(payload);
                     if !text.trim().is_empty() {
                         if excerpt.is_empty() {
                             excerpt = history::flatten_truncate(&text, EXCERPT_CHARS);
@@ -473,6 +481,31 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
             continue; // already counted in pass 1
         };
         let payload = entry.get("payload").unwrap_or(&Value::Null);
+        // A rollout is APPEND-ONLY: rolling a thread back does not erase anything, the CLI
+        // just appends `{"type":"thread_rolled_back","num_turns":N}`. Replaying the file
+        // verbatim therefore replayed turns the backend has already discarded — including a
+        // user prompt the user watched disappear. Drop the LAST `num_turns` turns, a turn
+        // starting at each user message (the same boundary the rest of this module treats as
+        // a turn). `num_turns` missing or 0 → nothing to drop.
+        if payload.get("type").and_then(Value::as_str) == Some("thread_rolled_back") {
+            let n = payload.get("num_turns").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if n > 0 {
+                let starts: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| matches!(it, ConversationItem::UserMessage { .. }))
+                    .map(|(i, _)| i)
+                    .collect();
+                // Fewer recorded turns than the rollback claims → the whole file goes.
+                let cut = starts.len().saturating_sub(n);
+                items.truncate(starts.get(cut).copied().unwrap_or(0));
+                // Tool cards from the dropped turns can no longer be closed — forget them,
+                // or the end-of-file sweep would emit results for cards that no longer exist.
+                open_tools.clear();
+                view_image_calls.clear();
+            }
+            continue;
+        }
         if let Some(t) = payload.get("turn_id").and_then(Value::as_str) {
             current_turn = Some(t.to_string());
         }
@@ -484,14 +517,19 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
         match entry.get("type").and_then(Value::as_str) {
             Some("event_msg") => match payload.get("type").and_then(Value::as_str) {
                 Some("user_message") => {
-                    let text = message_text(payload.get("message"), payload.get("images"));
-                    msg_seq += 1;
-                    items.push(ConversationItem::UserMessage {
-                        id: format!("cx-u{msg_seq}"),
-                        text,
-                        parent_tool_use_id: None,
-                        replay: false,
-                    });
+                    let text = message_text(payload);
+                    // An empty turn is not a turn: without this it rendered as an avatar
+                    // and an empty bubble (and a blank row in the history preview). Mirrors
+                    // the Claude side's `push_user_text` guard.
+                    if !text.trim().is_empty() {
+                        msg_seq += 1;
+                        items.push(ConversationItem::UserMessage {
+                            id: format!("cx-u{msg_seq}"),
+                            text,
+                            parent_tool_use_id: None,
+                            replay: false,
+                        });
+                    }
                 }
                 Some("agent_message") => {
                     if let Some(text) = payload.get("message").and_then(Value::as_str) {
@@ -752,14 +790,30 @@ fn stamp_turn(items: &mut [ConversationItem], from: usize, turn_id: Option<&str>
 
 /// The user turn's text; an image-only turn (empty text but attachments) gets an
 /// `[image]` placeholder so the bubble is never blank.
-fn message_text(message: Option<&Value>, images: Option<&Value>) -> String {
-    let text = message.and_then(Value::as_str).unwrap_or("").trim().to_string();
+/// The display text of a rollout `user_message`, with the `[image]` placeholder for a turn
+/// that is nothing but attachments.
+///
+/// ⚠️ Reads BOTH image fields. Flight Deck only ever sends `UserInput::LocalImage`
+/// (`codex/session.rs`), which the CLI persists as `local_images`, leaving `images` empty —
+/// so keying on `images` alone made every image-only Codex turn come back as an EMPTY
+/// bubble (and its conversation vanish from the history list and the search index, whose
+/// callers drop a turn with no excerpt).
+fn message_text(payload: &Value) -> String {
+    let text = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if !text.is_empty() {
         return text;
     }
-    let has_images = images
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty());
+    let has_images = ["images", "local_images"].iter().any(|k| {
+        payload
+            .get(k)
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    });
     if has_images {
         "[image]".to_string()
     } else {
@@ -995,9 +1049,57 @@ mod tests {
 
     #[test]
     fn image_only_user_turn_gets_a_placeholder() {
-        let content = line("event_msg", json!({ "type": "user_message", "message": "", "images": ["data:…"] }));
+        // ⚠️ The REAL shape Flight Deck produces. It only ever sends `UserInput::LocalImage`,
+        // which the CLI persists under `local_images` — `images` stays empty. Keying on
+        // `images` alone (as this test used to, with a shape the app cannot emit) meant every
+        // image-only Codex turn came back as an EMPTY bubble, and its conversation dropped
+        // out of the history list and the search index entirely.
+        let content = line(
+            "event_msg",
+            json!({ "type": "user_message", "message": "", "images": [], "local_images": ["/tmp/a.png"] }),
+        );
         let (items, _) = parse_rollout_str(&content);
         assert!(is_user(&items[0], "[image]"));
+        // The other field still works (a turn sent by another Codex client).
+        let other = line("event_msg", json!({ "type": "user_message", "message": "", "images": ["data:…"] }));
+        let (items, _) = parse_rollout_str(&other);
+        assert!(is_user(&items[0], "[image]"));
+    }
+
+    /// A `user_message` with no text and no attachments is not a turn — it must not render
+    /// as an avatar with an empty bubble (nor a blank row in the history preview).
+    #[test]
+    fn a_wholly_empty_user_turn_is_not_a_bubble() {
+        let content = line("event_msg", json!({ "type": "user_message", "message": "" }));
+        let (items, _) = parse_rollout_str(&content);
+        assert!(
+            !items.iter().any(|i| matches!(i, ConversationItem::UserMessage { .. })),
+            "an empty user_message must not become a bubble"
+        );
+    }
+
+    /// A rollout is append-only: `thread_rolled_back{num_turns}` says the last N turns were
+    /// discarded by the backend. Replaying them would show the user a prompt they watched
+    /// disappear.
+    #[test]
+    fn a_rolled_back_turn_is_not_replayed() {
+        let content = [
+            line("event_msg", json!({ "type": "user_message", "message": "first" })),
+            line("event_msg", json!({ "type": "agent_message", "message": "answer one" })),
+            line("event_msg", json!({ "type": "user_message", "message": "second" })),
+            line("event_msg", json!({ "type": "agent_message", "message": "answer two" })),
+            line("event_msg", json!({ "type": "thread_rolled_back", "num_turns": 1 })),
+        ]
+        .join("\n");
+        let (items, _) = parse_rollout_str(&content);
+        let users: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["first"], "the rolled-back turn must be gone, the earlier one kept");
     }
 
     #[test]

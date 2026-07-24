@@ -3,6 +3,11 @@ import { commands, events } from "../../ipc/client";
 import { useEditorStore } from "./editorStore";
 import { useAppErrors } from "../../store/appErrors";
 
+/** How often open tabs are re-checked against the disk when no fs event can tell
+ *  us (see the safety-net effect). Short enough that a rewritten PDF looks live,
+ *  long enough that the cost — one batched `stat` over the open tabs — is noise. */
+const DISK_POLL_MS = 2000;
+
 /** Run a watch IPC call, logging both an error Result and a thrown rejection.
  *  Watch is best-effort (a failure only means live-refresh won't fire) but must
  *  never fail silently — a dead watch is otherwise invisible. */
@@ -25,6 +30,12 @@ function runWatch(
  * The watch follows `cwd`: switching conversation — or the agent entering a
  * worktree (a live cwd move) — re-points it. When the panel closes (`enabled`
  * false) the watch is dropped.
+ *
+ * Events are the FAST path, not the only one: this hook also resyncs open tabs
+ * whenever the watch (re)points, and on a timer, so a write the watcher can't
+ * report (ignored dir, outside the cwd, another conversation, dead watcher) still
+ * reaches the open tab. Both go through `resyncOpenBuffers`, which stats before it
+ * reads — an unchanged tab costs a syscall.
  */
 export function useFsWatch(convId: string, cwd: string | null, enabled: boolean): void {
   // Always-current target for the (once-registered) event listener.
@@ -54,6 +65,35 @@ export function useFsWatch(convId: string, cwd: string | null, enabled: boolean)
   useEffect(() => {
     if (!enabled || !cwd) return;
     void useEditorStore.getState().resyncOpenBuffers(convId);
+  }, [enabled, cwd, convId]);
+
+  // Safety net: some writes reach an open tab through NO event at all, so no amount
+  // of watch plumbing would catch them —
+  //   - the file lives under an ignored dir (build/, dist/, target/… — the watcher
+  //     drops those wholesale so a busy node_modules can't flood the UI, but a PDF
+  //     compiled into build/ is exactly the file you have open),
+  //   - the file sits outside the watched cwd (opened through a file mention),
+  //   - the watcher backend died (an error banner is shown, but the tabs would then
+  //     never refresh again for the rest of the session).
+  // A periodic resync closes all three at once. It is deliberately built on the same
+  // stamp check as everything else: one batched `stat` per tick, and a real read only
+  // for what actually moved — so an idle panel costs a handful of syscalls a minute.
+  // Paused while the window is hidden: nobody is looking, and the (re)point resync
+  // plus the next tick catch up on return.
+  useEffect(() => {
+    if (!enabled || !cwd) return;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void useEditorStore.getState().resyncOpenBuffers(convId);
+    };
+    const id = setInterval(tick, DISK_POLL_MS);
+    // Coming back to a hidden-then-visible window shouldn't wait out a whole period.
+    const onVisible = () => tick();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [enabled, cwd, convId]);
 
   // Subscribe once; the handler reads the live target from the ref. A failed

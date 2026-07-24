@@ -234,6 +234,12 @@ struct CodexCore {
     /// turn-scoped notifications. `turn/interrupt` REQUIRES it alongside the threadId, so
     /// without it the stream-control button can't stop a Codex turn. `None` between turns.
     current_turn_id: Option<String>,
+    /// `clientUserMessageId`s WE stamped on `turn/start`. The server echoes each back as the
+    /// `userMessage` item's `clientId`, so an item whose id is in here is our own turn
+    /// (already shown optimistically) and an item whose id is NOT is a turn that came in
+    /// over the bridge — the Codex analogue of the Claude assembler's `sent_user_uuids`.
+    /// Consumed on match, so the set self-bounds to in-flight sends.
+    sent_client_ids: HashSet<String>,
     /// Wall-clock start of the live turn, stamped when we send `turn/start` (the same edge
     /// as the front's `turnStartedAt`). Consumed at `turn/completed` to fill the timeline
     /// `TurnResult.duration_ms` — Codex's `turn/completed` carries NO server-measured turn
@@ -305,6 +311,7 @@ impl CodexCore {
             open_tools: HashSet::new(),
             pending_approvals: HashSet::new(),
             current_turn_id: None,
+            sent_client_ids: HashSet::new(),
             turn_started_at: None,
             controls: CodexControls::default(),
             applied_controls: None,
@@ -614,6 +621,12 @@ impl CodexCore {
                 self.turn_started_at = Some(Instant::now());
                 self.push_state();
                 let mut params = TurnStartParams::new(thread_id.to_string(), input);
+                // Stamp OUR id on this turn and remember it: the server echoes it back as
+                // the `userMessage` item's `clientId`, which is how `on_item` tells this
+                // turn (already on screen optimistically) from one typed on the phone/web.
+                let client_msg_id = uuid::Uuid::new_v4().to_string();
+                self.sent_client_ids.insert(client_msg_id.clone());
+                params.client_user_message_id = Some(client_msg_id);
                 self.controls.apply_to(&mut params);
                 let params = serde_json::to_value(params).unwrap_or(Value::Null);
                 match server.request("turn/start", params).await {
@@ -1425,10 +1438,30 @@ impl CodexCore {
                 self.emit_tool_result(&id, json!("Conversation compacted."), false);
             }
 
-            // The user's own echoed message / a hook-injected prompt: NOT model tool work
-            // (the front already renders the user turn). Intentionally no-op — modelled
-            // explicitly so they never trip the generic residue below.
-            ThreadItem::UserMessage | ThreadItem::HookPrompt => {}
+            // A user message echoed back as an item. Ours (already rendered optimistically
+            // by the front) → nothing to do. NOT ours → it was typed somewhere else (the
+            // phone/web bridge) and this is the only live signal it exists: surface it, or
+            // it stays invisible until a reload makes it appear from nowhere. Mirrors the
+            // Claude assembler's `was_ours` handling of `--replay-user-messages`.
+            ThreadItem::HookPrompt => {}
+            ThreadItem::UserMessage { id, content, client_id } => {
+                let was_ours = client_id
+                    .as_deref()
+                    .is_some_and(|c| self.sent_client_ids.remove(c));
+                if !was_ours {
+                    let text = user_input_text(&content);
+                    if !text.trim().is_empty() {
+                        self.push_item(ConversationItem::UserMessage {
+                            id,
+                            text,
+                            parent_tool_use_id: None,
+                            // Spliced into place: like a Claude bridge turn, it can land
+                            // out of order against the streaming reply.
+                            replay: true,
+                        });
+                    }
+                }
+            }
 
             // A FUTURE item type this build does not model → a generic card named after the
             // raw wire `type`, keyed by the item's own id. Never a silent drop; a signal to
@@ -2190,6 +2223,34 @@ fn epoch_to_seconds_string(n: f64) -> String {
 /// can't duplicate.
 fn steer_outcome_uncertain(e: &CodexError) -> bool {
     matches!(e, CodexError::Timeout(_))
+}
+
+/// The display text of an echoed `userMessage` item's `content` (a raw `UserInput[]`):
+/// its text parts joined, or the `[image]` placeholder for an attachment-only turn —
+/// the same placeholder the cold rollout reader and the Claude path use, so a bridge turn
+/// reads identically live and after a reload.
+fn user_input_text(content: &[Value]) -> String {
+    let mut text = String::new();
+    let mut has_image = false;
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+            // `localImage` (what we send) and any future image variant.
+            Some(t) if t.to_ascii_lowercase().contains("image") => has_image = true,
+            _ => {}
+        }
+    }
+    if text.trim().is_empty() && has_image {
+        return "[image]".to_string();
+    }
+    text
 }
 
 /// Build the `turn/start` input blocks from a message: the text (if any) then one

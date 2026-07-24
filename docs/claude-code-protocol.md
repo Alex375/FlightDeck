@@ -301,19 +301,49 @@ input:{skill,args?}}`, then:
 2. the **same body** as above.
    There is **NO `<command-*>` header** here — the `Skill` tool_use *is* the header.
 
-**⚠️ LIVE vs ON-DISK divergence on the body's `isMeta` (task 7e69f8ee, captured via
-`live_capture_skill_body_replay`):** the body line carries `isMeta:true` **only in the
-PERSISTED transcript**. On the **LIVE stdout** stream-json the CLI **OMITS `isMeta`** (and
-`sourceToolUseID`) on that exact line — it is a *bare* `user` text line with no distinguishing
-metadata. So a guard that drops only `isMeta:true` works on reload but NOT live.
+⚠️ **The body's prefix is NOT guaranteed.** The CLI builds it as
+`skillRoot ? "Base directory for this skill: " + root + "\n\n" + body : body` — a skill with no
+filesystem root injects its SKILL.md **raw**. 27 such bodies (3.5–8.8 KB) exist in real
+transcripts (`artifact-design`, `code-review`, `deep-research`, `review`). Re-invoking a skill
+already loaded this session injects a one-line notice instead
+(`(Re-invocation of /X — the skill instructions were previously loaded…)`). Any guard keyed on
+the prefix alone therefore misses a real and recurring share of bodies.
+
+### `isMeta` (disk) vs `isSynthetic` (live) — the general rule
+
+**The CLI renames the flag on the way out.** Every `user` line the binary injects ITSELF is
+flagged, but under a different name on each surface:
+
+| surface | field |
+|---|---|
+| persisted transcript | `isMeta: true` |
+| live stdout | `isSynthetic: true` (and **no** `isMeta`) |
+
+VERIFIED against **2.1.217**, both by live probe and by reading the binary: all three
+`case"user"` emitters yield `{type:"user", …, isSynthetic: o.isMeta || o.isVisibleInTranscriptOnly}`,
+the public zod schema for the `user` type declares `isSynthetic` and no `isMeta`, and the
+inverse converter maps `isMeta: t.isSynthetic`. Note it is a **superset** of the disk flag: it
+also covers `isVisibleInTranscriptOnly` lines (the `/compact` continuation summary, which on
+disk carries `isCompactSummary` + `isVisibleInTranscriptOnly` and **no** `isMeta`).
+
+This covers the skill body AND every other injected line — the `[Image: original WxH, displayed
+at WxH…]` note emitted after reading a downscaled image, stop-hook feedback, continuation
+nudges, plugin-injected prompts. `sourceToolUseID` remains disk-only and is NOT a live
+distinguisher.
 
 **Handling:**
-- **Reload** (`history.rs::push_user`): the on-disk `isMeta:true` line is dropped like any meta
-  line (also covers system-reminders and the "while you were working" wrapper).
-- **Live** (`assembler.rs::ingest_user`): `isMeta` is absent, so we drop the body by its
-  boilerplate **prefix** `Base directory for this skill:` **while a `Skill` tool_use is armed**
-  this turn (`skill_invocation_pending`, set in `ingest_assistant`, reset on `result`). Gated on
-  BOTH so a real user turn is never swallowed.
+- **Reload** (`history.rs::push_user`): drops `isMeta` **or** `isVisibleInTranscriptOnly` **or**
+  `isCompactSummary`.
+- **Live** (`assembler.rs::ingest_user`): drops `isSynthetic` (and still honours `isMeta`).
+  Applied to the **bubble branch only**, never as an early return — an injected line can also
+  carry `tool_result` blocks, which must still be surfaced. The prefix guard
+  (`skill_invocation_pending`, armed from `content_block_start` AND the assembled assistant
+  message) is kept as belt-and-braces for a future binary that stops sending `isSynthetic`.
+- **Neither surface flags** `[Request interrupted by user]`, another command's
+  `<local-command-stdout>`, or the `<ide_opened_file>` banner. Those are classified by text in
+  `history::classify_injected_text` — one body called from BOTH paths — and become timeline
+  notices (or, for the IDE banner, are stripped off the prompt they precede) rather than user
+  bubbles or silent drops.
 
 So the SKILL.md **body never renders as a user bubble** (live OR reload). The visible trace is:
 for a typed command, the header string → a clean `.cv-cmd` chip (`userText.tsx`); for a model
@@ -321,7 +351,13 @@ invocation, the `Skill` tool_use → a dedicated `SkillChip` (from `input.skill`
 `fixtures/capture_skill.jsonl` (on-disk, `isMeta:true`) + `fixtures/capture_skill_live.jsonl`
 (live shape, NO `isMeta`); regression tests: `skill_body_user_line_is_dropped`,
 `skill_body_line_is_skipped_on_restore`, `skill_invocation_fixture_surfaces_tool_use_not_body`,
-`skill_body_live_line_without_ismeta_is_dropped`, `skill_body_drop_does_not_swallow_real_next_turn`.
+`skill_body_live_line_without_ismeta_is_dropped`, `skill_body_drop_does_not_swallow_real_next_turn`,
+`synthetic_user_lines_are_dropped`, `skill_body_is_dropped_when_armed_only_from_the_stream`.
+
+⚠️ **The structural guard is the parity table** (`assembler.rs`, `mod parity_tests`): the live
+and reload paths are separate code keyed on DIFFERENT fields, so each half can regress to green
+alone — which is exactly what happened here (the disk test passed for years while the live
+guard was dead code). Any new injected shape belongs in that table.
 
 ### 3.8 `parent_tool_use_id` = sub-agent (Task) grouping (`confirmed`)
 

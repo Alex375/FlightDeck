@@ -548,6 +548,32 @@ pub async fn load_session_goal(session_id: String) -> Result<Option<GoalState>, 
         .map_err(|e| e.to_string())
 }
 
+/// Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
+/// nothing. The front calls this BEFORE killing the live session, so an unresolvable target
+/// costs nothing instead of tearing the session down for a rewind that was always going to
+/// fail. See [`history::check_rewind_target`].
+#[tauri::command]
+#[specta::specta]
+pub async fn check_rewind_target(
+    session_id: String,
+    target_id: String,
+    target_is_user: bool,
+    target_text: Option<String>,
+    occurrence: Option<u32>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        history::check_rewind_target(
+            &session_id,
+            &target_id,
+            target_is_user,
+            target_text.as_deref(),
+            occurrence.map(|o| o as usize),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Rewind a conversation IN PLACE by truncating its on-disk transcript at `target_id`,
 /// dropping that message (USER target) or everything after its response (ASSISTANT
 /// target). Destructive by design ("resume from here"): the removed turns are
@@ -1445,6 +1471,16 @@ pub async fn read_image(path: String) -> Result<crate::fs::ImageContent, String>
     tokio::task::spawn_blocking(move || crate::fs::read_image(&path))
         .await
         .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Stat several paths at once (size + mtime, no bytes) so the editor can tell
+/// which open tabs actually changed on disk before re-reading any of them.
+#[tauri::command]
+#[specta::specta]
+pub async fn stat_files(paths: Vec<String>) -> Result<Vec<crate::fs::FileStat>, String> {
+    tokio::task::spawn_blocking(move || crate::fs::stat_files(&paths))
+        .await
         .map_err(|e| e.to_string())
 }
 

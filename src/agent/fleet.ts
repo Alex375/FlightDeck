@@ -20,6 +20,14 @@ import {
   type Repo,
   type RepoGroup,
 } from "../store/conversationsStore";
+import {
+  useOrderSlot,
+  slotFor,
+  manualIndex,
+  manualConvIndex,
+  manualComparator,
+  type OrderBlob,
+} from "../store/manualOrder";
 import { readoutBucket, statusRank, type AgentStatus } from "./status";
 import { agentStatusForEntry } from "./useAgentStatus";
 
@@ -149,14 +157,22 @@ export function orderLanes(
   repos: Repo[],
   conversations: Conversation[],
   rank: (c: Conversation) => number,
+  // When present, a level whose `auto*` flag is FALSE uses the MANUAL drag order from
+  // `order` instead of the status-first sort (new/never-dragged items go to the very
+  // start, newest-first). Omitted → the historical all-automatic behaviour.
+  manual?: { order: OrderBlob; autoConvs: boolean; autoRepos: boolean },
 ): FleetLane[] {
+  const manualConvs = !!manual && !manual.autoConvs;
+  const manualRepos = !!manual && !manual.autoRepos;
+  const needRank = !manualConvs || !manualRepos;
   // Derive each conversation's status rank ONCE. `rank` runs a real status
   // derivation (not a cheap field read), so calling it inside the O(n log n) sort
   // comparators below would re-derive the same conversation on every compare —
   // O(n log n) derivations per recompute, replayed on every streaming delta. Cache
   // it to one derivation per conversation; the comparators read the cached value.
+  // (Skipped entirely when BOTH levels are manual — no status needed then.)
   const rankById = new Map<string, number>();
-  for (const c of conversations) rankById.set(c.id, rank(c));
+  if (needRank) for (const c of conversations) rankById.set(c.id, rank(c));
   const r = (c: Conversation) => rankById.get(c.id) ?? 99;
   // After the status sort, a group's first conversation holds its lowest (most
   // urgent) rank; the lane's recency tiebreak is the max activity across it.
@@ -165,12 +181,13 @@ export function orderLanes(
     g.conversations.length
       ? Math.max(...g.conversations.map((c) => c.lastActivityAt))
       : g.repo.addedAt;
-  return groupByRepo(
-    repos,
-    conversations,
-    (a, b) => r(a) - r(b) || b.lastActivityAt - a.lastActivityAt,
-    (a, b) => repoRank(a) - repoRank(b) || repoAt(b) - repoAt(a),
-  );
+  const sortConvs = manualConvs
+    ? manualComparator<Conversation>(manualConvIndex(manual!.order.convOrder), (c) => c.id, (c) => c.createdAt)
+    : (a: Conversation, b: Conversation) => r(a) - r(b) || b.lastActivityAt - a.lastActivityAt;
+  const sortRepos = manualRepos
+    ? manualComparator<FleetLane>(manualIndex(manual!.order.repoOrder), (g) => g.repo.id, (g) => g.repo.addedAt)
+    : (a: FleetLane, b: FleetLane) => repoRank(a) - repoRank(b) || repoAt(b) - repoAt(a);
+  return groupByRepo(repos, conversations, sortConvs, sortRepos);
 }
 
 /** Project lanes to a flat, shallow-stable order-token list, so `useShallow` can
@@ -215,6 +232,10 @@ export function useFleetLanes(): FleetLane[] {
   const bg = useRunningCountsByConv();
   const bgBash = useRunningBashCountsByConv();
   const reAlertBash = useDisplay((s) => s.alertOnBackgroundBash);
+  const autoConvs = useDisplay((s) => s.autoOrderFleetConvs);
+  const autoRepos = useDisplay((s) => s.autoOrderFleetRepos);
+  const shared = useDisplay((s) => s.sharedManualOrder);
+  const order = useOrderSlot(slotFor("flightdeck", shared));
   const tokens = useConversationStore(
     useShallow((s) => {
       const rank = (c: Conversation) =>
@@ -228,7 +249,7 @@ export function useFleetLanes(): FleetLane[] {
             reAlertBash,
           ),
         );
-      return lanesToTokens(orderLanes(repos, conversations, rank));
+      return lanesToTokens(orderLanes(repos, conversations, rank, { order, autoConvs, autoRepos }));
     }),
   );
   return useMemo(() => rebuildLanes(tokens, repos, conversations), [tokens, repos, conversations]);

@@ -42,17 +42,16 @@ import { looksLikeFile, looksLikePath, segmentPath, type PathParts } from "./pat
 interface MentionCtx {
   convId: string;
   cwd: string;
-  /** True when file mentions must render as plain text. Folds TWO things: the host
-   *  has no editor to reveal into (the `inert` prop — Flight Deck reply modal, where a
-   *  click would be a dead link that also flips the persisted `editorOpen` flag) OR the
-   *  user's "make file paths clickable" pref is off. Used by inline-code prose mentions
-   *  and tool-card chips (both respect that pref). */
+  /** True when the host has no editor to reveal into (Flight Deck reply modal, where a
+   *  click would be a dead link that also flips the persisted `editorOpen` flag). This is
+   *  the ONLY universal gate: when set, every mention surface degrades to plain text. */
   inert: boolean;
-  /** True ONLY when the host has no editor to reveal into (the `inert` prop). Does NOT
-   *  fold in the pref. Used by Markdown file LINKS (MentionLink): a file link the model
-   *  wrote in its conversation is clickable regardless of the "clickable file paths"
-   *  setting — that setting is scoped to the Read/Write tool-card chips, not prose links. */
-  hostInert: boolean;
+  /** True when the tool STEP ROW's filename must not be clickable — i.e. the host is inert
+   *  OR the user turned the "clickable file paths (Read/Write tools)" pref off. That pref is
+   *  DELIBERATELY narrow: it only removes the navigation from the row that also expands the
+   *  card (a dual-purpose click), and touches NOTHING else — not the filename in the expanded
+   *  diff/snippet header, not prose paths, not Markdown file links. */
+  stepRowInert: boolean;
 }
 
 const Ctx = createContext<MentionCtx | null>(null);
@@ -68,13 +67,13 @@ export function FileMentionProvider({
   inert?: boolean;
   children: ReactNode;
 }) {
-  // The "make file paths clickable" pref gates inline-code mentions + tool-card chips
-  // (folded into `inert`), but NOT Markdown file links (they use `hostInert`, which
-  // reflects only the no-editor-host prop).
-  const clickable = useDisplay((s) => s.clickableFileMentions);
+  // The "clickable file paths (Read/Write tools)" pref gates ONE surface: the filename on a
+  // tool step row (ToolStepRow). Everything else — prose inline-code paths, Markdown file
+  // links, the filename in a diff/snippet header — stays clickable regardless of it.
+  const clickableStepRow = useDisplay((s) => s.clickableFileMentions);
   const value = useMemo(
-    () => ({ convId, cwd, inert: inert || !clickable, hostInert: inert }),
-    [convId, cwd, inert, clickable],
+    () => ({ convId, cwd, inert, stepRowInert: inert || !clickableStepRow }),
+    [convId, cwd, inert, clickableStepRow],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
@@ -139,16 +138,17 @@ function openTarget(t: MentionTarget): void {
  * agent just CREATED non-clickable (it didn't exist at first render). openFile
  * surfaces a read error if the path is truly gone.
  */
-function useAuthoritativeTarget(path: string | undefined): MentionTarget | null {
+function useAuthoritativeTarget(path: string | undefined, stepRow: boolean): MentionTarget | null {
   const ctx = useFileMentionCtx();
   const cwd = ctx?.cwd ?? null;
+  const blocked = ctx ? (stepRow ? ctx.stepRowInert : ctx.inert) : true;
   return useMemo(() => {
     const trimmed = path?.trim();
     // Guard the one non-filesystem shape that can slip through an authoritative
     // arg: a URL/remote handle (a tool naming its arg `file_path` with a URL).
-    if (!ctx || ctx.inert || !cwd || !trimmed || SCHEME.test(trimmed)) return null;
+    if (!ctx || blocked || !cwd || !trimmed || SCHEME.test(trimmed)) return null;
     return { ctx, abs: resolveMentionAbs(cwd, trimmed), mention: { path: trimmed } };
-  }, [ctx, cwd, path]);
+  }, [ctx, blocked, cwd, path]);
 }
 
 // ---- Shared clickable element ------------------------------------------------
@@ -269,17 +269,23 @@ export function MentionInlineCode({
 /**
  * A tool-card / diff file chip: `display` (the basename) is clickable, opening
  * the full authoritative `path`. Renders nothing when there is no path.
+ *
+ * `stepRow` marks the ONE surface the "clickable file paths (Read/Write tools)" pref
+ * governs: the filename on a tool STEP ROW, whose click competes with the row's own
+ * expand toggle. Everywhere else (diff/snippet header) the chip ignores that pref.
  */
 export function MentionPathChip({
   path,
   className,
   display,
+  stepRow = false,
 }: {
   path: string | undefined;
   className?: string;
   display: ReactNode;
+  stepRow?: boolean;
 }) {
-  const target = useAuthoritativeTarget(path);
+  const target = useAuthoritativeTarget(path, stepRow);
   if (!path) return null;
   return <ClickableFile element="span" className={className} display={display} target={target} />;
 }
@@ -306,12 +312,12 @@ export function MentionLink({
   children?: ReactNode;
 }) {
   const ctx = useFileMentionCtx();
-  // Uses `hostInert` (not `inert`): a file link the model wrote in its conversation is
-  // clickable regardless of the "make file paths clickable" pref — only a host with no
+  // Gated by `inert` alone: a file link the model wrote in its conversation is clickable
+  // regardless of the "clickable file paths (Read/Write tools)" pref — only a host with no
   // editor to reveal into (the reply modal) forces plain text.
   const route = useMemo(
-    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: ctx?.hostInert ?? true }),
-    [href, ctx?.cwd, ctx?.hostInert],
+    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: ctx?.inert ?? true }),
+    [href, ctx?.cwd, ctx?.inert],
   );
   // A hosted-artifact URL renders as a compact artifact card (opens the in-app viewer / browser),
   // not a plain anchor — regardless of host, so it's recognisable everywhere Claude links one.

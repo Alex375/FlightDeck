@@ -356,6 +356,93 @@ pub(crate) fn is_goal_command_noise(text: &str) -> bool {
     false
 }
 
+/// What to do with a `user` line the CLI injected but did NOT flag (no `isMeta` on disk,
+/// no `isSynthetic` live) — the shapes that leak on BOTH surfaces because there is no
+/// provenance field to key on, only the text itself.
+pub(crate) enum InjectedText {
+    /// Pure plumbing a dedicated UI already represents → drop it from the thread.
+    Drop,
+    /// Real information that the human nonetheless did not say → surface it as a timeline
+    /// notice, never as a user bubble. Dropping these outright would be a silent loss.
+    Notice { subtype: &'static str, message: String },
+}
+
+/// The two `[Request interrupted by user…]` lines the CLI writes when a turn is cut short
+/// (Stop, a denied tool, or a session teardown). Matched by EXACT equality, not by prefix:
+/// across 3 559 real transcripts all 126 occurrences are the bare sentence alone on the
+/// line, and an exact test can never swallow a human message that merely opens with these
+/// words. Neither carries `isMeta`, `isSynthetic` nor `isSidechain` — the text is the only
+/// signal there is.
+const INTERRUPTED_LINES: [&str; 2] = [
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+];
+
+/// Classify a `user` line's text when no provenance flag is available.
+///
+/// Shared by BOTH surfaces on purpose — `history.rs::push_user_text` (reload) and
+/// `assembler.rs::ingest_user` (live) call this one body, the pattern already proven by
+/// [`is_goal_command_noise`]: one implementation, two call sites, no way for the two
+/// renderings of the same line to drift apart.
+///
+/// `None` = a genuine human turn; render the bubble.
+pub(crate) fn classify_injected_text(text: &str) -> Option<InjectedText> {
+    let t = text.trim();
+    // `/goal` plumbing — the dedicated goal UI (target icon + composer chip) represents it.
+    if is_goal_command_noise(t) {
+        return Some(InjectedText::Drop);
+    }
+    if INTERRUPTED_LINES.contains(&t) {
+        return Some(InjectedText::Notice {
+            subtype: "interrupted",
+            message: t.trim_start_matches('[').trim_end_matches(']').to_string(),
+        });
+    }
+    // The stdout of any OTHER local slash command ("Compacted", "Set model to opus",
+    // "Login successful", …). Real feedback — show it, attributed to the command rather
+    // than to the user. `/goal`'s own stdout never reaches here (dropped above).
+    if let Some(inner) = strip_wrapper(t, "local-command-stdout") {
+        let message = inner.trim().to_string();
+        return Some(if message.is_empty() {
+            // Nothing to show and nothing lost — an empty stdout carries no information.
+            InjectedText::Drop
+        } else {
+            InjectedText::Notice { subtype: "command_output", message }
+        });
+    }
+    // The wrapper the CLI puts around locally-run command output. DISK-ONLY in practice
+    // (`isMeta:true`, and a live probe never saw it on stdout), so this is defensive: if a
+    // future binary stops flagging it, it still can't become a bubble.
+    if strip_wrapper(t, "local-command-caveat").is_some() {
+        return Some(InjectedText::Drop);
+    }
+    None
+}
+
+/// The inner text of `<tag>…</tag>` when `t` is exactly that wrapper, else `None`.
+/// The closing tag is tolerated as missing (the CLI has shipped unterminated wrappers).
+fn strip_wrapper<'a>(t: &'a str, tag: &str) -> Option<&'a str> {
+    let inner = t.strip_prefix(&format!("<{tag}>"))?;
+    Some(inner.strip_suffix(&format!("</{tag}>")).unwrap_or(inner))
+}
+
+/// Strip the `<ide_opened_file>…</ide_opened_file>` banner the IDE integration PREPENDS to
+/// a real prompt, in the same content array. Unlike everything in
+/// [`classify_injected_text`], this one must NOT drop the line: the human's actual message
+/// follows it and would be lost with it.
+pub(crate) fn strip_ide_banner(text: &str) -> &str {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix("<ide_opened_file>") else {
+        return text;
+    };
+    match rest.split_once("</ide_opened_file>") {
+        Some((_, after)) => after.trim_start_matches('\n'),
+        // Unterminated banner: nothing trustworthy follows, keep the text as-is rather
+        // than guess where it ends.
+        None => text,
+    }
+}
+
 fn parse_transcript(path: &Path) -> Vec<ConversationItem> {
     match std::fs::read_to_string(path) {
         // The main conversation transcript: skip sidechain (sub-agent) turns — the
@@ -435,9 +522,18 @@ pub(crate) fn parse_transcript_str(
 /// A `user` transcript line is either a real prompt (string or text blocks) or
 /// the delivery vehicle for `tool_result` blocks.
 fn push_user(entry: &Value, items: &mut Vec<ConversationItem>) {
-    // Meta user lines (injected command output, system reminders, …) are not real
-    // turns — the UI never shows them, so drop them on restore too.
-    if entry.get("isMeta").and_then(Value::as_bool) == Some(true) {
+    // Lines the CLI injected rather than the human typing them (command output, system
+    // reminders, skill bodies, the `[Image: …]` downscale note, …) are not real turns.
+    //
+    // ⚠️ THREE flags, not one. Live, the wire folds them into a single `isSynthetic`
+    // (`isMeta || isVisibleInTranscriptOnly` — see `UserMsg::is_synthetic`), so the reload
+    // must honour the same union or the two surfaces disagree: `/compact`'s continuation
+    // summary carries `isCompactSummary` + `isVisibleInTranscriptOnly` and NO `isMeta`,
+    // which is exactly how a 14-20 KB internal summary used to render as a user bubble.
+    let injected = ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"]
+        .iter()
+        .any(|flag| entry.get(flag).and_then(Value::as_bool) == Some(true));
+    if injected {
         return;
     }
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
@@ -492,13 +588,25 @@ fn push_user(entry: &Value, items: &mut Vec<ConversationItem>) {
 }
 
 fn push_user_text(uuid: &str, text: &str, items: &mut Vec<ConversationItem>) {
+    // Strip the IDE's "user opened a file" banner glued in front of a real prompt before
+    // anything else — the prompt itself must survive.
+    let text = strip_ide_banner(text);
     if text.trim().is_empty() {
         return;
     }
-    // `/goal` plumbing (the command echo + its "Goal set/cleared" / "No goal set" stdout) is now
-    // shown by the dedicated goal UI — drop it so it never clutters the restored thread.
-    if is_goal_command_noise(text) {
-        return;
+    // Injected lines with no provenance flag (`/goal` plumbing, `[Request interrupted by
+    // user]`, another command's stdout). Same body as the live path — see
+    // [`classify_injected_text`].
+    match classify_injected_text(text) {
+        Some(InjectedText::Drop) => return,
+        Some(InjectedText::Notice { subtype, message }) => {
+            items.push(ConversationItem::Notice {
+                subtype: subtype.to_string(),
+                detail: json!({ "message": message }),
+            });
+            return;
+        }
+        None => {}
     }
     items.push(ConversationItem::UserMessage {
         id: uuid.to_string(),
@@ -721,6 +829,30 @@ fn read_transcript_lines(path: &Path) -> Result<(String, Vec<Option<Value>>), St
     let parsed: Vec<Option<Value>> =
         content.lines().map(|l| serde_json::from_str::<Value>(l.trim()).ok()).collect();
     Ok((content, parsed))
+}
+
+/// Can a rewind at `target_id` be resolved? Runs exactly [`rewind_transcript`]'s locator and
+/// throws the result away — READ-ONLY, nothing is truncated.
+///
+/// Exists because rewinding is a two-step move whose steps can't be reordered: the live
+/// session must be stopped BEFORE the file is truncated (an alive writer would corrupt it),
+/// but a target that can't be located only fails at truncation time — so an unresolvable
+/// target used to kill the session and THEN report failure, leaving the user with a dead
+/// session, an error banner, and the message still there. Ask first, kill second.
+pub fn check_rewind_target(
+    session_id: &str,
+    target_id: &str,
+    target_is_user: bool,
+    target_text: Option<&str>,
+    occurrence: Option<usize>,
+) -> Result<(), String> {
+    let config_dir =
+        claude_config_dir().ok_or_else(|| "Claude config directory not found".to_string())?;
+    let path = find_transcript(&config_dir, session_id)
+        .ok_or_else(|| "conversation transcript not found".to_string())?;
+    let (content, parsed) = read_transcript_lines(&path)?;
+    let raw: Vec<&str> = content.lines().collect();
+    resolve_cut(&raw, &parsed, target_id, target_is_user, target_text, occurrence).map(|_| ())
 }
 
 /// Truncate `session_id`'s transcript at `target_id` (rewind the conversation IN PLACE).
@@ -1063,8 +1195,16 @@ fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
 /// meta / sidechain line or a `tool_result`-only delivery (no human text). Mirrors
 /// [`push_user`]'s filtering so the listed excerpt is the same first prompt the
 /// preview shows.
+///
+/// ⚠️ "Mirrors" is load-bearing and was once only half-true: this ran two of the flag
+/// checks and NONE of the text ones, so 134 real conversations were listed (and indexed,
+/// and — with no ai-title — NAMED) by raw plumbing XML their own thread deliberately hides.
+/// Every filter `push_user`/`push_user_text` applies must be applied here too.
 fn first_user_text(entry: &Value) -> Option<String> {
-    if entry.get("isMeta").and_then(Value::as_bool) == Some(true) {
+    let injected = ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"]
+        .iter()
+        .any(|flag| entry.get(flag).and_then(Value::as_bool) == Some(true));
+    if injected {
         return None;
     }
     if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -1100,10 +1240,14 @@ fn first_user_text(entry: &Value) -> Option<String> {
         }
         _ => return None,
     };
-    if text.trim().is_empty() {
+    // Same text-level filtering as the thread: an excerpt must never show what the
+    // conversation itself hides (a `/goal` echo, `[Request interrupted by user]`, another
+    // command's stdout), and the IDE banner must be peeled off the prompt it precedes.
+    let text = strip_ide_banner(&text);
+    if text.trim().is_empty() || classify_injected_text(text).is_some() {
         None
     } else {
-        Some(text)
+        Some(text.to_string())
     }
 }
 
@@ -1781,6 +1925,75 @@ mod tests {
             })
             .collect();
         assert_eq!(users, vec!["hello"]);
+    }
+
+    /// Injected lines with no provenance flag at all. They must never be user bubbles, and —
+    /// because they carry real information — must not vanish either: they become notices.
+    #[test]
+    fn unflagged_injected_lines_become_notices_not_bubbles() {
+        for (text, want_subtype) in [
+            ("[Request interrupted by user]", "interrupted"),
+            ("[Request interrupted by user for tool use]", "interrupted"),
+            ("<local-command-stdout>Set model to opus</local-command-stdout>", "command_output"),
+        ] {
+            let mut items = Vec::new();
+            push_user_text("u1", text, &mut items);
+            assert!(
+                matches!(&items[..], [ConversationItem::Notice { subtype, .. }] if subtype == want_subtype),
+                "{text:?} must render as a {want_subtype} notice, got {items:?}"
+            );
+        }
+        // A human message that merely MENTIONS an interrupt is a real turn (the interrupt
+        // markers are matched by exact equality, never as a prefix).
+        let mut items = Vec::new();
+        push_user_text("u2", "[Request interrupted by user] happens too often, fix it", &mut items);
+        assert!(matches!(&items[..], [ConversationItem::UserMessage { .. }]));
+    }
+
+    /// The compaction summary carries `isCompactSummary` + `isVisibleInTranscriptOnly` and NO
+    /// `isMeta` — a 14-20 KB internal digest that used to render as a message the user sent.
+    #[test]
+    fn the_compaction_summary_is_not_a_user_turn() {
+        let line = r#"{"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"uuid":"c1","message":{"role":"user","content":"This session is being continued from a previous conversation…"}}"#;
+        let (items, _) = parse_transcript_str(line, true);
+        assert!(items.is_empty(), "the compaction summary must not be a bubble, got {items:?}");
+    }
+
+    /// The IDE banner is PREPENDED to a real prompt in the same content array — it has to be
+    /// stripped, not dropped, or the human's actual message goes with it.
+    #[test]
+    fn the_ide_banner_is_stripped_and_the_prompt_survives() {
+        let mut items = Vec::new();
+        push_user_text(
+            "u3",
+            "<ide_opened_file>The user opened /a/b.md in the IDE.</ide_opened_file>\nfix the typo",
+            &mut items,
+        );
+        assert!(
+            matches!(&items[..], [ConversationItem::UserMessage { text, .. }] if text == "fix the typo"),
+            "got {items:?}"
+        );
+    }
+
+    /// The history excerpt must hide exactly what the thread hides — it is the row label, and
+    /// for an untitled conversation it becomes the name it is restored under.
+    #[test]
+    fn the_excerpt_skips_what_the_thread_hides() {
+        let hidden = [
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Base directory for this skill: /x"}}"#,
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued…"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted</local-command-stdout>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/goal</command-name>"}}"#,
+        ];
+        for line in hidden {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(first_user_text(&v), None, "must not be an excerpt: {line}");
+        }
+        // …while a real prompt still is one.
+        let v: Value =
+            serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#).unwrap();
+        assert_eq!(first_user_text(&v).as_deref(), Some("hello"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ import type {
   CodexPluginsLive,
   ExtensionsSnapshot,
   FileContent,
+  FileStat,
   FsChangeEvent,
   FsWatchErrorEvent,
   FsEntry,
@@ -913,7 +914,27 @@ export const mockCommands = {
     // image viewer path without a real filesystem.
     const data_base64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
-    return ok({ path, data_base64, too_large: false, size: 70 });
+    return ok({
+      path,
+      data_base64,
+      too_large: false,
+      size: mockBytesSize(path),
+      mtime_ms: mockMtimeMs(path),
+    });
+  },
+
+  async statFiles(paths: string[]): Promise<Result<FileStat[], string>> {
+    if (paths.some((p) => p.includes("__throw__"))) throw new Error("mock statFiles transport failure");
+    if (paths.some((p) => p.includes("__fail__"))) return { status: "error", error: "mock statFiles failed" };
+    return ok(
+      paths.map((path) => ({
+        path,
+        // `__gone__` simulates a path that vanished between two checks.
+        exists: !path.includes("__gone__"),
+        size: mockSize(path),
+        mtime_ms: mockMtimeMs(path),
+      })),
+    );
   },
 
   async writeFile(_path: string, _content: string): Promise<Result<null, string>> {
@@ -1060,20 +1081,74 @@ function mockDir(path: string): FsEntry[] {
   ];
 }
 
+// ---- Simulated disk mutations ----------------------------------------------
+//
+// The mock is otherwise deterministic, which makes "the agent rewrote this file
+// while you weren't looking" — the exact case the editor's staleness check
+// exists for — impossible to express. So each path carries a revision a caller
+// can bump: content, size and mtime all derive from it, moving together the way
+// a real rewrite moves them. Without this, `statFiles` could only ever answer
+// "unchanged" and no test could tell a working refresh from a broken one.
+
+const mockRevisions = new Map<string, number>();
+/** Epoch ms of revision 0 — fixed, so a mock mtime is reproducible. */
+const MOCK_MTIME_BASE = 1_700_000_000_000;
+
+/** Simulate an external write to `path` (an agent editing the file on disk). */
+export function touchMockFile(path: string): void {
+  mockRevisions.set(path, (mockRevisions.get(path) ?? 0) + 1);
+}
+
+/** Reset every simulated write (call between tests). */
+export function resetMockDisk(): void {
+  mockRevisions.clear();
+}
+
+function mockRevision(path: string): number {
+  return mockRevisions.get(path) ?? 0;
+}
+
+function mockMtimeMs(path: string): number {
+  return MOCK_MTIME_BASE + mockRevision(path) * 1000;
+}
+
+/** Paths the mock serves as raw bytes (`readImage`) rather than text. */
+function isMockBytesPath(path: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|pdf)$/i.test(path);
+}
+
+/** Byte size the mock reports for a bytes path — must match what `readImage`
+ *  returns, or every stat would look like a change and re-read forever. */
+function mockBytesSize(path: string): number {
+  return 70 + mockRevision(path);
+}
+
 /** Synthetic file content for the browser/dev editor. */
 function mockFile(path: string): FileContent {
   const name = path.split("/").pop() ?? path;
+  const mtime_ms = mockMtimeMs(path);
   // Test sentinels: simulate a file that is binary / exceeds the size limit on
   // disk. Both return empty content, mirroring the Rust read_file guards.
-  if (path.includes("__binary__")) return { path, content: "", too_large: false, binary: true, size: 1024 };
-  if (path.includes("__toolarge__")) return { path, content: "", too_large: true, binary: false, size: 99_000_000 };
+  if (path.includes("__binary__"))
+    return { path, content: "", too_large: false, binary: true, size: 1024, mtime_ms };
+  if (path.includes("__toolarge__"))
+    return { path, content: "", too_large: true, binary: false, size: 99_000_000, mtime_ms };
   let content = `// ${name}\n// (mock file — browser/dev build, no real filesystem)\n`;
   if (name.endsWith(".md")) {
     content = `# ${name}\n\nMock markdown for the dev build.\n\n- one\n- two\n`;
   } else if (name.endsWith(".json")) {
     content = `{\n  "name": "mock",\n  "version": "0.0.0"\n}\n`;
   }
-  return { path, content, too_large: false, binary: false, size: content.length };
+  // A simulated write changes the bytes, exactly as the real thing would.
+  const rev = mockRevision(path);
+  if (rev > 0) content += `// revision ${rev}\n`;
+  return { path, content, too_large: false, binary: false, size: content.length, mtime_ms };
+}
+
+/** Size the mock's `statFiles` reports — the same number the matching reader
+ *  returns for that path (text vs bytes), so stat and read never disagree. */
+function mockSize(path: string): number {
+  return isMockBytesPath(path) ? mockBytesSize(path) : mockFile(path).size;
 }
 
 // Synthetic git state for dev/Playwright. A small DAG with one merge so the

@@ -825,7 +825,6 @@ export const ConductorComposer = forwardRef<
                 <MenuItem
                   key={m.value}
                   on={modelFamily(modelId) === m.value}
-                  hint={m.hint}
                   onClick={() => chooseModel(m.value, m.backend)}
                 >
                   {m.label}

@@ -15,18 +15,17 @@ export interface ModelOption {
   /** Wire value — the alias/id sent verbatim to the backend at spawn. */
   value: string;
   backend: BackendKind;
-  /** Optional trailing hint chip in the menu (e.g. context window, preview date). */
-  hint?: string;
 }
 
 // The real Claude models. Wire value = CLI alias (sent verbatim to set_model and used
-// at spawn); the hint surfaces Opus's 1M context window. Default = Opus 4.8.
+// at spawn). Default = Opus 4.8. NO trailing hints: a context-window chip on Opus alone
+// read as a per-model fact the other rows silently contradicted, and the real window is
+// only known once a turn reports it (see the ContextMeter, which shows it for real).
 export const CLAUDE_MODELS: ModelOption[] = [
-  // Fable 5: time-limited preview model (special rate limit, until 2026-07-12). Same
-  // effort tier as Opus. Alias "fable" is sent verbatim. Pinned at the top while the
-  // preview window is open.
-  { label: "Fable 5", value: "fable", backend: "claude", hint: "Jul 12" },
-  { label: "Opus 4.8", value: "opus", backend: "claude", hint: "1M" },
+  // Fable 5: preview model with its own rate-limit window (surfaced by the usage ring as
+  // a model-scoped cap). Same effort tier as Opus. Alias "fable" is sent verbatim.
+  { label: "Fable 5", value: "fable", backend: "claude" },
+  { label: "Opus 4.8", value: "opus", backend: "claude" },
   { label: "Sonnet 4.6", value: "sonnet", backend: "claude" },
   { label: "Haiku 4.5", value: "haiku", backend: "claude" },
 ];

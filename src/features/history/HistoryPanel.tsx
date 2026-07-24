@@ -13,6 +13,7 @@ import { Ico } from "../../ui/kit";
 import { repoName, reactivateDiskConversation, useConversationsStore } from "../../store/conversationsStore";
 import { BackendMark } from "../conversation/ConvMark";
 import { SubAgentTranscript } from "../conversation/SubAgentTranscript";
+import { userMessagePreviewText } from "../conversation/userText";
 import { useHistoryUi } from "./historyUiStore";
 import {
   applySearch,
@@ -311,7 +312,9 @@ export function HistoryPanel() {
                     <span className={`${styles.backendBadge} ${styles.previewBadge}`}>
                       <BackendMark kind={selected.backend} />
                     </span>
-                    {(selected.title ?? "").trim() || selected.excerpt || "Conversation"}
+                    {(selected.title ?? "").trim() ||
+                      (selected.excerpt ? userMessagePreviewText(selected.excerpt) : "") ||
+                      "Conversation"}
                   </div>
                   <div className={styles.previewMeta}>
                     <Ico name="folder" className="sm" />
@@ -380,10 +383,15 @@ function Row({
   present: boolean;
   onClick: () => void;
 }) {
-  const label = (conv.title ?? "").trim() || conv.excerpt || "Conversation";
+  // Run the excerpt through the same cleanup the thread's own bubbles use: a first prompt
+  // that was a slash command is stored WRAPPED (`<command-message>…<command-name>/foo…`),
+  // and without this the raw tags become the row's label — and, for a conversation with no
+  // ai-title, the name it is restored under.
+  const excerpt = conv.excerpt ? userMessagePreviewText(conv.excerpt) : conv.excerpt;
+  const label = (conv.title ?? "").trim() || excerpt || "Conversation";
   // In a title row, the excerpt is a useful second line; a search snippet (if any)
   // is more relevant than the generic excerpt.
-  const second = (snippet && snippet.trim()) || conv.excerpt;
+  const second = (snippet && snippet.trim()) || excerpt;
   return (
     <button
       type="button"

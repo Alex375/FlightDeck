@@ -12,7 +12,7 @@
 
 import { useMemo, type ReactNode } from "react";
 import type { ConversationItem, JsonValue, NormalizedBlock } from "../../ipc/client";
-import { Avatar, ClaudeMark, UserMark } from "../../ui/kit";
+import { Avatar, ClaudeMark, Ico, UserMark } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import {
@@ -133,9 +133,42 @@ export function toRows(items: ConversationItem[]): Row[] {
 }
 
 /**
- * Render a finished transcript (sub-agent / history preview). Pure: depends only on `items`.
+ * The instruction Claude wrote to open a sub-agent's run — rendered with its OWN
+ * attribution, never the human avatar.
+ *
+ * It occupies the "first user turn" slot of a sub-agent transcript because that is how the
+ * wire models it, but the human never wrote it: showing it under their avatar claimed they
+ * had asked for something they never asked for. Same bubble geometry as a user turn (so the
+ * transcript still reads as a conversation), different mark and a label that says who spoke.
  */
-export function SubAgentTranscript({ items }: { items: ConversationItem[] }) {
+export function AgentInstruction({ text }: { text: string }) {
+  return (
+    <div className="cv-msg cv-user cv-agentprompt">
+      <Avatar ai>
+        <Ico name="spark" className="sm" />
+      </Avatar>
+      <div className="cv-bubble">
+        <div className="cv-agentprompt-label">Instruction to the sub-agent</div>
+        <UserText text={text} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Render a finished transcript (sub-agent / history preview). Pure: depends only on `items`.
+ *
+ * `agentPrompt`: the opening turn is the instruction Claude gave the sub-agent, not a human
+ * message — render it as such (see [`AgentInstruction`]). Off for the history preview, whose
+ * first turn IS the human's prompt.
+ */
+export function SubAgentTranscript({
+  items,
+  agentPrompt,
+}: {
+  items: ConversationItem[];
+  agentPrompt?: boolean;
+}) {
   const results = useMemo(() => {
     const map = new Map<string, JoinedResult>();
     for (const it of items) {
@@ -146,6 +179,10 @@ export function SubAgentTranscript({ items }: { items: ConversationItem[] }) {
     return map;
   }, [items]);
   const rows = useMemo(() => toRows(items), [items]);
+
+  // The first user-shaped row of a SUB-AGENT transcript is the instruction Claude wrote to
+  // launch it; everything after is the sub-agent's own run.
+  const promptKey = agentPrompt ? rows.find((r) => r.kind === "user")?.key : undefined;
 
   return (
     <div className="cv-subtranscript">
@@ -158,6 +195,7 @@ export function SubAgentTranscript({ items }: { items: ConversationItem[] }) {
         // the clean card, not a raw user bubble — so history matches the conversation.
         const special = parseSpecialMessage(r.text);
         if (special) return <SpecialMessageCard key={r.key} data={special} />;
+        if (r.key === promptKey) return <AgentInstruction key={r.key} text={r.text} />;
         return (
           <div className="cv-msg cv-user" key={r.key}>
             <Avatar user>

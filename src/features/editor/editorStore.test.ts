@@ -4,6 +4,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAppErrors } from "../../store/appErrors";
+import { resetMockDisk, touchMockFile } from "../../ipc/mock/mockBindings";
 import { useEditorStore, type FileBuffer } from "./editorStore";
 
 const CONV = "conv-1";
@@ -31,6 +32,9 @@ function patch(path: string, fields: Partial<FileBuffer>) {
 
 beforeEach(() => {
   useEditorStore.setState({ byConv: {} });
+  // Simulated disk writes are module-global in the mock — reset them so one test's
+  // "the agent rewrote this" doesn't leak into the next one's baseline.
+  resetMockDisk();
 });
 
 describe("buffer lifecycle", () => {
@@ -135,20 +139,20 @@ describe("conflict policy on external change", () => {
   });
 });
 
-describe("resyncOpenBuffers (catch-up when the watch re-points)", () => {
+describe("resyncOpenBuffers (catch-up when the watch re-points, and on the poll tick)", () => {
   it("catches up a CLEAN open buffer that changed while unwatched", async () => {
     const s = useEditorStore.getState();
     s.ensureConv(CONV, ROOT);
     await s.openFile(CONV, FILE);
-    // Simulate a disk change we never got an event for (watch was on another cwd):
-    // a stale clean baseline differing from what readFile now returns.
-    patch(FILE, { content: "OLD", saved: "OLD", dirty: false });
+    const opened = buffer().content;
+    // A write we never got an event for (the watch was on another cwd).
+    touchMockFile(FILE);
 
-    // No path list — the watch just re-pointed here and we re-read everything open.
+    // No path list — the watch just re-pointed here and we re-check everything open.
     await s.resyncOpenBuffers(CONV);
 
     const b = buffer();
-    expect(b.content).not.toBe("OLD"); // resynced from disk
+    expect(b.content).not.toBe(opened); // resynced from disk
     expect(b.content).toBe(b.saved);
     expect(b.dirty).toBe(false);
   });
@@ -158,6 +162,7 @@ describe("resyncOpenBuffers (catch-up when the watch re-points)", () => {
     s.ensureConv(CONV, ROOT);
     await s.openFile(CONV, FILE);
     patch(FILE, { content: "LOCAL", saved: "OLD", dirty: true });
+    touchMockFile(FILE);
 
     await s.resyncOpenBuffers(CONV);
 
@@ -167,16 +172,79 @@ describe("resyncOpenBuffers (catch-up when the watch re-points)", () => {
     expect(b.diskChanged).toBe(true);
   });
 
-  it("SKIPS image/PDF tabs on resync (hot switch path — no full-byte re-read)", async () => {
+  // The regression this whole mechanism exists for: an agent rewrites a PDF (or an
+  // image) you have open while you're on ANOTHER conversation. No fs event ever
+  // reaches this tab, and resync used to skip binaries outright to save the re-read
+  // — so the viewer kept showing the old document as though it were current.
+  it("REFRESHES an image tab rewritten while this conversation was unwatched", async () => {
     const s = useEditorStore.getState();
     s.ensureConv(CONV, ROOT);
     await s.openFile(CONV, "/repo/pic.png");
-    // Sentinel: if resync re-read the image it would be replaced by the mock's PNG.
-    patch("/repo/pic.png", { imageDataUrl: "data:SENTINEL" });
+    patch("/repo/pic.png", { imageDataUrl: "data:STALE" });
+    touchMockFile("/repo/pic.png");
 
     await s.resyncOpenBuffers(CONV);
 
-    expect(buffer("/repo/pic.png").imageDataUrl).toBe("data:SENTINEL"); // untouched → skipped
+    expect(buffer("/repo/pic.png").imageDataUrl).not.toBe("data:STALE");
+  });
+
+  it("REFRESHES a PDF tab rewritten while this conversation was unwatched", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/doc.pdf");
+    patch("/repo/doc.pdf", { pdfBase64: "STALE" });
+    touchMockFile("/repo/doc.pdf");
+
+    await s.resyncOpenBuffers(CONV);
+
+    expect(buffer("/repo/doc.pdf").pdfBase64).not.toBe("STALE");
+  });
+
+  // The other half of the deal: covering binaries must NOT mean re-reading every
+  // open tab's bytes on every conversation switch and every poll tick. An untouched
+  // file is settled by its stat alone.
+  it("does NOT re-read a tab whose disk stamp is unchanged", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/doc.pdf");
+    await s.openFile(CONV, FILE);
+    // Sentinels that only a real re-read would overwrite. Nothing was touched on
+    // disk, so the stamps still match and both must survive.
+    patch("/repo/doc.pdf", { pdfBase64: "UNTOUCHED" });
+    patch(FILE, { content: "UNTOUCHED", saved: "UNTOUCHED" });
+
+    await s.resyncOpenBuffers(CONV);
+
+    expect(buffer("/repo/doc.pdf").pdfBase64).toBe("UNTOUCHED");
+    expect(buffer(FILE).content).toBe("UNTOUCHED");
+  });
+
+  it("re-reads rather than trusting a buffer with no stamp yet", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/doc.pdf");
+    // An unknown stamp must read as "unknown", never as "unchanged" — otherwise a
+    // buffer that failed to stamp (a failed read) would be frozen forever.
+    patch("/repo/doc.pdf", { pdfBase64: "STALE", diskStamp: null });
+
+    await s.resyncOpenBuffers(CONV);
+
+    expect(buffer("/repo/doc.pdf").pdfBase64).not.toBe("STALE");
+  });
+
+  it("falls back to a full re-read when the stat call itself fails", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/doc.pdf");
+    patch("/repo/doc.pdf", { pdfBase64: "STALE" });
+    // Make ONLY the stat fail (the mock fails on a `__fail__` path anywhere in the
+    // batch), while the tab itself stays perfectly readable. Skipping the refresh
+    // here would leave the PDF stale with nothing to show for it.
+    await s.openFile(CONV, "/repo/__fail__/other.txt");
+
+    await s.resyncOpenBuffers(CONV);
+
+    expect(buffer("/repo/doc.pdf").pdfBase64).not.toBe("STALE");
   });
 });
 

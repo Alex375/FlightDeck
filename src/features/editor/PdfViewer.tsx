@@ -73,15 +73,29 @@ export default function PdfViewer({ base64 }: { base64: string }) {
    *  callback can accumulate across its incremental deliveries without a stale closure. */
   const [visible, setVisible] = useState<Set<number>>(() => new Set());
   const visibleRef = useRef<Set<number>>(new Set());
+  /**
+   * Bumped each time a NEW document takes over the canvases. The render effect
+   * depends on it because nothing else would tell it to repaint: a file rewritten
+   * in place typically comes back with the SAME page count at the SAME size, so
+   * `numPages`/`pageWidth`/`visible` are all unchanged and the canvases would go
+   * on showing the previous document indefinitely.
+   */
+  const [docRev, setDocRev] = useState(0);
 
-  // ---- Load the document + collect page sizes (once per file) ----------------
+  // ---- Load the document + collect page sizes (per file, and per rewrite) ----
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    setLoading(true);
-    setPageDims([]);
-    canvasRefs.current = [];
-    pdfRef.current = null;
+    // Only the FIRST document shows the loading placeholder. When these bytes are a
+    // refresh of a file already on screen (the agent rewrote it), tearing the pages
+    // down would blank the panel and throw the reader back to the top of the
+    // document — several times over while a build loop regenerates it. Instead the
+    // current pages stay put and are swapped for the new ones once they're parsed.
+    if (!pdfRef.current) {
+      setLoading(true);
+      setPageDims([]);
+      canvasRefs.current = [];
+    }
 
     // Destroying the loading task (in cleanup) tears down the worker transport AND the
     // resolved document — so teardown on remount / a new file needs nothing more.
@@ -98,10 +112,16 @@ export default function PdfViewer({ base64 }: { base64: string }) {
         }
         if (cancelled) return;
         pdfRef.current = pdf;
+        // Drop refs to pages the new document doesn't have (a shorter revision);
+        // the surviving ones keep their painted bitmap until the repaint below.
+        canvasRefs.current.length = dims.length;
         setPageDims(dims);
         setLoading(false);
+        setDocRev((r) => r + 1);
       } catch (e) {
         if (!cancelled) {
+          // Includes a file caught mid-write (a half-flushed PDF is genuinely
+          // unreadable). Reported rather than swallowed; the next refresh recovers.
           setError(e instanceof Error ? e.message : String(e));
           setLoading(false);
         }
@@ -256,7 +276,7 @@ export default function PdfViewer({ base64 }: { base64: string }) {
         }
       }
     };
-  }, [numPages, pageWidth, fitWidth, visible]);
+  }, [numPages, pageWidth, fitWidth, visible, docRev]);
 
   // ---- Ctrl/Cmd+wheel (and trackpad pinch) zoom; plain wheel scrolls ----------
   useEffect(() => {

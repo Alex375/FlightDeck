@@ -248,10 +248,31 @@ pub struct UserMsg {
     pub uuid: Option<String>,
     pub parent_tool_use_id: Option<String>,
     /// Injected/meta user lines (command output, system reminders, the queued-message
-    /// "while you were working" wrapper) carry `isMeta:true` and are NOT real turns —
-    /// the assembler drops them exactly as the transcript restore does.
+    /// "while you were working" wrapper) carry `isMeta:true` and are NOT real turns.
+    /// ⚠️ DISK-ONLY: the live stdout wire never carries this name — see [`Self::is_synthetic`],
+    /// which is the same flag under the name the CLI actually emits. Kept because the
+    /// transcript shape is parsed with these same types.
     #[serde(rename = "isMeta")]
     pub is_meta: Option<bool>,
+    /// The LIVE-wire counterpart of [`Self::is_meta`]: every `user` line the CLI injects
+    /// ITSELF (skill bodies, the `[Image: original WxH…]` downscale note, stop-hook
+    /// feedback, continuation nudges, plugin-injected prompts, the `/compact` summary)
+    /// carries `isSynthetic:true` on stdout, and NEVER `isMeta`.
+    ///
+    /// VERIFIED against claude 2.1.217, both by live probe and by reading the binary: all
+    /// three `case"user"` emitters yield
+    /// `{type:"user", …, isSynthetic: o.isMeta || o.isVisibleInTranscriptOnly}`, the public
+    /// zod schema for the `user` type declares `isSynthetic` and no `isMeta`, and the
+    /// inverse converter maps `isMeta: t.isSynthetic`. It is a deliberate rename, not an
+    /// omission — which is why the `is_meta` guard was dead code on the live path and every
+    /// injected line leaked as a fake user bubble (LIVE-ONLY: a reload reads the on-disk
+    /// `isMeta:true` twin and drops it, so the ghost vanished when you came back).
+    ///
+    /// ⚠️ It is a SUPERSET of the disk flag (`isMeta || isVisibleInTranscriptOnly`), so the
+    /// reload guard in `history.rs::push_user` must honour BOTH source flags or the two
+    /// surfaces drift again — see that function.
+    #[serde(rename = "isSynthetic")]
+    pub is_synthetic: Option<bool>,
     /// `true` on a user turn RE-EMITTED by `--replay-user-messages` (a live echo). The
     /// UI splices these into the right spot (they can arrive out-of-order vs the
     /// streaming reply); a transcript restore, by contrast, is already chronological and
@@ -263,8 +284,7 @@ pub struct UserMsg {
     /// spawning tool_use's id. ⚠️ On the LIVE stdout wire the CLI OMITS this (AND `isMeta`)
     /// on that line — proven by `live_capture_skill_body_replay` (both came back `None`
     /// live, `isMeta:true` + `sourceToolUseID` only on disk). So it is NOT a live-safe
-    /// distinguisher; the live skill-body drop keys on the boilerplate prefix while a
-    /// `Skill` tool_use is armed (see `Assembler::skill_invocation_pending`). Kept for the
+    /// distinguisher; live, that body is recognised by [`Self::is_synthetic`]. Kept for the
     /// disk shape and future wire changes.
     #[serde(rename = "sourceToolUseID")]
     pub source_tool_use_id: Option<String>,

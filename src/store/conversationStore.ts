@@ -820,10 +820,15 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
 }
 
 /** A `notice` that is a NEUTRAL in-band marker (folds into a clean-output round without
- *  cutting the work): only a confirmed control change. Every other notice — errors — is a
- *  hard boundary that ends the round. */
+ *  cutting the work): a confirmed control change, or a local command's echoed output
+ *  (`command_output` — "Compacted", "Set model to opus"). Every other notice — errors, and
+ *  `interrupted`, which really does end the work — is a hard boundary that ends the round.
+ *
+ *  Keeping `command_output` soft matters: these lines used to arrive as fake USER bubbles,
+ *  which split one response into two folded rounds. Turning them into hard notices would
+ *  have preserved exactly that split under a new name. */
 function isSoftNotice(subtype: string | undefined): boolean {
-  return subtype === "control_change";
+  return subtype === "control_change" || subtype === "command_output";
 }
 
 /**

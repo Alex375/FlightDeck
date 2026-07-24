@@ -34,6 +34,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 // always a real Codex wire id. models.ts only imports `BackendKind` as a TYPE from
 // here (erased at runtime), so this value edge is acyclic.
 import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
+import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
@@ -60,6 +61,18 @@ import {
   type PlanConvSnapshot,
 } from "./planAnnotations";
 import { clearSidebarFold, clearAllSidebarFold } from "./sidebarFold";
+import {
+  clearManualOrderConversation,
+  clearManualOrderRepo,
+  clearAllManualOrder,
+  useOrderSlot,
+  slotFor,
+  manualIndex,
+  manualConvIndex,
+  manualComparator,
+  type OrderBlob,
+} from "./manualOrder";
+import { useDisplay } from "./display";
 import { disposeTerminal, disposeAllTerminals } from "../features/terminal/cleanup";
 import { useGitViewStore } from "../features/git/gitViewStore";
 import { clearMentionCache } from "../features/conversation/mentionCache";
@@ -424,6 +437,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     if (!repo) return;
     // Forget this repo's sidebar collapse state (the group is about to disappear).
     clearSidebarFold(repo.id);
+    // Forget any manual drag order for this repo (and its conversations, in every slot).
+    clearManualOrderRepo(repo.id);
     // Cascade-delete every conversation under this repo. Mirror removeConversation's
     // full per-row teardown: the Rust delete_repo only cascades DB rows, so we must
     // stop each live `claude` process here (no orphan) and drop every per-conversation
@@ -518,6 +533,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     clearComposerAttachments(id);
     clearCodexControls(id);
     clearWorkFold(id);
+    clearManualOrderConversation(id);
     clearPlanAnnotations(id);
     autoTitlePending.delete(id);
     titleContext.delete(id);
@@ -930,7 +946,10 @@ export function reactivateDiskConversation(d: DiskConversation): string {
   const kind: BackendKind = d.backend === "codex" ? "codex" : "claude";
   useConversationsStore.getState().addConversation({
     id,
-    name: (d.title ?? "").trim() || d.excerpt.trim() || DEFAULT_CONV_NAME,
+    // An untitled conversation falls back to its first prompt — cleaned up first, or a
+    // conversation opened on a slash command would be NAMED with the CLI's raw
+    // `<command-message>…<command-name>` wrapper.
+    name: (d.title ?? "").trim() || userMessagePreviewText(d.excerpt).trim() || DEFAULT_CONV_NAME,
     repoId: repo.id,
     cwd,
     // The transcript's last-message time is the best available creation/activity proxy
@@ -1375,9 +1394,10 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
  *    text is put back in the composer draft so it can be edited and re-sent;
  *  - a CLAUDE message → its whole response is kept and everything AFTER it is removed.
  *
- * Order matters: the live `claude` process is stopped FIRST (it holds the full history
- * in memory and would rewrite the transcript on its next turn, undoing the cut), THEN
- * the transcript is truncated, THEN the timeline is rebuilt from the shortened file. The
+ * Order matters: the target is VALIDATED first (read-only — killing a session for a rewind
+ * that cannot resolve is not recoverable), then the live `claude` process is stopped (it
+ * holds the full history in memory and would rewrite the transcript on its next turn,
+ * undoing the cut), THEN the transcript is truncated, THEN the timeline is rebuilt. The
  * next message re-spawns `--resume` on the truncated transcript (VERIFIED: resume honours
  * the truncation). Returns the outcome, or `null` if the conversation has no session yet.
  */
@@ -1420,11 +1440,26 @@ export async function rewindConversation(
     if (targetIsUser && targetText) useComposerDrafts.getState().setDraft(convId, targetText);
     return { removed_prompt: targetIsUser ? targetText : null, removed_lines: 1 };
   }
-  // 1. Kill the live process AND WAIT for it to be fully reaped (stopConversationSession →
+  // 1. Check the target can actually be located — READ-ONLY, before anything destructive.
+  //    The kill below can't be undone, and a target the locator can't find (a turn whose
+  //    text no longer matches, a line the transcript never persisted) would otherwise take
+  //    the live session down with it and still leave the message on screen.
+  const check = await commands.checkRewindTarget(
+    conv.sessionId,
+    targetId,
+    targetIsUser,
+    targetText,
+    occurrence,
+  );
+  if (check.status !== "ok") {
+    useAppErrors.getState().pushError("Couldn't rewind the conversation.", check.error);
+    throw new Error(check.error);
+  }
+  // 2. Kill the live process AND WAIT for it to be fully reaped (stopConversationSession →
   //    stop_session → shutdown_and_wait) so nothing re-writes the transcript from its
   //    in-memory state while / after we truncate.
   await stopConversationSession(convId);
-  // 2. Truncate the on-disk transcript at the target. `targetText` + `occurrence` are the
+  // 3. Truncate the on-disk transcript at the target. `targetText` + `occurrence` are the
   //    fallback locator for a LIVE turn (its synthetic front id isn't on disk — resolve_cut),
   //    occurrence disambiguating identical repeated prompts.
   const res = await commands.rewindConversation(conv.sessionId, targetId, targetIsUser, targetText, occurrence);
@@ -1432,9 +1467,9 @@ export async function rewindConversation(
     useAppErrors.getState().pushError("Couldn't rewind the conversation.", res.error);
     throw new Error(res.error);
   }
-  // 3. Rebuild the timeline from the (now shorter) transcript.
+  // 4. Rebuild the timeline from the (now shorter) transcript.
   await reloadConversationHistory(convId);
-  // 4. A user rewind hands the removed prompt back to the composer so it can be edited
+  // 5. A user rewind hands the removed prompt back to the composer so it can be edited
   //    and re-sent ("go back to this prompt, control returns to Claude").
   if (res.data.removed_prompt) {
     useComposerDrafts.getState().setDraft(convId, res.data.removed_prompt);
@@ -1519,6 +1554,7 @@ export async function wipeAllData(): Promise<void> {
   clearAllWorkFold();
   clearAllPlanAnnotations();
   clearAllSidebarFold();
+  clearAllManualOrder();
   autoTitlePending.clear();
   titleContext.clear();
   titleGenCount.clear();
@@ -1602,11 +1638,49 @@ export function groupConversationsByRepo(
   );
 }
 
-/** Reactive repo-grouped conversations (recency-ordered). */
+/**
+ * Group conversations by repo honouring the sidebar's MANUAL drag order per level. Each
+ * level (conversations within a repo; the repos themselves) is either automatic
+ * (recency, the historical behaviour) or manual, chosen independently via the two
+ * `auto*` flags. In manual mode the order comes from `order`; items missing from it
+ * (brand-new, or never dragged) sort to the top newest-first (see `manualComparator`).
+ * Pure + testable — the sidebar hook and the ⌘⌥↑/↓ nav both call it.
+ */
+export function groupConversationsByRepoOrdered(
+  repos: Repo[],
+  conversations: Conversation[],
+  order: OrderBlob,
+  autoConvs: boolean,
+  autoRepos: boolean,
+): RepoGroup[] {
+  const convIndex = autoConvs ? null : manualConvIndex(order.convOrder);
+  const sortConvs = convIndex
+    ? manualComparator<Conversation>(convIndex, (c) => c.id, (c) => c.createdAt)
+    : (a: Conversation, b: Conversation) => b.lastActivityAt - a.lastActivityAt;
+  // A repo's recency = the max activity across its conversations (order-independent, so
+  // it's correct even when the conversations are in a manual, non-recency order); empty
+  // repos fall back to when they were added.
+  const repoRecency = (g: RepoGroup) =>
+    g.conversations.length ? Math.max(...g.conversations.map((c) => c.lastActivityAt)) : g.repo.addedAt;
+  const sortRepos = autoRepos
+    ? (a: RepoGroup, b: RepoGroup) => repoRecency(b) - repoRecency(a)
+    : manualComparator<RepoGroup>(manualIndex(order.repoOrder), (g) => g.repo.id, (g) => g.repo.addedAt);
+  return groupByRepo(repos, conversations, sortConvs, sortRepos);
+}
+
+/** Reactive repo-grouped conversations, honouring the sidebar's manual drag order (or
+ *  recency when the auto-order toggles are on). */
 export function useConversationsByRepo(): RepoGroup[] {
   const repos = useRepos();
   const conversations = useConversations();
-  return useMemo(() => groupConversationsByRepo(repos, conversations), [repos, conversations]);
+  const autoConvs = useDisplay((s) => s.autoOrderSidebarConvs);
+  const autoRepos = useDisplay((s) => s.autoOrderSidebarRepos);
+  const shared = useDisplay((s) => s.sharedManualOrder);
+  const order = useOrderSlot(slotFor("sidebar", shared));
+  return useMemo(
+    () => groupConversationsByRepoOrdered(repos, conversations, order, autoConvs, autoRepos),
+    [repos, conversations, order, autoConvs, autoRepos],
+  );
 }
 
 // NOTE: the conversation status model now lives in `src/agent/status.ts`

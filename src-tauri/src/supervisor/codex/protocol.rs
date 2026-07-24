@@ -380,10 +380,23 @@ pub enum ThreadItem {
     },
     /// A context-compaction boundary → a compact marker card.
     ContextCompaction { id: String },
-    /// The user's own message / a hook-injected prompt echoed as items. NOT model tool work
-    /// (the front already renders the user turn optimistically) → intentionally no-op, but
-    /// modelled explicitly so they never trip the generic residue card in `on_item`.
-    UserMessage,
+    /// A user message echoed back as an item. USUALLY our own (the front already rendered
+    /// it optimistically) — but NOT always: a turn typed on the phone/web over the bridge
+    /// arrives here too, and dropping the whole variant made those invisible until a reload
+    /// made them appear out of nowhere. `client_id` is the echo of the
+    /// `clientUserMessageId` we stamped on `turn/start`: ours if we know it, remote if not.
+    #[serde(rename_all = "camelCase")]
+    UserMessage {
+        #[serde(default)]
+        id: String,
+        /// `UserInput[]` — text and/or attachments. Kept raw; the actor reads the text parts.
+        #[serde(default)]
+        content: Vec<Value>,
+        #[serde(default)]
+        client_id: Option<String>,
+    },
+    /// A hook-injected prompt: never a human turn → intentionally no-op, but modelled
+    /// explicitly so it never trips the generic residue card in `on_item`.
     HookPrompt,
     /// Any FUTURE item type this build does not model. `on_item` still surfaces it as a
     /// generic named card (from the raw `type`) — never a silent drop.
@@ -613,6 +626,11 @@ pub struct TurnStartParams {
     /// per-turn override on `turn/start` (verified against `generate-ts` 0.144.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// OUR id for the message this turn carries. Echoed back as `clientId` on the
+    /// `userMessage` item, which is the only way to tell a turn WE sent from one that came
+    /// in over the bridge (phone/web) — the Codex analogue of Claude's `sent_user_uuids`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_user_message_id: Option<String>,
 }
 
 impl TurnStartParams {
@@ -629,6 +647,7 @@ impl TurnStartParams {
             summary: None,
             personality: None,
             service_tier: None,
+            client_user_message_id: None,
         }
     }
 }
@@ -885,17 +904,30 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(d.item, ThreadItem::DynamicToolCall { tool, namespace, .. } if tool == "lint" && namespace.as_deref() == Some("plugins")));
-        // imageView carries the file path; the user echo / hook prompt decode to no-op variants.
+        // imageView carries the file path; the hook prompt decodes to a no-op variant.
         let iv: ItemEnvelope = serde_json::from_value(
             json!({"item":{"type":"imageView","id":"iv1","path":"/tmp/a.png"}}),
         )
         .unwrap();
         assert!(matches!(iv.item, ThreadItem::ImageView { path, .. } if path == "/tmp/a.png"));
+        // A user echo keeps its id, content and `clientId` — the actor needs all three to
+        // tell OUR turn (stamped `clientUserMessageId`) from one typed over the bridge.
         let um: ItemEnvelope = serde_json::from_value(
-            json!({"item":{"type":"userMessage","id":"u1","clientId":null,"content":[]}}),
+            json!({"item":{"type":"userMessage","id":"u1","clientId":"c-1",
+                           "content":[{"type":"text","text":"hi"}]}}),
         )
         .unwrap();
-        assert!(matches!(um.item, ThreadItem::UserMessage));
+        assert!(matches!(
+            um.item,
+            ThreadItem::UserMessage { ref id, ref client_id, ref content }
+                if id == "u1" && client_id.as_deref() == Some("c-1") && content.len() == 1
+        ));
+        // `clientId` absent (a bridge turn) still decodes — it is what marks it as NOT ours.
+        let remote: ItemEnvelope = serde_json::from_value(
+            json!({"item":{"type":"userMessage","id":"u2","content":[]}}),
+        )
+        .unwrap();
+        assert!(matches!(remote.item, ThreadItem::UserMessage { ref client_id, .. } if client_id.is_none()));
         // The assistant text item round-trips with its text (extra wire fields ignored).
         let p2: ItemEnvelope =
             serde_json::from_value(json!({"item":{"type":"agentMessage","id":"m1","text":"hi","phase":"final_answer"}})).unwrap();

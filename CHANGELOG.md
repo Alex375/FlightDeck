@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.3.0
+
+- New: arrange your conversations and repositories by hand — drag them anywhere (the whole row or card, no handle) in the sidebar or on the Flight Deck. A new "Reordering" settings tab lets you freeze the automatic order per view; new items still land on top and your order is kept across restarts.
+- Fixed: file paths stay clickable everywhere — the "clickable file paths" setting now only controls the filename on Read/Write/Edit rows, not paths in text, file links or snippet headers.
+- Fixed: any open tab — text, image or PDF — now stays in sync when an agent rewrites the file on disk.
+- Fixed: content the CLI injects into a conversation no longer appears as a message you sent.
+
 ## v1.2.0
 
 - New: the active goal (`/goal`) is now displayed — on Flight Deck cards and at the top of the conversation — so you always see what an agent is working toward.

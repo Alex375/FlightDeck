@@ -25,6 +25,7 @@ export type {
   ExtScope,
   ExtensionsSnapshot,
   FileContent,
+  FileStat,
   ForkOutcome,
   FsChangeEvent,
   FsEntry,

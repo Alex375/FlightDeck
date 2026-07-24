@@ -16,7 +16,7 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { commands } from "../../ipc/client";
-import type { FsEntry } from "../../ipc/client";
+import type { FileStat, FsEntry } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
 import { baseName, dirName, imageMimeForPath, isImagePath, isPdfPath, languageForPath } from "./language";
 import { isWithin, joinPath, uniqueDest, validateName } from "./fileOps";
@@ -25,6 +25,41 @@ import { isWithin, joinPath, uniqueDest, validateName } from "./fileOps";
 const AUTOSAVE_MS = 1000;
 
 export type SplitOrientation = "row" | "column"; // side-by-side | stacked
+
+/** What a file looked like on disk when a buffer's bytes were read: the cheap
+ *  identity (size + mtime) we can re-check with a `stat`, without re-reading the
+ *  content. See `diskStampChanged`. */
+export interface DiskStamp {
+  size: number;
+  /** Ms since the epoch, or null when the platform reported none. */
+  mtimeMs: number | null;
+}
+
+/**
+ * Whether a fresh `stat` says a buffer's bytes are out of date and must be re-read.
+ *
+ * Biased towards re-reading: an unknown stamp, or a path that no longer stats,
+ * both answer "changed". A stale tab shown as current is a silent lie, while a
+ * needless re-read costs one file read — and for a vanished/unreadable file the
+ * read is exactly what surfaces the real reason to the user.
+ *
+ * Size is the primary signal; mtime catches a same-size rewrite. When either side
+ * has no mtime (filesystem/platform doesn't report one) size stands alone — the
+ * best available answer without hashing the content.
+ */
+export function diskStampChanged(stamp: DiskStamp | null, stat: FileStat): boolean {
+  if (!stamp || !stat.exists) return true;
+  if (stat.size !== stamp.size) return true;
+  if (stat.mtime_ms === null || stamp.mtimeMs === null) return false;
+  // `!==`, not `>`: a restore or a `git checkout` can move mtime BACKWARDS, and
+  // that is just as much a change as a newer one.
+  return stat.mtime_ms !== stamp.mtimeMs;
+}
+
+/** The disk stamp carried by a completed read (`readFile` / `readImage`). */
+function stampOf(read: { size: number; mtime_ms: number | null }): DiskStamp {
+  return { size: read.size, mtimeMs: read.mtime_ms };
+}
 
 export interface FileBuffer {
   path: string;
@@ -59,6 +94,12 @@ export interface FileBuffer {
    *  view (zoom 1, centered). */
   imageZoom?: number;
   imageOffset?: { x: number; y: number };
+  /** The last on-disk state this buffer has SEEN (not necessarily what it shows —
+   *  a dirty buffer keeps the user's text while having seen a newer disk version).
+   *  The staleness check stats the path and compares against this, so an untouched
+   *  tab costs a syscall instead of a full re-read. Null until loaded / when a read
+   *  failed — which reads as "unknown, re-read it" (see `diskStampChanged`). */
+  diskStamp: DiskStamp | null;
   /** An external write arrived while the buffer was dirty (banner shown). */
   diskChanged: boolean;
   /** The pending external content for the "reload" action (null otherwise). */
@@ -270,13 +311,14 @@ interface EditorState {
 
   // ---- Live filesystem changes ----
   onExternalChange: (convId: string, paths: string[]) => Promise<void>;
-  /** Catch-up re-read of the open TEXT tabs for a conversation, applying the same
-   *  conflict policy as a live change. Called when the single OS watch (re)points at
-   *  this conversation's cwd — on a conversation switch, editor reopen, or worktree
-   *  cwd move. The watch only reports changes from the moment it starts, so anything
-   *  the agent wrote while this cwd was NOT the watched one was missed; without this
-   *  resync an open preview stays stale until reopened. Image/PDF tabs and tree dirs
-   *  are intentionally NOT resynced here (hot path — see the implementation note). */
+  /** Bring every open tab of a conversation back in line with the disk — ALL kinds
+   *  (text, image, PDF) — applying the same conflict policy as a live change. One
+   *  batched `stat` decides which tabs actually need re-reading, so this stays cheap
+   *  enough to run both when the OS watch (re)points at this cwd (conversation
+   *  switch, editor reopen, worktree move) and on a periodic tick. It is what covers
+   *  every change no watch reports: another conversation's tabs, a closed panel, an
+   *  ignored dir (build/, dist/…), a file outside the watched cwd. Tree dirs are
+   *  deliberately NOT resynced here (see the implementation note). */
   resyncOpenBuffers: (convId: string) => Promise<void>;
   /** Apply the pending on-disk content over the local buffer ("reload"). */
   reloadFromDisk: (convId: string, path: string) => void;
@@ -467,6 +509,7 @@ function fileBufferFrom(path: string): FileBuffer {
     imageSize: null,
     isPdf: isPdfPath(path),
     pdfBase64: null,
+    diskStamp: null,
     diskChanged: false,
     diskContent: null,
     preview: false,
@@ -544,7 +587,9 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     if (buf.isImage) {
       const res = await safeCmd(() => commands.readImage(path));
       if (res.status !== "ok") {
-        patchBuffer(convId, path, (b) => ({ ...b, error: "Image unavailable on disk." }));
+        // Clear the stamp: the buffer no longer matches any known disk state, so the
+        // next check must re-read rather than conclude "unchanged" from a stale stamp.
+        patchBuffer(convId, path, (b) => ({ ...b, error: "Image unavailable on disk.", diskStamp: null }));
         return;
       }
       const img = res.data;
@@ -554,6 +599,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         tooLarge: img.too_large,
         imageSize: img.size,
         imageDataUrl: img.too_large ? null : imageDataUrlFor(path, img.data_base64),
+        diskStamp: stampOf(img),
       }));
       return;
     }
@@ -562,7 +608,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     if (buf.isPdf) {
       const res = await safeCmd(() => commands.readImage(path));
       if (res.status !== "ok") {
-        patchBuffer(convId, path, (b) => ({ ...b, error: "PDF unavailable on disk." }));
+        patchBuffer(convId, path, (b) => ({ ...b, error: "PDF unavailable on disk.", diskStamp: null }));
         return;
       }
       const doc = res.data;
@@ -572,31 +618,37 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         tooLarge: doc.too_large,
         imageSize: doc.size,
         pdfBase64: doc.too_large ? null : doc.data_base64,
+        diskStamp: stampOf(doc),
       }));
       return;
     }
     const res = await safeCmd(() => commands.readFile(path));
     if (res.status !== "ok") {
       // The file likely vanished — flag it but keep the tab/content.
-      patchBuffer(convId, path, (b) => ({ ...b, error: "File unavailable on disk." }));
+      patchBuffer(convId, path, (b) => ({ ...b, error: "File unavailable on disk.", diskStamp: null }));
       return;
     }
     const f = res.data;
     patchBuffer(convId, path, (b) => {
+      // Whatever branch we take below, the buffer now knows what the disk looks
+      // like — including the "no real change" one, whose whole point is that the
+      // content matches even though the stamp (an autosave's own echo, a rewrite
+      // with identical bytes) moved.
+      const stamped = { ...b, diskStamp: stampOf(f) };
       // No real change vs what we already have on disk → ignore (this also
       // absorbs the echo of our own save).
-      if (f.content === b.saved) return { ...b, diskChanged: false, diskContent: null };
+      if (f.content === b.saved) return { ...stamped, diskChanged: false, diskContent: null };
       // Unsaved local edits: never clobber — surface the on-disk version via the
       // banner. This MUST be checked before the binary/too-large branch below:
       // if the on-disk file turned binary or >MAX_FILE_BYTES, that branch would
       // otherwise overwrite the buffer with the (empty) disk content and drop the
       // user's edits with no banner and no error — a silent data loss.
-      if (b.dirty) return { ...b, diskChanged: true, diskContent: f.content };
+      if (b.dirty) return { ...stamped, diskChanged: true, diskContent: f.content };
       if (b.binary || f.binary || f.too_large) {
-        return { ...b, binary: f.binary, tooLarge: f.too_large, saved: f.content, content: f.content };
+        return { ...stamped, binary: f.binary, tooLarge: f.too_large, saved: f.content, content: f.content };
       }
       // Clean buffer: live-reload in place.
-      return { ...b, content: f.content, saved: f.content, dirty: false, error: null };
+      return { ...stamped, content: f.content, saved: f.content, dirty: false, error: null };
     });
   }
 
@@ -1006,6 +1058,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
             tooLarge: img.too_large,
             imageSize: img.size,
             imageDataUrl: img.too_large ? null : imageDataUrlFor(path, img.data_base64),
+            diskStamp: stampOf(img),
           };
         });
         return;
@@ -1027,6 +1080,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
             tooLarge: doc.too_large,
             imageSize: doc.size,
             pdfBase64: doc.too_large ? null : doc.data_base64,
+            diskStamp: stampOf(doc),
           };
         });
         return;
@@ -1046,6 +1100,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           dirty: false,
           binary: f.binary,
           tooLarge: f.too_large,
+          diskStamp: stampOf(f),
           // Markdown opens in rendered preview by default (read-first); the
           // toggle flips to source for editing. A pending line reveal forces
           // source so Monaco mounts and can jump to the line.
@@ -1166,28 +1221,53 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     resyncOpenBuffers: async (convId) => {
       const conv = get().byConv[convId];
       if (!conv) return;
-      // The single OS watch just (re)pointed at this conversation's cwd, so we may
-      // have missed on-disk changes made while it was watching a DIFFERENT cwd (we
-      // were on another conversation, or the editor was closed). Re-read the open
-      // TEXT tabs to catch up — same conflict policy as a live change (clean
-      // reloads, dirty stays + banner). The active tab (what the user is looking at)
-      // goes first.
+      // Catch up on on-disk changes this conversation never heard about, and the
+      // periodic safety net for the ones no watch can deliver. The live fs watch is
+      // SINGLE and follows the shown conversation, so it misses: another
+      // conversation's tabs, everything while the panel is closed, files under an
+      // ignored dir (build/, dist/, target/… — see fs::IGNORED_DIRS) and files
+      // outside the watched cwd. Without this pass those tabs would sit stale
+      // indefinitely, showing an old version as if it were current.
       //
-      // Deliberately narrow — this runs on the hot conversation-switch path:
-      //  - Image/PDF tabs are skipped: re-reading their full bytes (up to
-      //    fs::MAX_FILE_BYTES) on every switch is costly, and an agent rewriting a
-      //    binary you have open while you're away is rare. They refresh from a live
-      //    fs event once the watch points here, or on reopen.
-      //  - We do NOT re-list loaded tree dirs here: iterating every loaded dir on
-      //    each switch costs a readDir per dir AND turns an externally-deleted dir
-      //    into a spurious "tree may be stale" banner. The tree refreshes from live
-      //    events while this cwd is watched.
+      // ALL tab kinds are covered — text, images and PDFs alike. What keeps that
+      // affordable is the stamp check: ONE batched `stat` for every open tab, then
+      // a real read only for the ones whose size/mtime actually moved. An untouched
+      // 15 MiB PDF costs a syscall, not a base64 round-trip. (An earlier version
+      // skipped binaries outright to avoid the cost — which is exactly how a PDF
+      // rewritten while you were on another conversation stayed stale.)
+      //
+      // Then the usual conflict policy applies per tab (clean reloads in place,
+      // dirty keeps the user's text and raises the banner). The active tab — what
+      // the user is actually looking at — is refreshed first.
+      //
+      // We still do NOT re-list loaded tree dirs here: iterating every loaded dir
+      // costs a readDir per dir AND turns an externally-deleted dir into a spurious
+      // "tree may be stale" banner. The tree refreshes from live events.
       const ordered = conv.activeTab
         ? [conv.activeTab, ...conv.tabs.filter((p) => p !== conv.activeTab)]
         : conv.tabs;
-      for (const path of ordered) {
-        const b = conv.buffers[path];
-        if (!b || b.isImage || b.isPdf) continue;
+      const paths = ordered.filter((p) => conv.buffers[p]);
+      if (paths.length === 0) return;
+
+      const res = await safeCmd(() => commands.statFiles(paths));
+      if (res.status !== "ok") {
+        // The cheap check failed (it shouldn't — it's one stat per path). Don't
+        // silently skip the refresh and leave tabs stale: fall back to reading
+        // them, which is what this pass exists to guarantee.
+        console.error("[editor] statFiles failed, falling back to a full re-read:", res.error);
+        for (const path of paths) await reloadTab(convId, path);
+        return;
+      }
+      const stats = new Map(res.data.map((s) => [s.path, s]));
+      for (const path of paths) {
+        // Re-read the buffer each iteration: a reload above may have changed it,
+        // and the tab could have been closed while we awaited.
+        const b = get().byConv[convId]?.buffers[path];
+        if (!b) continue;
+        const stat = stats.get(path);
+        // No stat for a path we asked about (shouldn't happen — the backend answers
+        // one entry per path) is unknown, not unchanged → re-read.
+        if (stat && !diskStampChanged(b.diskStamp, stat)) continue;
         await reloadTab(convId, path);
       }
     },

@@ -3,7 +3,10 @@
 // same todo summary, context fill and worktree badge. No bespoke data, no fake
 // chrome: every element is wired to the live store.
 import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Dot, Pill, Ico, ClaudeMark, CodexMark } from "../../ui/kit";
+import { guardReorderClick, type DragData } from "../../ui/orderDnd";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { agentStatusToDot, backgroundCount, isActivelyRunning, railState, rowAttention } from "../../agent/status";
 import { useLastMessageSummary } from "../../store/lastMessageSummary";
@@ -68,6 +71,21 @@ export function StreamCard({
   // The importance rail (left edge) lights up only for states that deserve a glance;
   // `off` (shut down) and `idle` (at rest) get no rail and recede — `dim` a touch more
   // than `rest`, the only whisper between the two calm states (that + the dot shape).
+  // The WHOLE card is the drag surface (no grip): `listeners` + the click guard go on the
+  // card root below. While dragging, the card is hidden in place and a DragOverlay ghost
+  // (rendered by FlightDeck, outside the swimlane's overflow clip) follows the cursor.
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: conv.id,
+    data: { kind: "conv", repoId: conv.repoId } satisfies DragData,
+  });
+  const dragStyle = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    // Hidden in place while dragging — the DragOverlay ghost (rendered by FlightDeck,
+    // outside the swimlane's overflow clip) is the moving visual; the gap marks the drop.
+    opacity: isDragging ? 0 : undefined,
+  };
+
   const rail = railState(status);
   const cls =
     "wf-card ag-card ag-card-clickable" +
@@ -96,7 +114,15 @@ export function StreamCard({
   };
 
   return (
-    <div className={cls} data-rail={rail ?? undefined} onClick={onCardClick}>
+    <div
+      ref={setNodeRef}
+      style={dragStyle}
+      className={cls + " cv-draggable"}
+      data-rail={rail ?? undefined}
+      onClick={onCardClick}
+      onClickCapture={guardReorderClick}
+      {...listeners}
+    >
       <div className="ag-card-h">
         <Dot s={dot} pulse ring={backgroundCount(status) > 0} />
         <button className="ag-card-name" onClick={() => onOpen(conv.id)} title={conv.name}>

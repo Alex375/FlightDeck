@@ -73,6 +73,12 @@
 .ag-card[data-rail="err"]::before    { background:var(--wf-err); }
 .ag-card-h { display:flex; align-items:center; gap:9px; }
 .ag-card-name { font:inherit; font-size:13px; font-weight:600; flex:1; min-width:0; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx-hi); background:transparent; border:0; cursor:pointer; padding:0; }
+
+/* The floating drag ghost (dnd-kit DragOverlay) — a compact pill that follows the cursor,
+   rendered outside the swimlane so it escapes the `.ag-grid` overflow clip. */
+.ag-drag-ghost { display:inline-flex; align-items:center; gap:8px; max-width:340px; padding:8px 12px; border-radius:10px; background:var(--wf-panel-3); border:1px solid var(--wf-line-2); box-shadow:0 10px 30px rgba(0,0,0,.42); color:var(--wf-tx-hi); font-size:12.5px; font-weight:600; cursor:grabbing; }
+.ag-drag-ghost .wf-ico { flex:0 0 auto; width:15px; height:15px; color:var(--wf-tx-lo); }
+.ag-drag-ghost span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ag-card-name:hover { text-decoration:underline; }
 /* Delete-from-card affordance (mirrors the sidebar's .cv-sess-del): a reveal-on-hover
    × that stays danger-tinted on hover. Fixed width so revealing it shifts no layout. */

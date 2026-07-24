@@ -431,6 +431,20 @@ async loadSessionGoal(sessionId: string) : Promise<Result<GoalState | null, stri
 }
 },
 /**
+ * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
+ * nothing. The front calls this BEFORE killing the live session, so an unresolvable target
+ * costs nothing instead of tearing the session down for a rewind that was always going to
+ * fail. See [`history::check_rewind_target`].
+ */
+async checkRewindTarget(sessionId: string, targetId: string, targetIsUser: boolean, targetText: string | null, occurrence: number | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("check_rewind_target", { sessionId, targetId, targetIsUser, targetText, occurrence }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Rewind a conversation IN PLACE by truncating its on-disk transcript at `target_id`,
  * dropping that message (USER target) or everything after its response (ASSISTANT
  * target). Destructive by design ("resume from here"): the removed turns are
@@ -1166,6 +1180,18 @@ async readFile(path: string) : Promise<Result<FileContent, string>> {
 async readImage(path: string) : Promise<Result<ImageContent, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("read_image", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stat several paths at once (size + mtime, no bytes) so the editor can tell
+ * which open tabs actually changed on disk before re-reading any of them.
+ */
+async statFiles(paths: string[]) : Promise<Result<FileStat[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stat_files", { paths }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2065,7 +2091,32 @@ warnings: string[] }
  * [`MAX_FILE_BYTES`]) and `binary` (a NUL byte was found — not shown as text).
  * In both guard cases `content` is empty.
  */
-export type FileContent = { path: string; content: string; too_large: boolean; binary: boolean; size: number }
+export type FileContent = { path: string; content: string; too_large: boolean; binary: boolean; size: number; 
+/**
+ * Last-modified time when these bytes were read — the editor's staleness
+ * stamp (see [`FileStat`]). `None` when the platform doesn't report one.
+ */
+mtime_ms: number | null }
+/**
+ * What a file looks like on disk WITHOUT reading it: its size and last-modified
+ * time. One `stat` per path, no bytes — which is the whole point. The editor
+ * stamps every loaded buffer with this and re-checks it to decide whether the
+ * content actually needs re-reading, so a 15 MiB PDF that nobody touched costs a
+ * syscall instead of a full base64 round-trip.
+ */
+export type FileStat = { path: string; 
+/**
+ * False when the path can't be stat'ed at all — gone, or unreadable. The
+ * caller must treat this as "re-read it" rather than "unchanged": the real
+ * reason then surfaces through the normal read path (which reports it to the
+ * user) instead of being swallowed here.
+ */
+exists: boolean; size: number; 
+/**
+ * Milliseconds since the Unix epoch. `None` when the filesystem or platform
+ * doesn't report a modification time — callers then compare `size` alone.
+ */
+mtime_ms: number | null }
 /**
  * The result of a fork ("branch a new conversation here"): the freshly-written
  * branch conversation (ready to bring into the app via `reactivateDiskConversation`) and,
@@ -2233,7 +2284,12 @@ export type ImageContent = { path: string;
  * Base64 of the raw file bytes, NO `data:` prefix (the front prepends the
  * `data:<mime>;base64,` header, choosing the MIME from the extension).
  */
-data_base64: string; too_large: boolean; size: number }
+data_base64: string; too_large: boolean; size: number; 
+/**
+ * Last-modified time when these bytes were read — the editor's staleness
+ * stamp (see [`FileStat`]). `None` when the platform doesn't report one.
+ */
+mtime_ms: number | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),

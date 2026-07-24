@@ -657,6 +657,19 @@ impl Assembler {
                     if cb.get("type").and_then(Value::as_str) == Some("tool_use") {
                         let id = cb.get("id").and_then(Value::as_str).unwrap_or_default();
                         let name = cb.get("name").and_then(Value::as_str).unwrap_or_default();
+                        // Arm the skill-body belt-and-braces HERE, not only from the
+                        // assembled assistant message: that message lands at END of turn, and
+                        // on a concurrent tool branch the injected body can arrive BEFORE it
+                        // (4 such orderings exist in real transcripts) — the prefix guard
+                        // would then be disarmed when the body shows up. Armed from the
+                        // stream, it is set the moment the tool_use is announced.
+                        //
+                        // ⚠️ Set before `record_tool`, which returns early for any tool that
+                        // is not background-capable ("Skill" is not, and must NOT be added to
+                        // `is_bg_capable_tool` — that would reclassify it as a background task).
+                        if name == "Skill" {
+                            self.skill_invocation_pending = true;
+                        }
                         // Input is empty at content_block_start (it streams later); the
                         // command is captured from the assembled assistant message.
                         self.record_tool(id, name, cb.get("input"), out);
@@ -820,11 +833,16 @@ impl Assembler {
     }
 
     fn ingest_user(&mut self, u: &UserMsg, out: &mut Vec<SessionEvent>) {
-        // Injected/meta lines are never real turns — drop them exactly as the
-        // transcript restore does (history.rs `push_user`), so live and reload agree.
-        if u.is_meta == Some(true) {
-            return;
-        }
+        // Is this a line the CLI injected ITSELF rather than a turn a human typed?
+        //
+        // LIVE the flag is `isSynthetic`; on the transcript shape the same lines carry
+        // `isMeta` (the CLI renames it on the way out — see `UserMsg::is_synthetic`).
+        // Honour BOTH so this guard can't go dead the way the `isMeta`-only one did.
+        //
+        // ⚠️ Deliberately NOT an early return: an injected line can also carry
+        // `tool_result` blocks, and those must still be surfaced (a returning-early guard
+        // would silently swallow a tool's output). It gates the BUBBLE only, below.
+        let injected = u.is_synthetic == Some(true) || u.is_meta == Some(true);
         // A `user` message carries two things we surface: `tool_result` blocks (always),
         // AND — when the session is bridged (Remote Control) — a turn typed on the
         // phone/web, which the binary injects into the stream as an ordinary text user
@@ -833,11 +851,17 @@ impl Assembler {
         // remote-originated: surface it (keyed by uuid → the UI dedupes a re-delivery)
         // or it would only appear on reload. Mirrors history.rs `push_user`.
         let mut text = String::new();
+        let mut has_image = false;
         match u.message.get("content") {
             Some(Value::String(s)) => text.push_str(s),
             Some(Value::Array(blocks)) => {
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str) {
+                        // Counted, not rendered: the normalized block model carries no image
+                        // yet (restoring thumbnails is a separate follow-up). What matters
+                        // here is that an image-only turn is not INVISIBLE — see the
+                        // placeholder below, which mirrors `history.rs::push_user`.
+                        Some("image") => has_image = true,
                         Some("text") => {
                             if let Some(t) = b.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
@@ -874,19 +898,19 @@ impl Assembler {
             }
             _ => {}
         }
-        // Drop the INJECTED SKILL.md body of a model-invoked skill. On disk it's
-        // `isMeta:true` (already dropped above); LIVE the CLI omits `isMeta`, so we
-        // recognise it by its boilerplate prefix WHILE a `Skill` invocation is in
-        // flight this turn. Gated on BOTH (armed flag AND prefix) so a real user turn
-        // is never swallowed — the visible trace is the `Skill` tool_use (SkillChip).
-        // Runs unconditionally (not under the old `if !text` guard): empty text never
-        // matches the prefix, and the uuid bookkeeping below must run even for an
-        // images-only turn (empty text + image blocks).
-        if self.skill_invocation_pending
-            && text.trim_start().starts_with("Base directory for this skill:")
-        {
-            return;
-        }
+        // Belt-and-braces for the INJECTED SKILL.md body of a model-invoked skill: its
+        // boilerplate prefix, while a `Skill` invocation is in flight this turn. The
+        // `injected` flag above already covers it on a current binary — this stays so the
+        // body can't come back as a bubble if a future binary drops `isSynthetic` too.
+        // Gated on BOTH (armed flag AND prefix) so a real user turn is never swallowed —
+        // the visible trace is the `Skill` tool_use (SkillChip).
+        //
+        // ⚠️ It only catches PREFIXED bodies. A skill with no filesystem root injects its
+        // SKILL.md raw (the CLI only prepends the header when it has a root), and a
+        // re-invocation injects a one-line notice instead — 35 such bodies exist in real
+        // transcripts. Those are caught by `injected`, never by this prefix.
+        let skill_body =
+            self.skill_invocation_pending && text.trim_start().starts_with(SKILL_BODY_PREFIX);
         {
             let uuid = u.uuid.clone().unwrap_or_default();
             // Consume the echo bookkeeping FIRST, regardless of content: a turn WE sent
@@ -912,22 +936,47 @@ impl Assembler {
             // the context-meter guard in `ingest_stream_event`. The `tool_result` blocks above
             // are still surfaced (a sub-agent's internal results carry the same parent and are
             // routed to its own card downstream).
-            // `/goal` plumbing is represented by the dedicated goal UI now, so never surface it as
-            // a bubble: the command echo is already dropped as `was_ours`, but the CLI-generated
-            // `<local-command-stdout>` reply ("Goal set/cleared", "No goal set") carries a FRESH
-            // uuid — without this guard, clearing a goal from the chip would leave that stdout in
-            // the thread. Mirrors `history.rs` `push_user_text` on reload.
-            if !was_ours && !text.trim().is_empty() && u.parent_tool_use_id.is_none()
-                && !super::history::is_goal_command_noise(&text)
+            // Strip the IDE's "user opened a file" banner glued in front of a real prompt,
+            // before the emptiness test — same call as `push_user_text` on reload.
+            let mut text = super::history::strip_ide_banner(&text).to_string();
+            // An image-only turn from the bridge (a photo sent from the phone with no
+            // caption) has empty text and would fail the emptiness test below — it used to
+            // be INVISIBLE live and then appear out of nowhere on reload, which reads as the
+            // app inventing a message. Use the same "[image]" placeholder the reload path
+            // uses so both surfaces show the same thing. Our OWN image turns never get here
+            // (`was_ours`); the UI already shows their thumbnails optimistically.
+            if text.trim().is_empty() && has_image && !was_ours {
+                text = "[image]".to_string();
+            }
+            if !was_ours
+                && !injected
+                && !skill_body
+                && !text.trim().is_empty()
+                && u.parent_tool_use_id.is_none()
             {
-                out.push(SessionEvent::Item(ConversationItem::UserMessage {
-                    id: uuid,
-                    text,
-                    parent_tool_use_id: u.parent_tool_use_id.clone(),
-                    // A live wire turn is an out-of-order replay to splice into place;
-                    // a real remote turn always carries `isReplay:true` here.
-                    replay: u.is_replay == Some(true),
-                }));
+                // Injected shapes the wire does NOT flag (`/goal` plumbing, `[Request
+                // interrupted by user]`, another local command's stdout) are classified by
+                // text — the same body `push_user_text` runs on reload, so a given line
+                // renders identically on both surfaces.
+                match super::history::classify_injected_text(&text) {
+                    Some(super::history::InjectedText::Drop) => {}
+                    Some(super::history::InjectedText::Notice { subtype, message }) => {
+                        out.push(SessionEvent::Item(ConversationItem::Notice {
+                            subtype: subtype.to_string(),
+                            detail: serde_json::json!({ "message": message }),
+                        }));
+                    }
+                    None => {
+                        out.push(SessionEvent::Item(ConversationItem::UserMessage {
+                            id: uuid,
+                            text,
+                            parent_tool_use_id: u.parent_tool_use_id.clone(),
+                            // A live wire turn is an out-of-order replay to splice into place;
+                            // a real remote turn always carries `isReplay:true` here.
+                            replay: u.is_replay == Some(true),
+                        }));
+                    }
+                }
             }
         }
     }
@@ -1010,6 +1059,13 @@ fn change_notice(control: &str, icon: &str, from: &str, to: &str) -> SessionEven
         detail: serde_json::json!({ "control": control, "icon": icon, "from": from, "to": to }),
     })
 }
+
+/// The boilerplate header the CLI prepends to an injected SKILL.md body — but ONLY when
+/// the skill has a filesystem root (`skillRoot ? "Base directory for this skill: …" : body`).
+/// A rootless/bundled skill injects its body raw, and a re-invocation injects a one-line
+/// notice instead, so this prefix identifies SOME injected bodies, never all of them: it is
+/// the belt-and-braces behind `UserMsg::is_synthetic`, not the primary guard.
+const SKILL_BODY_PREFIX: &str = "Base directory for this skill:";
 
 /// The tools CAPABLE of spawning a background task. Only these are remembered in
 /// `tool_names` (the correlation map), keeping it far smaller than "every tool_use" —
@@ -2277,6 +2333,11 @@ mod tests {
     /// An injected/meta user line (`isMeta:true` — command output, system reminders,
     /// the queued "while you were working" wrapper) is NOT a real turn → dropped, just
     /// like the transcript restore does.
+    ///
+    /// ⚠️ This shape is the DISK one. It is kept because the same types parse transcripts,
+    /// but it proves nothing about the live path: the CLI renames the flag to `isSynthetic`
+    /// on stdout, so for years this test was green while the live guard was dead code. The
+    /// live shape is covered by [`synthetic_user_lines_are_dropped`] and the parity table.
     #[test]
     fn meta_user_message_is_dropped() {
         let mut asm = seeded();
@@ -2288,6 +2349,121 @@ mod tests {
         }))
         .unwrap();
         assert!(asm.ingest(&m).is_empty(), "a meta user line must be dropped");
+    }
+
+    /// Every user line the CLI injects itself carries `isSynthetic:true` on the LIVE wire —
+    /// and NO `isMeta` (VERIFIED against claude 2.1.217 by live probe and by reading the
+    /// binary: `isSynthetic: o.isMeta || o.isVisibleInTranscriptOnly`). None of them may
+    /// become a user bubble.
+    ///
+    /// The four shapes below are the ones that actually leaked, each with real occurrence
+    /// counts from the user's own transcripts.
+    #[test]
+    fn synthetic_user_lines_are_dropped() {
+        for (label, text) in [
+            // A skill with a filesystem root: body prefixed by the boilerplate header.
+            ("prefixed skill body", "Base directory for this skill: /x/.claude/skills/done\n\n# Done\n…"),
+            // A ROOTLESS skill: the CLI prepends nothing, so the prefix guard can't see it.
+            // 27 such bodies (3.5–8.8 KB) exist on disk.
+            ("rootless skill body", "Approach this as the design lead at a small studio known for their versatility…"),
+            // Re-invoking a skill already loaded this session (8 on disk).
+            ("skill re-invocation", "(Re-invocation of /done — the skill instructions were previously loaded; the arguments or dynamic output below are new.)"),
+            // The sidecar the CLI emits after reading an image it had to downscale (23 on
+            // disk) — the "Claude's screenshot shows up as a message I sent" report.
+            ("image downscale note", "[Image: original 2400x1524, displayed at 2000x1270. Multiply coordinates by 1.20 to map to original image.]"),
+        ] {
+            let mut asm = seeded();
+            let m: CliMessage = serde_json::from_value(serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": [{"type": "text", "text": text}] },
+                // As on the wire: isSynthetic present, isMeta ABSENT.
+                "isSynthetic": true,
+                "uuid": "u-synth"
+            }))
+            .unwrap();
+            let items: Vec<_> = user_texts(asm.ingest(&m));
+            assert!(items.is_empty(), "{label} must not surface as a user bubble, got {items:?}");
+        }
+    }
+
+    /// A synthetic line can also be the CARRIER of a `tool_result`. Dropping the whole line
+    /// (rather than just its bubble) would swallow a tool's output — a silent loss.
+    #[test]
+    fn a_synthetic_line_still_surfaces_its_tool_result() {
+        let mut asm = seeded();
+        let m: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "output"},
+                {"type": "text", "text": "[Image: original 2400x1524, displayed at 2000x1270.]"}
+            ]},
+            "isSynthetic": true,
+            "uuid": "u-synth-tr"
+        }))
+        .unwrap();
+        let evs = asm.ingest(&m);
+        assert!(user_texts(evs.clone()).is_empty(), "the injected text must not become a bubble");
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                SessionEvent::Item(ConversationItem::ToolResult { tool_use_id, .. }) if tool_use_id == "toolu_1"
+            )),
+            "the tool_result on the same line must still be surfaced"
+        );
+    }
+
+    /// The skill-body belt-and-braces must be armed from the STREAMED `content_block_start`,
+    /// not only from the assembled assistant message: that message lands at end of turn, and
+    /// on a concurrent tool branch the injected body arrives BEFORE it (4 such orderings on
+    /// disk). Here the assistant message never arrives at all.
+    #[test]
+    fn skill_body_is_dropped_when_armed_only_from_the_stream() {
+        let mut asm = seeded();
+        let start: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "tool_use", "id": "toolu_sk", "name": "Skill", "input": {}}},
+            "session_id": "s"
+        }))
+        .unwrap();
+        asm.ingest(&start);
+        // The injected body, WITHOUT any provenance flag at all — the worst case, where only
+        // the armed prefix guard can catch it.
+        let body: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [
+                {"type": "text", "text": "Base directory for this skill: /x/.claude/skills/done\n\n# Done"}
+            ]},
+            "uuid": "u-body"
+        }))
+        .unwrap();
+        assert!(
+            user_texts(asm.ingest(&body)).is_empty(),
+            "a skill body must be dropped even when the assistant message hasn't arrived yet"
+        );
+    }
+
+    /// A GENUINE turn must still get through — the guards must not swallow real messages.
+    #[test]
+    fn a_real_remote_turn_still_surfaces() {
+        let mut asm = seeded();
+        let m: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{"type": "text", "text": "ship it"}] },
+            "uuid": "u-remote", "isReplay": true
+        }))
+        .unwrap();
+        assert_eq!(user_texts(asm.ingest(&m)), vec!["ship it".to_string()]);
+    }
+
+    /// The user-visible texts of any `UserMessage` items in a batch of events.
+    fn user_texts(evs: Vec<SessionEvent>) -> Vec<String> {
+        evs.into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::UserMessage { text, .. }) => Some(text),
+                _ => None,
+            })
+            .collect()
     }
 
     /// REGRESSION (task 2247ebd6): a MODEL-invoked skill (the `Skill` tool — e.g. land → /done)
@@ -2510,5 +2686,159 @@ mod tests {
         assert_eq!(flipped[0].task_id, "agentX");
         assert_eq!(flipped[0].status, BackgroundTaskStatus::Running);
         assert_eq!(flipped[0].kind, BackgroundTaskKind::Agent);
+    }
+}
+
+/// LIVE ↔ RELOAD parity — the structural guard for the "content I never wrote is shown as a
+/// message I sent" class of bug.
+///
+/// The two surfaces are different code (`Assembler::ingest` reads the stdout wire,
+/// `history::parse_transcript_str` reads the transcript) and their guards key on DIFFERENT
+/// fields, because the CLI renames them on the way to disk (`isSynthetic` → `isMeta`) and
+/// hides some shapes behind no field at all. Nothing forced the two halves to agree, so each
+/// could regress to green on its own — which is exactly what happened: the disk test passed
+/// while the live guard was dead code, for every shape below.
+///
+/// This table pins the invariant directly: for each known line, the LIVE shape and the DISK
+/// shape must yield the SAME user bubbles. A future field rename breaks this test on the
+/// surface that drifted.
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use crate::supervisor::history::parse_transcript_str;
+    use serde_json::json;
+
+    /// The user-visible bubble texts the LIVE path produces for one wire line.
+    fn live_bubbles(line: serde_json::Value) -> Vec<String> {
+        let mut asm = Assembler::new();
+        let msg: CliMessage = serde_json::from_value(line).expect("live line must parse");
+        asm.ingest(&msg)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::UserMessage { text, .. }) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The user-visible bubble texts the RELOAD path produces for one transcript line.
+    fn disk_bubbles(line: serde_json::Value) -> Vec<String> {
+        let content = serde_json::to_string(&line).expect("disk line must serialize");
+        let (items, _) = parse_transcript_str(&content, true);
+        items
+            .into_iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each case: a label, the line as it arrives LIVE, the same line as PERSISTED, and the
+    /// bubbles both must produce. Real shapes, taken from probes against claude 2.1.217 and
+    /// from the on-disk transcripts.
+    #[test]
+    fn live_and_reload_agree_on_every_known_line() {
+        let text_content = |t: &str| json!([{ "type": "text", "text": t }]);
+        let cases: Vec<(&str, serde_json::Value, serde_json::Value, Vec<&str>)> = vec![
+            (
+                "a genuine human prompt",
+                json!({"type":"user","uuid":"u1","message":{"role":"user","content":text_content("ship it")}}),
+                json!({"type":"user","uuid":"u1","message":{"role":"user","content":text_content("ship it")}}),
+                vec!["ship it"],
+            ),
+            (
+                "a prefixed skill body",
+                json!({"type":"user","uuid":"u2","isSynthetic":true,
+                       "message":{"role":"user","content":text_content("Base directory for this skill: /x\n\n# Done")}}),
+                json!({"type":"user","uuid":"u2","isMeta":true,
+                       "message":{"role":"user","content":text_content("Base directory for this skill: /x\n\n# Done")}}),
+                vec![],
+            ),
+            (
+                "a rootless skill body (no prefix to key on)",
+                json!({"type":"user","uuid":"u3","isSynthetic":true,
+                       "message":{"role":"user","content":text_content("Approach this as the design lead at a small studio…")}}),
+                json!({"type":"user","uuid":"u3","isMeta":true,
+                       "message":{"role":"user","content":text_content("Approach this as the design lead at a small studio…")}}),
+                vec![],
+            ),
+            (
+                "the image downscale sidecar",
+                json!({"type":"user","uuid":"u4","isSynthetic":true,
+                       "message":{"role":"user","content":text_content("[Image: original 2400x1524, displayed at 2000x1270.]")}}),
+                // On disk this one is a bare STRING content, not a block array.
+                json!({"type":"user","uuid":"u4","isMeta":true,
+                       "message":{"role":"user","content":"[Image: original 2400x1524, displayed at 2000x1270.]"}}),
+                vec![],
+            ),
+            (
+                "stop-hook feedback",
+                json!({"type":"user","uuid":"u5","isSynthetic":true,
+                       "message":{"role":"user","content":text_content("Stop hook feedback:\n[all tests pass]: not yet")}}),
+                json!({"type":"user","uuid":"u5","isMeta":true,
+                       "message":{"role":"user","content":text_content("Stop hook feedback:\n[all tests pass]: not yet")}}),
+                vec![],
+            ),
+            (
+                "the /compact continuation summary",
+                json!({"type":"user","uuid":"u6","isSynthetic":true,
+                       "message":{"role":"user","content":text_content("This session is being continued from a previous conversation…")}}),
+                // Disk: NO isMeta — `isCompactSummary` + `isVisibleInTranscriptOnly` instead.
+                json!({"type":"user","uuid":"u6","isCompactSummary":true,"isVisibleInTranscriptOnly":true,
+                       "message":{"role":"user","content":text_content("This session is being continued from a previous conversation…")}}),
+                vec![],
+            ),
+            (
+                "an interrupt marker (flagged on NEITHER surface)",
+                json!({"type":"user","uuid":"u7","message":{"role":"user","content":text_content("[Request interrupted by user]")}}),
+                json!({"type":"user","uuid":"u7","message":{"role":"user","content":text_content("[Request interrupted by user]")}}),
+                vec![],
+            ),
+            (
+                "another command's stdout (flagged on NEITHER surface)",
+                json!({"type":"user","uuid":"u8","message":{"role":"user","content":text_content("<local-command-stdout>Set model to opus</local-command-stdout>")}}),
+                json!({"type":"user","uuid":"u8","message":{"role":"user","content":text_content("<local-command-stdout>Set model to opus</local-command-stdout>")}}),
+                vec![],
+            ),
+            (
+                "the IDE banner glued in front of a real prompt",
+                json!({"type":"user","uuid":"u9","message":{"role":"user","content":text_content(
+                    "<ide_opened_file>The user opened /a/b.md in the IDE.</ide_opened_file>\nfix the typo")}}),
+                json!({"type":"user","uuid":"u9","message":{"role":"user","content":text_content(
+                    "<ide_opened_file>The user opened /a/b.md in the IDE.</ide_opened_file>\nfix the typo")}}),
+                vec!["fix the typo"],
+            ),
+            (
+                "a sub-agent prompt (parent_tool_use_id live, isSidechain on disk)",
+                json!({"type":"user","uuid":"u10","parent_tool_use_id":"toolu_a",
+                       "message":{"role":"user","content":text_content("Research the auth flow")}}),
+                json!({"type":"user","uuid":"u10","isSidechain":true,
+                       "message":{"role":"user","content":text_content("Research the auth flow")}}),
+                vec![],
+            ),
+            (
+                "an image-only turn",
+                json!({"type":"user","uuid":"u11","message":{"role":"user","content":
+                    [{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]}}),
+                json!({"type":"user","uuid":"u11","message":{"role":"user","content":
+                    [{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]}}),
+                vec!["[image]"],
+            ),
+            (
+                "/goal plumbing",
+                json!({"type":"user","uuid":"u12","message":{"role":"user","content":text_content(
+                    "<local-command-stdout>Goal set: all tests pass</local-command-stdout>")}}),
+                json!({"type":"user","uuid":"u12","message":{"role":"user","content":text_content(
+                    "<local-command-stdout>Goal set: all tests pass</local-command-stdout>")}}),
+                vec![],
+            ),
+        ];
+
+        for (label, live, disk, want) in cases {
+            let want: Vec<String> = want.into_iter().map(str::to_string).collect();
+            assert_eq!(live_bubbles(live), want, "LIVE differs from expectation: {label}");
+            assert_eq!(disk_bubbles(disk), want, "RELOAD differs from expectation: {label}");
+        }
     }
 }

@@ -194,12 +194,15 @@ export function ToolStepRow({
           // The whole row toggles the detail; only the file NAME is a clickable mention
           // that opens the file. Split "Edit foo.ts" → "Edit " (toggles) + chip("foo.ts")
           // (the chip stops propagation, so it opens instead of toggling).
+          // `stepRow` marks this as the surface the "clickable file paths (Read/Write
+          // tools)" pref governs: off → the whole row is a plain expander, and the file
+          // is still reachable from the filename in the expanded diff/snippet header.
           const base = filePath ? basename(filePath) : null;
           if (filePath && base && label.endsWith(base)) {
             return (
               <span className="cv-step-t" title={label}>
                 {label.slice(0, label.length - base.length)}
-                <MentionPathChip path={filePath} display={base} />
+                <MentionPathChip path={filePath} display={base} stepRow />
               </span>
             );
           }

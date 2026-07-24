@@ -9,6 +9,7 @@ export type SettingsSection =
   | "general"
   | "accounts"
   | "conversation"
+  | "reordering"
   | "shortcuts"
   | "notifications"
   | "updates"

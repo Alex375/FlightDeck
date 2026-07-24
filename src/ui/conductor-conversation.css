@@ -77,6 +77,12 @@
 .cv-sess-del { flex:0 0 auto; width:22px; height:22px; margin-right:5px; border:0; background:transparent; color:var(--wf-tx-lo); display:inline-flex; align-items:center; justify-content:center; border-radius:5px; cursor:pointer; opacity:0; transition:opacity .12s ease, background .12s ease, color .12s ease; }
 .cv-sess-row:hover .cv-sess-del { opacity:1; }
 .cv-sess-del:hover { background:var(--wf-err-bg); color:var(--wf-err); }
+/* Manual reordering: the WHOLE row / repo header / card is the drag surface (no grip).
+   A small pointer activation distance keeps clicks working; show the "grabbing" cursor
+   only while an actual drag is in flight, so clickable rows/cards keep their normal
+   cursor at rest. `touch-action` lets the pointer sensor own a touch gesture. */
+.cv-draggable { touch-action: none; }
+.cv-draggable:active { cursor: grabbing; }
 /* Worktree badge: shown (always) when a conversation runs in a linked worktree. */
 .cv-wt-badge { flex:0 0 auto; width:20px; height:20px; margin-right:2px; border:0; background:transparent; color:var(--wf-accent); display:inline-flex; align-items:center; justify-content:center; border-radius:5px; cursor:pointer; opacity:.8; transition:opacity .12s ease, background .12s ease; }
 .cv-wt-badge:hover { opacity:1; background:var(--wf-panel-3); }
@@ -205,6 +211,13 @@
    fences, long paths) wraps/scrolls internally instead of widening — and overflowing —
    its container. */
 .cv-subtranscript { display:flex; flex-direction:column; gap:18px; min-width:0; }
+/* Claude's opening instruction to a sub-agent. Sits in the first-turn slot of a sub-agent
+   transcript, but it is NOT a human message — the label + assistant mark say who wrote it,
+   so the bubble can keep the same geometry without claiming the user asked for it. */
+.cv-agentprompt .cv-agentprompt-label {
+  font-size:11px; font-weight:600; letter-spacing:.02em; text-transform:uppercase;
+  opacity:.55; margin-bottom:6px;
+}
 /* The user's own messages keep their full-width bubble (as before), but the avatar
    moves to the RIGHT: row-reverse puts the avatar at the far right and the bubble
    (flex:1) fills the rest to its left. */

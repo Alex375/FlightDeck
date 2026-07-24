@@ -15,11 +15,26 @@ import { Ico } from "../../ui/kit";
 const NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 
-/** Pull the command + args out of a CLI-wrapped slash-command message; `null` when the
- *  text isn't a command invocation (a normal prompt). */
+/** A slash-command as the user actually TYPED it, before the CLI wraps it: the whole
+ *  message is one line opening on `/name`, optionally followed by arguments.
+ *
+ *  Needed for live/reload parity: the optimistic bubble we append on send holds the raw
+ *  "/compact" the user typed (or a button sent), while the SAME turn read back from the
+ *  transcript holds the CLI's `<command-name>` wrapper. Without this, one command rendered
+ *  as grey raw text live and as a chip after a reload.
+ *
+ *  The name may not contain `/`, which is what keeps a path from being mistaken for a
+ *  command: "/Users/alex/notes.md" fails, "/compact" and "/tosse-workflow:pickup" pass. */
+const BARE_RE = /^\/([A-Za-z0-9][\w:.-]*)(?:[ \t]+([^\n]*))?$/;
+
+/** Pull the command + args out of a slash-command message, in either shape (CLI-wrapped or
+ *  as typed); `null` when the text isn't a command invocation (a normal prompt). */
 export function parseSlashCommand(text: string): { command: string; args: string } | null {
   const m = NAME_RE.exec(text);
-  if (!m) return null;
+  if (!m) {
+    const bare = BARE_RE.exec(text.trim());
+    return bare ? { command: "/" + bare[1], args: (bare[2] ?? "").trim() } : null;
+  }
   let command = m[1].trim();
   if (!command) return null;
   if (!command.startsWith("/")) command = "/" + command;

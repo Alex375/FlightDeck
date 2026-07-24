@@ -100,6 +100,20 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
     );
   }
 
+  // Informational, NOT errors: content the CLI injected into the transcript as a `user`
+  // line that the human never typed. These used to render as full user bubbles with the
+  // human's avatar ("[Request interrupted by user]", another slash command's stdout) —
+  // they are real information, so they stay visible, but attributed to the system rather
+  // than to the user. Same subtle inline treatment as `control_change`.
+  if (subtype === "interrupted" || subtype === "command_output") {
+    return (
+      <div className={styles.controlChange}>
+        <Ico name={subtype === "interrupted" ? "stop" : "term"} className="sm" />
+        <span>{get("message")}</span>
+      </div>
+    );
+  }
+
   if (subtype === "control_error") {
     return (
       <ErrorBlock detail={noticeDetailText(d)}>

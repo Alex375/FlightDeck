@@ -82,6 +82,10 @@ const WF_PATHS: Record<string, string> = {
   coffee: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
   // A bullseye / target — an active `/goal` (Claude working toward a completion condition).
   target: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M11 7.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4M11 11h.01",
+  // Up/down arrows — manual reordering (drag to arrange). The "Reordering" settings tab.
+  reorder: "M7 8l3-3 3 3M10 5v6M17 14l-3 3-3-3M14 17v-6",
+  // A six-dot drag handle — the affordance shown inside the Flight Deck drag ghost.
+  grip: "M8 6h.01M14 6h.01M8 11h.01M14 11h.01M8 16h.01M14 16h.01",
 };
 
 export function Ico({ name, className }: { name: string; className?: string }) {

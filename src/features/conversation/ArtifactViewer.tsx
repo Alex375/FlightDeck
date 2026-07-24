@@ -5,13 +5,32 @@
 // "Open on claude.ai" button (the durable hosted copy). READ-ONLY: it never writes anything, and
 // the iframe's scripts can reach neither the app nor the network.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { commands } from "../../ipc/client";
+import type { FileStat } from "../../ipc/client";
 import { Ico } from "../../ui/kit";
 import type { ArtifactView } from "../editor/editorStore";
 import { withArtifactCsp } from "./artifactCsp";
 import { StreamMarkdown } from "./StreamMarkdown";
+
+/** How often the local file is re-checked for a rewrite. No fs watch reaches it:
+ *  artifacts live in a temp dir outside the watched cwd, and opening this viewer
+ *  unmounts the editor panel (which is what owns the watch). */
+const POLL_MS = 2000;
+
+/**
+ * A stat reduced to "is this a different file state than last time".
+ *
+ * Deliberately NOT the editor's `diskStampChanged`, which answers "might this be
+ * stale?" and so treats an unreadable path as changed — correct for a one-shot
+ * check, but on a repeating tick a deleted file would then re-trigger a failing
+ * reload every two seconds, forever. Comparing successive observations instead
+ * makes "still gone" a non-event, while a file that comes back is one.
+ */
+function statKey(s: FileStat): string {
+  return s.exists ? `${s.size}:${s.mtime_ms ?? "?"}` : "gone";
+}
 
 /**
  * Why the file can't be shown. These stay DISTINCT outcomes on purpose: they used to collapse
@@ -91,12 +110,27 @@ function ArtifactUnavailable({
 
 export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: () => void }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
+  /** Bumped when the file changed underneath us, to re-run the load effect. */
+  const [rev, setRev] = useState(0);
+  /** The file state the currently shown content came from (see `statKey`). */
+  const seenKey = useRef<string | null>(null);
+  /** Which artifact is currently on screen, to tell "a different one" from "the
+   *  same one, rewritten". */
+  const shownPath = useRef<string | null>(null);
   const url = view.url;
 
   useEffect(() => {
     let cancelled = false;
-    setLoad({ status: "loading" });
     const path = view.filePath;
+    // Switching to a DIFFERENT artifact blanks the panel (its content has nothing
+    // to do with what's on screen). A re-publish of the SAME one doesn't: the
+    // current version stays visible until the new bytes are in, so an artifact
+    // being iterated on doesn't strobe.
+    if (shownPath.current !== path) {
+      setLoad({ status: "loading" });
+      seenKey.current = null;
+      shownPath.current = path;
+    }
     if (!path) {
       setLoad({ status: "nopath" });
       return;
@@ -105,6 +139,11 @@ export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose:
       .readFile(path)
       .then((res) => {
         if (cancelled) return;
+        if (res.status === "ok") {
+          // Remember what we just rendered, so the poll below only reacts to
+          // changes that landed AFTER it.
+          seenKey.current = `${res.data.size}:${res.data.mtime_ms ?? "?"}`;
+        }
         if (res.status !== "ok") {
           // A failed read is a REAL failure (temp file swept, permissions, I/O): log it and show
           // the underlying reason instead of a generic message that hides what went wrong.
@@ -130,6 +169,42 @@ export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose:
       });
     return () => {
       cancelled = true;
+    };
+  }, [view.filePath, rev]);
+
+  // Keep the preview honest while it's on screen. Re-publishing an artifact rewrites
+  // the SAME temp path, so nothing here changes prop-wise and the panel would go on
+  // showing the previous version as though it were the current one. Nothing else can
+  // tell us: the file lives outside the watched cwd, and this viewer replaces the
+  // editor panel that owns the fs watch. Cost is one stat every couple of seconds.
+  useEffect(() => {
+    const path = view.filePath;
+    if (!path) return;
+    let stopped = false;
+    const check = async () => {
+      if (stopped || (typeof document !== "undefined" && document.hidden)) return;
+      let stat: FileStat | undefined;
+      try {
+        const res = await commands.statFiles([path]);
+        if (res.status !== "ok") {
+          console.error("ArtifactViewer: statFiles failed for", path, "-", res.error);
+          return;
+        }
+        stat = res.data[0];
+      } catch (e) {
+        console.error("ArtifactViewer: statFiles threw for", path, "-", e);
+        return;
+      }
+      if (stopped || !stat) return;
+      const key = statKey(stat);
+      if (seenKey.current === null || key === seenKey.current) return;
+      seenKey.current = key;
+      setRev((r) => r + 1);
+    };
+    const id = setInterval(() => void check(), POLL_MS);
+    return () => {
+      stopped = true;
+      clearInterval(id);
     };
   }, [view.filePath]);
 

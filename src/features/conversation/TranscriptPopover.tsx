@@ -118,7 +118,7 @@ export function TranscriptPopover({
       body = <LiveSubThread session={liveSession ?? ""} ids={liveIds} promptText={promptText} />;
       break;
     case "disk":
-      body = <SubAgentTranscript items={items!} />;
+      body = <SubAgentTranscript items={items!} agentPrompt />;
       break;
     case "loading":
       body = <div className={styles.note}>Loading transcript…</div>;

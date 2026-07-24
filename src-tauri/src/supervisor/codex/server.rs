@@ -93,7 +93,20 @@ struct Started {
 /// await (only a brief clone-out of the send handles).
 pub struct CodexServer {
     inner: tokio::sync::Mutex<Option<Started>>,
+    /// The `clientInfo.name` sent at `initialize`, which Codex persists as the rollout's
+    /// `originator`. Threads WE drive on the user's behalf announce themselves as
+    /// [`CLIENT_NAME`]; internal one-shot threads use [`CLIENT_NAME_INTERNAL`] so their
+    /// rollouts can be told apart on disk and kept out of the History panel.
+    client_name: &'static str,
 }
+
+/// `clientInfo.name` for a real user conversation → rollout `originator`.
+pub(crate) const CLIENT_NAME: &str = "flight-deck";
+
+/// `clientInfo.name` for an INTERNAL one-shot thread (auto-title, probes) — a thread the
+/// user never opened and must never see listed. Its cleanup is best-effort archival, so the
+/// rollout can survive; this marker is what lets the reader recognise and skip it.
+pub(crate) const CLIENT_NAME_INTERNAL: &str = "flight-deck-internal";
 
 impl Default for CodexServer {
     fn default() -> Self {
@@ -105,6 +118,16 @@ impl CodexServer {
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(None),
+            client_name: CLIENT_NAME,
+        }
+    }
+
+    /// A server for INTERNAL one-shot work (auto-title, probes). Identical except that its
+    /// threads are stamped [`CLIENT_NAME_INTERNAL`] on disk — see the field doc.
+    pub(crate) fn internal() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            client_name: CLIENT_NAME_INTERNAL,
         }
     }
 
@@ -142,7 +165,7 @@ impl CodexServer {
         // initialize → wait for the result → initialized (a bare notification).
         let init_params = serde_json::to_value(protocol::InitializeParams {
             client_info: protocol::ClientInfo {
-                name: "flight-deck".into(),
+                name: self.client_name.into(),
                 title: "Flight Deck".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
@@ -213,7 +236,11 @@ impl CodexServer {
         model: Option<&str>,
         cwd: &Path,
     ) -> Result<String, CodexError> {
-        let server = CodexServer::new();
+        // Stamped as an INTERNAL client so its rollout is recognisable on disk: the archive
+        // below is best-effort, and a surviving rollout used to be listed in the History
+        // panel as a real conversation — one whose only "user message" is the title prompt
+        // WE wrote, shown under the user's avatar.
+        let server = CodexServer::internal();
         let (thread_id, mut inbound) =
             match server.start_thread_with(cwd, model, "read-only", "never").await {
                 Ok(p) => p,

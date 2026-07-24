@@ -598,7 +598,7 @@ function AgentTranscriptPane({
       </div>
     );
   } else {
-    body = <SubAgentTranscript items={items} />;
+    body = <SubAgentTranscript items={items} agentPrompt />;
   }
 
   return (

@@ -63,9 +63,12 @@ export interface DisplayPrefs {
    *  hover controls. Read by {@link MessageActions} (via the conversation thread). */
   messageControls: boolean;
 
-  /** Render file paths referenced by tools (Read/Write chips) and prose as clickable chips
-   *  that open the file in the side editor. ON by default. Off → paths render as plain,
-   *  non-clickable text. Read by {@link FileMentionProvider} (folded into its `inert`). */
+  /** Make the filename on a tool STEP ROW (the "Edit foo.ts" row that also expands the card)
+   *  clickable. ON by default. Off → that row is a plain expander and its filename is plain
+   *  text. DELIBERATELY NARROW: it gates that one dual-purpose surface and NOTHING else —
+   *  paths in prose, Markdown file links and the filename in the expanded diff/snippet header
+   *  stay clickable everywhere (conversation, Flight Deck…) whatever this pref says. Read by
+   *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
@@ -100,6 +103,32 @@ export interface DisplayPrefs {
    *  derivation ({@link deriveAgentStatus} via {@link AgentSignals.reAlertOnBackgroundBash}) and
    *  the notification suppression. */
   alertOnBackgroundBash: boolean;
+
+  /** Auto-reorder the conversation SIDEBAR's conversations by recency (most-recent first,
+   *  the historical behaviour). ON by default. OFF → the sidebar keeps a MANUAL, drag-and-drop
+   *  order that never reshuffles on its own (new conversations still land on top). Read by
+   *  {@link useConversationsByRepo}. Independent of the repo-level toggle below. */
+  autoOrderSidebarConvs: boolean;
+
+  /** Auto-reorder the conversation SIDEBAR's repositories by recency. ON by default. OFF →
+   *  the repo groups keep a MANUAL, drag-and-drop order. Read by {@link useConversationsByRepo}. */
+  autoOrderSidebarRepos: boolean;
+
+  /** Auto-reorder the FLIGHT DECK's cards by status-then-recency (the historical behaviour —
+   *  action-required/error → review → running → idle → off). ON by default. OFF → the cards in
+   *  each swimlane keep a MANUAL, drag-and-drop order that never reshuffles, so even a card that
+   *  needs attention stays put (new conversations still land at the very start). Read by
+   *  {@link useFleetLanes}. */
+  autoOrderFleetConvs: boolean;
+
+  /** Auto-reorder the FLIGHT DECK's swimlanes (repositories) by status-then-recency. ON by
+   *  default. OFF → the swimlanes keep a MANUAL, drag-and-drop order. Read by {@link useFleetLanes}. */
+  autoOrderFleetRepos: boolean;
+
+  /** Whether the sidebar and the Flight Deck SHARE one manual order (drag in one reorders both)
+   *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
+   *  that are in manual mode. Read via {@link slotFor}. */
+  sharedManualOrder: boolean;
 }
 
 // Off by default: the transcript shows everything inline as before. The user opts in
@@ -120,6 +149,13 @@ const DEFAULTS: DisplayPrefs = {
   showThinkingTime: true,
   showToolTime: true,
   alertOnBackgroundBash: false,
+  // Ordering defaults to today's automatic behaviour (recency / status-first); the user
+  // opts into a frozen, drag-ordered layout per surface+level. Shared order on by default.
+  autoOrderSidebarConvs: true,
+  autoOrderSidebarRepos: true,
+  autoOrderFleetConvs: true,
+  autoOrderFleetRepos: true,
+  sharedManualOrder: true,
 };
 
 function load(): DisplayPrefs {
@@ -165,6 +201,11 @@ export const useDisplay = create<DisplayState>((set) => ({
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,
         showToolTime: patch.showToolTime ?? s.showToolTime,
         alertOnBackgroundBash: patch.alertOnBackgroundBash ?? s.alertOnBackgroundBash,
+        autoOrderSidebarConvs: patch.autoOrderSidebarConvs ?? s.autoOrderSidebarConvs,
+        autoOrderSidebarRepos: patch.autoOrderSidebarRepos ?? s.autoOrderSidebarRepos,
+        autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
+        autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
+        sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
       };
       save(next);
       return next;

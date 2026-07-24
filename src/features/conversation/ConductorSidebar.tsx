@@ -33,6 +33,11 @@ import { WorktreeBadge } from "../git/WorktreeBadge";
 import { useWorktreeUi } from "../git/worktreeUiStore";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
 import { useHistoryUi } from "../history/historyUiStore";
+import { DndContext } from "@dnd-kit/core";
+import { SortableContext, verticalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
+import { useSurfaceOrderDnd, orderCollisionDetection, guardReorderClick, type DragData } from "../../ui/orderDnd";
 
 /** The conversation's status glyph: the "sonar" running indicator while a turn is in
  *  flight, otherwise the plain coloured status dot (review / attention / error / idle…). */
@@ -67,6 +72,20 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   // Escape suppress it entirely (so a cancel never writes the edited draft).
   const settled = useRef(false);
 
+  // The WHOLE row is the drag surface (no grip): `listeners` go on the row root below.
+  // A small activation distance (see useSurfaceOrderDnd) keeps a plain click selecting;
+  // `guardReorderClick` swallows the click that follows a real drag. The row moves via
+  // transform while dragging.
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: conv.id,
+    data: { kind: "conv", repoId: conv.repoId } satisfies DragData,
+  });
+  const dragStyle = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : undefined,
+  };
+
   // "Busy" for delete-safety: a turn in flight OR any background work still running.
   const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
   // If the work settles while the confirm is open, its "still running / work may be
@@ -94,7 +113,12 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
 
   if (editing) {
     return (
-      <div className={"cv-sess-row" + (active ? " on" : "")} data-attn={attn ?? undefined}>
+      <div
+        ref={setNodeRef}
+        style={dragStyle}
+        className={"cv-sess-row" + (active ? " on" : "")}
+        data-attn={attn ?? undefined}
+      >
         <span className="cv-sess" style={{ cursor: "default" }}>
           <StatusDot status={status} />
           <input
@@ -115,7 +139,14 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   }
 
   return (
-    <div className={"cv-sess-row" + (active ? " on" : "")} data-attn={attn ?? undefined}>
+    <div
+      ref={setNodeRef}
+      style={dragStyle}
+      className={"cv-sess-row cv-draggable" + (active ? " on" : "")}
+      data-attn={attn ?? undefined}
+      {...listeners}
+      onClickCapture={guardReorderClick}
+    >
       <button
         type="button"
         className="cv-sess"
@@ -217,9 +248,21 @@ function RepoGroup({
   const removeRepo = useConversationsStore((s) => s.removeRepo);
   const [confirming, setConfirming] = useState(false);
 
+  // Whole header is the drag surface for reordering repositories (no grip). `listeners`
+  // + the click guard go on the header row below; the group moves via transform.
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: repo.id,
+    data: { kind: "repo" } satisfies DragData,
+  });
+  const dragStyle = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.6 : undefined,
+  };
+
   return (
-    <div className={"cv-repo" + (collapsed ? " collapsed" : "")}>
-      <div className="cv-repo-h">
+    <div ref={setNodeRef} style={dragStyle} className={"cv-repo" + (collapsed ? " collapsed" : "")}>
+      <div className="cv-repo-h cv-draggable" {...listeners} onClickCapture={guardReorderClick}>
         {/* Chevron + title — the collapse toggle. Flexes to fill all the space the buttons
             leave, so at rest the name runs right up to the + at the edge. */}
         <button
@@ -310,16 +353,21 @@ function RepoGroup({
       {collapsed ? null : items.length === 0 ? (
         <div className="cv-repo-empty">No conversations</div>
       ) : (
-        items.map((c) => <ConvRow key={c.id} conv={c} active={c.id === activeId} />)
+        <SortableContext items={items.map((c) => c.id)} strategy={verticalListSortingStrategy}>
+          {items.map((c) => <ConvRow key={c.id} conv={c} active={c.id === activeId} />)}
+        </SortableContext>
       )}
     </div>
   );
 }
 
 export function ConductorSidebar() {
-  // Repo-grouped, recency-ordered conversations — the shared selector used by both
-  // this sidebar and the FlightDeck grid (see useConversationsByRepo).
-  const groups = useConversationsByRepo();
+  // Repo-grouped conversations — recency-ordered, or the user's manual drag order when
+  // the "auto reorder" toggles are off (see useConversationsByRepo). `useSurfaceOrderDnd`
+  // wraps them with the drag wiring; `groups` is what to render (an ephemeral recency-mode
+  // drag override falls back to the automatic order on the next change).
+  const { displayGroups: groups, sensors, onDragStart, onDragEnd, onDragCancel } =
+    useSurfaceOrderDnd("sidebar", useConversationsByRepo());
   const activeId = useActiveConversationId();
   const openHistory = useHistoryUi((s) => s.openPanel);
   const settingsOpen = useSettingsUi((s) => s.open);
@@ -396,9 +444,23 @@ export function ConductorSidebar() {
             No repositories. Click <span className="wf-hi">＋</span> to open a folder.
           </div>
         ) : (
-          groups.map(({ repo, conversations: items }) => (
-            <RepoGroup key={repo.id} repo={repo} items={items} activeId={activeId} />
-          ))
+          <DndContext
+            sensors={sensors}
+            collisionDetection={orderCollisionDetection}
+            modifiers={[restrictToVerticalAxis]}
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
+            onDragCancel={onDragCancel}
+          >
+            <SortableContext
+              items={groups.map((g) => g.repo.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              {groups.map(({ repo, conversations: items }) => (
+                <RepoGroup key={repo.id} repo={repo} items={items} activeId={activeId} />
+              ))}
+            </SortableContext>
+          </DndContext>
         )}
       </div>
 
