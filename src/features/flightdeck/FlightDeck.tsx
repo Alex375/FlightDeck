@@ -46,8 +46,8 @@ function useNow(periodMs = 30_000): number {
   return now;
 }
 
-/** One repo swimlane: a sortable header (drag the grip to reorder repos) over a
- *  horizontally-scrolling card grid whose cards are themselves sortable within the lane. */
+/** One repo swimlane: a sortable header (the whole header is the drag surface — no grip)
+ *  over a horizontally-scrolling card grid whose cards are themselves sortable within the lane. */
 function RepoLane({
   repo,
   conversations,
