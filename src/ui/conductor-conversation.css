@@ -232,6 +232,13 @@
 .cv-cmd .wf-ico { color:var(--wf-accent); flex:none; }
 .cv-cmd-name { color:var(--wf-tx-hi); font-weight:600; }
 .cv-cmd-args { color:var(--wf-tx-lo); overflow-wrap:anywhere; }
+/* A `/goal <condition>` SET rendered as a dedicated card inside the user bubble: an accent
+   "Goal set" header (target glyph, matching the composer/Flight Deck goal chip) over the full
+   condition. Uses the bubble's own background — no nested box. */
+.cv-goalcard { display:flex; flex-direction:column; gap:6px; }
+.cv-goalcard-head { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:var(--wf-accent); }
+.cv-goalcard-head .wf-ico { color:var(--wf-accent); flex:none; }
+.cv-goalcard-cond { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.45; color:var(--wf-tx-hi); }
 /* A skill/command the MODEL invoked (the `Skill` tool, e.g. land → /done), shown inline in the
    assistant flow as its own command pill — distinct from a user-typed chip (which sits inside a
    user bubble). Reuses the `.cv-cmd` chip inside so "/done" reads identically either way. */
