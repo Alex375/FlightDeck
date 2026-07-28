@@ -32,6 +32,20 @@ describe("parseGoalCommand", () => {
     expect(parseGoalCommand("  /goal trim me  ")).toEqual({ action: "set", condition: "trim me" });
   });
 
+  it("tolerates an unterminated <command-args> like the Rust twin (command_args)", () => {
+    // The CLI has shipped wrappers without a closing tag; Rust's `command_args` takes the
+    // remainder so an unterminated SET stays a SET (kept in the thread as a card). The front
+    // must agree, else Rust keeps the line but the front renders a bare chip instead of a card.
+    expect(parseGoalCommand("<command-name>/goal</command-name>\n<command-args>ship the site")).toEqual(
+      { action: "set", condition: "ship the site" },
+    );
+    // …and an unterminated EMPTY args is still a bare status query.
+    expect(parseGoalCommand("<command-name>/goal</command-name>\n<command-args>")).toEqual({
+      action: "status",
+      condition: "",
+    });
+  });
+
   it("classifies clear and bare status (both shapes)", () => {
     expect(parseGoalCommand("/goal clear")).toEqual({ action: "clear", condition: "" });
     expect(parseGoalCommand("<command-name>/goal</command-name>\n<command-args>clear</command-args>")).toEqual(

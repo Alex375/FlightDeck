@@ -18,11 +18,25 @@ import { Ico } from "../../ui/kit";
 export type GoalAction = "set" | "clear" | "status";
 
 const GOAL_NAME_RE = /<command-name>\s*\/?goal\s*<\/command-name>/;
-const GOAL_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
+const ARGS_OPEN = "<command-args>";
+const ARGS_CLOSE = "</command-args>";
 // Bare `/goal` as typed: the word must END at `/goal` (whitespace or end-of-string), so
 // "/goalpost" is NOT a goal command. A condition may span multiple lines (unlike a generic
 // slash-command, whose args are single-line) — hence `[\s\S]*` rather than `[^\n]*`.
 const GOAL_BARE_RE = /^\/goal(?:\s+([\s\S]*))?$/;
+
+/** Inner text of the wrapped shape's `<command-args>…`. Mirrors Rust `command_args`
+ *  (history.rs): a MISSING closing tag is tolerated — the CLI has shipped unterminated
+ *  wrappers — by taking the remainder, so an unterminated SET still parses as a real condition
+ *  rather than empty. This keeps the front's card in step with the Rust normalizer, which KEEPS
+ *  such a line in the thread. No `<command-args>` tag at all → empty (a bare status query). */
+function wrappedArgs(text: string): string {
+  const start = text.indexOf(ARGS_OPEN);
+  if (start < 0) return "";
+  const rest = text.slice(start + ARGS_OPEN.length);
+  const end = rest.indexOf(ARGS_CLOSE);
+  return end < 0 ? rest : rest.slice(0, end);
+}
 
 /** Parse a `/goal` invocation in either shape (CLI-wrapped or as typed); `null` when the text
  *  isn't a `/goal` command. `condition` is the trimmed goal text for a SET, empty otherwise. */
@@ -31,8 +45,7 @@ export function parseGoalCommand(
 ): { action: GoalAction; condition: string } | null {
   let argsRaw: string;
   if (GOAL_NAME_RE.test(text)) {
-    const a = GOAL_ARGS_RE.exec(text);
-    argsRaw = a ? a[1] : "";
+    argsRaw = wrappedArgs(text);
   } else {
     const m = GOAL_BARE_RE.exec(text.trim());
     if (!m) return null;
