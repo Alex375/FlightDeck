@@ -9,6 +9,10 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.4.0
+
+- New: when you set a goal with `/goal`, it now shows up in the thread as its own card instead of being sent silently — so you can see the goal you just set.
+
 ## v1.3.0
 
 - New: arrange your conversations and repositories by hand — drag them anywhere (the whole row or card, no handle) in the sidebar or on the Flight Deck. A new "Reordering" settings tab lets you freeze the automatic order per view; new items still land on top and your order is kept across restarts.
