@@ -96,6 +96,12 @@ export type Segment =
   // DELIVERABLE, never intermediate work, so it is also peeled out of the clean-output work fold
   // (see splitFinalMessage) and shown in clear even when buried mid-round (see renderFoldedWork).
   | { kind: "artifact"; key: string; step: ToolStep }
+  // `AskUserQuestion` — an interactive question to the user — is a DECISION artifact exactly
+  // like a plan: it renders as its OWN inline card (question + chosen answer once settled)
+  // instead of an anonymous "Question" step row buried in a collapsed run, and it is peeled
+  // out of the clean-output work fold (see splitFinalMessage). Burying it made whole
+  // exchanges unreadable: a round of text → tools → question showed only tool rows.
+  | { kind: "question"; key: string; step: ToolStep }
   // An in-band marker (control-change bar / message injected mid-work) shown inline in the
   // flow. NOT work: it doesn't count as a step and never breaks the clean-output work fold —
   // it just renders at its chronological place (see coalesceCleanRounds / interleaveMarkers).
@@ -198,6 +204,13 @@ export function groupBlocks(
         out.push({ kind: "artifact", key: `art-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;
       }
+      // AskUserQuestion is a decision artifact (question + answer) — its own inline card,
+      // breaks the run so the exchange stays readable in the flow.
+      if (b.name === "AskUserQuestion") {
+        run = null;
+        out.push({ kind: "question", key: `q-${i}`, step: { id: b.id, name: b.name, input: b.input } });
+        return;
+      }
       if (!run) {
         run = [];
         out.push({ kind: "run", key: `run-${i}`, steps: run });
@@ -251,6 +264,9 @@ export function splitFinalMessage(segments: Segment[]): {
   // where the approved plan is followed by more work in the same group) is NOT peeled here — the
   // scan stops at the trailing run — but it is still shown in clear: CleanBlocks splits the fold
   // at each plan (see renderFoldedWork), so a buried plan is never hidden inside the work block.
+  // A trailing `question` (AskUserQuestion) is peeled like a plan: a response that closes on a
+  // question — typically prose explaining the situation, then the ask — must keep BOTH the
+  // question card and its preceding explanation in clear, not fold them as "work".
   let i = segments.length;
   while (
     i > 0 &&
@@ -259,7 +275,8 @@ export function splitFinalMessage(segments: Segment[]): {
       segments[i - 1].kind === "plan" ||
       // A trailing `artifact` is peeled too: a just-published artifact is a deliverable, not
       // intermediate work — it stays in clear under clean output (like a plan).
-      segments[i - 1].kind === "artifact")
+      segments[i - 1].kind === "artifact" ||
+      segments[i - 1].kind === "question")
   )
     i--;
   return { work: segments.slice(0, i), final: segments.slice(i) };
@@ -283,6 +300,9 @@ export type WorkAtom =
   // counts as a step nor holds the live window open (its publish settles quickly). It is pulled
   // back into clear by renderFoldedWork so a published artifact is never hidden.
   | { kind: "artifact"; key: string; step: ToolStep }
+  // A question card: a non-step atom (like plan) — folds only when buried mid-work, never
+  // counts as a step nor holds the live window open.
+  | { kind: "question"; key: string; step: ToolStep }
   | { kind: "thinking"; key: string; text: string }
   | { kind: "text"; key: string; text: string }
   // An in-band marker: a non-step atom (like text/thinking) — it folds with the surrounding
@@ -305,6 +325,8 @@ export function flattenWork(segs: Segment[]): WorkAtom[] {
       out.push({ kind: "plan", key: seg.key, step: seg.step });
     } else if (seg.kind === "artifact") {
       out.push({ kind: "artifact", key: seg.key, step: seg.step });
+    } else if (seg.kind === "question") {
+      out.push({ kind: "question", key: seg.key, step: seg.step });
     } else if (seg.kind === "thinking") {
       out.push({ kind: "thinking", key: seg.key, text: seg.text });
     } else if (seg.kind === "marker") {
@@ -338,6 +360,7 @@ export function atomsToSegments(atoms: WorkAtom[], keyPrefix: string): Segment[]
     else if (a.kind === "skill") out.push({ kind: "skill", key: a.key, step: a.step });
     else if (a.kind === "plan") out.push({ kind: "plan", key: a.key, step: a.step });
     else if (a.kind === "artifact") out.push({ kind: "artifact", key: a.key, step: a.step });
+    else if (a.kind === "question") out.push({ kind: "question", key: a.key, step: a.step });
     else if (a.kind === "thinking") out.push({ kind: "thinking", key: a.key, text: a.text });
     else if (a.kind === "marker")
       out.push({ kind: "marker", key: a.key, markerKind: a.markerKind, id: a.id });

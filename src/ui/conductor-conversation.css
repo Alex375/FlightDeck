@@ -501,6 +501,17 @@
 .cv-q-tab.is-done.is-active { color:var(--wf-tx-hi); }
 .cv-q-tab .wf-ico { width:12px; height:12px; }
 
+/* Inline question card (the `question` segment in the transcript flow): one row per
+   question — header chip, the question, the chosen answer once settled. */
+.cv-qcard { gap:9px; }
+.cv-qa { display:flex; align-items:flex-start; gap:9px; }
+.cv-qa .cv-q-tab { flex:0 0 auto; border-color:var(--wf-line-2); margin-top:1px; }
+.cv-qa-body { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.cv-qa-question { font-size:12.5px; line-height:1.45; color:var(--wf-tx); }
+.cv-qa-answer { display:inline-flex; align-items:center; gap:5px; font-size:12.5px; line-height:1.4; color:var(--wf-run); font-weight:500; }
+.cv-qa-answer .wf-ico { width:12px; height:12px; flex:0 0 auto; }
+.cv-qa-pending { color:var(--wf-tx-lo); font-weight:400; font-style:italic; }
+
 .cv-q-head { display:flex; align-items:center; gap:7px; font-size:13px; line-height:1.45; color:var(--wf-tx-hi); font-weight:500; }
 .cv-q-head .wf-ico { flex:0 0 auto; color:var(--wf-wait); }
 .cv-q-head > span:nth-child(2) { flex:1; }

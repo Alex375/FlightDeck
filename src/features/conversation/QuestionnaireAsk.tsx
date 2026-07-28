@@ -2,8 +2,10 @@ import { useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import type { JsonValue, PermissionRequestPayload } from "../../ipc/client";
 import { useAnswerPermission } from "../../ipc/useCommands";
+import { useConversationStore } from "../../store/conversationStore";
 import { Ico } from "../../ui/kit";
 import { AiAvatar } from "./ConvMark";
+import { resultContentText } from "./resultText";
 import { ToolResultBody } from "./ToolResultBody";
 
 // AskUserQuestion questionnaire — reproduces the Claude Code terminal UX:
@@ -408,6 +410,71 @@ export function QuestionnaireSummary({
             ) : (
               <div className="cv-qs-a empty">Not answered</div>
             )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---- Inline question card (transcript flow) --------------------------------
+// The flow-anchored face of an AskUserQuestion: the run-breaking `question`
+// segment (see toolGroup.ts) renders THIS card instead of an anonymous
+// "Question" step row lost inside a collapsed run. While the ask is pending
+// the interactive questionnaire still lives in the bottom AskTurn — this card
+// marks the exchange in place and shows the chosen answers once the
+// tool_result lands, so a settled round reads as question → decision.
+
+/** Parse the CLI's answer recap — `"Question"="Answer"` pairs — from the tool_result text. */
+export function parseAnswerPairs(text: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const m of text.matchAll(/"([^"]+)"="([^"]*)"/g)) out.set(m[1], m[2]);
+  return out;
+}
+
+export function QuestionCard({
+  session,
+  toolUseId,
+  input,
+}: {
+  session: string;
+  toolUseId: string;
+  input: JsonValue;
+}) {
+  const questions = useMemo(() => parseQuestions(input), [input]);
+  const result = useConversationStore((s) => s.sessions[session]?.toolResults[toolUseId]);
+  const answers = useMemo(
+    () => (result ? parseAnswerPairs(resultContentText(result.content) ?? "") : null),
+    [result],
+  );
+  if (questions.length === 0) return null;
+  return (
+    <div className="cv-q cv-qcard">
+      {questions.map((q, i) => {
+        const a = answers?.get(q.question) ?? null;
+        return (
+          <div key={i} className="cv-qa">
+            <span className={`cv-q-tab${a ? " is-done" : ""}`}>
+              <Ico name="form" className="sm" />
+              {q.header}
+            </span>
+            <div className="cv-qa-body">
+              <div className="cv-qa-question">{q.question}</div>
+              {a ? (
+                <div className="cv-qa-answer">
+                  <Ico name="check" className="sm" />
+                  <span>{a}</span>
+                </div>
+              ) : (
+                <div className="cv-qa-answer cv-qa-pending">
+                  {result
+                    ? result.isError
+                      ? "Question declined or interrupted."
+                      : "Free-form answer — see the thread."
+                    : "Waiting for the answer…"}
+                </div>
+              )}
+            </div>
           </div>
         );
       })}
