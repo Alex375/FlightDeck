@@ -501,16 +501,26 @@
 .cv-q-tab.is-done.is-active { color:var(--wf-tx-hi); }
 .cv-q-tab .wf-ico { width:12px; height:12px; }
 
-/* Inline question card (the `question` segment in the transcript flow): one row per
-   question — header chip, the question, the chosen answer once settled. */
+/* Unified answered-questionnaire card (the `question` segment in the flow + the expanded tool
+   detail + sub-agent transcripts): one row per question — header chip, the question, the chosen
+   answer(s) as chips once settled. */
 .cv-qcard { gap:9px; }
 .cv-qa { display:flex; align-items:flex-start; gap:9px; }
-.cv-qa .cv-q-tab { flex:0 0 auto; border-color:var(--wf-line-2); margin-top:1px; }
-.cv-qa-body { display:flex; flex-direction:column; gap:3px; min-width:0; }
+/* Standalone header chip — decoupled from the interactive `.cv-q-tab` so restyling the
+   questionnaire's tabs never leaks into this settled card. */
+.cv-qa-hdr { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; margin-top:1px; font-size:11px; color:var(--wf-tx-lo); border:1px solid var(--wf-line-2); border-radius:7px; padding:3px 8px; }
+.cv-qa-hdr .wf-ico { width:12px; height:12px; }
+.cv-qa-hdr.is-done { color:var(--wf-run); border-color:color-mix(in srgb, var(--wf-run) 35%, var(--wf-line-2)); }
+.cv-qa-body { display:flex; flex-direction:column; gap:4px; min-width:0; }
 .cv-qa-question { font-size:12.5px; line-height:1.45; color:var(--wf-tx); }
-.cv-qa-answer { display:inline-flex; align-items:center; gap:5px; font-size:12.5px; line-height:1.4; color:var(--wf-run); font-weight:500; }
-.cv-qa-answer .wf-ico { width:12px; height:12px; flex:0 0 auto; }
+.cv-qa-answer { display:flex; align-items:flex-start; gap:6px; font-size:12.5px; line-height:1.4; color:var(--wf-run); font-weight:500; }
+.cv-qa-answer .wf-ico { width:12px; height:12px; flex:0 0 auto; margin-top:2px; }
+.cv-qa-chips { display:flex; flex-wrap:wrap; gap:5px; }
+.cv-qa-chip { font-size:11.5px; line-height:1.3; padding:3px 9px; border-radius:7px; background:var(--wf-accent-dim); color:var(--wf-accent); border:1px solid color-mix(in srgb, var(--wf-accent) 35%, transparent); }
 .cv-qa-pending { color:var(--wf-tx-lo); font-weight:400; font-style:italic; }
+/* Raw-result fallback: an unrecognized answer payload shown verbatim under the questions so
+   nothing is ever silently hidden. */
+.cv-qa-raw { border-top:1px solid var(--wf-line); padding-top:9px; }
 
 .cv-q-head { display:flex; align-items:center; gap:7px; font-size:13px; line-height:1.45; color:var(--wf-tx-hi); font-weight:500; }
 .cv-q-head .wf-ico { flex:0 0 auto; color:var(--wf-wait); }
@@ -549,13 +559,6 @@
 .cv-q-recap-a { flex:1; font-size:12.5px; color:var(--wf-tx-hi); }
 .cv-q-recap-a.empty { color:var(--wf-tx-xlo); font-style:italic; }
 
-/* Answered-questionnaire recap inside the AskUserQuestion tool card (expanded). */
-.cv-qs { display:flex; flex-direction:column; gap:11px; }
-.cv-qs-row { display:flex; flex-direction:column; gap:5px; }
-.cv-qs-q { font-size:12px; line-height:1.4; color:var(--wf-tx); }
-.cv-qs-a { display:flex; flex-wrap:wrap; gap:5px; }
-.cv-qs-a.empty { font-size:11.5px; color:var(--wf-tx-xlo); font-style:italic; }
-.cv-qs-chip { font-size:11.5px; line-height:1.3; padding:3px 9px; border-radius:7px; background:var(--wf-accent-dim); color:var(--wf-accent); border:1px solid color-mix(in srgb, var(--wf-accent) 35%, transparent); }
 .cv-meta-grid { display:grid; grid-template-columns:1fr 1fr; gap:11px 14px; }
 .cv-meta-grid > div { display:flex; flex-direction:column; gap:3px; }
 .cv-meta-grid span:first-child { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--wf-tx-xlo); }

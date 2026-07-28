@@ -311,26 +311,61 @@ export function questionCount(input: JsonValue): number {
   return parseQuestions(input).length;
 }
 
-const ANSWER_PREFIX = "Your questions have been answered:";
-const ANSWER_SUFFIX = "You can now continue with these answers in mind.";
+// The CLI returns the chosen answers in the tool_result as a single string of
+// `"<question>"="<answer>"` pairs. The WRAPPING sentence has changed across
+// `claude` binary versions and BOTH wordings still occur in the wild (verified
+// on disk — even within a single session), so we anchor on a SET of known
+// prefixes/suffixes rather than one:
+//   - current : `The user answered: … Read the answers carefully — …`
+//   - legacy  : `Your questions have been answered: … You can now continue …`
+// The pair list between them is identical in both. ⚠️ Keep BOTH forever: old
+// transcripts reload with the legacy wording, new sessions emit the current one.
+const ANSWER_PREFIXES = ["The user answered:", "Your questions have been answered:"];
+const ANSWER_SUFFIXES = [
+  "Read the answers carefully",
+  "You can now continue with these answers in mind.",
+];
 
 /**
- * The CLI does NOT echo answers on the tool input — it returns them in the
- * tool_result as a single string:
- *   Your questions have been answered: "Q1"="A1", "Q2"="A2". You can now …
- * (multi-select answers are the labels joined by ", "). We already know every
- * question's exact text from `input.questions`, so we anchor on `"<question>"="`
- * and read each answer up to the next question's anchor — robust to commas,
- * accents and punctuation inside the answers. Returns {} if the format is not
- * recognized (e.g. a skip notice).
+ * True when the result text is a shape we understand: a recognized answer recap
+ * OR a skip/ignore notice (even if a given question ends up unanswered). A
+ * non-empty result that is NOT recognized (e.g. a future CLI wording we don't
+ * parse yet) must never be mislabelled "Not answered" — the card shows it RAW
+ * instead, so an answer is never silently hidden.
  */
-function parseAnsweredResult(content: JsonValue, questions: Question[]): Record<string, string> {
-  if (typeof content !== "string") return {};
-  const at = content.indexOf(ANSWER_PREFIX);
+export function resultRecognized(text: string): boolean {
+  return ANSWER_PREFIXES.some((p) => text.includes(p)) || /skip|ignor/i.test(text);
+}
+
+/**
+ * Parse the `"<question>"="<answer>"` recap from the tool_result text (already
+ * flattened to a string via resultContentText). We know each question's exact
+ * text from `input.questions`, so we anchor on `"<question>"="` and read each
+ * answer up to the next question's anchor — robust to commas, quotes, accents
+ * and punctuation INSIDE an answer (a naive `"q"="a"` regex truncates a
+ * free-text "Other" answer that contains a `"`). Returns {} when no known prefix
+ * is present (unknown format / skip notice).
+ */
+export function parseAnsweredResult(text: string, questions: Question[]): Record<string, string> {
+  // First matching prefix wins (both wordings never coexist in one result).
+  let at = -1;
+  let plen = 0;
+  for (const p of ANSWER_PREFIXES) {
+    const i = text.indexOf(p);
+    if (i >= 0 && (at < 0 || i < at)) {
+      at = i;
+      plen = p.length;
+    }
+  }
   if (at < 0) return {};
-  let body = content.slice(at + ANSWER_PREFIX.length).trim();
-  const sfx = body.lastIndexOf(ANSWER_SUFFIX);
-  if (sfx >= 0) body = body.slice(0, sfx).trim();
+  let body = text.slice(at + plen).trim();
+  for (const s of ANSWER_SUFFIXES) {
+    const sfx = body.lastIndexOf(s);
+    if (sfx >= 0) {
+      body = body.slice(0, sfx).trim();
+      break;
+    }
+  }
   if (body.endsWith(".")) body = body.slice(0, -1).trim();
 
   const out: Record<string, string> = {};
@@ -356,82 +391,114 @@ function parseAnsweredResult(content: JsonValue, questions: Question[]): Record<
 }
 
 /**
- * Read-only recap of an answered questionnaire, shown when the AskUserQuestion
- * tool card is expanded in the thread. Renders each question with its chosen
- * answer(s) as chips — a human view of exactly what was sent back to Claude. The
- * answers live on the tool input (`input.answers`, keyed by question text, the
- * same shape the official extension reads). If they are absent, we fall back to
- * the raw tool_result text so nothing is ever hidden.
+ * Split a stored answer into chips: a multi-select answer is a ", "-joined list
+ * of labels → one chip each; a single answer (possibly a free-text "Other" that
+ * contains commas) stays whole. Mirrors the CLI's join and the historical recap.
  */
-export function QuestionnaireSummary({
+export function answerChips(answer: string, multiSelect: boolean): string[] {
+  const a = answer.trim();
+  if (!a) return [];
+  return multiSelect ? a.split(", ").filter(Boolean) : [a];
+}
+
+// ---- Unified answered-questionnaire card -----------------------------------
+// The single settled face of an AskUserQuestion, used in THREE surfaces: the
+// main thread flow (via the live `QuestionCard` wrapper below), the expanded
+// tool detail (ToolDetail), and sub-agent transcripts (SubAgentTranscript). It
+// renders each question with its chosen answer(s) as chips — a human view of
+// exactly what was sent back to Claude. Answers come from `input.answers` first
+// (the shape the official extension reads), else parsed from the tool_result.
+// ⚠️ Zero silent error: when the result is present but in a shape we DON'T
+// recognize (e.g. a future CLI wording), the RAW text is shown under the
+// questions so an answer is never hidden — that exact failure mode (a changed
+// CLI wording) is what once made the whole recap read as raw text.
+
+/** Answers for a card: `input.answers` (keyed by question text) wins; else parse the result. */
+function resolveAnswers(input: JsonValue, resultText: string, questions: Question[]): Record<string, string> {
+  const fromInput = asObject(asObject(input).answers);
+  if (Object.keys(fromInput).length > 0) {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(fromInput)) if (typeof v === "string") out[k] = v;
+    return out;
+  }
+  return parseAnsweredResult(resultText, questions);
+}
+
+/** Label for a question left without a parsed answer (chips empty) when NOT in the raw-fallback
+ *  case: pending (no result yet), skipped, declined/interrupted, or an optional blank answer. */
+function emptyStateLabel(result: { isError: boolean } | undefined, resultText: string): string {
+  if (!result) return "Waiting for the answer…";
+  if (/skip|ignor/i.test(resultText)) return "Not answered";
+  if (result.isError) return "Question declined or interrupted.";
+  return "Not answered";
+}
+
+export function QuestionnaireCard({
   input,
   result,
 }: {
   input: JsonValue;
-  result?: JsonValue;
+  result?: { content: JsonValue; isError: boolean };
 }) {
   const questions = parseQuestions(input);
-  if (questions.length === 0) {
-    return <ToolResultBody content={result ?? null} isError={false} />;
-  }
+  const resultText = result ? resultContentText(result.content) ?? "" : "";
+  if (questions.length === 0)
+    // Malformed input: never hide the payload — show the raw result if there is one.
+    return result ? <ToolResultBody content={result.content} isError={result.isError} /> : null;
 
-  // Answers come from the tool_result string (CLI format); a future CLI that
-  // echoes them on the input is honored first.
-  const fromInput = asObject(asObject(input).answers);
-  const answers = Object.keys(fromInput).length > 0 ? fromInput : parseAnsweredResult(result ?? null, questions);
-
-  const resultStr = typeof result === "string" ? result : "";
-  const recognized = resultStr.includes(ANSWER_PREFIX) || /skip|ignor/i.test(resultStr);
-  // Unknown result shape and nothing parsed → show the raw text rather than
-  // mislabelling every question "Not answered".
-  if (Object.keys(answers).length === 0 && resultStr && !recognized) {
-    return <ToolResultBody content={result ?? null} isError={false} />;
-  }
+  const answers = resolveAnswers(input, resultText, questions);
+  const anyAnswer = questions.some((q) => (answers[q.question] ?? "").trim() !== "");
+  // Present, non-empty result that yielded no answers and isn't a shape we know → show it RAW
+  // (once, under the questions) rather than mislabelling every question "Not answered".
+  const rawFallback = !anyAnswer && !!result && resultText.trim() !== "" && !resultRecognized(resultText);
 
   return (
-    <div className="cv-qs">
+    <div className="cv-q cv-qcard">
       {questions.map((q, i) => {
-        const raw = answers[q.question];
-        const answer = typeof raw === "string" ? raw.trim() : "";
-        // Multi-select answers are a comma-joined list → one chip each; a single
-        // answer (possibly free text with commas) stays whole.
-        const chips = answer ? (q.multiSelect ? answer.split(", ").filter(Boolean) : [answer]) : [];
+        const chips = answerChips(answers[q.question] ?? "", q.multiSelect);
         return (
-          <div key={i} className="cv-qs-row">
-            <div className="cv-qs-q">{q.question}</div>
-            {chips.length > 0 ? (
-              <div className="cv-qs-a">
-                {chips.map((c, j) => (
-                  <span key={j} className="cv-qs-chip">
-                    {c}
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <div className="cv-qs-a empty">Not answered</div>
-            )}
+          <div key={i} className="cv-qa">
+            <span className={`cv-qa-hdr${chips.length ? " is-done" : ""}`}>
+              <Ico name="form" className="sm" />
+              {q.header}
+            </span>
+            <div className="cv-qa-body">
+              <div className="cv-qa-question">{q.question}</div>
+              {chips.length > 0 ? (
+                <div className="cv-qa-answer">
+                  <Ico name="check" className="sm" />
+                  <div className="cv-qa-chips">
+                    {chips.map((c, j) => (
+                      <span key={j} className="cv-qa-chip">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : rawFallback ? null : (
+                <div className="cv-qa-answer cv-qa-pending">{emptyStateLabel(result, resultText)}</div>
+              )}
+            </div>
           </div>
         );
       })}
+      {rawFallback && (
+        <div className="cv-qa-raw">
+          <ToolResultBody content={result!.content} isError={result!.isError} />
+        </div>
+      )}
     </div>
   );
 }
 
-// ---- Inline question card (transcript flow) --------------------------------
+// ---- Inline question card (live main-thread flow) --------------------------
 // The flow-anchored face of an AskUserQuestion: the run-breaking `question`
 // segment (see toolGroup.ts) renders THIS card instead of an anonymous
-// "Question" step row lost inside a collapsed run. While the ask is pending
-// the interactive questionnaire still lives in the bottom AskTurn — this card
-// marks the exchange in place and shows the chosen answers once the
-// tool_result lands, so a settled round reads as question → decision.
-
-/** Parse the CLI's answer recap — `"Question"="Answer"` pairs — from the tool_result text. */
-export function parseAnswerPairs(text: string): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const m of text.matchAll(/"([^"]+)"="([^"]*)"/g)) out.set(m[1], m[2]);
-  return out;
-}
-
+// "Question" step row lost inside a collapsed run. While the ask is pending the
+// interactive questionnaire still lives in the bottom AskTurn — this thin
+// wrapper just reads the tool_result from the store by id and delegates to the
+// shared QuestionnaireCard, so the live, expanded-detail and sub-agent surfaces
+// stay identical.
 export function QuestionCard({
   session,
   toolUseId,
@@ -441,43 +508,6 @@ export function QuestionCard({
   toolUseId: string;
   input: JsonValue;
 }) {
-  const questions = useMemo(() => parseQuestions(input), [input]);
   const result = useConversationStore((s) => s.sessions[session]?.toolResults[toolUseId]);
-  const answers = useMemo(
-    () => (result ? parseAnswerPairs(resultContentText(result.content) ?? "") : null),
-    [result],
-  );
-  if (questions.length === 0) return null;
-  return (
-    <div className="cv-q cv-qcard">
-      {questions.map((q, i) => {
-        const a = answers?.get(q.question) ?? null;
-        return (
-          <div key={i} className="cv-qa">
-            <span className={`cv-q-tab${a ? " is-done" : ""}`}>
-              <Ico name="form" className="sm" />
-              {q.header}
-            </span>
-            <div className="cv-qa-body">
-              <div className="cv-qa-question">{q.question}</div>
-              {a ? (
-                <div className="cv-qa-answer">
-                  <Ico name="check" className="sm" />
-                  <span>{a}</span>
-                </div>
-              ) : (
-                <div className="cv-qa-answer cv-qa-pending">
-                  {result
-                    ? result.isError
-                      ? "Question declined or interrupted."
-                      : "Free-form answer — see the thread."
-                    : "Waiting for the answer…"}
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
+  return <QuestionnaireCard input={input} result={result ?? undefined} />;
 }

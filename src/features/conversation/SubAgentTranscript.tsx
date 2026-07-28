@@ -23,6 +23,7 @@ import {
   type Segment,
 } from "./toolGroup";
 import { ClaudeWorkBlock, StaticToolStep, ToolSection } from "./ToolSection";
+import { QuestionnaireCard } from "./QuestionnaireAsk";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
@@ -40,17 +41,21 @@ function renderSegments(segments: Segment[], results: Map<string, JoinedResult>)
   return segments.map((seg) => {
     if (seg.kind === "text") return <StreamMarkdown key={seg.key} text={seg.text} />;
     if (seg.kind === "thinking") return <ThinkingBlock key={seg.key} text={seg.text} finalized />;
-    // A nested sub-agent OR workflow OR proposed plan OR artifact OR question in a settled
-    // transcript: one step row (no live card to drill into). These `.step` segments (vs the
-    // run branch's `.steps`) MUST be handled here — otherwise they fall through to the run
-    // branch and crash. A sub-agent proposing a plan / asking a question is a non-case in
-    // practice, but the union requires the branch.
+    // A settled AskUserQuestion renders the SAME unified card as the live thread (question +
+    // chosen-answer chips), so sub-agent transcripts read identically — not an anonymous step row.
+    if (seg.kind === "question")
+      return (
+        <QuestionnaireCard key={seg.key} input={seg.step.input} result={results.get(seg.step.id)} />
+      );
+    // A nested sub-agent OR workflow OR proposed plan OR artifact in a settled transcript: one
+    // step row (no live card to drill into). These `.step` segments (vs the run branch's
+    // `.steps`) MUST be handled here — otherwise they fall through to the run branch and crash.
+    // A sub-agent proposing a plan is a non-case in practice, but the union requires the branch.
     if (
       seg.kind === "agent" ||
       seg.kind === "workflow" ||
       seg.kind === "plan" ||
-      seg.kind === "artifact" ||
-      seg.kind === "question"
+      seg.kind === "artifact"
     )
       return <StaticToolStep key={seg.key} step={seg.step} result={results.get(seg.step.id)} />;
     // A model-invoked slash-command: the same dedicated command chip as the live thread.

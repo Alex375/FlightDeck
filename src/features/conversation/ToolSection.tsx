@@ -24,7 +24,7 @@ import { Ico } from "../../ui/kit";
 import { DiffView } from "./DiffView";
 import { applyPatchChanges, parseUnifiedDiff } from "./unifiedDiff";
 import { MentionPathChip } from "./FileMention";
-import { QuestionnaireSummary } from "./QuestionnaireAsk";
+import { QuestionnaireCard } from "./QuestionnaireAsk";
 import { resultContentText } from "./resultText";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { ToolResultBody } from "./ToolResultBody";
@@ -76,7 +76,7 @@ export function ToolDetail({
 }) {
   const meta = toolMeta(name, input);
 
-  if (name === "AskUserQuestion") return <QuestionnaireSummary input={input} result={result?.content} />;
+  if (name === "AskUserQuestion") return <QuestionnaireCard input={input} result={result} />;
 
   // Codex's file-edit tool: `changes: [{path, kind, diff}]`, each `diff` a per-file unified
   // diff. Parse each into DiffView's line model (the result is authoritative — the input can
