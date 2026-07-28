@@ -12,6 +12,7 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 ## v1.4.0
 
 - New: when you set a goal with `/goal`, it now shows up in the thread as its own card instead of being sent silently — so you can see the goal you just set.
+- Improved: when the agent asks you a multiple-choice question, the question and the answer you picked now appear as their own card in the thread — the exchange stays readable instead of being folded away with the intermediate work.
 
 ## v1.3.0
 

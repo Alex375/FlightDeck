@@ -335,6 +335,15 @@ Logiciel desktop interne pour utiliser Claude Code de manière optimisée pour n
 ## Principe directeur : performance
 Le logiciel doit être **rapide et très optimisé** — c'est une exigence cœur, non négociable. Tous les arbitrages techniques se tranchent en faveur de la perf (cœur natif, pas de surcouche lourde). C'est la raison d'être des choix de stack ci-dessous.
 
+## Principe directeur : réversibilité & contrôle utilisateur (options/réglages)
+Dès qu'on **ajoute une fonctionnalité** ou qu'on **change une fonctionnalité existante d'une manière qui altère vraiment l'expérience utilisateur**, on laisse à l'utilisateur le moyen de **l'activer / le désactiver**, donc de **revenir au comportement précédent**. Par défaut, dès qu'on peut exposer un réglage utile sur ce qu'on fabrique, **on le fait**.
+
+⚠️ **La distinction est essentielle** : ce principe vise les **vraies features / vrais changements de comportement voulus**, **PAS les corrections de bugs** ni les petits ajustements qui *règlent* un problème. Un bugfix (un rendu qui affichait mal, un parsing qui tronquait, une carte au lieu d'une ligne illisible…) ne mérite **pas** de toggle — on corrige, point. On n'ajoute un réglage que quand le changement modifie **délibérément ce que vit l'utilisateur**, pas quand il répare ce qui était cassé ou améliore à la marge.
+
+Règle de décision quand on hésite : **ne pas trancher seul**. Si on ne sait pas si un changement relève de la feature (→ toggle) ou du bugfix (→ pas de toggle), où placer l'option, ou quel doit être son défaut, on **le demande ou le suggère explicitement à l'utilisateur** avant de figer le comportement.
+
+Le *mécanisme concret* (page Réglages à onglets, préférences `tosse:display` en localStorage, briques `ToggleRow`/`SettingsGroup`) vit au niveau du contexte **repo** : ce principe dit *qu'il faut* une option ; le repo dit *comment* la câbler.
+
 ## Structure générale de l'UI (grandes lignes)
 Deux vues principales :
 1. **Vue Gestion d'agents** — l'aperçu de tous les agents en cours.
