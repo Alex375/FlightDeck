@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import type { JsonValue, PermissionRequestPayload } from "../../ipc/client";
 import { useAnswerPermission } from "../../ipc/useCommands";
-import { useConversationStore } from "../../store/conversationStore";
+import { useToolResult } from "../../store/conversationStore";
 import { Ico } from "../../ui/kit";
 import { AiAvatar } from "./ConvMark";
 import { resultContentText } from "./resultText";
@@ -402,9 +402,13 @@ export function answerChips(answer: string, multiSelect: boolean): string[] {
 }
 
 // ---- Unified answered-questionnaire card -----------------------------------
-// The single settled face of an AskUserQuestion, used in THREE surfaces: the
-// main thread flow (via the live `QuestionCard` wrapper below), the expanded
-// tool detail (ToolDetail), and sub-agent transcripts (SubAgentTranscript). It
+// The single settled face of an AskUserQuestion. Two surfaces render it: the main
+// thread flow (via the `QuestionCard` wrapper below, reading the live store) and
+// settled sub-agent transcripts (SubAgentTranscript, results handed in from disk)
+// — both peel `AskUserQuestion` into its own
+// `question` segment, so it never reaches a tool row. ToolDetail keeps a branch
+// for it as a fall-through safety net only (unreachable while groupBlocks peels
+// the tool; kept so a step row could never render an ask as raw JSON). It
 // renders each question with its chosen answer(s) as chips — a human view of
 // exactly what was sent back to Claude. Answers come from `input.answers` first
 // (the shape the official extension reads), else parsed from the tool_result.
@@ -496,9 +500,9 @@ export function QuestionnaireCard({
 // segment (see toolGroup.ts) renders THIS card instead of an anonymous
 // "Question" step row lost inside a collapsed run. While the ask is pending the
 // interactive questionnaire still lives in the bottom AskTurn — this thin
-// wrapper just reads the tool_result from the store by id and delegates to the
-// shared QuestionnaireCard, so the live, expanded-detail and sub-agent surfaces
-// stay identical.
+// wrapper just reads the tool_result from the store by id (through the shared
+// `useToolResult` selector) and delegates to the shared QuestionnaireCard, so the
+// thread and sub-agent-transcript surfaces stay identical.
 export function QuestionCard({
   session,
   toolUseId,
@@ -508,6 +512,6 @@ export function QuestionCard({
   toolUseId: string;
   input: JsonValue;
 }) {
-  const result = useConversationStore((s) => s.sessions[session]?.toolResults[toolUseId]);
-  return <QuestionnaireCard input={input} result={result ?? undefined} />;
+  const result = useToolResult(session, toolUseId);
+  return <QuestionnaireCard input={input} result={result} />;
 }

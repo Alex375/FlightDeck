@@ -76,6 +76,9 @@ export function ToolDetail({
 }) {
   const meta = toolMeta(name, input);
 
+  // Safety net, not a live path: `groupBlocks` peels AskUserQuestion into its own `question`
+  // segment (rendered by QuestionCard / SubAgentTranscript), so it never reaches a step row.
+  // Kept so that if it ever did, an ask would still read as a questionnaire, not raw JSON.
   if (name === "AskUserQuestion") return <QuestionnaireCard input={input} result={result} />;
 
   // Codex's file-edit tool: `changes: [{path, kind, diff}]`, each `diff` a per-file unified
