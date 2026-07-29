@@ -12,6 +12,7 @@ import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
 import { Ico } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { UpdateSection } from "./UpdateSection";
+import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { AccountsSection } from "./AccountsSection";
@@ -157,7 +158,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {section === "notifications" && <NotificationsSection />}
 
-            {section === "updates" && <UpdateSection />}
+            {section === "updates" && (
+              <>
+                <UpdateSection />
+                <ClaudeCliSection />
+              </>
+            )}
 
             {section === "data" && (
               <div>

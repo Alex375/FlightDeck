@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod cli_update;
 pub mod extensions;
 pub mod fs;
 pub mod git;
@@ -25,7 +26,7 @@ use ipc::commands::{
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
     account_claude_logout, account_claude_status, account_codex_login_cancel,
     account_codex_login_start, account_codex_logout, account_codex_status,
-    claude_available,
+    claude_available, claude_cli_status, claude_cli_update, set_claude_cli_auto_update,
     codex_available, codex_archive, codex_compact, codex_fork, codex_list_extensions,
     codex_list_hooks, codex_list_models, codex_list_plugins, codex_list_skills,
     codex_load_history, codex_marketplace_add, codex_marketplace_remove,
@@ -170,6 +171,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_active_conversation,
             wipe_all_data,
             set_awake,
+            claude_cli_status,
+            claude_cli_update,
+            set_claude_cli_auto_update,
         ])
         .events(collect_events![
             TickEvent,

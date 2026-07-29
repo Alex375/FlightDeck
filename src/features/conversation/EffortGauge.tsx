@@ -25,7 +25,7 @@ const LABELS: Record<EffortLevel, string> = EFFORT_LABELS;
 // Claude, `ultra` the deeper Codex-only rung above it (gpt-5.6); `ultracode` (xhigh +
 // workflows) stays the app's special top step. The ordering also drives clampEffort —
 // keeping max AFTER xhigh means clamping an xhigh request on a max-but-not-xhigh model
-// (Sonnet 4.6) lands on `high`, never jumps UP to max; ultra ranks above max so a
+// (e.g. legacy Sonnet 4.6) lands on `high`, never jumps UP to max; ultra ranks above max so a
 // Codex `ultra` clamps down to `max` on a Claude model, and `ultracode` clamps down to
 // `ultra` on a gpt-5.6 Codex model.
 const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
@@ -34,7 +34,7 @@ const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", 
  *  gates `max`, `eve` gates `xhigh`; both verified live against 2.1.187). `[]` = no
  *  effort. A level the model doesn't accept is silently swallowed by the CLI, so we
  *  only offer what's safe; the live `get_settings` read-back keeps the gauge honest
- *  if reality ever differs. NOTE: Sonnet 4.6 accepts `max` but NOT `xhigh`. */
+ *  if reality ever differs. NOTE: Sonnet 5 accepts `xhigh` (legacy Sonnet 4.6 had `max` but not `xhigh`). */
 export function effortLevelsForModel(model: string | null | undefined): EffortLevel[] {
   const m = (model || "").toLowerCase();
   // Codex models: gpt-5.x top out at xhigh; the gpt-5.6 family (sol/terra/luna) adds the
@@ -47,7 +47,7 @@ export function effortLevelsForModel(model: string | null | undefined): EffortLe
   if (m.includes("haiku")) return []; // Haiku 4.5 has no effort support → slider hidden
   if (m.includes("opus")) return ["low", "medium", "high", "xhigh", "max"]; // xhigh + max
   if (m.includes("fable")) return ["low", "medium", "high", "xhigh", "max"]; // same tier as Opus
-  if (m.includes("sonnet")) return ["low", "medium", "high", "max"]; // max, but no xhigh
+  if (m.includes("sonnet")) return ["low", "medium", "high", "xhigh", "max"]; // Sonnet 5 gained xhigh
   return ["low", "medium", "high"]; // safe fallback
 }
 

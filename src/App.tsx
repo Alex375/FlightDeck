@@ -20,9 +20,11 @@ import { useHistoryUi } from "./features/history/historyUiStore";
 import { useEditorStore } from "./features/editor/editorStore";
 import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
 import { UpdateBanner } from "./features/settings/UpdateBanner";
+import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { startUpdaterAutoCheck } from "./store/updater";
+import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
 import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
@@ -102,6 +104,7 @@ export default function App() {
     void bootConversations();
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();
+    startClaudeCliAutoCheck();
     // Prime OS notification permission so the first agent notification doesn't
     // race a permission prompt, and unlock audio on the first user gesture so a
     // background chime isn't blocked by the webview's autoplay policy.
@@ -252,7 +255,7 @@ export default function App() {
   return (
     <Win
       title={view === "flightdeck" ? "Flight Deck" : active?.name ?? "Conductor"}
-      banner={<><UpdateBanner /><AppErrorBanner /></>}
+      banner={<><UpdateBanner /><ClaudeCliBanner /><AppErrorBanner /></>}
       nav={
         <>
           <NavBtn

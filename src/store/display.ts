@@ -129,6 +129,11 @@ export interface DisplayPrefs {
    *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
    *  that are in manual mode. Read via {@link slotFor}. */
   sharedManualOrder: boolean;
+
+  /** Show the dismissable banner offering to update the piloted `claude` binary when a newer
+   *  version is published. ON by default. Off → no banner (Settings → Updates → Claude Code CLI
+   *  still lets you check/update). Read by {@link ClaudeCliBanner}. */
+  showClaudeCliBanner: boolean;
 }
 
 // Off by default: the transcript shows everything inline as before. The user opts in
@@ -156,6 +161,7 @@ const DEFAULTS: DisplayPrefs = {
   autoOrderFleetConvs: true,
   autoOrderFleetRepos: true,
   sharedManualOrder: true,
+  showClaudeCliBanner: true,
 };
 
 function load(): DisplayPrefs {
@@ -206,6 +212,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
         autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
         sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
+        showClaudeCliBanner: patch.showClaudeCliBanner ?? s.showClaudeCliBanner,
       };
       save(next);
       return next;

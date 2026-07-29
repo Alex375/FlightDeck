@@ -15,7 +15,7 @@ describe("backendOfModel", () => {
     expect(backendOfModel("sonnet")).toBe("claude");
     expect(backendOfModel("haiku")).toBe("claude");
     expect(backendOfModel("fable")).toBe("claude");
-    expect(backendOfModel("claude-opus-4-8[1m]")).toBe("claude");
+    expect(backendOfModel("claude-opus-5[1m]")).toBe("claude");
   });
 
   it("classifies the Codex model ids as codex (exact + resolved)", () => {
@@ -39,13 +39,13 @@ describe("backendOfModel", () => {
 
 describe("modelLabel", () => {
   it("labels exact catalogue ids", () => {
-    expect(modelLabel("opus")).toBe("Opus 4.8");
+    expect(modelLabel("opus")).toBe("Opus 5");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
   });
 
   it("labels resolved Claude ids by family", () => {
-    expect(modelLabel("claude-sonnet-4-6")).toBe("Sonnet 4.6");
+    expect(modelLabel("claude-sonnet-5")).toBe("Sonnet 5");
   });
 
   it("falls back to the raw id / placeholder", () => {
@@ -56,7 +56,7 @@ describe("modelLabel", () => {
 
 describe("modelFamily (menu highlight)", () => {
   it("maps a resolved Claude id back to its picker value", () => {
-    expect(modelFamily("claude-opus-4-8[1m]")).toBe("opus");
+    expect(modelFamily("claude-opus-5[1m]")).toBe("opus");
   });
   it("maps a Codex id (exact + longest-first) to its value", () => {
     expect(modelFamily("gpt-5.5")).toBe("gpt-5.5");

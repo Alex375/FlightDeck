@@ -248,7 +248,7 @@ pub fn set_model_request(request_id: &str, model: &str) -> Value {
 /// authority. HISTORY: up to 2.1.186 `"max"` was a `--effort` SPAWN-flag alias only
 /// and the runtime control swallowed it; 2.1.187 promoted it to a real runtime level
 /// (top tier, above `xhigh` — xhigh is "just below maximum"). WHICH levels a model
-/// accepts is per-model (e.g. Sonnet 4.6 takes `max` but NOT `xhigh`); that gating is
+/// accepts is per-model (e.g. legacy Sonnet 4.6 took `max` but NOT `xhigh`); that gating is
 /// the front-end gauge's job ([`effortLevelsForModel`] in `EffortGauge.tsx`), not
 /// this list. `"ultracode"` is still a SEPARATE boolean flag (see
 /// [`set_ultracode_request`]), never an effort value.

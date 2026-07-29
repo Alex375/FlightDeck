@@ -13,6 +13,8 @@ import type {
   GoalState,
   DiskConversation,
   ClaudeAccountStatus,
+  ClaudeCliStatus,
+  ClaudeUpdateOutcome,
   CodexAccountStatus,
   CodexControls,
   CodexHooksSnapshot,
@@ -776,6 +778,32 @@ export const mockCommands = {
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {
     // No real power assertion in the browser/dev mock — the toggle is inert here.
+    return ok(null);
+  },
+
+  async claudeCliStatus(): Promise<ClaudeCliStatus> {
+    // Dev/Playwright: pretend the CLI is installed and current, auto-update on.
+    return {
+      installed_version: "2.1.220",
+      latest_version: "2.1.220",
+      update_available: false,
+      auto_update_enabled: true,
+      install_method: "native",
+      channel: "latest",
+      config_warning: null,
+    };
+  },
+
+  async claudeCliUpdate(): Promise<Result<ClaudeUpdateOutcome, string>> {
+    return ok({
+      updated: false,
+      from: null,
+      to: "2.1.220",
+      message: "Claude Code is up to date (2.1.220)",
+    });
+  },
+
+  async setClaudeCliAutoUpdate(_enabled: boolean): Promise<Result<null, string>> {
     return ok(null);
   },
 

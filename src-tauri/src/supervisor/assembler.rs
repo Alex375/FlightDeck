@@ -1183,9 +1183,9 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
 fn model_label(id: &str) -> String {
     let s = id.to_lowercase();
     if s.contains("opus") {
-        "Opus 4.8".to_string()
+        "Opus 5".to_string()
     } else if s.contains("sonnet") {
-        "Sonnet 4.6".to_string()
+        "Sonnet 5".to_string()
     } else if s.contains("haiku") {
         "Haiku 4.5".to_string()
     } else if s.contains("fable") {
@@ -2138,14 +2138,14 @@ mod tests {
         let init: CliMessage = serde_json::from_value(serde_json::json!({
             "type": "system", "subtype": "init",
             "session_id": "s", "uuid": "u", "cwd": "/x",
-            "model": "claude-sonnet-4-6", "permissionMode": "default",
+            "model": "claude-sonnet-5", "permissionMode": "default",
             "tools": ["Bash"], "slash_commands": []
         }))
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
         assert_eq!(detail["control"], serde_json::json!("Model"));
-        assert_eq!(detail["from"], serde_json::json!("Opus 4.8"));
-        assert_eq!(detail["to"], serde_json::json!("Sonnet 4.6"));
+        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
     }
 
     /// `system/bridge_state` is a Remote Control HEALTH signal: a `disconnected` /

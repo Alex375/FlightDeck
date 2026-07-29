@@ -1441,6 +1441,43 @@ async setAwake(awake: boolean) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Read the Claude CLI (`claude` binary) update status: installed + latest published version,
+ * whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
+ * missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel
+ * always renders. Distinct from the app's own updater (`tauri-plugin-updater`) — this manages
+ * the piloted `claude` binary. See [`crate::cli_update`].
+ */
+async claudeCliStatus() : Promise<ClaudeCliStatus> {
+    return await TAURI_INVOKE("claude_cli_status");
+},
+/**
+ * Run `claude update` (check + install in one shot — the CLI has no check-only mode) and
+ * report the outcome. Bounded so a wedged download can't hang. `Err` only when the process
+ * couldn't run / timed out / exited non-zero.
+ */
+async claudeCliUpdate() : Promise<Result<ClaudeUpdateOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_cli_update") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Flip the Claude CLI's background auto-updater (`enabled == true` → auto-update ON) by
+ * writing `env.DISABLE_AUTOUPDATER` in `~/.claude/settings.json`, through the single
+ * settings.json writer (`extensions`) so the atomic/anti-race discipline holds. Blocking file
+ * IO is deported off the async runtime.
+ */
+async setClaudeCliAutoUpdate(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_claude_cli_auto_update", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1683,6 +1720,68 @@ authMethod: string | null; email: string | null; orgName: string | null;
  * `max` | `pro` | … when on a subscription.
  */
 subscriptionType: string | null }
+/**
+ * Snapshot for the Settings "Claude CLI" section + the update banner. Every version field is
+ * `Option` because each source can be independently unavailable (binary missing →
+ * `installed_version: None`; offline → `latest_version: None`).
+ */
+export type ClaudeCliStatus = { 
+/**
+ * Active binary version (`claude --version`), e.g. `"2.1.220"`. `None` if the binary
+ * can't be found or run.
+ */
+installed_version: string | null; 
+/**
+ * Latest published version (npm registry `latest` dist-tag). `None` when the check
+ * couldn't run (offline, registry error) — best-effort, never surfaced as an error.
+ */
+latest_version: string | null; 
+/**
+ * `true` only when BOTH versions are known and latest is strictly newer than installed.
+ */
+update_available: boolean; 
+/**
+ * Whether the CLI's background auto-updater is on (i.e. `env.DISABLE_AUTOUPDATER` is NOT
+ * `"1"` in `settings.json`). Defaults to `true` — the CLI's own default.
+ */
+auto_update_enabled: boolean; 
+/**
+ * How the CLI was installed (`~/.claude.json` `installMethod`: `"native"`, `"npm"`, …).
+ * `None` if unknown. Informational: a native install auto-updates; npm/brew don't — the
+ * UI can hint accordingly.
+ */
+install_method: string | null; 
+/**
+ * The auto-update release channel (`settings.json` `autoUpdatesChannel`: `"latest"` /
+ * `"stable"`). `None` = the CLI default (`"latest"`).
+ */
+channel: string | null; 
+/**
+ * Set when a config file EXISTS but couldn't be parsed (corrupt `settings.json` or
+ * `~/.claude.json`), so the panel can warn instead of silently showing a fabricated
+ * default. `None` = configs read cleanly (or were simply absent — the normal case).
+ */
+config_warning: string | null }
+/**
+ * Result of running `claude update`.
+ */
+export type ClaudeUpdateOutcome = { 
+/**
+ * `true` when the CLI reported it installed a new version; `false` when already current.
+ */
+updated: boolean; 
+/**
+ * The version updated FROM (only on a successful update).
+ */
+from: string | null; 
+/**
+ * The resulting version (the new one on update, or the current one when already current).
+ */
+to: string | null; 
+/**
+ * The CLI's own result line, bounded — shown verbatim so the user sees exactly what it said.
+ */
+message: string }
 /**
  * The signed-in Codex account, whitelisted from `account/read` (no tokens — the wire
  * response carries none, and we forward only these fields).
