@@ -2,10 +2,9 @@
 // published. DISTINCT from UpdateBanner, which updates the app itself. "×" dismisses the
 // current version (a later release re-offers on its own); "Update" runs `claude update` in
 // place — non-destructive to the app (it only swaps the binary used at the next spawn). A
-// failed update surfaces INLINE here (not just in Settings), and the whole banner can be
-// turned off persistently via the `showClaudeCliBanner` display pref.
+// failed update surfaces INLINE here (not just in Settings). No settings toggle backs it: the
+// per-version dismissal IS the off switch, and it re-arms on its own for the next release.
 import { useClaudeCliUpdate, shouldShowClaudeCliBanner } from "../../store/claudeCliUpdate";
-import { useDisplay } from "../../store/display";
 import { Ico } from "../../ui/kit";
 import styles from "./ClaudeCliBanner.module.css";
 
@@ -16,9 +15,8 @@ export function ClaudeCliBanner() {
   const error = useClaudeCliUpdate((s) => s.error);
   const runUpdate = useClaudeCliUpdate((s) => s.runUpdate);
   const dismiss = useClaudeCliUpdate((s) => s.dismiss);
-  const enabled = useDisplay((s) => s.showClaudeCliBanner);
 
-  if (!enabled || !shouldShowClaudeCliBanner(status, dismissedVersion)) return null;
+  if (!shouldShowClaudeCliBanner(status, dismissedVersion)) return null;
 
   // An update launched from the banner that failed must show its failure HERE (where the
   // action was taken), not silently revert to the plain offer — the error is only otherwise

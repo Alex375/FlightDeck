@@ -413,6 +413,59 @@
   font-weight: 600;
 }
 
+/* Version line shared by the two updater cards (app + Claude CLI) — see VersionStatus.
+   Inline-flex + wrap so a long detail wraps under the pills instead of stretching the row. */
+.verLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+.verLine :global(.wf-ico) {
+  color: var(--text-muted);
+}
+.verPill {
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  padding: 2px 9px;
+}
+.verPillNew {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.verState {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+/* Integer size so the dot rasterizes symmetrically (see the box-shadow spread lesson). */
+.verDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: none;
+}
+.verDot[data-state="current"] {
+  background: var(--wf-run, #4ade80);
+}
+.verDot[data-state="available"] {
+  background: var(--accent);
+}
+.verDetail {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Release notes ("What's new"), rendered as Markdown inside a framed card. */
 .notesCard {
   margin-bottom: var(--space-4);

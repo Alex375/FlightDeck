@@ -78,6 +78,46 @@ export function ToggleRow({
   );
 }
 
+/** The version line shown by BOTH updaters (the app and the piloted `claude` binary), so the
+ *  two cards read as one system: the installed version as a mono pill, an arrow to the new one
+ *  when an update is waiting, a state dot + label, and an optional muted detail (install method,
+ *  channel…). `state` drives the dot's colour: `current` green, `available` accent, `unknown`
+ *  muted (version couldn't be read — never dressed up as "up to date"). */
+export function VersionStatus({
+  installed,
+  latest,
+  state,
+  detail,
+}: {
+  installed: string | null;
+  latest?: string | null;
+  state: "current" | "available" | "unknown";
+  detail?: ReactNode;
+}) {
+  const label =
+    state === "available" ? "Update available" : state === "current" ? "Up to date" : "Unknown";
+  return (
+    <span className={styles.verLine}>
+      {installed ? (
+        <span className={styles.verPill}>v{installed}</span>
+      ) : (
+        <span className={styles.verPill}>—</span>
+      )}
+      {state === "available" && latest ? (
+        <>
+          <Ico name="arrow" className="sm" />
+          <span className={`${styles.verPill} ${styles.verPillNew}`}>v{latest}</span>
+        </>
+      ) : null}
+      <span className={styles.verState}>
+        <span className={styles.verDot} data-state={state} />
+        {label}
+      </span>
+      {detail ? <span className={styles.verDetail}>· {detail}</span> : null}
+    </span>
+  );
+}
+
 /** A "pick one" rail of selectable option cards — each shows a label, a description, and a
  *  check when selected. Shared by the settings tabs that offer a small enumerated choice
  *  (Markdown rendering mode, Caffeinate mode…) so the pattern lives in ONE place. Pass

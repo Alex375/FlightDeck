@@ -158,11 +158,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {section === "notifications" && <NotificationsSection />}
 
+            {/* Two updaters, one tab: the app itself, then the `claude` binary it drives.
+                One page heading covers both — each has its own titled card below. */}
             {section === "updates" && (
-              <>
+              <div>
+                <PageHead
+                  title="Updates"
+                  subtitle="Flight Deck and the Claude Code CLI it drives."
+                />
                 <UpdateSection />
                 <ClaudeCliSection />
-              </>
+              </div>
             )}
 
             {section === "data" && (
