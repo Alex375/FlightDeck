@@ -59,9 +59,17 @@ pub struct ClaudeCliStatus {
     pub latest_version: Option<String>,
     /// `true` only when BOTH versions are known and latest is strictly newer than installed.
     pub update_available: bool,
-    /// Whether the CLI's background auto-updater is on (i.e. `env.DISABLE_AUTOUPDATER` is NOT
-    /// `"1"` in `settings.json`). Defaults to `true` — the CLI's own default.
+    /// Whether the CLI's background auto-updater is on. Two INDEPENDENT gates close it:
+    /// `env.DISABLE_AUTOUPDATER` in `settings.json` (the one we own) and `autoUpdates:false`
+    /// in `~/.claude.json` (the CLI's own — see [`Self::auto_update_locked`]). Defaults to
+    /// `true` — the CLI's own default.
     pub auto_update_enabled: bool,
+    /// `true` when auto-update is held OFF by `~/.claude.json` (`autoUpdates:false`, unprotected)
+    /// — a gate our toggle CANNOT open, because that file belongs to the CLI and we never write
+    /// it (writing it races the binary; see the `extensions` module's read-only policy). Without
+    /// this flag the switch would appear to turn on and then silently spring back at the next
+    /// read; the panel disables it and says why instead.
+    pub auto_update_locked: bool,
     /// How the CLI was installed (`~/.claude.json` `installMethod`: `"native"`, `"npm"`, …).
     /// `None` if unknown. Informational: a native install auto-updates; npm/brew don't — the
     /// UI can hint accordingly.
@@ -90,13 +98,26 @@ pub struct ClaudeUpdateOutcome {
 
 /// Read the full CLI update status: installed + latest version, update availability, and the
 /// auto-update config. BEST-EFFORT throughout — never returns an error, so the Settings panel
-/// always has something to render. The three probes run concurrently to bound wall-clock.
+/// always has something to render.
+///
+/// The local probes (binary version + config) run concurrently, but the REGISTRY call is
+/// deliberately sequenced AFTER them and SKIPPED when no `claude` is installed: a Codex-only
+/// user must not pay an outbound request on every check for a version they could never act on
+/// (`update_available` needs both sides anyway, so the answer is unchanged). The trade is one
+/// extra round-trip in the installed case — noticeable only on the two paths where a human is
+/// waiting (opening Settings, hitting "Check for updates"), and bounded there by the version
+/// probe's own timeout; the periodic background check pays nothing that matters.
 pub async fn status() -> ClaudeCliStatus {
-    let (installed, latest, cfg) = tokio::join!(installed_version(), fetch_latest_version(), async {
+    let (installed, cfg) = tokio::join!(installed_version(), async {
         tokio::task::spawn_blocking(read_cli_config)
             .await
             .unwrap_or_else(|_| CliConfig::default())
     });
+    let latest = if installed.is_some() {
+        fetch_latest_version().await
+    } else {
+        None
+    };
     let update_available = match (latest.as_deref(), installed.as_deref()) {
         (Some(l), Some(i)) => is_newer(l, i),
         _ => false,
@@ -106,6 +127,7 @@ pub async fn status() -> ClaudeCliStatus {
         latest_version: latest,
         update_available,
         auto_update_enabled: cfg.auto_update_enabled,
+        auto_update_locked: cfg.auto_update_locked,
         install_method: cfg.install_method,
         channel: cfg.channel,
         config_warning: cfg.config_warning,
@@ -119,15 +141,16 @@ pub async fn run_update() -> Result<ClaudeUpdateOutcome, String> {
     let out = run_claude(&["update"], UPDATE_TIMEOUT).await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The CLI prints its progress/result on stdout; fall back to stderr if stdout is empty.
-    let combined = if stdout.trim().is_empty() {
-        stderr.into_owned()
-    } else {
-        stdout.into_owned()
-    };
     if !out.status.success() {
-        return Err(cap(last_nonempty_line(&combined), 200));
+        // On FAILURE the diagnosis is on stderr — and stdout is usually NOT empty (it carried the
+        // progress lines up to the point of failure), so preferring stdout here would report
+        // "Checking for updates…" as the reason the update failed. Read stderr first, and fall
+        // back to stdout only when stderr said nothing at all.
+        let reason = if stderr.trim().is_empty() { &stdout } else { &stderr };
+        return Err(cap(last_nonempty_line(reason), 200));
     }
+    // On SUCCESS the result line is on stdout; fall back to stderr if stdout is empty.
+    let combined = if stdout.trim().is_empty() { stderr } else { stdout };
     Ok(parse_update_output(&combined))
 }
 
@@ -191,6 +214,9 @@ async fn run_claude(args: &[&str], timeout: Duration) -> Result<std::process::Ou
 #[derive(Debug, Clone)]
 struct CliConfig {
     auto_update_enabled: bool,
+    /// Auto-update is held OFF by `~/.claude.json`, which we never write (see
+    /// [`ClaudeCliStatus::auto_update_locked`]).
+    auto_update_locked: bool,
     install_method: Option<String>,
     channel: Option<String>,
     /// A config file EXISTS but couldn't be parsed (see [`ClaudeCliStatus::config_warning`]).
@@ -198,11 +224,13 @@ struct CliConfig {
 }
 
 impl Default for CliConfig {
-    /// The CLI's own defaults when nothing is configured: auto-update ON, method/channel
-    /// unknown. Crucially `auto_update_enabled` defaults to `true` (NOT `bool::default()`).
+    /// The CLI's own defaults when nothing is configured: auto-update ON and unlocked,
+    /// method/channel unknown. Crucially `auto_update_enabled` defaults to `true` (NOT
+    /// `bool::default()`).
     fn default() -> Self {
         Self {
             auto_update_enabled: true,
+            auto_update_locked: false,
             install_method: None,
             channel: None,
             config_warning: None,
@@ -275,6 +303,9 @@ fn read_cli_config() -> CliConfig {
 
     CliConfig {
         auto_update_enabled: !(env_disabled || config_disabled),
+        // Only the `~/.claude.json` gate is a LOCK: `DISABLE_AUTOUPDATER` is the key our own
+        // toggle turns, so it never locks anything.
+        auto_update_locked: config_disabled,
         install_method: global.install_method,
         channel,
         config_warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
@@ -357,9 +388,33 @@ fn is_newer(latest: &str, installed: &str) -> bool {
     }
 }
 
-/// The last non-blank line of some output (the CLI prints its result last).
+/// The last non-blank line of some output (used for an ERROR, where the CLI's complaint is last).
 fn last_nonempty_line(text: &str) -> &str {
-    text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("")
+    text.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// Markers of `claude update`'s RESULT line, lowercased. `"updated"` appears only in the
+/// success wording ("Successfully updated…"); `"up to date"` only in the no-op one. Note
+/// `"Checking for updates…"` matches NEITHER (it says "updates", not "updated").
+const UPDATE_RESULT_MARKERS: [&str; 2] = ["updated", "up to date"];
+
+/// The RESULT line of `claude update`'s output: the LAST line carrying a known marker,
+/// scanned from the END so a trailing progress/noise line can't shadow it. Falls back to the
+/// last non-blank line when no marker is present, so an unknown future wording is still shown
+/// verbatim rather than dropped. (Taking the last line BLINDLY was fragile: one extra trailing
+/// line and a real update silently read as `updated: false`.)
+fn update_result_line(text: &str) -> &str {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .find(|l| {
+            let low = l.to_lowercase();
+            UPDATE_RESULT_MARKERS.iter().any(|m| low.contains(m))
+        })
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("")
 }
 
 /// Cap a string to `n` chars for a user-facing message; never empty (→ "unknown").
@@ -372,11 +427,14 @@ fn cap(s: &str, n: usize) -> String {
     }
 }
 
-/// Parse `claude update`'s final result line. Real forms (verified live, 2.1.220):
+/// Parse `claude update`'s result line. Real forms (verified live, 2.1.220):
 /// - `"Successfully updated from 2.1.218 to version 2.1.220"` → updated, from + to.
 /// - `"Claude Code is up to date (2.1.220)"` → not updated, to = current.
+///
+/// The line is located by marker (see [`update_result_line`]), not by position, so trailing
+/// output after the result doesn't turn a real update into a silent no-op.
 fn parse_update_output(raw: &str) -> ClaudeUpdateOutcome {
-    let line = last_nonempty_line(raw);
+    let line = update_result_line(raw);
     let versions = all_versions_in(line);
     // "updated" appears only in the success line; "up to date" does not contain it.
     let updated = line.to_lowercase().contains("updated");
@@ -456,6 +514,48 @@ mod tests {
     }
 
     #[test]
+    fn result_line_is_found_by_marker_not_by_position() {
+        // A trailing line after the result (progress tail, hint, blank-ish noise) must NOT
+        // shadow it — taking the last line blindly read a real update as "not updated".
+        let raw = "Checking for updates...\n\
+                   Successfully updated from 2.1.218 to version 2.1.220\n\
+                   Restart your terminal to use the new version.";
+        let o = parse_update_output(raw);
+        assert!(o.updated, "the result line is found despite the trailing line");
+        assert_eq!(o.from.as_deref(), Some("2.1.218"));
+        assert_eq!(o.to.as_deref(), Some("2.1.220"));
+
+        // Same for the no-op wording.
+        let o2 = parse_update_output(
+            "Checking for updates to latest version...\n\
+             Claude Code is up to date (2.1.220)\n\
+             Run `claude` to start.",
+        );
+        assert!(!o2.updated);
+        assert_eq!(o2.to.as_deref(), Some("2.1.220"));
+    }
+
+    #[test]
+    fn unknown_wording_falls_back_to_the_last_line_verbatim() {
+        // No known marker → we still surface SOMETHING the user can read, never an empty
+        // message that would look like nothing happened. Trailing blanks must not win either
+        // (the old last-line rule and the new marker rule agree here — that's the point:
+        // hardening the good case must not regress the unknown one).
+        let o = parse_update_output("Some future wording\nfinal line 9.9.9\n   \n");
+        assert!(!o.updated);
+        assert_eq!(o.message, "final line 9.9.9");
+        assert_eq!(o.to.as_deref(), Some("9.9.9"), "the version is still read out of it");
+        // Nothing at all to say → the capped message is "unknown", never empty.
+        assert_eq!(parse_update_output("\n  \n").message, "unknown");
+    }
+
+    #[test]
+    fn checking_line_is_not_mistaken_for_a_result() {
+        // "Checking for updates" says "updates", not "updated" — it must not match.
+        assert_eq!(update_result_line("Checking for updates...\nlast"), "last");
+    }
+
+    #[test]
     fn cap_caps_and_is_never_empty() {
         assert_eq!(cap("", 10), "unknown");
         assert_eq!(cap("hello", 3), "hel");
@@ -480,5 +580,14 @@ mod tests {
         assert!(is_config_disabled(Some(false), Some("native"), Some(false)), "native but unprotected → disabled");
         assert!(!is_config_disabled(Some(true), Some("npm"), None), "autoUpdates true → enabled");
         assert!(!is_config_disabled(None, Some("npm"), None), "autoUpdates absent → enabled");
+    }
+
+    #[test]
+    fn default_config_is_unlocked_and_on() {
+        // The safe default must never present the toggle as locked (which would deny the user
+        // a control that actually works).
+        let c = CliConfig::default();
+        assert!(c.auto_update_enabled);
+        assert!(!c.auto_update_locked);
     }
 }

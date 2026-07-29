@@ -781,6 +781,14 @@ fn apply_claude_auto_update(text: &str, enabled: bool) -> Result<String, String>
 /// so the same anti-race discipline as the plugin/marketplace toggles). `enabled == true`
 /// means "auto-update ON". This is the ONE writer of that key; the read side lives in
 /// [`crate::cli_update`].
+///
+/// ⚠️ This key is only ONE of the two gates the CLI honours. The other, `autoUpdates:false`
+/// in `~/.claude.json`, is deliberately NOT written here — that file belongs to the CLI and
+/// writing it races the binary. The asymmetry that follows: `enabled == false` always bites
+/// (this key alone is enough to disable), but `enabled == true` only re-enables when the other
+/// gate is already open. The read side reports the closed case as
+/// [`crate::cli_update::ClaudeCliStatus::auto_update_locked`] and the panel disables the switch,
+/// rather than letting it silently spring back.
 pub fn set_claude_auto_update(enabled: bool) -> Result<(), String> {
     let home = home_dir().ok_or("could not resolve home directory")?;
     write_settings(&home, |text| apply_claude_auto_update(text, enabled))

@@ -785,14 +785,20 @@ export const mockCommands = {
     // Dev/Playwright: pretend the CLI is installed and current, auto-update on. Add
     // `?cliUpdate` to the URL to get the "update available" state instead (banner + the
     // Settings card's primary action) — otherwise it's only reachable when Anthropic
-    // happens to publish a newer version than the one installed.
-    const pending = new URLSearchParams(location.search).has("cliUpdate");
+    // happens to publish a newer version than the one installed. `?cliLocked` gives the
+    // auto-update-held-off-by-`~/.claude.json` state (greyed switch + its explanation), which
+    // otherwise needs a real install carrying `autoUpdates:false` without the native-install
+    // protection — any install method can be in that state, npm is just the usual one.
+    const params = new URLSearchParams(location.search);
+    const pending = params.has("cliUpdate");
+    const locked = params.has("cliLocked");
     return {
       installed_version: "2.1.220",
       latest_version: pending ? "2.1.221" : "2.1.220",
       update_available: pending,
-      auto_update_enabled: true,
-      install_method: "native",
+      auto_update_enabled: !locked,
+      auto_update_locked: locked,
+      install_method: locked ? "npm" : "native",
       channel: "latest",
       config_warning: null,
     };

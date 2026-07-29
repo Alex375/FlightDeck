@@ -1469,7 +1469,9 @@ async claudeCliUpdate() : Promise<Result<ClaudeUpdateOutcome, string>> {
  * Flip the Claude CLI's background auto-updater (`enabled == true` → auto-update ON) by
  * writing `env.DISABLE_AUTOUPDATER` in `~/.claude/settings.json`, through the single
  * settings.json writer (`extensions`) so the atomic/anti-race discipline holds. Blocking file
- * IO is deported off the async runtime.
+ * IO is deported off the async runtime. While `auto_update_locked` is set (the `~/.claude.json`
+ * gate, which we never write) only the DISABLE direction still bites — `enabled == true` writes
+ * fine but cannot re-enable anything, so the UI disables the switch in that case.
  */
 async setClaudeCliAutoUpdate(enabled: boolean) : Promise<Result<null, string>> {
     try {
@@ -1741,10 +1743,20 @@ latest_version: string | null;
  */
 update_available: boolean; 
 /**
- * Whether the CLI's background auto-updater is on (i.e. `env.DISABLE_AUTOUPDATER` is NOT
- * `"1"` in `settings.json`). Defaults to `true` — the CLI's own default.
+ * Whether the CLI's background auto-updater is on. Two INDEPENDENT gates close it:
+ * `env.DISABLE_AUTOUPDATER` in `settings.json` (the one we own) and `autoUpdates:false`
+ * in `~/.claude.json` (the CLI's own — see [`Self::auto_update_locked`]). Defaults to
+ * `true` — the CLI's own default.
  */
 auto_update_enabled: boolean; 
+/**
+ * `true` when auto-update is held OFF by `~/.claude.json` (`autoUpdates:false`, unprotected)
+ * — a gate our toggle CANNOT open, because that file belongs to the CLI and we never write
+ * it (writing it races the binary; see the `extensions` module's read-only policy). Without
+ * this flag the switch would appear to turn on and then silently spring back at the next
+ * read; the panel disables it and says why instead.
+ */
+auto_update_locked: boolean; 
 /**
  * How the CLI was installed (`~/.claude.json` `installMethod`: `"native"`, `"npm"`, …).
  * `None` if unknown. Informational: a native install auto-updates; npm/brew don't — the

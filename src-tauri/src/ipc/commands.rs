@@ -847,7 +847,9 @@ pub async fn claude_cli_update() -> Result<crate::cli_update::ClaudeUpdateOutcom
 /// Flip the Claude CLI's background auto-updater (`enabled == true` → auto-update ON) by
 /// writing `env.DISABLE_AUTOUPDATER` in `~/.claude/settings.json`, through the single
 /// settings.json writer (`extensions`) so the atomic/anti-race discipline holds. Blocking file
-/// IO is deported off the async runtime.
+/// IO is deported off the async runtime. While `auto_update_locked` is set (the `~/.claude.json`
+/// gate, which we never write) only the DISABLE direction still bites — `enabled == true` writes
+/// fine but cannot re-enable anything, so the UI disables the switch in that case.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_claude_cli_auto_update(enabled: bool) -> Result<(), String> {
