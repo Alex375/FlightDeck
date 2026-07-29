@@ -13,6 +13,8 @@ import type {
   GoalState,
   DiskConversation,
   ClaudeAccountStatus,
+  ClaudeCliStatus,
+  ClaudeUpdateOutcome,
   CodexAccountStatus,
   CodexControls,
   CodexHooksSnapshot,
@@ -776,6 +778,42 @@ export const mockCommands = {
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {
     // No real power assertion in the browser/dev mock — the toggle is inert here.
+    return ok(null);
+  },
+
+  async claudeCliStatus(): Promise<ClaudeCliStatus> {
+    // Dev/Playwright: pretend the CLI is installed and current, auto-update on. Add
+    // `?cliUpdate` to the URL to get the "update available" state instead (banner + the
+    // Settings card's primary action) — otherwise it's only reachable when Anthropic
+    // happens to publish a newer version than the one installed. `?cliLocked` gives the
+    // auto-update-held-off-by-`~/.claude.json` state (greyed switch + its explanation), which
+    // otherwise needs a real install carrying `autoUpdates:false` without the native-install
+    // protection — any install method can be in that state, npm is just the usual one.
+    const params = new URLSearchParams(location.search);
+    const pending = params.has("cliUpdate");
+    const locked = params.has("cliLocked");
+    return {
+      installed_version: "2.1.220",
+      latest_version: pending ? "2.1.221" : "2.1.220",
+      update_available: pending,
+      auto_update_enabled: !locked,
+      auto_update_locked: locked,
+      install_method: locked ? "npm" : "native",
+      channel: "latest",
+      config_warning: null,
+    };
+  },
+
+  async claudeCliUpdate(): Promise<Result<ClaudeUpdateOutcome, string>> {
+    return ok({
+      updated: false,
+      from: null,
+      to: "2.1.220",
+      message: "Claude Code is up to date (2.1.220)",
+    });
+  },
+
+  async setClaudeCliAutoUpdate(_enabled: boolean): Promise<Result<null, string>> {
     return ok(null);
   },
 

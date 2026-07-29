@@ -61,6 +61,17 @@ describe("parseSlashCommand", () => {
     expect(userMessagePreviewText("/land now")).toBe("/land now");
     expect(userMessagePreviewText("fix the typo")).toBe("fix the typo");
   });
+
+  // A `/goal` SET is shown as a card in the thread; on the plain-text preview surfaces (pin /
+  // Flight Deck peek) it collapses to "Goal: <condition>", the same on both wire shapes.
+  it("previews a /goal SET as its condition", () => {
+    expect(userMessagePreviewText("/goal ship the site")).toBe("Goal: ship the site");
+    expect(
+      userMessagePreviewText(
+        "<command-name>/goal</command-name>\n<command-args>ship the site</command-args>",
+      ),
+    ).toBe("Goal: ship the site");
+  });
 });
 
 describe("parseSkillInvocation", () => {

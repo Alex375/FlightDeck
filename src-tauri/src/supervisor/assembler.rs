@@ -1183,9 +1183,9 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
 fn model_label(id: &str) -> String {
     let s = id.to_lowercase();
     if s.contains("opus") {
-        "Opus 4.8".to_string()
+        "Opus 5".to_string()
     } else if s.contains("sonnet") {
-        "Sonnet 4.6".to_string()
+        "Sonnet 5".to_string()
     } else if s.contains("haiku") {
         "Haiku 4.5".to_string()
     } else if s.contains("fable") {
@@ -2138,14 +2138,14 @@ mod tests {
         let init: CliMessage = serde_json::from_value(serde_json::json!({
             "type": "system", "subtype": "init",
             "session_id": "s", "uuid": "u", "cwd": "/x",
-            "model": "claude-sonnet-4-6", "permissionMode": "default",
+            "model": "claude-sonnet-5", "permissionMode": "default",
             "tools": ["Bash"], "slash_commands": []
         }))
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
         assert_eq!(detail["control"], serde_json::json!("Model"));
-        assert_eq!(detail["from"], serde_json::json!("Opus 4.8"));
-        assert_eq!(detail["to"], serde_json::json!("Sonnet 4.6"));
+        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
     }
 
     /// `system/bridge_state` is a Remote Control HEALTH signal: a `disconnected` /
@@ -2740,6 +2740,9 @@ mod parity_tests {
     #[test]
     fn live_and_reload_agree_on_every_known_line() {
         let text_content = |t: &str| json!([{ "type": "text", "text": t }]);
+        // A `/goal <condition>` SET echo, in the CLI's wrapped shape — used as both the wire line
+        // and the expected bubble text, so live and reload must agree it survives.
+        let goal_set_echo = "<command-name>/goal</command-name>\n<command-args>ship the site</command-args>";
         let cases: Vec<(&str, serde_json::Value, serde_json::Value, Vec<&str>)> = vec![
             (
                 "a genuine human prompt",
@@ -2826,11 +2829,28 @@ mod parity_tests {
                 vec!["[image]"],
             ),
             (
-                "/goal plumbing",
+                "/goal stdout plumbing (dropped)",
                 json!({"type":"user","uuid":"u12","message":{"role":"user","content":text_content(
                     "<local-command-stdout>Goal set: all tests pass</local-command-stdout>")}}),
                 json!({"type":"user","uuid":"u12","message":{"role":"user","content":text_content(
                     "<local-command-stdout>Goal set: all tests pass</local-command-stdout>")}}),
+                vec![],
+            ),
+            (
+                // A `/goal <condition>` SET is now shown in the thread (rendered as a "Goal set"
+                // card by the front). The echo flows through as a user message on BOTH surfaces.
+                "a /goal SET echo (kept — rendered as a Goal card)",
+                json!({"type":"user","uuid":"u13","message":{"role":"user","content":text_content(goal_set_echo)}}),
+                json!({"type":"user","uuid":"u13","message":{"role":"user","content":text_content(goal_set_echo)}}),
+                vec![goal_set_echo],
+            ),
+            (
+                // …but a `/goal clear` echo stays plumbing (represented by the target chip).
+                "a /goal clear echo (dropped)",
+                json!({"type":"user","uuid":"u14","message":{"role":"user","content":text_content(
+                    "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
+                json!({"type":"user","uuid":"u14","message":{"role":"user","content":text_content(
+                    "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
                 vec![],
             ),
         ];

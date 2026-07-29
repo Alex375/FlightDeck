@@ -631,3 +631,45 @@ describe("atomStillRunning", () => {
     expect(liveVisibleStart(atoms, done, 3)).toBe(2);
   });
 });
+
+// ---- AskUserQuestion as a decision-artifact segment ------------------------
+// A question to the user must anchor the exchange in the flow (own segment, breaks
+// the run) and stay in clear when it closes a response — burying it as a "Question"
+// step row inside a collapsed run made whole rounds unreadable (only tool rows shown).
+describe("question segments", () => {
+  it("AskUserQuestion becomes its own segment and breaks the surrounding run", () => {
+    const segs = groupBlocks([
+      tool("a", "Bash"),
+      tool("q", "AskUserQuestion", { questions: [] }),
+      tool("b", "Bash"),
+    ]);
+    expect(segs.map((s) => s.kind)).toEqual(["run", "question", "run"]);
+    if (segs[1].kind === "question") expect(segs[1].step.id).toBe("q");
+  });
+
+  it("splitFinalMessage peels a trailing question WITH its preceding prose", () => {
+    const segs = groupBlocks([
+      text("intro"),
+      tool("a", "Bash"),
+      text("explanation before the ask"),
+      tool("q", "AskUserQuestion", { questions: [] }),
+    ]);
+    const { work, final } = splitFinalMessage(segs);
+    expect(work.map((s) => s.kind)).toEqual(["text", "run"]);
+    expect(final.map((s) => s.kind)).toEqual(["text", "question"]);
+  });
+
+  it("a question survives the atoms round-trip and never counts as work", () => {
+    const segs = groupBlocks([
+      tool("a", "Bash"),
+      tool("q", "AskUserQuestion", { questions: [] }),
+      tool("b", "Bash"),
+    ]);
+    const atoms = flattenWork(segs);
+    expect(atoms.map((a) => a.kind)).toEqual(["step", "question", "step"]);
+    const back = atomsToSegments(atoms, "k");
+    expect(back.map((s) => s.kind)).toEqual(["run", "question", "run"]);
+    expect(countWorkSteps(segs)).toBe(2); // the two Bash steps only
+    expect(workStepIds(segs)).toEqual(["a", "b"]); // the question id is not "work"
+  });
+});

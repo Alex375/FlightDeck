@@ -1,16 +1,18 @@
-// "Update" section of the Settings panel: current vs available version,
-// release notes (rendered as Markdown), a manual check button, download progress,
-// and the "install + restart" action — gated behind a relaunch confirmation so a
-// running conversation is never killed by surprise. All state lives in the updater
-// store; the in-app notes are the changelog part of the release body (the GitHub-only
-// install instructions are stripped, see `inAppReleaseNotes`).
-import { useState } from "react";
+// "Flight Deck" card of the Updates tab: the app's own updater — current vs available
+// version, release notes (rendered as Markdown), a manual check button, download progress,
+// and the "install + restart" action, gated behind a relaunch confirmation so a running
+// conversation is never killed by surprise. All state lives in the updater store; the in-app
+// notes are the changelog part of the release body (the GitHub-only install instructions are
+// stripped, see `inAppReleaseNotes`). Its twin below is ClaudeCliSection, which updates the
+// piloted `claude` binary — the two share the same card + VersionStatus shape on purpose.
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { useUpdater, inAppReleaseNotes } from "../../store/updater";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { Ico } from "../../ui/kit";
-import { PageHead } from "./SettingsKit";
+import { SettingsGroup, ToggleRow, VersionStatus } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
 function formatBytes(n: number): string {
@@ -34,6 +36,15 @@ export function UpdateSection() {
   );
 
   const [confirmingInstall, setConfirmingInstall] = useState(false);
+  // The running app's version, so the card states what's installed even when no update is
+  // pending (the updater only reports `currentVersion` alongside an available one). Null
+  // outside the Tauri webview (plain browser dev server) → the row falls back to "—".
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
+  }, []);
 
   const checking = status === "checking";
   const downloading = status === "downloading" || status === "installing";
@@ -45,13 +56,18 @@ export function UpdateSection() {
       ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
       : null;
 
-  return (
-    <div>
-      <PageHead title="Updates" subtitle="Installed version, what's new, and installation." />
+  // What the version row states. `unknown` only while no check has landed yet (or one
+  // failed) — never dressed up as "up to date".
+  const versionState = hasUpdate ? "available" : status === "uptodate" ? "current" : "unknown";
+  const installed = update?.currentVersion ?? appVersion;
 
+  return (
+    <>
+      {/* An available update is an EVENT: announce it above the cards (motif + version jump
+          + what's new). The action itself lives in the card below, so there's exactly one
+          update button on the page. */}
       {hasUpdate && update ? (
         <>
-          {/* Inviting header: the update motif + a clear current → new version jump. */}
           <div className={styles.updateHero}>
             <span className={styles.updateSpark}>
               <Ico name="spark" />
@@ -76,9 +92,57 @@ export function UpdateSection() {
           ) : (
             <div className={styles.desc}>Various improvements and fixes.</div>
           )}
+        </>
+      ) : null}
 
-          {downloading && progress ? (
-            <div className={styles.progressWrap}>
+      <SettingsGroup title="Flight Deck" icon="spark">
+        <ToggleRow
+          title="Version"
+          hint={
+            <VersionStatus
+              installed={installed}
+              latest={update?.version}
+              state={versionState}
+              detail={
+                status === "error"
+                  ? "The last check failed."
+                  : lastCheckError
+                    ? `Last automatic check failed: ${lastCheckError}`
+                    : undefined
+              }
+            />
+          }
+          control={
+            hasUpdate ? (
+              <button
+                className={`${styles.btn} ${styles.primary} ${styles.btnUpdate}`}
+                onClick={() => setConfirmingInstall(true)}
+                disabled={downloading}
+              >
+                <Ico name="refresh" className="sm" />
+                {status === "installing"
+                  ? "Restarting…"
+                  : status === "downloading"
+                    ? "Downloading…"
+                    : error
+                      ? "Retry installation"
+                      : "Update and restart"}
+              </button>
+            ) : (
+              <button
+                className={`${styles.btn} ${styles.ghost}`}
+                onClick={() => void check()}
+                disabled={checking}
+              >
+                {checking ? "Checking…" : "Check for updates"}
+              </button>
+            )
+          }
+        />
+
+        {downloading && progress ? (
+          <div className={styles.trow}>
+            <div className={styles.ttext}>
               <div className={styles.progressTrack}>
                 <div
                   className={styles.progressFill}
@@ -95,50 +159,9 @@ export function UpdateSection() {
                     : `${formatBytes(progress.downloaded)}…`}
               </div>
             </div>
-          ) : null}
-
-          <div className={styles.row}>
-            <button
-              className={`${styles.btn} ${styles.primary} ${styles.btnUpdate}`}
-              onClick={() => setConfirmingInstall(true)}
-              disabled={downloading}
-            >
-              <Ico name="refresh" className="sm" />
-              {status === "installing"
-                ? "Restarting…"
-                : status === "downloading"
-                  ? "Downloading…"
-                  : error
-                    ? "Retry installation"
-                    : "Update and restart"}
-            </button>
           </div>
-        </>
-      ) : (
-        <>
-          <div className={styles.desc}>
-            {status === "uptodate"
-              ? "The app is up to date."
-              : status === "error"
-                ? "The last check failed."
-                : "Check whether a new signed version is available."}
-          </div>
-          {status !== "error" && lastCheckError ? (
-            <div className={styles.hintWarn}>
-              Last automatic check failed: {lastCheckError}
-            </div>
-          ) : null}
-          <div className={styles.row}>
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => void check()}
-              disabled={checking}
-            >
-              {checking ? "Checking…" : "Check for updates"}
-            </button>
-          </div>
-        </>
-      )}
+        ) : null}
+      </SettingsGroup>
 
       {error ? <div className={styles.errorMsg}>{error}</div> : null}
 
@@ -173,6 +196,6 @@ export function UpdateSection() {
           " No conversations are running."
         )}
       </ConfirmDialog>
-    </div>
+    </>
   );
 }

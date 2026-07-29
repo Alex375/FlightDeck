@@ -53,31 +53,38 @@ export function useSendMessage(convId: string) {
       worktree,
       queued,
       images,
-      silent,
+      goal,
     }: {
       text: string;
       worktree?: boolean;
       queued?: boolean;
       images?: UserTurnImage[];
-      // `silent`: send WITHOUT the optimistic bubble / title / summary — for `/goal` commands,
-      // whose plumbing is represented by the goal chip, not a thread turn (keeps live == reload,
-      // since the Rust normalizer also drops the goal echo + stdout on both paths).
-      silent?: boolean;
+      // `goal`: this send is a `/goal` command. "set" (a real condition) shows in the thread as
+      // a "Goal set" card — an optimistic bubble like any message, but WITHOUT driving the
+      // auto-title / summary (a goal is a directive, not the conversation's topic). "plumbing"
+      // (clear / bare status) is fully silent — the target chip represents it, and the Rust
+      // normalizer drops the echo + stdout on both live and reload. Either kind refreshes the
+      // goal chip. `undefined` = an ordinary message (bubble + title + summary).
+      goal?: "set" | "plumbing";
     }) => {
+      // A goal SET shows its bubble like any message; only "plumbing" stays fully silent.
+      const showBubble = goal !== "plumbing";
+      // Auto-title / "last ask" summary are for real conversational content only — never a `/goal`.
+      const driveTitle = goal === undefined;
       // The core does not echo user turns, so append optimistically (keyed by the
       // stable id) before sending — instant even while the session spawns.
-      if (!silent) {
+      if (showBubble) {
         addUserTurn(convId, text, queued, images);
         // Sending the next message consumes any pending reminder: the user has moved on from
         // the previous result. `addUserTurn` clears the LIVE turnSeen, so the PERSISTED reminder
-        // must be cleared under the SAME condition — a silent send does neither. Otherwise a
-        // `/goal` would swallow an unread attention reminder (persisted side cleared) while the
-        // live side still says "unread": the two halves would disagree and the reminder would
-        // vanish without the user ever seeing the result it pointed at.
+        // must be cleared under the SAME condition — a "plumbing" send does neither. Otherwise it
+        // would swallow an unread attention reminder (persisted side cleared) while the live side
+        // still says "unread": the two halves would disagree and the reminder would vanish
+        // without the user ever seeing the result it pointed at.
         useConversationsStore.getState().setReminder(convId, null);
         // Sending IS activity: float the conversation to the top now and persist the new
-        // timestamp so the recency order survives a restart. Also skipped when silent: a `/goal`
-        // is plumbing, not work on this conversation, so it must not reshuffle the fleet's
+        // timestamp so the recency order survives a restart. Skipped for "plumbing": a `/goal
+        // clear`/status is not work on this conversation, so it must not reshuffle the fleet's
         // recency order (and must not persist a write for it either).
         useConversationsStore.getState().noteActivity(convId, { persist: true });
       }
@@ -93,9 +100,9 @@ export function useSendMessage(convId: string) {
       const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
       const codexControls = conv?.kind === "codex" ? buildCodexControls(conv) : null;
       const res = await unwrap(commands.sendMessage(handle, text, wireImages, codexControls));
-      // A silent `/goal` command is not conversational content, so it must not drive the title or
-      // the Flight Deck "last ask" peek either — otherwise goal plumbing would leak into those.
-      if (!silent) {
+      // A `/goal` command is not conversational content, so it must not drive the title or the
+      // Flight Deck "last ask" peek either — otherwise a goal directive would leak into those.
+      if (driveTitle) {
         // On each of the first few messages of a still-untitled conversation, ask the
         // binary to (re)generate a smart title from the accumulated intent (capped, then
         // frozen; no-op once renamed / over the cap / no live session). Like the VS Code
@@ -107,14 +114,14 @@ export function useSendMessage(convId: string) {
         // arrives via SessionSummaryEvent. Regenerated on every send (unlike the title,
         // which settles). `handle` is the live session we just sent through.
         triggerLastMessageSummary(convId, handle, text);
-      } else {
-        // The send was a silent `/goal` and it was ACCEPTED. Nothing else will tell the user it
-        // took: no bubble, no stdout, and — `/goal` being a LOCAL command — possibly no model turn
-        // at all, so the busy edge that normally refetches the goal may never fire. Refresh from
-        // the transcript now, on a short bounded ladder because the `goal_status` write lands
-        // asynchronously (and this conversation may not have a session id until `system/init`).
-        // The session id is resolved lazily HERE because `goalStore` must not import
-        // `conversationsStore` (which imports it — circular).
+      }
+      if (goal !== undefined) {
+        // A `/goal` was ACCEPTED. Refresh the target chip from the transcript on a short bounded
+        // ladder: the `goal_status` write lands asynchronously, and — `/goal` being a LOCAL
+        // command — it may never produce a model turn whose busy edge would otherwise refetch it.
+        // (A SET also shows the card in the thread now; this still drives the chip.) The session
+        // id is resolved lazily HERE because `goalStore` must not import `conversationsStore`
+        // (which imports it — circular).
         scheduleGoalRefresh(
           convId,
           () =>

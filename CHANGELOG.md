@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.4.0
+
+- New: Opus 5 and Sonnet 5 in the model menu, and Sonnet 5 now offers the "Extra" reasoning effort — and with it Ultra code — which the previous Sonnet didn't accept.
+- New: keep the Claude Code CLI up to date from inside the app. A banner tells you when a newer `claude` binary is published, and Settings → Updates gained a "Claude Code CLI" card: installed version, one-click update, and a switch for the CLI's own background auto-updater. The tab now shows both updaters side by side — Flight Deck, and the CLI it drives.
+- New: when you set a goal with `/goal`, it now shows up in the thread as its own card instead of being sent silently — so you can see the goal you just set.
+- Improved: when the agent asks you a multiple-choice question, the question and the answer you picked now appear as their own card in the thread — the exchange stays readable instead of being folded away with the intermediate work.
+
 ## v1.3.0
 
 - New: arrange your conversations and repositories by hand — drag them anywhere (the whole row or card, no handle) in the sidebar or on the Flight Deck. A new "Reordering" settings tab lets you freeze the automatic order per view; new items still land on top and your order is kept across restarts.

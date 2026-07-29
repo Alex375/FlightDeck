@@ -108,7 +108,7 @@ pub async fn spawn_session(
     let id = sessions.next_id();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
-    // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
+    // Product defaults when unset: Opus 5 + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
     // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
@@ -822,6 +822,40 @@ pub fn set_awake(
     awake: bool,
 ) -> Result<(), String> {
     power.set_awake(awake)
+}
+
+/// Read the Claude CLI (`claude` binary) update status: installed + latest published version,
+/// whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
+/// missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel
+/// always renders. Distinct from the app's own updater (`tauri-plugin-updater`) — this manages
+/// the piloted `claude` binary. See [`crate::cli_update`].
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_cli_status() -> crate::cli_update::ClaudeCliStatus {
+    crate::cli_update::status().await
+}
+
+/// Run `claude update` (check + install in one shot — the CLI has no check-only mode) and
+/// report the outcome. Bounded so a wedged download can't hang. `Err` only when the process
+/// couldn't run / timed out / exited non-zero.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_cli_update() -> Result<crate::cli_update::ClaudeUpdateOutcome, String> {
+    crate::cli_update::run_update().await
+}
+
+/// Flip the Claude CLI's background auto-updater (`enabled == true` → auto-update ON) by
+/// writing `env.DISABLE_AUTOUPDATER` in `~/.claude/settings.json`, through the single
+/// settings.json writer (`extensions`) so the atomic/anti-race discipline holds. Blocking file
+/// IO is deported off the async runtime. While `auto_update_locked` is set (the `~/.claude.json`
+/// gate, which we never write) only the DISABLE direction still bites — `enabled == true` writes
+/// fine but cannot re-enable anything, so the UI disables the switch in that case.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_claude_cli_auto_update(enabled: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::extensions::set_claude_auto_update(enabled))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Send a user turn to a session: the typed `text` plus any joined `images`. For Claude

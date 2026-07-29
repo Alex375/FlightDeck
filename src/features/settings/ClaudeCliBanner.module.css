@@ -1,0 +1,47 @@
+/* Banner offering to update the piloted `claude` binary. Mirrors UpdateBanner's look
+   (accent-tinted strip) but is a row of actions, not a single clickable button. */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: 8px 16px;
+  border: 0;
+  border-bottom: 1px solid var(--accent);
+  background: var(--accent-dim, var(--bg-hover));
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+}
+
+.label {
+  flex: 1;
+  font-weight: 500;
+}
+
+.cta {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  font: inherit;
+}
+.cta:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.dismiss {
+  color: var(--text-secondary, var(--text-primary));
+  opacity: 0.7;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  font: inherit;
+  padding: 0 4px;
+  line-height: 1;
+}
+.dismiss:hover {
+  opacity: 1;
+}

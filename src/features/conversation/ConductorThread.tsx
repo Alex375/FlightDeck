@@ -39,7 +39,7 @@ import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
 import { AiAvatar } from "./ConvMark";
 import { useNow } from "../../ui/useNow";
-import { QuestionnaireAsk } from "./QuestionnaireAsk";
+import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
 import { PlanCard } from "./PlanCard";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { SubAgentTranscript } from "./SubAgentTranscript";
@@ -610,6 +610,17 @@ function renderSegments(
           input={seg.step.input}
         />
       );
+    if (seg.kind === "question")
+      // A question to the user renders as its own inline card (question + chosen answer)
+      // anchoring the exchange in the flow; the interactive ask stays in the bottom AskTurn.
+      return (
+        <QuestionCard
+          key={seg.key}
+          session={session}
+          toolUseId={seg.step.id}
+          input={seg.step.input}
+        />
+      );
     // A `run` of regular tools. The trailing run of the live turn renders EXPANDED so its
     // steps appear live (spinner → result), then collapses to its header on settle. Past
     // / non-trailing runs render collapsed. `active` gates the spinner so a resultless
@@ -638,9 +649,12 @@ const LIVE_WINDOW = 3;
  *  renders in clear between them, preserving chronology. The common (no-plan) case is byte-for-byte
  *  unchanged and keeps the round's single foldKey, so its remembered open/collapsed state stands. */
 function renderFoldedWork(session: string, folded: Segment[], roundKey: string): ReactNode {
-  // A `plan` OR an `artifact` is a decision/deliverable that must never hide inside the fold,
-  // even when buried mid-round: split the fold at each so it renders in clear between work runs.
-  if (!folded.some((s) => s.kind === "plan" || s.kind === "artifact")) {
+  // A `plan`, an `artifact` or a `question` is a decision/deliverable that must never hide
+  // inside the fold, even when buried mid-round (e.g. an answered AskUserQuestion followed by
+  // more work in the same group): split the fold at each so it renders in clear between runs.
+  const cuts = (s: Segment) =>
+    s.kind === "plan" || s.kind === "artifact" || s.kind === "question";
+  if (!folded.some(cuts)) {
     return (
       <ClaudeWorkBlock count={countWorkSteps(folded)} foldConv={session} foldKey={roundKey}>
         {renderSegments(session, folded, false, -1)}
@@ -667,7 +681,7 @@ function renderFoldedWork(session: string, folded: Segment[], roundKey: string):
     chunk = [];
   };
   for (const seg of folded) {
-    if (seg.kind === "plan" || seg.kind === "artifact") {
+    if (cuts(seg)) {
       flush();
       out.push(...renderSegments(session, [seg], false, -1));
     } else {

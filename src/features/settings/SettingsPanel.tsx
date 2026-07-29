@@ -12,6 +12,7 @@ import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
 import { Ico } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { UpdateSection } from "./UpdateSection";
+import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { AccountsSection } from "./AccountsSection";
@@ -157,7 +158,18 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {section === "notifications" && <NotificationsSection />}
 
-            {section === "updates" && <UpdateSection />}
+            {/* Two updaters, one tab: the app itself, then the `claude` binary it drives.
+                One page heading covers both — each has its own titled card below. */}
+            {section === "updates" && (
+              <div>
+                <PageHead
+                  title="Updates"
+                  subtitle="Flight Deck and the Claude Code CLI it drives."
+                />
+                <UpdateSection />
+                <ClaudeCliSection />
+              </div>
+            )}
 
             {section === "data" && (
               <div>

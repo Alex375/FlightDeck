@@ -337,23 +337,47 @@ fn goal_stdout_head(inner: &str, heads: &[&str]) -> bool {
     })
 }
 
-/// Is this user-message text pure `/goal` plumbing — the slash-command echo or its
-/// local-command stdout — that the dedicated goal UI (target icon + composer chip) now
-/// represents? We drop it from the thread so MANAGING a goal, above all clearing it from the
-/// chip, never leaves `/goal clear` / "No goal set" / "Goal set:" noise in the conversation.
-/// Matches the `<command-name>/goal</command-name>` invocation (any args) and the `/goal`
-/// `<local-command-stdout>` responses — the known shapes ONLY (set / cleared / achieved / bare
-/// status / "No goal set"), never any stdout that merely opens on the word "Goal".
+/// Is this user-message text pure `/goal` PLUMBING that the dedicated goal UI (target icon +
+/// composer chip) represents, and must NOT appear in the thread? Two families stay hidden:
+///   - every `/goal` `<local-command-stdout>` response (set / cleared / achieved / bare status /
+///     "No goal set") — the known shapes ONLY, never a stdout that merely opens on "Goal";
+///   - a `/goal clear` or bare-status ECHO — clearing/querying is chip plumbing.
+///
+/// A `/goal <condition>` SET echo is DELIBERATELY not noise: the user asked to SEE the goal they
+/// set, so it flows through as a normal user message and renders as a "Goal set" card (front
+/// `goalCommand.tsx`). The two are told apart by the echo's `<command-args>`: empty or "clear" =
+/// plumbing, a real condition = SET. (Live, our own SET echo never reaches here — it is dropped as
+/// `was_ours` and shown by the optimistic bubble; this governs the reload path and remote SETs.)
 pub(crate) fn is_goal_command_noise(text: &str) -> bool {
     let t = text.trim_start();
     if t.starts_with("<command-name>/goal</command-name>") {
-        return true;
+        return goal_echo_is_plumbing(t);
     }
     if let Some(rest) = t.strip_prefix("<local-command-stdout>") {
         return goal_stdout_head(rest, &GOAL_STDOUT_TERMINAL)
             || goal_stdout_head(rest, &GOAL_STDOUT_INFO);
     }
     false
+}
+
+/// A `/goal` command echo is plumbing (drop it) when its `<command-args>` are empty (a bare status
+/// query) or exactly "clear" — the cases the target chip already represents. A real condition is a
+/// SET and must render in the thread. A missing `<command-args>` tag counts as empty → plumbing.
+fn goal_echo_is_plumbing(echo: &str) -> bool {
+    let args = command_args(echo).unwrap_or("").trim();
+    args.is_empty() || args.eq_ignore_ascii_case("clear")
+}
+
+/// The inner text of a slash-command echo's `<command-args>…</command-args>`, if present. Tolerates
+/// a missing closing tag (the CLI has shipped unterminated wrappers — see `strip_wrapper`) by
+/// taking the remainder, so an unterminated SET still counts as a real condition rather than empty.
+fn command_args(text: &str) -> Option<&str> {
+    let start = text.find("<command-args>")? + "<command-args>".len();
+    let rest = &text[start..];
+    Some(match rest.find("</command-args>") {
+        Some(end) => &rest[..end],
+        None => rest,
+    })
 }
 
 /// What to do with a `user` line the CLI injected but did NOT flag (no `isMeta` on disk,
@@ -1904,13 +1928,34 @@ mod tests {
         assert!(!is_goal_command_noise(
             "<local-command-stdout>Goal condition is limited to 500 characters (got 812)</local-command-stdout>"
         ));
+        // A `/goal <condition>` SET echo is NOT noise: the user wants to SEE the goal they set, so
+        // it flows through as a user message and renders as a "Goal set" card — including a
+        // multi-line condition.
+        assert!(!is_goal_command_noise(
+            "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship the whole site</command-args>"
+        ));
+        assert!(!is_goal_command_noise(
+            "<command-name>/goal</command-name>\n<command-args>do X\nthen Y</command-args>"
+        ));
+        // …but the clearing / bare-status echoes stay plumbing (the target chip represents them):
+        // an explicit `clear`, empty args, and no `<command-args>` tag at all.
+        assert!(is_goal_command_noise(
+            "<command-name>/goal</command-name>\n<command-args>clear</command-args>"
+        ));
+        assert!(is_goal_command_noise(
+            "<command-name>/goal</command-name>\n<command-args></command-args>"
+        ));
+        assert!(is_goal_command_noise("<command-name>/goal</command-name>"));
 
-        // On reload, the goal echo + stdout are dropped from the thread, real turns kept.
+        // On reload: the SET echo flows through as a user message (→ "Goal set" card downstream),
+        // while the clear echo and ALL `/goal` stdouts are dropped. Real turns are kept.
         let base = std::env::temp_dir().join(format!("tosse-goalnoise-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         let sid = "88888888-8888-8888-8888-888888888888";
         write_transcript(&base, "-p", sid, &[
             r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>ship the site</command-args>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Goal set: ship the site</local-command-stdout>"}}"#,
             r#"{"type":"user","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>clear</command-args>"}}"#,
             r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>No goal set</local-command-stdout>"}}"#,
         ]);
@@ -1924,7 +1969,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(users, vec!["hello"]);
+        assert_eq!(users.len(), 2, "kept: the real turn + the SET echo; dropped: clear echo + stdouts");
+        assert_eq!(users[0], "hello");
+        assert!(
+            users[1].contains("<command-args>ship the site</command-args>"),
+            "the SET echo must survive as the card's source, got {:?}",
+            users[1]
+        );
     }
 
     /// Injected lines with no provenance flag at all. They must never be user bubbles, and —

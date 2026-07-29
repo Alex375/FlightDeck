@@ -11,6 +11,7 @@
 import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
 import { Ico } from "../../ui/kit";
+import { GoalCommandCard, parseGoalCommand } from "./goalCommand";
 
 const NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
@@ -49,6 +50,10 @@ export function parseSlashCommand(text: string): { command: string; args: string
  *  other message is returned unchanged. Twin of `UserText`'s chip, for the plain-text
  *  surfaces that can't render a chip. */
 export function userMessagePreviewText(text: string): string {
+  // A `/goal` SET collapses to its condition (the card's plain-text twin), so the pin / peek
+  // read "Goal: <condition>" instead of the raw `<command-*>` wrapper.
+  const goal = parseGoalCommand(text);
+  if (goal?.action === "set") return `Goal: ${goal.condition}`;
   const cmd = parseSlashCommand(text);
   if (!cmd) return text;
   return cmd.args ? `${cmd.command} ${cmd.args}` : cmd.command;
@@ -57,6 +62,11 @@ export function userMessagePreviewText(text: string): string {
 /** A user message's text: a slash-command shows as a clean chip (the `<command-*>` wrapper
  *  is dropped), everything else renders as-is. */
 export function UserText({ text }: { text: string }) {
+  // A `/goal <condition>` SET is surfaced as its own card — the user asked to SEE the goal they
+  // set, not to have it hidden as plumbing. Clear / bare-status fall through to the normal
+  // slash-command chip (the Rust normalizer keeps those out of the thread anyway).
+  const goal = parseGoalCommand(text);
+  if (goal?.action === "set") return <GoalCommandCard condition={goal.condition} />;
   const cmd = parseSlashCommand(text);
   // A plain prompt keeps its line breaks: the raw text carries `\n`, but HTML collapses
   // whitespace by default, so we render it in a `white-space: pre-wrap` span (the fix for

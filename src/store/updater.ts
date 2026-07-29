@@ -25,6 +25,28 @@ export interface AvailableUpdate {
   notes?: string;
 }
 
+/** Whether the app's own update banner is showing. Pure, so it can be unit-tested AND read by
+ *  the OTHER banner (the piloted `claude` binary's) to stand down: two stacked accent strips at
+ *  the top of the window is noise, and updating the APP is the more consequential of the two
+ *  (it restarts and kills live sessions), so it takes the slot. The CLI offer is not lost — it
+ *  stays in Settings → Updates and the banner returns on its own once this one clears. */
+export function isUpdateBannerVisible(
+  status: UpdaterStatus,
+  update: AvailableUpdate | null,
+): boolean {
+  return (
+    !!update &&
+    // `checking` counts ONLY because `update` is still in hand: a periodic re-check flips the
+    // status for a moment without retracting the offer, and dropping the banner there made it
+    // blink — taking the CLI banner in and out of the freed slot with it. A check that finds
+    // nothing clears `update`, so the banner still goes away when it should.
+    (status === "available" ||
+      status === "checking" ||
+      status === "downloading" ||
+      status === "installing")
+  );
+}
+
 /** Separator in a release body: everything AFTER it is GitHub-page-only (the
  *  self-signed / Gatekeeper install instructions, useful for a manual .dmg download
  *  but pointless for the in-app auto-updater). See `.github/workflows/release.yml`. */

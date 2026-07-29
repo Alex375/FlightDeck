@@ -622,6 +622,13 @@ fn marketplace_source(home: &Path, name: &str) -> Option<serde_json::Value> {
     known.get(name).and_then(|k| k.source.clone())
 }
 
+/// Serializes every `settings.json` writer (plugin / marketplace / CLI-auto-update toggles) so
+/// two concurrent read-modify-write cycles can't lose one another's change (a lost update on
+/// distinct keys). `write_atomic` prevents a torn FILE; this lock prevents a torn EDIT. Mirrors
+/// the Codex `CONFIG_WRITE_LOCK` discipline, now that a fourth writer (CLI auto-update) shares
+/// this spine.
+static SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read `~/.claude/settings.json` fresh, apply `transform`, and write the result back
 /// atomically — the shared read-modify-write spine of [`set_plugin_enabled`] and the
 /// auto-update setters. Absent file → an empty object (the first write creates it).
@@ -629,6 +636,8 @@ fn write_settings(
     home: &Path,
     transform: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
+    // Hold across the WHOLE read→transform→write so concurrent toggles serialize.
+    let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = home.join(".claude/settings.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -734,6 +743,55 @@ fn apply_plugin_enabled(text: &str, plugin_id: &str, enabled: bool) -> Result<St
         .ok_or("enabledPlugins is not an object")?
         .insert(plugin_id.to_string(), serde_json::Value::Bool(enabled));
     serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
+}
+
+/// Pure transform: set/clear `env.DISABLE_AUTOUPDATER` to reflect the Claude CLI's
+/// background auto-updater state. `enabled == true` (auto-update ON) REMOVES the key and
+/// prunes an emptied `env`; `enabled == false` sets it to `"1"`. Order-preserving; testable
+/// without the filesystem.
+fn apply_claude_auto_update(text: &str, enabled: bool) -> Result<String, String> {
+    let mut root: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
+    let obj = root
+        .as_object_mut()
+        .ok_or("settings.json is not a JSON object")?;
+    if enabled {
+        if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+            env.remove("DISABLE_AUTOUPDATER");
+            if env.is_empty() {
+                obj.remove("env");
+            }
+        }
+    } else {
+        if !obj.get("env").map(|v| v.is_object()).unwrap_or(false) {
+            obj.insert("env".to_string(), serde_json::json!({}));
+        }
+        if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+            env.insert(
+                "DISABLE_AUTOUPDATER".to_string(),
+                serde_json::Value::String("1".to_string()),
+            );
+        }
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
+}
+
+/// Flip the Claude CLI's background auto-updater by writing `env.DISABLE_AUTOUPDATER` in
+/// `~/.claude/settings.json` (atomic, order-preserving — the shared [`write_settings`] spine,
+/// so the same anti-race discipline as the plugin/marketplace toggles). `enabled == true`
+/// means "auto-update ON". This is the ONE writer of that key; the read side lives in
+/// [`crate::cli_update`].
+///
+/// ⚠️ This key is only ONE of the two gates the CLI honours. The other, `autoUpdates:false`
+/// in `~/.claude.json`, is deliberately NOT written here — that file belongs to the CLI and
+/// writing it races the binary. The asymmetry that follows: `enabled == false` always bites
+/// (this key alone is enough to disable), but `enabled == true` only re-enables when the other
+/// gate is already open. The read side reports the closed case as
+/// [`crate::cli_update::ClaudeCliStatus::auto_update_locked`] and the panel disables the switch,
+/// rather than letting it silently spring back.
+pub fn set_claude_auto_update(enabled: bool) -> Result<(), String> {
+    let home = home_dir().ok_or("could not resolve home directory")?;
+    write_settings(&home, |text| apply_claude_auto_update(text, enabled))
 }
 
 /// Replace `path` atomically: write a sibling temp file, then rename over the
@@ -1390,6 +1448,31 @@ mod tests {
         assert_eq!(v["extraKnownMarketplaces"]["a"]["autoUpdate"], true, "existing flipped");
         assert_eq!(v["extraKnownMarketplaces"]["b"]["autoUpdate"], true, "new added");
         assert_eq!(v["extraKnownMarketplaces"]["b"]["source"]["repo"], "o/b", "new carries source");
+    }
+
+    #[test]
+    fn apply_claude_auto_update_sets_and_clears_the_disable_flag() {
+        // OFF → env.DISABLE_AUTOUPDATER = "1", sibling keys preserved.
+        let after = apply_claude_auto_update(r#"{"theme":"auto"}"#, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["env"]["DISABLE_AUTOUPDATER"], "1");
+        assert_eq!(v["theme"], "auto", "unrelated key preserved");
+
+        // ON → key removed AND the now-empty env pruned.
+        let after2 = apply_claude_auto_update(&after, true).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&after2).unwrap();
+        assert!(v2.get("env").is_none(), "emptied env is pruned");
+        assert_eq!(v2["theme"], "auto");
+    }
+
+    #[test]
+    fn apply_claude_auto_update_keeps_other_env_keys_when_enabling() {
+        // Enabling removes only DISABLE_AUTOUPDATER, never a sibling env var, and keeps env.
+        let before = r#"{"env":{"FOO":"bar","DISABLE_AUTOUPDATER":"1"}}"#;
+        let after = apply_claude_auto_update(before, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(v["env"].get("DISABLE_AUTOUPDATER").is_none());
+        assert_eq!(v["env"]["FOO"], "bar", "unrelated env var kept → env not pruned");
     }
 
     #[test]

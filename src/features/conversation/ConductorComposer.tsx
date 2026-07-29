@@ -53,6 +53,7 @@ import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
 import { isGoalCommand, markGoalSeen } from "../../store/goalStore";
+import { parseGoalCommand } from "./goalCommand";
 import {
   SlashCommandMenu,
   filterSlashCommands,
@@ -542,22 +543,30 @@ export const ConductorComposer = forwardRef<
     // message above." Holding it app-side until the turn ends would defeat that
     // mid-turn injection — the agent must see it in-flight, not only at the end.
     // Sending also (re)starts the stream lazily if the session is off/ended.
-    // A `/goal` command (set / clear / status) is plumbing for the goal chip, not conversational
-    // content: send it SILENTLY (no optimistic bubble / title / summary), matching the reloaded
-    // thread which drops it as noise. `markGoalSeen` arms the turn-edge refetch so a freshly set
-    // goal appears without every goalless conversation paying a per-turn transcript read.
+    // `/goal` handling splits by intent. A goal that SETS a condition is a substantive
+    // instruction the user wants to SEE, so it shows in the thread as a "Goal set" card
+    // (`goal: "set"` → optimistic bubble, but still no auto-title/summary — it's a directive,
+    // not a topic). Clearing / bare-status stay pure chip plumbing (`goal: "plumbing"` → fully
+    // silent, matching the reloaded thread which drops those). `markGoalSeen` arms the turn-edge
+    // refetch so the target chip picks up a freshly set goal without every goalless conversation
+    // paying a per-turn transcript read.
     const goalCmd = isGoalCommand(t);
     if (goalCmd) markGoalSeen(session);
+    const goalKind = goalCmd
+      ? parseGoalCommand(t)?.action === "set"
+        ? ("set" as const)
+        : ("plumbing" as const)
+      : undefined;
     // Same invariant for the optimistic PLACEHOLDER name — hence computed BEFORE this call: a
     // fresh conversation whose first message is `/goal <condition>` must not end up named after
-    // that command in the sidebar and on its Flight Deck card. Goal plumbing is invisible
-    // everywhere else, so it must not name the conversation either; the conversation stays
-    // auto-title-eligible and gets named by the first REAL message instead.
+    // that command in the sidebar and on its Flight Deck card. Even though a goal SET now shows
+    // as a card in the thread, a (often long) goal directive is a poor conversation NAME; the
+    // conversation stays auto-title-eligible and gets named by the first REAL message instead.
     if (!goalCmd) useConversationsStore.getState().noteFirstMessage(session, t);
     // The worktree toggle only applies to the very first spawn of a conversation.
     // `queued`: busy at send time → the CLI will inject this mid-turn, so the
     // bubble shows a "pending" badge until the turn ends.
-    send.mutate({ text: t, images, worktree: useWorktree && isFresh, queued: busy, silent: goalCmd });
+    send.mutate({ text: t, images, worktree: useWorktree && isFresh, queued: busy, goal: goalKind });
     // `/reload-skills` makes the CLI re-scan on-disk skills; mirror that in the
     // `/` menu by re-fetching this cwd's catalogue (a fresh spawn reads disk
     // afresh), overwriting the once-per-session cache. Fire-and-forget.

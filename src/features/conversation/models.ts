@@ -18,15 +18,15 @@ export interface ModelOption {
 }
 
 // The real Claude models. Wire value = CLI alias (sent verbatim to set_model and used
-// at spawn). Default = Opus 4.8. NO trailing hints: a context-window chip on Opus alone
+// at spawn). Default = Opus 5. NO trailing hints: a context-window chip on Opus alone
 // read as a per-model fact the other rows silently contradicted, and the real window is
 // only known once a turn reports it (see the ContextMeter, which shows it for real).
 export const CLAUDE_MODELS: ModelOption[] = [
   // Fable 5: preview model with its own rate-limit window (surfaced by the usage ring as
   // a model-scoped cap). Same effort tier as Opus. Alias "fable" is sent verbatim.
   { label: "Fable 5", value: "fable", backend: "claude" },
-  { label: "Opus 4.8", value: "opus", backend: "claude" },
-  { label: "Sonnet 4.6", value: "sonnet", backend: "claude" },
+  { label: "Opus 5", value: "opus", backend: "claude" },
+  { label: "Sonnet 5", value: "sonnet", backend: "claude" },
   { label: "Haiku 4.5", value: "haiku", backend: "claude" },
 ];
 
@@ -77,8 +77,8 @@ export function modelLabel(id?: string | null): string {
   const s = id.toLowerCase();
   const exact = ALL_MODELS.find((m) => m.value === s);
   if (exact) return exact.label;
-  if (s.includes("opus")) return "Opus 4.8";
-  if (s.includes("sonnet")) return "Sonnet 4.6";
+  if (s.includes("opus")) return "Opus 5";
+  if (s.includes("sonnet")) return "Sonnet 5";
   if (s.includes("haiku")) return "Haiku 4.5";
   if (s.includes("fable")) return "Fable 5";
   const codex = CODEX_BY_LEN.find((m) => s.includes(m.value));
