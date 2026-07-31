@@ -59,6 +59,9 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   TosseAccountStatus,
+  TosseRepoLink,
+  TosseRepoLinksPayload,
+  TosseRepository,
   SlashCommand,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -387,6 +390,57 @@ export const mockCommands = {
     return ok(null);
   },
   async tosseLogout(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  // The demo repo, matched to a CRM repository from its git remote — enough to exercise the
+  // badge's linked state and the whole card (url, linked project, Markdown context). Any
+  // OTHER folder has no entry here, so it renders the un-associated state (hollow mark on
+  // hover) and its picker lists the three repositories below.
+  async tosseRepoLinks(): Promise<Result<TosseRepoLinksPayload, string>> {
+    const repositories: TosseRepository[] = [
+      {
+        id: "crm-tosse-code",
+        name: "tosse-code",
+        url: "https://github.com/Alex375/tosse-code",
+        host: "github",
+        status: "Actif",
+        context:
+          "# tosse-code\n\nDesktop app to drive Claude Code.\n\n- **Stack**: Tauri 2, Rust, React\n- Ships as *Flight Deck*.",
+        projects: [{ id: "p-1", name: "Tosse Code", status: "En cours" }],
+      },
+      {
+        id: "crm-api",
+        name: "TOSSE",
+        url: "https://github.com/Alex375/CRM_max",
+        host: "github",
+        status: "Actif",
+        context: null,
+        projects: [{ id: "p-2", name: "CRM TOSSE", status: "En cours" }],
+      },
+      {
+        id: "crm-archived",
+        name: "old-prototype",
+        url: null,
+        host: "github",
+        status: "Archivé",
+        context: null,
+        projects: [],
+      },
+    ];
+    const links: TosseRepoLink[] = [
+      {
+        repoId: "repo-demo",
+        remoteUrl: "git@github.com:Alex375/tosse-code.git",
+        repository: repositories[0],
+        source: "remote",
+        manualRepositoryId: null,
+        ambiguous: [],
+        remoteError: null,
+      },
+    ];
+    return ok({ connected: true, links, repositories, error: null });
+  },
+  async tosseLinkRepository(): Promise<Result<null, string>> {
     return ok(null);
   },
 

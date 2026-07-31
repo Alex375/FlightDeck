@@ -409,6 +409,33 @@ async tosseLogout() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Pair every Flight Deck folder with the TOSSE repository it belongs to.
+ * 
+ * A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's
+ * urls (normalized — see [`crate::git::normalize_remote_url`]). Names are NEVER matched.
+ */
+async tosseRepoLinks() : Promise<Result<TosseRepoLinksPayload, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_repo_links") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
+ * 
+ * Local only — the CRM has no field for a machine path, and this is never written back.
+ */
+async tosseLinkRepository(repoId: string, repositoryId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_link_repository", { repoId, repositoryId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Fetch the slash commands available in `cwd` WITHOUT starting a persistent
  * session. Spawns a short-lived `claude`, performs the `initialize` handshake
  * (spec §4.4), reads the advertised commands from its `control_response`, and
@@ -2963,6 +2990,93 @@ signedOutReason: string | null;
  * card stays "connected" and shows this as the reason the name/email are missing.
  */
 identityError: string | null }
+/**
+ * How a local folder came to be linked to a CRM repository.
+ */
+export type TosseLinkSource = 
+/**
+ * The user picked it — always wins over any automatic match.
+ */
+"manual" | 
+/**
+ * Derived from the folder's `origin` remote.
+ */
+"remote"
+/**
+ * A project a repository is attached to, trimmed to what the app displays. The CRM models
+ * repository↔project as N-N, so this is a list, and it can legitimately be empty.
+ */
+export type TosseProjectRef = { id: string; name: string; status: string | null }
+/**
+ * One local folder's relationship to TOSSE, as the UI shows it.
+ */
+export type TosseRepoLink = { repoId: string; remoteUrl: string | null; 
+/**
+ * The linked repository. `None` covers three DIFFERENT situations the UI must not
+ * blur: nothing matched, the remote matched several (see `ambiguous`), or a manual
+ * link points at a repository the CRM no longer returns (see `manual_repository_id`).
+ */
+repository: TosseRepository | null; source: TosseLinkSource | null; 
+/**
+ * The id the user pinned. Kept even when it resolves to nothing, so the UI can say
+ * "the repository you picked is gone" instead of quietly falling back to unlinked.
+ */
+manualRepositoryId: string | null; 
+/**
+ * Candidates when one remote matches SEVERAL CRM repositories. We never pick for the
+ * user; the UI offers the choice.
+ */
+ambiguous: TosseRepository[]; 
+/**
+ * Why the folder's remote could not be read at all (moved, deleted, not a repository).
+ * Filled by the caller that does the git read; `None` on the happy path AND when the
+ * folder simply has no remote — those two are different, and only this one is a fault.
+ */
+remoteError: string | null }
+/**
+ * How each of Flight Deck's folders relates to TOSSE, in one call.
+ * 
+ * One payload rather than a command per repo: the CRM's repository list is a single
+ * request, and matching needs all of it at once.
+ */
+export type TosseRepoLinksPayload = { 
+/**
+ * False when no TOSSE session is held. The app is fully usable in that state, so the
+ * UI shows nothing at all — and this call costs nothing either (it returns before
+ * reading a single git remote).
+ */
+connected: boolean; 
+/**
+ * One entry per Flight Deck repo, in the order the store holds them.
+ */
+links: TosseRepoLink[]; 
+/**
+ * Every repository the CRM knows, for the manual picker. Empty when `error` is set.
+ */
+repositories: TosseRepository[]; 
+/**
+ * Set when we ARE connected but the list could not be read (offline, server error).
+ * The links then resolve to nothing, and the UI says why instead of showing a folder
+ * as un-associated — which would look like the association was lost.
+ */
+error: string | null }
+/**
+ * A repository as TOSSE knows it.
+ * 
+ * ⚠️ `url` is nullable in the CRM's schema and genuinely absent on a fair share of the
+ * rows — a repository with no url can never be matched automatically, which is the whole
+ * reason a manual association exists alongside.
+ */
+export type TosseRepository = { id: string; name: string; url: string | null; host: string | null; 
+/**
+ * `"Actif"` / `"Archivé"`. Shown, never used to filter: hiding an archived repository
+ * would silently break an association the user made deliberately.
+ */
+status: string | null; 
+/**
+ * The repo-level context the CRM keeps for agents — Markdown, rendered as-is.
+ */
+context: string | null; projects: TosseProjectRef[] }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

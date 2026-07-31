@@ -83,8 +83,15 @@ pub struct WorktreeStatus {
 pub enum GitError {
     /// `git` could not be launched at all (not installed / not on PATH).
     Spawn(std::io::Error),
-    /// `git` ran but exited non-zero; carries the command and its trimmed stderr.
-    Command { args: String, stderr: String },
+    /// `git` ran but exited non-zero; carries the command, its exit code and its
+    /// trimmed stderr. The code matters because git overloads "failure": `git
+    /// config --get` exits 1 with an EMPTY stderr for a key that simply is not
+    /// set, which is an answer ("no remote"), not a fault — see [`remote_url`].
+    Command {
+        args: String,
+        code: Option<i32>,
+        stderr: String,
+    },
     /// Output that did not match the shape we expect.
     Parse(String),
 }
@@ -93,7 +100,7 @@ impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GitError::Spawn(e) => write!(f, "could not launch git: {e}"),
-            GitError::Command { args, stderr } => {
+            GitError::Command { args, stderr, .. } => {
                 if stderr.is_empty() {
                     write!(f, "git {args} failed")
                 } else {
@@ -132,6 +139,7 @@ fn run_git_bytes(dir: &str, args: &[&str]) -> Result<Vec<u8>, GitError> {
     if !output.status.success() {
         return Err(GitError::Command {
             args: args.join(" "),
+            code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
@@ -197,6 +205,82 @@ fn build_diff(path: &str, old: &[u8], new: &[u8], old_label: &str, new_label: &s
         old_label: old_label.to_string(),
         new_label: new_label.to_string(),
     }
+}
+
+/// The `origin` remote of the repository `repo_path` lives in, or `None` when it
+/// simply has no such remote (a purely local repository — common enough that it
+/// is an ANSWER, not an error).
+///
+/// Works unchanged from inside a linked worktree: `.claude/worktrees/<branch>`
+/// shares the main repository's config, which is where remotes live.
+///
+/// ⚠️ Only a genuine failure (git missing, not a repository, unreadable config)
+/// comes back as `Err`. `git config --get` signals "key not set" with exit code 1
+/// and an empty stderr — matching on the CODE, not on the message, is what keeps
+/// "no remote" from being reported as a broken repository.
+pub fn remote_url(repo_path: &str) -> Result<Option<String>, GitError> {
+    match run_git(repo_path, &["config", "--get", "remote.origin.url"]) {
+        Ok(out) => {
+            let url = out.trim();
+            Ok((!url.is_empty()).then(|| url.to_string()))
+        }
+        Err(GitError::Command {
+            code: Some(1),
+            stderr,
+            ..
+        }) if stderr.is_empty() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reduce a git remote URL to a comparison key, so the SAME repository written in
+/// different notations compares equal. `None` for anything that carries no
+/// identity (empty, or a URL with no path part).
+///
+/// This is the ONE place that decides whether two URLs mean the same repository —
+/// the app never compares remote strings anywhere else, and never matches on the
+/// repository NAME (verified against production data: `CRM_max` is named "TOSSE"
+/// in the CRM, `landing_page` is "landing-page-josty" — a name match would both
+/// miss real pairs and invent false ones).
+///
+/// Every transformation below exists because both forms occur in the real data:
+/// - scp-style SSH (`git@github.com:Alex375/CRM_max.git`) vs HTTPS
+///   (`https://github.com/Alex375/CRM_max`) — the local clones use both;
+/// - a trailing `.git`, present on clone URLs and absent from the CRM's;
+/// - case: GitHub treats owner/repo case-insensitively, so `CRM_max` and
+///   `crm_max` are one repository.
+pub fn normalize_remote_url(url: &str) -> Option<String> {
+    let mut s = url.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Drop the scheme (`https://`, `ssh://`, `git://`, `file://`…). What remains
+    // is `[user@]host/path` for a URL, or the scp-style form handled just below.
+    if let Some(rest) = s.split_once("://") {
+        s = rest.1;
+    } else if let Some((head, tail)) = s.split_once(':') {
+        // scp-style `git@host:owner/repo` — but NOT a Windows drive or a port-ish
+        // oddity: require the colon to come before any slash, as git itself does.
+        if !head.contains('/') {
+            return normalize_remote_url(&format!("{head}/{tail}"));
+        }
+    }
+
+    // Credentials are not identity: `git@github.com/x` and `github.com/x` are one.
+    if let Some((_, host_and_path)) = s.split_once('@') {
+        s = host_and_path;
+    }
+
+    let s = s.trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/');
+
+    // A host with no path identifies no repository — refuse to match on it, or
+    // every remote-less `github.com` would collapse into one pair.
+    if s.is_empty() || !s.contains('/') {
+        return None;
+    }
+    Some(s.to_lowercase())
 }
 
 /// List every worktree of the repository that `repo_path` lives in. The main
@@ -397,6 +481,67 @@ fn same_path(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair that motivates the whole normalizer: a local SSH remote and the
+    /// CRM's HTTPS URL, differing in scheme, credentials, `.git` and case — the
+    /// same repository, and the app must see it as one.
+    #[test]
+    fn ssh_and_https_forms_of_one_repo_normalize_alike() {
+        let ssh = normalize_remote_url("git@github.com:Alex375/CRM_max.git");
+        let https = normalize_remote_url("https://github.com/Alex375/CRM_max");
+        assert_eq!(ssh.as_deref(), Some("github.com/alex375/crm_max"));
+        assert_eq!(ssh, https);
+    }
+
+    #[test]
+    fn normalizes_the_other_shapes_seen_in_the_real_data() {
+        // Local clone URL: HTTPS with a trailing `.git`.
+        assert_eq!(
+            normalize_remote_url("https://github.com/Alex375/tosse-code.git").as_deref(),
+            Some("github.com/alex375/tosse-code")
+        );
+        // ssh:// URL form (rather than scp-style) plus a trailing slash.
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/Alex375/tosse-code/").as_deref(),
+            Some("github.com/alex375/tosse-code")
+        );
+        // Surrounding whitespace: `git config --get` output is read verbatim.
+        assert_eq!(
+            normalize_remote_url("  https://github.com/Alex375/tosse-code  \n").as_deref(),
+            Some("github.com/alex375/tosse-code")
+        );
+    }
+
+    /// Distinct repositories must NOT collapse together — the failure mode that
+    /// would silently link a local folder to the wrong CRM entry.
+    #[test]
+    fn distinct_repositories_do_not_collide() {
+        assert_ne!(
+            normalize_remote_url("https://github.com/Alex375/tosse-code"),
+            normalize_remote_url("https://github.com/Alex375/tosse-showcase")
+        );
+        // Same repo name, different owner.
+        assert_ne!(
+            normalize_remote_url("https://github.com/Alex375/app"),
+            normalize_remote_url("https://github.com/clousty8/app")
+        );
+        // Same path, different host.
+        assert_ne!(
+            normalize_remote_url("https://github.com/Alex375/app"),
+            normalize_remote_url("https://gitlab.com/Alex375/app")
+        );
+    }
+
+    /// Anything that identifies no repository yields `None` rather than a key that
+    /// could match another empty-ish value (a CRM repository with a null url, a
+    /// local repo with no remote).
+    #[test]
+    fn identity_less_urls_yield_none() {
+        assert_eq!(normalize_remote_url(""), None);
+        assert_eq!(normalize_remote_url("   "), None);
+        assert_eq!(normalize_remote_url("https://github.com"), None);
+        assert_eq!(normalize_remote_url("https://github.com/"), None);
+    }
 
     #[test]
     fn parses_main_and_linked_worktrees() {

@@ -44,7 +44,8 @@ use ipc::commands::{
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ultracode,
     spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
-    tosse_login_cancel, tosse_login_start, tosse_logout, tosse_status,
+    tosse_link_repository, tosse_login_cancel, tosse_login_start, tosse_logout, tosse_repo_links,
+    tosse_status,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -93,6 +94,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_login_start,
             tosse_login_cancel,
             tosse_logout,
+            tosse_repo_links,
+            tosse_link_repository,
             fetch_slash_commands,
             load_session_history,
             load_session_context,

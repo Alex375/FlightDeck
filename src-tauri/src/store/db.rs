@@ -20,13 +20,13 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::model::{ConversationRecord, PersistedState, RepoRecord};
+use super::model::{ConversationRecord, PersistedState, RepoRecord, RepoTosseLink};
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -47,7 +47,14 @@ type Migration = fn(&Connection) -> rusqlite::Result<()>;
 /// OFF — and that pragma is a NO-OP inside a transaction. Since the runner wraps
 /// each migration in one, such a migration must toggle foreign-key enforcement
 /// outside it; do not assume you can flip it from inside a `migrate_vN` body.
-const MIGRATIONS: &[Migration] = &[migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5];
+const MIGRATIONS: &[Migration] = &[
+    migrate_v1,
+    migrate_v2,
+    migrate_v3,
+    migrate_v4,
+    migrate_v5,
+    migrate_v6,
+];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
@@ -189,6 +196,27 @@ fn migrate_v5(conn: &Connection) -> rusqlite::Result<()> {
         "conversations",
         "backend",
         "ALTER TABLE conversations ADD COLUMN backend TEXT",
+    )
+}
+
+/// v6 — the TOSSE repository a local folder is pinned to, when the user picked one
+/// by hand. NULL (the default for every existing row) means "no manual choice": the
+/// app then derives the link from the folder's git remote, so nothing changes for a
+/// user who never opens the feature — or who never connects to TOSSE at all.
+///
+/// It lives in SQLite rather than in the `tosse:display` localStorage prefs because
+/// it records a decision about a repository, not a display preference: it must
+/// survive a settings reset and belongs next to the row it qualifies.
+///
+/// ⚠️ Deliberately NOT a foreign key: the id belongs to another system (the CRM's
+/// database), so nothing local can enforce it, and a repository deleted server-side
+/// must degrade to "the repository you picked is gone" rather than corrupt the row.
+fn migrate_v6(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "tosse_repository_id",
+        "ALTER TABLE repos ADD COLUMN tosse_repository_id TEXT",
     )
 }
 
@@ -351,6 +379,40 @@ impl Store {
             params![repo.id, repo.path, repo.added_at],
         )?;
         Ok(())
+    }
+
+    /// Every repo with the TOSSE repository it is pinned to, if any. Feeds the
+    /// association matcher, which also needs `path` to read each folder's git remote.
+    pub fn repo_tosse_links(&self) -> rusqlite::Result<Vec<RepoTosseLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, path, tosse_repository_id FROM repos ORDER BY added_at ASC")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RepoTosseLink {
+                    repo_id: row.get(0)?,
+                    path: row.get(1)?,
+                    tosse_repository_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Pin a repo to a TOSSE repository, or clear the pin with `None`.
+    ///
+    /// The ONLY writer of that column — see [`RepoTosseLink`] for why it is not part of
+    /// the record `upsert_repo` writes. Returns the number of rows touched so the caller
+    /// can tell "cleared" from "that repo does not exist" instead of reporting success.
+    pub fn set_repo_tosse_link(
+        &self,
+        repo_id: &str,
+        repository_id: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE repos SET tosse_repository_id = ?2 WHERE id = ?1",
+            params![repo_id, repository_id],
+        )
     }
 
     /// Delete a repo; its conversations cascade away via the FK.
@@ -681,6 +743,36 @@ mod tests {
         c.clean_output = None;
         store.upsert_conversation(&c).unwrap();
         assert_eq!(store.load_state().unwrap().conversations[0].clean_output, None);
+    }
+
+    #[test]
+    fn tosse_link_round_trips_and_survives_a_repo_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        // Unset by default — a user who never touches the feature has no association.
+        assert_eq!(store.repo_tosse_links().unwrap()[0].tosse_repository_id, None);
+
+        assert_eq!(store.set_repo_tosse_link("r1", Some("crm-abc")).unwrap(), 1);
+        assert_eq!(
+            store.repo_tosse_links().unwrap()[0].tosse_repository_id.as_deref(),
+            Some("crm-abc")
+        );
+
+        // The regression this column is shaped to avoid: re-upserting the repo (adding
+        // the same folder again, an undo, a path fix) must NOT blank the association.
+        store.upsert_repo(&repo("r1")).unwrap();
+        assert_eq!(
+            store.repo_tosse_links().unwrap()[0].tosse_repository_id.as_deref(),
+            Some("crm-abc"),
+            "upsert_repo must not clear a link it knows nothing about"
+        );
+
+        // Clearing is explicit, and only ever via its own call.
+        assert_eq!(store.set_repo_tosse_link("r1", None).unwrap(), 1);
+        assert_eq!(store.repo_tosse_links().unwrap()[0].tosse_repository_id, None);
+
+        // A repo that does not exist reports zero rows rather than a silent success.
+        assert_eq!(store.set_repo_tosse_link("ghost", Some("x")).unwrap(), 0);
     }
 
     #[test]

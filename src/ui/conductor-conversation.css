@@ -42,6 +42,21 @@
 .cv-repo-reveal { display:none; }
 .cv-repo-h:hover .cv-repo-reveal { display:inline-flex; animation:cv-reveal-in .14s ease; }
 @keyframes cv-reveal-in { from { opacity:0; transform:translateX(-3px); } to { opacity:1; transform:none; } }
+/* TOSSE mark. LINKED: always visible, in the CRM's brand colour — that a folder belongs to
+   a client project is standing information, not a tool. UNLINKED: it also carries
+   .cv-repo-reveal, so it behaves like the secondary tools above (nothing at rest) and reads
+   as hollow — an offer to associate, not a state. ATTENTION (ambiguous match / a pinned
+   repository gone): stays visible, muted, with a small warning flag. */
+.cv-tosse-badge { position:relative; }
+.cv-tosse-badge .wf-tosse-mark { width:17px; height:12px; }
+.cv-tosse-badge.linked { color:var(--wf-tosse-accent); opacity:1; }
+.cv-tosse-badge.linked:hover { background:color-mix(in srgb, var(--wf-tosse-accent) 16%, transparent); color:var(--wf-tosse-accent); }
+/* Hollow at rest: the mark's own north-needle accent is dropped and the whole glyph is
+   dimmed, so an unassociated folder never mimics an associated one. */
+.cv-tosse-badge:not(.linked) .wf-tosse-mark { --logo-accent:currentColor; opacity:.55; }
+.cv-tosse-badge.attention { color:var(--wf-warn, #e0a63f); opacity:1; }
+.cv-tosse-badge.attention .wf-tosse-mark { opacity:.85; }
+.cv-tosse-badge-flag { position:absolute; right:1px; bottom:1px; width:9px; height:9px; color:var(--wf-warn, #e0a63f); }
 .cv-repo-empty { font-size:11.5px; color:var(--wf-tx-xlo); padding:3px 9px 6px 27px; font-style:italic; }
 .cv-sess-list { display:flex; flex-direction:column; gap:1px; padding:2px 6px; }
 /* Row = the hover/active target; it holds the main button + the kebab menu. */

@@ -8,7 +8,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
-import type { Result, TosseAccountStatus } from "./client";
+import type { Result, TosseAccountStatus, TosseRepoLink, TosseRepoLinksPayload } from "./client";
 import { accountStatusKey } from "./useAccounts";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
@@ -58,4 +58,53 @@ export function useTosseConnectionActions() {
   // WAITING, and the browser round-trip may already have completed — in which case we are
   // connected and the card must not keep claiming otherwise until staleTime lapses.
   return { loginStart, loginCancel, logout, refresh };
+}
+
+export const tosseRepoLinksKey = ["tosse-repo-links"] as const;
+
+/**
+ * How each Flight Deck folder maps to a TOSSE repository — the whole table in one query,
+ * because the CRM's repository list is a single request and matching needs all of it.
+ *
+ * ONE shared query for every repo header: keyed globally (not per repo), so N sidebar
+ * badges cost one fetch. A signed-out user gets `connected: false` for free — the command
+ * returns before reading a single git remote.
+ *
+ * `enabled` lets the caller skip the work entirely when the feature is switched off in
+ * Settings, so the display preference costs nothing rather than merely hiding the result.
+ */
+export function useTosseRepoLinks(enabled = true) {
+  return useQuery<TosseRepoLinksPayload>({
+    queryKey: tosseRepoLinksKey,
+    enabled,
+    queryFn: () => unwrap(commands.tosseRepoLinks()),
+    // Repositories move rarely and each refetch shells out to `git` once per folder, so
+    // this stays deliberately cold; the mutation below invalidates it on a real change.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** One folder's link, or `undefined` while the query is still loading / disabled. */
+export function repoLinkFor(
+  payload: TosseRepoLinksPayload | undefined,
+  repoId: string,
+): TosseRepoLink | undefined {
+  return payload?.links.find((l) => l.repoId === repoId);
+}
+
+/**
+ * Pin a folder to a TOSSE repository by hand (or clear it with `null`).
+ *
+ * Purely local — TOSSE has no field for a machine path and is never written to. The
+ * account-status key is NOT touched: this changes an association, not the session.
+ */
+export function useLinkTosseRepository() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { repoId: string; repositoryId: string | null }): Promise<null> =>
+      unwrap(commands.tosseLinkRepository(v.repoId, v.repositoryId)),
+    // Refetch on success only: a failed write must leave the displayed link alone rather
+    // than flicker to a state the database never accepted.
+    onSuccess: () => qc.invalidateQueries({ queryKey: tosseRepoLinksKey }),
+  });
 }

@@ -500,6 +500,113 @@ pub async fn tosse_logout() -> Result<(), String> {
     crate::tosse::logout().await.map_err(|e| e.to_string())
 }
 
+/// How each of Flight Deck's folders relates to TOSSE, in one call.
+///
+/// One payload rather than a command per repo: the CRM's repository list is a single
+/// request, and matching needs all of it at once.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseRepoLinksPayload {
+    /// False when no TOSSE session is held. The app is fully usable in that state, so the
+    /// UI shows nothing at all — and this call costs nothing either (it returns before
+    /// reading a single git remote).
+    pub connected: bool,
+    /// One entry per Flight Deck repo, in the order the store holds them.
+    pub links: Vec<crate::tosse::TosseRepoLink>,
+    /// Every repository the CRM knows, for the manual picker. Empty when `error` is set.
+    pub repositories: Vec<crate::tosse::TosseRepository>,
+    /// Set when we ARE connected but the list could not be read (offline, server error).
+    /// The links then resolve to nothing, and the UI says why instead of showing a folder
+    /// as un-associated — which would look like the association was lost.
+    pub error: Option<String>,
+}
+
+/// Pair every Flight Deck folder with the TOSSE repository it belongs to.
+///
+/// A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's
+/// urls (normalized — see [`crate::git::normalize_remote_url`]). Names are NEVER matched.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_repo_links(
+    store: tauri::State<'_, Store>,
+) -> Result<TosseRepoLinksPayload, String> {
+    let rows = store.repo_tosse_links().map_err(|e| e.to_string())?;
+
+    // Ask TOSSE FIRST: a signed-out user must not pay for a git spawn per folder just to
+    // be told there is nothing to show.
+    let listed = match crate::tosse::list_repositories().await {
+        Ok(list) => Ok(list),
+        Err(crate::tosse::TosseError::NotConnected) => {
+            return Ok(TosseRepoLinksPayload {
+                connected: false,
+                links: Vec::new(),
+                repositories: Vec::new(),
+                error: None,
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+
+    // Reading remotes shells out to `git` once per folder — off the async runtime.
+    let locals = tauri::async_runtime::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|row| {
+                let (remote_url, remote_error) = match crate::git::remote_url(&row.path) {
+                    Ok(url) => (url, None),
+                    // A folder that moved or was deleted must SAY so: silently reporting
+                    // "no remote" would present it as simply un-associated.
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                (
+                    crate::tosse::LocalRepo {
+                        repo_id: row.repo_id,
+                        remote_url,
+                        manual_repository_id: row.tosse_repository_id,
+                    },
+                    remote_error,
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("could not read the repositories' git remotes: {e}"))?;
+
+    let (inputs, remote_errors): (Vec<_>, Vec<_>) = locals.into_iter().unzip();
+    let repositories = listed.as_ref().cloned().unwrap_or_default();
+    let mut links = crate::tosse::resolve_links(&inputs, &repositories);
+    for (link, err) in links.iter_mut().zip(remote_errors) {
+        link.remote_error = err;
+    }
+
+    Ok(TosseRepoLinksPayload {
+        connected: true,
+        links,
+        repositories,
+        error: listed.err(),
+    })
+}
+
+/// Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
+///
+/// Local only — the CRM has no field for a machine path, and this is never written back.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_link_repository(
+    store: tauri::State<'_, Store>,
+    repo_id: String,
+    repository_id: Option<String>,
+) -> Result<(), String> {
+    let touched = store
+        .set_repo_tosse_link(&repo_id, repository_id.as_deref())
+        .map_err(|e| e.to_string())?;
+    if touched == 0 {
+        // Reporting success here would leave the UI showing an association that was
+        // never stored, and that quietly vanishes on the next load.
+        return Err(format!("no repository with id {repo_id} is registered"));
+    }
+    Ok(())
+}
+
 /// Fetch the slash commands available in `cwd` WITHOUT starting a persistent
 /// session. Spawns a short-lived `claude`, performs the `initialize` handshake
 /// (spec §4.4), reads the advertised commands from its `control_response`, and

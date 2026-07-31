@@ -23,6 +23,7 @@ import {
   type AgentStatus,
 } from "../../agent/status";
 import { useSettingsUi } from "../../store/settingsUi";
+import { TosseRepoBadge } from "../tosse/TosseRepoBadge";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
@@ -276,6 +277,10 @@ function RepoGroup({
           <Ico name="chev" className="sm cv-repo-fold-chev" />
           <span className="cv-repo-n">{repoName(repo.path)}</span>
         </button>
+        {/* TOSSE — renders nothing unless the CRM is connected. Solid and always visible
+            when this folder maps to a repository there; otherwise it behaves like the
+            secondary tools below (revealed on hover) and offers to associate it by hand. */}
+        <TosseRepoBadge repoId={repo.id} />
         {/* Worktrees + extensions — revealed only on header hover (0-width at rest). */}
         <button
           type="button"

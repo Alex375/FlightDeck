@@ -14,6 +14,7 @@ import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
+import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { useExtensionsUi } from "./features/extensions/extensionsUiStore";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { useHistoryUi } from "./features/history/historyUiStore";
@@ -316,6 +317,8 @@ export default function App() {
       <WorktreeManager />
       {/* Idem: the extensions manager, opened per repo (sidebar) or per conversation (composer). */}
       <ExtensionsManager />
+      {/* Idem: the TOSSE card of a repository, opened by the mark on its sidebar header. */}
+      <TosseRepoCard />
       {/* Idem: the conversation-history search panel, opened from the sidebar search bar. */}
       <HistoryPanel />
       {/* Mounted once, globally: the full-screen "Ultra code" activation blast. */}

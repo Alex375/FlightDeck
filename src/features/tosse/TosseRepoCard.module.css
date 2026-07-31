@@ -1,0 +1,397 @@
+/* The TOSSE repository card. Shape and tokens are borrowed from the worktree manager so it
+   reads as the same family of dialog; only the brand accent (the CRM's own colour) is
+   specific to it. */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--overlay-scrim);
+}
+
+.panel {
+  width: 620px;
+  max-width: 92vw;
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+}
+
+/* ── Header ── */
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--wf-line);
+}
+.headMark {
+  color: var(--wf-tosse-accent);
+  flex: 0 0 auto;
+}
+.title {
+  flex: 1;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.titleRepo {
+  color: var(--wf-tx-lo);
+  font-weight: 500;
+}
+/* The CRM's own status word, stated quietly: it is a fact about the repository, not a call
+   to action — a filled brand-coloured pill would out-shout the title next to it. */
+.status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--wf-tosse-accent) 80%, var(--wf-tx-lo));
+  border: 1px solid color-mix(in srgb, var(--wf-tosse-accent) 32%, transparent);
+}
+/* An archived repository is stated plainly rather than hidden: the association was a
+   deliberate choice, and dropping it silently would be worse than showing it greyed. */
+.status[data-archived="true"] {
+  color: var(--wf-tx-lo);
+  border-color: var(--wf-line);
+}
+
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.iconBtn:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.iconBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── Body ── */
+
+.body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.facts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fact {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+.factLabel {
+  flex: 0 0 96px;
+  color: var(--wf-tx-lo);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.factValue {
+  flex: 1;
+  min-width: 0;
+  color: var(--wf-tx-hi);
+  overflow-wrap: anywhere;
+}
+.mono {
+  font-family: var(--wf-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  color: var(--wf-tx-mid);
+}
+.muted {
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+}
+
+/* A `<button>`, not an `<a>`: the app opens external URLs through the opener plugin. */
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--wf-accent);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.link:hover {
+  text-decoration: underline;
+}
+.linkIco {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  opacity: 0.75;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sectionLabel {
+  color: var(--wf-tx-lo);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.projects {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.projects li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+}
+.projectName {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--wf-tx-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.projectStatus {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+}
+
+/* The CRM's Markdown context. Bounded and scrollable: some repositories carry pages of it,
+   and it must not push the actions out of reach. */
+.context {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 10px 11px;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+  font-size: 12.5px;
+}
+
+/* ── Problem / empty states ── */
+
+.problem {
+  display: flex;
+  gap: 9px;
+  padding: 10px 11px;
+  border: 1px solid color-mix(in srgb, var(--wf-warn, #e0a63f) 40%, var(--wf-line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--wf-warn, #e0a63f) 8%, transparent);
+  color: var(--wf-tx-mid);
+}
+.problem > .wf-ico {
+  flex: 0 0 auto;
+  color: var(--wf-warn, #e0a63f);
+}
+.problemTitle {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+.problemBody {
+  font-size: 12px;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 22px 12px;
+  text-align: center;
+}
+.emptyIco {
+  width: 22px;
+  height: 22px;
+  color: var(--wf-tx-lo);
+  opacity: 0.7;
+}
+.emptyTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+.emptyBody {
+  font-size: 12.5px;
+  color: var(--wf-tx-lo);
+  max-width: 42ch;
+  overflow-wrap: anywhere;
+}
+
+/* ── Picker ── */
+
+.searchRow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-lo);
+}
+.search {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--wf-tx-hi);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.pickList,
+.candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.candidates {
+  margin-top: 7px;
+}
+
+.candidate {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.candidate:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  border-color: color-mix(in srgb, var(--wf-tosse-accent) 45%, var(--wf-line));
+}
+.candidate:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.candidate[data-current="true"] {
+  border-color: color-mix(in srgb, var(--wf-tosse-accent) 55%, var(--wf-line));
+}
+.candidateName {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.candidateUrl {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+/* ── Footer ── */
+
+.foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--wf-line);
+}
+.footSpacer {
+  flex: 1;
+}
+
+.ghostBtn,
+.primaryBtn {
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+.ghostBtn {
+  border: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx-mid);
+}
+.ghostBtn:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.primaryBtn {
+  border: 1px solid color-mix(in srgb, var(--wf-tosse-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--wf-tosse-accent) 16%, transparent);
+  color: var(--wf-tosse-accent);
+  font-weight: 600;
+}
+.primaryBtn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--wf-tosse-accent) 26%, transparent);
+}
+.ghostBtn:disabled,
+.primaryBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}

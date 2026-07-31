@@ -19,6 +19,20 @@ pub struct RepoRecord {
     pub added_at: i64,
 }
 
+/// A repo together with the TOSSE repository the user pinned it to, if any.
+///
+/// ⚠️ Kept OUT of [`RepoRecord`] deliberately. `upsert_repo` rewrites that record
+/// wholesale, and every caller of it (adding a folder, renaming, restoring an undo)
+/// knows nothing about TOSSE — carrying the field there would let any of them blank
+/// a link the user set. The association is written only by its own dedicated call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RepoTosseLink {
+    pub repo_id: String,
+    pub path: String,
+    /// The CRM repository id, or `None` when the user never pinned one.
+    pub tosse_repository_id: Option<String>,
+}
+
 /// A conversation's persisted metadata.
 ///
 /// The stable `id` is the identity the whole app keys off. It is deliberately

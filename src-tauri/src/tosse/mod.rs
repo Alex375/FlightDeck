@@ -1243,9 +1243,372 @@ async fn revoke(client_id: &str, token: &str, is_refresh: bool) -> R<()> {
     }
 }
 
+// ── Repositories ─────────────────────────────────────────────────────────────────────
+
+/// A project a repository is attached to, trimmed to what the app displays. The CRM models
+/// repository↔project as N-N, so this is a list, and it can legitimately be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseProjectRef {
+    pub id: String,
+    pub name: String,
+    pub status: Option<String>,
+}
+
+/// A repository as TOSSE knows it.
+///
+/// ⚠️ `url` is nullable in the CRM's schema and genuinely absent on a fair share of the
+/// rows — a repository with no url can never be matched automatically, which is the whole
+/// reason a manual association exists alongside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseRepository {
+    pub id: String,
+    pub name: String,
+    pub url: Option<String>,
+    pub host: Option<String>,
+    /// `"Actif"` / `"Archivé"`. Shown, never used to filter: hiding an archived repository
+    /// would silently break an association the user made deliberately.
+    pub status: Option<String>,
+    /// The repo-level context the CRM keeps for agents — Markdown, rendered as-is.
+    pub context: Option<String>,
+    pub projects: Vec<TosseProjectRef>,
+}
+
+/// GET a first-party `/api/v1/*` endpoint with our Bearer token, parsed as JSON.
+///
+/// The single entry point for TOSSE data reads (the Tasks view will reuse it), so the
+/// token handling, the error shaping and the `{success, data}` envelope live in one place.
+async fn api_get(path: &str) -> R<Value> {
+    let token = access_token().await?;
+    let url = format!("{BASE_URL}{path}");
+    let (status, body) = send_text(http()?.get(&url).bearer_auth(token)).await?;
+    if !status.is_success() {
+        return Err(TosseError::Http {
+            status: status.as_u16(),
+            body: readable_error(&body),
+        });
+    }
+    serde_json::from_str(&body)
+        .map_err(|e| TosseError::Protocol(format!("{path} did not return JSON ({e})")))
+}
+
+/// Every repository TOSSE holds (`GET /api/v1/repositories`).
+///
+/// Read-only, always: the CRM has no field for a local path, and a path on one machine
+/// means nothing on another — the association is kept locally and NEVER written back.
+pub async fn list_repositories() -> R<Vec<TosseRepository>> {
+    let v = api_get("/api/v1/repositories").await?;
+    let items = v
+        .pointer("/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            TosseError::Protocol(format!(
+                "the repository list carried no `data` array: {}",
+                snippet(&v.to_string())
+            ))
+        })?;
+    items.iter().map(parse_repository).collect()
+}
+
+/// Shape one repository. A row without an `id` is a protocol error rather than a skipped
+/// entry: silently dropping rows would show a short list that looks complete.
+fn parse_repository(v: &Value) -> R<TosseRepository> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let id = s("id").ok_or_else(|| {
+        TosseError::Protocol(format!(
+            "a repository came back without an id: {}",
+            snippet(&v.to_string())
+        ))
+    })?;
+    let projects = v
+        .get("projects")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                // The join row nests the project; tolerate a flattened shape too.
+                .map(|row| row.get("project").unwrap_or(row))
+                .filter_map(|p| {
+                    Some(TosseProjectRef {
+                        id: p.get("id").and_then(Value::as_str)?.to_string(),
+                        name: p
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Untitled project")
+                            .to_string(),
+                        status: p.get("status").and_then(Value::as_str).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(TosseRepository {
+        name: s("name").unwrap_or_else(|| id.clone()),
+        id,
+        url: s("url"),
+        host: s("host"),
+        status: s("status"),
+        context: s("context"),
+        projects,
+    })
+}
+
+// ── Matching a local folder to a repository ──────────────────────────────────────────
+
+/// How a local folder came to be linked to a CRM repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum TosseLinkSource {
+    /// The user picked it — always wins over any automatic match.
+    Manual,
+    /// Derived from the folder's `origin` remote.
+    Remote,
+}
+
+/// What the caller knows about one local folder, gathered before matching. Keeping this an
+/// INPUT is what lets [`resolve_links`] stay pure: git and SQLite are read by the IPC layer.
+#[derive(Debug, Clone)]
+pub struct LocalRepo {
+    /// Flight Deck's own repo id (the SQLite primary key).
+    pub repo_id: String,
+    /// `origin`'s URL, or `None` for a repository with no remote.
+    pub remote_url: Option<String>,
+    /// A repository id the user pinned by hand, if any.
+    pub manual_repository_id: Option<String>,
+}
+
+/// One local folder's relationship to TOSSE, as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseRepoLink {
+    pub repo_id: String,
+    pub remote_url: Option<String>,
+    /// The linked repository. `None` covers three DIFFERENT situations the UI must not
+    /// blur: nothing matched, the remote matched several (see `ambiguous`), or a manual
+    /// link points at a repository the CRM no longer returns (see `manual_repository_id`).
+    pub repository: Option<TosseRepository>,
+    pub source: Option<TosseLinkSource>,
+    /// The id the user pinned. Kept even when it resolves to nothing, so the UI can say
+    /// "the repository you picked is gone" instead of quietly falling back to unlinked.
+    pub manual_repository_id: Option<String>,
+    /// Candidates when one remote matches SEVERAL CRM repositories. We never pick for the
+    /// user; the UI offers the choice.
+    pub ambiguous: Vec<TosseRepository>,
+    /// Why the folder's remote could not be read at all (moved, deleted, not a repository).
+    /// Filled by the caller that does the git read; `None` on the happy path AND when the
+    /// folder simply has no remote — those two are different, and only this one is a fault.
+    pub remote_error: Option<String>,
+}
+
+/// Pair local folders with CRM repositories. Pure — no IO, no globals — so the matching
+/// rules are unit-testable and have exactly one definition.
+///
+/// Precedence is deliberate: a manual link ALWAYS wins, because it is the only signal that
+/// records a human decision; the remote is a good guess, not an instruction.
+pub fn resolve_links(locals: &[LocalRepo], repositories: &[TosseRepository]) -> Vec<TosseRepoLink> {
+    locals
+        .iter()
+        .map(|local| {
+            let manual = local.manual_repository_id.as_deref().and_then(|id| {
+                repositories
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| (r.clone(), TosseLinkSource::Manual))
+            });
+            let mut ambiguous = Vec::new();
+            let resolved = manual.or_else(|| {
+                // A pinned id that resolved to nothing must NOT silently fall back to the
+                // remote guess: the user's choice would appear to have been overruled.
+                if local.manual_repository_id.is_some() {
+                    return None;
+                }
+                let key = local
+                    .remote_url
+                    .as_deref()
+                    .and_then(crate::git::normalize_remote_url)?;
+                let mut matches = repositories.iter().filter(|r| {
+                    r.url
+                        .as_deref()
+                        .and_then(crate::git::normalize_remote_url)
+                        .is_some_and(|k| k == key)
+                });
+                let first = matches.next()?;
+                let rest: Vec<_> = matches.cloned().collect();
+                if rest.is_empty() {
+                    Some((first.clone(), TosseLinkSource::Remote))
+                } else {
+                    ambiguous.push(first.clone());
+                    ambiguous.extend(rest);
+                    None
+                }
+            });
+            let (repository, source) = match resolved {
+                Some((r, s)) => (Some(r), Some(s)),
+                None => (None, None),
+            };
+            TosseRepoLink {
+                repo_id: local.repo_id.clone(),
+                remote_url: local.remote_url.clone(),
+                repository,
+                source,
+                manual_repository_id: local.manual_repository_id.clone(),
+                ambiguous,
+                remote_error: None,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo(id: &str, name: &str, url: Option<&str>) -> TosseRepository {
+        TosseRepository {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: url.map(str::to_string),
+            host: Some("github".into()),
+            status: Some("Actif".into()),
+            context: None,
+            projects: Vec::new(),
+        }
+    }
+
+    fn local(repo_id: &str, remote: Option<&str>, manual: Option<&str>) -> LocalRepo {
+        LocalRepo {
+            repo_id: repo_id.to_string(),
+            remote_url: remote.map(str::to_string),
+            manual_repository_id: manual.map(str::to_string),
+        }
+    }
+
+    /// The real production pair the whole feature hangs on: the local folder is called
+    /// `CRM_max` and speaks SSH, the CRM calls the same repository "TOSSE" over HTTPS.
+    /// Matching by NAME would miss it — matching by normalized remote finds it.
+    #[test]
+    fn matches_a_folder_to_its_repository_by_remote_despite_different_names() {
+        let repositories = vec![
+            repo("r-tosse", "TOSSE", Some("https://github.com/Alex375/CRM_max")),
+            repo(
+                "r-code",
+                "tosse-code",
+                Some("https://github.com/Alex375/tosse-code"),
+            ),
+        ];
+        let links = resolve_links(
+            &[local("local-crm", Some("git@github.com:Alex375/CRM_max.git"), None)],
+            &repositories,
+        );
+        assert_eq!(links[0].repository.as_ref().map(|r| r.name.as_str()), Some("TOSSE"));
+        assert_eq!(links[0].source, Some(TosseLinkSource::Remote));
+        assert!(links[0].ambiguous.is_empty());
+    }
+
+    /// The cases that never resolve on their own, and must read as "unlinked" rather than
+    /// as an error: a folder with no remote, and a CRM repository with no url.
+    #[test]
+    fn a_folder_with_no_remote_and_a_repository_with_no_url_stay_unlinked() {
+        let repositories = vec![repo("r-none", "landing_page", None)];
+        let links = resolve_links(
+            &[local("local-a", None, None), local("local-b", Some(""), None)],
+            &repositories,
+        );
+        assert!(links.iter().all(|l| l.repository.is_none() && l.source.is_none()));
+        // Two url-less sides must not match EACH OTHER through an empty key.
+        assert!(links.iter().all(|l| l.ambiguous.is_empty()));
+    }
+
+    /// A human decision outranks the automatic guess, and is not overruled by it.
+    #[test]
+    fn a_manual_link_wins_over_the_remote_match() {
+        let repositories = vec![
+            repo("r-guess", "guessed", Some("https://github.com/Alex375/app")),
+            repo("r-picked", "picked-by-hand", Some("https://github.com/other/thing")),
+        ];
+        let links = resolve_links(
+            &[local(
+                "local-a",
+                Some("https://github.com/Alex375/app.git"),
+                Some("r-picked"),
+            )],
+            &repositories,
+        );
+        assert_eq!(
+            links[0].repository.as_ref().map(|r| r.id.as_str()),
+            Some("r-picked")
+        );
+        assert_eq!(links[0].source, Some(TosseLinkSource::Manual));
+    }
+
+    /// A pinned repository the CRM no longer returns (deleted server-side) must surface as
+    /// a broken choice — never as a quiet fallback to the remote guess, which would look
+    /// like the app silently overrode the user.
+    #[test]
+    fn a_stale_manual_link_does_not_fall_back_to_the_remote_guess() {
+        let repositories = vec![repo("r-guess", "guessed", Some("https://github.com/Alex375/app"))];
+        let links = resolve_links(
+            &[local(
+                "local-a",
+                Some("https://github.com/Alex375/app"),
+                Some("r-deleted"),
+            )],
+            &repositories,
+        );
+        assert_eq!(links[0].repository, None);
+        assert_eq!(links[0].source, None);
+        assert_eq!(links[0].manual_repository_id.as_deref(), Some("r-deleted"));
+    }
+
+    /// Two CRM rows pointing at one remote: we refuse to pick, and hand both to the UI.
+    #[test]
+    fn an_ambiguous_remote_offers_the_candidates_instead_of_guessing() {
+        let repositories = vec![
+            repo("r-1", "first", Some("https://github.com/Alex375/dup")),
+            repo("r-2", "second", Some("git@github.com:Alex375/dup.git")),
+        ];
+        let links = resolve_links(
+            &[local("local-a", Some("https://github.com/Alex375/dup"), None)],
+            &repositories,
+        );
+        assert_eq!(links[0].repository, None);
+        assert_eq!(links[0].ambiguous.len(), 2);
+    }
+
+    /// The `{success, data}` envelope, the nested N-N project join, and a null url — the
+    /// exact shape `GET /api/v1/repositories` returns in production.
+    #[test]
+    fn parses_a_repository_row_with_its_nested_projects() {
+        let row = serde_json::json!({
+            "id": "518262ab",
+            "name": "fiabila-ia-formulation",
+            "url": null,
+            "host": "github",
+            "status": "Actif",
+            "context": "# Repo\n\nSome markdown.",
+            "projects": [
+                { "projectId": "3dd2c6c2",
+                  "project": { "id": "3dd2c6c2", "name": "IA de formulation", "status": "En cours" } }
+            ]
+        });
+        let parsed = parse_repository(&row).expect("a well-formed row must parse");
+        assert_eq!(parsed.url, None);
+        assert_eq!(parsed.context.as_deref(), Some("# Repo\n\nSome markdown."));
+        assert_eq!(parsed.projects.len(), 1);
+        assert_eq!(parsed.projects[0].name, "IA de formulation");
+        assert_eq!(parsed.projects[0].status.as_deref(), Some("En cours"));
+    }
+
+    /// A row missing its id fails loudly: dropping it would render a short list that looks
+    /// complete, and the user would hunt for a repository that is simply not displayed.
+    #[test]
+    fn a_repository_row_without_an_id_is_a_protocol_error() {
+        let row = serde_json::json!({ "name": "nameless" });
+        assert!(matches!(
+            parse_repository(&row),
+            Err(TosseError::Protocol(_))
+        ));
+    }
 
     #[test]
     fn pkce_challenge_matches_the_rfc_7636_test_vector() {
@@ -1620,6 +1983,30 @@ mod tests {
         let parsed: StoredAuth = serde_json::from_str(&back).expect("must parse back");
         assert_eq!(parsed.refresh_token, record.refresh_token);
         assert_eq!(parsed.client_id, record.client_id);
+    }
+
+    /// PROBE (read-only, USES the stored session): the one link this feature cannot verify
+    /// offline — that a `tosse:app` Bearer is actually accepted on `/api/v1/repositories`,
+    /// and that the payload has the shape [`parse_repository`] expects.
+    ///
+    /// Reads only; writes nothing, to TOSSE or to disk. Fails with `NotConnected` when this
+    /// Mac holds no session — sign in from Settings → TOSSE first.
+    /// Run: `cargo test --lib -- --ignored --nocapture live_tosse_repositories`.
+    #[tokio::test]
+    #[ignore = "hits the live TOSSE backend with the stored session"]
+    async fn live_tosse_repositories() {
+        let repos = list_repositories().await.expect("the list should be readable");
+        eprintln!("{} repositories", repos.len());
+        for r in repos.iter().take(5) {
+            eprintln!(
+                "  {:32} url={:?} projects={} context={}",
+                r.name,
+                r.url,
+                r.projects.len(),
+                r.context.as_ref().map_or(0, |c| c.len())
+            );
+        }
+        assert!(!repos.is_empty(), "production holds repositories");
     }
 
     /// PROBE (read-only, no credentials): the live metadata document must advertise the

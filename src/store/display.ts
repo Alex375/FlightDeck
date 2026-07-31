@@ -71,6 +71,14 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
+   *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
+   *  associate it by hand). Clicking it opens that repository's TOSSE card. ON by default.
+   *  Off → the header looks exactly as it did before the feature, and the association is
+   *  not even computed (no repository list fetched, no git remote read). Nothing shows in
+   *  either case when TOSSE is not connected. Read by {@link TosseRepoBadge}. */
+  tosseRepoBadge: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -144,6 +152,7 @@ const DEFAULTS: DisplayPrefs = {
   showLastMessagePreview: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseRepoBadge: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -196,6 +205,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,
