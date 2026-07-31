@@ -66,9 +66,19 @@ pub struct SpawnConfig {
     pub effort: Option<String>,
     /// Initial permission mode (`--permission-mode`, e.g. "default", "plan"). `None`
     /// lets the CLI use its own default. NOTE: `bypassPermissions` is downgraded to
-    /// `default` server-side unless `--allow-dangerously-skip-permissions` is also
-    /// passed (which we deliberately do NOT — the UI keeps bypass disabled).
+    /// `default` server-side unless [`Self::allow_bypass_permissions`] is set.
     pub permission_mode: Option<String>,
+    /// Pass `--allow-dangerously-skip-permissions`, which UNLOCKS `bypassPermissions`
+    /// as a selectable mode without turning it on. Verified against the CLI's own help
+    /// (2.1.220): "Enable bypassing all permission checks *as an option, without it
+    /// being enabled by default*". Without it the CLI silently downgrades a
+    /// `bypassPermissions` request (spawn flag or runtime `set_permission_mode`) to
+    /// `default` — see `control::parse_set_permission_mode_ack`.
+    ///
+    /// ⚠️ NOT `--dangerously-skip-permissions` (no `--allow-` prefix): that one turns
+    /// the bypass ON outright, which is never what this flag is for. Off unless the
+    /// user opted in via Settings → General → Permissions.
+    pub allow_bypass_permissions: bool,
 }
 
 impl SpawnConfig {
@@ -85,6 +95,7 @@ impl SpawnConfig {
             model: None,
             effort: None,
             permission_mode: None,
+            allow_bypass_permissions: false,
         }
     }
 }
@@ -341,6 +352,11 @@ impl Transport {
         }
         if let Some(mode) = &cfg.permission_mode {
             cmd.arg("--permission-mode").arg(mode);
+        }
+        // Unlocks `bypassPermissions` as a choice (it does NOT enable it) — see the
+        // field doc. Opt-in, off by default.
+        if cfg.allow_bypass_permissions {
+            cmd.arg("--allow-dangerously-skip-permissions");
         }
 
         cmd.current_dir(&cfg.cwd)

@@ -36,6 +36,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
+import { bypassPermissionsAllowed } from "./permissions";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
@@ -138,6 +139,15 @@ export interface Conversation {
    * worktree indicator/badge so they follow the agent. Cleared on `ExitWorktree`.
    */
   liveCwd: string | null;
+  /**
+   * Whether the LIVE process was spawned with `--allow-dangerously-skip-permissions`,
+   * i.e. whether it can actually honour "Bypass permissions". In-memory ONLY, and only
+   * meaningful while {@link handle} is set: the flag exists solely at spawn, so a
+   * session started before the user opted in can never gain it — it must be restarted.
+   * The composer reads this to grey out the Bypass choice (with the reason) instead of
+   * offering a pick the CLI would silently downgrade to `default`.
+   */
+  bypassAllowed: boolean;
   // ---- Per-conversation controls (persisted) -------------------------------
   // Last-known model / effort / ultracode / permission, persisted so they survive
   // a restart and are re-applied at the next (lazy) spawn. While a session is LIVE,
@@ -279,6 +289,7 @@ const recordToConv = (c: ConversationRecord): Conversation => ({
   sessionId: c.session_id,
   handle: null,
   liveCwd: null,
+  bypassAllowed: false,
   model: c.model,
   effort: c.effort,
   ultracode: c.ultracode,
@@ -366,7 +377,7 @@ interface ConversationsState {
   /** Store Claude's session_id on the conversation for --resume (keyed by stable id). */
   noteSessionId: (id: string, sessionId: string) => void;
   /** Bind a conversation (by stable id) to its live Rust session handle. In-memory only. */
-  setHandle: (id: string, handle: string | null) => void;
+  setHandle: (id: string, handle: string | null, bypassAllowed?: boolean) => void;
   /** Set/clear the worktree the session moved into (EnterWorktree/ExitWorktree). In-memory only. */
   setLiveCwd: (id: string, cwd: string | null) => void;
   /** Repoint a conversation's working directory (e.g. into a freshly created worktree) and persist it. */
@@ -684,9 +695,14 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     );
   },
 
-  setHandle: (id, handle) =>
+  // `bypassAllowed` is a property of the PROCESS just spawned (it carries the unlock
+  // flag or it doesn't), so it is set here alongside the handle and cleared with it: a
+  // conversation with no live process has nothing to allow.
+  setHandle: (id, handle, bypassAllowed = false) =>
     set((s) => ({
-      conversations: s.conversations.map((c) => (c.id === id ? { ...c, handle } : c)),
+      conversations: s.conversations.map((c) =>
+        c.id === id ? { ...c, handle, bypassAllowed: handle ? bypassAllowed : false } : c,
+      ),
     })),
 
   setLiveCwd: (id, cwd) =>
@@ -833,6 +849,7 @@ export function createConversationInRepo(
     sessionId: null,
     handle: null, // no live process until the first message
     liveCwd: null,
+    bypassAllowed: false,
     // Seed the backend's own default model so a Codex conversation never carries a
     // Claude alias (which its binary would reject at thread/start).
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
@@ -876,6 +893,7 @@ export function createConversationInWorktree(
     sessionId: null,
     handle: null, // no live process until the first message
     liveCwd: null,
+    bypassAllowed: false,
     // Seed the backend's own default model so a Codex conversation never carries a
     // Claude alias (which its binary would reject at thread/start).
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
@@ -959,6 +977,7 @@ export function reactivateDiskConversation(d: DiskConversation): string {
     sessionId: d.session_id,
     handle: null, // no live process until the first message (lazy)
     liveCwd: null,
+    bypassAllowed: false,
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
     effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
     ultracode: false,
@@ -999,6 +1018,7 @@ export function materializeCodexBranch(
     sessionId: forkThreadId,
     handle: null,
     liveCwd: null,
+    bypassAllowed: false,
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
     model: forkModel ?? source.model ?? DEFAULT_CODEX_MODEL,
     effort: source.effort ?? DEFAULT_CODEX_EFFORT,
@@ -1125,6 +1145,11 @@ export async function ensureConversationSession(
     // setConvBackend spawning guard: whatever kind spawns is the kind persisted).
     const atSpawn =
       useConversationsStore.getState().conversations.find((c) => c.id === convId) ?? before;
+    // App-wide opt-in, read at spawn (the ONLY moment it can be applied): it unlocks
+    // "Bypass permissions" as a choosable mode for this process without enabling it.
+    // Remembered on the conversation below so the composer knows what this live session
+    // can actually honour.
+    const allowBypass = bypassPermissionsAllowed();
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1134,6 +1159,7 @@ export async function ensureConversationSession(
       atSpawn.ultracode,
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
+      allowBypass,
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1168,11 +1194,12 @@ export async function ensureConversationSession(
           atSpawn.ultracode,
           // Same backend on the fresh-worktree re-spawn.
           atSpawn.kind,
+          allowBypass,
         );
       }
     }
     if (res.status !== "ok") throw new Error(res.error);
-    useConversationsStore.getState().setHandle(convId, res.data);
+    useConversationsStore.getState().setHandle(convId, res.data, allowBypass);
     return res.data;
   })();
   spawning.set(convId, promise);
@@ -1236,6 +1263,23 @@ export async function startConversationSession(convId: string): Promise<string> 
 export async function restartConversationSession(convId: string): Promise<string> {
   await stopConversationSession(convId);
   return startConversationSession(convId);
+}
+
+/**
+ * Put every conversation still set to "Bypass permissions" back to `default` — called
+ * when the app-wide opt-in is turned OFF (Settings → General → Permissions).
+ *
+ * Withdrawing the permission to bypass has to take effect NOW, not at the next spawn:
+ * a live session already running in bypass would otherwise keep skipping every prompt
+ * until it is restarted, while the setting claims bypass is off. `setConvPermission`
+ * both persists the demotion and pushes it to the live stream, so the two agree.
+ * Conversations already on another mode are untouched (it is idempotent).
+ */
+export function demoteBypassConversations(): void {
+  const store = useConversationsStore.getState();
+  for (const c of store.conversations) {
+    if (c.permissionMode === "bypassPermissions") store.setConvPermission(c.id, "default");
+  }
 }
 
 // Conversations whose on-disk transcript has already been replayed this run.

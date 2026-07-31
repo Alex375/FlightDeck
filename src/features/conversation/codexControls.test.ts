@@ -22,6 +22,7 @@ function codexConv(over: Partial<Conversation> = {}): Conversation {
     kind: "codex",
     handle: null,
     liveCwd: null,
+    bypassAllowed: false,
     model: "gpt-5.5",
     effort: "high",
     ultracode: false,

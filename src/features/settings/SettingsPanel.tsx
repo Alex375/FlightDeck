@@ -5,7 +5,8 @@
 // straight onto a given tab.
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { wipeAllData } from "../../store/conversationsStore";
+import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
@@ -136,6 +137,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 <TimingPrefs />
                 <FleetBannerPrefs />
                 <BackgroundTaskPrefs />
+                <PermissionPrefs />
                 <CaffeinatePrefs />
               </div>
             )}
@@ -512,6 +514,41 @@ function BackgroundTaskPrefs() {
         checked={alertOnBackgroundBash}
         onChange={(v) => set({ alertOnBackgroundBash: v })}
         label="Alert for background shell commands"
+      />
+    </SettingsGroup>
+  );
+}
+
+/** Permission prefs in the General tab: unlock "Bypass permissions" as a mode a
+ *  conversation may be switched to. The unlock is a SPAWN flag
+ *  (`--allow-dangerously-skip-permissions`), so it only reaches sessions started after
+ *  it — the composer's menu says so when a running session can't honour it.
+ *
+ *  Turning it off demotes every conversation still in Bypass back to Default, live ones
+ *  included: withdrawing the permission has to bite immediately, not at the next spawn. */
+function PermissionPrefs() {
+  const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
+  const set = usePermissionPrefs((s) => s.set);
+  return (
+    <SettingsGroup title="Permissions" icon="shield">
+      <ToggleRow
+        title="Allow Bypass permissions mode"
+        hint={
+          <>
+            Makes <strong>Bypass permissions</strong> selectable in a conversation's permission
+            menu. In that mode the agent runs every tool — edits, shell commands, network calls —{" "}
+            <strong>without ever asking</strong>. Unlocking is not enabling: nothing changes until
+            a conversation is explicitly switched to it, and only sessions started afterwards can
+            use it (restart a running one). Turning this back off returns every conversation still
+            in Bypass to <strong>Default</strong> right away. <strong>Off by default.</strong>
+          </>
+        }
+        checked={allowBypass}
+        onChange={(v) => {
+          set({ allowBypassPermissions: v });
+          if (!v) demoteBypassConversations();
+        }}
+        label="Allow Bypass permissions mode"
       />
     </SettingsGroup>
   );

@@ -27,11 +27,13 @@ vi.mock("../ipc/client", () => {
 
 import { commands } from "../ipc/client";
 import type { DiskConversation } from "../ipc/client";
+import { usePermissionPrefs } from "./permissions";
 import {
   acknowledgeConversation,
   createConversationInRepo,
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
+  demoteBypassConversations,
   ensureConversationSession,
   loadConversationHistory,
   reactivateDiskConversation,
@@ -51,6 +53,7 @@ const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   sessionId: null,
   handle: null,
   liveCwd: null,
+  bypassAllowed: false,
   model: "opus",
   effort: "xhigh",
   ultracode: false,
@@ -138,6 +141,52 @@ describe("conversationsStore — per-conversation controls", () => {
     // Persisted, but there is no live-stream command for a pure display pref.
     expect(commands.upsertConversation).toHaveBeenCalled();
     expect(commands.setModel).not.toHaveBeenCalled();
+    expect(commands.setPermissionMode).not.toHaveBeenCalled();
+  });
+});
+
+describe("conversationsStore — bypass-permissions unlock", () => {
+  beforeEach(() => {
+    usePermissionPrefs.setState({ allowBypassPermissions: false });
+  });
+
+  it("passes the app-wide opt-in to the spawn and remembers it on the conversation", async () => {
+    usePermissionPrefs.setState({ allowBypassPermissions: true });
+    await ensureConversationSession("c1");
+    // Last positional arg of spawnSession — the process gets the unlock flag…
+    const args = vi.mocked(commands.spawnSession).mock.calls[0];
+    expect(args[args.length - 1]).toBe(true);
+    // …and the conversation records that THIS live session can honour bypass.
+    expect(conv0().bypassAllowed).toBe(true);
+  });
+
+  it("spawns WITHOUT the flag while the opt-in is off", async () => {
+    await ensureConversationSession("c1");
+    const args = vi.mocked(commands.spawnSession).mock.calls[0];
+    expect(args[args.length - 1]).toBe(false);
+    expect(conv0().bypassAllowed).toBe(false);
+  });
+
+  it("clearing the handle clears bypassAllowed — nothing to allow with no process", async () => {
+    usePermissionPrefs.setState({ allowBypassPermissions: true });
+    await ensureConversationSession("c1");
+    expect(conv0().bypassAllowed).toBe(true);
+    useConversationsStore.getState().setHandle("c1", null);
+    expect(conv0().bypassAllowed).toBe(false);
+  });
+
+  it("demoteBypassConversations returns bypassing conversations to default, live ones included", () => {
+    seed(baseConv({ handle: "session-7", permissionMode: "bypassPermissions" }));
+    demoteBypassConversations();
+    expect(conv0().permissionMode).toBe("default");
+    // Withdrawing the permission has to bite NOW, not at the next spawn.
+    expect(commands.setPermissionMode).toHaveBeenCalledWith("session-7", "default");
+  });
+
+  it("demoteBypassConversations leaves every other mode alone", () => {
+    seed(baseConv({ handle: "session-7", permissionMode: "acceptEdits" }));
+    demoteBypassConversations();
+    expect(conv0().permissionMode).toBe("acceptEdits");
     expect(commands.setPermissionMode).not.toHaveBeenCalled();
   });
 });
@@ -498,8 +547,9 @@ describe("conversationsStore — controls applied at spawn", () => {
     );
     const handle = await ensureConversationSession("c1");
     expect(handle).toBe("session-1");
-    // (cwd, resume, model, effort, permissionMode, ultracode, backend) — the
-    // conversation's own controls + its backend, NOT the old hardcoded defaults.
+    // (cwd, resume, model, effort, permissionMode, ultracode, backend,
+    // allowBypassPermissions) — the conversation's own controls + its backend + the
+    // app-wide bypass opt-in, NOT the old hardcoded defaults.
     expect(commands.spawnSession).toHaveBeenCalledWith(
       "/tmp/r1",
       null,
@@ -508,6 +558,7 @@ describe("conversationsStore — controls applied at spawn", () => {
       "plan",
       false,
       "claude",
+      false,
     );
   });
 });

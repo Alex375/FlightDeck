@@ -378,6 +378,7 @@ export const mockCommands = {
     permissionMode: string | null,
     ultracode: boolean,
     _backend: "claude" | "codex",
+    _allowBypassPermissions?: boolean,
   ): Promise<Result<string, string>> {
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;

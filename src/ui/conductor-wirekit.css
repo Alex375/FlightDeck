@@ -418,6 +418,13 @@
 
 /* mode dot in the dropdown menu */
 .cv-perm-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+/* Why "Bypass permissions" is greyed out. Sits BELOW the rows rather than inside the
+   disabled one: `.wf-mi:disabled` dims to .36 (an opacity an inner element cannot climb
+   back out of) and takes no pointer events, so neither a hint nor a title would read.
+   Wraps — unlike .wf-mi-t/.wf-mi-h, this is a sentence, so it gets a width to wrap in
+   instead of stretching the popover. */
+.cv-perm-note { max-width:212px; margin:4px 6px 2px; padding-top:6px; border-top:1px solid var(--wf-line);
+  font-size:10px; line-height:1.35; color:var(--wf-tx-lo); white-space:normal; }
 
 @media (prefers-reduced-motion: reduce) {
   .wf-eff-fill, .wf-eff-thumb { transition:none; }

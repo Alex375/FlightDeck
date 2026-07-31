@@ -259,6 +259,25 @@ pub fn is_valid_effort_level(level: &str) -> bool {
     VALID_EFFORT_LEVELS.contains(&level)
 }
 
+/// The permission mode a spawn can ACTUALLY honour. `bypassPermissions` only sticks on
+/// a process spawned with `--allow-dangerously-skip-permissions`
+/// ([`SpawnConfig::allow_bypass_permissions`](crate::supervisor::SpawnConfig)); without
+/// it the CLI silently downgrades the request to `default` (see
+/// [`parse_set_permission_mode_ack`]). We apply that same demotion UP FRONT so the mode
+/// we spawn with, the mode we re-assert after init (`InitialControls`) and the mode the
+/// CLI reports all agree — rather than asking for a bypass we know will be refused and
+/// letting the ack quietly disagree with the request.
+///
+/// Only `bypassPermissions` is demoted: it is the only mode the UI can select that the
+/// flag gates. Every other mode passes through untouched.
+pub fn permission_mode_for_spawn(mode: &str, allow_bypass: bool) -> &str {
+    if !allow_bypass && mode == PermissionMode::BypassPermissions.as_wire() {
+        PermissionMode::Default.as_wire()
+    } else {
+        mode
+    }
+}
+
 /// `apply_flag_settings` — push a session flag/setting change. Used here to set the
 /// reasoning effort level (one of [`VALID_EFFORT_LEVELS`]). Mirrors the extension
 /// SDK (`{subtype:"apply_flag_settings", settings:{effortLevel}}`). Callers MUST
@@ -889,6 +908,19 @@ mod tests {
             "response": { "subtype": "success", "request_id": "p-1", "response": { "mode": "plan" } }
         });
         assert_eq!(parse_set_permission_mode_ack(&line).as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn spawn_demotes_bypass_only_without_the_unlock_flag() {
+        // Without --allow-dangerously-skip-permissions the CLI downgrades a bypass
+        // request to `default`; we do it up front so nothing disagrees later.
+        assert_eq!(permission_mode_for_spawn("bypassPermissions", false), "default");
+        assert_eq!(permission_mode_for_spawn("bypassPermissions", true), "bypassPermissions");
+        // Every other mode is untouched, flag or not — the flag gates bypass ONLY.
+        for mode in ["auto", "default", "plan", "acceptEdits"] {
+            assert_eq!(permission_mode_for_spawn(mode, false), mode);
+            assert_eq!(permission_mode_for_spawn(mode, true), mode);
+        }
     }
 
     #[test]

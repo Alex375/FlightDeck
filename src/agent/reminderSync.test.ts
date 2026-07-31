@@ -24,6 +24,7 @@ const conv = (over: Partial<Conversation> = {}): Conversation => ({
   sessionId: null,
   handle: "session-1", // live by default
   liveCwd: null,
+  bypassAllowed: false,
   model: "opus",
   effort: "xhigh",
   ultracode: false,

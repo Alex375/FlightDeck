@@ -92,6 +92,11 @@ fn unknown_session() -> String {
 /// stream starts in EXACTLY the state the UI shows — never the old hardcoded
 /// defaults. Returns our session id; conversation/state/permission events are
 /// emitted on the Tauri event bus.
+///
+/// `allow_bypass_permissions` carries the user's app-wide opt-in (Settings → General →
+/// Permissions): it UNLOCKS `bypassPermissions` as a selectable mode for this process
+/// without turning it on. It can only be decided at spawn — a live session cannot gain
+/// it — so the front end restarts, or greys out the choice, accordingly.
 #[tauri::command]
 #[specta::specta]
 pub async fn spawn_session(
@@ -104,10 +109,12 @@ pub async fn spawn_session(
     permission_mode: Option<String>,
     ultracode: bool,
     backend: Backend,
+    allow_bypass_permissions: bool,
 ) -> Result<String, String> {
     let id = sessions.next_id();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
+    cfg.allow_bypass_permissions = allow_bypass_permissions;
     // Product defaults when unset: Opus 5 + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
@@ -121,7 +128,17 @@ pub async fn spawn_session(
         .unwrap_or_else(|| "xhigh".into());
     cfg.model = Some(model.unwrap_or_else(|| "opus".into()));
     cfg.effort = Some(effort);
-    cfg.permission_mode = Some(permission_mode.unwrap_or_else(|| "auto".into()));
+    // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
+    // off (e.g. the user turned the Settings toggle back off while a conversation still
+    // had bypass selected) — the CLI would demote it anyway, silently. Doing it here
+    // keeps the spawn flag, the post-init re-assert and the CLI's own view in agreement.
+    cfg.permission_mode = Some(
+        control::permission_mode_for_spawn(
+            &permission_mode.unwrap_or_else(|| "auto".into()),
+            allow_bypass_permissions,
+        )
+        .to_string(),
+    );
     let initial = InitialControls {
         model: cfg.model.clone(),
         effort: cfg.effort.clone(),

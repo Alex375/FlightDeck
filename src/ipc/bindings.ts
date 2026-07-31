@@ -15,10 +15,15 @@ async ping(msg: string) : Promise<Pong> {
  * stream starts in EXACTLY the state the UI shows — never the old hardcoded
  * defaults. Returns our session id; conversation/state/permission events are
  * emitted on the Tauri event bus.
+ * 
+ * `allow_bypass_permissions` carries the user's app-wide opt-in (Settings → General →
+ * Permissions): it UNLOCKS `bypassPermissions` as a selectable mode for this process
+ * without turning it on. It can only be decided at spawn — a live session cannot gain
+ * it — so the front end restarts, or greys out the choice, accordingly.
  */
-async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend) : Promise<Result<string, string>> {
+async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend }) };
+    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
