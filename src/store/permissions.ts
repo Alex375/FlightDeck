@@ -81,10 +81,6 @@ export function bypassPermissionsAllowed(): boolean {
  *  than sent: the CLI would silently downgrade it to `default` and the menu would snap
  *  back with no explanation. Pure — the composer renders the string, the tests assert it.
  *
- *  The sentence is a CLAUSE, not a standalone line: the composer prefixes it with the
- *  mode's own name and colour dot, so the note reads as being about Bypass alone and
- *  can't be mistaken for a remark on the whole menu.
- *
  *  @param allowed       the app-wide opt-in (Settings → General → Permissions)
  *  @param live          is a process currently running for this conversation
  *  @param sessionAllows was THAT process spawned with the unlock flag */
@@ -93,7 +89,7 @@ export function bypassBlockedReason(
   live: boolean,
   sessionAllows: boolean,
 ): string | null {
-  if (!allowed) return "allow it in Settings → General → Permissions.";
-  if (live && !sessionAllows) return "restart this conversation to unlock it.";
+  if (!allowed) return "Allow it in Settings → General → Permissions.";
+  if (live && !sessionAllows) return "Restart this conversation to unlock it.";
   return null;
 }
