@@ -152,6 +152,9 @@ function TosseConnectionGroup() {
     <ConnectionCard
       accent="var(--wf-tosse-accent)"
       mark={<TosseCrmMark />}
+      // The rose is bichrome (light body, coral north needle) — a brand-filled plate would
+      // hide the needle, so it sits on a neutral one and keeps its real colours.
+      plate="neutral"
       name="TOSSE"
       provider="Internal CRM"
       state={state}

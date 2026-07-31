@@ -32,6 +32,7 @@ export interface CardPill {
 export function ConnectionCard({
   accent,
   mark,
+  plate = "brand",
   name,
   provider,
   state,
@@ -43,6 +44,10 @@ export function ConnectionCard({
 }: {
   accent: string;
   mark: ReactNode;
+  /** How the mark's plate is filled. `"brand"` (default) tints it with `accent` and shows a
+   *  white silhouette — right for a single-colour mark. `"neutral"` keeps the plate quiet so
+   *  a mark with its OWN palette renders in its real colours. */
+  plate?: "brand" | "neutral";
   name: string;
   provider: string;
   state: CardState;
@@ -64,7 +69,9 @@ export function ConnectionCard({
   return (
     <section className={s.card} data-state={state} style={{ ["--brand" as string]: accent }}>
       <div className={s.head}>
-        <span className={s.tile}>{mark}</span>
+        <span className={s.tile} data-plate={plate === "neutral" ? "neutral" : undefined}>
+          {mark}
+        </span>
         <div className={s.headText}>
           <span className={s.brandName}>{name}</span>
           <span className={s.provider}>{provider}</span>

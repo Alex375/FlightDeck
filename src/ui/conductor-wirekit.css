@@ -241,6 +241,11 @@
    read smaller than its neighbours. Match their HEIGHT instead and let the width follow the
    artwork's ratio, so the rail's icons carry the same optical weight. */
 .wf-tosse-mark.sm { width: 18px; height: 13px; }
+/* The rose is BICHROME in TOSSE's own UI: body in the text colour, north needle in the
+   brand accent. Carrying that here (rather than flattening it to one colour) is what makes
+   it read as the actual logo. Value = the CRM's dark-scheme `--logo-accent`; its body
+   follows `currentColor` like every other mark. */
+.wf-tosse-mark { --logo-accent: #e05a40; }
 /* The model picker chip wears the Claude logo, tinted with the brand coral. */
 .wf-chip .wf-claude { width: 14px; height: 14px; color: var(--wf-accent); }
 /* Codex/OpenAI brand mark — monochrome (currentColor), NO background. Inherits the
