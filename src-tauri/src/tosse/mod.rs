@@ -36,9 +36,10 @@
 //! framework and binding the ACL to this (self-signed) app — which would also reintroduce
 //! the access prompt on every rebuild, since the ACL follows the code signature. The
 //! trade-off is accepted here: the threat model is a single-user developer Mac, and the
-//! whole app already runs with that user's privileges. What is NOT accepted is leaking the
-//! token to processes that aren't even trying — hence the stdin handoff in
-//! [`keychain_write`], since argv is world-readable within the user session.
+//! whole app already runs with that user's privileges. The same reasoning covers passing
+//! the secret on argv in [`keychain_write`] — see the note there for why the safer stdin
+//! form is unusable (a hard 128-character truncation) and why every write is read back
+//! instead.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -233,20 +234,28 @@ fn keychain_read() -> R<Option<StoredAuth>> {
 
 /// Write (upsert) our Keychain item. `-U` updates in place when it already exists.
 ///
-/// ⚠️ The secret goes in on **stdin**, never as a `-w <value>` argument: a process's argv is
-/// readable by any other process of the same user (`ps`), so passing the token there would
-/// expose it for the lifetime of the call. `security` prompts twice for a `-w` with no
-/// value, hence the doubled write. Safe because `serde_json::to_string` emits ONE line (no
-/// pretty-printing), so the blob can never be split across the two prompts.
+/// ## Why the secret goes in on argv, despite `security`'s own warning
+/// Handing it on **stdin** (a `-w` with no value, which prompts) is the safer shape — argv
+/// is readable by other processes of the same user — and that is what this function did
+/// first. It had to be reverted: `security`'s prompt reads through `getpass`, which
+/// **truncates at 128 characters**, and our JSON blob is roughly twice that. The result was
+/// a silently half-written item and a sign-in that could never be repaired, because every
+/// rewrite truncated again. VERIFIED empirically: 128 bytes in → 128 out, 130 in → 128 out.
+///
+/// Accepting argv here costs little in this threat model: the item's ACL names
+/// `/usr/bin/security`, so any process of the same user can already read the token back on
+/// demand (see the module doc). argv widens *passive* visibility, not *access*.
+///
+/// ⚠️ Whatever the input channel, the write is VERIFIED by reading it back: a truncated or
+/// mangled item must never be left behind reporting success. That is exactly how the
+/// stdin attempt failed, and the read-back is what makes the failure loud instead of a
+/// corrupted store discovered at the next launch.
 #[cfg(target_os = "macos")]
 fn keychain_write(auth: &StoredAuth) -> R<()> {
-    use std::io::Write as _;
-
     let blob = serde_json::to_string(auth)
         .map_err(|e| TosseError::Keychain(format!("could not serialize credentials: {e}")))?;
-    debug_assert!(!blob.contains('\n'), "the stdin handoff requires a single-line blob");
 
-    let mut child = std::process::Command::new("/usr/bin/security")
+    let out = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
             "-U",
@@ -256,36 +265,33 @@ fn keychain_write(auth: &StoredAuth) -> R<()> {
             "oauth",
             "-D",
             "Flight Deck TOSSE credentials",
-            "-w", // no value → read the secret from stdin (twice: value + confirmation)
+            "-w",
+            &blob,
         ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
         .map_err(|e| TosseError::Keychain(format!("failed to run /usr/bin/security: {e}")))?;
 
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| TosseError::Keychain("security stdin unavailable".into()))?;
-        stdin
-            .write_all(format!("{blob}\n{blob}\n").as_bytes())
-            .map_err(|e| TosseError::Keychain(format!("could not hand the secret to security: {e}")))?;
-        // Dropping stdin closes the pipe, which is what lets `security` finish its prompts.
+    if !out.status.success() {
+        return Err(TosseError::Keychain(format!(
+            "security exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
 
-    let out = child
-        .wait_with_output()
-        .map_err(|e| TosseError::Keychain(format!("could not wait for security: {e}")))?;
-    if out.status.success() {
-        return Ok(());
+    // Read-back check — "written" must mean "stored intact".
+    let stored = keychain_read()?.ok_or_else(|| {
+        TosseError::Keychain("the credentials vanished right after being saved".into())
+    })?;
+    let round_tripped = serde_json::to_string(&stored)
+        .map_err(|e| TosseError::Keychain(format!("could not re-serialize credentials: {e}")))?;
+    if round_tripped != blob {
+        return Err(TosseError::Keychain(
+            "the credentials came back altered after saving — refusing to trust the stored copy"
+                .into(),
+        ));
     }
-    Err(TosseError::Keychain(format!(
-        "security exit {}: {}",
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stderr).trim()
-    )))
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1558,6 +1564,62 @@ mod tests {
         assert_eq!(t.refresh_token.as_deref(), Some("rt"));
         assert_eq!(t.expires_in, Some(3600));
         assert!(parse_token_response(r#"{"error":"invalid_grant"}"#).is_err());
+    }
+
+    /// A REAL Keychain round-trip with a full-size record.
+    ///
+    /// Regression test for a shipped bug: the secret was briefly handed to `security` on
+    /// stdin, whose prompt truncates at 128 characters. A real record is about twice that,
+    /// so it was stored cut in half — and since every rewrite truncated again, sign-in could
+    /// not repair itself. The first probe used a SHORT secret and saw nothing, which is the
+    /// whole lesson: this one uses a record the size the app actually writes.
+    ///
+    /// Ignored by default because it touches the login Keychain (it uses its own service
+    /// name and deletes it afterwards, so it never touches the app's real item).
+    /// Run: `cargo test --lib -- --ignored --nocapture keychain_round_trips`.
+    #[test]
+    #[ignore = "writes to the real macOS Keychain"]
+    #[cfg(target_os = "macos")]
+    fn keychain_round_trips_a_full_size_record() {
+        const PROBE_SERVICE: &str = "Flight Deck TOSSE (test probe)";
+        let write = |blob: &str| {
+            std::process::Command::new("/usr/bin/security")
+                .args([
+                    "add-generic-password", "-U", "-s", PROBE_SERVICE, "-a", "oauth", "-w", blob,
+                ])
+                .output()
+                .expect("security should run")
+        };
+        let read = || {
+            let out = std::process::Command::new("/usr/bin/security")
+                .args(["find-generic-password", "-s", PROBE_SERVICE, "-w"])
+                .output()
+                .expect("security should run");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // A record with the shape and size the app really stores: two UUID-ish tokens, the
+        // client id, the port list and an expiry — comfortably past the 128-char cliff.
+        let record = StoredAuth {
+            client_id: Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301".into()),
+            redirect_ports: Some(CALLBACK_PORTS.to_vec()),
+            access_token: Some("b7e23ec2-9f4a-4c1d-8f2b-1a2b3c4d5e6f".into()),
+            refresh_token: Some("c8f34fd3-a05b-4d2e-9a3c-2b3c4d5e6f70".into()),
+            expires_at_ms: Some(1_785_600_000_000),
+        };
+        let blob = serde_json::to_string(&record).expect("serialize");
+        assert!(blob.len() > 128, "the probe must exceed the truncation cliff ({})", blob.len());
+
+        assert!(write(&blob).status.success(), "the write should succeed");
+        let back = read();
+        let _ = std::process::Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-s", PROBE_SERVICE])
+            .output();
+
+        assert_eq!(back.len(), blob.len(), "the stored secret was truncated");
+        let parsed: StoredAuth = serde_json::from_str(&back).expect("must parse back");
+        assert_eq!(parsed.refresh_token, record.refresh_token);
+        assert_eq!(parsed.client_id, record.client_id);
     }
 
     /// PROBE (read-only, no credentials): the live metadata document must advertise the
