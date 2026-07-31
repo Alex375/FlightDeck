@@ -29,6 +29,16 @@
 //! Because the item is CREATED by `security`, later reads by `security` are inside its ACL
 //! and raise no access prompt (contrast `usage::mod`, which reads an item the `claude` CLI
 //! created and can therefore prompt).
+//!
+//! ⚠️ **Known limit of that convenience**: an ACL naming `/usr/bin/security` means ANY
+//! process running as the same user can read the item back, silently, just by invoking
+//! `security` itself. Narrowing it would mean dropping the CLI for the native Security
+//! framework and binding the ACL to this (self-signed) app — which would also reintroduce
+//! the access prompt on every rebuild, since the ACL follows the code signature. The
+//! trade-off is accepted here: the threat model is a single-user developer Mac, and the
+//! whole app already runs with that user's privileges. What is NOT accepted is leaking the
+//! token to processes that aren't even trying — hence the stdin handoff in
+//! [`keychain_write`], since argv is world-readable within the user session.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -184,41 +194,59 @@ fn now_unix_ms() -> i64 {
 
 // ── Keychain I/O (macOS `/usr/bin/security`) ─────────────────────────────────────────
 
-/// Read our Keychain item. A MISSING item is the normal "never signed in" state → `None`.
-/// Any other failure is logged and also yields `None` (the caller then behaves as signed
-/// out, which is the safe direction), never a silent success.
+/// Read our Keychain item.
+///
+/// `Ok(None)` means the item does not exist — the normal "never signed in" state.
+/// EVERY other outcome is an `Err`, and that distinction is load-bearing: a failed read
+/// collapsed into "absent" would let [`with_stored`] seed its closure with an EMPTY record
+/// and write that back over the real item, destroying the `client_id` and the refresh token
+/// with no error anywhere. A store we cannot read is a fault to report, never a blank slate
+/// to overwrite. ([`reset_stored`] is the one explicit, user-initiated way past this.)
 #[cfg(target_os = "macos")]
-fn keychain_read() -> Option<StoredAuth> {
+fn keychain_read() -> R<Option<StoredAuth>> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
         .output()
-        .ok()?;
+        .map_err(|e| TosseError::Keychain(format!("failed to run /usr/bin/security: {e}")))?;
+
     if !out.status.success() {
         // 44 = errSecItemNotFound truncated to 8 bits: the expected "no item yet" case.
-        if out.status.code() != Some(44) {
-            eprintln!(
-                "[tosse] keychain read failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        if out.status.code() == Some(44) {
+            return Ok(None);
         }
-        return None;
+        return Err(TosseError::Keychain(format!(
+            "security exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
+
     let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    match serde_json::from_str::<StoredAuth>(&blob) {
-        Ok(a) => Some(a),
-        Err(e) => {
-            eprintln!("[tosse] keychain item is not valid JSON ({e}); treating as signed out");
-            None
-        }
-    }
+    serde_json::from_str::<StoredAuth>(&blob)
+        .map(Some)
+        .map_err(|e| {
+            TosseError::Keychain(format!(
+                "the stored credentials are unreadable ({e}) — sign in again to replace them"
+            ))
+        })
 }
 
 /// Write (upsert) our Keychain item. `-U` updates in place when it already exists.
+///
+/// ⚠️ The secret goes in on **stdin**, never as a `-w <value>` argument: a process's argv is
+/// readable by any other process of the same user (`ps`), so passing the token there would
+/// expose it for the lifetime of the call. `security` prompts twice for a `-w` with no
+/// value, hence the doubled write. Safe because `serde_json::to_string` emits ONE line (no
+/// pretty-printing), so the blob can never be split across the two prompts.
 #[cfg(target_os = "macos")]
 fn keychain_write(auth: &StoredAuth) -> R<()> {
+    use std::io::Write as _;
+
     let blob = serde_json::to_string(auth)
         .map_err(|e| TosseError::Keychain(format!("could not serialize credentials: {e}")))?;
-    let out = std::process::Command::new("/usr/bin/security")
+    debug_assert!(!blob.contains('\n'), "the stdin handoff requires a single-line blob");
+
+    let mut child = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
             "-U",
@@ -228,11 +256,28 @@ fn keychain_write(auth: &StoredAuth) -> R<()> {
             "oauth",
             "-D",
             "Flight Deck TOSSE credentials",
-            "-w",
-            &blob,
+            "-w", // no value → read the secret from stdin (twice: value + confirmation)
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| TosseError::Keychain(format!("failed to run /usr/bin/security: {e}")))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| TosseError::Keychain("security stdin unavailable".into()))?;
+        stdin
+            .write_all(format!("{blob}\n{blob}\n").as_bytes())
+            .map_err(|e| TosseError::Keychain(format!("could not hand the secret to security: {e}")))?;
+        // Dropping stdin closes the pipe, which is what lets `security` finish its prompts.
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| TosseError::Keychain(format!("could not wait for security: {e}")))?;
     if out.status.success() {
         return Ok(());
     }
@@ -244,8 +289,8 @@ fn keychain_write(auth: &StoredAuth) -> R<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_read() -> Option<StoredAuth> {
-    None
+fn keychain_read() -> R<Option<StoredAuth>> {
+    Ok(None)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -260,7 +305,16 @@ fn keychain_write(_auth: &StoredAuth) -> R<()> {
 /// write — the same lost-update hazard the CLI-config writers guard against.
 static KEYCHAIN_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Blocking Keychain I/O, run off the async runtime and behind [`KEYCHAIN_LOCK`].
+/// Read-modify-write of the Keychain item, off the async runtime and behind
+/// [`KEYCHAIN_LOCK`].
+///
+/// ⚠️ The read is propagated, never defaulted: see [`keychain_read`] for why turning an
+/// unreadable store into a blank one would silently destroy credentials.
+///
+/// The whole read-modify-write runs inside ONE `spawn_blocking`, which is what makes it
+/// abort-safe: cancelling the caller (a sign-in the user cancels mid-write) drops the await
+/// but the blocking closure still runs to completion, so the item can never be left
+/// half-written. The lock guard is held across that await for the same reason.
 async fn with_stored<T, F>(f: F) -> R<T>
 where
     F: FnOnce(StoredAuth) -> R<(StoredAuth, T)> + Send + 'static,
@@ -268,7 +322,8 @@ where
 {
     let _guard = KEYCHAIN_LOCK.lock().await;
     tokio::task::spawn_blocking(move || {
-        let (next, out) = f(keychain_read().unwrap_or_default())?;
+        let current = keychain_read()?.unwrap_or_default();
+        let (next, out) = f(current)?;
         keychain_write(&next)?;
         Ok(out)
     })
@@ -276,11 +331,26 @@ where
     .map_err(|e| TosseError::Local(format!("keychain task failed: {e}")))?
 }
 
-/// Read the stored credentials off-thread (no write, so no lock needed).
-async fn read_stored() -> StoredAuth {
-    tokio::task::spawn_blocking(|| keychain_read().unwrap_or_default())
+/// Read the stored credentials off-thread. Takes [`KEYCHAIN_LOCK`] so a read can't observe
+/// an item mid-rewrite, and propagates a read failure rather than reporting "signed out".
+async fn read_stored() -> R<StoredAuth> {
+    let _guard = KEYCHAIN_LOCK.lock().await;
+    tokio::task::spawn_blocking(|| keychain_read().map(Option::unwrap_or_default))
         .await
-        .unwrap_or_default()
+        .map_err(|e| TosseError::Local(format!("keychain task failed: {e}")))?
+}
+
+/// Overwrite the item with a blank record, discarding whatever is there.
+///
+/// The ONLY sanctioned way past [`keychain_read`]'s refusal to overwrite an unreadable
+/// store: a corrupted item would otherwise wedge the user out of signing in at all, since
+/// every path that could repair it reads first. Called only from [`login_start`], i.e.
+/// behind an explicit user action whose whole point is to replace the credentials.
+async fn reset_stored() -> R<()> {
+    let _guard = KEYCHAIN_LOCK.lock().await;
+    tokio::task::spawn_blocking(|| keychain_write(&StoredAuth::default()))
+        .await
+        .map_err(|e| TosseError::Local(format!("keychain task failed: {e}")))?
 }
 
 // ── HTTP plumbing ────────────────────────────────────────────────────────────────────
@@ -379,6 +449,44 @@ struct Endpoints {
 /// offline).
 static ENDPOINTS: StdMutex<Option<Endpoints>> = StdMutex::new(None);
 
+/// Validate one endpoint from the discovery document before we trust it.
+///
+/// The metadata is fetched over TLS from [`BASE_URL`], so it is not attacker-controlled in
+/// normal operation; this guards against a MISCONFIGURED document turning into credential
+/// exfiltration. Two levels, because the endpoints do not all carry secrets:
+///
+/// - `secret_bearing` = true (token, registration, revocation): must be HTTPS **and** on
+///   exactly [`BASE_URL`]'s host. These are the ones we POST the authorization code, the
+///   refresh token and the client identity to.
+/// - `secret_bearing` = false (authorization): HTTPS only. We merely OPEN it in the browser
+///   with public parameters (client_id, PKCE challenge, state); the code comes back to our
+///   own loopback listener, never to that host. Pinning it would be wrong anyway — TOSSE's
+///   authorization endpoint legitimately lives on the FRONTEND host, not the backend.
+///
+/// Host pinning is deliberately an exact match rather than a "same registrable domain"
+/// test: getting the latter right needs a public-suffix list, and an approximation here
+/// (`*.up.railway.app`) would accept every other Railway deployment — security theatre.
+fn checked_endpoint(url: Option<String>, field: &str, secret_bearing: bool) -> R<String> {
+    let raw = url.ok_or_else(|| TosseError::Protocol(format!("metadata has no {field}")))?;
+    let parsed = url::Url::parse(&raw)
+        .map_err(|e| TosseError::Protocol(format!("{field} is not a valid URL ({e})")))?;
+    if parsed.scheme() != "https" {
+        return Err(TosseError::Protocol(format!(
+            "{field} is not https ({raw}) — refusing to use it"
+        )));
+    }
+    if secret_bearing {
+        let base_host = url::Url::parse(BASE_URL).ok().and_then(|u| u.host_str().map(str::to_string));
+        let host = parsed.host_str().unwrap_or_default();
+        if Some(host) != base_host.as_deref() {
+            return Err(TosseError::Protocol(format!(
+                "{field} points at {host}, not the TOSSE backend — refusing to send credentials there"
+            )));
+        }
+    }
+    Ok(raw)
+}
+
 async fn discover() -> R<Endpoints> {
     if let Ok(guard) = ENDPOINTS.lock() {
         if let Some(e) = guard.as_ref() {
@@ -397,13 +505,15 @@ async fn discover() -> R<Endpoints> {
         .map_err(|e| TosseError::Protocol(format!("metadata is not JSON ({e}): {}", snippet(&body))))?;
     let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let endpoints = Endpoints {
-        authorization: field("authorization_endpoint")
-            .ok_or_else(|| TosseError::Protocol("metadata has no authorization_endpoint".into()))?,
-        token: field("token_endpoint")
-            .ok_or_else(|| TosseError::Protocol("metadata has no token_endpoint".into()))?,
-        registration: field("registration_endpoint")
-            .ok_or_else(|| TosseError::Protocol("metadata has no registration_endpoint".into()))?,
-        revocation: field("revocation_endpoint"),
+        // Opened in the browser with public parameters only — HTTPS is the whole check.
+        authorization: checked_endpoint(field("authorization_endpoint"), "authorization_endpoint", false)?,
+        // These three receive the code / refresh token / client identity: host-pinned.
+        token: checked_endpoint(field("token_endpoint"), "token_endpoint", true)?,
+        registration: checked_endpoint(field("registration_endpoint"), "registration_endpoint", true)?,
+        revocation: match field("revocation_endpoint") {
+            Some(u) => Some(checked_endpoint(Some(u), "revocation_endpoint", true)?),
+            None => None,
+        },
     };
     if let Ok(mut guard) = ENDPOINTS.lock() {
         *guard = Some(endpoints.clone());
@@ -439,14 +549,24 @@ fn code_challenge(verifier: &str) -> String {
 /// Our `client_id`, registering once per install and reusing it forever after.
 /// Every candidate loopback port is registered up front, so a sign-in that has to fall
 /// back to another port still presents a `redirect_uri` the server recognises.
+/// The registered client we may reuse, if any.
+///
+/// A client is reusable only while it still covers the exact ports we can bind (see
+/// [`StoredAuth::redirect_ports`]) — the server matches `redirect_uri` by exact string, so a
+/// stale registration dead-ends the sign-in in the BROWSER, where the app can neither see
+/// nor explain the failure. Pure, so the rule is exercised by tests rather than restated
+/// by them.
+fn reusable_client(stored: &StoredAuth) -> Option<&str> {
+    let id = stored.client_id.as_deref().filter(|s| !s.is_empty())?;
+    (stored.redirect_ports.as_deref() == Some(CALLBACK_PORTS)).then_some(id)
+}
+
 async fn ensure_client(endpoints: &Endpoints) -> R<String> {
-    let stored = read_stored().await;
-    if let Some(id) = stored.client_id.filter(|s| !s.is_empty()) {
-        // Reuse it only if it still covers the ports we can actually bind (see
-        // `StoredAuth::redirect_ports`); otherwise fall through and register afresh.
-        if stored.redirect_ports.as_deref() == Some(CALLBACK_PORTS) {
-            return Ok(id);
-        }
+    let stored = read_stored().await?;
+    if let Some(id) = reusable_client(&stored) {
+        return Ok(id.to_string());
+    }
+    if stored.client_id.is_some() {
         eprintln!("[tosse] registered redirect ports changed; re-registering the OAuth client");
     }
     let redirect_uris: Vec<Value> = CALLBACK_PORTS
@@ -508,69 +628,125 @@ struct CallbackResult {
 /// Bind the first free candidate port. All busy → a [`TosseError::Local`] naming the ports,
 /// which is actionable ("something else is on 47890…"), unlike a bare bind failure.
 async fn bind_callback() -> R<(tokio::net::TcpListener, u16)> {
+    let mut failures = Vec::new();
     for port in CALLBACK_PORTS {
-        if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", *port)).await {
-            return Ok((l, *port));
+        match tokio::net::TcpListener::bind(("127.0.0.1", *port)).await {
+            Ok(l) => return Ok((l, *port)),
+            // Keep the REAL reason for each port: "address in use" and "permission denied"
+            // call for very different actions, and reporting every failure as "port busy"
+            // would send the user hunting for a process that isn't the problem.
+            Err(e) => failures.push(format!("{port}: {e}")),
         }
     }
     Err(TosseError::Local(format!(
-        "no free local port for the sign-in callback (tried {CALLBACK_PORTS:?})"
+        "no local port available for the sign-in callback — {}",
+        failures.join(", ")
     )))
 }
 
-/// Serve the redirect: accept connections until one carries `code` or `error`, answer it
-/// with a human-readable page, and return what it carried.
+/// How long a single accepted connection may take to send its request head. Anything on
+/// loopback sends it immediately; this only bounds a peer that connects and then says
+/// nothing. Without it, ONE silent socket would stall the accept loop for the whole
+/// [`LOGIN_TIMEOUT`] — any local process could freeze a sign-in for five minutes.
+const CALLBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve the redirect: accept connections until one carries a callback that is actually
+/// OURS, answer it with a human-readable page, and return what it carried.
 ///
 /// ⚠️ The loop is not optional — a browser routinely opens extra connections to the same
 /// origin (favicon, speculative preconnect). Answering only the FIRST accept would often
 /// consume one of those and hang waiting for a redirect that already arrived.
-async fn serve_callback(listener: tokio::net::TcpListener) -> R<CallbackResult> {
-    loop {
-        let (mut sock, _) = listener
-            .accept()
-            .await
-            .map_err(|e| TosseError::Local(format!("callback accept failed: {e}")))?;
+///
+/// ⚠️ `expected_state` is matched HERE, not by the caller: a request is only "final" if its
+/// `state` is ours. Otherwise any local process could hit the port with `?code=x` and abort
+/// a sign-in the user is in the middle of — the check has to gate the loop, not run after it.
+async fn serve_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> R<CallbackResult> {
+    // Each connection is handled in its OWN task, and the accept loop never waits on one.
+    // Handling them in sequence meant a single peer that connected and stayed silent held
+    // the loop for its entire read timeout — any local process could stall the sign-in just
+    // by opening sockets. Now a stalled connection only delays itself.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<CallbackResult>(4);
+    let state = expected_state.to_string();
 
-        // Read just the request line + headers; the redirect carries everything in the
-        // query string, so we never need a body. Bounded so a rogue client can't stream
-        // into memory.
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        let head = loop {
-            match sock.read(&mut chunk).await {
-                Ok(0) => break String::from_utf8_lossy(&buf).into_owned(),
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&buf);
-                    if text.contains("\r\n\r\n") || buf.len() > 16 * 1024 {
-                        break text.into_owned();
-                    }
-                }
-                Err(_) => break String::from_utf8_lossy(&buf).into_owned(),
-            }
-        };
+    let accept_loop = async move {
+        loop {
+            let (sock, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => return TosseError::Local(format!("callback accept failed: {e}")),
+            };
+            let tx = tx.clone();
+            let state = state.clone();
+            tokio::spawn(async move { handle_callback_conn(sock, &state, tx).await });
+        }
+    };
 
-        let parsed = parse_callback_request(&head);
-        let is_final = parsed
-            .as_ref()
-            .is_some_and(|p| p.code.is_some() || p.error.is_some());
+    tokio::select! {
+        // The first handler to recognise OUR callback wins.
+        Some(cb) = rx.recv() => Ok(cb),
+        err = accept_loop => Err(err),
+    }
+}
 
-        let page = match &parsed {
-            Some(p) if p.error.is_some() => {
-                html_page("Sign-in refused", "You can close this tab and try again in Flight Deck.")
-            }
-            Some(p) if p.code.is_some() => {
-                html_page("Flight Deck is connected", "You can close this tab.")
-            }
-            // Anything else (favicon, a stray probe): a terse 404, and keep listening.
-            _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
-        };
-        let _ = sock.write_all(page.as_bytes()).await;
-        let _ = sock.flush().await;
+/// Answer one connection, and forward the result if it is the callback we are waiting for.
+async fn handle_callback_conn(
+    mut sock: tokio::net::TcpStream,
+    expected_state: &str,
+    tx: tokio::sync::mpsc::Sender<CallbackResult>,
+) {
+    // Bounded in BOTH size and time: a rogue or stalled client can neither stream into
+    // memory nor hold this task open.
+    let Ok(head) = tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_head(&mut sock)).await
+    else {
         let _ = sock.shutdown().await;
+        return;
+    };
 
-        if is_final {
-            return Ok(parsed.expect("is_final implies parsed"));
+    let parsed = parse_callback_request(&head);
+    // Ours only if it carries an outcome AND the state we issued. A stray hit gets a 404
+    // and is forgotten; the listener stays up for the genuine redirect.
+    let is_ours = parsed.as_ref().is_some_and(|p| {
+        (p.code.is_some() || p.error.is_some()) && p.state.as_deref() == Some(expected_state)
+    });
+
+    let page = match &parsed {
+        Some(p) if is_ours && p.error.is_some() => {
+            html_page("Sign-in refused", "You can close this tab and try again in Flight Deck.")
+        }
+        Some(p) if is_ours && p.code.is_some() => {
+            html_page("Flight Deck is connected", "You can close this tab.")
+        }
+        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    };
+    let _ = sock.write_all(page.as_bytes()).await;
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
+
+    if is_ours {
+        // A full channel (or a receiver already gone) means the flow is settled — dropping
+        // this duplicate is correct, not a swallowed error.
+        let _ = tx.try_send(parsed.expect("is_ours implies parsed"));
+    }
+}
+
+/// Read one HTTP request head (up to the blank line), capped at 16 KiB. Returns whatever
+/// arrived on EOF or read error — the caller decides whether it is a usable request.
+async fn read_request_head(sock: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match sock.read(&mut chunk).await {
+            Ok(0) => return String::from_utf8_lossy(&buf).into_owned(),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if text.contains("\r\n\r\n") || buf.len() > 16 * 1024 {
+                    return text.into_owned();
+                }
+            }
+            Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
         }
     }
 }
@@ -588,18 +764,23 @@ fn parse_callback_request(head: &str) -> Option<CallbackResult> {
         state: None,
         error: None,
     };
+    // Collect `error` and `error_description` separately, then pick. Writing both into the
+    // same field made the winner depend on the ORDER the server happened to emit them in
+    // (last write wins), so `?error_description=…&error=…` silently showed the machine code
+    // instead of the sentence — the opposite of what the comment promised.
+    let mut error_code = None;
+    let mut error_description = None;
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
             "code" => out.code = Some(v.into_owned()),
             "state" => out.state = Some(v.into_owned()),
-            "error" => out.error = Some(v.into_owned()),
-            "error_description" => {
-                // Prefer the human description when both are present.
-                out.error = Some(v.into_owned());
-            }
+            "error" => error_code = Some(v.into_owned()),
+            "error_description" => error_description = Some(v.into_owned()),
             _ => {}
         }
     }
+    // Prefer the human description whenever it is present, whatever the order.
+    out.error = error_description.or(error_code);
     Some(out)
 }
 
@@ -653,6 +834,14 @@ where
     cancel_current().await;
 
     let endpoints = discover().await?;
+    // Signing in is the one action whose whole point is to replace the credentials, so it
+    // is also the only sanctioned way out of an unreadable store: everything else refuses
+    // to overwrite what it cannot read, which would otherwise leave a corrupted item
+    // permanently wedging the user out (every repair path reads first).
+    if let Err(e) = read_stored().await {
+        eprintln!("[tosse] stored credentials unusable ({e}); resetting them for a fresh sign-in");
+        reset_stored().await?;
+    }
     let client_id = ensure_client(&endpoints).await?;
     let (listener, port) = bind_callback().await?;
 
@@ -704,7 +893,11 @@ async fn complete_login(
     expected_state: String,
     redirect: String,
 ) -> R<()> {
-    let cb = match tokio::time::timeout(LOGIN_TIMEOUT, serve_callback(listener)).await {
+    // The `state` nonce ties the redirect to the request WE started; `serve_callback` only
+    // returns once it sees a callback carrying it, so anything else was already ignored
+    // (and kept the listener alive) rather than aborting this sign-in.
+    let cb = match tokio::time::timeout(LOGIN_TIMEOUT, serve_callback(listener, &expected_state)).await
+    {
         Ok(res) => res?,
         Err(_) => {
             return Err(TosseError::Local(
@@ -715,13 +908,6 @@ async fn complete_login(
 
     if let Some(err) = cb.error {
         return Err(TosseError::Denied(err));
-    }
-    // The `state` nonce ties this redirect to the request WE started. A mismatch means the
-    // callback came from somewhere else — refuse it rather than exchange an unknown code.
-    if cb.state.as_deref() != Some(expected_state.as_str()) {
-        return Err(TosseError::Denied(
-            "the browser came back with an unexpected state — sign-in aborted".into(),
-        ));
     }
     let code = cb
         .code
@@ -820,7 +1006,7 @@ pub async fn access_token() -> R<String> {
     // Read AFTER taking the lock: a caller that queued behind an in-flight refresh must see
     // its result, not the stale snapshot it would have read on the way in — otherwise it
     // would refresh again with a token the winner just had revoked.
-    let stored = read_stored().await;
+    let stored = read_stored().await?;
     let now = now_unix_ms();
     if stored.access_is_fresh(now) {
         return Ok(stored.access_token.expect("fresh implies present"));
@@ -838,18 +1024,56 @@ pub async fn access_token() -> R<String> {
     });
     let (status, text) = post_json(&endpoints.token, &body).await?;
     if !status.is_success() {
-        // A refused refresh is terminal for this session (revoked or 30-day expiry): clear
-        // the tokens so the UI stops claiming "connected" and asks for a fresh sign-in.
-        // The `client_id` survives — see `StoredAuth`.
-        let _ = clear_tokens().await;
-        return Err(TosseError::Denied(
-            "the TOSSE session expired — sign in again".into(),
-        ));
+        // ⚠️ Only a grant the server actually REJECTED is terminal. Everything else — 429,
+        // 5xx, a captive portal, a Railway redeploy returning 502 — is transient, and
+        // clearing on it would destroy a perfectly valid refresh token and force the whole
+        // browser sign-in again. RFC 6749 §5.2 says a dead grant is a 400 with
+        // `invalid_grant` / `invalid_client`; anything else is reported WITH its status and
+        // the server's own message, and the stored session is left untouched (`status()`
+        // treats `Http` as non-terminal, so the card stays connected).
+        if is_terminal_grant_failure(status, &text) {
+            // Report a failed wipe instead of swallowing it: "signed out" must not be a lie.
+            clear_tokens().await?;
+            return Err(TosseError::Denied(
+                "the TOSSE session expired — sign in again".into(),
+            ));
+        }
+        return Err(TosseError::Http {
+            status: status.as_u16(),
+            body: readable_error(&text),
+        });
     }
     let tokens = parse_token_response(&text)?;
     let access = tokens.access_token.clone();
-    store_tokens(tokens).await?;
+    // ⚠️ A write failure here is NOT cosmetic: the server has already rotated the pair and
+    // revoked the token we just used, so a rotation we fail to persist means the stored
+    // refresh token is dead. Say so as a terminal error rather than returning an access
+    // token that works once and leaves the next call to fail mysteriously.
+    if let Err(e) = store_tokens(tokens).await {
+        return Err(TosseError::Denied(format!(
+            "the refreshed TOSSE session could not be saved ({e}) — sign in again"
+        )));
+    }
     Ok(access)
+}
+
+/// Whether a refused token-endpoint response means the GRANT itself is dead (so the stored
+/// session must be cleared), as opposed to a transient server or network condition.
+///
+/// Kept narrow on purpose: misclassifying a transient failure here costs the user their
+/// session. A 400/401 alone is not enough — we require the OAuth error code that says the
+/// grant is gone (RFC 6749 §5.2).
+fn is_terminal_grant_failure(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST && status != reqwest::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return false; // Unparseable body: assume transient, keep the session.
+    };
+    matches!(
+        v.get("error").and_then(Value::as_str),
+        Some("invalid_grant") | Some("invalid_client") | Some("unauthorized_client")
+    )
 }
 
 /// Drop the tokens but KEEP the registered `client_id` (see [`StoredAuth`]).
@@ -872,7 +1096,21 @@ async fn clear_tokens() -> R<()> {
 /// `/api/v1/auth/me` for the identity, and a failure there degrades to
 /// `identity_error` — never silently, and never by demoting the card to "not connected".
 pub async fn status() -> TosseAccountStatus {
-    let stored = read_stored().await;
+    let stored = match read_stored().await {
+        Ok(s) => s,
+        // The credential store itself is unreadable (Keychain denied, corrupted item). That
+        // is NOT "never signed in": say so, so the card explains it instead of quietly
+        // inviting a sign-in that may hit the same wall.
+        Err(e) => {
+            return TosseAccountStatus {
+                connected: false,
+                name: None,
+                email: None,
+                signed_out_reason: Some(e.to_string()),
+                identity_error: None,
+            }
+        }
+    };
     if stored.refresh_token.is_none() && stored.access_token.is_none() {
         return TosseAccountStatus {
             connected: false,
@@ -936,7 +1174,16 @@ async fn fetch_identity(token: &str) -> R<(Option<String>, Option<String>)> {
     // The API wraps payloads as `{success, data}`; tolerate a bare object too.
     let user = v.pointer("/data/user").or_else(|| v.get("data")).unwrap_or(&v);
     let s = |k: &str| user.get(k).and_then(Value::as_str).map(str::to_string);
-    Ok((s("name"), s("email")))
+    let (name, email) = (s("name"), s("email"));
+    // A 200 whose shape we don't recognise must not pass as "connected, no identity": that
+    // silently blanks the card with nothing to act on. Treat it as the protocol error it is.
+    if name.is_none() && email.is_none() {
+        return Err(TosseError::Protocol(format!(
+            "the identity response carried neither a name nor an email: {}",
+            snippet(&body)
+        )));
+    }
+    Ok((name, email))
 }
 
 /// Sign out: best-effort token revocation server-side, then drop the local tokens.
@@ -945,7 +1192,11 @@ async fn fetch_identity(token: &str) -> R<(Option<String>, Option<String>)> {
 /// user could not sign out of a machine they no longer trust. The revocation error is
 /// returned so the UI can say the server-side session may still be live.
 pub async fn logout() -> R<()> {
-    let stored = read_stored().await;
+    // ⚠️ Hold REFRESH_LOCK for the WHOLE sign-out. Without it a refresh already in flight
+    // finishes after we clear and writes a fresh token pair back — silently resurrecting the
+    // session the user just ended, with the UI reporting success. Signing out has to win.
+    let _refresh_guard = REFRESH_LOCK.lock().await;
+    let stored = read_stored().await?;
     let mut revoke_err = None;
     if let (Some(client_id), Some(token)) = (
         stored.client_id.clone(),
@@ -1018,12 +1269,24 @@ mod tests {
         assert!(cb.error.is_none());
     }
 
+    /// The human description must win over the machine code REGARDLESS of the order the
+    /// server emits them in. An earlier version wrote both into the same field, so the
+    /// winner was whichever came last — `?error_description=…&error=…` showed the bare code,
+    /// the opposite of what the comment promised.
     #[test]
     fn parses_a_denied_redirect_and_prefers_the_description() {
-        let head = "GET /callback?error=access_denied&error_description=User%20said%20no HTTP/1.1\r\n\r\n";
-        let cb = parse_callback_request(head).expect("parses");
-        assert_eq!(cb.error.as_deref(), Some("User said no"));
-        assert!(cb.code.is_none());
+        for head in [
+            "GET /callback?error=access_denied&error_description=User%20said%20no HTTP/1.1\r\n\r\n",
+            "GET /callback?error_description=User%20said%20no&error=access_denied HTTP/1.1\r\n\r\n",
+        ] {
+            let cb = parse_callback_request(head).expect("parses");
+            assert_eq!(cb.error.as_deref(), Some("User said no"), "order must not matter");
+            assert!(cb.code.is_none());
+        }
+        // With only the machine code, that code IS the message — nothing is dropped.
+        let only_code = parse_callback_request("GET /callback?error=access_denied HTTP/1.1\r\n\r\n")
+            .expect("parses");
+        assert_eq!(only_code.error.as_deref(), Some("access_denied"));
     }
 
     #[test]
@@ -1067,22 +1330,199 @@ mod tests {
         assert!(back.refresh_token.is_none());
     }
 
-    /// The reuse rule `ensure_client` applies: a stored client is only good while it still
-    /// covers the ports we can bind. Anything else must re-register, because the server
-    /// matches `redirect_uri` by exact string and would otherwise dead-end the sign-in in
-    /// the browser, where the app can neither see nor explain the failure.
+    /// The reuse rule `ensure_client` applies, exercised through the REAL predicate — an
+    /// earlier version of this test re-implemented the comparison inline, so it asserted
+    /// against itself and could never have caught a change in the rule.
     #[test]
     fn a_client_is_reused_only_while_its_ports_still_match() {
-        let reusable = |ports: Option<Vec<u16>>| ports.as_deref() == Some(CALLBACK_PORTS);
-        assert!(reusable(Some(CALLBACK_PORTS.to_vec())));
+        let with = |client_id: Option<&str>, ports: Option<Vec<u16>>| StoredAuth {
+            client_id: client_id.map(str::to_string),
+            redirect_ports: ports,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reusable_client(&with(Some("cid"), Some(CALLBACK_PORTS.to_vec()))),
+            Some("cid")
+        );
         // Written before the field existed → unknown → re-register once.
-        assert!(!reusable(None));
-        // A shortened / shifted / reordered list is NOT interchangeable: the registration
-        // stores the exact strings, so only an identical list is safe to reuse.
-        assert!(!reusable(Some(CALLBACK_PORTS[..2].to_vec())));
+        assert_eq!(reusable_client(&with(Some("cid"), None)), None);
+        // A shortened / reordered list is NOT interchangeable: registration stores the exact
+        // strings, so only an identical list is safe to reuse.
+        assert_eq!(
+            reusable_client(&with(Some("cid"), Some(CALLBACK_PORTS[..2].to_vec()))),
+            None
+        );
         let mut reversed = CALLBACK_PORTS.to_vec();
         reversed.reverse();
-        assert!(!reusable(Some(reversed)));
+        assert_eq!(reusable_client(&with(Some("cid"), Some(reversed))), None);
+        // No client (or a blank one) is never reusable, whatever the ports say.
+        assert_eq!(reusable_client(&with(None, Some(CALLBACK_PORTS.to_vec()))), None);
+        assert_eq!(reusable_client(&with(Some(""), Some(CALLBACK_PORTS.to_vec()))), None);
+    }
+
+    /// Only a genuinely rejected grant may clear the session. Everything else — a Railway
+    /// redeploy answering 502, a rate limit, a captive portal — must leave the refresh token
+    /// alone, or a server hiccup silently costs the user their session.
+    #[test]
+    fn only_a_rejected_grant_is_terminal() {
+        use reqwest::StatusCode;
+        let invalid_grant = r#"{"error":"invalid_grant","error_description":"expired"}"#;
+
+        assert!(is_terminal_grant_failure(StatusCode::BAD_REQUEST, invalid_grant));
+        assert!(is_terminal_grant_failure(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid_client"}"#
+        ));
+
+        // Transient: the session must survive all of these.
+        assert!(!is_terminal_grant_failure(StatusCode::BAD_GATEWAY, "<html>502</html>"));
+        assert!(!is_terminal_grant_failure(StatusCode::INTERNAL_SERVER_ERROR, invalid_grant));
+        assert!(!is_terminal_grant_failure(StatusCode::TOO_MANY_REQUESTS, invalid_grant));
+        assert!(!is_terminal_grant_failure(StatusCode::SERVICE_UNAVAILABLE, ""));
+        // A 400 whose body we cannot read is assumed transient — losing a session on a
+        // guess is worse than one extra failed call.
+        assert!(!is_terminal_grant_failure(StatusCode::BAD_REQUEST, "not json"));
+        assert!(!is_terminal_grant_failure(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"temporarily_unavailable"}"#
+        ));
+    }
+
+    /// Discovered endpoints are where we send an authorization code and a refresh token, so
+    /// a downgraded or off-host URL must be refused rather than trusted.
+    #[test]
+    fn discovered_endpoints_must_be_https_and_on_the_deployment() {
+        // The real production values must both pass. The authorization endpoint genuinely
+        // lives on the FRONTEND host, which is exactly why it is not host-pinned.
+        assert!(checked_endpoint(
+            Some("https://backend-production-668c.up.railway.app/oauth/token".into()),
+            "token_endpoint",
+            true
+        )
+        .is_ok());
+        assert!(checked_endpoint(
+            Some("https://frontend-production-7e11.up.railway.app/oauth/authorize".into()),
+            "authorization_endpoint",
+            false
+        )
+        .is_ok());
+
+        // Secret-bearing: downgraded, off-host, malformed or missing → refused.
+        for bad in [
+            "http://backend-production-668c.up.railway.app/oauth/token",
+            "https://evil.example.com/oauth/token",
+            "https://frontend-production-7e11.up.railway.app/oauth/token",
+            "not a url",
+        ] {
+            assert!(
+                checked_endpoint(Some(bad.into()), "token_endpoint", true).is_err(),
+                "{bad} must not receive credentials"
+            );
+        }
+        assert!(checked_endpoint(None, "token_endpoint", true).is_err());
+
+        // Non-secret-bearing still refuses plain http — we will not open a downgraded
+        // authorization URL — but tolerates another host.
+        assert!(checked_endpoint(
+            Some("http://frontend-production-7e11.up.railway.app/oauth/authorize".into()),
+            "authorization_endpoint",
+            false
+        )
+        .is_err());
+    }
+
+    /// `serve_callback` is the only path a sign-in can succeed through, and it had no test.
+    /// These drive a REAL listener over loopback.
+    mod callback_server {
+        use super::*;
+
+        /// Bind an ephemeral port and serve one sign-in against it.
+        async fn serve_with(
+            requests: Vec<String>,
+            expected_state: &str,
+        ) -> R<CallbackResult> {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let state = expected_state.to_string();
+            let server = tokio::spawn(async move { serve_callback(listener, &state).await });
+
+            for req in requests {
+                let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+                sock.write_all(req.as_bytes()).await.unwrap();
+                let _ = sock.flush().await;
+                // Give the server a moment to answer before the next connection.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            server.await.unwrap()
+        }
+
+        fn get(target: &str) -> String {
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        }
+
+        #[tokio::test]
+        async fn returns_the_matching_redirect() {
+            let cb = serve_with(vec![get("/callback?code=abc&state=s1")], "s1")
+                .await
+                .expect("should accept our redirect");
+            assert_eq!(cb.code.as_deref(), Some("abc"));
+        }
+
+        #[tokio::test]
+        async fn ignores_a_favicon_and_keeps_waiting_for_the_real_redirect() {
+            // The browser's extra connections must not consume the sign-in.
+            let cb = serve_with(
+                vec![get("/favicon.ico"), get("/callback?code=abc&state=s1")],
+                "s1",
+            )
+            .await
+            .expect("the favicon must not end the wait");
+            assert_eq!(cb.code.as_deref(), Some("abc"));
+        }
+
+        #[tokio::test]
+        async fn a_stray_callback_with_a_foreign_state_cannot_abort_the_sign_in() {
+            // Any local process can reach the port; one hitting it with `?code=` must NOT
+            // kill a sign-in in progress. The genuine redirect still wins.
+            let cb = serve_with(
+                vec![
+                    get("/callback?code=attacker&state=wrong"),
+                    get("/callback?error=nope&state=wrong"),
+                    get("/callback?code=mine&state=s1"),
+                ],
+                "s1",
+            )
+            .await
+            .expect("only our own state may complete the flow");
+            assert_eq!(cb.code.as_deref(), Some("mine"));
+        }
+
+        #[tokio::test]
+        async fn a_silent_socket_does_not_wedge_the_loop() {
+            // A peer that connects and says nothing used to hold the accept loop for the
+            // whole 5-minute login window. It must be dropped on the read timeout while the
+            // real redirect still completes. (Bounded by the test's own timeout: if the
+            // wedge regressed, this fails instead of hanging the suite.)
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { serve_callback(listener, "s1").await });
+
+            let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(get("/callback?code=abc&state=s1").as_bytes())
+                .await
+                .unwrap();
+
+            let cb = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("the silent socket must not block the accept loop")
+                .unwrap()
+                .expect("the real redirect should be served");
+            assert_eq!(cb.code.as_deref(), Some("abc"));
+        }
     }
 
     /// Error bodies must reach the user as sentences, not as JSON punctuation. The first

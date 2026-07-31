@@ -54,5 +54,8 @@ export function useTosseConnectionActions() {
     // card must stop showing a session that no longer exists on this Mac.
     onSettled: refresh,
   });
-  return { loginStart, loginCancel, logout };
+  // `refresh` is exposed because cancelling a sign-in needs it: cancelling only stops us
+  // WAITING, and the browser round-trip may already have completed — in which case we are
+  // connected and the card must not keep claiming otherwise until staleTime lapses.
+  return { loginStart, loginCancel, logout, refresh };
 }

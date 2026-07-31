@@ -44,7 +44,7 @@ export function TosseSection() {
 
 function TosseConnectionGroup() {
   const status = useTosseConnection(true);
-  const { loginStart, loginCancel, logout } = useTosseConnectionActions();
+  const { loginStart, loginCancel, logout, refresh } = useTosseConnectionActions();
   // "waiting" = the URL was opened and the core is holding the loopback callback; the
   // outcome arrives as the app-global `account_login` event.
   const [waiting, setWaiting] = useState(false);
@@ -92,16 +92,22 @@ function TosseConnectionGroup() {
   // none is ever swallowed. `signedOutReason` explains a session that STOPPED working
   // (revoked or expired refresh token), which is a different story from never having
   // connected — the invite below says which.
+  //
+  // ⚠️ A sign-out failure is only shown while we are actually signed OUT. `logout.error`
+  // is a partial success ("signed out here, but TOSSE could not be told"), and a mutation's
+  // error sticks until the next call: left unfiltered it would still be pinned under a
+  // freshly CONNECTED card minutes later, describing a session that no longer exists.
   const err =
     loginErr ??
     (loginStart.error as Error | null)?.message ??
-    (logout.error as Error | null)?.message ??
+    (connected ? null : (logout.error as Error | null)?.message) ??
     status.data?.signedOutReason ??
     null;
 
   const startLogin = () => {
     setLoginErr(null);
-    useAccountLoginStore.getState().clear(BACKEND); // a new attempt supersedes a stashed failure
+    logout.reset(); // a new attempt supersedes the previous sign-out's outcome
+    useAccountLoginStore.getState().clear(BACKEND); // …and any stashed failure
     loginStart.mutate(undefined, {
       onSuccess: (url) => {
         setWaiting(true);
@@ -109,7 +115,16 @@ function TosseConnectionGroup() {
       },
     });
   };
-  const cancelLogin = () => loginCancel.mutate(undefined, { onSettled: () => setWaiting(false) });
+  // Cancelling only stops us WAITING. If the browser round-trip had already completed, the
+  // core has the tokens and we are connected — so refetch instead of leaving the card
+  // asserting "Not connected" until its 30 s staleTime lapses.
+  const cancelLogin = () =>
+    loginCancel.mutate(undefined, {
+      onSettled: () => {
+        setWaiting(false);
+        void refresh();
+      },
+    });
 
   const actions = connected ? (
     <LogoutControl pending={logout.isPending} onConfirm={() => logout.mutate()} label="Disconnect…" />
