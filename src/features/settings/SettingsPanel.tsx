@@ -538,9 +538,9 @@ function PermissionPrefs() {
             Makes <strong>Bypass permissions</strong> selectable in a conversation's permission
             menu. In that mode the agent runs every tool — edits, shell commands, network calls —{" "}
             <strong>without ever asking</strong>. Unlocking is not enabling: nothing changes until
-            a conversation is explicitly switched to it, and only sessions started afterwards can
-            use it (restart a running one). Turning this back off returns every conversation still
-            in Bypass to <strong>Default</strong> right away. <strong>Off by default.</strong>
+            a conversation is explicitly switched to it, and only conversations started afterwards
+            can use it (restart a running one). Turning this back off returns every conversation
+            still in Bypass to <strong>Default</strong> right away. <strong>Off by default.</strong>
           </>
         }
         checked={allowBypass}

@@ -422,9 +422,14 @@
    disabled one: `.wf-mi:disabled` dims to .36 (an opacity an inner element cannot climb
    back out of) and takes no pointer events, so neither a hint nor a title would read.
    Wraps — unlike .wf-mi-t/.wf-mi-h, this is a sentence, so it gets a width to wrap in
-   instead of stretching the popover. */
+   instead of stretching the popover.
+   It leads with the mode's name + its colour dot (the same red as the row it explains)
+   so it reads as belonging to THAT row: sitting under the full list, an unlabelled
+   sentence looked like a note on the whole menu. */
 .cv-perm-note { max-width:212px; margin:4px 6px 2px; padding-top:6px; border-top:1px solid var(--wf-line);
-  font-size:10px; line-height:1.35; color:var(--wf-tx-lo); white-space:normal; }
+  font-size:10px; line-height:1.4; color:var(--wf-tx-lo); white-space:normal; }
+.cv-perm-note .cv-perm-dot { width:6px; height:6px; margin-right:5px; }
+.cv-perm-note-mode { color:var(--wf-tx); font-weight:600; }
 
 @media (prefers-reduced-motion: reduce) {
   .wf-eff-fill, .wf-eff-thumb { transition:none; }

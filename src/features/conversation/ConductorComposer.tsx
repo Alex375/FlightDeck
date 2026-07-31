@@ -908,8 +908,19 @@ export const ConductorComposer = forwardRef<
             })}
             {/* The reason lives OUTSIDE the disabled row on purpose: a disabled button
                 takes no pointer events (a `title` would never show) and is dimmed to
-                .36 opacity, which would bury the one sentence that explains the refusal. */}
-            {bypassBlocked ? <div className="cv-perm-note">{bypassBlocked}</div> : null}
+                .36 opacity, which would bury the one sentence that explains the refusal.
+                Sitting under the whole list, though, it could read as a remark about the
+                MENU — so it names the mode and repeats its colour dot: the note belongs
+                to the one greyed row above it, not to the four live ones. */}
+            {bypassBlocked ? (
+              <div className="cv-perm-note">
+                <span
+                  className="cv-perm-dot"
+                  style={{ background: PERM_TONE.bypassPermissions }}
+                />
+                <span className="cv-perm-note-mode">Bypass permissions</span> — {bypassBlocked}
+              </div>
+            ) : null}
           </Menu>
         ) : (
           /* Codex controls — all applied as per-turn overrides (see codexControls). */

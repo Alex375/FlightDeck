@@ -77,9 +77,13 @@ export function bypassPermissionsAllowed(): boolean {
  *
  *  Two distinct blockers, and they must not be conflated: the app-wide opt-in is off, or
  *  it is on but THIS process was spawned before it was (the unlock is a spawn flag, so a
- *  running session can never gain it). Either way the pick must be refused rather than
- *  sent: the CLI would silently downgrade it to `default` and the menu would snap back
- *  with no explanation. Pure — the composer renders the string, the tests assert it.
+ *  running conversation can never gain it). Either way the pick must be refused rather
+ *  than sent: the CLI would silently downgrade it to `default` and the menu would snap
+ *  back with no explanation. Pure — the composer renders the string, the tests assert it.
+ *
+ *  The sentence is a CLAUSE, not a standalone line: the composer prefixes it with the
+ *  mode's own name and colour dot, so the note reads as being about Bypass alone and
+ *  can't be mistaken for a remark on the whole menu.
  *
  *  @param allowed       the app-wide opt-in (Settings → General → Permissions)
  *  @param live          is a process currently running for this conversation
@@ -89,7 +93,7 @@ export function bypassBlockedReason(
   live: boolean,
   sessionAllows: boolean,
 ): string | null {
-  if (!allowed) return "Allow it in Settings → General → Permissions.";
-  if (live && !sessionAllows) return "Restart this stream to unlock it.";
+  if (!allowed) return "allow it in Settings → General → Permissions.";
+  if (live && !sessionAllows) return "restart this conversation to unlock it.";
   return null;
 }
