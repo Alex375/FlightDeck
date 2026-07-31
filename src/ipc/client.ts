@@ -68,6 +68,7 @@ export type {
   SkillInfo,
   SlashCommand,
   TickEvent,
+  TosseAccountStatus,
   UsageError,
   UsageWindow,
   WorkflowJournal,

@@ -58,6 +58,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  TosseAccountStatus,
   SlashCommand,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -367,6 +368,25 @@ export const mockCommands = {
     return ok(null);
   },
   async accountCodexLogout(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  // ---- TOSSE (the CRM) — demo connection ------------------------------------------
+  async tosseStatus(): Promise<Result<TosseAccountStatus, string>> {
+    return ok({
+      connected: true,
+      name: "Demo User",
+      email: "demo@example.com",
+      signedOutReason: null,
+      identityError: null,
+    });
+  },
+  async tosseLoginStart(): Promise<Result<string, string>> {
+    return ok("https://tosse.example/oauth/demo");
+  },
+  async tosseLoginCancel(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async tosseLogout(): Promise<Result<null, string>> {
     return ok(null);
   },
 

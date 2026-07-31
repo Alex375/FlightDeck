@@ -458,6 +458,48 @@ pub async fn account_codex_logout() -> Result<(), String> {
     codex::accounts::logout().await.map_err(|e| e.to_string())
 }
 
+// ── TOSSE (the internal CRM) — a THIRD connection, unrelated to the two agent backends
+// above: it authenticates the human to their CRM, not an agent to a model provider. Unlike
+// those, no CLI owns the credentials — we run the OAuth flow and hold the tokens ourselves
+// (see `crate::tosse`). The app is fully usable without it.
+
+/// The TOSSE connection state (identity when reachable). Never fails on a network
+/// outage — an offline machine still reports the session it holds.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_status() -> Result<crate::tosse::TosseAccountStatus, String> {
+    Ok(crate::tosse::status().await)
+}
+
+/// Start a TOSSE sign-in: returns the authorization URL to open. The flow completes
+/// ASYNCHRONOUSLY once the browser hits our loopback callback — the outcome lands as the
+/// app-global [`AccountLoginEvent`] with `backend: "tosse"`, exactly like the Codex login.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_login_start(app: tauri::AppHandle) -> Result<String, String> {
+    crate::tosse::login_start(move |success, error| {
+        crate::ipc::events::emit_account_login(&app, "tosse", success, error);
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Abort the in-flight TOSSE sign-in (drops the loopback listener). Safe when none runs.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_login_cancel() -> Result<(), String> {
+    crate::tosse::login_cancel().await;
+    Ok(())
+}
+
+/// Sign out of TOSSE: revokes the session server-side (best effort) and clears the local
+/// tokens. Errs only when revocation failed — the local sign-out has happened either way.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_logout() -> Result<(), String> {
+    crate::tosse::logout().await.map_err(|e| e.to_string())
+}
+
 /// Fetch the slash commands available in `cwd` WITHOUT starting a persistent
 /// session. Spawns a short-lived `claude`, performs the `initialize` handshake
 /// (spec §4.4), reads the advertised commands from its `control_response`, and

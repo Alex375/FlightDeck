@@ -16,6 +16,7 @@ import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { AccountsSection } from "./AccountsSection";
+import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -23,6 +24,9 @@ import styles from "./SettingsPanel.module.css";
 const TABS: Array<{ id: SettingsSection; label: string; icon: string }> = [
   { id: "general", label: "General", icon: "cog" },
   { id: "accounts", label: "Accounts", icon: "key" },
+  // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
+  // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
+  { id: "tosse", label: "TOSSE", icon: "list" },
   { id: "conversation", label: "Conversation", icon: "chat" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
@@ -141,6 +145,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             )}
 
             {section === "accounts" && <AccountsSection />}
+
+            {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
 

@@ -40,6 +40,15 @@ serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+# TOSSE sign-in (`tosse/mod.rs`) — the app's only hand-written OAuth client (PKCE + a
+# loopback redirect, RFC 8252). `ring` supplies BOTH halves of PKCE: SHA-256 for the S256
+# challenge and the OS CSPRNG for the verifier / `state` nonce — and it is already compiled
+# above as rustls' crypto provider, so declaring it direct adds no crate. `url` parses the
+# callback query string and builds the authorization URL (also already in the tree, via
+# reqwest), instead of hand-rolling query escaping.
+ring = "0.17"
+url = "2"
+
 # Persistence: SQLite compiled into the binary (`bundled`) — nothing to install,
 # no system dependency. Synchronous and tiny; our writes are rare and off the hot
 # path, so we skip sqlx's async machinery (see `store/db.rs`).

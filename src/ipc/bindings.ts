@@ -361,6 +361,54 @@ async accountCodexLogout() : Promise<Result<null, string>> {
 }
 },
 /**
+ * The TOSSE connection state (identity when reachable). Never fails on a network
+ * outage — an offline machine still reports the session it holds.
+ */
+async tosseStatus() : Promise<Result<TosseAccountStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start a TOSSE sign-in: returns the authorization URL to open. The flow completes
+ * ASYNCHRONOUSLY once the browser hits our loopback callback — the outcome lands as the
+ * app-global [`AccountLoginEvent`] with `backend: "tosse"`, exactly like the Codex login.
+ */
+async tosseLoginStart() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_login_start") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Abort the in-flight TOSSE sign-in (drops the loopback listener). Safe when none runs.
+ */
+async tosseLoginCancel() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_login_cancel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Sign out of TOSSE: revokes the session server-side (best effort) and clears the local
+ * tokens. Errs only when revocation failed — the local sign-out has happened either way.
+ */
+async tosseLogout() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_logout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Fetch the slash commands available in `cwd` WITHOUT starting a persistent
  * session. Spawns a short-lived `claude`, performs the `initialize` handshake
  * (spec §4.4), reads the advertised commands from its `control_response`, and
@@ -2899,6 +2947,22 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * The TOSSE connection as the Settings tab shows it. `connected` false with a
+ * `signed_out_reason` means we HELD a session and it stopped working (revoked/expired
+ * refresh token) — a different story from "never signed in", and the UI says so.
+ */
+export type TosseAccountStatus = { connected: boolean; name: string | null; email: string | null; 
+/**
+ * Why a stored session is no longer usable. `None` when simply never connected.
+ */
+signedOutReason: string | null; 
+/**
+ * Set when we ARE connected but the identity probe could not run (offline, or the
+ * server does not accept Bearer on `/api/v1/*` yet). Never silently swallowed: the
+ * card stays "connected" and shows this as the reason the name/email are missing.
+ */
+identityError: string | null }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

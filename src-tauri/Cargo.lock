@@ -4720,6 +4720,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",
@@ -4737,6 +4738,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "trash",
+ "url",
  "uuid",
 ]
 

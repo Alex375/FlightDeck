@@ -8,6 +8,7 @@ import { create } from "zustand";
 export type SettingsSection =
   | "general"
   | "accounts"
+  | "tosse"
   | "conversation"
   | "reordering"
   | "shortcuts"

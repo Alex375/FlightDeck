@@ -20,6 +20,9 @@
   --wf-accent:    #d97757;   /* Claude brand mark (coral) — rare use */
   --wf-accent-dim:#3a2a24;
   --wf-codex-accent:#10a37f; /* Codex brand mark (OpenAI green) — Accounts cards, Extensions tab, Plan pill */
+  --wf-tosse-accent:#6f8cf5; /* TOSSE (the CRM) mark — Settings → TOSSE card. Indigo: the CRM
+                                has no brand colour of its own, so this only has to stay
+                                distinct from coral/green/violet above. */
   --wf-ultra:     #b483e0;   /* "Ultra code" tier — premium violet */
   --wf-ultra-dim: #2e2440;
 

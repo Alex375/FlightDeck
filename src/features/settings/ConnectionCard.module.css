@@ -1,8 +1,9 @@
-/* Settings → Accounts — graphical per-backend account cards. Each card carries a
-   brand accent (--brand, set per backend) driving a soft top glow, the mark tile,
-   the plan pill and the connect CTA. Three visual states via [data-state]:
-   connected (rich identity + brand glow), disconnected (muted + red status), and
-   loading (skeleton). Built on the shared wirekit + semantic tokens. */
+/* Settings — the graphical "connection to a service" card, shared by every account-like
+   surface (Accounts → Claude & Codex, TOSSE). Each card carries a brand accent (--brand,
+   set per service) driving a soft top glow, the mark tile, the plan pill and the connect
+   CTA. Three visual states via [data-state]: connected (rich identity + brand glow),
+   disconnected (muted + red status), and loading (skeleton). Built on the shared wirekit +
+   semantic tokens. Owned by ConnectionCard.tsx — see it before adding a class here. */
 
 .cards {
   display: flex;
