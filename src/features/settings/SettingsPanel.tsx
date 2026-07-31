@@ -3,13 +3,13 @@
 // destructive "drop all", kept while the SQL model is still in flux). The active
 // section is shared state so deep-links (e.g. the update banner) can open it
 // straight onto a given tab.
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { wipeAllData } from "../../store/conversationsStore";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
-import { Ico } from "../../ui/kit";
+import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
@@ -21,12 +21,14 @@ import { ShortcutsSection } from "./ShortcutsSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
-const TABS: Array<{ id: SettingsSection; label: string; icon: string }> = [
+// `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
+// the rest of the rail stays on the shared icon set.
+const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: ReactNode }> = [
   { id: "general", label: "General", icon: "cog" },
   { id: "accounts", label: "Accounts", icon: "key" },
   // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
-  { id: "tosse", label: "TOSSE", icon: "list" },
+  { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
@@ -112,7 +114,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 data-on={section === t.id ? "" : undefined}
                 onClick={() => setSection(t.id)}
               >
-                <Ico name={t.icon} className="sm" />
+                {t.mark ?? <Ico name={t.icon} className="sm" />}
                 <span>{t.label}</span>
               </button>
             ))}

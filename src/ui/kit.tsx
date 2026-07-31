@@ -97,6 +97,43 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   );
 }
 
+/** The TOSSE (CRM) brand mark — "La Rose": a compass rose between two code chevrons.
+ *  Ported from the CRM's own asset (`apps/frontend/public/logo.svg` /
+ *  `components/shared/tosse-logo.tsx`), inlined so it tints crisply at small sizes with no
+ *  asset fetch — same approach as the Claude and Codex marks below.
+ *
+ *  ⚠️ NOT to be confused with `TosseMark` (src/ui/TosseMark.tsx), which is THIS app's own
+ *  logo (the Flight Deck aircraft). This one identifies the external CRM we connect to.
+ *
+ *  The source art tints its north needle with `--logo-accent`, falling back to
+ *  `currentColor`. We leave that variable unset on purpose: on the Settings tile the mark
+ *  sits on a filled brand plate where a second hue would muddy it, and staying monochrome
+ *  matches how the Claude/Codex marks render in the same slot.
+ *
+ *  The viewBox is cropped to the artwork (the standalone asset carries generous padding),
+ *  so the mark fills its 24px box instead of floating inside it. */
+export function TosseCrmMark({ className }: { className?: string }) {
+  return (
+    <svg
+      className={"wf-tosse-mark " + (className || "")}
+      viewBox="56 26 208 148"
+      fill="currentColor"
+      role="img"
+      aria-label="TOSSE"
+    >
+      <polygon points="157,90 160,32 163,90" />
+      <polygon points="163,110 160,168 157,110" />
+      <polygon points="150,103 88,100 150,97" />
+      <polygon points="170,97 232,100 170,103" />
+      <polygon points="196,52 174.2,94.4 161.4,84.8" fill="var(--logo-accent, currentColor)" />
+      <polygon points="124,148 145.8,105.6 158.6,115.2" />
+      <circle cx="160" cy="100" r="12" fill="none" stroke="currentColor" strokeWidth="8" />
+      <path d="M108 54 C90 66 72 84 62 100 C72 116 90 134 108 146 C100 132 86 116 78 100 C86 84 100 68 108 54 Z" />
+      <path d="M212 54 C230 66 248 84 258 100 C248 116 230 134 212 146 C220 132 234 116 242 100 C234 84 220 68 212 54 Z" />
+    </svg>
+  );
+}
+
 /** The Claude sunburst mark (the official Anthropic/Claude logo), filled with
  *  `currentColor` so it inherits the surrounding text colour — used for the model
  *  picker chip and Claude's message avatars. Reuses the brand asset already shipped

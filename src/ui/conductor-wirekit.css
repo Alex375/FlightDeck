@@ -20,9 +20,9 @@
   --wf-accent:    #d97757;   /* Claude brand mark (coral) — rare use */
   --wf-accent-dim:#3a2a24;
   --wf-codex-accent:#10a37f; /* Codex brand mark (OpenAI green) — Accounts cards, Extensions tab, Plan pill */
-  --wf-tosse-accent:#6f8cf5; /* TOSSE (the CRM) mark — Settings → TOSSE card. Indigo: the CRM
-                                has no brand colour of its own, so this only has to stay
-                                distinct from coral/green/violet above. */
+  --wf-tosse-accent:#e05a40; /* TOSSE (the CRM) brand mark — Settings → TOSSE card. The CRM's
+                                own dark-scheme accent, taken from its "La Rose" logo asset
+                                (its light-scheme value is #c2402a). */
   --wf-ultra:     #b483e0;   /* "Ultra code" tier — premium violet */
   --wf-ultra-dim: #2e2440;
 
@@ -233,8 +233,14 @@
 .wf-ico { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .wf-ico.sm { width: 13px; height: 13px; }
 
-/* Brand marks (filled, currentColor) — Claude sunburst + user silhouette. */
-.wf-claude, .wf-user-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
+/* Brand marks (filled, currentColor) — Claude sunburst + user silhouette + the TOSSE rose.
+   Sized here rather than via `.wf-ico`: that class is for STROKED glyphs (`fill: none`),
+   which would erase a filled logo. */
+.wf-claude, .wf-user-mark, .wf-tosse-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
+/* The rose is landscape (≈1.4:1), so matching the 13px square glyphs on WIDTH would make it
+   read smaller than its neighbours. Match their HEIGHT instead and let the width follow the
+   artwork's ratio, so the rail's icons carry the same optical weight. */
+.wf-tosse-mark.sm { width: 18px; height: 13px; }
 /* The model picker chip wears the Claude logo, tinted with the brand coral. */
 .wf-chip .wf-claude { width: 14px; height: 14px; color: var(--wf-accent); }
 /* Codex/OpenAI brand mark — monochrome (currentColor), NO background. Inherits the

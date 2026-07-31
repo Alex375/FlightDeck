@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 import { events } from "../../ipc/client";
 import { useTosseConnection, useTosseConnectionActions } from "../../ipc/useTosse";
 import { useAccountLoginStore } from "../../store/accountLogin";
-import { Ico } from "../../ui/kit";
+import { Ico, TosseCrmMark } from "../../ui/kit";
 import { PageHead } from "./SettingsKit";
 import {
   ConnectionCard,
@@ -151,7 +151,7 @@ function TosseConnectionGroup() {
   return (
     <ConnectionCard
       accent="var(--wf-tosse-accent)"
-      mark={<Ico name="list" />}
+      mark={<TosseCrmMark />}
       name="TOSSE"
       provider="Internal CRM"
       state={state}
