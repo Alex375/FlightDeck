@@ -49,8 +49,12 @@
    repository gone): stays visible, muted, with a small warning flag. */
 .cv-tosse-badge { position:relative; }
 .cv-tosse-badge .wf-tosse-mark { width:17px; height:12px; }
-.cv-tosse-badge.linked { color:var(--wf-tosse-accent); opacity:1; }
-.cv-tosse-badge.linked:hover { background:color-mix(in srgb, var(--wf-tosse-accent) 16%, transparent); color:var(--wf-tosse-accent); }
+/* Linked = the mark in its REAL bichrome livery (body in the text colour, north needle in
+   the brand accent from .wf-tosse-mark). Tinting the whole glyph coral would flatten it back
+   into the silhouette that fix 7b94f83 deliberately undid — the accent needle alone is what
+   makes it read as TOSSE's logo among grey icons. */
+.cv-tosse-badge.linked { color:var(--wf-tx-mid); opacity:1; }
+.cv-tosse-badge.linked:hover { background:color-mix(in srgb, var(--wf-tosse-accent) 16%, transparent); color:var(--wf-tx-hi); }
 /* Hollow at rest: the mark's own north-needle accent is dropped and the whole glyph is
    dimmed, so an unassociated folder never mimics an associated one. */
 .cv-tosse-badge:not(.linked) .wf-tosse-mark { --logo-accent:currentColor; opacity:.55; }
