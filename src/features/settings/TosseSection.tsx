@@ -14,8 +14,9 @@ import { useEffect, useState } from "react";
 import { events } from "../../ipc/client";
 import { useTosseConnection, useTosseConnectionActions } from "../../ipc/useTosse";
 import { useAccountLoginStore } from "../../store/accountLogin";
+import { useDisplay } from "../../store/display";
 import { Ico, TosseCrmMark } from "../../ui/kit";
-import { PageHead } from "./SettingsKit";
+import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import {
   ConnectionCard,
   LogoutControl,
@@ -37,8 +38,54 @@ export function TosseSection() {
       />
       <div className={s.cards}>
         <TosseConnectionGroup />
+        <TosseDisplayPrefs />
       </div>
     </div>
+  );
+}
+
+/** What TOSSE is allowed to show elsewhere in the app.
+ *
+ *  These two live HERE rather than in General → Display, where they started: someone looking
+ *  for "the TOSSE settings" opens the TOSSE tab, and a preference filed under Display is one
+ *  they have to already know about to find. They stay together, right under the connection
+ *  that makes either of them mean anything — switched off, both surfaces stop FETCHING, not
+ *  merely stop drawing. */
+function TosseDisplayPrefs() {
+  const tosseRepoBadge = useDisplay((d) => d.tosseRepoBadge);
+  const tosseTasksView = useDisplay((d) => d.tosseTasksView);
+  const set = useDisplay((d) => d.set);
+  return (
+    <SettingsGroup title="In the app" icon="list">
+      <ToggleRow
+        title="TOSSE mark on repositories"
+        hint={
+          <>
+            Marks each repository in the sidebar with the <strong>TOSSE</strong> logo when it
+            matches a repository in the CRM, and lets you associate one by hand otherwise.
+            Click the mark to open that repository's TOSSE card. <strong>On by default.</strong>{" "}
+            Off → nothing is shown and nothing is fetched. Nothing appears either way when you
+            are not connected to TOSSE.
+          </>
+        }
+        checked={tosseRepoBadge}
+        onChange={(v) => set({ tosseRepoBadge: v })}
+        label="Show the TOSSE mark on repositories"
+      />
+      <ToggleRow
+        title="TOSSE tasks view"
+        hint={
+          <>
+            Adds a third view (<strong>⌘3</strong>) listing the CRM's active projects by client,
+            with their open tasks. <strong>On by default.</strong> Off → the tab disappears and
+            nothing is fetched. The tab is absent anyway while you are not connected to TOSSE.
+          </>
+        }
+        checked={tosseTasksView}
+        onChange={(v) => set({ tosseTasksView: v })}
+        label="Show the TOSSE tasks view"
+      />
+    </SettingsGroup>
   );
 }
 

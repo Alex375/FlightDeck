@@ -590,6 +590,11 @@ export const mockCommands = {
   async tosseBriefing(): Promise<Result<TosseBriefing, string>> {
     return ok(demoBriefing);
   },
+  // The real one is derived from the discovered `authorization_endpoint`; the demo answers
+  // the production frontend so "Open in TOSSE" is clickable in a mock run too.
+  async tosseWebUrl(): Promise<Result<string, string>> {
+    return ok("https://frontend-production-7e11.up.railway.app");
+  },
   async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
     const found = demoAllTasks().find((row) => row.task.id === taskId);
     if (!found) return err(`no task with id ${taskId}`);

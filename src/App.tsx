@@ -19,6 +19,7 @@ import { TosseView } from "./features/tosse/TosseView";
 import { useTosseConnection } from "./ipc/useTosse";
 import { useExtensionsUi } from "./features/extensions/extensionsUiStore";
 import { HistoryPanel } from "./features/history/HistoryPanel";
+import { SettingsPanel } from "./features/settings/SettingsPanel";
 import { useHistoryUi } from "./features/history/historyUiStore";
 import { useEditorStore } from "./features/editor/editorStore";
 import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
@@ -77,6 +78,10 @@ export default function App() {
   // (see notify.ts). It also keeps the same conversation from being mounted twice
   // (modal + full view) at once.
   const closeReplyModal = useFlightdeckModal((s) => s.close);
+
+  // Settings is mounted here rather than in the sidebar, so ⌘, works from every view.
+  const settingsOpen = useSettingsUi((s) => s.open);
+  const closeSettings = useSettingsUi((s) => s.closeSettings);
 
   // The TOSSE tab is CONDITIONAL — it exists only while signed in to the CRM (and while the
   // display preference keeps it on). Signed out we show no tab at all rather than an empty
@@ -360,6 +365,10 @@ export default function App() {
       <TosseRepoCard />
       {/* Idem: the conversation-history search panel, opened from the sidebar search bar. */}
       <HistoryPanel />
+      {/* Idem: Settings. Global rather than inside the sidebar, because ⌘, is a GLOBAL chord
+          (the shortcuts catalogue lists it as one) — mounted in the sidebar it did nothing
+          from the Flight Deck or the TOSSE view, silently leaving the store "open". */}
+      <SettingsPanel open={settingsOpen} onClose={closeSettings} />
       {/* Mounted once, globally: the full-screen "Ultra code" activation blast. */}
       <UltraCodeBlast />
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from

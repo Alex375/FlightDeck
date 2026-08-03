@@ -163,6 +163,26 @@ export function useTosseBriefing(enabled = true) {
   });
 }
 
+export const tosseWebUrlKey = ["tosse-web-url"] as const;
+
+/**
+ * Where TOSSE lives in a browser — the origin behind every "Open in TOSSE" link.
+ *
+ * Never expires: it comes from the OAuth metadata, which is discovered once per run and
+ * cached in the core, so refetching would only re-ask a question whose answer cannot change
+ * under us. A failure leaves the links out rather than rendering ones that lead nowhere —
+ * the caller says so on the surface that would have carried them.
+ */
+export function useTosseWebUrl(enabled = true) {
+  return useQuery<string>({
+    queryKey: tosseWebUrlKey,
+    enabled,
+    queryFn: () => unwrap(commands.tosseWebUrl()),
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
 /** One task in full — fetched only when a row is opened (the briefing omits the Markdown). */
 export function useTosseTaskDetail(taskId: string | null) {
   return useQuery<TosseTaskDetail>({

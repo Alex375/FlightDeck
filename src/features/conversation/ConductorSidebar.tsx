@@ -27,7 +27,6 @@ import { TosseRepoBadge } from "../tosse/TosseRepoBadge";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
-import { SettingsPanel } from "../settings/SettingsPanel";
 import { Dot, Ico, Menu, MenuItem, MenuLabel, RunPulse } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { WorktreeBadge } from "../git/WorktreeBadge";
@@ -375,9 +374,7 @@ export function ConductorSidebar() {
     useSurfaceOrderDnd("sidebar", useConversationsByRepo());
   const activeId = useActiveConversationId();
   const openHistory = useHistoryUi((s) => s.openPanel);
-  const settingsOpen = useSettingsUi((s) => s.open);
   const openSettings = useSettingsUi((s) => s.openSettings);
-  const closeSettings = useSettingsUi((s) => s.closeSettings);
   const showFleet = useDisplay((s) => s.fleetBannerConversation);
 
   // Resizable width, persisted (localStorage). The grip is an absolute handle on the
@@ -495,7 +492,10 @@ export function ConductorSidebar() {
         </span>
       </button>
 
-      <SettingsPanel open={settingsOpen} onClose={closeSettings} />
+      {/* The panel itself is mounted GLOBALLY (App.tsx), not here: this button only opens
+          it. Mounted here, ⌘, flipped the store from the Flight Deck or the TOSSE view but
+          rendered nothing — the shortcut its own catalogue lists as global was dead in two
+          views out of three, and left `open: true` stuck with no way to clear it. */}
 
       {/* Drag handle on the right edge — resizes the sidebar, width persisted. */}
       <div className="cv-side-grip">

@@ -234,8 +234,6 @@ function DisplayPrefs() {
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
-  const tosseRepoBadge = useDisplay((s) => s.tosseRepoBadge);
-  const tosseTasksView = useDisplay((s) => s.tosseTasksView);
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Display" icon="list">
@@ -309,34 +307,6 @@ function DisplayPrefs() {
         checked={clickableFileMentions}
         onChange={(v) => set({ clickableFileMentions: v })}
         label="Make the filename on Read/Write rows clickable"
-      />
-      <ToggleRow
-        title="TOSSE mark on repositories"
-        hint={
-          <>
-            Marks each repository in the sidebar with the <strong>TOSSE</strong> logo when it
-            matches a repository in the CRM, and lets you associate one by hand otherwise.
-            Click the mark to open that repository's TOSSE card. <strong>On by default.</strong>{" "}
-            Off → nothing is shown and nothing is fetched. Nothing appears either way when you
-            are not connected to TOSSE.
-          </>
-        }
-        checked={tosseRepoBadge}
-        onChange={(v) => set({ tosseRepoBadge: v })}
-        label="Show the TOSSE mark on repositories"
-      />
-      <ToggleRow
-        title="TOSSE tasks view"
-        hint={
-          <>
-            Adds a third view (<strong>⌘3</strong>) listing the CRM's active projects by client,
-            with their open tasks. <strong>On by default.</strong> Off → the tab disappears and
-            nothing is fetched. The tab is absent anyway while you are not connected to TOSSE.
-          </>
-        }
-        checked={tosseTasksView}
-        onChange={(v) => set({ tosseTasksView: v })}
-        label="Show the TOSSE tasks view"
       />
     </SettingsGroup>
   );

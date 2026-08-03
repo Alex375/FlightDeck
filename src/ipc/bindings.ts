@@ -451,6 +451,19 @@ async tosseBriefing() : Promise<Result<TosseBriefing, string>> {
 }
 },
 /**
+ * Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
+ * the CRM for everything it deliberately does not edit (title, priority, assignee, due
+ * date, deletion). Discovered, not hard-coded — see `tosse::web_url`.
+ */
+async tosseWebUrl() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_web_url") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * One task in full — the Markdown fields and relations the briefing leaves out. Fetched
  * when a row is actually opened, never for a list.
  */

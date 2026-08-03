@@ -641,6 +641,15 @@ pub async fn tosse_briefing() -> Result<crate::tosse::TosseBriefing, String> {
     crate::tosse::briefing().await.map_err(|e| e.to_string())
 }
 
+/// Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
+/// the CRM for everything it deliberately does not edit (title, priority, assignee, due
+/// date, deletion). Discovered, not hard-coded — see `tosse::web_url`.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_web_url() -> Result<String, String> {
+    crate::tosse::web_url().await.map_err(|e| e.to_string())
+}
+
 /// One task in full — the Markdown fields and relations the briefing leaves out. Fetched
 /// when a row is actually opened, never for a list.
 #[tauri::command]

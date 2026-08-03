@@ -9,16 +9,20 @@
 // One request feeds all of it (`tosse_briefing`); the detail panel fetches a task in full
 // only when a row is opened. Writes are optimistic with a whole-board rollback, and a
 // refused write says why — see `useTosse`.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
+import { useSettingsUi } from "../../store/settingsUi";
+import { useHistoryUi } from "../history/historyUiStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useCreateTosseTask,
   useSetTosseProjectStatus,
   useSetTosseTaskStatus,
   useTosseBriefing,
   useTosseTaskDetail,
+  useTosseWebUrl,
 } from "../../ipc/useTosse";
 import { useTosseFold } from "../../store/tosseFold";
 import type { TosseProject, TosseTask } from "../../ipc/client";
@@ -64,6 +68,33 @@ function ProgressRing({ done, total }: { done: number; total: number }) {
         {done}/{total}
       </span>
     </span>
+  );
+}
+
+/**
+ * "Open in TOSSE" — the way out to the CRM for everything this view deliberately does not
+ * edit: a task's title, priority, assignee or due date, and deletions. Without it, the v1
+ * write scope would read as "you can't", when it is really "not from here".
+ *
+ * Renders nothing while the origin is unknown: a link that cannot be built is worse than no
+ * link. The detail panel reports the reason once — see {@link TaskDetail} — instead of every
+ * card repeating the same failure.
+ */
+function OpenInTosse({ path, title, compact }: { path: string; title: string; compact?: boolean }) {
+  const { data: origin } = useTosseWebUrl();
+  if (!origin) return null;
+  return (
+    <button
+      className={compact ? s.openIcon : s.open}
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        void openUrl(`${origin}${path}`);
+      }}
+    >
+      <Ico name="external" className="sm" />
+      {compact ? null : "Open in TOSSE"}
+    </button>
   );
 }
 
@@ -249,6 +280,11 @@ function ProjectCard({
           <span className={`${s.state} ${s[`state_${stateClass(project.status)}`]}`}>
             {project.status ?? "—"}
           </span>
+          <OpenInTosse
+            compact
+            path={`/projects/${project.id}`}
+            title={`Open « ${project.name} » in TOSSE`}
+          />
           {actions.map((a) => (
             <button
               key={a.next}
@@ -339,6 +375,31 @@ function stateClass(status: string | null): string {
 function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }) {
   const { data, isLoading, error } = useTosseTaskDetail(taskId);
   const setTaskStatus = useSetTosseTaskStatus();
+  const { error: webUrlError } = useTosseWebUrl();
+  // A full-screen modal opened OVER this panel owns Escape — closing both at once would
+  // lose the task you were reading for a key you aimed at the modal.
+  // ⚠️ Two separate calls, NOT `useSettingsUi(…) || useHistoryUi(…)`: `||` short-circuits,
+  // so the second hook would go uncalled whenever the first is true — a changing hook order,
+  // which React treats as a broken component (it tears the view down mid-render).
+  const settingsOpen = useSettingsUi((u) => u.open);
+  const historyOpen = useHistoryUi((u) => u.open);
+  const modalOver = settingsOpen || historyOpen;
+
+  // Escape closes the panel — the button says so, so it has to be true.
+  //
+  // Listening on `window` (not `document`) is what makes this well-behaved: any layer that
+  // is genuinely ABOVE — a ConfirmDialog, a portalled popover — listens on `document` and
+  // stops propagation there, so the key never reaches us and only that layer closes. The
+  // app-wide capture guard in App.tsx keeps macOS from leaving fullscreen either way.
+  useEffect(() => {
+    if (modalOver) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [modalOver, onClose]);
+
   return (
     <aside className={s.detail}>
       <div className={s.detailHead}>
@@ -429,6 +490,17 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
           inert button that looks live would be worse than none. */}
       <div className={s.detailFoot}>
         <div className={s.muted}>Discuss / Start land here (lot 3).</div>
+        <span className={s.spacer} />
+        {/* Said ONCE, here, rather than on every card that would have carried a link: the
+            title/priority/assignee edits this view doesn't do all point at TOSSE, so an
+            unreachable CRM is worth a sentence, not silence. */}
+        {webUrlError ? (
+          <span className={s.muted} title={String(webUrlError.message)}>
+            TOSSE link unavailable
+          </span>
+        ) : (
+          <OpenInTosse path={`/tasks/${taskId}`} title="Open this task in TOSSE" />
+        )}
       </div>
     </aside>
   );

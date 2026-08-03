@@ -527,6 +527,32 @@ async fn discover() -> R<Endpoints> {
     Ok(endpoints)
 }
 
+/// Where TOSSE lives in a browser — the origin the tasks view links out to for everything
+/// it deliberately cannot edit (a task's title, priority, assignee, due date; deletions).
+///
+/// DERIVED from the discovered `authorization_endpoint` rather than hard-coded, for the
+/// reason spelled out on [`checked_endpoint`]: the consent page lives on the FRONTEND, so
+/// that field already tells us where the web app is, and a redeployed frontend is followed
+/// for free — exactly like the sign-in. Discovery is cached process-wide, so this costs at
+/// most one metadata request per run.
+pub async fn web_url() -> R<String> {
+    origin_of(&discover().await?.authorization)
+}
+
+/// `https://host[:port]` from a URL, dropping path and query — an endpoint is not a home
+/// page, so `/oauth/authorize` must not survive into the links we build.
+fn origin_of(raw: &str) -> R<String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| TosseError::Protocol(format!("authorization_endpoint is not a valid URL ({e})")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| TosseError::Protocol(format!("authorization_endpoint has no host ({raw})")))?;
+    Ok(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
 // ── PKCE ─────────────────────────────────────────────────────────────────────────────
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
@@ -2524,5 +2550,31 @@ mod tests {
         }))
         .expect("parses");
         assert!(!live.resolved && past.resolved);
+    }
+
+    #[test]
+    fn the_web_origin_drops_the_authorize_path() {
+        // The links we build are `<origin>/tasks/<id>`: keeping the endpoint's own path
+        // would send the browser to `/oauth/authorize/tasks/<id>`.
+        assert_eq!(
+            origin_of("https://frontend-production-7e11.up.railway.app/oauth/authorize?x=1")
+                .expect("an https endpoint has an origin"),
+            "https://frontend-production-7e11.up.railway.app"
+        );
+    }
+
+    #[test]
+    fn the_web_origin_keeps_a_non_default_port() {
+        // A frontend served on a port (a local or staging deployment) is still reachable —
+        // dropping the port would link to a host that answers something else entirely.
+        assert_eq!(
+            origin_of("https://tosse.example:8443/oauth/authorize").expect("parses"),
+            "https://tosse.example:8443"
+        );
+    }
+
+    #[test]
+    fn a_web_origin_without_a_host_fails_rather_than_linking_nowhere() {
+        assert!(origin_of("data:text/html,nope").is_err());
     }
 }
