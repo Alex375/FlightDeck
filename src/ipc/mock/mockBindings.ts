@@ -430,6 +430,7 @@ export const mockCommands = {
     const links: TosseRepoLink[] = [
       {
         repoId: "repo-demo",
+        resolved: true,
         remoteUrl: "git@github.com:Alex375/tosse-code.git",
         repository: repositories[0],
         source: "remote",

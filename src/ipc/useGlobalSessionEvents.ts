@@ -50,6 +50,7 @@ import { agentEventFor } from "../notifications/transition";
 import { syncReminderFromLive } from "../agent/reminderSync";
 import type { SessionStatePayload } from "./client";
 import { worktreesKey } from "./useWorktrees";
+import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
@@ -450,6 +451,11 @@ export function useGlobalSessionEvents(): void {
         .getState()
         .recordOutcome(payload.backend, payload.success, payload.error);
       void queryClient.invalidateQueries({ queryKey: ["account-status"] });
+      // A TOSSE sign-in also changes what the repository marks can show. Their query lives
+      // under its own key, so the invalidation above does not reach it — without this, the
+      // marks stay absent for a full staleTime after connecting, and the feature looks
+      // broken exactly when it is first tried.
+      if (payload.backend === "tosse") invalidateTosseRepoLinks(queryClient);
     }
 
     function onCommands(payload: SessionCommandsEvent) {

@@ -1382,6 +1382,14 @@ pub struct LocalRepo {
 #[serde(rename_all = "camelCase")]
 pub struct TosseRepoLink {
     pub repo_id: String,
+    /// Whether matching actually RAN. False when the CRM's repository list could not be
+    /// read: the fields below then say nothing about reality.
+    ///
+    /// ⚠️ The distinction that must never collapse: "we looked and found nothing" versus
+    /// "we could not look". Resolving against an empty list makes the two identical, and
+    /// the UI then tells the user their repository was deleted — during a 30-second outage,
+    /// with a destructive button as the only way out.
+    pub resolved: bool,
     pub remote_url: Option<String>,
     /// The linked repository. `None` covers three DIFFERENT situations the UI must not
     /// blur: nothing matched, the remote matched several (see `ambiguous`), or a manual
@@ -1405,7 +1413,30 @@ pub struct TosseRepoLink {
 ///
 /// Precedence is deliberate: a manual link ALWAYS wins, because it is the only signal that
 /// records a human decision; the remote is a good guess, not an instruction.
-pub fn resolve_links(locals: &[LocalRepo], repositories: &[TosseRepository]) -> Vec<TosseRepoLink> {
+///
+/// `repositories` is `None` when the CRM list could not be READ (offline, 5xx). Every link
+/// then comes back `resolved: false` and carries no verdict — the caller must not conclude
+/// anything from it. Passing `Some(&[])` is a different statement: the CRM was reached and
+/// genuinely holds no repository.
+pub fn resolve_links(
+    locals: &[LocalRepo],
+    repositories: Option<&[TosseRepository]>,
+) -> Vec<TosseRepoLink> {
+    let Some(repositories) = repositories else {
+        return locals
+            .iter()
+            .map(|local| TosseRepoLink {
+                repo_id: local.repo_id.clone(),
+                resolved: false,
+                remote_url: local.remote_url.clone(),
+                repository: None,
+                source: None,
+                manual_repository_id: local.manual_repository_id.clone(),
+                ambiguous: Vec::new(),
+                remote_error: None,
+            })
+            .collect();
+    };
     locals
         .iter()
         .map(|local| {
@@ -1448,6 +1479,7 @@ pub fn resolve_links(locals: &[LocalRepo], repositories: &[TosseRepository]) -> 
             };
             TosseRepoLink {
                 repo_id: local.repo_id.clone(),
+                resolved: true,
                 remote_url: local.remote_url.clone(),
                 repository,
                 source,
@@ -1498,7 +1530,7 @@ mod tests {
         ];
         let links = resolve_links(
             &[local("local-crm", Some("git@github.com:Alex375/CRM_max.git"), None)],
-            &repositories,
+            Some(&repositories),
         );
         assert_eq!(links[0].repository.as_ref().map(|r| r.name.as_str()), Some("TOSSE"));
         assert_eq!(links[0].source, Some(TosseLinkSource::Remote));
@@ -1512,7 +1544,7 @@ mod tests {
         let repositories = vec![repo("r-none", "landing_page", None)];
         let links = resolve_links(
             &[local("local-a", None, None), local("local-b", Some(""), None)],
-            &repositories,
+            Some(&repositories),
         );
         assert!(links.iter().all(|l| l.repository.is_none() && l.source.is_none()));
         // Two url-less sides must not match EACH OTHER through an empty key.
@@ -1532,7 +1564,7 @@ mod tests {
                 Some("https://github.com/Alex375/app.git"),
                 Some("r-picked"),
             )],
-            &repositories,
+            Some(&repositories),
         );
         assert_eq!(
             links[0].repository.as_ref().map(|r| r.id.as_str()),
@@ -1553,7 +1585,7 @@ mod tests {
                 Some("https://github.com/Alex375/app"),
                 Some("r-deleted"),
             )],
-            &repositories,
+            Some(&repositories),
         );
         assert_eq!(links[0].repository, None);
         assert_eq!(links[0].source, None);
@@ -1569,10 +1601,34 @@ mod tests {
         ];
         let links = resolve_links(
             &[local("local-a", Some("https://github.com/Alex375/dup"), None)],
-            &repositories,
+            Some(&repositories),
         );
         assert_eq!(links[0].repository, None);
         assert_eq!(links[0].ambiguous.len(), 2);
+    }
+
+    /// The regression that matters most: a list we could NOT read must never produce a
+    /// verdict. Resolving against an empty list would make "we could not look" identical to
+    /// "we looked and found nothing" — and the UI then announces that the user's chosen
+    /// repository was deleted, during what is often a 30-second outage.
+    #[test]
+    fn an_unreadable_repository_list_yields_no_verdict_at_all() {
+        let locals = [
+            local("local-pinned", Some("https://github.com/Alex375/app"), Some("r-picked")),
+            local("local-plain", Some("https://github.com/Alex375/other"), None),
+        ];
+
+        let blind = resolve_links(&locals, None);
+        assert!(blind.iter().all(|l| !l.resolved), "nothing was resolved");
+        assert!(blind.iter().all(|l| l.repository.is_none() && l.source.is_none()));
+        // The user's own choice is carried through untouched, so it can be restored — and
+        // never mistaken for "the repository is gone".
+        assert_eq!(blind[0].manual_repository_id.as_deref(), Some("r-picked"));
+
+        // Reaching a CRM that genuinely holds nothing is a DIFFERENT statement, and it does
+        // count as a verdict.
+        let empty = resolve_links(&locals, Some(&[]));
+        assert!(empty.iter().all(|l| l.resolved), "an empty CRM is still an answer");
     }
 
     /// The `{success, data}` envelope, the nested N-N project join, and a null url — the

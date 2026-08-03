@@ -544,6 +544,18 @@ pub async fn tosse_repo_links(
                 error: None,
             })
         }
+        // A refused grant means the stored session was just CLEARED (see `access_token`),
+        // so we are signed out, not "connected but failing". Reporting `connected: true`
+        // here would make the UI diagnose the CRM's data while the real answer is "sign in
+        // again" — the reason travels in `error` so it can be said out loud.
+        Err(e @ crate::tosse::TosseError::Denied(_)) => {
+            return Ok(TosseRepoLinksPayload {
+                connected: false,
+                links: Vec::new(),
+                repositories: Vec::new(),
+                error: Some(e.to_string()),
+            })
+        }
         Err(e) => Err(e.to_string()),
     };
 
@@ -572,8 +584,12 @@ pub async fn tosse_repo_links(
     .map_err(|e| format!("could not read the repositories' git remotes: {e}"))?;
 
     let (inputs, remote_errors): (Vec<_>, Vec<_>) = locals.into_iter().unzip();
+    // ⚠️ `None` (not an empty slice) when the list failed to load: matching must not RUN
+    // against data we never received, or "we could not look" becomes indistinguishable
+    // from "we looked and found nothing" — and the UI announces a deletion that never
+    // happened, next to a button that destroys the association for good.
+    let mut links = crate::tosse::resolve_links(&inputs, listed.as_deref().ok());
     let repositories = listed.as_ref().cloned().unwrap_or_default();
-    let mut links = crate::tosse::resolve_links(&inputs, &repositories);
     for (link, err) in links.iter_mut().zip(remote_errors) {
         link.remote_error = err;
     }

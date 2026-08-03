@@ -56,7 +56,7 @@ export function TosseRepoCard() {
   const repoId = useTosseRepoUi((s) => s.repoId);
   const close = useTosseRepoUi((s) => s.closeCard);
   const repoPath = useConversationsStore((s) => s.repos.find((r) => r.id === repoId)?.path ?? null);
-  const { data, isFetching, refetch } = useTosseRepoLinks(repoId != null);
+  const { data, isFetching, refetch, error: queryError } = useTosseRepoLinks(repoId != null);
   const linkRepository = useLinkTosseRepository();
   const [picking, setPicking] = useState(false);
   const [query, setQuery] = useState("");
@@ -75,12 +75,16 @@ export function TosseRepoCard() {
     return () => window.removeEventListener("keydown", onKey);
   }, [close, picking]);
 
-  // Reset the picker whenever the card opens on another repo, so it never inherits the
-  // previous folder's search text.
+  // Reset per-card state whenever the card opens on another repo, so it never inherits the
+  // previous folder's search text — nor its failed save. A mutation error is about ONE
+  // folder: left standing, it would accuse the next repository of a write it never
+  // attempted ("the association was not saved", quoting the other folder's id).
+  const resetLink = linkRepository.reset;
   useEffect(() => {
     setPicking(false);
     setQuery("");
-  }, [repoId]);
+    resetLink();
+  }, [repoId, resetLink]);
 
   const link: TosseRepoLink | undefined = repoLinkFor(data, repoId ?? "");
   const candidates = useMemo(
@@ -105,6 +109,11 @@ export function TosseRepoCard() {
 
   const repository = link?.repository ?? null;
   const busy = linkRepository.isPending;
+  // Did matching actually RUN for this folder? False while the CRM list is unreadable, and
+  // for a folder added since the last fetch. Every claim below is gated on it: without the
+  // list, "no repository carries this remote" and "the one you picked is gone" are things
+  // we cannot know — and stating them pushed the user to clear a valid association.
+  const checked = link?.resolved === true;
 
   function pin(repositoryId: string | null) {
     linkRepository.mutate(
@@ -154,6 +163,22 @@ export function TosseRepoCard() {
             </div>
           ) : null}
 
+          {/* A refresh that failed must not leave the previous content standing as if it
+              had been confirmed — the button would look like a no-op. */}
+          {queryError ? (
+            <div className={styles.problem}>
+              <Ico name="alert" className="sm" />
+              <div>
+                <div className={styles.problemTitle}>
+                  The TOSSE associations could not be refreshed
+                </div>
+                <div className={styles.problemBody}>
+                  {String(queryError)} — what is shown below may be out of date.
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {linkRepository.isError ? (
             <div className={styles.problem}>
               <Ico name="alert" className="sm" />
@@ -178,8 +203,11 @@ export function TosseRepoCard() {
           ) : null}
 
           {/* A pinned repository the CRM no longer returns. Never silently replaced by the
-              remote guess, so the user sees their own choice, broken. */}
-          {!repository && link?.manualRepositoryId ? (
+              remote guess, so the user sees their own choice, broken.
+              ⚠️ Gated on `checked`: without a readable list this same shape means "we could
+              not verify", and announcing a deletion there — with a destructive button as the
+              only way out — is how a passing outage cost a valid association. */}
+          {checked && !repository && link?.manualRepositoryId ? (
             <div className={styles.problem}>
               <Ico name="alert" className="sm" />
               <div>
@@ -276,17 +304,41 @@ export function TosseRepoCard() {
               ) : null}
             </>
           ) : (
-            !picking && (
+            !picking &&
+            (checked ? (
               <div className={styles.empty}>
                 <Ico name="link" className={styles.emptyIco} />
                 <div className={styles.emptyTitle}>This folder is not associated with TOSSE</div>
                 <div className={styles.emptyBody}>
-                  {link?.remoteUrl
-                    ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
-                    : "This folder has no git remote, so it cannot be matched automatically."}
+                  {link?.remoteError
+                    ? `This folder's git remote could not be read, so it cannot be matched automatically.`
+                    : link?.remoteUrl
+                      ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
+                      : "This folder has no git remote, so it cannot be matched automatically."}
                 </div>
               </div>
-            )
+            ) : (
+              // Not checked: say exactly that, and nothing about the folder's remote or
+              // about the CRM's contents. The banner above already gives the cause when
+              // there is one; a folder added since the last fetch simply has no entry yet.
+              <div className={styles.empty}>
+                <Ico name="link" className={styles.emptyIco} />
+                <div className={styles.emptyTitle}>This association has not been checked yet</div>
+                <div className={styles.emptyBody}>
+                  {data?.error
+                    ? "TOSSE could not be read, so this folder's association could not be verified. Nothing has changed — retry once TOSSE is reachable."
+                    : "This folder has not been matched against TOSSE yet. Refresh to check it."}
+                </div>
+                <button
+                  type="button"
+                  className={styles.ghostBtn}
+                  disabled={isFetching}
+                  onClick={() => void refetch()}
+                >
+                  {isFetching ? "Checking…" : "Refresh"}
+                </button>
+              </div>
+            ))
           )}
 
           {/* ── Picker ── */}
@@ -328,16 +380,25 @@ export function TosseRepoCard() {
 
         <div className={styles.foot}>
           {/* Clearing is only offered when a pin actually exists — clearing an automatic
-              match would suggest a stored state that is not there. */}
+              match would suggest a stored state that is not there.
+              ⚠️ Disabled while the association is unchecked: during an outage this used to
+              be the ONLY enabled control (the picker needs a repository list), so the single
+              thing the user could do was destroy a pin on the strength of a false report. */}
           {link?.manualRepositoryId ? (
             <button
               type="button"
               className={styles.ghostBtn}
-              disabled={busy}
+              disabled={busy || !checked}
               onClick={() => pin(null)}
             >
               Clear association
             </button>
+          ) : null}
+          {/* Said in VISIBLE text, not in a `title`: a disabled control has no pointer
+              events, so its tooltip never renders and the user is left with a dead button
+              and no reason. */}
+          {link?.manualRepositoryId && !checked ? (
+            <span className={styles.footNote}>unavailable until TOSSE can be reached</span>
           ) : null}
           <span className={styles.footSpacer} />
           {picking ? (

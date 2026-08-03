@@ -3010,7 +3010,17 @@ export type TosseProjectRef = { id: string; name: string; status: string | null 
 /**
  * One local folder's relationship to TOSSE, as the UI shows it.
  */
-export type TosseRepoLink = { repoId: string; remoteUrl: string | null; 
+export type TosseRepoLink = { repoId: string; 
+/**
+ * Whether matching actually RAN. False when the CRM's repository list could not be
+ * read: the fields below then say nothing about reality.
+ * 
+ * ⚠️ The distinction that must never collapse: "we looked and found nothing" versus
+ * "we could not look". Resolving against an empty list makes the two identical, and
+ * the UI then tells the user their repository was deleted — during a 30-second outage,
+ * with a destructive button as the only way out.
+ */
+resolved: boolean; remoteUrl: string | null; 
 /**
  * The linked repository. `None` covers three DIFFERENT situations the UI must not
  * blur: nothing matched, the remote matched several (see `ambiguous`), or a manual

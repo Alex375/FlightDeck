@@ -215,20 +215,22 @@ fn build_diff(path: &str, old: &[u8], new: &[u8], old_label: &str, new_label: &s
 /// shares the main repository's config, which is where remotes live.
 ///
 /// ⚠️ Only a genuine failure (git missing, not a repository, unreadable config)
-/// comes back as `Err`. `git config --get` signals "key not set" with exit code 1
-/// and an empty stderr — matching on the CODE, not on the message, is what keeps
-/// "no remote" from being reported as a broken repository.
+/// comes back as `Err` — matched on the exit CODE, never on the message.
+///
+/// ⚠️ Why `remote get-url` and NOT `config --get remote.origin.url`: `git config`
+/// also reads the global file, so in a folder that is not a repository at all it
+/// exits **1 with an empty stderr** — the exact signature of "this repository has
+/// no origin". The two would be indistinguishable, and a checkout whose `.git` was
+/// deleted would be reported as merely remote-less, sending the user to fix by hand
+/// what is in fact a broken clone. `remote get-url` separates them: **2** = no such
+/// remote, **128** = not a repository (both verified against git itself).
 pub fn remote_url(repo_path: &str) -> Result<Option<String>, GitError> {
-    match run_git(repo_path, &["config", "--get", "remote.origin.url"]) {
+    match run_git(repo_path, &["remote", "get-url", "origin"]) {
         Ok(out) => {
             let url = out.trim();
             Ok((!url.is_empty()).then(|| url.to_string()))
         }
-        Err(GitError::Command {
-            code: Some(1),
-            stderr,
-            ..
-        }) if stderr.is_empty() => Ok(None),
+        Err(GitError::Command { code: Some(2), .. }) => Ok(None),
         Err(e) => Err(e),
     }
 }

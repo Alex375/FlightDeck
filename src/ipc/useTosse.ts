@@ -10,6 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
 import type { Result, TosseAccountStatus, TosseRepoLink, TosseRepoLinksPayload } from "./client";
 import { accountStatusKey } from "./useAccounts";
+import { useConversationsStore } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
@@ -41,7 +42,12 @@ export function useTosseConnection(enabled = true) {
  */
 export function useTosseConnectionActions() {
   const qc = useQueryClient();
-  const refresh = () => qc.invalidateQueries({ queryKey: tosseStatusKey() });
+  // Both keys: the connection state AND everything derived from it. A sign-out that left
+  // the repo links cached would keep the sidebar marks lit on a dead session.
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: tosseStatusKey() });
+    invalidateTosseRepoLinks(qc);
+  };
   const loginStart = useMutation({
     mutationFn: (): Promise<string> => unwrap(commands.tosseLoginStart()),
   });
@@ -63,6 +69,18 @@ export function useTosseConnectionActions() {
 export const tosseRepoLinksKey = ["tosse-repo-links"] as const;
 
 /**
+ * Refresh the repo-links query. Call it wherever the TOSSE SESSION changes.
+ *
+ * Without this the payload's `connected` flag — the gate every badge reads — stays stuck
+ * for a full `staleTime`: sign in, and the marks simply do not appear for five minutes
+ * (the feature reads as broken on first use); sign out, and they keep showing CRM names
+ * and context for a session that no longer exists.
+ */
+export function invalidateTosseRepoLinks(qc: ReturnType<typeof useQueryClient>): void {
+  void qc.invalidateQueries({ queryKey: tosseRepoLinksKey });
+}
+
+/**
  * How each Flight Deck folder maps to a TOSSE repository — the whole table in one query,
  * because the CRM's repository list is a single request and matching needs all of it.
  *
@@ -74,8 +92,14 @@ export const tosseRepoLinksKey = ["tosse-repo-links"] as const;
  * Settings, so the display preference costs nothing rather than merely hiding the result.
  */
 export function useTosseRepoLinks(enabled = true) {
+  // The set of folders is an INPUT of the answer, so it belongs in the key: a repo added
+  // since the last fetch has no entry in the payload, and the card would then describe that
+  // absence as a fact about the folder ("it has no git remote"). Adding or removing a
+  // folder now re-runs the match instead of waiting out `staleTime`.
+  // `tosseRepoLinksKey` stays the PREFIX, so invalidating by it still matches every variant.
+  const repoKey = useConversationsStore((s) => s.repos.map((r) => r.id).join(","));
   return useQuery<TosseRepoLinksPayload>({
-    queryKey: tosseRepoLinksKey,
+    queryKey: [...tosseRepoLinksKey, repoKey],
     enabled,
     queryFn: () => unwrap(commands.tosseRepoLinks()),
     // Repositories move rarely and each refetch shells out to `git` once per folder, so

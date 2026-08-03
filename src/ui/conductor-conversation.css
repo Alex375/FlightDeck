@@ -53,14 +53,18 @@
    the brand accent from .wf-tosse-mark). Tinting the whole glyph coral would flatten it back
    into the silhouette that fix 7b94f83 deliberately undid — the accent needle alone is what
    makes it read as TOSSE's logo among grey icons. */
-.cv-tosse-badge.linked { color:var(--wf-tx-mid); opacity:1; }
+.cv-tosse-badge.linked { color:var(--wf-tx); opacity:1; }
 .cv-tosse-badge.linked:hover { background:color-mix(in srgb, var(--wf-tosse-accent) 16%, transparent); color:var(--wf-tx-hi); }
 /* Hollow at rest: the mark's own north-needle accent is dropped and the whole glyph is
    dimmed, so an unassociated folder never mimics an associated one. */
 .cv-tosse-badge:not(.linked) .wf-tosse-mark { --logo-accent:currentColor; opacity:.55; }
-.cv-tosse-badge.attention { color:var(--wf-warn, #e0a63f); opacity:1; }
+.cv-tosse-badge.attention { color:var(--wf-att); opacity:1; }
 .cv-tosse-badge.attention .wf-tosse-mark { opacity:.85; }
-.cv-tosse-badge-flag { position:absolute; right:1px; bottom:1px; width:9px; height:9px; color:var(--wf-warn, #e0a63f); }
+/* Unchecked (CRM unreadable, or a folder not matched yet): visible so the card stays
+   reachable, but MUTED — no warning colour, no flag. Nothing is known to be wrong. */
+.cv-tosse-badge.unknown { color:var(--wf-tx-lo); opacity:.65; }
+/* Wins over `.cv-repo-h .wf-ico { color:var(--wf-tx-lo) }` on specificity (0,2,1 vs 0,2,0). */
+.cv-tosse-badge .cv-tosse-badge-flag { position:absolute; right:1px; bottom:1px; width:9px; height:9px; color:var(--wf-att); }
 .cv-repo-empty { font-size:11.5px; color:var(--wf-tx-xlo); padding:3px 9px 6px 27px; font-style:italic; }
 .cv-sess-list { display:flex; flex-direction:column; gap:1px; padding:2px 6px; }
 /* Row = the hover/active target; it holds the main button + the kebab menu. */

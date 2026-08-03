@@ -4,9 +4,11 @@ import { orderForPicker } from "./TosseRepoCard";
 import type { TosseRepository } from "../../ipc/client";
 
 const link = (over: Partial<Parameters<typeof badgeStateFor>[0]> = {}) => ({
+  resolved: true,
   repository: null,
   ambiguous: [],
   manualRepositoryId: null,
+  remoteError: null,
   ...over,
 });
 
@@ -17,9 +19,6 @@ describe("badgeStateFor", () => {
 
   it("is unlinked for a folder that simply matches nothing", () => {
     expect(badgeStateFor(link())).toBe("unlinked");
-    // No entry at all (repo added after the last fetch) reads the same way — the badge
-    // must never claim a link it has not seen.
-    expect(badgeStateFor(undefined)).toBe("unlinked");
   });
 
   it("asks for attention when several repositories match the same remote", () => {
@@ -30,6 +29,35 @@ describe("badgeStateFor", () => {
     // The user made a choice and it is now broken: hiding this behind the plain
     // "unlinked" state would silently discard their decision.
     expect(badgeStateFor(link({ manualRepositoryId: "gone" }))).toBe("attention");
+  });
+
+  it("asks for attention when the folder's git remote could not be read", () => {
+    // A broken checkout is a real problem, and a different one from "no remote" — the
+    // hollow "associate me" mark would send the user to fix the wrong thing.
+    expect(badgeStateFor(link({ remoteError: "fatal: not a git repository" }))).toBe("attention");
+  });
+
+  // ── The regression the adversarial review caught: an unread CRM list is not evidence ──
+
+  it("does not raise attention on a pinned folder when the CRM list was never read", () => {
+    // Same shape as a genuinely deleted repository (`repository: null` + a surviving pin),
+    // but here nothing was checked. Flagging it turned a 30-second outage into a warning
+    // that pushed the user toward destroying a valid association.
+    expect(badgeStateFor(link({ resolved: false, manualRepositoryId: "r-picked" }))).toBe(
+      "unknown",
+    );
+  });
+
+  it("stays quiet on an unpinned folder when the CRM list was never read", () => {
+    // Nothing is known, and nothing is claimed — no invitation to associate either, since
+    // the picker could not be populated anyway.
+    expect(badgeStateFor(link({ resolved: false }))).toBe("unlinked");
+  });
+
+  it("is unknown for a folder with no entry at all", () => {
+    // A repo added since the last fetch: we have not looked at it, so we say nothing
+    // about it — least of all that it has no git remote.
+    expect(badgeStateFor(undefined)).toBe("unknown");
   });
 });
 

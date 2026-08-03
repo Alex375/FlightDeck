@@ -133,7 +133,7 @@
 .mono {
   font-family: var(--wf-mono, ui-monospace, monospace);
   font-size: 11.5px;
-  color: var(--wf-tx-mid);
+  color: var(--wf-tx);
 }
 .muted {
   color: var(--wf-tx-lo);
@@ -227,14 +227,16 @@
   display: flex;
   gap: 9px;
   padding: 10px 11px;
-  border: 1px solid color-mix(in srgb, var(--wf-warn, #e0a63f) 40%, var(--wf-line));
+  border: 1px solid color-mix(in srgb, var(--wf-att) 40%, var(--wf-line));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--wf-warn, #e0a63f) 8%, transparent);
-  color: var(--wf-tx-mid);
+  background: var(--wf-att-bg);
+  color: var(--wf-tx);
 }
-.problem > .wf-ico {
-  flex: 0 0 auto;
-  color: var(--wf-warn, #e0a63f);
+/* `:global` is REQUIRED: `.wf-ico` is a plain global class, and CSS Modules would hash it
+   here into a name no element carries — the rule would simply never match, and the icon
+   would silently render in the inherited text colour. */
+.problem > :global(.wf-ico) {
+  color: var(--wf-att);
 }
 .problemTitle {
   font-size: 12.5px;
@@ -362,6 +364,12 @@
 .footSpacer {
   flex: 1;
 }
+/* Why a control next to it is disabled — in visible text, because a disabled button has no
+   pointer events and its `title` would never render. */
+.footNote {
+  font-size: 11.5px;
+  color: var(--wf-tx-lo);
+}
 
 .ghostBtn,
 .primaryBtn {
@@ -375,7 +383,7 @@
 .ghostBtn {
   border: 1px solid var(--wf-line);
   background: transparent;
-  color: var(--wf-tx-mid);
+  color: var(--wf-tx);
 }
 .ghostBtn:hover:not(:disabled) {
   background: var(--wf-panel-3);
