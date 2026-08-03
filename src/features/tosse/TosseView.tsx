@@ -27,6 +27,7 @@ import {
 import { useTosseFold } from "../../store/tosseFold";
 import type { TosseProject, TosseTask } from "../../ipc/client";
 import {
+  briefingTotals,
   groupByClient,
   isOverdue,
   projectActions,
@@ -35,6 +36,7 @@ import {
   STATUS_TONE,
   TASK_STATUS_CHOICES,
   type ProjectAction,
+  type StatusSection,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
 
@@ -233,6 +235,53 @@ function AddTaskRow({ projectId, status }: { projectId: string; status: string }
   );
 }
 
+/**
+ * The status sections of a card: a dot + label + count per status, then its rows.
+ *
+ * Shared by the project cards and the project-less band — it was copy-pasted between the
+ * two, which is how the band ended up drifting (its rows went through a different mutation
+ * whose failures nothing displayed). One renderer means one behaviour.
+ */
+function StatusSections({
+  sections,
+  selectedTaskId,
+  onOpenTask,
+  onStatus,
+}: {
+  sections: StatusSection[];
+  selectedTaskId: string | null;
+  onOpenTask: (id: string) => void;
+  onStatus: (task: TosseTask, status: string) => void;
+}) {
+  return (
+    <>
+      {sections.map((section) => (
+        <div
+          key={section.status}
+          className={s.section}
+          data-tone={STATUS_TONE[section.status] ?? "todo"}
+        >
+          <div className={s.sectionHead}>
+            <span className={s.sectionDot} />
+            <span className={s.sectionLabel}>{section.status}</span>
+            <span className={s.sectionCount}>{section.tasks.length}</span>
+            <span className={s.sectionRule} />
+          </div>
+          {section.tasks.map((task) => (
+            <TaskRow
+              key={task.id}
+              task={task}
+              selected={task.id === selectedTaskId}
+              onOpen={() => onOpenTask(task.id)}
+              onStatus={(status) => onStatus(task, status)}
+            />
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
 /** One project: the Briefing's card, with a state control instead of a state label. */
 function ProjectCard({
   project,
@@ -311,27 +360,14 @@ function ProjectCard({
       ) : (
         <>
           <div className={s.cardRule} />
-          {sections.map((section) => (
-            <div key={section.status} className={s.section} data-tone={STATUS_TONE[section.status] ?? "todo"}>
-              <div className={s.sectionHead}>
-                <span className={s.sectionDot} />
-                <span className={s.sectionLabel}>{section.status}</span>
-                <span className={s.sectionCount}>{section.tasks.length}</span>
-                <span className={s.sectionRule} />
-              </div>
-              {section.tasks.map((task) => (
-                <TaskRow
-                  key={task.id}
-                  task={task}
-                  selected={task.id === selectedTaskId}
-                  onOpen={() => onOpenTask(task.id)}
-                  onStatus={(status) =>
-                    setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
-                  }
-                />
-              ))}
-            </div>
-          ))}
+          <StatusSections
+            sections={sections}
+            selectedTaskId={selectedTaskId}
+            onOpenTask={onOpenTask}
+            onStatus={(task, status) =>
+              setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
+            }
+          />
           {sections.length === 0 ? <div className={s.cardEmpty}>No open task</div> : null}
           {/* ONE creation line per card, not one per section: a row under every status was
               three invitations where one is wanted. New tasks land in « À faire » — the
@@ -412,7 +448,11 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
         <div className={s.detailTitle}>{data?.task.title ?? "…"}</div>
         {data ? (
           <div className={s.detailChips}>
-            <span className={`${s.state} ${s[`state_${stateClass(data.task.status)}`]}`}>
+            {/* A TASK's status, so it uses the task colour language — `stateClass` maps
+                PROJECT states, and sent everything it didn't know to "todo": a task in
+                « Review » came out grey here while the board painted it blue, in the one
+                place meant to tell you what the task is. */}
+            <span className={`${s.state} ${s[`state_${STATUS_TONE[data.task.status] ?? "todo"}`]}`}>
               {data.task.status}
             </span>
             {data.task.priority ? (
@@ -429,6 +469,12 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
       <div className={s.detailBody}>
         {isLoading ? <div className={s.muted}>Loading…</div> : null}
         {error ? <div className={s.rowError}>{String(error.message)}</div> : null}
+        {/* The MUTATION's error, not the query's. Ticking a subtask writes to the CRM, and
+            a refusal used to land nowhere: this panel only ever rendered the read error, so
+            a rejected write looked exactly like an accepted one. */}
+        {setTaskStatus.error ? (
+          <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
+        ) : null}
 
         {data && data.blockedBy.length > 0 ? (
           <section>
@@ -565,14 +611,10 @@ export function TosseView() {
     () => groupByClient(data?.projects ?? [], data?.pausedProjects ?? []),
     [data],
   );
-  const totals = useMemo(() => {
-    const all = (data?.projects ?? []).flatMap((p) => p.tasks);
-    return {
-      running: all.filter((t) => t.status === "En cours").length,
-      review: all.filter((t) => t.status === "Review").length,
-      todo: all.filter((t) => t.status === "À faire").length,
-    };
-  }, [data]);
+  const totals = useMemo(
+    () => briefingTotals(data?.projects ?? [], data?.generalTasks ?? []),
+    [data],
+  );
 
   return (
     <div className={s.page}>
@@ -580,19 +622,19 @@ export function TosseView() {
         <TosseCrmMark className="sm" />
         <span className={s.toolbarTitle}>Tasks</span>
         <span className={s.toolbarCounts}>
-          {totals.running > 0 ? (
+          {(totals["En cours"] ?? 0) > 0 ? (
             <span>
-              <b className={s.cRun}>{totals.running}</b> En cours
+              <b className={s.cRun}>{totals["En cours"]}</b> En cours
             </span>
           ) : null}
-          {totals.review > 0 ? (
+          {(totals["Review"] ?? 0) > 0 ? (
             <span>
-              <b className={s.cRev}>{totals.review}</b> Review
+              <b className={s.cRev}>{totals["Review"]}</b> Review
             </span>
           ) : null}
-          {totals.todo > 0 ? (
+          {(totals["À faire"] ?? 0) > 0 ? (
             <span>
-              <b className={s.cTodo}>{totals.todo}</b> À faire
+              <b className={s.cTodo}>{totals["À faire"]}</b> À faire
             </span>
           ) : null}
         </span>
@@ -646,36 +688,11 @@ export function TosseView() {
             ))}
 
             {data && data.generalTasks.length > 0 ? (
-              <>
-                <div className={`${s.band} ${s.bandStatic}`}>
-                  <span className={s.bandChevron}>▾</span>
-                  <span className={s.bandName}>No project</span>
-                  <span className={s.bandRule} />
-                  <span className={s.bandProjects}>
-                    {data.generalTasks.length} task{data.generalTasks.length > 1 ? "s" : ""}
-                  </span>
-                </div>
-                <div className={s.card}>
-                  {statusSections(data.generalTasks).map((section) => (
-                    <div key={section.status} className={s.section} data-tone={STATUS_TONE[section.status] ?? "todo"}>
-                      <div className={s.sectionHead}>
-                        <span className={s.sectionDot} />
-                        <span className={s.sectionLabel}>{section.status}</span>
-                        <span className={s.sectionCount}>{section.tasks.length}</span>
-                        <span className={s.sectionRule} />
-                      </div>
-                      {section.tasks.map((task) => (
-                        <GeneralTaskRow
-                          key={task.id}
-                          task={task}
-                          selected={task.id === openTaskId}
-                          onOpen={() => setOpenTaskId(task.id)}
-                        />
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </>
+              <GeneralTaskBand
+                tasks={data.generalTasks}
+                selectedTaskId={openTaskId}
+                onOpenTask={setOpenTaskId}
+              />
             ) : null}
           </div>
         </div>
@@ -686,24 +703,49 @@ export function TosseView() {
   );
 }
 
-/** A project-less task: same row, but its status writes go through the shared mutation
- *  (there is no card around it to own one). */
-function GeneralTaskRow({
-  task,
-  selected,
-  onOpen,
+/**
+ * The « No project » band — the CRM's project-less tasks (an admin task, a phone call…).
+ *
+ * It owns ONE mutation for the whole band and RENDERS ITS ERROR, exactly like a project
+ * card. Before, each row created its own mutation and nobody read the result: a refused
+ * write (expired session, offline, a status the CRM rejects) left the row untouched with no
+ * message anywhere — indistinguishable from a click that never registered, so the user
+ * clicked again and walked away believing the CRM had been updated.
+ */
+function GeneralTaskBand({
+  tasks,
+  selectedTaskId,
+  onOpenTask,
 }: {
-  task: TosseTask;
-  selected: boolean;
-  onOpen: () => void;
+  tasks: TosseTask[];
+  selectedTaskId: string | null;
+  onOpenTask: (id: string) => void;
 }) {
   const setTaskStatus = useSetTosseTaskStatus();
+  const sections = useMemo(() => statusSections(tasks), [tasks]);
   return (
-    <TaskRow
-      task={task}
-      selected={selected}
-      onOpen={onOpen}
-      onStatus={(status) => setTaskStatus.mutate({ taskId: task.id, status })}
-    />
+    <>
+      <div className={`${s.band} ${s.bandStatic}`}>
+        <span className={s.bandChevron}>▾</span>
+        <span className={s.bandName}>No project</span>
+        <span className={s.bandRule} />
+        <span className={s.bandProjects}>
+          {tasks.length} task{tasks.length > 1 ? "s" : ""}
+        </span>
+      </div>
+      <div className={s.card}>
+        {setTaskStatus.error ? (
+          <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
+        ) : null}
+        <StatusSections
+          sections={sections}
+          selectedTaskId={selectedTaskId}
+          onOpenTask={onOpenTask}
+          onStatus={(task, status) =>
+            setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
+          }
+        />
+      </div>
+    </>
   );
 }

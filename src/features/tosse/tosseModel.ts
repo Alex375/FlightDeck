@@ -4,7 +4,49 @@
 // Kept out of the component so the ordering rules — the part that has to stay stable while
 // rows move under optimistic writes — is unit-testable without a DOM.
 
-import type { TosseProject, TosseTask } from "../../ipc/client";
+import type { TosseBriefing, TosseProject, TosseTask } from "../../ipc/client";
+
+/**
+ * The statuses that make a task LEAVE the briefing.
+ *
+ * Mirrors the server's own filter (`briefing.service.ts`:
+ * `status: { notIn: ['Archivé', 'Fait', 'Backlog', 'En attente'] }`). THREE of the six
+ * statuses the menu offers are in here, not just `Fait`.
+ */
+export const STATUSES_OFF_THE_BOARD = new Set([
+  "Fait",
+  "Backlog",
+  "En attente",
+  "Archivé",
+]);
+
+/**
+ * The board as it looks the instant a task is moved to `status` — the optimistic patch.
+ *
+ * Covers `generalTasks` as well as the projects, because the project-less band is rendered
+ * too: patching only `projects` meant a status change on one of those rows moved nothing,
+ * and — the real damage — a REFUSED write had nothing to roll back, so failure and success
+ * produced the identical screen.
+ *
+ * A task whose new status is off the board is removed rather than moved: the briefing does
+ * not carry those, so keeping the row would show something the next refetch deletes on its
+ * own, which reads as a glitch instead of as the move that was asked for.
+ */
+export function applyStatusToBoard(
+  briefing: TosseBriefing,
+  taskId: string,
+  status: string,
+): TosseBriefing {
+  const patch = (tasks: TosseTask[]): TosseTask[] =>
+    STATUSES_OFF_THE_BOARD.has(status)
+      ? tasks.filter((t) => t.id !== taskId)
+      : tasks.map((t) => (t.id === taskId ? { ...t, status } : t));
+  return {
+    ...briefing,
+    projects: briefing.projects.map((p) => ({ ...p, tasks: patch(p.tasks) })),
+    generalTasks: patch(briefing.generalTasks),
+  };
+}
 
 /**
  * The status sections a project card shows, in order.
@@ -88,6 +130,24 @@ export function statusCounts(projects: TosseProject[]): Record<string, number> {
   for (const p of projects) {
     for (const t of p.tasks) counts[t.status] = (counts[t.status] ?? 0) + 1;
   }
+  return counts;
+}
+
+/**
+ * The toolbar's headline counts — EVERY open task the view shows, project-less ones
+ * included.
+ *
+ * Counted from the same two lists the body renders (`projects[].tasks` + `generalTasks`),
+ * because a total that silently omits a band is worse than no total: the header said
+ * "5 À faire" while six rows sat below it, and nothing on screen explained the difference.
+ * Pure, so the arithmetic is unit-tested rather than eyeballed.
+ */
+export function briefingTotals(
+  projects: TosseProject[],
+  generalTasks: TosseTask[] = [],
+): Record<string, number> {
+  const counts = statusCounts(projects);
+  for (const t of generalTasks) counts[t.status] = (counts[t.status] ?? 0) + 1;
   return counts;
 }
 

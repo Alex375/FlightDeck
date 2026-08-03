@@ -72,7 +72,56 @@ const CLIENT_NAME: &str = "Flight Deck";
 const CALLBACK_PORTS: &[u16] = &[47890, 47891, 47892, 47893, 47894];
 
 /// Keychain item holding our own OAuth material (see the module doc's credential policy).
+///
+/// This is the PRODUCTION item name; test builds get their own (see [`keychain_service`]).
 const KEYCHAIN_SERVICE: &str = "Flight Deck TOSSE";
+
+/// The account leg of the Keychain key. Both the read AND the write must use it: searching
+/// by service alone returns whichever matching item `security` finds first, so any process
+/// running as this user could plant `-s "Flight Deck TOSSE" -a whatever` and have us read
+/// ITS token — sending the user's briefing, and every write they make, to someone else's
+/// CRM account. Pinning the pair means we address exactly the item we wrote.
+const KEYCHAIN_ACCOUNT: &str = "oauth";
+
+/// The bundle identifier this process runs under, published once at startup by `lib.rs`.
+/// `None` in unit tests and in any caller that never set it.
+static BUNDLE_IDENTIFIER: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// The identifier of the app Alexandre actually uses. Builds carrying it keep the historic
+/// item name, so shipping this change does not sign anyone out.
+const PRODUCTION_IDENTIFIER: &str = "com.tosse.desktop";
+
+/// Tell the credential store which bundle it belongs to. Call once, early, before any
+/// Keychain access (see [`keychain_service`]).
+pub fn set_bundle_identifier(identifier: String) {
+    if let Ok(mut guard) = BUNDLE_IDENTIFIER.lock() {
+        *guard = Some(identifier);
+    }
+}
+
+/// The Keychain item name for THIS build.
+///
+/// ⚠️ The data directory is already isolated per bundle identifier (`app_data_dir()`), but
+/// this item was not — so a `/build-app` test build and the production app read, refreshed
+/// and cleared the SAME credentials. TOSSE rotates the refresh token on every exchange and
+/// revokes the previous one, so whichever process refreshed second got `invalid_grant`,
+/// wiped the item, and signed BOTH out; a sign-out or a `reset_stored` in a throwaway build
+/// disconnected the real one just as effectively.
+///
+/// Production keeps the historic name on purpose: renaming it there would orphan the item
+/// every existing install already holds and demand a fresh browser sign-in for no benefit.
+fn keychain_service() -> String {
+    service_name_for(BUNDLE_IDENTIFIER.lock().ok().and_then(|g| g.clone()).as_deref())
+}
+
+/// The naming rule itself, split out so it is testable without touching global state.
+/// `None` (identifier never published, e.g. a unit test) keeps the production name.
+fn service_name_for(identifier: Option<&str>) -> String {
+    match identifier {
+        Some(id) if id != PRODUCTION_IDENTIFIER => format!("{KEYCHAIN_SERVICE} ({id})"),
+        _ => KEYCHAIN_SERVICE.to_string(),
+    }
+}
 
 /// Give the user time to sign in to TOSSE in the browser and grant consent, without
 /// leaking a listener forever if they simply walk away.
@@ -171,6 +220,17 @@ struct StoredAuth {
     /// Access-token expiry, ms since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at_ms: Option<i64>,
+    /// Why the tokens were cleared, when they were cleared because the SERVER refused the
+    /// grant (revoked or expired refresh token).
+    ///
+    /// Kept on disk because the error goes to whoever happened to trigger the refresh —
+    /// usually a background caller (`tosse_repo_links`, `tosse_briefing`) whose failure no
+    /// surface renders. Without it, the next `status()` sees no tokens and reports the
+    /// blank-slate "never signed in" state, so Settings shows a first-time invitation and
+    /// the user is never told their session died. Cleared by [`store_tokens`] the moment a
+    /// new session is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed_out_reason: Option<String>,
 }
 
 impl StoredAuth {
@@ -205,8 +265,18 @@ fn now_unix_ms() -> i64 {
 /// to overwrite. ([`reset_stored`] is the one explicit, user-initiated way past this.)
 #[cfg(target_os = "macos")]
 fn keychain_read() -> R<Option<StoredAuth>> {
+    // Searched by the SAME (service, account) pair we write with — see [`KEYCHAIN_ACCOUNT`]
+    // for why service alone is not enough.
+    let service = keychain_service();
     let out = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            &service,
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-w",
+        ])
         .output()
         .map_err(|e| TosseError::Keychain(format!("failed to run /usr/bin/security: {e}")))?;
 
@@ -255,14 +325,15 @@ fn keychain_write(auth: &StoredAuth) -> R<()> {
     let blob = serde_json::to_string(auth)
         .map_err(|e| TosseError::Keychain(format!("could not serialize credentials: {e}")))?;
 
+    let service = keychain_service();
     let out = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
             "-U",
             "-s",
-            KEYCHAIN_SERVICE,
+            &service,
             "-a",
-            "oauth",
+            KEYCHAIN_ACCOUNT,
             "-D",
             "Flight Deck TOSSE credentials",
             "-w",
@@ -1014,6 +1085,9 @@ async fn store_tokens(t: Tokens) -> R<()> {
         if t.refresh_token.is_some() {
             a.refresh_token = t.refresh_token;
         }
+        // A working session supersedes whatever killed the previous one — otherwise the
+        // card would keep explaining a death the user has already recovered from.
+        a.signed_out_reason = None;
         Ok((a, ()))
     })
     .await
@@ -1065,10 +1139,12 @@ pub async fn access_token() -> R<String> {
         // treats `Http` as non-terminal, so the card stays connected).
         if is_terminal_grant_failure(status, &text) {
             // Report a failed wipe instead of swallowing it: "signed out" must not be a lie.
-            clear_tokens().await?;
-            return Err(TosseError::Denied(
-                "the TOSSE session expired — sign in again".into(),
-            ));
+            // The reason is PERSISTED, because this error is returned to whoever triggered
+            // the refresh — often a background query nothing renders. Stored, it survives to
+            // the next `status()` and the Settings card explains what happened.
+            let reason = "your TOSSE session expired or was revoked — connect again";
+            clear_tokens(Some(reason.to_string())).await?;
+            return Err(TosseError::Denied(reason.to_string()));
         }
         return Err(TosseError::Http {
             status: status.as_u16(),
@@ -1109,11 +1185,16 @@ fn is_terminal_grant_failure(status: reqwest::StatusCode, body: &str) -> bool {
 }
 
 /// Drop the tokens but KEEP the registered `client_id` (see [`StoredAuth`]).
-async fn clear_tokens() -> R<()> {
-    with_stored(|mut a| {
+///
+/// `reason` records WHY, and is what a later `status()` shows instead of the first-time
+/// invitation. `None` for a sign-out the user asked for — they know why that happened, and
+/// a "your session expired" note under a button they just pressed would be nonsense.
+async fn clear_tokens(reason: Option<String>) -> R<()> {
+    with_stored(move |mut a| {
         a.access_token = None;
         a.refresh_token = None;
         a.expires_at_ms = None;
+        a.signed_out_reason = reason;
         Ok((a, ()))
     })
     .await
@@ -1148,7 +1229,11 @@ pub async fn status() -> TosseAccountStatus {
             connected: false,
             name: None,
             email: None,
-            signed_out_reason: None,
+            // A session that DIED says so, instead of showing the same blank invitation as a
+            // machine that never connected. The cause was recorded when the tokens were
+            // cleared, because the refresh that discovered it usually ran behind a
+            // background query whose error nothing displays.
+            signed_out_reason: stored.signed_out_reason.clone(),
             identity_error: None,
         };
     }
@@ -1224,6 +1309,17 @@ async fn fetch_identity(token: &str) -> R<(Option<String>, Option<String>)> {
 /// user could not sign out of a machine they no longer trust. The revocation error is
 /// returned so the UI can say the server-side session may still be live.
 pub async fn logout() -> R<()> {
+    // ⚠️ A sign-IN in flight resurrects the session just as effectively as a refresh does,
+    // and it was not covered: `complete_login` writes through `store_tokens`, which only
+    // takes KEYCHAIN_LOCK, so a browser round-trip finishing after the clear left the app
+    // connected to the account the user had just signed out of — reporting success both
+    // times. Abort it FIRST, under LOGIN_FLOW like every other cancel path.
+    // Lock order is LOGIN_FLOW → REFRESH_LOCK, and `login_start` never takes REFRESH_LOCK,
+    // so no inversion is possible.
+    {
+        let _flow = LOGIN_FLOW.lock().await;
+        cancel_current().await;
+    }
     // ⚠️ Hold REFRESH_LOCK for the WHOLE sign-out. Without it a refresh already in flight
     // finishes after we clear and writes a fresh token pair back — silently resurrecting the
     // session the user just ended, with the UI reporting success. Signing out has to win.
@@ -1239,7 +1335,9 @@ pub async fn logout() -> R<()> {
             Err(e) => revoke_err = Some(e),
         }
     }
-    clear_tokens().await?;
+    // No reason recorded: the user asked for this one, and a "your session expired" note
+    // under the button they just pressed would be nonsense.
+    clear_tokens(None).await?;
     match revoke_err {
         None => Ok(()),
         Some(e) => Err(TosseError::Local(format!(
@@ -2404,6 +2502,7 @@ mod tests {
             access_token: Some("b7e23ec2-9f4a-4c1d-8f2b-1a2b3c4d5e6f".into()),
             refresh_token: Some("c8f34fd3-a05b-4d2e-9a3c-2b3c4d5e6f70".into()),
             expires_at_ms: Some(1_785_600_000_000),
+            signed_out_reason: None,
         };
         let blob = serde_json::to_string(&record).expect("serialize");
         assert!(blob.len() > 128, "the probe must exceed the truncation cliff ({})", blob.len());
@@ -2550,6 +2649,57 @@ mod tests {
         }))
         .expect("parses");
         assert!(!live.resolved && past.resolved);
+    }
+
+    #[test]
+    fn production_keeps_the_historic_keychain_item_name() {
+        // ⚠️ Renaming it for production would orphan the item every existing install already
+        // holds — silently signing everyone out on upgrade for no benefit.
+        assert_eq!(service_name_for(Some(PRODUCTION_IDENTIFIER)), KEYCHAIN_SERVICE);
+        assert_eq!(service_name_for(None), KEYCHAIN_SERVICE);
+    }
+
+    #[test]
+    fn a_test_build_gets_its_own_keychain_item() {
+        // Prod and a `/build-app` build run side by side by design. Sharing one item meant
+        // whichever refreshed second was told `invalid_grant` (TOSSE rotates and revokes on
+        // every exchange), cleared the item, and signed BOTH out.
+        assert_eq!(
+            service_name_for(Some("com.tosse.desktop.tosse-connection")),
+            "Flight Deck TOSSE (com.tosse.desktop.tosse-connection)"
+        );
+        assert_ne!(
+            service_name_for(Some("com.tosse.desktop.dev")),
+            service_name_for(Some(PRODUCTION_IDENTIFIER))
+        );
+    }
+
+    #[test]
+    fn credentials_written_before_the_reason_field_existed_still_parse() {
+        // Rétrocompatibilité du format stocké : un item écrit par une version précédente n'a
+        // pas `signed_out_reason`. S'il cessait de se parser, `read_stored` renverrait une
+        // erreur Keychain et TOUS les utilisateurs installés seraient déconnectés à la mise
+        // à jour — la panne la plus chère que ce champ pouvait provoquer.
+        let old = r#"{"client_id":"cid","access_token":"at","refresh_token":"rt"}"#;
+        let parsed: StoredAuth = serde_json::from_str(old).expect("an older item must parse");
+        assert_eq!(parsed.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(parsed.signed_out_reason, None);
+    }
+
+    #[test]
+    fn a_recorded_sign_out_reason_survives_a_round_trip() {
+        // The reason is stored precisely BECAUSE the error goes to a background caller that
+        // renders nothing; it has to still be there at the next `status()`.
+        let record = StoredAuth {
+            signed_out_reason: Some("your TOSSE session expired or was revoked".into()),
+            ..StoredAuth::default()
+        };
+        let blob = serde_json::to_string(&record).expect("serialize");
+        let back: StoredAuth = serde_json::from_str(&blob).expect("parse");
+        assert_eq!(back.signed_out_reason, record.signed_out_reason);
+        // …and a record with no reason must not carry an empty key around.
+        let clean = serde_json::to_string(&StoredAuth::default()).expect("serialize");
+        assert!(!clean.contains("signed_out_reason"), "got {clean}");
     }
 
     #[test]

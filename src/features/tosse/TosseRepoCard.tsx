@@ -184,7 +184,10 @@ export function TosseRepoCard() {
               <Ico name="alert" className="sm" />
               <div>
                 <div className={styles.problemTitle}>The association was not saved</div>
-                <div className={styles.problemBody}>{String(linkRepository.error)}</div>
+                {/* `.message`, not `String(error)`: the latter renders "Error: …" — the
+                    class name is noise the user has to read past to reach the reason. Same
+                    treatment as every other error surface in this feature. */}
+                <div className={styles.problemBody}>{String(linkRepository.error.message)}</div>
               </div>
             </div>
           ) : null}

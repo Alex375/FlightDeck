@@ -106,9 +106,13 @@ export function Ico({ name, className }: { name: string; className?: string }) {
  *  logo (the Flight Deck aircraft). This one identifies the external CRM we connect to.
  *
  *  The source art tints its north needle with `--logo-accent`, falling back to
- *  `currentColor`. We leave that variable unset on purpose: on the Settings tile the mark
- *  sits on a filled brand plate where a second hue would muddy it, and staying monochrome
- *  matches how the Claude/Codex marks render in the same slot.
+ *  `currentColor`. That variable IS set, globally, by `.wf-tosse-mark` in
+ *  `conductor-wirekit.css` (to the CRM's own `#e05a40`): the rose is bichrome in TOSSE's UI
+ *  — body in the text colour, north needle in the brand accent — and carrying that here is
+ *  what makes it read as the real logo rather than a flattened silhouette. On the Settings
+ *  tile it therefore sits on a NEUTRAL plate (`plate="neutral"`), not a filled brand one,
+ *  which would swallow the needle. The one place that deliberately flattens it back to
+ *  monochrome is the hollow, unlinked repository badge (`.cv-tosse-badge:not(.linked)`).
  *
  *  The viewBox is cropped to the artwork (the standalone asset carries generous padding),
  *  so the mark fills its 24px box instead of floating inside it. */

@@ -493,6 +493,13 @@ pub fn run() {
                 app.set_menu(menu)?;
             }
 
+            // Tell the TOSSE credential store which bundle this is, BEFORE anything can
+            // touch the Keychain. Its item used to be one fixed name shared by every build,
+            // so a `/build-app` test build refreshing its token revoked production's and
+            // signed both out; test builds now get their own item, production keeps the
+            // historic one (renaming it there would orphan every existing install's).
+            tosse::set_bundle_identifier(app.config().identifier.clone());
+
             // Open the persistence store in the app data dir (created if absent).
             // The store is the single owner of SQLite; the rest of the core and
             // the UI see domain records via IPC, never rows. dev and the bundled

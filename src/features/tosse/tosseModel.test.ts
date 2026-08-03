@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { TosseProject, TosseTask } from "../../ipc/client";
+import type { TosseBriefing } from "../../ipc/client";
 import {
+  applyStatusToBoard,
+  briefingTotals,
   groupByClient,
   isOverdue,
   projectActions,
   shortDate,
   statusSections,
+  STATUSES_OFF_THE_BOARD,
 } from "./tosseModel";
 
 function task(id: string, status: string, extra: Partial<TosseTask> = {}): TosseTask {
@@ -164,5 +168,95 @@ describe("dates", () => {
 
   it("renders dd/mm, zero-padded", () => {
     expect(shortDate("2026-03-07T00:00:00.000Z")).toBe("07/03");
+  });
+});
+
+describe("toolbar totals", () => {
+  // The regression these lock down: the header counted `projects[].tasks` only, so the
+  // project-less band — a band the page RENDERS, right below — was missing from the totals.
+  // The bar read "5 À faire" above six visible rows, with nothing to explain the gap.
+  it("counts the project-less band, not just the projects", () => {
+    const projects = [project("p1", "c1", [task("t1", "À faire"), task("t2", "En cours")])];
+    const general = [task("g1", "À faire"), task("g2", "Review")];
+
+    expect(briefingTotals(projects, general)).toEqual({
+      "À faire": 2,
+      "En cours": 1,
+      Review: 1,
+    });
+  });
+
+  it("still adds up with no project-less tasks at all", () => {
+    const projects = [project("p1", "c1", [task("t1", "Review"), task("t2", "Review")])];
+    expect(briefingTotals(projects)).toEqual({ Review: 2 });
+    expect(briefingTotals(projects, [])).toEqual({ Review: 2 });
+  });
+
+  it("is empty rather than undefined when there is nothing open", () => {
+    expect(briefingTotals([], [])).toEqual({});
+  });
+});
+
+describe("optimistic status patch", () => {
+  const board = (): TosseBriefing => ({
+    projects: [project("p1", "c1", [task("t1", "À faire"), task("t2", "En cours")])],
+    pausedProjects: [],
+    generalTasks: [task("g1", "À faire")],
+  });
+
+  it("moves a task inside a project", () => {
+    const next = applyStatusToBoard(board(), "t1", "En cours");
+    expect(next.projects[0].tasks.find((t) => t.id === "t1")?.status).toBe("En cours");
+    // Its neighbours are untouched.
+    expect(next.projects[0].tasks.find((t) => t.id === "t2")?.status).toBe("En cours");
+  });
+
+  // The regression: `generalTasks` was skipped, so a project-less row never moved. That is
+  // what made a REFUSED write invisible — there was no optimistic change to roll back, so
+  // failure looked exactly like success.
+  it("moves a PROJECT-LESS task too", () => {
+    const next = applyStatusToBoard(board(), "g1", "En cours");
+    expect(next.generalTasks[0].status).toBe("En cours");
+  });
+
+  it("drops a project-less task that leaves the board", () => {
+    expect(applyStatusToBoard(board(), "g1", "Fait").generalTasks).toEqual([]);
+  });
+
+  // The server's briefing filter excludes four statuses, not one. Keeping a row the next
+  // refetch deletes makes it linger a second and then vanish on its own — a glitch, not the
+  // move the user asked for.
+  it("drops a task for EVERY status that leaves the briefing, not just « Fait »", () => {
+    for (const status of ["Fait", "Backlog", "En attente", "Archivé"]) {
+      const next = applyStatusToBoard(board(), "t1", status);
+      expect(next.projects[0].tasks.map((t) => t.id), `status ${status}`).toEqual(["t2"]);
+    }
+  });
+
+  it("keeps a task that stays on the board", () => {
+    for (const status of ["À faire", "En cours", "Review"]) {
+      const next = applyStatusToBoard(board(), "t1", status);
+      expect(next.projects[0].tasks.map((t) => t.id), `status ${status}`).toEqual(["t1", "t2"]);
+    }
+  });
+
+  it("mirrors the server's own exclusion list", () => {
+    // briefing.service.ts: status: { notIn: ['Archivé', 'Fait', 'Backlog', 'En attente'] }
+    expect([...STATUSES_OFF_THE_BOARD].sort()).toEqual(
+      ["Archivé", "Backlog", "En attente", "Fait"].sort(),
+    );
+  });
+
+  it("does not mutate the board it was given (the rollback copy must stay intact)", () => {
+    const before = board();
+    const snapshot = JSON.stringify(before);
+    applyStatusToBoard(before, "t1", "Fait");
+    expect(JSON.stringify(before)).toBe(snapshot);
+  });
+
+  it("leaves the board alone when the id matches nothing", () => {
+    const next = applyStatusToBoard(board(), "nope", "Fait");
+    expect(next.projects[0].tasks).toHaveLength(2);
+    expect(next.generalTasks).toHaveLength(1);
   });
 });

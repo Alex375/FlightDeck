@@ -240,6 +240,12 @@
 .state_run { color: var(--wf-run); border-color: #2a5545; background: var(--wf-run-bg); }
 .state_pause { color: var(--wf-att); border-color: #4a3a1c; background: var(--wf-att-bg); }
 .state_todo { color: var(--wf-tx-lo); }
+/* Task tones (STATUS_TONE), for the chip in the detail panel. `run`/`todo` above are shared
+   with the project chip; these three complete the set so a task's status is painted in the
+   SAME language as the board — blue = waiting for you, violet = on hold, green = done. */
+.state_wait { color: var(--wf-wait); border-color: #24425e; background: var(--wf-wait-bg); }
+.state_hold { color: #a78bfa; border-color: #3b3160; background: #211c33; }
+.state_done { color: var(--wf-run); border-color: #2a5545; background: var(--wf-run-bg); }
 .act {
   display: inline-flex;
   align-items: center;

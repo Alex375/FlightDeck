@@ -207,13 +207,6 @@ fn build_diff(path: &str, old: &[u8], new: &[u8], old_label: &str, new_label: &s
     }
 }
 
-/// The `origin` remote of the repository `repo_path` lives in, or `None` when it
-/// simply has no such remote (a purely local repository — common enough that it
-/// is an ANSWER, not an error).
-///
-/// Works unchanged from inside a linked worktree: `.claude/worktrees/<branch>`
-/// shares the main repository's config, which is where remotes live.
-///
 /// What asking a folder for its `origin` remote turned up.
 ///
 /// Three ORDINARY outcomes, deliberately distinct — Flight Deck's folders are working

@@ -18,6 +18,7 @@ import type {
   TosseTaskDetail,
 } from "./client";
 import { accountStatusKey } from "./useAccounts";
+import { applyStatusToBoard } from "../features/tosse/tosseModel";
 import { useConversationsStore } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
@@ -144,7 +145,10 @@ export function useLinkTosseRepository() {
 // ── Tasks view ──────────────────────────────────────────────────────────────────────
 
 export const tosseBriefingKey = ["tosse-briefing"] as const;
-export const tosseTaskKey = (id: string) => ["tosse-task", id] as const;
+/** Prefix shared by every single-task query — invalidate this to refresh whichever task
+ *  panel is open, whatever its id. */
+export const tosseTaskKeyPrefix = ["tosse-task"] as const;
+export const tosseTaskKey = (id: string) => [...tosseTaskKeyPrefix, id] as const;
 
 /**
  * Everything the tasks view shows, in one query.
@@ -204,11 +208,6 @@ function patchBriefing(
   return previous;
 }
 
-/** Deep-enough clone for our patches: projects and their task arrays are replaced, the task
- *  objects themselves are shared until one is edited. */
-function mapProjects(b: TosseBriefing, f: (tasks: TosseTask[]) => TosseTask[]): TosseBriefing {
-  return { ...b, projects: b.projects.map((p) => ({ ...p, tasks: f(p.tasks) })) };
-}
 
 /**
  * Move a task to another status.
@@ -218,29 +217,36 @@ function mapProjects(b: TosseBriefing, f: (tasks: TosseTask[]) => TosseTask[]): 
  * (a blocked task, an expired session), the previous board is restored WHOLE and the
  * caller shows the reason — a silent revert on the next refetch would look like a bug.
  *
- * A task moved to `Fait` leaves the board: the briefing never lists done tasks, so keeping
- * it would show a row that vanishes on the next refresh anyway.
+ * A task moved off the board (see {@link STATUSES_OFF_THE_BOARD}) is removed rather than
+ * moved: the briefing does not list those, so keeping the row would show something that
+ * vanishes on the next refresh anyway.
  */
 export function useSetTosseTaskStatus() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { taskId: string; status: string; title?: string }): Promise<null> =>
       unwrap(commands.tosseSetTaskStatus(v.taskId, v.status)),
-    onMutate: ({ taskId, status }) => ({
-      previous: patchBriefing(qc, (b) =>
-        mapProjects(b, (tasks) =>
-          status === "Fait"
-            ? tasks.filter((t) => t.id !== taskId)
-            : tasks.map((t) => (t.id === taskId ? { ...t, status } : t)),
-        ),
-      ),
-    }),
+    onMutate: async ({ taskId, status }) => {
+      // Stop any briefing refetch already in flight FIRST. Without this, a response that
+      // left before our patch can land after it and overwrite the optimistic board with
+      // pre-write data — and, if the write then fails, our rollback would "restore" that
+      // stale answer as if it were the state the user had.
+      await qc.cancelQueries({ queryKey: tosseBriefingKey });
+      return {
+        previous: patchBriefing(qc, (b) => applyStatusToBoard(b, taskId, status)),
+      };
+    },
     onError: (_e, _v, ctx) => {
       if (ctx?.previous) qc.setQueryData(tosseBriefingKey, ctx.previous);
     },
-    onSettled: (_d, _e, v) => {
+    onSettled: () => {
       void qc.invalidateQueries({ queryKey: tosseBriefingKey });
-      void qc.invalidateQueries({ queryKey: tosseTaskKey(v.taskId) });
+      // The WHOLE `tosse-task` prefix, not just the task we wrote. Ticking a SUBTASK writes
+      // the subtask's id, while the panel on screen is keyed by its PARENT — invalidating
+      // only the written id refreshed a query nobody was looking at, so the checkbox never
+      // moved and success looked exactly like failure. At most a couple of task queries are
+      // ever cached (one open panel), so the wider invalidation costs nothing.
+      void qc.invalidateQueries({ queryKey: tosseTaskKeyPrefix });
     },
   });
 }
@@ -251,15 +257,20 @@ export function useSetTosseProjectStatus() {
   return useMutation({
     mutationFn: (v: { projectId: string; status: string; name?: string }): Promise<null> =>
       unwrap(commands.tosseSetProjectStatus(v.projectId, v.status)),
-    onMutate: ({ projectId, status }) => ({
-      previous: patchBriefing(qc, (b) => ({
-        ...b,
-        projects: b.projects.map((p) => (p.id === projectId ? { ...p, status } : p)),
-        pausedProjects: b.pausedProjects.map((p) =>
-          p.id === projectId ? { ...p, status } : p,
-        ),
-      })),
-    }),
+    onMutate: async ({ projectId, status }) => {
+      // Same reason as the task mutation: an in-flight refetch must not land on top of the
+      // optimistic board, or the rollback restores that stale answer instead of the truth.
+      await qc.cancelQueries({ queryKey: tosseBriefingKey });
+      return {
+        previous: patchBriefing(qc, (b) => ({
+          ...b,
+          projects: b.projects.map((p) => (p.id === projectId ? { ...p, status } : p)),
+          pausedProjects: b.pausedProjects.map((p) =>
+            p.id === projectId ? { ...p, status } : p,
+          ),
+        })),
+      };
+    },
     onError: (_e, _v, ctx) => {
       if (ctx?.previous) qc.setQueryData(tosseBriefingKey, ctx.previous);
     },
@@ -306,7 +317,13 @@ export function useCreateTosseTask() {
           p.id === v.projectId ? { ...p, tasks: [...p.tasks, created] } : p,
         ),
       }));
-      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
     },
+    // Refetch on BOTH outcomes, not just success. A creation can fail on the way BACK — the
+    // task exists in the CRM but the response was lost (dropped connection, a Railway
+    // restart mid-flight). Refetching only on success left that task invisible here, so the
+    // obvious move — retype it and press enter again — filed it a second time. Now the board
+    // refreshes either way, and a task that WAS created shows up next to the error instead
+    // of inviting a duplicate.
+    onSettled: () => void qc.invalidateQueries({ queryKey: tosseBriefingKey }),
   });
 }

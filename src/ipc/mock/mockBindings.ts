@@ -336,6 +336,38 @@ function demoAllTasks(): { task: TosseTask; projectId: string | null; projectNam
   ];
 }
 
+/**
+ * Subtasks per parent task, created on first read and then KEPT — so ticking one in the
+ * demo actually sticks, and the panel that shows it can be seen to refresh (or not).
+ */
+const demoSubtasksByParent = new Map<string, TosseTask[]>();
+
+function demoSubtasks(parentId: string): TosseTask[] {
+  let rows = demoSubtasksByParent.get(parentId);
+  if (!rows) {
+    rows = [
+      demoTask(`${parentId}-st-1`, "Cadrage design", "Fait"),
+      demoTask(`${parentId}-st-2`, "Vue + navigation ⌘3", "À faire"),
+      demoTask(`${parentId}-st-3`, "Lecture briefing + groupement client", "À faire"),
+      demoTask(`${parentId}-st-4`, "Écriture : statut + création", "À faire"),
+    ];
+    demoSubtasksByParent.set(parentId, rows);
+  }
+  return rows;
+}
+
+/** Apply a status write to a subtask wherever it lives. Returns true if one matched. */
+function writeDemoSubtaskStatus(taskId: string, status: string): boolean {
+  for (const rows of demoSubtasksByParent.values()) {
+    const row = rows.find((r) => r.id === taskId);
+    if (row) {
+      row.status = status;
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- Commands (same shape as the generated facade) -------------------------
 
 export const mockCommands = {
@@ -598,22 +630,24 @@ export const mockCommands = {
   async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
     const found = demoAllTasks().find((row) => row.task.id === taskId);
     if (!found) return err(`no task with id ${taskId}`);
+    // `subtaskDone` is DERIVED, as the server derives it
+    // (`task.subtasks.filter(s => s.status === 'Fait').length`) — a frozen count would make
+    // the panel's own header disagree with the checkboxes right underneath it.
+    const subtasks = found.task.subtaskCount > 0 ? demoSubtasks(found.task.id) : [];
     return ok({
-      task: found.task,
+      task: {
+        ...found.task,
+        subtaskDone: subtasks.filter((st) => st.status === "Fait").length,
+      },
       projectId: found.projectId,
       projectName: found.projectName,
       context:
         "## Périmètre\n\nListe des projets **groupés par client**, tâches triées par statut.\n\n- Écriture : statut + création\n- États dégradés : hors-ligne, session expirée",
       content: null,
-      subtasks:
-        found.task.subtaskCount > 0
-          ? [
-              demoTask("st-1", "Cadrage design", "Fait"),
-              demoTask("st-2", "Vue + navigation ⌘3", "À faire"),
-              demoTask("st-3", "Lecture briefing + groupement client", "À faire"),
-              demoTask("st-4", "Écriture : statut + création", "À faire"),
-            ]
-          : [],
+      // MUTABLE, like the briefing above: ticking a subtask has to be visible in the demo,
+      // otherwise a write that never reaches the open panel looks exactly like one that
+      // does — the very bug this band of the UI shipped with.
+      subtasks,
       blockedBy:
         found.task.id === "t-lot3"
           ? [{ id: "t-lot2", title: "Lot 2 — vue « Tâches TOSSE »", status: "En cours", resolved: false }]
@@ -624,12 +658,28 @@ export const mockCommands = {
   async tosseSetTaskStatus(taskId: string, status: string): Promise<Result<null, string>> {
     // One id always refuses, so the demo can show what a rejected write looks like.
     if (taskId === "t-blocked") return err("Task is blocked by « Lot 1 » and cannot be started");
+    // A subtask ticked in the detail panel — its own list, not the board.
+    if (writeDemoSubtaskStatus(taskId, status)) return ok(null);
+    // Mirrors the server's briefing filter — a task moved to any of these leaves the board,
+    // not just « Fait » (briefing.service.ts: notIn ['Archivé','Fait','Backlog','En attente']).
+    const leavesTheBoard = ["Fait", "Backlog", "En attente", "Archivé"].includes(status);
     for (const p of demoBriefing.projects) {
       const t = p.tasks.find((x) => x.id === taskId);
       if (!t) continue;
-      if (status === "Fait") p.tasks = p.tasks.filter((x) => x.id !== taskId);
+      if (leavesTheBoard) p.tasks = p.tasks.filter((x) => x.id !== taskId);
       else t.status = status;
       return ok(null);
+    }
+    // Project-less tasks are a real band of the view, so the demo has to move them too:
+    // a mock that silently accepted the write without changing anything could not show the
+    // difference between an applied write and a swallowed one.
+    const g = demoBriefing.generalTasks.find((x) => x.id === taskId);
+    if (g) {
+      if (leavesTheBoard) {
+        demoBriefing.generalTasks = demoBriefing.generalTasks.filter((x) => x.id !== taskId);
+      } else {
+        g.status = status;
+      }
     }
     return ok(null);
   },
