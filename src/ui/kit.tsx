@@ -219,6 +219,7 @@ export function Win({
 
 export function NavBtn({
   icon,
+  glyph,
   label,
   on,
   badge,
@@ -226,6 +227,9 @@ export function NavBtn({
   onClick,
 }: {
   icon?: string;
+  /** A ready-made mark, for a tab whose identity isn't one of the `WF_PATHS` glyphs — the
+   *  TOSSE tab wears the CRM's own brand mark. Takes precedence over `icon`. */
+  glyph?: React.ReactNode;
   label: string;
   on?: boolean;
   badge?: number | null;
@@ -234,7 +238,7 @@ export function NavBtn({
 }) {
   return (
     <button {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
-      {icon ? <Ico name={icon} className="sm" /> : null}
+      {glyph ?? (icon ? <Ico name={icon} className="sm" /> : null)}
       {label}
       {badge != null ? <span className="wf-badge att">{badge}</span> : null}
     </button>

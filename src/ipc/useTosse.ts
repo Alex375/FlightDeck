@@ -8,7 +8,15 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
-import type { Result, TosseAccountStatus, TosseRepoLink, TosseRepoLinksPayload } from "./client";
+import type {
+  Result,
+  TosseAccountStatus,
+  TosseBriefing,
+  TosseRepoLink,
+  TosseRepoLinksPayload,
+  TosseTask,
+  TosseTaskDetail,
+} from "./client";
 import { accountStatusKey } from "./useAccounts";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
@@ -106,5 +114,155 @@ export function useLinkTosseRepository() {
     // Refetch on success only: a failed write must leave the displayed link alone rather
     // than flicker to a state the database never accepted.
     onSuccess: () => qc.invalidateQueries({ queryKey: tosseRepoLinksKey }),
+  });
+}
+
+// ── Tasks view ──────────────────────────────────────────────────────────────────────
+
+export const tosseBriefingKey = ["tosse-briefing"] as const;
+export const tosseTaskKey = (id: string) => ["tosse-task", id] as const;
+
+/**
+ * Everything the tasks view shows, in one query.
+ *
+ * Refetched when the window regains focus, because the CRM is also edited in a browser and
+ * by agents through the MCP: coming back to Flight Deck should not show yesterday's board.
+ * `staleTime` keeps switching views from re-fetching on every tab click.
+ */
+export function useTosseBriefing(enabled = true) {
+  return useQuery<TosseBriefing>({
+    queryKey: tosseBriefingKey,
+    enabled,
+    queryFn: () => unwrap(commands.tosseBriefing()),
+    staleTime: 60_000,
+    refetchOnWindowFocus: true,
+  });
+}
+
+/** One task in full — fetched only when a row is opened (the briefing omits the Markdown). */
+export function useTosseTaskDetail(taskId: string | null) {
+  return useQuery<TosseTaskDetail>({
+    queryKey: tosseTaskKey(taskId ?? ""),
+    enabled: taskId != null,
+    queryFn: () => unwrap(commands.tosseTaskDetail(taskId as string)),
+    staleTime: 30_000,
+  });
+}
+
+/** Apply `f` to the cached briefing, if there is one. Returns the previous value so a
+ *  failed write can put it back exactly as it was. */
+function patchBriefing(
+  qc: ReturnType<typeof useQueryClient>,
+  f: (b: TosseBriefing) => TosseBriefing,
+): TosseBriefing | undefined {
+  const previous = qc.getQueryData<TosseBriefing>(tosseBriefingKey);
+  if (previous) qc.setQueryData<TosseBriefing>(tosseBriefingKey, f(previous));
+  return previous;
+}
+
+/** Deep-enough clone for our patches: projects and their task arrays are replaced, the task
+ *  objects themselves are shared until one is edited. */
+function mapProjects(b: TosseBriefing, f: (tasks: TosseTask[]) => TosseTask[]): TosseBriefing {
+  return { ...b, projects: b.projects.map((p) => ({ ...p, tasks: f(p.tasks) })) };
+}
+
+/**
+ * Move a task to another status.
+ *
+ * Optimistic: the row jumps to its new section immediately, because the whole point of
+ * doing this here rather than in the browser is that it feels local. If the server refuses
+ * (a blocked task, an expired session), the previous board is restored WHOLE and the
+ * caller shows the reason — a silent revert on the next refetch would look like a bug.
+ *
+ * A task moved to `Fait` leaves the board: the briefing never lists done tasks, so keeping
+ * it would show a row that vanishes on the next refresh anyway.
+ */
+export function useSetTosseTaskStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { taskId: string; status: string; title?: string }): Promise<null> =>
+      unwrap(commands.tosseSetTaskStatus(v.taskId, v.status)),
+    onMutate: ({ taskId, status }) => ({
+      previous: patchBriefing(qc, (b) =>
+        mapProjects(b, (tasks) =>
+          status === "Fait"
+            ? tasks.filter((t) => t.id !== taskId)
+            : tasks.map((t) => (t.id === taskId ? { ...t, status } : t)),
+        ),
+      ),
+    }),
+    onError: (_e, _v, ctx) => {
+      if (ctx?.previous) qc.setQueryData(tosseBriefingKey, ctx.previous);
+    },
+    onSettled: (_d, _e, v) => {
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      void qc.invalidateQueries({ queryKey: tosseTaskKey(v.taskId) });
+    },
+  });
+}
+
+/** Start / pause / finish a project. Same optimistic contract as the task status. */
+export function useSetTosseProjectStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { projectId: string; status: string; name?: string }): Promise<null> =>
+      unwrap(commands.tosseSetProjectStatus(v.projectId, v.status)),
+    onMutate: ({ projectId, status }) => ({
+      previous: patchBriefing(qc, (b) => ({
+        ...b,
+        projects: b.projects.map((p) => (p.id === projectId ? { ...p, status } : p)),
+        pausedProjects: b.pausedProjects.map((p) =>
+          p.id === projectId ? { ...p, status } : p,
+        ),
+      })),
+    }),
+    onError: (_e, _v, ctx) => {
+      if (ctx?.previous) qc.setQueryData(tosseBriefingKey, ctx.previous);
+    },
+    // Always refetch: a project that changed state moves BETWEEN `projects` and
+    // `pausedProjects` (and takes its tasks with it), which is the server's call to make.
+    onSettled: () => void qc.invalidateQueries({ queryKey: tosseBriefingKey }),
+  });
+}
+
+/**
+ * Create a task in a project, with the status of the group it was typed into.
+ *
+ * NOT optimistic: the created row's id comes from the server, and inventing a temporary one
+ * would make the row un-clickable (its detail panel would 404) for as long as the request
+ * takes. The input clears on success only, so a refused creation keeps what was typed.
+ */
+export function useCreateTosseTask() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: {
+      projectId: string;
+      title: string;
+      status: string;
+      kind?: string | null;
+      priority?: string | null;
+      assignedTo?: string | null;
+    }): Promise<TosseTask> =>
+      unwrap(
+        commands.tosseCreateTask(
+          v.projectId,
+          v.title,
+          v.status,
+          v.kind ?? null,
+          v.priority ?? null,
+          v.assignedTo ?? null,
+        ),
+      ),
+    onSuccess: (created, v) => {
+      // Seed the cache with what the server returned so the row appears without waiting for
+      // the refetch, then reconcile.
+      patchBriefing(qc, (b) => ({
+        ...b,
+        projects: b.projects.map((p) =>
+          p.id === v.projectId ? { ...p, tasks: [...p.tasks, created] } : p,
+        ),
+      }));
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+    },
   });
 }

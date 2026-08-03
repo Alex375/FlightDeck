@@ -607,6 +607,72 @@ pub fn tosse_link_repository(
     Ok(())
 }
 
+/// Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
+///
+/// The CRM assembles this shape for its own Briefing page — active projects with their
+/// client, their open tasks and their progress counts — so the view reads that instead of
+/// stitching `/clients` + `/projects` + `/tasks` together and re-deriving it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_briefing() -> Result<crate::tosse::TosseBriefing, String> {
+    crate::tosse::briefing().await.map_err(|e| e.to_string())
+}
+
+/// One task in full — the Markdown fields and relations the briefing leaves out. Fetched
+/// when a row is actually opened, never for a list.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_task_detail(task_id: String) -> Result<crate::tosse::TosseTaskDetail, String> {
+    crate::tosse::task_detail(&task_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Move a task to another status.
+///
+/// ⚠️ `"Fait"` is reachable from here, and that is deliberate: the repo's rule is that no
+/// AGENT closes a task, and this command only ever runs because a human clicked a status in
+/// the UI. Nothing in the agent surface calls it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_set_task_status(task_id: String, status: String) -> Result<(), String> {
+    crate::tosse::set_task_status(&task_id, &status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Move a project to another status — the Start / Pause / Finish control on a project card.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_set_project_status(project_id: String, status: String) -> Result<(), String> {
+    crate::tosse::set_project_status(&project_id, &status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Create a task in a project, with the status of the group it was typed into.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_create_task(
+    project_id: String,
+    title: String,
+    status: String,
+    kind: Option<String>,
+    priority: Option<String>,
+    assigned_to: Option<String>,
+) -> Result<crate::tosse::TosseTask, String> {
+    crate::tosse::create_task(
+        &project_id,
+        &title,
+        &status,
+        kind.as_deref(),
+        priority.as_deref(),
+        assigned_to.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Fetch the slash commands available in `cwd` WITHOUT starting a persistent
 /// session. Spawns a short-lived `claude`, performs the `initialize` handshake
 /// (spec §4.4), reads the advertised commands from its `control_response`, and

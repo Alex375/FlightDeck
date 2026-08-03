@@ -15,6 +15,8 @@ import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
+import { TosseView } from "./features/tosse/TosseView";
+import { useTosseConnection } from "./ipc/useTosse";
 import { useExtensionsUi } from "./features/extensions/extensionsUiStore";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { useHistoryUi } from "./features/history/historyUiStore";
@@ -41,7 +43,7 @@ import {
 import { useDisplay, resolveCleanOutput } from "./store/display";
 import { useNotifications } from "./store/notifications";
 import { useSettingsUi } from "./store/settingsUi";
-import { NavBtn, Tag, Win } from "./ui/kit";
+import { NavBtn, Tag, TosseCrmMark, Win } from "./ui/kit";
 import {
   ACTION_BINDINGS,
   isEditableTarget,
@@ -75,13 +77,32 @@ export default function App() {
   // (see notify.ts). It also keeps the same conversation from being mounted twice
   // (modal + full view) at once.
   const closeReplyModal = useFlightdeckModal((s) => s.close);
+
+  // The TOSSE tab is CONDITIONAL — it exists only while signed in to the CRM (and while the
+  // display preference keeps it on). Signed out we show no tab at all rather than an empty
+  // shell, which is the whole point: the app is fully usable without TOSSE. Passing the
+  // preference as `enabled` means switching the feature off costs nothing either — the
+  // status query never runs.
+  const tosseTabEnabled = useDisplay((s) => s.tosseTasksView);
+  const { data: tosseConnection } = useTosseConnection(tosseTabEnabled);
+  const tosseAvailable = tosseTabEnabled && tosseConnection?.connected === true;
+
   const changeView = useCallback(
     (next: View) => {
+      // A view that isn't currently available is a no-op, not a blank screen: ⌘3 while
+      // signed out must leave you where you are.
+      if (next === "tosse" && !tosseAvailable) return;
       if (next !== "flightdeck") closeReplyModal();
       setView(next);
     },
-    [closeReplyModal],
+    [closeReplyModal, tosseAvailable],
   );
+
+  // Signing out (or switching the feature off) while the TOSSE view is open must not strand
+  // the window on a view that no longer exists — fall back to the deck.
+  useEffect(() => {
+    if (view === "tosse" && !tosseAvailable) setView("flightdeck");
+  }, [view, tosseAvailable]);
   // Defensive backstop: if a view change ever bypasses `changeView`, still close the
   // modal on leaving the deck (post-render, so it can lag — `changeView` is the
   // race-free path every current caller uses).
@@ -255,7 +276,13 @@ export default function App() {
 
   return (
     <Win
-      title={view === "flightdeck" ? "Flight Deck" : active?.name ?? "Conductor"}
+      title={
+        view === "flightdeck"
+          ? "Flight Deck"
+          : view === "tosse"
+            ? "TOSSE"
+            : active?.name ?? "Conductor"
+      }
       banner={<><UpdateBanner /><ClaudeCliBanner /><AppErrorBanner /></>}
       nav={
         <>
@@ -273,6 +300,16 @@ export default function App() {
             title="Flight Deck (⌘2)"
             onClick={() => changeView("flightdeck")}
           />
+          {/* Only while signed in to TOSSE — no tab rather than an empty one. */}
+          {tosseAvailable ? (
+            <NavBtn
+              glyph={<TosseCrmMark className="sm" />}
+              label="TOSSE"
+              on={view === "tosse"}
+              title="TOSSE tasks (⌘3)"
+              onClick={() => changeView("tosse")}
+            />
+          ) : null}
         </>
       }
       right={
@@ -306,6 +343,8 @@ export default function App() {
     >
       {view === "conversation" ? (
         <ConductorConversation active={active} />
+      ) : view === "tosse" ? (
+        <TosseView />
       ) : (
         <FlightDeck onOpen={openConversation} />
       )}

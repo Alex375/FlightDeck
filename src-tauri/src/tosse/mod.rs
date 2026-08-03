@@ -1459,6 +1459,353 @@ pub fn resolve_links(locals: &[LocalRepo], repositories: &[TosseRepository]) -> 
         .collect()
 }
 
+// ── Briefing: everything the Tasks view reads, in one request ────────────────────────
+
+/// The client a project hangs off. Nullable in the CRM (a project reaches its client
+/// THROUGH a mission, and either link can be missing), which is why the view needs a
+/// "no client" band rather than assuming every project has one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseClientRef {
+    pub id: String,
+    pub name: String,
+    pub logo_url: Option<String>,
+}
+
+/// A task as the briefing lists it — enough to render a row, and no more.
+///
+/// ⚠️ Deliberately WITHOUT `context`/`content`: the briefing omits them, and pulling every
+/// task's Markdown into a list of dozens would cost far more than it shows. The detail
+/// panel fetches the full task by id when one is actually opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseTask {
+    pub id: String,
+    pub title: String,
+    /// Raw CRM value (`"En cours"`, `"À faire"`, `"Review"`…), shown as-is: it is data, like
+    /// a project name, and translating it would drift from the CRM read in a browser.
+    pub status: String,
+    pub priority: Option<String>,
+    /// The CRM's `type` field (`"Code"`, `"Admin"`…). Renamed because `type` is a Rust
+    /// keyword; the wire name is handled by the parser, not by serde.
+    pub kind: Option<String>,
+    pub assigned_to: Option<String>,
+    pub due_date: Option<String>,
+    pub notes: Option<String>,
+    pub subtask_count: u32,
+    pub subtask_done: u32,
+}
+
+/// A project with the tasks the briefing kept for it.
+///
+/// `tasks` is empty for a paused project: the endpoint reports those by name only, and the
+/// view says so instead of pretending the project has nothing left to do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseProject {
+    pub id: String,
+    pub name: String,
+    /// `"En cours"` / `"En pause"` / `"À démarrer"` — drives the card's state control.
+    pub status: Option<String>,
+    pub client: Option<TosseClientRef>,
+    pub start_date: Option<String>,
+    pub due_date: Option<String>,
+    pub tasks: Vec<TosseTask>,
+    /// Progress across ALL of the project's tasks, done included — the briefing counts them
+    /// server-side, so the ring means the same thing here as on the CRM's own page.
+    pub task_count: u32,
+    pub task_done: u32,
+}
+
+/// `GET /api/v1/briefing/morning`, normalised.
+///
+/// ⚠️ What this endpoint deliberately LEAVES OUT: tasks in `Backlog`, `En attente` or
+/// `Fait`, and projects that are `Terminé`/`Archivé`. That is the right cut for a "what am
+/// I working on" screen — anything else is a targeted `/tasks?project_id=…` away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseBriefing {
+    pub projects: Vec<TosseProject>,
+    /// Paused projects, metadata only (no tasks) — shown recessed rather than hidden, so a
+    /// project you deliberately parked doesn't vanish from the app that manages it.
+    pub paused_projects: Vec<TosseProject>,
+    /// Tasks attached to no project at all. They have no card to live in, so the view gives
+    /// them their own band instead of dropping them.
+    pub general_tasks: Vec<TosseTask>,
+}
+
+/// Everything the Tasks view shows, in ONE request (`GET /api/v1/briefing/morning`).
+///
+/// The CRM already assembles exactly this shape for its own Briefing page — projects with
+/// their client, their tasks and their counts — so we read that instead of stitching
+/// `/clients` + `/projects` + `/tasks` together and re-deriving what the server computed.
+pub async fn briefing() -> R<TosseBriefing> {
+    let v = api_get("/api/v1/briefing/morning").await?;
+    let data = v.pointer("/data").ok_or_else(|| {
+        TosseError::Protocol(format!(
+            "the briefing carried no `data` object: {}",
+            snippet(&v.to_string())
+        ))
+    })?;
+    parse_briefing(data)
+}
+
+/// Shape the briefing payload. Split from the request so the mapping is testable without a
+/// network round-trip — the shape is the part that breaks when the CRM changes.
+fn parse_briefing(data: &Value) -> R<TosseBriefing> {
+    Ok(TosseBriefing {
+        projects: parse_list(data.get("projects"), parse_project)?,
+        paused_projects: parse_list(data.get("pausedProjects"), parse_project)?,
+        // `general` is omitted entirely when there is nothing in it — absence is normal.
+        general_tasks: parse_list(data.pointer("/general/tasks"), parse_task)?,
+    })
+}
+
+/// Map a (possibly absent) JSON array. A missing key is an empty list; a key holding
+/// something that is NOT an array is a protocol error, because that means the shape changed
+/// under us and silently rendering nothing would look like "you have no work".
+fn parse_list<T>(v: Option<&Value>, f: impl Fn(&Value) -> R<T>) -> R<Vec<T>> {
+    match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(rows)) => rows.iter().map(f).collect(),
+        Some(other) => Err(TosseError::Protocol(format!(
+            "expected a list, got {}",
+            snippet(&other.to_string())
+        ))),
+    }
+}
+
+fn parse_task(v: &Value) -> R<TosseTask> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+    let id = s("id").ok_or_else(|| {
+        TosseError::Protocol(format!(
+            "a task came back without an id: {}",
+            snippet(&v.to_string())
+        ))
+    })?;
+    Ok(TosseTask {
+        id,
+        title: s("title").unwrap_or_else(|| "Untitled task".to_string()),
+        // A row with no status would be unplaceable in a status-grouped view; the CRM always
+        // sends one, and "À faire" is the harmless landing spot if it ever doesn't.
+        status: s("status").unwrap_or_else(|| "À faire".to_string()),
+        priority: s("priority"),
+        kind: s("type"),
+        assigned_to: s("assignedTo"),
+        due_date: s("dueDate"),
+        notes: s("notes"),
+        subtask_count: n("subtaskCount"),
+        subtask_done: n("subtaskDone"),
+    })
+}
+
+fn parse_project(v: &Value) -> R<TosseProject> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let id = s("id").ok_or_else(|| {
+        TosseError::Protocol(format!(
+            "a project came back without an id: {}",
+            snippet(&v.to_string())
+        ))
+    })?;
+    let client = v.get("client").filter(|c| !c.is_null()).and_then(|c| {
+        Some(TosseClientRef {
+            id: c.get("id").and_then(Value::as_str)?.to_string(),
+            name: c
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled client")
+                .to_string(),
+            logo_url: c.get("logoUrl").and_then(Value::as_str).map(str::to_string),
+        })
+    });
+    Ok(TosseProject {
+        id,
+        name: s("name").unwrap_or_else(|| "Untitled project".to_string()),
+        status: s("status"),
+        client,
+        start_date: s("startDate"),
+        due_date: s("dueDate"),
+        tasks: parse_list(v.get("tasks"), parse_task)?,
+        task_count: v.get("taskCount").and_then(Value::as_u64).unwrap_or(0) as u32,
+        task_done: v.get("taskDone").and_then(Value::as_u64).unwrap_or(0) as u32,
+    })
+}
+
+// ── Writes ───────────────────────────────────────────────────────────────────────────
+
+/// Send a JSON body to a first-party endpoint with our Bearer token, and return the
+/// response's `data`.
+///
+/// Same shape as [`api_get`] on purpose: one place holds the token, the envelope and the
+/// error text, so a failed write reports the sentence the server wrote rather than a status
+/// code. ⚠️ The CRM's REST payloads are **camelCase** (`projectId`), unlike the MCP tools'
+/// snake_case — the difference is real and silently drops fields if mixed up.
+async fn api_write(method: reqwest::Method, path: &str, body: &Value) -> R<Value> {
+    let token = access_token().await?;
+    let url = format!("{BASE_URL}{path}");
+    let (status, text) = send_text(
+        http()?
+            .request(method, &url)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string()),
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(TosseError::Http {
+            status: status.as_u16(),
+            body: readable_error(&text),
+        });
+    }
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| TosseError::Protocol(format!("{path} did not return JSON ({e})")))?;
+    Ok(v.pointer("/data").cloned().unwrap_or(Value::Null))
+}
+
+/// Move a task to another status (`PATCH /api/v1/tasks/:id`).
+///
+/// The status string is passed through untouched rather than validated against a list we
+/// keep here: the server owns that enum, and a local copy would drift the day it gains a
+/// value. An invalid one comes back as a readable 400.
+pub async fn set_task_status(task_id: &str, status: &str) -> R<()> {
+    api_write(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/tasks/{task_id}"),
+        &serde_json::json!({ "status": status }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Move a project to another status (`PATCH /api/v1/projects/:id`) — the Start / Pause /
+/// Finish control on a project card.
+pub async fn set_project_status(project_id: &str, status: &str) -> R<()> {
+    api_write(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        &serde_json::json!({ "status": status }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Create a task in a project (`POST /api/v1/tasks`), returning it as the list renders it.
+///
+/// `source` is `"Manuel"`, not `"Claude Code"`: a human typed this title into a form. The
+/// distinction is what lets the CRM tell apart what an agent filed from what we did.
+pub async fn create_task(
+    project_id: &str,
+    title: &str,
+    status: &str,
+    kind: Option<&str>,
+    priority: Option<&str>,
+    assigned_to: Option<&str>,
+) -> R<TosseTask> {
+    let mut body = serde_json::json!({
+        "title": title,
+        "projectId": project_id,
+        "status": status,
+        "source": "Manuel",
+    });
+    // Omitted rather than sent as null: the create schema treats an absent field as "use the
+    // default", while an explicit null is a value the validator would reject.
+    let map = body.as_object_mut().expect("json! built an object");
+    for (k, v) in [
+        ("type", kind),
+        ("priority", priority),
+        ("assignedTo", assigned_to),
+    ] {
+        if let Some(v) = v {
+            map.insert(k.to_string(), Value::String(v.to_string()));
+        }
+    }
+    let created = api_write(reqwest::Method::POST, "/api/v1/tasks", &body).await?;
+    parse_task(&created)
+}
+
+// ── One task, in full (the detail panel) ─────────────────────────────────────────────
+
+/// A task referenced by another — a blocker, or something this task blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseTaskLink {
+    pub id: String,
+    pub title: String,
+    pub status: Option<String>,
+    /// A resolved relation is history, not a live blocker: the panel keeps showing it, but
+    /// dimmed, so "why was this stuck" stays answerable after the fact.
+    pub resolved: bool,
+}
+
+/// Everything the detail panel shows for one task (`GET /api/v1/tasks/:id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseTaskDetail {
+    /// The same row shape the list uses, so the panel and the row can't disagree.
+    pub task: TosseTask,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    /// The long-form fields the briefing omits — Markdown, rendered as-is.
+    pub context: Option<String>,
+    pub content: Option<String>,
+    pub subtasks: Vec<TosseTask>,
+    pub blocked_by: Vec<TosseTaskLink>,
+    pub blocks: Vec<TosseTaskLink>,
+}
+
+/// Fetch one task in full. Called when a row is opened, never for a list — this is the
+/// request that carries the Markdown the briefing deliberately leaves out.
+pub async fn task_detail(task_id: &str) -> R<TosseTaskDetail> {
+    let v = api_get(&format!("/api/v1/tasks/{task_id}")).await?;
+    let data = v.pointer("/data").ok_or_else(|| {
+        TosseError::Protocol(format!(
+            "the task carried no `data` object: {}",
+            snippet(&v.to_string())
+        ))
+    })?;
+    let s = |k: &str| data.get(k).and_then(Value::as_str).map(str::to_string);
+    Ok(TosseTaskDetail {
+        task: parse_task(data)?,
+        project_id: data
+            .pointer("/project/id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        project_name: data
+            .pointer("/project/name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        context: s("context"),
+        content: s("content"),
+        subtasks: parse_list(data.get("subtasks"), parse_task)?,
+        blocked_by: parse_list(data.get("blockedBy"), parse_task_link)?,
+        blocks: parse_list(data.get("blocks"), parse_task_link)?,
+    })
+}
+
+fn parse_task_link(v: &Value) -> R<TosseTaskLink> {
+    let id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            TosseError::Protocol(format!(
+                "a task relation came back without an id: {}",
+                snippet(&v.to_string())
+            ))
+        })?
+        .to_string();
+    Ok(TosseTaskLink {
+        id,
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled task")
+            .to_string(),
+        status: v.get("status").and_then(Value::as_str).map(str::to_string),
+        resolved: v.get("resolvedAt").is_some_and(|r| !r.is_null()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2021,5 +2368,99 @@ mod tests {
             e.authorization, e.token, e.registration, e.revocation
         );
         assert!(e.authorization.starts_with("http"));
+    }
+
+    // ── Briefing parsing ─────────────────────────────────────────────────────────────
+
+    /// The payload as `briefing.service.ts` builds it, trimmed to the fields we read.
+    fn briefing_fixture() -> Value {
+        serde_json::json!({
+            "projects": [{
+                "id": "p1",
+                "name": "Tosse Code",
+                "status": "En cours",
+                "startDate": "2026-03-12T00:00:00.000Z",
+                "dueDate": null,
+                "client": { "id": "c1", "name": "Interne", "website": null, "logoUrl": "https://x/logo.png" },
+                "tasks": [
+                    { "id": "t1", "title": "Lot 2", "priority": "Haute", "assignedTo": "Alexandre",
+                      "dueDate": null, "notes": null, "type": "Code", "status": "En cours",
+                      "subtaskCount": 4, "subtaskDone": 1 },
+                    { "id": "t2", "title": "Lot 1", "priority": "Haute", "assignedTo": "Alexandre",
+                      "dueDate": null, "notes": null, "type": "Code", "status": "Review",
+                      "subtaskCount": 0, "subtaskDone": 0 }
+                ],
+                "taskCount": 58,
+                "taskDone": 41
+            }],
+            "pausedProjects": [{
+                "id": "p2", "name": "Serveur MCP", "status": "En pause",
+                "client": { "id": "c2", "name": "Webdentiste", "website": null, "logoUrl": null }
+            }],
+            "general": { "tasks": [
+                { "id": "t3", "title": "Sans projet", "priority": "Basse", "status": "À faire",
+                  "subtaskCount": 0, "subtaskDone": 0 }
+            ] }
+        })
+    }
+
+    #[test]
+    fn briefing_keeps_projects_their_client_and_their_tasks() {
+        let b = parse_briefing(&briefing_fixture()).expect("fixture parses");
+        assert_eq!(b.projects.len(), 1);
+        let p = &b.projects[0];
+        assert_eq!(p.name, "Tosse Code");
+        assert_eq!(p.client.as_ref().map(|c| c.name.as_str()), Some("Interne"));
+        assert_eq!((p.task_done, p.task_count), (41, 58));
+        // Status is carried through verbatim: it is the CRM's value, not a local enum.
+        assert_eq!(p.tasks[0].status, "En cours");
+        assert_eq!(p.tasks[1].status, "Review");
+        // `type` is a Rust keyword; the wire name must still be picked up.
+        assert_eq!(p.tasks[0].kind.as_deref(), Some("Code"));
+        assert_eq!((p.tasks[0].subtask_done, p.tasks[0].subtask_count), (1, 4));
+        // A paused project is reported by name with NO tasks — the view says so rather than
+        // showing it as having nothing left to do.
+        assert_eq!(b.paused_projects.len(), 1);
+        assert!(b.paused_projects[0].tasks.is_empty());
+        assert_eq!(b.general_tasks.len(), 1);
+    }
+
+    #[test]
+    fn briefing_without_a_general_block_is_not_an_error() {
+        // The endpoint omits `general` entirely when no task is project-less.
+        let v = serde_json::json!({ "projects": [], "pausedProjects": [] });
+        let b = parse_briefing(&v).expect("an omitted section is normal");
+        assert!(b.general_tasks.is_empty());
+    }
+
+    #[test]
+    fn a_task_without_an_id_fails_loudly() {
+        // Dropping the row instead would render a SHORT list that looks complete.
+        let v = serde_json::json!({ "projects": [{ "id": "p1", "name": "P",
+            "tasks": [{ "title": "no id" }] }] });
+        let err = parse_briefing(&v).expect_err("a row with no id is a protocol error");
+        assert!(matches!(err, TosseError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_projects_field_that_is_not_a_list_fails_loudly() {
+        // A changed shape must not read as "you have no work today".
+        let v = serde_json::json!({ "projects": { "oops": true } });
+        let err = parse_briefing(&v).expect_err("a non-array list is a protocol error");
+        assert!(matches!(err, TosseError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn task_relations_record_whether_they_are_still_blocking() {
+        let live = parse_task_link(&serde_json::json!({
+            "id": "t9", "title": "Lot 1", "status": "Review", "resolvedAt": null
+        }))
+        .expect("parses");
+        let past = parse_task_link(&serde_json::json!({
+            "id": "t8", "title": "Ancien", "status": "Fait",
+            "resolvedAt": "2026-07-30T10:00:00.000Z"
+        }))
+        .expect("parses");
+        assert!(!live.resolved && past.resolved);
     }
 }
