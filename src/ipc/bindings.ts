@@ -436,6 +436,70 @@ async tosseLinkRepository(repoId: string, repositoryId: string | null) : Promise
 }
 },
 /**
+ * Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
+ * 
+ * The CRM assembles this shape for its own Briefing page — active projects with their
+ * client, their open tasks and their progress counts — so the view reads that instead of
+ * stitching `/clients` + `/projects` + `/tasks` together and re-deriving it.
+ */
+async tosseBriefing() : Promise<Result<TosseBriefing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_briefing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * One task in full — the Markdown fields and relations the briefing leaves out. Fetched
+ * when a row is actually opened, never for a list.
+ */
+async tosseTaskDetail(taskId: string) : Promise<Result<TosseTaskDetail, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_task_detail", { taskId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move a task to another status.
+ * 
+ * ⚠️ `"Fait"` is reachable from here, and that is deliberate: the repo's rule is that no
+ * AGENT closes a task, and this command only ever runs because a human clicked a status in
+ * the UI. Nothing in the agent surface calls it.
+ */
+async tosseSetTaskStatus(taskId: string, status: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_task_status", { taskId, status }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move a project to another status — the Start / Pause / Finish control on a project card.
+ */
+async tosseSetProjectStatus(projectId: string, status: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_project_status", { projectId, status }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a task in a project, with the status of the group it was typed into.
+ */
+async tosseCreateTask(projectId: string, title: string, status: string, kind: string | null, priority: string | null, assignedTo: string | null) : Promise<Result<TosseTask, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_create_task", { projectId, title, status, kind, priority, assignedTo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Fetch the slash commands available in `cwd` WITHOUT starting a persistent
  * session. Spawns a short-lived `claude`, performs the `initialize` handshake
  * (spec §4.4), reads the advertised commands from its `control_response`, and
@@ -2991,6 +3055,30 @@ signedOutReason: string | null;
  */
 identityError: string | null }
 /**
+ * `GET /api/v1/briefing/morning`, normalised.
+ * 
+ * ⚠️ What this endpoint deliberately LEAVES OUT: tasks in `Backlog`, `En attente` or
+ * `Fait`, and projects that are `Terminé`/`Archivé`. That is the right cut for a "what am
+ * I working on" screen — anything else is a targeted `/tasks?project_id=…` away.
+ */
+export type TosseBriefing = { projects: TosseProject[]; 
+/**
+ * Paused projects, metadata only (no tasks) — shown recessed rather than hidden, so a
+ * project you deliberately parked doesn't vanish from the app that manages it.
+ */
+pausedProjects: TosseProject[]; 
+/**
+ * Tasks attached to no project at all. They have no card to live in, so the view gives
+ * them their own band instead of dropping them.
+ */
+generalTasks: TosseTask[] }
+/**
+ * The client a project hangs off. Nullable in the CRM (a project reaches its client
+ * THROUGH a mission, and either link can be missing), which is why the view needs a
+ * "no client" band rather than assuming every project has one.
+ */
+export type TosseClientRef = { id: string; name: string; logoUrl: string | null }
+/**
  * How a local folder came to be linked to a CRM repository.
  */
 export type TosseLinkSource = 
@@ -3002,6 +3090,22 @@ export type TosseLinkSource =
  * Derived from the folder's `origin` remote.
  */
 "remote"
+/**
+ * A project with the tasks the briefing kept for it.
+ * 
+ * `tasks` is empty for a paused project: the endpoint reports those by name only, and the
+ * view says so instead of pretending the project has nothing left to do.
+ */
+export type TosseProject = { id: string; name: string; 
+/**
+ * `"En cours"` / `"En pause"` / `"À démarrer"` — drives the card's state control.
+ */
+status: string | null; client: TosseClientRef | null; startDate: string | null; dueDate: string | null; tasks: TosseTask[]; 
+/**
+ * Progress across ALL of the project's tasks, done included — the briefing counts them
+ * server-side, so the ring means the same thing here as on the CRM's own page.
+ */
+taskCount: number; taskDone: number }
 /**
  * A project a repository is attached to, trimmed to what the app displays. The CRM models
  * repository↔project as N-N, so this is a list, and it can legitimately be empty.
@@ -3093,6 +3197,45 @@ status: string | null;
  * The repo-level context the CRM keeps for agents — Markdown, rendered as-is.
  */
 context: string | null; projects: TosseProjectRef[] }
+/**
+ * A task as the briefing lists it — enough to render a row, and no more.
+ * 
+ * ⚠️ Deliberately WITHOUT `context`/`content`: the briefing omits them, and pulling every
+ * task's Markdown into a list of dozens would cost far more than it shows. The detail
+ * panel fetches the full task by id when one is actually opened.
+ */
+export type TosseTask = { id: string; title: string; 
+/**
+ * Raw CRM value (`"En cours"`, `"À faire"`, `"Review"`…), shown as-is: it is data, like
+ * a project name, and translating it would drift from the CRM read in a browser.
+ */
+status: string; priority: string | null; 
+/**
+ * The CRM's `type` field (`"Code"`, `"Admin"`…). Renamed because `type` is a Rust
+ * keyword; the wire name is handled by the parser, not by serde.
+ */
+kind: string | null; assignedTo: string | null; dueDate: string | null; notes: string | null; subtaskCount: number; subtaskDone: number }
+/**
+ * Everything the detail panel shows for one task (`GET /api/v1/tasks/:id`).
+ */
+export type TosseTaskDetail = { 
+/**
+ * The same row shape the list uses, so the panel and the row can't disagree.
+ */
+task: TosseTask; projectId: string | null; projectName: string | null; 
+/**
+ * The long-form fields the briefing omits — Markdown, rendered as-is.
+ */
+context: string | null; content: string | null; subtasks: TosseTask[]; blockedBy: TosseTaskLink[]; blocks: TosseTaskLink[] }
+/**
+ * A task referenced by another — a blocker, or something this task blocks.
+ */
+export type TosseTaskLink = { id: string; title: string; status: string | null; 
+/**
+ * A resolved relation is history, not a live blocker: the panel keeps showing it, but
+ * dimmed, so "why was this stuck" stays answerable after the fact.
+ */
+resolved: boolean }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

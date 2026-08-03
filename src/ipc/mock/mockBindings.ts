@@ -59,9 +59,13 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   TosseAccountStatus,
+  TosseBriefing,
+  TosseProject,
   TosseRepoLink,
   TosseRepoLinksPayload,
   TosseRepository,
+  TosseTask,
+  TosseTaskDetail,
   SlashCommand,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -195,8 +199,142 @@ function getRecord(session: string): SessionRecord {
 }
 
 const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
+const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 let mockCounter = 0;
+
+// ---- TOSSE briefing fixture ------------------------------------------------
+// Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
+// tasks, paused projects by name only, and the project-less tasks. Mutated in place by the
+// write commands so the demo behaves like the real thing.
+
+function demoTask(
+  id: string,
+  title: string,
+  status: string,
+  extra: Partial<TosseTask> = {},
+): TosseTask {
+  return {
+    id,
+    title,
+    status,
+    priority: "Moyenne",
+    kind: "Code",
+    assignedTo: "Alexandre",
+    dueDate: null,
+    notes: null,
+    subtaskCount: 0,
+    subtaskDone: 0,
+    ...extra,
+  };
+}
+
+const demoClientInterne = { id: "c-interne", name: "Interne", logoUrl: null };
+const demoClientWd = { id: "c-wd", name: "Webdentiste", logoUrl: null };
+
+const demoBriefing: TosseBriefing = {
+  projects: [
+    {
+      id: "p-tosse-code",
+      name: "Tosse Code",
+      status: "En cours",
+      client: demoClientInterne,
+      startDate: "2026-03-12T00:00:00.000Z",
+      dueDate: null,
+      taskCount: 58,
+      taskDone: 41,
+      tasks: [
+        demoTask("t-lot2", "Lot 2 — vue « Tâches TOSSE » + écriture", "En cours", {
+          priority: "Haute",
+          subtaskCount: 4,
+          subtaskDone: 1,
+        }),
+        demoTask("t-lot1", "Lot 1 — connexion (OAuth) + onglet Réglages", "Review", {
+          priority: "Haute",
+        }),
+        demoTask("t-bypass", "Réglage « autoriser le mode Bypass permissions »", "Review"),
+        demoTask("t-workflows", "Affichage live des workflows dans Flight Deck", "À faire", {
+          assignedTo: "Les deux",
+          subtaskCount: 4,
+          subtaskDone: 1,
+        }),
+        demoTask("t-lot3", "Lot 3 — association conversation ↔ tâche", "À faire", {
+          priority: "Haute",
+        }),
+        demoTask("t-readme", "Rédiger un README anglais", "À faire", {
+          priority: "Basse",
+          kind: "Rédaction",
+        }),
+      ],
+    },
+    {
+      id: "p-crm",
+      name: "TOSSE",
+      status: "En cours",
+      client: demoClientInterne,
+      startDate: null,
+      dueDate: "2026-08-15T00:00:00.000Z",
+      taskCount: 28,
+      taskDone: 16,
+      tasks: [
+        demoTask("t-bearer", "Bearer OAuth first-party sur /api/v1/*", "Review", {
+          priority: "Urgente",
+        }),
+        demoTask("t-changelog", "Page changelog publique", "À faire", { assignedTo: "Armand" }),
+      ],
+    },
+    {
+      id: "p-santecall",
+      name: "SanteCall 3.0 — Refonte plateforme",
+      status: "En cours",
+      client: demoClientWd,
+      startDate: null,
+      // Deliberately in the past: exercises the overdue styling.
+      dueDate: "2026-07-28T00:00:00.000Z",
+      taskCount: 31,
+      taskDone: 9,
+      tasks: [
+        demoTask("t-volubile", "Migration Volubile → middleware provider", "En cours", {
+          priority: "Urgente",
+          assignedTo: "Armand",
+          dueDate: "2026-08-02T00:00:00.000Z",
+        }),
+        demoTask("t-blocked", "Refonte du flux d'identification patient", "À faire", {
+          priority: "Haute",
+          assignedTo: "Armand",
+        }),
+      ],
+    },
+  ],
+  pausedProjects: [
+    {
+      id: "p-mcp-santecall",
+      name: "Serveur MCP SanteCall",
+      status: "En pause",
+      client: demoClientWd,
+      startDate: null,
+      dueDate: null,
+      tasks: [],
+      taskCount: 12,
+      taskDone: 10,
+    },
+  ],
+  // A project-less task has no card to live in — the view gives it its own band.
+  generalTasks: [demoTask("t-admin", "Déclarer l'URSSAF du trimestre", "À faire", { kind: "Admin" })],
+};
+
+let demoNextId = 1;
+
+/** Every demo task with the project it belongs to, for the detail command. */
+function demoAllTasks(): { task: TosseTask; projectId: string | null; projectName: string | null }[] {
+  const rows = demoBriefing.projects.flatMap((p: TosseProject) =>
+    p.tasks.map((task) => ({ task, projectId: p.id, projectName: p.name })),
+  );
+  return [
+    ...rows,
+    ...demoBriefing.generalTasks.map((task) => ({ task, projectId: null, projectName: null })),
+  ];
+}
 
 // ---- Commands (same shape as the generated facade) -------------------------
 
@@ -444,6 +582,79 @@ export const mockCommands = {
   },
   async tosseLinkRepository(): Promise<Result<null, string>> {
     return ok(null);
+  },
+  // ---- TOSSE tasks view -------------------------------------------------------------
+  // The demo briefing is MUTABLE: status changes and creations write into it, so the demo
+  // exercises the real optimistic-update path (row moves, counts follow) instead of
+  // snapping back on the next refetch.
+  async tosseBriefing(): Promise<Result<TosseBriefing, string>> {
+    return ok(demoBriefing);
+  },
+  async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
+    const found = demoAllTasks().find((row) => row.task.id === taskId);
+    if (!found) return err(`no task with id ${taskId}`);
+    return ok({
+      task: found.task,
+      projectId: found.projectId,
+      projectName: found.projectName,
+      context:
+        "## Périmètre\n\nListe des projets **groupés par client**, tâches triées par statut.\n\n- Écriture : statut + création\n- États dégradés : hors-ligne, session expirée",
+      content: null,
+      subtasks:
+        found.task.subtaskCount > 0
+          ? [
+              demoTask("st-1", "Cadrage design", "Fait"),
+              demoTask("st-2", "Vue + navigation ⌘3", "À faire"),
+              demoTask("st-3", "Lecture briefing + groupement client", "À faire"),
+              demoTask("st-4", "Écriture : statut + création", "À faire"),
+            ]
+          : [],
+      blockedBy:
+        found.task.id === "t-lot3"
+          ? [{ id: "t-lot2", title: "Lot 2 — vue « Tâches TOSSE »", status: "En cours", resolved: false }]
+          : [],
+      blocks: [],
+    });
+  },
+  async tosseSetTaskStatus(taskId: string, status: string): Promise<Result<null, string>> {
+    // One id always refuses, so the demo can show what a rejected write looks like.
+    if (taskId === "t-blocked") return err("Task is blocked by « Lot 1 » and cannot be started");
+    for (const p of demoBriefing.projects) {
+      const t = p.tasks.find((x) => x.id === taskId);
+      if (!t) continue;
+      if (status === "Fait") p.tasks = p.tasks.filter((x) => x.id !== taskId);
+      else t.status = status;
+      return ok(null);
+    }
+    return ok(null);
+  },
+  async tosseSetProjectStatus(projectId: string, status: string): Promise<Result<null, string>> {
+    const p = demoBriefing.projects.find((x) => x.id === projectId);
+    if (p) p.status = status;
+    return ok(null);
+  },
+  async tosseCreateTask(
+    projectId: string,
+    title: string,
+    status: string,
+    kind: string | null,
+    priority: string | null,
+    assignedTo: string | null,
+  ): Promise<Result<TosseTask, string>> {
+    const created: TosseTask = {
+      id: `t-new-${demoNextId++}`,
+      title,
+      status,
+      priority: priority ?? "Moyenne",
+      kind: kind ?? "Code",
+      assignedTo: assignedTo ?? "Alexandre",
+      dueDate: null,
+      notes: null,
+      subtaskCount: 0,
+      subtaskDone: 0,
+    };
+    demoBriefing.projects.find((p) => p.id === projectId)?.tasks.push(created);
+    return ok(created);
   },
 
   async spawnSession(

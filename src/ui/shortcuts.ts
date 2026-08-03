@@ -1,10 +1,14 @@
 // Pure keyboard-shortcut decisions for the top-level view switch, lifted out of the
 // App effect so they can be unit-tested without a DOM. We match the PHYSICAL key via
-// `e.code` ("Digit1"/"Digit2"), NOT the produced character (`e.key`): on AZERTY 1/2
-// sit on Shift positions, so under ⌘ `e.key` is "&"/"é". ⌘/Ctrl is required; Alt or
-// Shift disqualify the chord (so ⌘⇧1, ⌥⌘1, … stay free for other bindings).
+// `e.code` ("Digit1"/"Digit2"/"Digit3"), NOT the produced character (`e.key`): on AZERTY
+// the digits sit on Shift positions, so under ⌘ `e.key` is "&"/"é"/'"'. ⌘/Ctrl is
+// required; Alt or Shift disqualify the chord (so ⌘⇧1, ⌥⌘1, … stay free).
 
-export type View = "conversation" | "flightdeck";
+/** `"tosse"` is the CRM task view. Unlike the other two it is CONDITIONAL: it exists only
+ *  while signed in to TOSSE (and while the display preference keeps it on), so every place
+ *  that switches views has to cope with a target that may not be available — see
+ *  `App.changeView`, which falls back rather than showing an empty shell. */
+export type View = "conversation" | "flightdeck" | "tosse";
 
 /** The minimal shape of the keyboard event we decide on (a DOM `KeyboardEvent`
  *  satisfies it structurally, so the App handler passes its event straight in). */
@@ -21,6 +25,9 @@ export function viewForShortcut(e: ViewShortcutEvent): View | null {
   if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return null;
   if (e.code === "Digit1") return "conversation";
   if (e.code === "Digit2") return "flightdeck";
+  // ⌘3 resolves to a view that may not exist right now; the caller decides what to do
+  // with it (App ignores it when the TOSSE tab isn't showing), so this stays pure.
+  if (e.code === "Digit3") return "tosse";
   return null;
 }
 
@@ -235,6 +242,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { keys: "⌘ 1", label: "Conversation view" },
       { keys: "⌘ 2", label: "Flight Deck view" },
+      { keys: "⌘ 3", label: "TOSSE tasks view (when signed in to TOSSE)" },
       { keys: "⌘ N", label: "New conversation" },
       { keys: "⌘⌥ ↑ / ⌘⌥ ↓", label: "Previous / next conversation" },
       { keys: "⌘⇧ O", label: "Open conversation history" },

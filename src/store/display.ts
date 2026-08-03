@@ -79,6 +79,13 @@ export interface DisplayPrefs {
    *  either case when TOSSE is not connected. Read by {@link TosseRepoBadge}. */
   tosseRepoBadge: boolean;
 
+  /** Show the TOSSE tasks view — the third top-level view (⌘3), listing the CRM's projects
+   *  by client. ON by default. Off → the tab disappears and the view is never mounted, so
+   *  the briefing is not fetched either. Note this preference only ever MATTERS while
+   *  signed in to TOSSE: signed out, the tab is absent regardless (an empty shell would be
+   *  worse than no tab, per the feature's spec). Read by {@link App}. */
+  tosseTasksView: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -153,6 +160,7 @@ const DEFAULTS: DisplayPrefs = {
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
+  tosseTasksView: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -206,6 +214,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
+        tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,
