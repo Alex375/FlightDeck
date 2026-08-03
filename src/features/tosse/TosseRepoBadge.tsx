@@ -26,6 +26,7 @@ interface BadgeLink {
   repository: unknown;
   ambiguous: unknown[];
   manualRepositoryId: string | null;
+  /** A genuine git FAULT only — never set for a plain folder (see `notARepository`). */
   remoteError: string | null;
 }
 

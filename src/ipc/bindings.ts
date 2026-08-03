@@ -3038,9 +3038,15 @@ manualRepositoryId: string | null;
  */
 ambiguous: TosseRepository[]; 
 /**
- * Why the folder's remote could not be read at all (moved, deleted, not a repository).
- * Filled by the caller that does the git read; `None` on the happy path AND when the
- * folder simply has no remote — those two are different, and only this one is a fault.
+ * The folder is not a git repository at all — an ORDINARY situation here (Flight Deck
+ * works in folders, not only in clones), so it is not an error: it just means no
+ * automatic match is possible, and only a manual pick can associate it.
+ */
+notARepository: boolean; 
+/**
+ * Why the folder's remote could not be read — a genuine FAULT only (the folder has
+ * vanished, permissions, git missing). `None` on the happy path, when the repository
+ * simply has no remote, AND when the folder is not a repository: those are answers.
  */
 remoteError: string | null }
 /**

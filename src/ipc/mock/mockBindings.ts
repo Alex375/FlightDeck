@@ -431,6 +431,7 @@ export const mockCommands = {
       {
         repoId: "repo-demo",
         resolved: true,
+        notARepository: false,
         remoteUrl: "git@github.com:Alex375/tosse-code.git",
         repository: repositories[0],
         source: "remote",

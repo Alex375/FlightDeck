@@ -189,6 +189,10 @@ export function TosseRepoCard() {
             </div>
           ) : null}
 
+          {/* A genuine git fault only. A folder that simply is not a repository is an
+              ordinary case here and gets a plain sentence in the empty state below — not a
+              warning banner, which would put an alarm on every non-clone folder the user
+              has added. */}
           {link?.remoteError ? (
             <div className={styles.problem}>
               <Ico name="alert" className="sm" />
@@ -312,9 +316,11 @@ export function TosseRepoCard() {
                 <div className={styles.emptyBody}>
                   {link?.remoteError
                     ? `This folder's git remote could not be read, so it cannot be matched automatically.`
-                    : link?.remoteUrl
-                      ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
-                      : "This folder has no git remote, so it cannot be matched automatically."}
+                    : link?.notARepository
+                      ? "This folder is not a git repository, so there is no remote to match on. You can still pick a TOSSE repository by hand."
+                      : link?.remoteUrl
+                        ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
+                        : "This folder has no git remote, so it cannot be matched automatically."}
                 </div>
               </div>
             ) : (

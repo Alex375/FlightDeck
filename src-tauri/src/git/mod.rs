@@ -214,23 +214,54 @@ fn build_diff(path: &str, old: &[u8], new: &[u8], old_label: &str, new_label: &s
 /// Works unchanged from inside a linked worktree: `.claude/worktrees/<branch>`
 /// shares the main repository's config, which is where remotes live.
 ///
-/// ⚠️ Only a genuine failure (git missing, not a repository, unreadable config)
-/// comes back as `Err` — matched on the exit CODE, never on the message.
+/// What asking a folder for its `origin` remote turned up.
 ///
-/// ⚠️ Why `remote get-url` and NOT `config --get remote.origin.url`: `git config`
-/// also reads the global file, so in a folder that is not a repository at all it
-/// exits **1 with an empty stderr** — the exact signature of "this repository has
-/// no origin". The two would be indistinguishable, and a checkout whose `.git` was
-/// deleted would be reported as merely remote-less, sending the user to fix by hand
-/// what is in fact a broken clone. `remote get-url` separates them: **2** = no such
-/// remote, **128** = not a repository (both verified against git itself).
-pub fn remote_url(repo_path: &str) -> Result<Option<String>, GitError> {
+/// Three ORDINARY outcomes, deliberately distinct — Flight Deck's folders are working
+/// directories, and plenty of them are not repositories at all. Collapsing the last two
+/// into one loses the difference between "this repo has no remote" and "this isn't a repo",
+/// and the UI can then only say something wrong about one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteLookup {
+    /// `origin` exists and points here.
+    Url(String),
+    /// A git repository, but with no `origin` remote (purely local).
+    NoRemote,
+    /// Not a git repository — an ordinary folder. Not an error.
+    NotARepository,
+}
+
+/// The `origin` remote of the repository `repo_path` lives in.
+///
+/// Works unchanged from inside a linked worktree: `.claude/worktrees/<branch>` shares the
+/// main repository's config, which is where remotes live.
+///
+/// ⚠️ Only a genuine FAULT comes back as `Err`: git missing, a folder that has vanished,
+/// unreadable permissions. "No remote" and "not a repository" are answers.
+///
+/// ⚠️ Why `remote get-url` and NOT `config --get remote.origin.url`: `git config` also reads
+/// the global file, so outside a repository it exits **1 with an empty stderr** — the exact
+/// signature of "this repository has no origin". `remote get-url` separates them: **2** =
+/// no such remote, **128** = not a repository. Both verified against git itself.
+///
+/// ⚠️ 128 is git's catch-all fatal code, so it also covers a DELETED folder ("cannot change
+/// to '…'"). The stderr text is what tells them apart, and it is stable: [`run_git_bytes`]
+/// forces `LC_ALL=C` precisely so these messages never vary with the user's locale.
+pub fn remote_url(repo_path: &str) -> Result<RemoteLookup, GitError> {
     match run_git(repo_path, &["remote", "get-url", "origin"]) {
         Ok(out) => {
             let url = out.trim();
-            Ok((!url.is_empty()).then(|| url.to_string()))
+            Ok(if url.is_empty() {
+                RemoteLookup::NoRemote
+            } else {
+                RemoteLookup::Url(url.to_string())
+            })
         }
-        Err(GitError::Command { code: Some(2), .. }) => Ok(None),
+        Err(GitError::Command { code: Some(2), .. }) => Ok(RemoteLookup::NoRemote),
+        Err(GitError::Command {
+            code: Some(128),
+            stderr,
+            ..
+        }) if stderr.contains("not a git repository") => Ok(RemoteLookup::NotARepository),
         Err(e) => Err(e),
     }
 }
@@ -543,6 +574,49 @@ mod tests {
         assert_eq!(normalize_remote_url("   "), None);
         assert_eq!(normalize_remote_url("https://github.com"), None);
         assert_eq!(normalize_remote_url("https://github.com/"), None);
+    }
+
+    /// The three outcomes, against real `git` — the classification depends on exit codes
+    /// and one stderr string, which no fixture can vouch for.
+    ///
+    /// It matters because two of them are ORDINARY: Flight Deck opens folders, and a fair
+    /// share of them are not clones. Reporting those as a fault put a warning banner on
+    /// every plain folder the user had added.
+    #[test]
+    fn remote_lookup_separates_a_url_from_no_remote_from_no_repository() {
+        let base = std::env::temp_dir().join(format!("fd-remote-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let plain = base.join("plain-folder");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        let repo = base.join("repo-no-remote");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        run_git(repo.to_str().unwrap(), &["init", "-q", "."]).expect("git init");
+
+        assert_eq!(
+            remote_url(plain.to_str().unwrap()).expect("an ordinary folder is not a failure"),
+            RemoteLookup::NotARepository,
+        );
+        assert_eq!(
+            remote_url(repo.to_str().unwrap()).expect("a repository without origin is an answer"),
+            RemoteLookup::NoRemote,
+        );
+
+        run_git(
+            repo.to_str().unwrap(),
+            &["remote", "add", "origin", "git@github.com:Alex375/CRM_max.git"],
+        )
+        .expect("git remote add");
+        assert_eq!(
+            remote_url(repo.to_str().unwrap()).expect("the remote we just added"),
+            RemoteLookup::Url("git@github.com:Alex375/CRM_max.git".into()),
+        );
+
+        // A path that does not exist is the genuine fault, and must NOT pass for "no remote".
+        let gone = base.join("never-existed");
+        assert!(remote_url(gone.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

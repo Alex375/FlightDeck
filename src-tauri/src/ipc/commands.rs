@@ -563,19 +563,25 @@ pub async fn tosse_repo_links(
     let locals = tauri::async_runtime::spawn_blocking(move || {
         rows.into_iter()
             .map(|row| {
-                let (remote_url, remote_error) = match crate::git::remote_url(&row.path) {
-                    Ok(url) => (url, None),
-                    // A folder that moved or was deleted must SAY so: silently reporting
-                    // "no remote" would present it as simply un-associated.
-                    Err(e) => (None, Some(e.to_string())),
-                };
+                use crate::git::RemoteLookup;
+                // Three ordinary answers, one fault. A folder that is not a repository is
+                // COMMON here (Flight Deck opens folders, not only clones) and must not be
+                // dressed up as a failure; a folder that vanished, or that git cannot read,
+                // must SAY so rather than pass for "simply un-associated".
+                let (remote_url, not_a_repository, remote_error) =
+                    match crate::git::remote_url(&row.path) {
+                        Ok(RemoteLookup::Url(url)) => (Some(url), false, None),
+                        Ok(RemoteLookup::NoRemote) => (None, false, None),
+                        Ok(RemoteLookup::NotARepository) => (None, true, None),
+                        Err(e) => (None, false, Some(e.to_string())),
+                    };
                 (
                     crate::tosse::LocalRepo {
                         repo_id: row.repo_id,
                         remote_url,
                         manual_repository_id: row.tosse_repository_id,
                     },
-                    remote_error,
+                    (not_a_repository, remote_error),
                 )
             })
             .collect::<Vec<_>>()
@@ -583,14 +589,15 @@ pub async fn tosse_repo_links(
     .await
     .map_err(|e| format!("could not read the repositories' git remotes: {e}"))?;
 
-    let (inputs, remote_errors): (Vec<_>, Vec<_>) = locals.into_iter().unzip();
+    let (inputs, git_outcomes): (Vec<_>, Vec<_>) = locals.into_iter().unzip();
     // ⚠️ `None` (not an empty slice) when the list failed to load: matching must not RUN
     // against data we never received, or "we could not look" becomes indistinguishable
     // from "we looked and found nothing" — and the UI announces a deletion that never
     // happened, next to a button that destroys the association for good.
     let mut links = crate::tosse::resolve_links(&inputs, listed.as_deref().ok());
     let repositories = listed.as_ref().cloned().unwrap_or_default();
-    for (link, err) in links.iter_mut().zip(remote_errors) {
+    for (link, (not_a_repository, err)) in links.iter_mut().zip(git_outcomes) {
+        link.not_a_repository = not_a_repository;
         link.remote_error = err;
     }
 

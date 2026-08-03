@@ -70,6 +70,7 @@ function link(over: Partial<TosseRepoLink> = {}): TosseRepoLink {
     source: null,
     manualRepositoryId: null,
     ambiguous: [],
+    notARepository: false,
     remoteError: null,
     ...over,
   };
@@ -164,6 +165,22 @@ describe("TosseRepoCard when the CRM list WAS read", () => {
     });
     expect(text).toContain("This folder is not associated with TOSSE");
     expect(text).toContain("No TOSSE repository carries this folder's remote");
+  });
+
+  it("treats a plain (non-git) folder as an ordinary case, with no warning banner", () => {
+    // Flight Deck opens FOLDERS, not only clones — a fair share of them are not
+    // repositories at all. Reporting those as a fault put an alarm banner and an amber
+    // mark on every one of them.
+    const text = render({
+      connected: true,
+      error: null,
+      repositories: [repository],
+      links: [link({ resolved: true, remoteUrl: null, notARepository: true })],
+    });
+    expect(text).toContain("This folder is not a git repository");
+    expect(text).toContain("pick a TOSSE repository by hand");
+    expect(text).not.toContain("unreadable");
+    expect(text).not.toContain("could not be read");
   });
 
   it("blames the unreadable remote rather than the folder when git itself failed", () => {
