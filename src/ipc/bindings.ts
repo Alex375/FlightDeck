@@ -451,6 +451,18 @@ async tosseBriefing() : Promise<Result<TosseBriefing, string>> {
 }
 },
 /**
+ * The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
+ * the view can offer them as a section of their own — see `tosse::backlog`.
+ */
+async tosseBacklog() : Promise<Result<TosseBacklogTask[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_backlog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
  * the CRM for everything it deliberately does not edit (title, priority, assignee, due
  * date, deletion). Discovered, not hard-coded — see `tosse::web_url`.
@@ -3067,6 +3079,11 @@ signedOutReason: string | null;
  * card stays "connected" and shows this as the reason the name/email are missing.
  */
 identityError: string | null }
+/**
+ * A backlog task, plus the project it belongs to so the view can file it under the right
+ * card. `project_id` is `None` for a task that has no project at all.
+ */
+export type TosseBacklogTask = { projectId: string | null; task: TosseTask }
 /**
  * `GET /api/v1/briefing/morning`, normalised.
  * 

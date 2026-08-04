@@ -641,6 +641,14 @@ pub async fn tosse_briefing() -> Result<crate::tosse::TosseBriefing, String> {
     crate::tosse::briefing().await.map_err(|e| e.to_string())
 }
 
+/// The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
+/// the view can offer them as a section of their own — see `tosse::backlog`.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_backlog() -> Result<Vec<crate::tosse::TosseBacklogTask>, String> {
+    crate::tosse::backlog().await.map_err(|e| e.to_string())
+}
+
 /// Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
 /// the CRM for everything it deliberately does not edit (title, priority, assignee, due
 /// date, deletion). Discovered, not hard-coded — see `tosse::web_url`.

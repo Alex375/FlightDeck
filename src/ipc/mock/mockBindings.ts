@@ -59,6 +59,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   TosseAccountStatus,
+  TosseBacklogTask,
   TosseBriefing,
   TosseProject,
   TosseRepoLink,
@@ -637,6 +638,33 @@ export const mockCommands = {
   // the production frontend so "Open in TOSSE" is clickable in a mock run too.
   async tosseWebUrl(): Promise<Result<string, string>> {
     return ok("https://frontend-production-7e11.up.railway.app");
+  },
+  // Backlog comes from its own endpoint (the briefing excludes it). Spread across a project
+  // AND the project-less band, so a demo run exercises both places it can appear.
+  async tosseBacklog(): Promise<Result<TosseBacklogTask[], string>> {
+    return ok([
+      {
+        projectId: "p-tosse-code",
+        task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", {
+          priority: "Haute",
+        }),
+      },
+      {
+        projectId: "p-tosse-code",
+        task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
+          priority: "Basse",
+          assignedTo: "Armand",
+        }),
+      },
+      {
+        projectId: "p-santecall",
+        task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog"),
+      },
+      {
+        projectId: null,
+        task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
+      },
+    ]);
   },
   async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
     const found = demoAllTasks().find((row) => row.task.id === taskId);

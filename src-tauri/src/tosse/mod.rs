@@ -1718,6 +1718,51 @@ pub async fn briefing() -> R<TosseBriefing> {
     parse_briefing(data)
 }
 
+/// A backlog task, plus the project it belongs to so the view can file it under the right
+/// card. `project_id` is `None` for a task that has no project at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseBacklogTask {
+    pub project_id: Option<String>,
+    pub task: TosseTask,
+}
+
+/// Every task sitting in `Backlog`.
+///
+/// ⚠️ A SEPARATE request on purpose: the briefing deliberately excludes Backlog (along with
+/// `Fait`, `En attente` and `Archivé`) because it answers "what am I working on", and the
+/// server is the one who decides that. Rather than fight it, we ask the tasks endpoint for
+/// exactly the status the briefing left out.
+///
+/// `active_projects_only` mirrors the briefing's own view of the world, so a backlog task
+/// belonging to a paused or finished project does not reappear under a card the briefing
+/// itself would not show.
+pub async fn backlog() -> R<Vec<TosseBacklogTask>> {
+    let v = api_get("/api/v1/tasks?status=Backlog&active_projects_only=true").await?;
+    let rows = v
+        .pointer("/data")
+        .or_else(|| v.get("data"))
+        .unwrap_or(&v);
+    let Value::Array(rows) = rows else {
+        return Err(TosseError::Protocol(format!(
+            "the task list was not an array: {}",
+            snippet(&rows.to_string())
+        )));
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(TosseBacklogTask {
+                project_id: row
+                    .pointer("/project/id")
+                    .and_then(Value::as_str)
+                    .or_else(|| row.get("projectId").and_then(Value::as_str))
+                    .map(str::to_string),
+                task: parse_task(row)?,
+            })
+        })
+        .collect()
+}
+
 /// Shape the briefing payload. Split from the request so the mapping is testable without a
 /// network round-trip — the shape is the part that breaks when the CRM changes.
 fn parse_briefing(data: &Value) -> R<TosseBriefing> {

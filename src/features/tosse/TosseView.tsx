@@ -22,6 +22,7 @@ import {
   useCreateTosseTask,
   useSetTosseProjectStatus,
   useSetTosseTaskStatus,
+  useTosseBacklog,
   useTosseBriefing,
   useTosseTaskDetail,
   useTosseWebUrl,
@@ -30,16 +31,16 @@ import { AssigneeAvatar, splitMcpActor } from "./AssigneeAvatar";
 import { ClientAvatar } from "./ClientAvatar";
 import { useTosseFold } from "../../store/tosseFold";
 
-/** Fold key for the project-less band. Prefixed so it can never collide with a client id. */
-const GENERAL_FOLD_KEY = "band:general";
 import type { TosseProject, TosseTask } from "../../ipc/client";
 import {
   briefingTotals,
+  groupBacklogByProject,
   groupByClient,
   isOverdue,
   projectActions,
   sectionIcon,
   sectionLabel,
+  sortedBacklog,
   shortDate,
   statusSections,
   STATUS_TONE,
@@ -48,6 +49,18 @@ import {
   type StatusSection,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
+
+/** Fold key for the project-less band. Prefixed so it can never collide with a client id. */
+const GENERAL_FOLD_KEY = "band:general";
+
+/**
+ * Fold key for a card's Backlog section.
+ *
+ * ⚠️ Read INVERTED. `tosseFold` stores what is CLOSED, because every other band defaults to
+ * open. The backlog defaults to CLOSED — it is what you are not working on — so here the
+ * presence of the key means OPEN. Same store, same persistence, opposite default.
+ */
+const backlogKey = (projectId: string) => `backlog:${projectId}`;
 
 /** The progress ring on a project card (done / total across ALL its tasks). Pure SVG —
  *  the same shape the CRM draws, so the two read as one number. */
@@ -120,6 +133,66 @@ function MiniRing({ done, total }: { done: number; total: number }) {
         strokeDashoffset={c - pct * c}
       />
     </svg>
+  );
+}
+
+/**
+ * A card's Backlog: everything parked, behind a fold that starts CLOSED.
+ *
+ * It is a section like the others — same head, same rows — but it does not belong in the
+ * status order: the briefing is "what am I working on", and the backlog is the answer to a
+ * different question. Hence its own fold, its own default, and a heading you have to open.
+ */
+function BacklogSection({
+  foldKey,
+  tasks,
+  selectedTaskId,
+  onOpenTask,
+  onStatus,
+  writeErrors,
+}: {
+  foldKey: string;
+  tasks: TosseTask[];
+  selectedTaskId: string | null;
+  onOpenTask: (id: string) => void;
+  onStatus: (task: TosseTask, status: string) => void;
+  writeErrors?: Record<string, string>;
+}) {
+  // Inverted read — see `backlogKey`.
+  const open = useTosseFold((f) => f.folded[foldKey] === true);
+  const toggle = useTosseFold((f) => f.toggle);
+  if (tasks.length === 0) return null;
+  return (
+    <div className={s.section} data-tone="todo">
+      <button
+        className={`${s.sectionHead} ${s.sectionToggle}`}
+        onClick={() => toggle(foldKey)}
+        aria-expanded={open}
+        title={open ? "Hide the backlog" : "Show the backlog"}
+      >
+        <span className={`${s.sectionChevron} ${open ? "" : s.sectionChevronClosed}`}>
+          <Ico name="chevron" className="sm" />
+        </span>
+        <span className={s.sectionLabel}>Backlog</span>
+        <span className={s.sectionCount}>{tasks.length}</span>
+        <span className={s.sectionRule} />
+      </button>
+      {open
+        ? sortedBacklog(tasks).map((task) => (
+            <div key={task.id}>
+              <TaskRow
+                task={task}
+                selected={task.id === selectedTaskId}
+                onOpen={() => onOpenTask(task.id)}
+                onStatus={(status) => onStatus(task, status)}
+              />
+              {writeErrors?.[task.id] ? (
+                <div className={s.rowError}>{writeErrors[task.id]}</div>
+              ) : null}
+            </div>
+          ))
+        : null}
+    </div>
   );
 }
 
@@ -344,6 +417,7 @@ function ProjectCard({
   project,
   paused,
   index,
+  backlog,
   selectedTaskId,
   onOpenTask,
 }: {
@@ -351,6 +425,8 @@ function ProjectCard({
   paused?: boolean;
   /** Position in its band — drives the entry cascade (capped in CSS at 6 steps). */
   index?: number;
+  /** This project's parked tasks — they come from a separate request, see `useTosseBacklog`. */
+  backlog: TosseTask[];
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -438,7 +514,25 @@ function ProjectCard({
               )
             }
           />
-          {sections.length === 0 ? <div className={s.cardEmpty}>No open task</div> : null}
+          <BacklogSection
+            foldKey={backlogKey(project.id)}
+            tasks={backlog}
+            selectedTaskId={selectedTaskId}
+            onOpenTask={onOpenTask}
+            writeErrors={taskErrors.errors}
+            onStatus={(task, status) =>
+              setTaskStatus.mutate(
+                { taskId: task.id, status, title: task.title },
+                {
+                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
+                  onSuccess: () => taskErrors.clear(task.id),
+                },
+              )
+            }
+          />
+          {sections.length === 0 && backlog.length === 0 ? (
+            <div className={s.cardEmpty}>No open task</div>
+          ) : null}
           {/* ONE creation line per card, not one per section: a row under every status was
               three invitations where one is wanted. New tasks land in « À faire » — the
               status they nearly always start in — and moving one is a single click away. */}
@@ -686,10 +780,13 @@ function TaskDetail({
 /** A client band: a fold whose header keeps reporting what's inside when closed. */
 function ClientBand({
   band,
+  backlogByProject,
   selectedTaskId,
   onOpenTask,
 }: {
   band: ReturnType<typeof groupByClient>[number];
+  /** projectId → its parked tasks, from the separate backlog request. */
+  backlogByProject: Record<string, TosseTask[]>;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -734,6 +831,7 @@ function ClientBand({
               project={p}
               index={i}
               paused={p.status === "En pause"}
+              backlog={backlogByProject[p.id] ?? []}
               selectedTaskId={selectedTaskId}
               onOpenTask={onOpenTask}
             />
@@ -755,6 +853,14 @@ export function TosseView() {
   const totals = useMemo(
     () => briefingTotals(data?.projects ?? [], data?.generalTasks ?? []),
     [data],
+  );
+  // The backlog comes from its own request (the briefing excludes it), so it is filed under
+  // the right card here rather than by every card asking for its own.
+  const { data: backlogRows } = useTosseBacklog();
+  const backlogByProject = useMemo(() => groupBacklogByProject(backlogRows ?? []), [backlogRows]);
+  const generalBacklog = useMemo(
+    () => (backlogRows ?? []).filter((r) => !r.projectId).map((r) => r.task),
+    [backlogRows],
   );
 
   return (
@@ -830,14 +936,16 @@ export function TosseView() {
               <ClientBand
                 key={band.key}
                 band={band}
+                backlogByProject={backlogByProject}
                 selectedTaskId={openTaskId}
                 onOpenTask={setOpenTaskId}
               />
             ))}
 
-            {data && data.generalTasks.length > 0 ? (
+            {(data?.generalTasks.length ?? 0) > 0 || generalBacklog.length > 0 ? (
               <GeneralTaskBand
-                tasks={data.generalTasks}
+                tasks={data?.generalTasks ?? []}
+                backlog={generalBacklog}
                 selectedTaskId={openTaskId}
                 onOpenTask={setOpenTaskId}
               />
@@ -884,10 +992,13 @@ export function TosseView() {
  */
 function GeneralTaskBand({
   tasks,
+  backlog,
   selectedTaskId,
   onOpenTask,
 }: {
   tasks: TosseTask[];
+  /** Parked tasks that belong to no project either. */
+  backlog: TosseTask[];
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -919,6 +1030,22 @@ function GeneralTaskBand({
         <div className={s.card}>
           <StatusSections
             sections={sections}
+            selectedTaskId={selectedTaskId}
+            onOpenTask={onOpenTask}
+            writeErrors={taskErrors.errors}
+            onStatus={(task, status) =>
+              setTaskStatus.mutate(
+                { taskId: task.id, status, title: task.title },
+                {
+                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
+                  onSuccess: () => taskErrors.clear(task.id),
+                },
+              )
+            }
+          />
+          <BacklogSection
+            foldKey={backlogKey(GENERAL_FOLD_KEY)}
+            tasks={backlog}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
             writeErrors={taskErrors.errors}

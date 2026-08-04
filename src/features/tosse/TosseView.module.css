@@ -453,6 +453,29 @@
    box around each; halve it and the card collapses back into one long run of rows. */
 .section + .section { margin-top: 16px; }
 .sectionHead { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+/* The Backlog head is a button — same row, but it opens and closes. Reset the button chrome
+   and give it the card's own hover bleed so it reads as clickable. */
+.sectionToggle {
+  width: calc(100% + 12px);
+  margin: 0 -6px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: var(--wf-r);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sectionToggle:hover { background: var(--wf-panel-2); }
+.sectionToggle:hover .sectionLabel { color: var(--wf-tx-hi); }
+.sectionChevron {
+  display: inline-flex;
+  color: var(--ts-todo);
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sectionChevron svg { width: 12px; height: 12px; }
+.sectionChevronClosed { transform: rotate(-90deg); }
 .sectionDot {
   width: 6px;
   height: 6px;
@@ -789,16 +812,31 @@
   text-transform: uppercase;
   color: #8fa0d8;
 }
+/* A proper 28px target with a visible surface. At 2px of padding around a 13px glyph it was
+   a ~17px hitbox in the corner of a 500px panel — the control you reach for most often in
+   here, and the hardest one to hit. */
 .detailClose {
   margin-left: auto;
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  /* Pulled out so the bigger button doesn't push the kicker line down. */
+  margin-top: -4px;
+  margin-right: -6px;
+  border-radius: var(--wf-r);
+  border: 1px solid transparent;
   background: transparent;
-  border: 0;
   color: var(--wf-tx-lo);
   cursor: pointer;
-  display: inline-flex;
-  padding: 2px;
+  transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1), color 0.15s, border-color 0.15s;
 }
-.detailClose:hover { color: var(--wf-tx-hi); }
+.detailClose svg { width: 15px; height: 15px; }
+.detailClose:hover {
+  color: var(--wf-tx-hi);
+  background: var(--wf-panel-2);
+  border-color: var(--wf-line-2);
+}
 /* The CRM's task hero leads with SIZE, not weight — a light 26px title. At 20px the 300
    weight still holds in SF Pro; don't carry it down to body sizes, where it goes thin. */
 .detailTitle {

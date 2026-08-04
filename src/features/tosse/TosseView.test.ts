@@ -56,6 +56,8 @@ vi.mock("../../ipc/useTosse", () => ({
     dataUpdatedAt: 0,
   }),
   useTosseTaskDetail: () => ({ data: undefined, isLoading: false, error: null }),
+  // The backlog is a separate request; these tests are about the board itself.
+  useTosseBacklog: () => ({ data: [], isLoading: false, error: null }),
   useSetTosseTaskStatus: () => taskStatusMutation(),
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),

@@ -148,6 +148,25 @@ export function statusSections(tasks: TosseTask[]): StatusSection[] {
   return sections;
 }
 
+/** Backlog rows, in the same order as any other section. Exported because the backlog is
+ *  rendered on its own, outside `statusSections`. */
+export function sortedBacklog(tasks: TosseTask[]): TosseTask[] {
+  return sortTasks(tasks);
+}
+
+/** File the flat backlog response under each project id. Tasks with no project are left
+ *  out — the caller renders those in the project-less band. */
+export function groupBacklogByProject(
+  rows: Array<{ projectId: string | null; task: TosseTask }>,
+): Record<string, TosseTask[]> {
+  const by: Record<string, TosseTask[]> = {};
+  for (const row of rows) {
+    if (!row.projectId) continue;
+    (by[row.projectId] ??= []).push(row.task);
+  }
+  return by;
+}
+
 /** Priority first, then title — a total order, so a re-render after an optimistic write
  *  can't shuffle equal-priority rows around. */
 function sortTasks(tasks: TosseTask[]): TosseTask[] {

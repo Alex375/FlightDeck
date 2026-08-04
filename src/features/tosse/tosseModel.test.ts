@@ -4,12 +4,14 @@ import type { TosseBriefing } from "../../ipc/client";
 import {
   applyStatusToBoard,
   briefingTotals,
+  groupBacklogByProject,
   groupByClient,
   isOverdue,
   projectActions,
   sectionIcon,
   sectionLabel,
   shortDate,
+  sortedBacklog,
   statusSections,
   STATUSES_OFF_THE_BOARD,
   TASK_STATUS_CHOICES,
@@ -221,6 +223,39 @@ describe("section headings", () => {
     expect(sectionIcon("En attente")).toBe("circledot");
     // An unknown status still gets a glyph rather than an empty slot.
     expect(sectionIcon("Statut inconnu")).toBe("list");
+  });
+});
+
+describe("backlog grouping", () => {
+  it("files each parked task under its project", () => {
+    const rows = [
+      { projectId: "p1", task: task("b1", "Backlog") },
+      { projectId: "p2", task: task("b2", "Backlog") },
+      { projectId: "p1", task: task("b3", "Backlog") },
+    ];
+    const by = groupBacklogByProject(rows);
+    expect(by.p1.map((t) => t.id)).toEqual(["b1", "b3"]);
+    expect(by.p2.map((t) => t.id)).toEqual(["b2"]);
+  });
+
+  // Project-less backlog tasks belong to the "No project" band, which reads them from the
+  // raw list — grouping them under a project id would file them nowhere and lose them.
+  it("leaves project-less tasks out rather than inventing a bucket", () => {
+    const by = groupBacklogByProject([{ projectId: null, task: task("b-solo", "Backlog") }]);
+    expect(by).toEqual({});
+  });
+
+  it("is empty, not undefined, for a project with nothing parked", () => {
+    expect(groupBacklogByProject([])).toEqual({});
+  });
+
+  it("orders the backlog like every other section (priority, then title)", () => {
+    const rows = [
+      task("z", "Backlog", { priority: "Basse", title: "z" }),
+      task("a", "Backlog", { priority: "Urgente", title: "a" }),
+      task("m", "Backlog", { priority: "Moyenne", title: "m" }),
+    ];
+    expect(sortedBacklog(rows).map((t) => t.title)).toEqual(["a", "m", "z"]);
   });
 });
 

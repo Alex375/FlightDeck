@@ -11,6 +11,7 @@ import { commands } from "./client";
 import type {
   Result,
   TosseAccountStatus,
+  TosseBacklogTask,
   TosseBriefing,
   TosseRepoLink,
   TosseRepoLinksPayload,
@@ -213,6 +214,24 @@ export function useTosseWebUrl(enabled = true) {
   });
 }
 
+export const tosseBacklogKey = ["tosse-backlog"] as const;
+
+/**
+ * The Backlog tasks, which the briefing deliberately omits.
+ *
+ * A second request, and a deliberately cold one: a backlog is what you are NOT working on,
+ * so it does not need to track the board minute by minute. It is still invalidated by the
+ * writes below, so moving a task into or out of Backlog is reflected.
+ */
+export function useTosseBacklog(enabled = true) {
+  return useQuery<TosseBacklogTask[]>({
+    queryKey: tosseBacklogKey,
+    enabled,
+    queryFn: () => unwrap(commands.tosseBacklog()),
+    staleTime: 5 * 60_000,
+  });
+}
+
 /** One task in full — fetched only when a row is opened (the briefing omits the Markdown). */
 export function useTosseTaskDetail(taskId: string | null) {
   return useQuery<TosseTaskDetail>({
@@ -267,6 +286,8 @@ export function useSetTosseTaskStatus() {
     },
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      // A status write can move a task INTO or OUT OF Backlog, so that list is stale too.
+      void qc.invalidateQueries({ queryKey: tosseBacklogKey });
       // The WHOLE `tosse-task` prefix, not just the task we wrote. Ticking a SUBTASK writes
       // the subtask's id, while the panel on screen is keyed by its PARENT — invalidating
       // only the written id refreshed a query nobody was looking at, so the checkbox never

@@ -69,6 +69,7 @@ export type {
   SlashCommand,
   TickEvent,
   TosseAccountStatus,
+  TosseBacklogTask,
   TosseBriefing,
   TosseClientRef,
   TosseProject,
