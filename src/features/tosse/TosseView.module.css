@@ -697,12 +697,16 @@
   background: var(--wf-bg-2);
   display: flex;
   flex-direction: column;
-  animation: detailIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* Deliberately NOT the expo-out used elsewhere: that curve covers most of the distance in
+     its first few frames and then stops dead, which on a 500px panel arriving from the edge
+     reads as a slam. An ease-out-cubic over a longer 0.36s travels evenly and settles. */
+  animation: detailIn 0.36s cubic-bezier(0.33, 1, 0.68, 1) both;
 }
 @keyframes detailIn {
   from {
     opacity: 0;
-    transform: translateX(10px);
+    /* A shorter slide, over a longer time: the movement should be felt, not watched. */
+    transform: translateX(8px);
   }
   to {
     opacity: 1;
@@ -791,14 +795,28 @@
 }
 /* Staggered on open AND on switching task (the panel is keyed by task id), so replacing
    one task with another is legible instead of an instant swap. */
+/* Longer and softer than the panel's own entrance, with the steps kept close together so
+   the sections read as ONE settling movement rather than as items being dealt out. */
 .detailBody > section {
-  animation: tosseIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: sectionIn 0.42s cubic-bezier(0.33, 1, 0.68, 1) both;
 }
-.detailBody > section:nth-child(1) { animation-delay: 40ms; }
-.detailBody > section:nth-child(2) { animation-delay: 80ms; }
-.detailBody > section:nth-child(3) { animation-delay: 120ms; }
-.detailBody > section:nth-child(4) { animation-delay: 160ms; }
-.detailBody > section:nth-child(n + 5) { animation-delay: 200ms; }
+.detailBody > section:nth-child(1) { animation-delay: 50ms; }
+.detailBody > section:nth-child(2) { animation-delay: 95ms; }
+.detailBody > section:nth-child(3) { animation-delay: 140ms; }
+.detailBody > section:nth-child(4) { animation-delay: 180ms; }
+.detailBody > section:nth-child(n + 5) { animation-delay: 215ms; }
+/* Its own keyframe: a 4px lift, where the cards' entrance uses 8px. Inside an already
+   moving panel, the card's travel would double up and feel busy. */
+@keyframes sectionIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
 .detailKey {
   font-family: var(--wf-sans);
   font-size: 10px;
