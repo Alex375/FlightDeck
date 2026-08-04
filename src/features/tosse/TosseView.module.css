@@ -146,13 +146,15 @@
 .emptyBig { color: var(--wf-tx-lo); font-size: 14px; }
 
 /* ---- client band ------------------------------------------------------ */
+/* The client band is the view's top-level divider — the thing you scan to find WHOSE work
+   you are looking at — so it is deliberately bigger than a section heading inside a card. */
 .band {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 11px;
   /* A new client gets real white space above it; the FIRST one doesn't, or the page would
      open on a gap. */
-  padding: 24px 2px 10px;
+  padding: 30px 2px 14px;
   background: transparent;
   border: 0;
   width: 100%;
@@ -161,26 +163,26 @@
   color: inherit;
   transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.column > .band:first-child { padding-top: 6px; }
+.column > .band:first-child { padding-top: 10px; }
 .bandStatic { cursor: default; }
 .band:hover .bandName { color: var(--wf-tx-hi); }
 .bandChevron {
   color: var(--wf-tx-lo);
-  font-size: 10px;
-  width: 10px;
-  flex: 0 0 10px;
+  font-size: 11px;
+  width: 11px;
+  flex: 0 0 11px;
 }
 /* Initials plate — the last resort when a client has neither a logo nor a usable domain.
    The gradient is set inline (hashed from the name, as in the CRM) so the same client wears
    the same colour in both apps. */
 .bandAvatar {
-  width: 19px;
-  height: 19px;
-  border-radius: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
   display: grid;
   place-items: center;
   font-family: var(--wf-sans);
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   color: #fff;
   background: var(--wf-tosse-accent);
@@ -189,9 +191,9 @@
 /* The real mark: an uploaded logo or the site's favicon, on a light plate — most brand
    marks are drawn for a white background and vanish on our dark one. */
 .bandLogo {
-  width: 19px;
-  height: 19px;
-  border-radius: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -206,11 +208,22 @@
 }
 .bandName {
   font-family: var(--wf-mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
+  font-size: 13px;
+  font-weight: 600;
+  /* Slightly tighter than before: tracking that reads as "spaced" at 11px reads as "loose"
+     at 13, and the name would start to drift apart. */
+  letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--wf-tx);
+  color: var(--wf-tx-hi);
   white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Does NOT shrink. The band answers "whose work is this?", so the counts and the project
+     tally (both `overflow: hidden`) give up their width entirely before the name loses a
+     letter. Capped at 55% so an unusually long client name still cannot crowd the band out. */
+  flex: 0 0 auto;
+  max-width: 55%;
 }
 .bandFolded .bandName { color: var(--wf-tx-lo); }
 /* `1 1 8px`: the rule is the first thing to give up room when the band gets tight, so the
@@ -233,6 +246,10 @@
   color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  /* The least useful thing on the band, so it is the first to give up its width. */
+  flex: 0 6 auto;
+  min-width: 0;
+  overflow: hidden;
 }
 
 /* ---- project card ----------------------------------------------------- */
