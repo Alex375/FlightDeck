@@ -9,10 +9,12 @@
 // One request feeds all of it (`tosse_briefing`); the detail panel fetches a task in full
 // only when a row is opened. Writes are optimistic with a whole-board rollback, and a
 // refused write says why — see `useTosse`.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
+import { Splitter } from "../editor/Splitter";
 import { useSettingsUi } from "../../store/settingsUi";
+import { useTosseDetail } from "../../store/tosseDetail";
 import { useHistoryUi } from "../history/historyUiStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -31,6 +33,8 @@ import {
   groupByClient,
   isOverdue,
   projectActions,
+  sectionIcon,
+  sectionLabel,
   shortDate,
   statusSections,
   STATUS_TONE,
@@ -262,8 +266,12 @@ function StatusSections({
           data-tone={STATUS_TONE[section.status] ?? "todo"}
         >
           <div className={s.sectionHead}>
+            {/* Dot THEN icon THEN heading — the CRM draws all three, and the pair reads as
+                one mark. « Review » is titled « En revue » here, as it is there; the status
+                VALUE keeps its own name everywhere it is written or picked. */}
             <span className={s.sectionDot} />
-            <span className={s.sectionLabel}>{section.status}</span>
+            <Ico name={sectionIcon(section.status)} className={`sm ${s.sectionIco}`} />
+            <span className={s.sectionLabel}>{sectionLabel(section.status)}</span>
             <span className={s.sectionCount}>{section.tasks.length}</span>
             <span className={s.sectionRule} />
           </div>
@@ -286,11 +294,14 @@ function StatusSections({
 function ProjectCard({
   project,
   paused,
+  index,
   selectedTaskId,
   onOpenTask,
 }: {
   project: TosseProject;
   paused?: boolean;
+  /** Position in its band — drives the entry cascade (capped in CSS at 6 steps). */
+  index?: number;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -309,7 +320,10 @@ function ProjectCard({
   };
 
   return (
-    <div className={`${s.card} ${paused ? s.cardPaused : ""}`}>
+    <div
+      className={`${s.card} ${paused ? s.cardPaused : ""}`}
+      style={{ "--i": index ?? 0 } as React.CSSProperties}
+    >
       <div className={s.cardHead}>
         <div className={s.cardIdent}>
           <div className={s.cardName}>{project.name}</div>
@@ -408,7 +422,15 @@ function stateClass(status: string | null): string {
 }
 
 /** The detail panel: the CRM's task panel, trimmed to what this app can act on. */
-function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+function TaskDetail({
+  taskId,
+  width,
+  onClose,
+}: {
+  taskId: string;
+  width: number;
+  onClose: () => void;
+}) {
   const { data, isLoading, error } = useTosseTaskDetail(taskId);
   const setTaskStatus = useSetTosseTaskStatus();
   const { error: webUrlError } = useTosseWebUrl();
@@ -437,7 +459,10 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
   }, [modalOver, onClose]);
 
   return (
-    <aside className={s.detail}>
+    <aside
+      className={s.detail}
+      style={{ "--tosse-detail-w": `${width}px` } as React.CSSProperties}
+    >
       <div className={s.detailHead}>
         <div className={s.detailKicker}>
           {data?.projectName ?? "TOSSE"}
@@ -492,7 +517,7 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
         {data?.task.notes ? (
           <section>
             <div className={s.detailKey}>Notes</div>
-            <div className={s.md}>
+            <div className={s.mdCard}>
               <StreamMarkdown text={data.task.notes} />
             </div>
           </section>
@@ -501,7 +526,7 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
         {data?.context ? (
           <section>
             <div className={s.detailKey}>Context</div>
-            <div className={s.md}>
+            <div className={s.mdCard}>
               <StreamMarkdown text={data.context} />
             </div>
           </section>
@@ -582,7 +607,7 @@ function ClientBand({
             whether something in there is running or waiting. */}
         <span className={s.bandCounts}>
           {running > 0 ? <b className={s.cRun}>{running} en cours</b> : null}
-          {review > 0 ? <b className={s.cRev}>{review} review</b> : null}
+          {review > 0 ? <b className={s.cRev}>{review} en revue</b> : null}
           {todo > 0 ? <b className={s.cTodo}>{todo} à faire</b> : null}
         </span>
         <span className={s.bandProjects}>
@@ -591,10 +616,11 @@ function ClientBand({
       </button>
       {folded
         ? null
-        : band.projects.map((p) => (
+        : band.projects.map((p, i) => (
             <ProjectCard
               key={p.id}
               project={p}
+              index={i}
               paused={p.status === "En pause"}
               selectedTaskId={selectedTaskId}
               onOpenTask={onOpenTask}
@@ -607,6 +633,9 @@ function ClientBand({
 export function TosseView() {
   const { data, isLoading, isFetching, error, refetch, dataUpdatedAt } = useTosseBriefing();
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const detailWidth = useTosseDetail((d) => d.width);
+  const setDetailWidth = useTosseDetail((d) => d.setWidth);
   const bands = useMemo(
     () => groupByClient(data?.projects ?? [], data?.pausedProjects ?? []),
     [data],
@@ -629,7 +658,7 @@ export function TosseView() {
           ) : null}
           {(totals["Review"] ?? 0) > 0 ? (
             <span>
-              <b className={s.cRev}>{totals["Review"]}</b> Review
+              <b className={s.cRev}>{totals["Review"]}</b> {sectionLabel("Review")}
             </span>
           ) : null}
           {(totals["À faire"] ?? 0) > 0 ? (
@@ -650,6 +679,8 @@ export function TosseView() {
               : ""}
         </span>
         <button className={s.act} onClick={() => void refetch()} disabled={isFetching}>
+          {/* Spins while syncing, via the wirekit's existing class — no new CSS. */}
+          <Ico name="refresh" className={`sm${isFetching ? " wf-spin-fast" : ""}`} />
           Refresh
         </button>
       </div>
@@ -666,7 +697,7 @@ export function TosseView() {
         </div>
       ) : null}
 
-      <div className={s.body}>
+      <div className={s.body} ref={bodyRef}>
         <div className={s.scroll}>
           <div className={s.column}>
             {isLoading ? <div className={s.muted}>Loading the briefing…</div> : null}
@@ -697,7 +728,27 @@ export function TosseView() {
           </div>
         </div>
 
-        {openTaskId ? <TaskDetail taskId={openTaskId} onClose={() => setOpenTaskId(null)} /> : null}
+        {openTaskId ? (
+          <>
+            {/* The panel's width is the user's call and it persists — same treatment as the
+                conversations sidebar. */}
+            <Splitter
+              axis="x"
+              onMove={(x) => {
+                const box = bodyRef.current?.getBoundingClientRect();
+                if (box) setDetailWidth(box.right - x);
+              }}
+            />
+            {/* Keyed by task id so switching tasks REPLAYS the section cascade — otherwise
+                one task is swapped for another with nothing to mark the change. */}
+            <TaskDetail
+              key={openTaskId}
+              taskId={openTaskId}
+              width={detailWidth}
+              onClose={() => setOpenTaskId(null)}
+            />
+          </>
+        ) : null}
       </div>
     </div>
   );

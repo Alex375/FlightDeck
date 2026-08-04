@@ -58,9 +58,18 @@ export function applyStatusToBoard(
  */
 export const STATUS_ORDER = ["En cours", "Review", "À faire", "En attente", "Backlog"] as const;
 
-/** Semantic tone per status — mapped to Flight Deck's OWN colour language, deliberately not
- *  the CRM's (which paints "En cours" blue). Here blue already means "waiting for you" and
- *  green means "running", and two views of one app must not contradict each other. */
+/**
+ * Semantic tone per status.
+ *
+ * ⚠️ These tones are painted with the CRM's OWN colours in this view — blue for « En cours »,
+ * amber for « En revue » — and NOT with Flight Deck's language (where green means running
+ * and blue means waiting for you). Alexandre reversed the 2026-08-01 decision on
+ * 2026-08-04, having been told the two views would then disagree: this screen is the CRM's
+ * board, and the point is that it reads like the CRM.
+ *
+ * The colours live in `TosseView.module.css` as `--ts-*` variables scoped to `.page`, so the
+ * Flight Deck's own dots and rails are untouched.
+ */
 export const STATUS_TONE: Record<string, "run" | "wait" | "todo" | "hold" | "done"> = {
   "En cours": "run",
   Review: "wait",
@@ -69,6 +78,33 @@ export const STATUS_TONE: Record<string, "run" | "wait" | "todo" | "hold" | "don
   Backlog: "todo",
   Fait: "done",
 };
+
+/**
+ * What a status section is CALLED on a project card.
+ *
+ * The CRM's Briefing renames exactly one: « Review » reads « En revue » as a section
+ * heading, while the status VALUE stays « Review » everywhere it is written or picked
+ * (the status menu, the detail chip). We carry both, as it does.
+ */
+export const SECTION_LABELS: Record<string, string> = { Review: "En revue" };
+
+export function sectionLabel(status: string): string {
+  return SECTION_LABELS[status] ?? status;
+}
+
+/** The icon a status section wears, mirroring the CRM Briefing (Play / Eye / ListTodo /
+ *  CircleDot). Unknown statuses fall back to the list glyph rather than going bare. */
+export const SECTION_ICONS: Record<string, string> = {
+  "En cours": "play",
+  Review: "eye",
+  "À faire": "list",
+  "En attente": "circledot",
+  Backlog: "list",
+};
+
+export function sectionIcon(status: string): string {
+  return SECTION_ICONS[status] ?? "list";
+}
 
 /** Priority ordering inside a section. Unknown/absent priorities sit with "Moyenne" rather
  *  than at either end — an unlabelled task is ordinary, not urgent and not last. */

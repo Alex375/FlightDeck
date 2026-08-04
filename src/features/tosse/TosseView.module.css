@@ -1,9 +1,34 @@
-/* TOSSE tasks view. Structure follows the CRM's Briefing page; every colour comes from
-   the app's own tokens (conductor-wirekit.css) — no new hue is introduced here.
-   Status tones map to Flight Deck's language: run = green, review = blue (waiting for
-   you), à faire = neutral, en attente = violet. */
+/* TOSSE tasks view — deliberately the CRM's Briefing page, not a Flight Deck screen.
+   Structure, rhythm, type scale and motion are ported from
+   `CRM_max/apps/frontend/app/briefing/page.tsx`, scaled by ~0.85: the CRM is drawn at a
+   16px base, this app at 13px, so its raw values would inflate the view by a third.
+
+   ⚠️ STATUS COLOURS ARE THE CRM'S, NOT THE APP'S — blue « En cours », amber « En revue »,
+   violet « En attente ». That contradicts Flight Deck's own language one tab away (green =
+   running, blue = waiting for you); Alexandre reversed his 2026-08-01 decision on
+   2026-08-04 knowing that, because this screen IS the CRM's board. The hues live in the
+   `--ts-*` variables below, scoped to `.page`, so nothing outside this view is affected.
+   Everything else (surfaces, text, errors) still comes from the app's own tokens. */
 
 .page {
+  /* CRM status palette (Tailwind 500/400 pairs, as `briefing/page.tsx` uses them). */
+  --ts-run: #3b82f6;          /* blue-500  — En cours */
+  --ts-run-tx: #60a5fa;       /* blue-400 */
+  --ts-run-bg: rgba(59, 130, 246, 0.12);
+  --ts-run-line: rgba(59, 130, 246, 0.3);
+  --ts-wait: #f59e0b;         /* amber-500 — En revue */
+  --ts-wait-tx: #fbbf24;      /* amber-400 */
+  --ts-wait-bg: rgba(245, 158, 11, 0.12);
+  --ts-wait-line: rgba(245, 158, 11, 0.3);
+  --ts-todo: #9ca3af;         /* gray-400  — À faire */
+  --ts-todo-line: rgba(156, 163, 175, 0.25);
+  --ts-hold: #8b5cf6;         /* violet-500 — En attente */
+  --ts-hold-tx: #a78bfa;      /* violet-400 */
+  --ts-hold-bg: rgba(139, 92, 246, 0.12);
+  --ts-hold-line: rgba(139, 92, 246, 0.3);
+  --ts-done: #34d399;         /* emerald-400 — Fait */
+  --ts-done-bg: rgba(52, 211, 153, 0.12);
+
   flex: 1;
   min-height: 0;
   display: flex;
@@ -41,8 +66,8 @@
   font-weight: 600;
   margin-right: 4px;
 }
-.cRun { color: var(--wf-run); }
-.cRev { color: var(--wf-wait); }
+.cRun { color: var(--ts-run-tx); }
+.cRev { color: var(--ts-wait-tx); }
 .cTodo { color: var(--wf-tx-hi); }
 .spacer { flex: 1; }
 .sync {
@@ -82,15 +107,17 @@
 }
 .scroll {
   flex: 1;
-  min-width: 0;
+  /* Not 0: the list must keep a floor of its own, or a wide detail panel would grind it
+     down to nothing instead of the panel giving way. */
+  min-width: 340px;
   overflow-y: auto;
-  padding: 4px 18px 28px;
+  padding: 10px 24px 48px;
 }
-/* ONE centred column: projects stack and scroll, never side by side. Capped so a wide
-   window adds margin instead of stretching a task row until its title and its metadata
-   sit at opposite edges. */
+/* ONE centred column: projects stack and scroll, never side by side. Capped at the CRM's
+   own `max-w-5xl` so a wide window adds margin instead of stretching a task row until its
+   title and its metadata sit at opposite edges. */
 .column {
-  max-width: 960px;
+  max-width: 1024px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -113,15 +140,20 @@
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 16px 2px 9px;
+  /* A new client gets real white space above it; the FIRST one doesn't, or the page would
+     open on a gap. */
+  padding: 24px 2px 10px;
   background: transparent;
   border: 0;
   width: 100%;
   cursor: pointer;
   text-align: left;
   color: inherit;
+  transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
+.column > .band:first-child { padding-top: 6px; }
 .bandStatic { cursor: default; }
+.band:hover .bandName { color: var(--wf-tx-hi); }
 .bandChevron {
   color: var(--wf-tx-lo);
   font-size: 10px;
@@ -131,7 +163,7 @@
 .bandAvatar {
   width: 19px;
   height: 19px;
-  border-radius: 5px;
+  border-radius: 6px;
   display: grid;
   place-items: center;
   font-family: var(--wf-mono);
@@ -164,27 +196,44 @@
   background: var(--wf-panel);
   border: 1px solid var(--wf-line);
   border-radius: var(--wf-r-xl);
-  padding: 14px 15px 12px;
-  margin-bottom: 12px;
+  /* The CRM's `p-6` (24px) at our 0.85 scale — the single biggest reason its cards read as
+     calm and ours read as packed. */
+  padding: 20px 22px 16px;
+  margin-bottom: 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
+  /* Entry cascade, capped at 6 steps: a 20-project column must not ripple for a second.
+     ⚠️ Safe ONLY because cards are keyed by `p.id` — key one on mutable data (a status, a
+     count) and every optimistic write would flash the whole column back through opacity 0. */
+  animation: tosseIn 0.34s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(min(var(--i, 0), 6) * 40ms);
+}
+@keyframes tosseIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 .cardPaused { opacity: 0.6; }
 .cardHead { display: flex; align-items: flex-start; gap: 12px; }
 .cardIdent { min-width: 0; }
 .cardName {
-  font-size: 14.5px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--wf-tx-hi);
   letter-spacing: -0.01em;
-  line-height: 1.3;
+  line-height: 1.35;
 }
 .cardMeta {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 3px;
+  gap: 10px;
+  margin-top: 5px;
   font-size: 11px;
   color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
@@ -213,11 +262,14 @@
 .ringTrack { fill: none; stroke: var(--wf-line-2); stroke-width: 2.5; }
 .ringFill {
   fill: none;
-  stroke: var(--wf-run);
+  stroke: var(--ts-run);
   stroke-width: 2.5;
   stroke-linecap: round;
+  /* Sweeps to its new value when a task changes status. The CRM takes 1s, which is far too
+     slow for a number that moves on every click. */
+  transition: stroke-dashoffset 0.42s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.ringFull { composes: ringFill; stroke: var(--wf-run); }
+.ringFull { composes: ringFill; stroke: var(--ts-done); }
 .ringLabel {
   font-family: var(--wf-mono);
   font-size: 10.5px;
@@ -237,15 +289,33 @@
   color: var(--wf-tx-lo);
   white-space: nowrap;
 }
-.state_run { color: var(--wf-run); border-color: #2a5545; background: var(--wf-run-bg); }
-.state_pause { color: var(--wf-att); border-color: #4a3a1c; background: var(--wf-att-bg); }
+/* Chips share the board's palette so a status reads the same wherever it appears. */
+.state_run {
+  color: var(--ts-run-tx);
+  border-color: var(--ts-run-line);
+  background: var(--ts-run-bg);
+}
+.state_pause {
+  color: var(--ts-wait-tx);
+  border-color: var(--ts-wait-line);
+  background: var(--ts-wait-bg);
+}
 .state_todo { color: var(--wf-tx-lo); }
-/* Task tones (STATUS_TONE), for the chip in the detail panel. `run`/`todo` above are shared
-   with the project chip; these three complete the set so a task's status is painted in the
-   SAME language as the board — blue = waiting for you, violet = on hold, green = done. */
-.state_wait { color: var(--wf-wait); border-color: #24425e; background: var(--wf-wait-bg); }
-.state_hold { color: #a78bfa; border-color: #3b3160; background: #211c33; }
-.state_done { color: var(--wf-run); border-color: #2a5545; background: var(--wf-run-bg); }
+.state_wait {
+  color: var(--ts-wait-tx);
+  border-color: var(--ts-wait-line);
+  background: var(--ts-wait-bg);
+}
+.state_hold {
+  color: var(--ts-hold-tx);
+  border-color: var(--ts-hold-line);
+  background: var(--ts-hold-bg);
+}
+.state_done {
+  color: var(--ts-done);
+  border-color: rgba(52, 211, 153, 0.3);
+  background: var(--ts-done-bg);
+}
 .act {
   display: inline-flex;
   align-items: center;
@@ -265,13 +335,23 @@
 
 /* ---- status section --------------------------------------------------- */
 .section { display: flex; flex-direction: column; gap: 2px; }
-.section + .section { margin-top: 9px; }
-.sectionHead { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
-.sectionDot { width: 6px; height: 6px; border-radius: 50%; background: var(--wf-tx-lo); }
+/* The CRM's `space-y-4`, carried at FULL value — the one place we don't scale by 0.85.
+   This 16-against-2 ratio is what turns three lists into three blocks without needing a
+   box around each; halve it and the card collapses back into one long run of rows. */
+.section + .section { margin-top: 16px; }
+.sectionHead { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.sectionDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ts-todo);
+  flex: 0 0 6px;
+}
+.sectionIco { color: var(--ts-todo); flex: 0 0 auto; width: 12px; height: 12px; }
 .sectionLabel {
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--wf-tx-lo);
 }
@@ -283,28 +363,40 @@
 }
 .sectionRule { flex: 1; height: 1px; background: var(--wf-line); }
 
-.section[data-tone="run"] .sectionDot { background: var(--wf-run); }
-.section[data-tone="run"] .sectionLabel { color: var(--wf-run); }
-.section[data-tone="run"] .sectionRule { background: #2a5545; }
-.section[data-tone="wait"] .sectionDot { background: var(--wf-wait); }
-.section[data-tone="wait"] .sectionLabel { color: var(--wf-wait); }
-.section[data-tone="wait"] .sectionRule { background: #314463; }
-.section[data-tone="hold"] .sectionDot { background: var(--wf-ultra); }
-.section[data-tone="hold"] .sectionLabel { color: var(--wf-ultra); }
-.section[data-tone="hold"] .sectionRule { background: #3b2f52; }
+/* Per-status colour — the CRM's, see the header note. The dot takes the saturated 500, the
+   icon and label the lighter 400, exactly as the CRM pairs `dotCls` with `headerCls`. */
+.section[data-tone="run"] .sectionDot { background: var(--ts-run); }
+.section[data-tone="run"] .sectionIco,
+.section[data-tone="run"] .sectionLabel { color: var(--ts-run-tx); }
+.section[data-tone="run"] .sectionRule { background: var(--ts-run-line); }
+.section[data-tone="wait"] .sectionDot { background: var(--ts-wait); }
+.section[data-tone="wait"] .sectionIco,
+.section[data-tone="wait"] .sectionLabel { color: var(--ts-wait-tx); }
+.section[data-tone="wait"] .sectionRule { background: var(--ts-wait-line); }
+.section[data-tone="todo"] .sectionRule { background: var(--ts-todo-line); }
+.section[data-tone="hold"] .sectionDot { background: var(--ts-hold); }
+.section[data-tone="hold"] .sectionIco,
+.section[data-tone="hold"] .sectionLabel { color: var(--ts-hold-tx); }
+.section[data-tone="hold"] .sectionRule { background: var(--ts-hold-line); }
 
 /* ---- task row --------------------------------------------------------- */
 .row {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 5px 8px;
+  padding: 7px 8px;
   margin: 0 -8px;
-  border-radius: var(--wf-r);
+  border-radius: var(--wf-r-l);
   border-left: 2px solid transparent;
   cursor: pointer;
+  /* The CRM's `transition-all` on its own rows: the hover tint and the left rule fade in
+     instead of snapping. Cheap, and the single change that most makes the list feel alive. */
+  transition:
+    background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.row:hover { background: var(--wf-panel-2); border-left-color: var(--wf-tosse-accent); }
+.row:hover { background: var(--wf-panel-2); border-left-color: var(--ts-run); }
 .rowSel { background: var(--wf-panel-3); border-left-color: var(--wf-tosse-accent); }
 .row:hover .title, .rowSel .title { color: var(--wf-tx-hi); }
 
@@ -317,25 +409,38 @@
   border: 1.5px solid var(--wf-tx-xlo);
   background: transparent;
   cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
 }
-.dot_run { background: var(--wf-run); border-color: var(--wf-run); }
-.dot_wait { background: var(--wf-wait); border-color: var(--wf-wait); }
-.dot_hold { background: var(--wf-ultra); border-color: var(--wf-ultra); }
-.dot_done { background: var(--wf-done); border-color: var(--wf-done); }
-.dot_todo { background: transparent; }
+.dot_run { background: var(--ts-run); border-color: var(--ts-run); }
+.dot_wait { background: var(--ts-wait); border-color: var(--ts-wait); }
+.dot_hold { background: var(--ts-hold); border-color: var(--ts-hold); }
+.dot_done { background: var(--ts-done); border-color: var(--ts-done); }
+.dot_todo { background: transparent; border-color: var(--ts-todo); }
 .menuSep { height: 1px; background: var(--wf-line); margin: 3px 4px; }
 
+/* The CRM's priority pill: sentence case with a leading dot, not a shouty micro-caps tag.
+   Shares its metrics with `.state`, so the view has ONE badge grammar instead of two. */
 .pri {
-  font-size: 9.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 1px 6px;
+  padding: 2px 8px;
   border-radius: 999px;
   border: 1px solid var(--wf-line-2);
   color: var(--wf-tx-lo);
   background: var(--wf-panel-2);
   flex: 0 0 auto;
+  white-space: nowrap;
+}
+.pri::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 5px;
 }
 .pri_urg { color: #f3aeb4; border-color: #4a2b2f; background: var(--wf-err-bg); }
 .pri_hi { color: #f0cf9b; border-color: #4a3a1c; background: var(--wf-att-bg); }
@@ -343,8 +448,8 @@
 .pri_low { color: var(--wf-tx-xlo); border-color: var(--wf-line); background: transparent; }
 
 .kind {
-  font-size: 9.5px;
-  padding: 1px 5px;
+  font-size: 10px;
+  padding: 2px 6px;
   border-radius: 4px;
   color: var(--wf-tx-lo);
   background: var(--wf-panel-3);
@@ -354,7 +459,7 @@
 .title {
   flex: 1;
   min-width: 0;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--wf-tx);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -362,14 +467,14 @@
 }
 .subs {
   font-family: var(--wf-mono);
-  font-size: 9.5px;
+  font-size: 10px;
   color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
 }
 .who {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -381,7 +486,7 @@
   flex: 0 0 auto;
 }
 .due {
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
@@ -434,18 +539,63 @@
 
 /* ---- detail panel ----------------------------------------------------- */
 .detail {
-  flex: 0 0 372px;
+  /* `0 1 auto`, NOT `0 0`: a panel that never yields would grind the list to nothing on a
+     narrow window instead of giving way itself. Width is a user preference (drag the
+     splitter), so it comes in as a variable. */
+  flex: 0 1 auto;
+  width: var(--tosse-detail-w, 520px);
+  min-width: 380px;
+  max-width: min(760px, 62vw);
   border-left: 1px solid var(--wf-line);
   background: var(--wf-bg-2);
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  animation: detailIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes detailIn {
+  from {
+    opacity: 0;
+    transform: translateX(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 .detailHead {
-  padding: 13px 16px;
+  position: relative;
+  overflow: hidden;
+  padding: 20px 22px 18px;
   background: linear-gradient(160deg, #1b2036, #15161d);
   border-bottom: 1px solid var(--wf-line);
 }
+/* The CRM hero's depth, at zero cost and deliberately STATIC (the CRM doesn't animate them
+   either). Purely decorative — carries no status meaning.
+   ⚠️ Pseudo-elements are content-box despite the global `* { box-sizing: border-box }`, so
+   these are sized with width/height only and never given a border. */
+.detailHead::before,
+.detailHead::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(64px);
+  pointer-events: none;
+}
+.detailHead::before {
+  width: 224px;
+  height: 224px;
+  top: -80px;
+  right: -80px;
+  background: rgba(224, 90, 64, 0.06);
+}
+.detailHead::after {
+  width: 160px;
+  height: 160px;
+  bottom: -48px;
+  left: -48px;
+  background: rgba(122, 162, 227, 0.05);
+}
+.detailHead > * { position: relative; }
 .detailKicker {
   display: flex;
   align-items: center;
@@ -465,31 +615,51 @@
   padding: 2px;
 }
 .detailClose:hover { color: var(--wf-tx-hi); }
+/* The CRM's task hero leads with SIZE, not weight — a light 26px title. At 20px the 300
+   weight still holds in SF Pro; don't carry it down to body sizes, where it goes thin. */
 .detailTitle {
   color: var(--wf-tx-hi);
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 300;
   line-height: 1.3;
-  margin-top: 6px;
+  margin-top: 8px;
   letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
-.detailChips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.detailChips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .detailBody {
-  padding: 13px 16px;
+  padding: 18px 22px 26px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 20px;
   overflow-y: auto;
   flex: 1;
   min-height: 0;
 }
+/* Sections are separated by a rule, as in the CRM's continuous card — never by empty space
+   alone, which reads as a gap rather than as a boundary. */
+.detailBody > section + section {
+  border-top: 1px solid var(--wf-line);
+  padding-top: 18px;
+}
+/* Staggered on open AND on switching task (the panel is keyed by task id), so replacing
+   one task with another is legible instead of an instant swap. */
+.detailBody > section {
+  animation: tosseIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.detailBody > section:nth-child(1) { animation-delay: 40ms; }
+.detailBody > section:nth-child(2) { animation-delay: 80ms; }
+.detailBody > section:nth-child(3) { animation-delay: 120ms; }
+.detailBody > section:nth-child(4) { animation-delay: 160ms; }
+.detailBody > section:nth-child(n + 5) { animation-delay: 200ms; }
 .detailKey {
-  font-family: var(--wf-mono);
+  font-family: var(--wf-sans);
   font-size: 10px;
-  letter-spacing: 0.1em;
+  font-weight: 600;
+  letter-spacing: 0.2em;
   text-transform: uppercase;
-  color: var(--wf-tx-xlo);
-  margin-bottom: 6px;
+  color: var(--wf-tx-lo);
+  margin-bottom: 8px;
 }
 .detailFoot {
   margin-top: auto;
@@ -497,7 +667,7 @@
   align-items: center;
   gap: 10px;
   border-top: 1px solid var(--wf-line);
-  padding: 12px 16px;
+  padding: 14px 22px;
   flex: 0 0 auto;
 }
 
@@ -525,7 +695,16 @@
   color: var(--wf-tosse-accent, var(--wf-tx-hi));
   border-color: var(--wf-tx-xlo);
 }
-.md { font-size: 12px; }
+/* Notes and Context sit in their own grey card, as in the CRM, instead of running loose on
+   the panel background.
+   ⚠️ No font-size here: `StreamMarkdown` renders `.md-body[data-md-mode="warm"]`, whose
+   higher specificity wins — a rule here would only mislead the next reader. */
+.mdCard {
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r-xl);
+  padding: 14px 16px;
+}
 .blockRow {
   display: flex;
   align-items: center;
@@ -542,31 +721,71 @@
   background: var(--wf-tx-lo);
   flex: 0 0 6px;
 }
-.blockDot[data-tone="run"] { background: var(--wf-run); }
-.blockDot[data-tone="wait"] { background: var(--wf-wait); }
-.blockDot[data-tone="done"] { background: var(--wf-done); }
+.blockDot[data-tone="run"] { background: var(--ts-run); }
+.blockDot[data-tone="wait"] { background: var(--ts-wait); }
+.blockDot[data-tone="hold"] { background: var(--ts-hold); }
+.blockDot[data-tone="done"] { background: var(--ts-done); }
 .blockRow .muted { margin-left: auto; }
 
+/* Full-width hover rows with the same -8px bleed as the task rows, so a subtask reads as
+   something you click, not as a line of text with a box next to it. */
 .subRow {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   width: 100%;
-  padding: 4px 0;
+  padding: 7px 8px;
+  margin: 0 -8px;
+  border-radius: var(--wf-r-l);
   background: transparent;
   border: 0;
   color: var(--wf-tx);
-  font-size: 12px;
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
+  transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1), color 0.15s;
 }
-.subRow:hover { color: var(--wf-tx-hi); }
+.subRow:hover { color: var(--wf-tx-hi); background: var(--wf-panel-2); }
 .check {
-  width: 13px;
-  height: 13px;
-  border-radius: 4px;
-  border: 1px solid var(--wf-line-2);
-  flex: 0 0 13px;
+  position: relative;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  border: 1.5px solid var(--wf-line-2);
+  flex: 0 0 16px;
+  transition: background-color 0.2s cubic-bezier(0, 0, 0.2, 1), border-color 0.2s;
 }
-.checkOn { background: var(--wf-run); border-color: var(--wf-run); }
+.checkOn { background: var(--ts-done); border-color: var(--ts-done); }
+/* An actual tick, not a filled square — the box has to say "done", not "selected". */
+.checkOn::after {
+  content: "";
+  position: absolute;
+  left: 4.5px;
+  top: 1.5px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--wf-bg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
 .subDone { color: var(--wf-tx-lo); text-decoration: line-through; }
+
+/* ---- motion opt-out ---------------------------------------------------- */
+/* The CRM has no reduced-motion handling anywhere in its frontend; that part we don't port.
+   Everything above stays legible without movement — the animations only ever add entrance
+   and hover, never convey state. */
+@media (prefers-reduced-motion: reduce) {
+  .card,
+  .detail,
+  .detailBody > section {
+    animation: none;
+  }
+  .row,
+  .subRow,
+  .dot,
+  .check,
+  .ringFill,
+  .band {
+    transition: none;
+  }
+}

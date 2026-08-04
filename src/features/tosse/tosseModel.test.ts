@@ -7,9 +7,12 @@ import {
   groupByClient,
   isOverdue,
   projectActions,
+  sectionIcon,
+  sectionLabel,
   shortDate,
   statusSections,
   STATUSES_OFF_THE_BOARD,
+  TASK_STATUS_CHOICES,
 } from "./tosseModel";
 
 function task(id: string, status: string, extra: Partial<TosseTask> = {}): TosseTask {
@@ -194,6 +197,28 @@ describe("toolbar totals", () => {
 
   it("is empty rather than undefined when there is nothing open", () => {
     expect(briefingTotals([], [])).toEqual({});
+  });
+});
+
+describe("section headings", () => {
+  // The CRM's Briefing titles the Review column « En revue » while the status VALUE stays
+  // « Review » — the two must not be conflated, or a status write would send a name the
+  // server does not know.
+  it("renames only Review, and only as a heading", () => {
+    expect(sectionLabel("Review")).toBe("En revue");
+    expect(sectionLabel("En cours")).toBe("En cours");
+    expect(sectionLabel("À faire")).toBe("À faire");
+    // The value written to the CRM is untouched.
+    expect(TASK_STATUS_CHOICES).toContain("Review");
+    expect(TASK_STATUS_CHOICES).not.toContain("En revue");
+  });
+
+  it("gives every status an icon, and never renders a bare heading", () => {
+    expect(sectionIcon("En cours")).toBe("play");
+    expect(sectionIcon("Review")).toBe("eye");
+    expect(sectionIcon("En attente")).toBe("circledot");
+    // An unknown status still gets a glyph rather than an empty slot.
+    expect(sectionIcon("Statut inconnu")).toBe("list");
   });
 });
 

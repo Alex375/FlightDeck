@@ -31,6 +31,10 @@ const WF_PATHS: Record<string, string> = {
   reply: "M9 7 5 11l4 4M5 11h7a4 4 0 0 0 4-4V5",
   bell: "M6 9a5 5 0 0 1 10 0c0 4 2 5 2 5H4s2-1 2-5ZM9 18a2 2 0 0 0 4 0",
   clock: "M11 5a6 6 0 1 1 0 12 6 6 0 0 1 0-12ZM11 8v3l2 2",
+  // The two glyphs the TOSSE view's status sections need, mirroring the CRM Briefing's own
+  // icons: an eye for « En revue » and a dotted circle for « En attente ».
+  eye: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM11 8.6a2.4 2.4 0 1 1 0 4.8 2.4 2.4 0 0 1 0-4.8Z",
+  circledot: "M11 4.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13ZM11 9.6a1.4 1.4 0 1 1 0 2.8 1.4 1.4 0 0 1 0-2.8Z",
   file: "M6 3h6l4 4v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1ZM12 3v4h4",
   diff: "M11 4v6m-3-3h6M5 16h12",
   term: "M4 5h14v12H4zM7 9l3 2-3 2M12 13h3",
