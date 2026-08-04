@@ -102,6 +102,27 @@ function OpenInTosse({ path, title, compact }: { path: string; title: string; co
   );
 }
 
+/** The subtask ring on a task row — the card's `ProgressRing` shrunk to fit a 33px line,
+ *  without its label (the ratio is already spelled out beside it). */
+function MiniRing({ done, total }: { done: number; total: number }) {
+  const pct = total > 0 ? done / total : 0;
+  const r = 5.5;
+  const c = 2 * Math.PI * r;
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" className={s.subRing} aria-hidden="true">
+      <circle cx="7" cy="7" r={r} className={s.ringTrack} />
+      <circle
+        cx="7"
+        cy="7"
+        r={r}
+        className={pct >= 1 ? s.ringFull : s.ringFill}
+        strokeDasharray={c}
+        strokeDashoffset={c - pct * c}
+      />
+    </svg>
+  );
+}
+
 /** A task row. The status dot is the write surface: click it, pick a status. NOT a drag —
  *  dragging means "manual order" everywhere else in this app, and a mis-drop here would
  *  write to the CRM. */
@@ -161,8 +182,11 @@ function TaskRow({
       ) : null}
       {task.kind ? <span className={s.kind}>{task.kind}</span> : null}
       <span className={s.title}>{task.title}</span>
+      {/* A ring, as the perimeter asks and as the CRM draws it: the ratio is readable at a
+          glance from the arc, where "1/4" has to be read. */}
       {task.subtaskCount > 0 ? (
-        <span className={s.subs}>
+        <span className={s.subs} title={`${task.subtaskDone} of ${task.subtaskCount} subtasks done`}>
+          <MiniRing done={task.subtaskDone} total={task.subtaskCount} />
           {task.subtaskDone}/{task.subtaskCount}
         </span>
       ) : null}
@@ -234,6 +258,28 @@ function AddTaskRow({ projectId, status }: { projectId: string; status: string }
 }
 
 /**
+ * Failed per-task writes, kept BY TASK.
+ *
+ * A card shares one mutation across all its rows, so `mutation.error` holds only the most
+ * recent failure — click another row and the previous refusal is wiped before anyone read
+ * it, which is the silent failure all over again. Keeping them keyed by task means each
+ * refusal stays put, under the row it belongs to, until that row's write succeeds.
+ */
+function useTaskWriteErrors() {
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const note = (taskId: string, message: string) =>
+    setErrors((prev) => ({ ...prev, [taskId]: message }));
+  const clear = (taskId: string) =>
+    setErrors((prev) => {
+      if (!(taskId in prev)) return prev;
+      const next = { ...prev };
+      delete next[taskId];
+      return next;
+    });
+  return { errors, note, clear };
+}
+
+/**
  * The status sections of a card: a dot + label + count per status, then its rows.
  *
  * Shared by the project cards and the project-less band — it was copy-pasted between the
@@ -245,11 +291,14 @@ function StatusSections({
   selectedTaskId,
   onOpenTask,
   onStatus,
+  writeErrors,
 }: {
   sections: StatusSection[];
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
   onStatus: (task: TosseTask, status: string) => void;
+  /** taskId → why its last write was refused. Rendered under that row. */
+  writeErrors?: Record<string, string>;
 }) {
   return (
     <>
@@ -270,13 +319,19 @@ function StatusSections({
             <span className={s.sectionRule} />
           </div>
           {section.tasks.map((task) => (
-            <TaskRow
-              key={task.id}
-              task={task}
-              selected={task.id === selectedTaskId}
-              onOpen={() => onOpenTask(task.id)}
-              onStatus={(status) => onStatus(task, status)}
-            />
+            <div key={task.id}>
+              <TaskRow
+                task={task}
+                selected={task.id === selectedTaskId}
+                onOpen={() => onOpenTask(task.id)}
+                onStatus={(status) => onStatus(task, status)}
+              />
+              {/* Right under the row it happened on — an error at the top of the card would
+                  not say WHICH task the CRM refused. */}
+              {writeErrors?.[task.id] ? (
+                <div className={s.rowError}>{writeErrors[task.id]}</div>
+              ) : null}
+            </div>
           ))}
         </div>
       ))}
@@ -301,6 +356,7 @@ function ProjectCard({
 }) {
   const setTaskStatus = useSetTosseTaskStatus();
   const setProjectStatus = useSetTosseProjectStatus();
+  const taskErrors = useTaskWriteErrors();
   const [confirming, setConfirming] = useState<ProjectAction | null>(null);
   const sections = useMemo(() => statusSections(project.tasks), [project.tasks]);
   const actions = projectActions(project.status);
@@ -355,12 +411,11 @@ function ProjectCard({
         </div>
       </div>
 
-      {/* A refused write is shown where it happened, not swallowed by the next refetch. */}
+      {/* A refused write is shown where it happened, not swallowed by the next refetch.
+          Task-level refusals are rendered under their own row (see `writeErrors`); this one
+          is the PROJECT's own state change, which has no row to sit under. */}
       {setProjectStatus.error ? (
         <div className={s.rowError}>{String(setProjectStatus.error.message)}</div>
-      ) : null}
-      {setTaskStatus.error ? (
-        <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
       ) : null}
 
       {paused ? (
@@ -372,8 +427,15 @@ function ProjectCard({
             sections={sections}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
+            writeErrors={taskErrors.errors}
             onStatus={(task, status) =>
-              setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
+              setTaskStatus.mutate(
+                { taskId: task.id, status, title: task.title },
+                {
+                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
+                  onSuccess: () => taskErrors.clear(task.id),
+                },
+              )
             }
           />
           {sections.length === 0 ? <div className={s.cardEmpty}>No open task</div> : null}
@@ -471,9 +533,33 @@ function TaskDetail({
                 PROJECT states, and sent everything it didn't know to "todo": a task in
                 « Review » came out grey here while the board painted it blue, in the one
                 place meant to tell you what the task is. */}
-            <span className={`${s.state} ${s[`state_${STATUS_TONE[data.task.status] ?? "todo"}`]}`}>
-              {data.task.status}
-            </span>
+            {/* The status is a CONTROL here too, not a label: the panel is where you read a
+                task in full, so it is also where you move it on. Same menu as the row's
+                dot — one way to change a status, wherever you are. */}
+            <Menu
+              portal
+              trigger={
+                <button
+                  className={`${s.state} ${s.stateBtn} ${s[`state_${STATUS_TONE[data.task.status] ?? "todo"}`]}`}
+                  title={`${data.task.status} — change status`}
+                >
+                  {data.task.status}
+                  <Ico name="chevron" className="sm" />
+                </button>
+              }
+            >
+              {TASK_STATUS_CHOICES.map((choice) => (
+                <div key={choice}>
+                  {choice === "Fait" ? <div className={s.menuSep} /> : null}
+                  <MenuItem
+                    on={data.task.status === choice}
+                    onClick={() => setTaskStatus.mutate({ taskId, status: choice })}
+                  >
+                    {choice}
+                  </MenuItem>
+                </div>
+              ))}
+            </Menu>
             {data.task.priority ? (
               <span className={`${s.pri} ${s[`pri_${priorityClass(data.task.priority)}`]}`}>
                 {data.task.priority}
@@ -515,6 +601,19 @@ function TaskDetail({
           </section>
         ) : null}
 
+        {/* The task's BODY. It was fetched, crossed the IPC and was then dropped on the
+            floor — so a task whose description lives in `content` (the CRM's long-form
+            field, distinct from the one-line `notes`) opened onto an empty panel and read as
+            having no description at all. The CRM's own panel renders all three. */}
+        {data?.content ? (
+          <section>
+            <div className={s.detailKey}>Description</div>
+            <div className={s.mdCard}>
+              <StreamMarkdown text={data.content} />
+            </div>
+          </section>
+        ) : null}
+
         {data?.task.notes ? (
           <section>
             <div className={s.detailKey}>Notes</div>
@@ -531,6 +630,12 @@ function TaskDetail({
               <StreamMarkdown text={data.context} />
             </div>
           </section>
+        ) : null}
+
+        {/* Loaded, but the task carries nothing to show. Said explicitly, because a panel
+            that is simply blank is indistinguishable from one that failed to load. */}
+        {data && !data.content && !data.task.notes && !data.context && data.subtasks.length === 0 && data.blockedBy.length === 0 ? (
+          <div className={s.muted}>This task has no description, notes or subtasks.</div>
         ) : null}
 
         {data && data.subtasks.length > 0 ? (
@@ -709,7 +814,12 @@ export function TosseView() {
           <div className={s.column}>
             {isLoading ? <div className={s.muted}>Loading the briefing…</div> : null}
 
-            {!isLoading && bands.length === 0 && !error ? (
+            {/* ⚠️ Gated on EVERYTHING the page renders, not just the client bands. The
+                project-less band is a sibling below, so counting only `bands` printed
+                "Nothing open in TOSSE" directly above a list of open tasks — while the
+                toolbar, which does count them, announced how many there were. The view
+                contradicted itself on the only question it exists to answer. */}
+            {!isLoading && bands.length === 0 && (data?.generalTasks.length ?? 0) === 0 && !error ? (
               <div className={s.empty}>
                 <div className={s.emptyBig}>Nothing open in TOSSE</div>
                 <div>Every active project is clear. Backlog and done tasks live in the CRM.</div>
@@ -743,7 +853,9 @@ export function TosseView() {
               axis="x"
               onMove={(x) => {
                 const box = bodyRef.current?.getBoundingClientRect();
-                if (box) setDetailWidth(box.right - x);
+                // The row's width goes with it, so the clamp knows the same cap the CSS
+                // applies — otherwise part of the drag stores a width nothing honours.
+                if (box) setDetailWidth(box.right - x, box.width);
               }}
             />
             {/* Keyed by task id so switching tasks REPLAYS the section cascade — otherwise
@@ -780,6 +892,7 @@ function GeneralTaskBand({
   onOpenTask: (id: string) => void;
 }) {
   const setTaskStatus = useSetTosseTaskStatus();
+  const taskErrors = useTaskWriteErrors();
   const sections = useMemo(() => statusSections(tasks), [tasks]);
   const folded = useTosseFold((f) => f.folded[GENERAL_FOLD_KEY] === true);
   const toggle = useTosseFold((f) => f.toggle);
@@ -804,15 +917,19 @@ function GeneralTaskBand({
       </button>
       {folded ? null : (
         <div className={s.card}>
-          {setTaskStatus.error ? (
-            <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
-          ) : null}
           <StatusSections
             sections={sections}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
+            writeErrors={taskErrors.errors}
             onStatus={(task, status) =>
-              setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
+              setTaskStatus.mutate(
+                { taskId: task.id, status, title: task.title },
+                {
+                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
+                  onSuccess: () => taskErrors.clear(task.id),
+                },
+              )
             }
           />
         </div>

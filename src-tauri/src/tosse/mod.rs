@@ -1721,10 +1721,21 @@ pub async fn briefing() -> R<TosseBriefing> {
 /// Shape the briefing payload. Split from the request so the mapping is testable without a
 /// network round-trip — the shape is the part that breaks when the CRM changes.
 fn parse_briefing(data: &Value) -> R<TosseBriefing> {
+    // ⚠️ `projects` must be PRESENT. A wrong type is already loud (`parse_list`), but a
+    // missing key was silent: it produced an empty board, which the view renders as
+    // "Nothing open in TOSSE" — a confident statement about the user's workload, made from
+    // a payload we failed to understand. An endpoint that stops sending its main list is a
+    // protocol change, and it has to say so.
+    if data.get("projects").is_none() {
+        return Err(TosseError::Protocol(format!(
+            "the briefing carried no `projects` list: {}",
+            snippet(&data.to_string())
+        )));
+    }
     Ok(TosseBriefing {
         projects: parse_list(data.get("projects"), parse_project)?,
+        // `pausedProjects` and `general` are omitted when empty — absence IS the answer.
         paused_projects: parse_list(data.get("pausedProjects"), parse_project)?,
-        // `general` is omitted entirely when there is nothing in it — absence is normal.
         general_tasks: parse_list(data.pointer("/general/tasks"), parse_task)?,
     })
 }
@@ -2625,6 +2636,19 @@ mod tests {
         let v = serde_json::json!({ "projects": [], "pausedProjects": [] });
         let b = parse_briefing(&v).expect("an omitted section is normal");
         assert!(b.general_tasks.is_empty());
+    }
+
+    #[test]
+    fn a_briefing_with_no_projects_key_at_all_fails_loudly() {
+        // An EMPTY list means "nothing open" and is fine; a MISSING list means we did not
+        // understand the payload. Rendering the second as the first tells the user their
+        // board is clear on the strength of a shape we failed to read.
+        let missing = serde_json::json!({ "pausedProjects": [] });
+        let err = parse_briefing(&missing).expect_err("a missing `projects` is a protocol error");
+        assert!(matches!(err, TosseError::Protocol(_)), "got {err:?}");
+
+        let empty = serde_json::json!({ "projects": [] });
+        assert!(parse_briefing(&empty).expect("an empty list is an answer").projects.is_empty());
     }
 
     #[test]

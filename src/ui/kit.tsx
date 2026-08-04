@@ -36,6 +36,8 @@ const WF_PATHS: Record<string, string> = {
   eye: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM11 8.6a2.4 2.4 0 1 1 0 4.8 2.4 2.4 0 0 1 0-4.8Z",
   /** Disclosure chevron, pointing DOWN (open). Rotate it to show a collapsed state. */
   chevron: "M5.5 8.5 11 14l5.5-5.5",
+  /** A robot head — marks an action taken through the MCP server, as the CRM does. */
+  bot: "M7 9h8a1.5 1.5 0 0 1 1.5 1.5v4A1.5 1.5 0 0 1 15 16H7a1.5 1.5 0 0 1-1.5-1.5v-4A1.5 1.5 0 0 1 7 9ZM11 6.5V9M9 12.2h.01M13 12.2h.01M4 11.5v2M18 11.5v2",
   circledot: "M11 4.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13ZM11 9.6a1.4 1.4 0 1 1 0 2.8 1.4 1.4 0 0 1 0-2.8Z",
   file: "M6 3h6l4 4v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1ZM12 3v4h4",
   diff: "M11 4v6m-3-3h6M5 16h12",

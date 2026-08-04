@@ -27,6 +27,19 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   return res.data;
 }
 
+/**
+ * Whether a failure means the SESSION is gone, as opposed to a request going wrong.
+ *
+ * Matches what the core says when it holds no usable credentials — `TosseError::NotConnected`
+ * ("not connected to TOSSE") and `TosseError::Denied` (the revoked/expired grant, which
+ * carries "connect again"). Everything else — a 502, an offline machine, a bad payload — is
+ * transient and must NOT be read as a sign-out.
+ */
+function isSessionGone(error: unknown): boolean {
+  const msg = String((error as Error)?.message ?? "").toLowerCase();
+  return msg.includes("not connected to tosse") || msg.includes("connect again");
+}
+
 export const tosseStatusKey = () => accountStatusKey("tosse");
 
 /**
@@ -158,10 +171,23 @@ export const tosseTaskKey = (id: string) => [...tosseTaskKeyPrefix, id] as const
  * `staleTime` keeps switching views from re-fetching on every tab click.
  */
 export function useTosseBriefing(enabled = true) {
+  const qc = useQueryClient();
   return useQuery<TosseBriefing>({
     queryKey: tosseBriefingKey,
     enabled,
-    queryFn: () => unwrap(commands.tosseBriefing()),
+    queryFn: async () => {
+      try {
+        return await unwrap(commands.tosseBriefing());
+      } catch (e) {
+        // A session that died between two refreshes has to reach the CONNECTION state, or
+        // the tab stays up over a board it can no longer load: every retry fails the same
+        // way, and the one thing that would fix it — signing in again — is in a Settings
+        // tab the view never points at. Re-reading the status makes the tab withdraw and
+        // the card explain why. The error still propagates, so nothing is swallowed.
+        if (isSessionGone(e)) void qc.invalidateQueries({ queryKey: tosseStatusKey() });
+        throw e;
+      }
+    },
     staleTime: 60_000,
     refetchOnWindowFocus: true,
   });

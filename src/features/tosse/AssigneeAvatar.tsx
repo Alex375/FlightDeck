@@ -41,7 +41,7 @@ export function AssigneeAvatar({ name }: { name: string }) {
     return (
       <span className={s.whoMcp} title={`${person} · via MCP`}>
         <span className={s.whoMcpMain}>
-          <Ico name="spark" className="sm" />
+          <Ico name="bot" className="sm" />
         </span>
         <span className={s.whoMcpBadge} style={{ background: colour }}>
           {assigneeInitials(person)}

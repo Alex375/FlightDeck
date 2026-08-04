@@ -19,10 +19,12 @@ import type { TosseBriefing, TosseTask } from "../../ipc/client";
 
 const REFUSAL = "Task is blocked by « Lot 1 » and cannot be started";
 
-// What each hook hands back, so a single test can put one mutation into its error state.
+// What each hook hands back. `refuseWrites` makes the shared task mutation reject, through
+// the SAME callback path the component uses, so the test exercises the real wiring rather
+// than a pre-set error field.
 const state = {
   briefing: undefined as TosseBriefing | undefined,
-  taskStatusError: null as Error | null,
+  refuseWrites: false,
 };
 
 const mutation = () => ({
@@ -30,6 +32,18 @@ const mutation = () => ({
   reset: vi.fn(),
   isPending: false,
   error: null as Error | null,
+});
+
+/** The task-status mutation: calls back `onError` when the CRM is set to refuse. */
+const taskStatusMutation = () => ({
+  ...mutation(),
+  mutate: (
+    _vars: unknown,
+    opts?: { onError?: (e: Error) => void; onSuccess?: () => void },
+  ) => {
+    if (state.refuseWrites) opts?.onError?.(new Error(REFUSAL));
+    else opts?.onSuccess?.();
+  },
 });
 
 vi.mock("../../ipc/useTosse", () => ({
@@ -42,7 +56,7 @@ vi.mock("../../ipc/useTosse", () => ({
     dataUpdatedAt: 0,
   }),
   useTosseTaskDetail: () => ({ data: undefined, isLoading: false, error: null }),
-  useSetTosseTaskStatus: () => ({ ...mutation(), error: state.taskStatusError }),
+  useSetTosseTaskStatus: () => taskStatusMutation(),
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),
   useTosseWebUrl: () => ({ data: "https://tosse.example", error: null }),
@@ -87,7 +101,7 @@ beforeEach(() => {
   document.body.appendChild(container);
   root = createRoot(container);
   state.briefing = boardWithOnlyAGeneralTask();
-  state.taskStatusError = null;
+  state.refuseWrites = false;
 });
 
 afterEach(() => {
@@ -100,6 +114,23 @@ function render() {
   act(() => root.render(createElement(TosseView)));
 }
 
+/** Drive a real status change: click the row's status dot, then the menu entry.
+ *
+ *  Two separate `act`s — the menu only exists after the first click has been committed —
+ *  and the entry is looked up on `document`, since the menu renders through a portal. */
+function clickStatus(status: string) {
+  // By title, not by class: CSS-module hashes make `[class*='dot_']` also match
+  // `sectionDot`, and it picked the section heading's plain span instead of the control.
+  const dot = container.querySelector<HTMLButtonElement>("button[title*='change status']");
+  if (!dot) throw new Error("no status dot on the row");
+  act(() => dot.click());
+  const item = [...document.querySelectorAll<HTMLButtonElement>("button.wf-mi")].find(
+    (el) => el.textContent?.trim() === status,
+  );
+  if (!item) throw new Error(`no menu entry for "${status}"`);
+  act(() => item.click());
+}
+
 describe("the « No project » band", () => {
   it("renders its tasks", () => {
     render();
@@ -107,16 +138,29 @@ describe("the « No project » band", () => {
     expect(container.textContent).toContain("No project");
   });
 
-  // ⚠️ THE regression. Verified to fail before the fix: the band had no error surface at
-  // all, so this text appeared nowhere.
-  it("shows why a status write was refused", () => {
-    state.taskStatusError = new Error(REFUSAL);
+  // The assertion this test was missing, and which let the bug through: the empty state was
+  // gated on the CLIENT bands only, so a board whose only work is project-less printed
+  // "Nothing open in TOSSE" directly above the tasks it was denying — while the toolbar,
+  // which does count them, announced how many there were.
+  it("does not claim the board is empty while it is listing tasks", () => {
     render();
+    expect(container.textContent).not.toContain("Nothing open in TOSSE");
+  });
+
+  // ⚠️ THE regression. Driven through the real path: open the row's status menu, pick a
+  // status, let the write be refused. Before the fix the band rendered no error at all;
+  // before the SECOND fix the message lived on a mutation shared by every row, so the next
+  // click on another row wiped it.
+  it("shows why a status write was refused, under the row it happened on", () => {
+    state.refuseWrites = true;
+    render();
+    clickStatus("En cours");
     expect(container.textContent).toContain(REFUSAL);
   });
 
   it("says nothing when no write has failed", () => {
     render();
+    clickStatus("En cours");
     expect(container.textContent).not.toContain(REFUSAL);
   });
 });

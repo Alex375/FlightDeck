@@ -73,7 +73,9 @@
 }
 .cRun { color: var(--ts-run-tx); }
 .cRev { color: var(--ts-wait-tx); }
-.cTodo { color: var(--wf-tx-hi); }
+/* Neutral, like its section heading. It was the BRIGHTEST figure in the toolbar, which put
+   "À faire" above "En cours" in the visual hierarchy — the opposite of what the board says. */
+.cTodo { color: var(--ts-todo); }
 .spacer { flex: 1; }
 .sync {
   font-size: 11.5px;
@@ -157,11 +159,18 @@
   padding: 30px 2px 14px;
   background: transparent;
   border: 0;
-  width: 100%;
+  /* `calc(100% + 20px)`, NOT `100%`: the -10px side margins below bleed the hover surface
+     out on BOTH sides, and a 100% width would move the whole strip 10px left instead of
+     widening it — the band ended up misaligned with the cards it heads. */
+  width: calc(100% + 20px);
   cursor: pointer;
   text-align: left;
   color: inherit;
-  transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  /* `background-color` is what actually changes on hover; transitioning `color` alone left
+     the surface snapping in while the declaration claimed otherwise. */
+  transition:
+    background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .column > .band:first-child { padding-top: 10px; }
 /* The band is a disclosure control, so it has to LOOK like one: a hover surface that covers
@@ -397,6 +406,14 @@
   background: var(--ts-wait-bg);
 }
 .state_todo { color: var(--wf-tx-lo); }
+/* The chip as a control (detail panel): same pill, plus a caret and a hover. */
+.stateBtn {
+  gap: 4px;
+  cursor: pointer;
+  transition: filter 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.stateBtn:hover { filter: brightness(1.25); }
+.stateBtn svg { width: 11px; height: 11px; opacity: 0.75; }
 .state_wait {
   color: var(--ts-wait-tx);
   border-color: var(--ts-wait-line);
@@ -443,7 +460,9 @@
   background: var(--ts-todo);
   flex: 0 0 6px;
 }
-.sectionIco { color: var(--ts-todo); flex: 0 0 auto; width: 12px; height: 12px; }
+/* Doubled selector to outrank the wirekit's `.wf-ico.sm` (13px), which otherwise wins on
+   specificity and made this sizing dead. */
+.sectionIco.sectionIco { color: var(--ts-todo); flex: 0 0 auto; width: 12px; height: 12px; }
 .sectionLabel {
   font-size: 11px;
   font-weight: 600;
@@ -469,6 +488,10 @@
 .section[data-tone="wait"] .sectionIco,
 .section[data-tone="wait"] .sectionLabel { color: var(--ts-wait-tx); }
 .section[data-tone="wait"] .sectionRule { background: var(--ts-wait-line); }
+/* « À faire » is toned too — its dot and icon already were, so leaving the label grey made
+   the heading read as half-lit rather than as a deliberate neutral. */
+.section[data-tone="todo"] .sectionIco,
+.section[data-tone="todo"] .sectionLabel { color: var(--ts-todo); }
 .section[data-tone="todo"] .sectionRule { background: var(--ts-todo-line); }
 .section[data-tone="hold"] .sectionDot { background: var(--ts-hold); }
 .section[data-tone="hold"] .sectionIco,
@@ -562,12 +585,18 @@
   white-space: nowrap;
 }
 .subs {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-family: var(--wf-mono);
   font-size: 10px;
   color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
 }
+/* Same geometry as the card's ring, minus the label — see `MiniRing`. */
+.subRing { transform: rotate(-90deg); flex: 0 0 auto; }
+.subRing circle { stroke-width: 2; }
 /* The CRM's assignee disc: a full circle, filled with that person's OWN colour (set inline
    by `AssigneeAvatar`), white initials. It used to be a neutral grey plate, which said who
    only if you stopped to read it. */
@@ -746,7 +775,11 @@
   left: -48px;
   background: rgba(122, 162, 227, 0.05);
 }
-.detailHead > * { position: relative; }
+/* Both the glows and the content are positioned, so paint order would put the LAST
+   pseudo-element on top of the text. Explicit layers instead of relying on source order. */
+.detailHead::before,
+.detailHead::after { z-index: 0; }
+.detailHead > * { position: relative; z-index: 1; }
 .detailKicker {
   display: flex;
   align-items: center;
