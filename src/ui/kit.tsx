@@ -34,6 +34,8 @@ const WF_PATHS: Record<string, string> = {
   // The two glyphs the TOSSE view's status sections need, mirroring the CRM Briefing's own
   // icons: an eye for « En revue » and a dotted circle for « En attente ».
   eye: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM11 8.6a2.4 2.4 0 1 1 0 4.8 2.4 2.4 0 0 1 0-4.8Z",
+  /** Disclosure chevron, pointing DOWN (open). Rotate it to show a collapsed state. */
+  chevron: "M5.5 8.5 11 14l5.5-5.5",
   circledot: "M11 4.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13ZM11 9.6a1.4 1.4 0 1 1 0 2.8 1.4 1.4 0 0 1 0-2.8Z",
   file: "M6 3h6l4 4v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1ZM12 3v4h4",
   diff: "M11 4v6m-3-3h6M5 16h12",

@@ -26,8 +26,12 @@ import {
   useTosseTaskDetail,
   useTosseWebUrl,
 } from "../../ipc/useTosse";
+import { AssigneeAvatar, splitMcpActor } from "./AssigneeAvatar";
 import { ClientAvatar } from "./ClientAvatar";
 import { useTosseFold } from "../../store/tosseFold";
+
+/** Fold key for the project-less band. Prefixed so it can never collide with a client id. */
+const GENERAL_FOLD_KEY = "band:general";
 import type { TosseProject, TosseTask } from "../../ipc/client";
 import {
   briefingTotals,
@@ -44,13 +48,6 @@ import {
   type StatusSection,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
-
-/** Initials for a client with no logo — two letters, never an empty plate. */
-function initials(name: string): string {
-  const parts = name.split(/\s+/).filter(Boolean);
-  const letters = parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2);
-  return letters.toUpperCase();
-}
 
 /** The progress ring on a project card (done / total across ALL its tasks). Pure SVG —
  *  the same shape the CRM draws, so the two read as one number. */
@@ -169,11 +166,7 @@ function TaskRow({
           {task.subtaskDone}/{task.subtaskCount}
         </span>
       ) : null}
-      {task.assignedTo ? (
-        <span className={s.who} title={task.assignedTo}>
-          {task.assignedTo === "Les deux" ? "2" : initials(task.assignedTo)}
-        </span>
-      ) : null}
+      {task.assignedTo ? <AssigneeAvatar name={task.assignedTo} /> : null}
       {due ? <span className={`${s.due} ${late ? s.dueLate : ""}`}>{due}</span> : null}
     </div>
   );
@@ -487,7 +480,14 @@ function TaskDetail({
               </span>
             ) : null}
             {data.task.kind ? <span className={s.kind}>{data.task.kind}</span> : null}
-            {data.task.assignedTo ? <span className={s.kind}>{data.task.assignedTo}</span> : null}
+            {/* The person wears the SAME mark as in the list, with their name spelled out —
+                the panel has room for it, a 20px disc alone would not say who. */}
+            {data.task.assignedTo ? (
+              <span className={s.whoChip}>
+                <AssigneeAvatar name={data.task.assignedTo} />
+                {splitMcpActor(data.task.assignedTo).person}
+              </span>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -599,8 +599,14 @@ function ClientBand({
         className={`${s.band} ${folded ? s.bandFolded : ""}`}
         onClick={() => toggle(band.key)}
         aria-expanded={!folded}
+        title={folded ? `Show ${band.name}'s projects` : `Hide ${band.name}'s projects`}
       >
-        <span className={s.bandChevron}>{folded ? "▸" : "▾"}</span>
+        {/* A real disclosure control, not a bare glyph: it sits in its own hit area and
+            ROTATES between states, which is what makes the band read as something you can
+            click. The previous ▸/▾ character was easy to miss entirely. */}
+        <span className={s.bandChevron}>
+          <Ico name="chevron" className="sm" />
+        </span>
         <ClientAvatar name={band.name} logoUrl={band.logoUrl} website={band.website} />
         <span className={s.bandName}>{band.name}</span>
         <span className={s.bandRule} />
@@ -775,29 +781,42 @@ function GeneralTaskBand({
 }) {
   const setTaskStatus = useSetTosseTaskStatus();
   const sections = useMemo(() => statusSections(tasks), [tasks]);
+  const folded = useTosseFold((f) => f.folded[GENERAL_FOLD_KEY] === true);
+  const toggle = useTosseFold((f) => f.toggle);
   return (
     <>
-      <div className={`${s.band} ${s.bandStatic}`}>
-        <span className={s.bandChevron}>▾</span>
+      {/* Folds like a client band — it wears the same chevron, so it has to behave the same
+          way. Its own fold key, kept out of the client-id namespace. */}
+      <button
+        className={`${s.band} ${folded ? s.bandFolded : ""}`}
+        onClick={() => toggle(GENERAL_FOLD_KEY)}
+        aria-expanded={!folded}
+        title={folded ? "Show tasks with no project" : "Hide tasks with no project"}
+      >
+        <span className={s.bandChevron}>
+          <Ico name="chevron" className="sm" />
+        </span>
         <span className={s.bandName}>No project</span>
         <span className={s.bandRule} />
         <span className={s.bandProjects}>
           {tasks.length} task{tasks.length > 1 ? "s" : ""}
         </span>
-      </div>
-      <div className={s.card}>
-        {setTaskStatus.error ? (
-          <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
-        ) : null}
-        <StatusSections
-          sections={sections}
-          selectedTaskId={selectedTaskId}
-          onOpenTask={onOpenTask}
-          onStatus={(task, status) =>
-            setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
-          }
-        />
-      </div>
+      </button>
+      {folded ? null : (
+        <div className={s.card}>
+          {setTaskStatus.error ? (
+            <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
+          ) : null}
+          <StatusSections
+            sections={sections}
+            selectedTaskId={selectedTaskId}
+            onOpenTask={onOpenTask}
+            onStatus={(task, status) =>
+              setTaskStatus.mutate({ taskId: task.id, status, title: task.title })
+            }
+          />
+        </div>
+      )}
     </>
   );
 }

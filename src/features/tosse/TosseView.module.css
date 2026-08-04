@@ -164,14 +164,37 @@
   transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .column > .band:first-child { padding-top: 10px; }
-.bandStatic { cursor: default; }
-.band:hover .bandName { color: var(--wf-tx-hi); }
-.bandChevron {
-  color: var(--wf-tx-lo);
-  font-size: 11px;
-  width: 11px;
-  flex: 0 0 11px;
+/* The band is a disclosure control, so it has to LOOK like one: a hover surface that covers
+   the whole strip (bled out by 10px so it lines up with the cards), plus the chevron below.
+   Folded state is spelled out too — collapsed content that gives no sign of itself reads as
+   missing data rather than as something you hid. */
+.band {
+  border-radius: var(--wf-r-l);
+  margin: 0 -10px;
+  padding-left: 10px;
+  padding-right: 10px;
 }
+.band:hover { background: var(--wf-panel-2); }
+.band:hover .bandChevron { color: var(--wf-tx-hi); border-color: var(--wf-tx-xlo); }
+.band:hover .bandName { color: var(--wf-tx-hi); }
+/* Folded: the whole row steps back, and the count of what is hidden stays lit. */
+.bandFolded { opacity: 0.82; }
+.bandFolded .bandProjects { color: var(--wf-tx-lo); }
+/* Its own bordered hit area — the affordance the bare ▸/▾ character never had. Rotates
+   -90° when folded, so the state is legible from the shape alone. */
+.bandChevron {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--wf-r);
+  border: 1px solid var(--wf-line-2);
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-lo);
+  flex: 0 0 20px;
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1), color 0.15s, border-color 0.15s;
+}
+.bandFolded .bandChevron { transform: rotate(-90deg); }
 /* Initials plate — the last resort when a client has neither a logo nor a usable domain.
    The gradient is set inline (hashed from the name, as in the CRM) so the same client wears
    the same colour in both apps. */
@@ -545,6 +568,9 @@
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
 }
+/* The CRM's assignee disc: a full circle, filled with that person's OWN colour (set inline
+   by `AssigneeAvatar`), white initials. It used to be a neutral grey plate, which said who
+   only if you stopped to read it. */
 .who {
   width: 20px;
   height: 20px;
@@ -552,11 +578,55 @@
   display: grid;
   place-items: center;
   font-size: 9px;
-  font-family: var(--wf-mono);
-  color: var(--wf-tx-lo);
-  background: var(--wf-panel-3);
-  border: 1px solid var(--wf-line-2);
+  font-weight: 600;
+  font-family: var(--wf-sans);
+  color: #fff;
+  background: #6b7280;
   flex: 0 0 auto;
+  letter-spacing: 0;
+}
+/* An action taken through the MCP server: the robot is the main mark, the person who
+   triggered it rides in the corner — exactly the CRM's reading of "MCP de <name>". */
+.whoMcp {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+}
+.whoMcpMain {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #6366f1;
+  color: #fff;
+}
+.whoMcpMain svg { width: 11px; height: 11px; }
+.whoMcpBadge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  min-width: 12px;
+  height: 12px;
+  padding: 0 2px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 7px;
+  font-weight: 700;
+  color: #fff;
+  /* The ring is what keeps the badge legible where it overlaps the disc behind it. */
+  box-shadow: 0 0 0 1.5px var(--wf-panel);
+}
+/* The panel spells the name out next to the disc. */
+.whoChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
 }
 .due {
   font-size: 11px;

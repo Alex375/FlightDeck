@@ -287,6 +287,9 @@ const demoBriefing: TosseBriefing = {
       tasks: [
         demoTask("t-bearer", "Bearer OAuth first-party sur /api/v1/*", "Review", {
           priority: "Urgente",
+          // The CRM attributes actions taken through the MCP server this way, and it is how
+          // most tasks Claude files show up — so the demo has to exercise that mark too.
+          assignedTo: "MCP de Alexandre",
         }),
         demoTask("t-changelog", "Page changelog publique", "À faire", { assignedTo: "Armand" }),
       ],
