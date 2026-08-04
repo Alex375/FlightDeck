@@ -1632,6 +1632,12 @@ pub struct TosseClientRef {
     pub id: String,
     pub name: String,
     pub logo_url: Option<String>,
+    /// The client's website, when the CRM has one.
+    ///
+    /// Carried for its DOMAIN, not as a link: the CRM's own avatar falls back to that
+    /// domain's favicon when no logo has been uploaded, which is how most of its clients
+    /// end up with a mark at all.
+    pub website: Option<String>,
 }
 
 /// A task as the briefing lists it — enough to render a row, and no more.
@@ -1779,6 +1785,7 @@ fn parse_project(v: &Value) -> R<TosseProject> {
                 .unwrap_or("Untitled client")
                 .to_string(),
             logo_url: c.get("logoUrl").and_then(Value::as_str).map(str::to_string),
+            website: c.get("website").and_then(Value::as_str).map(str::to_string),
         })
     });
     Ok(TosseProject {

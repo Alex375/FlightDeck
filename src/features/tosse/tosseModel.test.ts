@@ -41,7 +41,9 @@ function project(
     id,
     name: id,
     status: "En cours",
-    client: clientId ? { id: clientId, name: clientId.toUpperCase(), logoUrl: null } : null,
+    client: clientId
+      ? { id: clientId, name: clientId.toUpperCase(), logoUrl: null, website: null }
+      : null,
     startDate: null,
     dueDate: null,
     tasks,

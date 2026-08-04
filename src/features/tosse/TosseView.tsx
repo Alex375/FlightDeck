@@ -26,6 +26,7 @@ import {
   useTosseTaskDetail,
   useTosseWebUrl,
 } from "../../ipc/useTosse";
+import { ClientAvatar } from "./ClientAvatar";
 import { useTosseFold } from "../../store/tosseFold";
 import type { TosseProject, TosseTask } from "../../ipc/client";
 import {
@@ -600,7 +601,7 @@ function ClientBand({
         aria-expanded={!folded}
       >
         <span className={s.bandChevron}>{folded ? "▸" : "▾"}</span>
-        <span className={s.bandAvatar}>{initials(band.name)}</span>
+        <ClientAvatar name={band.name} logoUrl={band.logoUrl} website={band.website} />
         <span className={s.bandName}>{band.name}</span>
         <span className={s.bandRule} />
         {/* Counts stay on a FOLDED band on purpose: a closed client still has to tell you

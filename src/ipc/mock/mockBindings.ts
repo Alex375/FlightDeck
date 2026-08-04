@@ -229,8 +229,16 @@ function demoTask(
   };
 }
 
-const demoClientInterne = { id: "c-interne", name: "Interne", logoUrl: null };
-const demoClientWd = { id: "c-wd", name: "Webdentiste", logoUrl: null };
+// One client with a website (its mark resolves to that domain's favicon) and one with
+// neither logo nor site (it falls back to initials on a hashed gradient) — so a demo run
+// exercises BOTH ends of the avatar cascade instead of only the empty one.
+const demoClientInterne = {
+  id: "c-interne",
+  name: "Interne",
+  logoUrl: null,
+  website: "https://anthropic.com",
+};
+const demoClientWd = { id: "c-wd", name: "Webdentiste", logoUrl: null, website: null };
 
 const demoBriefing: TosseBriefing = {
   projects: [

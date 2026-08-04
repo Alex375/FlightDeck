@@ -3090,7 +3090,15 @@ generalTasks: TosseTask[] }
  * THROUGH a mission, and either link can be missing), which is why the view needs a
  * "no client" band rather than assuming every project has one.
  */
-export type TosseClientRef = { id: string; name: string; logoUrl: string | null }
+export type TosseClientRef = { id: string; name: string; logoUrl: string | null; 
+/**
+ * The client's website, when the CRM has one.
+ * 
+ * Carried for its DOMAIN, not as a link: the CRM's own avatar falls back to that
+ * domain's favicon when no logo has been uploaded, which is how most of its clients
+ * end up with a mark at all.
+ */
+website: string | null }
 /**
  * How a local folder came to be linked to a CRM repository.
  */

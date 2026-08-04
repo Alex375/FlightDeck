@@ -192,6 +192,8 @@ export interface ClientBand {
   key: string;
   name: string;
   logoUrl: string | null;
+  /** Carried for its domain — the mark falls back to the site's favicon (see ClientAvatar). */
+  website: string | null;
   /** Active projects first, paused ones last (they carry no tasks). */
   projects: TosseProject[];
   openTasks: number;
@@ -217,6 +219,7 @@ export function groupByClient(projects: TosseProject[], paused: TosseProject[] =
         key,
         name: p.client?.name ?? "No client",
         logoUrl: p.client?.logoUrl ?? null,
+        website: p.client?.website ?? null,
         projects: [],
         openTasks: 0,
         counts: {},
