@@ -447,7 +447,10 @@
 .act_done { color: var(--wf-run); border-color: #2a5545; background: var(--wf-run-bg); }
 
 /* ---- status section --------------------------------------------------- */
-.section { display: flex; flex-direction: column; gap: 2px; }
+/* `gap: 5px` between rows — enough that each task reads as its own line rather than as part
+   of a block of text, while staying well under the 16px that separates SECTIONS (the two
+   spacings have to stay clearly different, or the grouping stops working). */
+.section { display: flex; flex-direction: column; gap: 5px; }
 /* The CRM's `space-y-4`, carried at FULL value — the one place we don't scale by 0.85.
    This 16-against-2 ratio is what turns three lists into three blocks without needing a
    box around each; halve it and the card collapses back into one long run of rows. */
@@ -526,7 +529,7 @@
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 7px 8px;
+  padding: 8px;
   margin: 0 -8px;
   border-radius: var(--wf-r-l);
   border-left: 2px solid transparent;
