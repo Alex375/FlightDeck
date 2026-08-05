@@ -32,7 +32,7 @@ const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(180);
 /// network step that makes the on-disk `marketplace.json` pins current — run it before
 /// re-reading update availability so newly published versions become visible. Operates
 /// on `~/.claude/plugins` (user-global), so it needs no working directory.
-pub fn refresh_marketplaces(name: Option<&str>) -> Result<(), String> {
+pub fn refresh_marketplaces(name: Option<&str>) -> Result<String, String> {
     let mut args = vec![
         "plugin".to_string(),
         "marketplace".to_string(),
@@ -50,7 +50,13 @@ pub fn refresh_marketplaces(name: Option<&str>) -> Result<(), String> {
 /// scope). `cwd` is the repo/conversation directory the command runs in — REQUIRED for
 /// project/local scope, which the CLI resolves from the working directory (there is no
 /// id-based project selector); harmless for the cwd-independent user scope.
-pub fn update_plugin(plugin_id: &str, scope: Option<&str>, cwd: &str) -> Result<(), String> {
+/// Returns the CLI's own one-line verdict, which the caller MUST show: an exit code
+/// of 0 does NOT mean the plugin moved. `claude plugin update` exits 0 while reporting
+/// `up_to_date` ("… is already at the latest version (1.3.6).") or `skipped` ("Skipped
+/// — X requires … at a version range that Y does not satisfy"). Discarding stdout on
+/// success made those outcomes indistinguishable from a real update: the spinner
+/// stopped, nothing changed, and the user was told nothing.
+pub fn update_plugin(plugin_id: &str, scope: Option<&str>, cwd: &str) -> Result<String, String> {
     let mut args = vec![
         "plugin".to_string(),
         "update".to_string(),
@@ -63,6 +69,20 @@ pub fn update_plugin(plugin_id: &str, scope: Option<&str>, cwd: &str) -> Result<
     run_claude(&args, Some(Path::new(cwd)))
 }
 
+/// The CLI's report line for a plugin operation: the last non-empty, non-progress
+/// line of its output (it prints a "Checking for updates…" preamble first). Empty
+/// when it said nothing usable.
+fn report_line(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.ends_with('\u{2026}') && !l.ends_with("..."))
+        .next_back()
+        .unwrap_or("")
+        .trim_start_matches(['\u{2714}', '\u{2713}', '*'])
+        .trim()
+        .to_string()
+}
+
 /// Run `claude <args>` to completion (in `cwd` when given), mapping a non-zero exit
 /// into a human `Err` that carries the tail of the binary's output (so a rejection is
 /// surfaced in the UI, never silent). Resolves the same `claude` binary our sessions
@@ -70,7 +90,7 @@ pub fn update_plugin(plugin_id: &str, scope: Option<&str>, cwd: &str) -> Result<
 /// timeout the child's whole process group is killed and a timeout `Err` returned, so a
 /// hung git fetch can't wedge the mutation forever. Synchronous — the IPC layer runs it
 /// off the async runtime.
-fn run_claude(args: &[String], cwd: Option<&Path>) -> Result<(), String> {
+fn run_claude(args: &[String], cwd: Option<&Path>) -> Result<String, String> {
     let bin = crate::supervisor::transport::resolved_claude_bin();
     let joined = args.join(" ");
     let mut cmd = Command::new(&bin);
@@ -110,7 +130,8 @@ fn run_claude(args: &[String], cwd: Option<&Path>) -> Result<(), String> {
         }
     };
     if output.status.success() {
-        return Ok(());
+        // Success ≠ "it changed". Hand the CLI's verdict back so the caller can say so.
+        return Ok(report_line(&String::from_utf8_lossy(&output.stdout)));
     }
     // Prefer stderr for the failure reason, falling back to stdout; keep only the tail.
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -157,5 +178,35 @@ mod tests {
         assert_eq!(tail_lines("a\nb\nc\nd", 2), "c\nd");
         assert_eq!(tail_lines("only", 8), "only");
         assert_eq!(tail_lines("", 8), "");
+    }
+
+    /// REGRESSION: `claude plugin update` exits 0 even when it did NOT move the
+    /// plugin, and its verdict is the LAST line — the first is a "Checking for
+    /// updates…" preamble. Reporting the wrong line (or none) is what made the
+    /// Update button look broken: it spun, stopped, and said nothing while the
+    /// plugin stayed flagged.
+    #[test]
+    fn report_line_keeps_the_verdict_not_the_progress_preamble() {
+        // The real up-to-date output that made the button look dead.
+        let out = "Checking for updates for plugin \"railway@claude-plugins-official\" at user scope…\n\
+                   ✔ railway is already at the latest version (1.3.6).\n";
+        assert_eq!(
+            report_line(out),
+            "railway is already at the latest version (1.3.6)."
+        );
+
+        // A skip is an exit-0 outcome too and must survive.
+        let skipped = "Checking for updates…\nSkipped — foo requires bar at a version range that 1.0.0 does not satisfy";
+        assert_eq!(
+            report_line(skipped),
+            "Skipped — foo requires bar at a version range that 1.0.0 does not satisfy"
+        );
+
+        // A real update keeps its line; trailing blanks and the check glyph are trimmed.
+        assert_eq!(report_line("✔ Updated railway to 1.4.0.\n\n"), "Updated railway to 1.4.0.");
+
+        // Nothing usable → empty (the caller renders no box rather than a blank one).
+        assert_eq!(report_line("Checking for updates…\n"), "");
+        assert_eq!(report_line(""), "");
     }
 }

@@ -1019,11 +1019,24 @@ fn extract_pin(entry: &serde_json::Value) -> MarketplacePin {
 /// Decide whether a plugin has an update and, when meaningful, the target human
 /// version. Pure and total, so it is unit-tested against every pin combination.
 ///
-/// Priority: a git `sha` mismatch is authoritative (a new commit) — the human version
-/// may be unchanged, so a "vX → vY" label is offered only when the versions DO differ.
-/// Falls back to a pure `version` comparison for path/version sources. Anything unknown
-/// (missing installed OR marketplace pin) is "no update": we never flag one we can't
-/// prove, so a plugin never nags without cause.
+/// Anything unknown (missing installed OR marketplace pin) is "no update": we never
+/// flag one we can't prove, so a plugin never nags without cause.
+///
+/// ⚠️ **A sha mismatch alone is NOT an update.** `claude plugin update` — the command
+/// this badge invites the user to run — decides by VERSION, not by commit:
+///
+/// ```text
+/// if (!isUnknown && (installed.version === resolved || installed.installPath === …))
+///     → "<plugin> is already at the latest version (<v>)."   // outcome: up_to_date
+/// ```
+///
+/// So when upstream has new commits but the plugin's version is unchanged, the CLI
+/// refuses to do anything — and a badge raised on the sha alone can NEVER be cleared
+/// by the action it offers. That is exactly what happened to `railway`
+/// (installed `191601b4…` v1.3.6 vs catalogue `c8b14877…`, no catalogue version):
+/// a permanent "Update available" whose button always answered "already at the latest
+/// version". A sha difference therefore only CONFIRMS an update we can already prove
+/// from the versions; on its own it is not actionable.
 fn compute_update(
     installed_sha: Option<&str>,
     installed_ver: Option<&str>,
@@ -1032,16 +1045,17 @@ fn compute_update(
     let Some(pin) = pin else {
         return (false, None);
     };
-    // Git-pinned: the commit sha is the truth (tolerating abbreviation — see sha_eq).
+    // Git-pinned: an EQUAL sha proves there is nothing to fetch (tolerating
+    // abbreviation — see sha_eq), whatever the versions say.
     if let (Some(a), Some(b)) = (installed_sha, pin.sha.as_deref()) {
         if sha_eq(a, b) {
             return (false, None);
         }
-        let target = match (installed_ver, pin.version.as_deref()) {
-            (Some(iv), Some(pv)) if iv != pv => Some(pv.to_string()),
-            _ => None,
+        // Shas differ: only a provable VERSION change is actionable.
+        return match (installed_ver, pin.version.as_deref()) {
+            (Some(iv), Some(pv)) if iv != pv => (true, Some(pv.to_string())),
+            _ => (false, None),
         };
-        return (true, target);
     }
     // Version-pinned (path sources) or a plugin.json version bump.
     if let (Some(a), Some(b)) = (installed_ver, pin.version.as_deref()) {
@@ -1479,13 +1493,19 @@ mod tests {
     }
 
     #[test]
-    fn compute_update_sha_is_authoritative_and_version_labels_only_when_differ() {
+    fn compute_update_needs_a_provable_version_change_not_just_a_new_commit() {
         // Same sha → no update, regardless of version.
         let pin = MarketplacePin { sha: Some("abc".into()), version: Some("1.1.0".into()) };
         assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), (false, None));
-        // Different sha, same version → update, but no "vX → vY" label (sha-only bump).
+        // REGRESSION (railway): different sha, SAME version → NOT an update. The CLI
+        // decides by version and would answer "already at the latest version", so a
+        // badge here could never be cleared by the button it offers.
         let pin = MarketplacePin { sha: Some("def".into()), version: Some("1.0.0".into()) };
-        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), (true, None));
+        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), (false, None));
+        // REGRESSION (railway, real shape): different sha and the catalogue carries NO
+        // version at all → nothing provable → no nag.
+        let no_ver = MarketplacePin { sha: Some("c8b14877".into()), version: None };
+        assert_eq!(compute_update(Some("191601b4"), Some("1.3.6"), Some(&no_ver)), (false, None));
         // Different sha AND version → update with the target version to display.
         let pin = MarketplacePin { sha: Some("def".into()), version: Some("1.1.0".into()) };
         assert_eq!(
@@ -1501,9 +1521,9 @@ mod tests {
         let full = "aa1e055b0f18d13787232b164cfb7416b553bd03";
         let pin = MarketplacePin { sha: Some("aa1e055b".into()), version: None };
         assert_eq!(compute_update(Some(full), None, Some(&pin)), (false, None));
-        // A DIFFERENT abbreviated sha is still an update.
+        // A DIFFERENT abbreviated sha with no provable version change is NOT an update.
         let other = MarketplacePin { sha: Some("bbbbbbb".into()), version: None };
-        assert_eq!(compute_update(Some(full), None, Some(&other)), (true, None));
+        assert_eq!(compute_update(Some(full), None, Some(&other)), (false, None));
         // Guard: a too-short (<7) prefix is NOT treated as equal (avoids coincidences).
         assert!(!sha_eq(full, "aa1e0"));
         assert!(sha_eq(full, "aa1e055b"));

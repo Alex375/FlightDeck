@@ -334,7 +334,7 @@ export function useMarketplaces(path: string | null) {
 export function useCheckPluginUpdates(path: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (name?: string | null): Promise<null> =>
+    mutationFn: (name?: string | null): Promise<string> =>
       unwrap(commands.refreshPluginMarketplaces(name ?? null)),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: extensionsKey(path) });
@@ -360,10 +360,13 @@ export function useCheckPluginUpdates(path: string | null) {
 export function useUpdatePlugin(path: string | null, handle: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (args: { pluginId: string; scope: string | null }): Promise<null> => {
+    mutationFn: async (args: { pluginId: string; scope: string | null }): Promise<string> => {
       // Pass the repo/conversation cwd so project/local-scoped updates resolve the
       // right project (the CLI selects it from the working directory).
-      await unwrap(commands.updatePlugin(args.pluginId, args.scope, path ?? ""));
+      // The CLI's verdict is the RESULT: exit 0 does not mean the plugin moved (it
+      // exits 0 on "already at the latest version" and on "Skipped — …"), so the
+      // caller renders this line instead of implying success.
+      const verdict = await unwrap(commands.updatePlugin(args.pluginId, args.scope, path ?? ""));
       if (handle) {
         // Best-effort hot-apply; a dead session ("unknown session") is harmless here.
         try {
@@ -375,7 +378,7 @@ export function useUpdatePlugin(path: string | null, handle: string | null) {
       // Refresh the `/` catalogue for this cwd even with no live session: it runs an
       // ephemeral spawn that re-reads the disk, so the menu matches the new version.
       await refetchSlashCommands(path);
-      return null;
+      return verdict;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: extensionsKey(path) }),
   });

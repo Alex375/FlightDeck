@@ -593,9 +593,7 @@ function ProjectBody({
               <AgentRow key={a.path} agent={a} onOpen={() => onOpenDoc({ name: a.name, source: CONFIG_SCOPE_LABEL[a.scope], path: a.path, description: a.description })} />
             )} empty="" />
           ) : null}
-          {updatePlugin.isError ? (
-            <div className={styles.error}>{(updatePlugin.error as Error).message}</div>
-          ) : null}
+          <PluginUpdateOutcome m={updatePlugin} />
           <Section
             icon="layers"
             title="Plugins"
@@ -760,9 +758,7 @@ function ConversationBody({
           footer={agentContribs.length ? <PluginContribFooter plugins={agentContribs} kind="agents" onOpen={onOpenPlugin} /> : null}
         />
       ) : null}
-      {updatePlugin.isError ? (
-        <div className={styles.error}>{(updatePlugin.error as Error).message}</div>
-      ) : null}
+      <PluginUpdateOutcome m={updatePlugin} />
       <Section
         icon="layers"
         title="Plugins"
@@ -1556,6 +1552,29 @@ function MarketplacesPage({
       </div>
     </div>
   );
+}
+
+/**
+ * What the plugin-update button actually did.
+ *
+ * `claude plugin update` exits 0 whether it upgraded the plugin, decided it was
+ * already current, or skipped it because another plugin pins an incompatible range —
+ * so a bare spinner that just stops tells the user nothing, and a plugin that visibly
+ * did not move reads as a broken button. The CLI's own verdict line is rendered
+ * verbatim: as an error when the command failed, otherwise as a neutral note.
+ */
+function PluginUpdateOutcome({
+  m,
+}: {
+  m: { isError: boolean; error: unknown; isSuccess: boolean; data?: string | null };
+}) {
+  if (m.isError) {
+    return <div className={styles.error}>{(m.error as Error).message}</div>;
+  }
+  // A successful run with nothing to say (the CLI printed only its progress line)
+  // needs no box — the refreshed snapshot speaks for itself.
+  if (!m.isSuccess || !m.data) return null;
+  return <div className={styles.warn}>{m.data}</div>;
 }
 
 /** Plugin contributions to a category, shown as ONE summary box per plugin (NOT as

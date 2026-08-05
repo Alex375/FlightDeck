@@ -1000,7 +1000,7 @@ async setAllMarketplacesAutoUpdate(enabled: boolean) : Promise<Result<null, stri
  * null, refreshes all. Shells out to the `claude` CLI off the async runtime; a
  * refresh can take a few seconds (git fetches).
  */
-async refreshPluginMarketplaces(name: string | null) : Promise<Result<null, string>> {
+async refreshPluginMarketplaces(name: string | null) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("refresh_plugin_marketplaces", { name }) };
 } catch (e) {
@@ -1016,7 +1016,7 @@ async refreshPluginMarketplaces(name: string | null) : Promise<Result<null, stri
  * LIVE session should follow with `reload_plugins` to hot-apply; otherwise the new
  * version is picked up on the next session spawn. Shells out off the async runtime.
  */
-async updatePlugin(pluginId: string, scope: string | null, path: string) : Promise<Result<null, string>> {
+async updatePlugin(pluginId: string, scope: string | null, path: string) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_plugin", { pluginId, scope, path }) };
 } catch (e) {

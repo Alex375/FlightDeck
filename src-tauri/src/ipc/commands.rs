@@ -1789,7 +1789,7 @@ pub async fn set_all_marketplaces_auto_update(enabled: bool) -> Result<(), Strin
 /// refresh can take a few seconds (git fetches).
 #[tauri::command]
 #[specta::specta]
-pub async fn refresh_plugin_marketplaces(name: Option<String>) -> Result<(), String> {
+pub async fn refresh_plugin_marketplaces(name: Option<String>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || crate::plugins::refresh_marketplaces(name.as_deref()))
         .await
         .map_err(|e| e.to_string())?
@@ -1807,7 +1807,7 @@ pub async fn update_plugin(
     plugin_id: String,
     scope: Option<String>,
     path: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         crate::plugins::update_plugin(&plugin_id, scope.as_deref(), &path)
     })
