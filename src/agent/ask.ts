@@ -10,6 +10,13 @@ export interface Ask {
   text?: string;
   /** A shell command to preview (Bash permissions). */
   cmd?: string;
+  /**
+   * Why the CLI is asking, when it says so — a blocked path (an edit outside the
+   * session's worktree or the allowed directories) and/or its own stated reason.
+   * Without this the card reads as an ordinary tool request and the user has no
+   * idea a restriction is what triggered it.
+   */
+  reason?: string;
 }
 
 /** Read a string field from a tool_use input object (the permission `input`). */
@@ -28,11 +35,13 @@ export function field(input: JsonValue, key: string): string | undefined {
  * handled here — callers branch on it first (it has its own multi-question UI).
  */
 export function classifyAsk(req: PermissionRequestPayload): Ask {
+  const reason = askReason(req);
   if (req.tool_name === "Bash") {
     return {
       kind: "permission",
       text: "Allow running the command?",
       cmd: field(req.input, "command"),
+      reason,
     };
   }
   const target = field(req.input, "file_path");
@@ -41,5 +50,35 @@ export function classifyAsk(req: PermissionRequestPayload): Ask {
     text:
       req.description ||
       (target ? `Allow editing ${target}?` : `Allow ${req.tool_name}?`),
+    reason,
   };
+}
+
+/**
+ * The "why" line of a permission prompt, built from whatever the CLI provided.
+ *
+ * `blocked_path` names the path that tripped a restriction; `decision_reason` is
+ * the CLI's own explanation and is NOT contractual in shape — it may be a plain
+ * string, or an object carrying one under a conventional key. Anything else is
+ * dropped rather than stringified: dumping raw JSON onto a permission card is
+ * worse than saying nothing. Returns undefined when there is nothing to say.
+ */
+export function askReason(req: PermissionRequestPayload): string | undefined {
+  const parts: string[] = [];
+  const why = reasonText(req.decision_reason);
+  if (why) parts.push(why);
+  if (req.blocked_path) parts.push(`Blocked path: ${req.blocked_path}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function reasonText(raw: JsonValue): string | undefined {
+  if (typeof raw === "string") return raw.trim() || undefined;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const obj = raw as Record<string, JsonValue>;
+    for (const key of ["message", "reason", "description", "type"]) {
+      const v = obj[key];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+  }
+  return undefined;
 }

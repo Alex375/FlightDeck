@@ -9,7 +9,7 @@
 // itself for them) and surfaced here instead.
 
 import { useMemo, useState } from "react";
-import { useBackgroundAgentIds, useSessionState, useToolResult } from "../../store/conversationStore";
+import { useBackgroundAgentIds, useToolResult } from "../../store/conversationStore";
 import { useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
@@ -28,9 +28,6 @@ export function AgentBar({ session }: { session: string }) {
   // no routed sub-agent thread. So on Codex we list EVERY running sub-agent, and render each
   // display-only (no transcript to drill, no per-agent stop wire).
   const isCodex = useIsCodex(session);
-  // Sub-agents inherit the conversation's effort (not recorded per sub-agent), so the
-  // parent's effort is the best available signal — same as the inline card.
-  const effort = useSessionState(session)?.effort ?? null;
   const claudeSessionId = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
   );
@@ -67,7 +64,10 @@ export function AgentBar({ session }: { session: string }) {
   return (
     <div className="cv-bgagents">
       {rows.map((t) => {
-        const meta = [t.subagent_type, t.model ? shortModel(t.model) : null, effort ? `effort ${effort}` : null]
+        // No effort here: it is per-agent-definition, not inherited from the parent —
+        // see the matching note on the inline sub-agent card. `model` IS per sub-agent
+        // (it rides the wire), so it stays.
+        const meta = [t.subagent_type, t.model ? shortModel(t.model) : null]
           .filter(Boolean)
           .join(" · ");
         // Defensive / forward-compatible: the wire's usage roll-up (tokens / tool-calls

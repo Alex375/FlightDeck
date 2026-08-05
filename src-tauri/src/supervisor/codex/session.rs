@@ -865,6 +865,8 @@ impl CodexCore {
                     title: Some("Run a command".into()),
                     description: p.reason,
                     suggestions: Value::Null,
+                    // Claude-only provenance fields (no Codex equivalent).
+                    ..Default::default()
                 }
             }
             "item/fileChange/requestApproval" => {
@@ -877,6 +879,7 @@ impl CodexCore {
                     title: Some("Edit files".into()),
                     description: p.reason,
                     suggestions: Value::Null,
+                    ..Default::default()
                 }
             }
             // The demux only routes the two approval kinds above; anything else here would

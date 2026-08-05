@@ -322,6 +322,8 @@
 .wf-ask-q li { font-size:12px; line-height:1.45; color:var(--wf-tx-hi); }
 .wf-ask.compact .wf-ask-q li { font-size:11.5px; }
 .wf-ask-cmd { font-size:11.5px; color:#f0cd97; background:#0e0e11; border:1px solid #4a3a22; border-radius:5px; padding:6px 9px; display:block; }
+/* Why the CLI is asking (blocked path / stated reason) — secondary to the ask itself. */
+.wf-ask-why { font-size:11.5px; line-height:1.45; color:var(--wf-tx-dim); overflow-wrap:anywhere; }
 
 /* ---- dropdown menus + compact chips ------------------------ */
 .wf-menu { position:relative; display:inline-flex; }

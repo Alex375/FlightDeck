@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyAsk, field } from "./ask";
+import { askReason, classifyAsk, field } from "./ask";
 import type { PermissionRequestPayload } from "../ipc/client";
 
 function req(p: Partial<PermissionRequestPayload>): PermissionRequestPayload {
@@ -11,6 +11,9 @@ function req(p: Partial<PermissionRequestPayload>): PermissionRequestPayload {
     title: null,
     description: null,
     suggestions: null,
+    blocked_path: null,
+    decision_reason: null,
+    agent_id: null,
     ...p,
   };
 }
@@ -66,5 +69,40 @@ describe("field", () => {
     expect(field([1, 2], "0")).toBeUndefined();
     expect(field({ x: 3 }, "x")).toBeUndefined();
     expect(field({}, "x")).toBeUndefined();
+  });
+});
+
+describe("askReason", () => {
+  it("says nothing when the CLI gave no reason", () => {
+    expect(askReason(req({}))).toBeUndefined();
+  });
+
+  it("surfaces a blocked path", () => {
+    const r = askReason(req({ blocked_path: "/repo/src/App.tsx" }));
+    expect(r).toBe("Blocked path: /repo/src/App.tsx");
+  });
+
+  it("reads a plain-string decision_reason", () => {
+    expect(askReason(req({ decision_reason: "Outside the session worktree" }))).toBe(
+      "Outside the session worktree",
+    );
+  });
+
+  it("reads a conventional key out of an object decision_reason", () => {
+    expect(askReason(req({ decision_reason: { message: "Path is fenced" } }))).toBe(
+      "Path is fenced",
+    );
+  });
+
+  it("combines the reason and the path, reason first", () => {
+    const r = askReason(req({ decision_reason: "Fenced", blocked_path: "/repo/x.ts" }));
+    expect(r).toBe("Fenced · Blocked path: /repo/x.ts");
+  });
+
+  it("drops a shapeless decision_reason rather than dumping JSON on the card", () => {
+    // An unrecognised object must NOT be stringified: raw JSON in a permission
+    // prompt is worse than no explanation at all.
+    expect(askReason(req({ decision_reason: { unknown: [1, 2, 3] } }))).toBeUndefined();
+    expect(askReason(req({ decision_reason: "   " }))).toBeUndefined();
   });
 });

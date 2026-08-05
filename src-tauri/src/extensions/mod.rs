@@ -313,6 +313,57 @@ struct PluginManifest {
     description: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    /// Where the plugin keeps its skills, relative to the install dir. The CLI
+    /// accepts a single path OR a list, and `"."` (the plugin root) is explicitly
+    /// supported. Absent → the `skills/` default.
+    #[serde(default)]
+    skills: Option<ManifestPaths>,
+    #[serde(default)]
+    agents: Option<ManifestPaths>,
+    #[serde(default)]
+    commands: Option<ManifestPaths>,
+}
+
+/// A manifest contribution path: either `"skills"` or `["skills", "extra/skills"]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ManifestPaths {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ManifestPaths {
+    fn as_slice(&self) -> Vec<&str> {
+        match self {
+            ManifestPaths::One(s) => vec![s.as_str()],
+            ManifestPaths::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Resolve a plugin's contribution directories: the manifest's declared paths when
+/// present, else the conventional `<default>` subdirectory.
+///
+/// Hardcoding `<install>/skills` under-reported every plugin that declares its own
+/// layout — the CLI loads those skills fine while the Extensions manager showed 0.
+/// Paths are resolved relative to the install dir, and `"."` (the documented
+/// single-skill-at-root layout) resolves to the dir itself.
+fn contribution_dirs(dir: &Path, declared: Option<&ManifestPaths>, default: &str) -> Vec<PathBuf> {
+    match declared {
+        Some(paths) => paths
+            .as_slice()
+            .iter()
+            .map(|p| {
+                let p = p.trim_start_matches("./").trim_end_matches('/');
+                if p.is_empty() || p == "." {
+                    dir.to_path_buf()
+                } else {
+                    dir.join(p)
+                }
+            })
+            .collect(),
+        None => vec![dir.join(default)],
+    }
 }
 
 // ---- public entry point ----------------------------------------------------
@@ -430,17 +481,34 @@ pub fn list_extensions(repo_path: &str) -> ExtensionsSnapshot {
         );
 
         // Scan what the plugin provides (counts always; entries only when enabled).
+        // The manifest may redirect any of the three, so honour it before falling back
+        // to the conventional subdirectory.
         let skills = dir
             .as_ref()
-            .map(|d| scan_skills(&d.join("skills"), ExtScope::Plugin, Some(id)))
+            .map(|d| {
+                contribution_dirs(d, manifest.skills.as_ref(), "skills")
+                    .iter()
+                    .flat_map(|p| scan_skills(p, ExtScope::Plugin, Some(id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let agents = dir
             .as_ref()
-            .map(|d| scan_agents(&d.join("agents"), ExtScope::Plugin, Some(id)))
+            .map(|d| {
+                contribution_dirs(d, manifest.agents.as_ref(), "agents")
+                    .iter()
+                    .flat_map(|p| scan_agents(p, ExtScope::Plugin, Some(id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let command_count = dir
             .as_ref()
-            .map(|d| count_markdown(&d.join("commands")))
+            .map(|d| {
+                contribution_dirs(d, manifest.commands.as_ref(), "commands")
+                    .iter()
+                    .map(|p| count_markdown(p))
+                    .sum()
+            })
             .unwrap_or(0);
         let plugin_mcp: McpJsonFile = dir
             .as_ref()
@@ -512,9 +580,18 @@ pub fn list_plugin_contents(repo_path: &str, plugin_id: &str) -> PluginContents 
     };
 
     let plugin_mcp: McpJsonFile = read_json(&dir.join(".mcp.json")).unwrap_or_default();
+    // Mirror the inventory scan: the manifest decides where skills/agents live.
+    let manifest: PluginManifest =
+        read_json(&dir.join(".claude-plugin/plugin.json")).unwrap_or_default();
     PluginContents {
-        skills: scan_skills(&dir.join("skills"), ExtScope::Plugin, Some(plugin_id)),
-        agents: scan_agents(&dir.join("agents"), ExtScope::Plugin, Some(plugin_id)),
+        skills: contribution_dirs(&dir, manifest.skills.as_ref(), "skills")
+            .iter()
+            .flat_map(|p| scan_skills(p, ExtScope::Plugin, Some(plugin_id)))
+            .collect(),
+        agents: contribution_dirs(&dir, manifest.agents.as_ref(), "agents")
+            .iter()
+            .flat_map(|p| scan_agents(p, ExtScope::Plugin, Some(plugin_id)))
+            .collect(),
         mcp_servers: plugin_mcp
             .mcp_servers
             .iter()
@@ -1022,6 +1099,24 @@ fn install_scope(install: &PluginInstall) -> ExtScope {
 /// `SKILL.md` whose frontmatter carries `name`/`description`. Missing dir → empty.
 fn scan_skills(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<SkillInfo> {
     let mut out = Vec::new();
+    // A `SKILL.md` sitting directly in the scanned directory IS a skill — that is the
+    // single-skill layout the CLI suggests when a manifest points at the plugin root
+    // (`"skills": "."`). Requiring a subdirectory missed it entirely.
+    let own_md = dir.join("SKILL.md");
+    if own_md.is_file() {
+        let front = std::fs::read_to_string(&own_md)
+            .ok()
+            .map(|c| parse_frontmatter(&c))
+            .unwrap_or_default();
+        out.push(SkillInfo {
+            name: front.name.unwrap_or_else(|| dir_name(dir)),
+            description: front.description,
+            scope,
+            source: source.map(str::to_string),
+            path: own_md.to_string_lossy().into_owned(),
+            enabled: true,
+        });
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
@@ -1500,6 +1595,61 @@ mod tests {
         assert_eq!(info.url.as_deref(), Some("https://h/mcp"));
         assert_eq!(info.source.as_deref(), Some("p@m"));
         assert!(info.enabled);
+    }
+
+    /// REGRESSION: a plugin manifest may redirect where its skills/agents/commands
+    /// live, including to the plugin ROOT (`"skills": "."`). Hardcoding
+    /// `<install>/skills` reported 0 skills for such a plugin while the CLI loaded
+    /// them fine.
+    #[test]
+    fn contribution_dirs_honour_the_manifest_and_default_without_one() {
+        let root = Path::new("/p");
+
+        // No declaration → the conventional subdirectory.
+        assert_eq!(contribution_dirs(root, None, "skills"), vec![root.join("skills")]);
+
+        // A single declared path, relative to the install dir.
+        let one = ManifestPaths::One("lib/skills".into());
+        assert_eq!(
+            contribution_dirs(root, Some(&one), "skills"),
+            vec![root.join("lib/skills")]
+        );
+
+        // "." (and "./") mean the plugin root itself, NOT a "." subdirectory.
+        for spelling in [".", "./", "./."] {
+            let at_root = ManifestPaths::One(spelling.into());
+            assert_eq!(
+                contribution_dirs(root, Some(&at_root), "skills"),
+                vec![root.to_path_buf()],
+                "{spelling} should resolve to the plugin root"
+            );
+        }
+
+        // A list contributes every entry.
+        let many = ManifestPaths::Many(vec!["skills".into(), "extra/skills".into()]);
+        assert_eq!(
+            contribution_dirs(root, Some(&many), "skills"),
+            vec![root.join("skills"), root.join("extra/skills")]
+        );
+    }
+
+    /// REGRESSION: a `SKILL.md` directly inside the scanned directory IS a skill —
+    /// the single-skill layout a root-pointing manifest produces. Requiring a
+    /// subdirectory skipped it silently.
+    #[test]
+    fn scan_skills_accepts_a_skill_md_at_the_scanned_root() {
+        let dir = std::env::temp_dir().join(format!("tosse-skills-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: at-root\n---\nbody").unwrap();
+        std::fs::write(nested.join("SKILL.md"), "---\nname: nested-one\n---\nbody").unwrap();
+
+        let found = scan_skills(&dir, ExtScope::Plugin, Some("p@m"));
+        let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"at-root"), "root SKILL.md must be found: {names:?}");
+        assert!(names.contains(&"nested-one"), "nested skills still found: {names:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Smoke test against the real `~/.claude` of the machine running it. Ignored

@@ -48,7 +48,7 @@ use ipc::commands::{
 use ipc::events::{
     AccountLoginEvent, FsChangeEvent, FsWatchErrorEvent, SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
-    SessionPermissionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
+    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -180,6 +180,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionStateEvent,
             SessionMessageEvent,
             SessionPermissionEvent,
+            SessionPermissionResolvedEvent,
             SessionCommandsEvent,
             SessionTaskEvent,
             SessionTitleEvent,

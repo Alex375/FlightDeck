@@ -21,6 +21,7 @@ import type {
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
+  SessionPermissionResolvedEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -377,6 +378,15 @@ export function useGlobalSessionEvents(): void {
       useConversationStore.getState().enqueuePermission(session, payload.request);
     }
 
+    // The CLI withdrew a prompt (mode flipped mid-check, turn ended, …). Drop the
+    // card: the store otherwise prunes only when the user answers, so a dead prompt
+    // would sit there looking answerable.
+    function onPermissionResolved(payload: SessionPermissionResolvedEvent) {
+      const session = convIdForHandle(payload.session);
+      if (!session) return;
+      useConversationStore.getState().removePermission(session, payload.request_id);
+    }
+
     function onTitle(payload: SessionTitleEvent) {
       const convId = convIdForHandle(payload.session);
       if (!convId) return; // unknown / deleted conversation
@@ -506,6 +516,10 @@ export function useGlobalSessionEvents(): void {
       .catch((e) => onAttachError("state", e));
     events.sessionPermissionEvent
       .listen((e) => { if (!disposed) onPermission(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permissions", e));
+    events.sessionPermissionResolvedEvent
+      .listen((e) => { if (!disposed) onPermissionResolved(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("permissions", e));
     events.sessionCommandsEvent

@@ -59,6 +59,7 @@ export type {
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
+  SessionPermissionResolvedEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionStatePayload,

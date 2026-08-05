@@ -1500,6 +1500,7 @@ sessionCommandsEvent: SessionCommandsEvent,
 sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
+sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
@@ -1517,6 +1518,7 @@ sessionCommandsEvent: "session-commands-event",
 sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
+sessionPermissionResolvedEvent: "session-permission-resolved-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
@@ -2552,7 +2554,24 @@ export type PermissionRequestPayload = { request_id: string; tool_name: string; 
 /**
  * CLI-provided suggestions (kept raw).
  */
-suggestions: JsonValue }
+suggestions: JsonValue; 
+/**
+ * The path that triggered the check, when the CLI blocked on one (e.g. an edit
+ * outside the session's worktree, or outside the allowed directories). Carries
+ * the "why" of a prompt that would otherwise read as an ordinary tool request.
+ */
+blocked_path: string | null; 
+/**
+ * The CLI's own reason for asking (kept raw — the shape is not contractual).
+ * Rendered as free text when it holds a human-readable string.
+ */
+decision_reason: JsonValue; 
+/**
+ * Set when the prompt comes from a background sub-agent task rather than the
+ * main thread, so the card can attribute it instead of implying the user's own
+ * turn is blocked.
+ */
+agent_id: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -2748,6 +2767,12 @@ export type SessionMessageEvent = { session: string; item: ConversationItem }
  * A `can_use_tool` permission prompt awaiting a decision.
  */
 export type SessionPermissionEvent = { session: string; request: PermissionRequestPayload }
+/**
+ * A pending permission prompt was withdrawn by the CLI and can no longer be
+ * answered. The UI drops the card: it otherwise prunes only on a user answer,
+ * leaving a dead prompt on screen that silently swallows the next click.
+ */
+export type SessionPermissionResolvedEvent = { session: string; request_id: string }
 /**
  * This session's Remote Control ("bridge") state changed — the ack of a
  * `remote_control` request, or an async `system/bridge_state` health downgrade. The

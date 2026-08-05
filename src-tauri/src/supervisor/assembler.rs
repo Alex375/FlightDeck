@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use super::control;
 use super::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, NormalizedBlock,
     RateLimitSnapshot, RemoteControlState, SessionEvent, SessionStatePayload,
@@ -365,9 +366,26 @@ impl Assembler {
                     ..RemoteControlState::default()
                 }));
             }
-            // Other subtypes are discarded by the protocol layer's catch-all; we
-            // surface nothing for them yet.
-            SystemMsg::Unknown => {}
+            // The CLI pushed a fresh slash-command catalogue mid-session (plugin
+            // toggled / installed / hot-reloaded). Forward it so the `/` menu follows
+            // a command set that changed under a live session, instead of waiting for
+            // the next spawn or an explicit refetch.
+            SystemMsg::CommandsChanged { commands } => {
+                if let Some(raw) = commands {
+                    out.push(SessionEvent::Commands(control::slash_commands_from_array(
+                        raw,
+                    )));
+                }
+            }
+            // A `system` subtype we do not model — like the top-level `Unknown` arm,
+            // almost always CLI protocol drift after a binary upgrade. We can't render
+            // it (we don't know its shape), but it must not vanish without a trace:
+            // this is the widest silent-drop path in the core.
+            SystemMsg::Unknown => {
+                eprintln!(
+                    "[assembler] dropping an unmodeled system subtype (CLI protocol drift after an upgrade?)"
+                );
+            }
         }
     }
 
@@ -1201,12 +1219,19 @@ fn effort_label(effort: Option<&str>, ultracode: bool) -> Option<String> {
     if ultracode {
         return Some("Ultra code".to_string());
     }
+    // ⚠️ Must mirror the front's EFFORT_LABELS (`src/agent/subagentMeta.ts`) verbatim:
+    // this label lands in the in-thread "Thinking effort: X → Y" notice, right under
+    // the composer chip that renders the SAME value from the front's table. Any drift
+    // makes the two disagree about one setting (they did: "Extra high" vs "Extra", and
+    // `max` fell through raw as "max" next to a chip reading "Max").
     Some(
         match effort? {
             "low" => "Low",
             "medium" => "Medium",
             "high" => "High",
-            "xhigh" => "Extra high",
+            "xhigh" => "Extra",
+            "max" => "Max",
+            "ultra" => "Ultra",
             other => return Some(other.to_string()),
         }
         .to_string(),
@@ -2085,7 +2110,7 @@ mod tests {
 
     fn seeded() -> Assembler {
         let mut asm = Assembler::new();
-        // Spawn baseline: Opus / Extra high / Default.
+        // Spawn baseline: Opus / Extra / Default.
         asm.seed_controls(Some("opus".into()), Some("xhigh".into()), Some("default".into()), false);
         asm
     }
@@ -2103,19 +2128,19 @@ mod tests {
             .expect("a control_change notice");
         assert_eq!(subtype, "control_change");
         assert_eq!(detail["control"], serde_json::json!("Thinking effort"));
-        assert_eq!(detail["from"], serde_json::json!("Extra high"));
+        assert_eq!(detail["from"], serde_json::json!("Extra"));
         assert_eq!(detail["to"], serde_json::json!("High"));
         // Re-reading the same value is silent (idempotent).
         assert!(first_notice(asm.apply_settings(None, Some("high".into()), Some(false))).is_none());
     }
 
-    /// Ultra code is announced as its own label, not as "Extra high".
+    /// Ultra code is announced as its own label, not as "Extra".
     #[test]
     fn ultracode_change_announces_its_own_label() {
         let mut asm = seeded();
         let (_, detail) = first_notice(asm.apply_settings(None, Some("xhigh".into()), Some(true)))
             .expect("a notice");
-        assert_eq!(detail["from"], serde_json::json!("Extra high"));
+        assert_eq!(detail["from"], serde_json::json!("Extra"));
         assert_eq!(detail["to"], serde_json::json!("Ultra code"));
     }
 
@@ -2146,6 +2171,45 @@ mod tests {
         assert_eq!(detail["control"], serde_json::json!("Model"));
         assert_eq!(detail["from"], serde_json::json!("Opus 5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
+    }
+
+    /// REGRESSION: `system/commands_changed` is a PUSH of a fresh slash-command
+    /// catalogue (a plugin was toggled / installed / hot-reloaded mid-session). It
+    /// used to fall into `SystemMsg::Unknown` and be discarded, so the `/` menu kept
+    /// serving a command set the live session no longer had.
+    #[test]
+    fn commands_changed_push_refreshes_the_slash_menu() {
+        let mut asm = seeded();
+        let push: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "commands_changed",
+            "commands": [
+                { "name": "pickup", "description": "(plugin) Start a task", "argumentHint": "<id>" },
+                { "name": "compact" },
+                { "description": "nameless entries are skipped" }
+            ]
+        }))
+        .unwrap();
+
+        let cmds = asm
+            .ingest(&push)
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::Commands(c) => Some(c),
+                _ => None,
+            })
+            .expect("the push must surface a fresh catalogue");
+        assert_eq!(cmds.len(), 2, "the entry without a name is dropped");
+        assert_eq!(cmds[0].name, "pickup");
+        assert_eq!(cmds[0].argument_hint, "<id>");
+        assert_eq!(cmds[1].name, "compact");
+        assert_eq!(cmds[1].description, "", "a missing description is empty, not an error");
+
+        // A bare invalidation (no payload) is tolerated and emits nothing.
+        let bare: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "commands_changed"
+        }))
+        .unwrap();
+        assert!(asm.ingest(&bare).is_empty());
     }
 
     /// `system/bridge_state` is a Remote Control HEALTH signal: a `disconnected` /

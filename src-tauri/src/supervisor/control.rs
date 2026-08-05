@@ -116,28 +116,34 @@ pub fn parse_initialize_commands(line: &Value) -> Option<Vec<SlashCommand>> {
         .get("response")?
         .get("commands")?
         .as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|c| {
-                let name = c.get("name")?.as_str()?.to_string();
-                let description = c
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let argument_hint = c
-                    .get("argumentHint")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                Some(SlashCommand {
-                    name,
-                    description,
-                    argument_hint,
-                })
+    Some(slash_commands_from_array(arr))
+}
+
+/// Map a raw `commands` array to [`SlashCommand`]s. Shared by the three surfaces
+/// that carry the SAME catalogue shape: the `initialize` response, the
+/// `reload_plugins` response (which returns a fresh catalogue after a hot-reload),
+/// and the `system/commands_changed` push. Entries without a `name` are skipped.
+pub fn slash_commands_from_array(arr: &[Value]) -> Vec<SlashCommand> {
+    arr.iter()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?.to_string();
+            let description = c
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let argument_hint = c
+                .get("argumentHint")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(SlashCommand {
+                name,
+                description,
+                argument_hint,
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 /// A correlated outbound-request acknowledgement (`control_response`). `request_id`

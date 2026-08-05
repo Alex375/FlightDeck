@@ -126,6 +126,16 @@ pub enum SystemMsg {
         state: Option<String>,
         detail: Option<String>,
     },
+    /// `system/commands_changed` — the CLI PUSHES a fresh slash-command catalogue
+    /// mid-session (a plugin was toggled, installed, or hot-reloaded). Without it the
+    /// `/` menu only ever refreshes at `initialize` or on an explicit refetch, so it
+    /// goes stale as soon as the command set changes under a live session. Same shape
+    /// as the `initialize` response's catalogue; `commands` is optional because the
+    /// push may be a bare invalidation signal.
+    CommandsChanged {
+        #[serde(default)]
+        commands: Option<Vec<Value>>,
+    },
     /// Other system subtypes (`compact_boundary`, `thinking_tokens`, …) are tolerated
     /// here so they never drop to [`CliMessage::Unknown`].
     #[serde(other)]
