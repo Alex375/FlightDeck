@@ -136,8 +136,39 @@ pub enum SystemMsg {
         #[serde(default)]
         commands: Option<Vec<Value>>,
     },
-    /// Other system subtypes (`compact_boundary`, `thinking_tokens`, …) are tolerated
-    /// here so they never drop to [`CliMessage::Unknown`].
+    /// Routine subtypes we deliberately do NOT render, listed explicitly so they never
+    /// reach [`Self::Unknown`].
+    ///
+    /// This matters because `Unknown` is the app's protocol-drift canary: if ordinary
+    /// traffic fell into it, its warning would fire on every normal session and a
+    /// genuinely new subtype would be indistinguishable from the noise. The set below
+    /// is what actually occurs on this machine's transcripts (`api_error`,
+    /// `local_command`, `stop_hook_summary`, `compact_boundary`, `turn_duration`,
+    /// `informational`) plus the ones the spec documents.
+    ///
+    /// ⚠️ `api_error` carries `level` + an `error{message, formatted}` object and is by
+    /// far the most frequent (network blips the CLI retries on its own). It is consumed
+    /// silently here because a failing turn already surfaces through `result`
+    /// (`api_error_status` → ErrorBlock); promoting every transient retry to a thread
+    /// notice would be noise, not signal.
+    #[serde(rename = "api_error")]
+    ApiError,
+    #[serde(rename = "local_command")]
+    LocalCommand,
+    #[serde(rename = "stop_hook_summary")]
+    StopHookSummary,
+    #[serde(rename = "compact_boundary")]
+    CompactBoundary,
+    #[serde(rename = "turn_duration")]
+    TurnDuration,
+    #[serde(rename = "informational")]
+    Informational,
+    #[serde(rename = "thinking_tokens")]
+    ThinkingTokens,
+    #[serde(rename = "model_refusal_fallback")]
+    ModelRefusalFallback,
+    /// A subtype we do not model at all — the drift canary. Reaching this arm should be
+    /// rare enough that its log line is worth reading.
     #[serde(other)]
     Unknown,
 }

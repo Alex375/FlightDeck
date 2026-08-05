@@ -789,6 +789,16 @@
   white-space: pre-wrap;
   margin-bottom: 12px;
 }
+/* Neutral report line — used for a plugin-update verdict that is NOT a failure. */
+.note {
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--wf-tx);
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-line);
+  margin-bottom: 12px;
+}
 .warn {
   padding: 9px 12px;
   border-radius: 8px;
@@ -1102,6 +1112,22 @@
   color: #f0b15a;
   border: 1px solid #5a4225;
   background: rgba(240, 177, 90, 0.08);
+  white-space: nowrap;
+}
+
+/* "Upstream moved": the marketplace points at a newer commit but publishes no version,
+   so an update can be neither proven nor ruled out. Deliberately MUTED, not amber —
+   it is an absence of information, not a call to action. */
+.unprovenBadge {
+  flex: 0 0 auto;
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: var(--wf-tx-dim);
+  border: 1px solid var(--wf-line);
+  background: transparent;
   white-space: nowrap;
 }
 /* "Update" — an amber-tinted action, sitting between the row body and toggle. */

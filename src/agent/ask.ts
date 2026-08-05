@@ -67,17 +67,30 @@ export function askReason(req: PermissionRequestPayload): string | undefined {
   const parts: string[] = [];
   const why = reasonText(req.decision_reason);
   if (why) parts.push(why);
-  if (req.blocked_path) parts.push(`Blocked path: ${req.blocked_path}`);
+  if (req.blocked_path) parts.push(`Blocked path: ${clean(req.blocked_path)}`);
+  // Attribute a prompt raised by a background sub-agent, so it does not read as if the
+  // user's own turn were the thing blocked.
+  if (req.agent_id) parts.push(`Asked by sub-agent ${clean(req.agent_id)}`);
   return parts.length ? parts.join(" · ") : undefined;
 }
 
+/** Control characters and ANSI/CSI escapes, which the CLI's own schema warns
+ *  `decision_reason` may carry ("May carry ANSI escapes; sanitize before rendering").
+ *  Rendered as-is they show up as literal `[1m` noise around the one line meant to
+ *  explain why the agent is blocked. */
+const ANSI_OR_CONTROL = /\u001B\[[0-9;?]*[ -/]*[@-~]|[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
+function clean(s: string): string {
+  return s.replace(ANSI_OR_CONTROL, "").trim();
+}
+
 function reasonText(raw: JsonValue): string | undefined {
-  if (typeof raw === "string") return raw.trim() || undefined;
+  if (typeof raw === "string") return clean(raw) || undefined;
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const obj = raw as Record<string, JsonValue>;
     for (const key of ["message", "reason", "description", "type"]) {
       const v = obj[key];
-      if (typeof v === "string" && v.trim()) return v.trim();
+      if (typeof v === "string" && clean(v)) return clean(v);
     }
   }
   return undefined;

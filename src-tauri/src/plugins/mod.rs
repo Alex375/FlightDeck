@@ -1,7 +1,13 @@
 //! Plugin update actions — the ONE place in the core that shells out to the
 //! `claude plugin …` CLI. Same encapsulation contract as [`crate::git`] (the `git`
-//! CLI): everything outside this module deals only in `Result<(), String>`; nothing
-//! else spawns the plugin CLI.
+//! CLI): nothing else spawns the plugin CLI.
+//!
+//! ⚠️ Every public function returns `Result<String, String>` where the `Ok` payload is
+//! the CLI's own one-line verdict (see [`report_line`]) and **callers MUST render it**.
+//! `claude plugin update` exits 0 while reporting `up_to_date` ("… is already at the
+//! latest version") or `skipped` ("Skipped — … version range …"), so a `Result<(),
+//! String>` signature here would re-introduce the swallowed-verdict bug: the spinner
+//! stops, nothing changes, and the UI implies success.
 //!
 //! ## Why the CLI, not files
 //! Plugin install/update is only officially supported through this CLI — the same

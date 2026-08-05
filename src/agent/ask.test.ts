@@ -99,6 +99,20 @@ describe("askReason", () => {
     expect(r).toBe("Fenced · Blocked path: /repo/x.ts");
   });
 
+  it("strips ANSI escapes the CLI warns it may send", () => {
+    // The can_use_tool schema says decision_reason "May carry ANSI escapes; sanitize
+    // before rendering" — rendered raw they show up as literal [1m noise.
+    const r = askReason(req({ decision_reason: "\u001B[1mDangerous rm\u001B[0m detected" }));
+    expect(r).toBe("Dangerous rm detected");
+    // A reason made only of escapes is nothing to say, not an empty box.
+    expect(askReason(req({ decision_reason: "\u001B[0m" }))).toBeUndefined();
+  });
+
+  it("attributes a prompt raised by a background sub-agent", () => {
+    const r = askReason(req({ agent_id: "agent_42", blocked_path: "/repo/x.ts" }));
+    expect(r).toBe("Blocked path: /repo/x.ts · Asked by sub-agent agent_42");
+  });
+
   it("drops a shapeless decision_reason rather than dumping JSON on the card", () => {
     // An unrecognised object must NOT be stringified: raw JSON in a permission
     // prompt is worse than no explanation at all.

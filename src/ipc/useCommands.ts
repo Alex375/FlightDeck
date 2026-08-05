@@ -162,7 +162,13 @@ export function useAnswerPermission(convId: string) {
       // Optimistically dismiss the card; the state event confirms awaiting=false.
       removePermission(convId, args.requestId);
       const handle = liveHandle(convId);
-      if (!handle) return; // nothing live to answer
+      // No live session: the process died while the card was on screen (crash, quit,
+      // stop). Dismissing it silently is indistinguishable from a delivered answer —
+      // the user believes they allowed something that was never sent. Fail loudly and
+      // let onError put it in the thread.
+      if (!handle) {
+        throw new Error("the session ended before your answer could be sent");
+      }
       return unwrap(
         commands.answerPermission(handle, args.requestId, args.decision),
       );

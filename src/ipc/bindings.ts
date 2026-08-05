@@ -2614,16 +2614,26 @@ export type PluginInfo = {
  */
 id: string; name: string; marketplace: string; version: string | null; description: string | null; enabled: boolean; scope: ExtScope; 
 /**
- * Whether the plugin's installed pin differs from its marketplace's currently
- * downloaded pin (compared on-disk — see [`compute_update`]). Only as fresh as
- * the last `claude plugin marketplace update`; the UI's "Check" button runs
- * that refresh then re-reads. Never a false positive: unknown pins → `false`.
+ * A PROVEN update: the marketplace's version is known and differs from the
+ * installed one (see [`compute_update`]). Only as fresh as the last `claude
+ * plugin marketplace update`; the UI's "Check" button runs that refresh then
+ * re-reads. When this is true, [`Self::latest_version`] is always populated.
  */
 update_available: boolean; 
 /**
+ * The upstream commit moved but no version is resolvable on either side, so we
+ * can NEITHER prove nor rule out an update — the honest third state.
+ * 
+ * This is the dominant shape of the official marketplace (278 entries: 225 carry
+ * a `source.sha`, only 14 any version), and it is why neither boolean answer
+ * works alone: claiming an update produces a badge `claude plugin update` refuses
+ * to clear ("already at the latest version"), while claiming currency hides real
+ * releases. The UI must say "unknown", not pick a side.
+ */
+update_unproven: boolean; 
+/**
  * The marketplace's human version when it is KNOWN and DIFFERS from the installed
- * one (for a "vX → vY" badge). `None` for sha-only updates (a new commit with the
- * same semver) — the UI falls back to a generic "Update available" then.
+ * one (for a "vX → vY" badge). Always `Some` when `update_available` is true.
  */
 latest_version: string | null; 
 /**

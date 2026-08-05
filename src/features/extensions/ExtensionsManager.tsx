@@ -16,6 +16,7 @@
 // sub-agent opens a clean markdown view of its SKILL.md / .md; a PLUGIN opens a
 // 3-pane explorer (rail / list / detail) of its own skills / MCP / sub-agents,
 // modelled on Claude.ai's Customize panel. See memory "extensions-two-distinct-views".
+import type { UseMutationResult } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ClaudeMark, CodexMark, Ico } from "../../ui/kit";
 import { useCodexAvailable } from "../../store/binaryAvailable";
@@ -593,7 +594,7 @@ function ProjectBody({
               <AgentRow key={a.path} agent={a} onOpen={() => onOpenDoc({ name: a.name, source: CONFIG_SCOPE_LABEL[a.scope], path: a.path, description: a.description })} />
             )} empty="" />
           ) : null}
-          <PluginUpdateOutcome m={updatePlugin} />
+          <PluginUpdateOutcome mutation={updatePlugin} />
           <Section
             icon="layers"
             title="Plugins"
@@ -758,7 +759,7 @@ function ConversationBody({
           footer={agentContribs.length ? <PluginContribFooter plugins={agentContribs} kind="agents" onOpen={onOpenPlugin} /> : null}
         />
       ) : null}
-      <PluginUpdateOutcome m={updatePlugin} />
+      <PluginUpdateOutcome mutation={updatePlugin} />
       <Section
         icon="layers"
         title="Plugins"
@@ -1055,6 +1056,7 @@ function CodexPluginsSection({
                     enabled: p.enabled,
                     scope: "user",
                     update_available: false,
+                    update_unproven: false,
                     latest_version: null,
                     skill_count: 0,
                     agent_count: 0,
@@ -1564,17 +1566,22 @@ function MarketplacesPage({
  * verbatim: as an error when the command failed, otherwise as a neutral note.
  */
 function PluginUpdateOutcome({
-  m,
+  mutation,
 }: {
-  m: { isError: boolean; error: unknown; isSuccess: boolean; data?: string | null };
+  mutation: Pick<
+    UseMutationResult<string, Error, { pluginId: string; scope: string | null }>,
+    "isError" | "error" | "isSuccess" | "data"
+  >;
 }) {
-  if (m.isError) {
-    return <div className={styles.error}>{(m.error as Error).message}</div>;
+  if (mutation.isError) {
+    return <div className={styles.error}>{(mutation.error as Error).message}</div>;
   }
   // A successful run with nothing to say (the CLI printed only its progress line)
   // needs no box — the refreshed snapshot speaks for itself.
-  if (!m.isSuccess || !m.data) return null;
-  return <div className={styles.warn}>{m.data}</div>;
+  if (!mutation.isSuccess || !mutation.data) return null;
+  // Neutral, NOT the amber warning box: "Updated railway to 1.4.0." is the happy path
+  // and must not read as an alert.
+  return <div className={styles.note}>{mutation.data}</div>;
 }
 
 /** Plugin contributions to a category, shown as ONE summary box per plugin (NOT as
@@ -1833,6 +1840,16 @@ function PluginRow({
             <Badge label={`Installed: ${CONFIG_SCOPE_LABEL[plugin.scope]}`} cls={configBadgeCls(plugin.scope)} />
             {plugin.update_available ? (
               <span className={styles.updateBadge}>{updateBadgeLabel(plugin.version, plugin.latest_version)}</span>
+            ) : plugin.update_unproven ? (
+              // Upstream moved but no version is resolvable on either side, so we can
+              // neither promise an update nor claim currency — say exactly that instead
+              // of picking a side the CLI would contradict.
+              <span
+                className={styles.unprovenBadge}
+                title="The marketplace points at a newer commit, but it publishes no version for this plugin — Flight Deck cannot tell whether that is a new release. Use Update to ask Claude Code."
+              >
+                Upstream moved
+              </span>
             ) : null}
           </span>
           <span className={styles.rowMeta}>
@@ -1850,7 +1867,9 @@ function PluginRow({
           title={
             plugin.update_available
               ? "Update this plugin now"
-              : "Force update to the marketplace's latest version"
+              : plugin.update_unproven
+                ? "Ask Claude Code whether a newer version exists"
+                : "Force update to the marketplace's latest version"
           }
         >
           <Ico name="refresh" className={"sm" + (updating ? " " + styles.spin : "")} />

@@ -240,7 +240,7 @@ export const mockCommands = {
         { name: "railway", scope: "user", transport: "stdio", command: "railway", url: null, source: null, enabled: false },
       ],
       plugins: [
-        { id: "browser@openai-bundled", name: "browser", marketplace: "openai-bundled", version: null, description: null, enabled: true, scope: "user", update_available: false, latest_version: null, skill_count: 0, agent_count: 0, command_count: 0, mcp_count: 0 },
+        { id: "browser@openai-bundled", name: "browser", marketplace: "openai-bundled", version: null, description: null, enabled: true, scope: "user", update_available: false, update_unproven: false, latest_version: null, skill_count: 0, agent_count: 0, command_count: 0, mcp_count: 0 },
       ],
       skills: [
         { name: "imagegen", description: "Generate an image", scope: "user", source: null, path: "/Users/x/.codex/skills/.system/imagegen/SKILL.md", enabled: true },

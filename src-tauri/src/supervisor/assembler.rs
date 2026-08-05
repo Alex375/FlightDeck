@@ -377,10 +377,21 @@ impl Assembler {
                     )));
                 }
             }
-            // A `system` subtype we do not model — like the top-level `Unknown` arm,
-            // almost always CLI protocol drift after a binary upgrade. We can't render
-            // it (we don't know its shape), but it must not vanish without a trace:
-            // this is the widest silent-drop path in the core.
+            // Routine traffic we deliberately don't render (see the variant docs in
+            // protocol.rs). Listed explicitly so the drift canary below stays meaningful.
+            SystemMsg::ApiError
+            | SystemMsg::LocalCommand
+            | SystemMsg::StopHookSummary
+            | SystemMsg::CompactBoundary
+            | SystemMsg::TurnDuration
+            | SystemMsg::Informational
+            | SystemMsg::ThinkingTokens
+            | SystemMsg::ModelRefusalFallback => {}
+            // A `system` subtype we do not model AT ALL — like the top-level `Unknown`
+            // arm, almost always CLI protocol drift after a binary upgrade. We can't
+            // render it (we don't know its shape), but it must not vanish without a
+            // trace. Because every routine subtype is matched above, this line firing
+            // actually means something.
             SystemMsg::Unknown => {
                 eprintln!(
                     "[assembler] dropping an unmodeled system subtype (CLI protocol drift after an upgrade?)"
