@@ -1099,23 +1099,18 @@ fn install_scope(install: &PluginInstall) -> ExtScope {
 /// `SKILL.md` whose frontmatter carries `name`/`description`. Missing dir → empty.
 fn scan_skills(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<SkillInfo> {
     let mut out = Vec::new();
+    // A manifest may name the SKILL.md file itself rather than a directory.
+    if dir.is_file() {
+        if let Some(info) = skill_from_md(dir, dir.parent().unwrap_or(dir), scope, source) {
+            out.push(info);
+        }
+        return out;
+    }
     // A `SKILL.md` sitting directly in the scanned directory IS a skill — that is the
     // single-skill layout the CLI suggests when a manifest points at the plugin root
     // (`"skills": "."`). Requiring a subdirectory missed it entirely.
-    let own_md = dir.join("SKILL.md");
-    if own_md.is_file() {
-        let front = std::fs::read_to_string(&own_md)
-            .ok()
-            .map(|c| parse_frontmatter(&c))
-            .unwrap_or_default();
-        out.push(SkillInfo {
-            name: front.name.unwrap_or_else(|| dir_name(dir)),
-            description: front.description,
-            scope,
-            source: source.map(str::to_string),
-            path: own_md.to_string_lossy().into_owned(),
-            enabled: true,
-        });
+    if let Some(info) = skill_from_md(&dir.join("SKILL.md"), dir, scope, source) {
+        out.push(info);
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -1125,60 +1120,93 @@ fn scan_skills(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<SkillIn
         if !path.is_dir() {
             continue;
         }
-        let skill_md = path.join("SKILL.md");
-        let front = std::fs::read_to_string(&skill_md)
-            .ok()
-            .map(|c| parse_frontmatter(&c))
-            .unwrap_or_default();
-        let name = front.name.unwrap_or_else(|| dir_name(&path));
-        out.push(SkillInfo {
-            name,
-            description: front.description,
-            scope,
-            source: source.map(str::to_string),
-            path: skill_md.to_string_lossy().into_owned(),
-            // Claude exposes no per-skill toggle — a discovered skill is active.
-            enabled: true,
-        });
+        if let Some(info) = skill_from_md(&path.join("SKILL.md"), &path, scope, source) {
+            out.push(info);
+        }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// One `SKILL.md` → [`SkillInfo`], named after its frontmatter or `owner` (the
+/// directory the skill belongs to). `None` when the file is absent.
+fn skill_from_md(
+    skill_md: &Path,
+    owner: &Path,
+    scope: ExtScope,
+    source: Option<&str>,
+) -> Option<SkillInfo> {
+    if !skill_md.is_file() {
+        return None;
+    }
+    let front = std::fs::read_to_string(skill_md)
+        .ok()
+        .map(|c| parse_frontmatter(&c))
+        .unwrap_or_default();
+    Some(SkillInfo {
+        name: front.name.unwrap_or_else(|| dir_name(owner)),
+        description: front.description,
+        scope,
+        source: source.map(str::to_string),
+        path: skill_md.to_string_lossy().into_owned(),
+        // Claude exposes no per-skill toggle — a discovered skill is active.
+        enabled: true,
+    })
 }
 
 /// Scan an `agents/` directory: one `*.md` per sub-agent, frontmatter carries
 /// `name`/`description`/`model`. Missing dir → empty.
 fn scan_agents(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<AgentInfo> {
     let mut out = Vec::new();
+    // A manifest may name individual FILES rather than a directory
+    // (`"agents": ["./agents/a.md", "./agents/b.md"]` is real, and common) — treat a
+    // path that IS a markdown file as a single contribution.
+    if dir.is_file() {
+        if let Some(info) = agent_from_md(dir, scope, source) {
+            out.push(info);
+        }
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
+        if let Some(info) = agent_from_md(&entry.path(), scope, source) {
+            out.push(info);
         }
-        let front = std::fs::read_to_string(&path)
-            .ok()
-            .map(|c| parse_frontmatter(&c))
-            .unwrap_or_default();
-        let name = front
-            .name
-            .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string());
-        out.push(AgentInfo {
-            name,
-            description: front.description,
-            model: front.model,
-            scope,
-            source: source.map(str::to_string),
-            path: path.to_string_lossy().into_owned(),
-        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
+/// One `*.md` sub-agent definition → [`AgentInfo`]. `None` for a non-markdown path.
+fn agent_from_md(path: &Path, scope: ExtScope, source: Option<&str>) -> Option<AgentInfo> {
+    if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        return None;
+    }
+    let front = std::fs::read_to_string(path)
+        .ok()
+        .map(|c| parse_frontmatter(&c))
+        .unwrap_or_default();
+    let name = front
+        .name
+        .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string());
+    Some(AgentInfo {
+        name,
+        description: front.description,
+        model: front.model,
+        scope,
+        source: source.map(str::to_string),
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
 /// Count `*.md` files directly in `dir` (for a plugin's `commands/`). 0 if absent.
 fn count_markdown(dir: &Path) -> u32 {
+    // Same as scan_agents: a manifest may list individual command files.
+    if dir.is_file() {
+        return u32::from(dir.extension().and_then(|x| x.to_str()) == Some("md"));
+    }
     std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -1648,6 +1676,39 @@ mod tests {
         let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"at-root"), "root SKILL.md must be found: {names:?}");
         assert!(names.contains(&"nested-one"), "nested skills still found: {names:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// REGRESSION: a manifest may list individual FILES, not a directory — real
+    /// plugins on this machine do (`"agents": ["./agents/a.md", "./agents/b.md"]`,
+    /// `"commands": [...]`). Honouring the manifest naively (scanning each entry as a
+    /// directory) would report 0 agents for exactly those plugins, which is WORSE
+    /// than the hardcoded path it replaced.
+    #[test]
+    fn scanners_accept_a_manifest_path_that_names_a_file() {
+        let dir = std::env::temp_dir().join(format!("tosse-files-{}", std::process::id()));
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("one.md"), "---\nname: solo-agent\n---\nbody").unwrap();
+        std::fs::write(agents.join("two.md"), "---\nname: other-agent\n---\nbody").unwrap();
+        std::fs::write(agents.join("notes.txt"), "not an agent").unwrap();
+
+        // A file-valued entry contributes exactly that agent.
+        let one = scan_agents(&agents.join("one.md"), ExtScope::Plugin, Some("p@m"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "solo-agent");
+
+        // A non-markdown path contributes nothing rather than erroring.
+        assert!(scan_agents(&agents.join("notes.txt"), ExtScope::Plugin, None).is_empty());
+
+        // A directory-valued entry still scans the whole directory.
+        assert_eq!(scan_agents(&agents, ExtScope::Plugin, None).len(), 2);
+
+        // Command counting follows the same rule.
+        assert_eq!(count_markdown(&agents.join("one.md")), 1);
+        assert_eq!(count_markdown(&agents.join("notes.txt")), 0);
+        assert_eq!(count_markdown(&agents), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }
