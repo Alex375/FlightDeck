@@ -146,11 +146,18 @@ pub enum SystemMsg {
     /// `local_command`, `stop_hook_summary`, `compact_boundary`, `turn_duration`,
     /// `informational`) plus the ones the spec documents.
     ///
-    /// ⚠️ `api_error` carries `level` + an `error{message, formatted}` object and is by
-    /// far the most frequent (network blips the CLI retries on its own). It is consumed
-    /// silently here because a failing turn already surfaces through `result`
-    /// (`api_error_status` → ErrorBlock); promoting every transient retry to a thread
-    /// notice would be noise, not signal.
+    /// ⚠️ `api_error` is the most frequent by far (199 occurrences across this machine's
+    /// transcripts). VERIFIED against the 2.1.220 binary: it is `yield`ed into the live
+    /// message stream (alongside `stream_event`), not disk-only, and carries
+    /// `{level:"error", error, retryInMs, retryAttempt, maxRetries, source}` where
+    /// `source` is `connection_retry` | `request_retry`.
+    ///
+    /// It is consumed SILENTLY on purpose: each one announces a retry the CLI performs
+    /// by itself, the turn continues, and a genuinely failed turn already surfaces
+    /// through `result` (`api_error_status` → ErrorBlock). A thread notice per retry
+    /// would be noise. The unexploited signal is `retryAttempt`/`maxRetries`, which
+    /// would let the UI explain a slow turn ("reconnecting, 2/3") — a display feature,
+    /// deliberately not built here.
     #[serde(rename = "api_error")]
     ApiError,
     #[serde(rename = "local_command")]
