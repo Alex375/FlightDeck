@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::control;
 use super::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, NormalizedBlock,
-    RateLimitSnapshot, RemoteControlState, SessionEvent, SessionStatePayload,
+    RateLimitSnapshot, RemoteControlState, RetryState, SessionEvent, SessionStatePayload,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
@@ -282,10 +282,19 @@ impl Assembler {
         let mut out = Vec::new();
         match msg {
             CliMessage::System(sys) => self.ingest_system(sys, &mut out),
-            CliMessage::StreamEvent(se) => self.ingest_stream_event(se, &mut out),
-            CliMessage::Assistant(a) => self.ingest_assistant(a, &mut out),
+            CliMessage::StreamEvent(se) => {
+                self.clear_retry(&mut out);
+                self.ingest_stream_event(se, &mut out)
+            }
+            CliMessage::Assistant(a) => {
+                self.clear_retry(&mut out);
+                self.ingest_assistant(a, &mut out)
+            }
             CliMessage::User(u) => self.ingest_user(u, &mut out),
-            CliMessage::Result(r) => self.ingest_result(r, &mut out),
+            CliMessage::Result(r) => {
+                self.clear_retry(&mut out);
+                self.ingest_result(r, &mut out)
+            }
             CliMessage::RateLimitEvent(rl) => self.ingest_rate_limit(rl, &mut out),
             // A top-level `"type"` we do not model — almost always CLI protocol drift
             // after a binary upgrade. Nothing to render (we don't know its shape), but
@@ -299,6 +308,15 @@ impl Assembler {
             _ => {}
         }
         out
+    }
+
+    /// Drop a pending retry notice: anything arriving from the model proves the
+    /// connection recovered. Emits a state event only when there was something to
+    /// clear, so this stays free on the hot path.
+    fn clear_retry(&mut self, out: &mut Vec<SessionEvent>) {
+        if self.state.retry.take().is_some() {
+            out.push(SessionEvent::State(self.state.clone()));
+        }
     }
 
     fn ingest_system(&mut self, sys: &SystemMsg, out: &mut Vec<SessionEvent>) {
@@ -379,8 +397,26 @@ impl Assembler {
             }
             // Routine traffic we deliberately don't render (see the variant docs in
             // protocol.rs). Listed explicitly so the drift canary below stays meaningful.
-            SystemMsg::ApiError
-            | SystemMsg::LocalCommand
+            // The CLI is retrying the turn's API call after a connection failure. It
+            // recovers by itself, but without surfacing this the turn just appears to
+            // hang. Cleared as soon as anything else arrives (see `clear_retry`).
+            SystemMsg::ApiError {
+                error,
+                retry_attempt,
+                max_retries,
+            } => {
+                self.state.retry = Some(RetryState {
+                    attempt: *retry_attempt,
+                    max: *max_retries,
+                    reason: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(|m| m.trim().to_string())
+                        .filter(|m| !m.is_empty()),
+                });
+                out.push(SessionEvent::State(self.state.clone()));
+            }
+            SystemMsg::LocalCommand
             | SystemMsg::StopHookSummary
             | SystemMsg::CompactBoundary
             | SystemMsg::TurnDuration
@@ -2182,6 +2218,47 @@ mod tests {
         assert_eq!(detail["control"], serde_json::json!("Model"));
         assert_eq!(detail["from"], serde_json::json!("Opus 5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
+    }
+
+    /// A connection failure mid-turn must be VISIBLE: the CLI retries by itself, so
+    /// without this the turn simply appears to hang. The notice clears as soon as the
+    /// model produces anything, which proves the connection came back.
+    #[test]
+    fn an_api_retry_is_surfaced_then_cleared_when_the_stream_resumes() {
+        let mut asm = seeded();
+        let retry: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "api_error", "level": "error",
+            "error": { "message": "Connection error." },
+            "retryInMs": 1000, "retryAttempt": 2, "maxRetries": 3,
+            "source": "connection_retry"
+        }))
+        .unwrap();
+
+        let state = asm
+            .ingest(&retry)
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .expect("a retry must reach the UI");
+        let r = state.retry.expect("retry state");
+        assert_eq!(r.attempt, Some(2));
+        assert_eq!(r.max, Some(3));
+        assert_eq!(r.reason.as_deref(), Some("Connection error."));
+
+        // The stream resuming clears it.
+        let delta: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta", "index": 0,
+                       "delta": { "type": "text_delta", "text": "hi" } }
+        }))
+        .unwrap();
+        let cleared = asm.ingest(&delta).into_iter().any(|e| {
+            matches!(e, SessionEvent::State(s) if s.retry.is_none())
+        });
+        assert!(cleared, "the notice must disappear once the model answers");
+        assert!(asm.state.retry.is_none());
     }
 
     /// REGRESSION: `system/commands_changed` is a PUSH of a fresh slash-command

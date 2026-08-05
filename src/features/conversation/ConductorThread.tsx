@@ -1350,6 +1350,20 @@ function WorkingIndicator({ session }: { session: string }) {
   // terminal-style ("$ command…") rather than the generic "Running …" phrase — the
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
+  // The connection dropped and Claude Code is retrying on its own. It takes over the
+  // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
+  // usual "Running …" phrase would be a lie while nothing is actually running.
+  const retry = useSessionState(session)?.retry ?? null;
+  if (retry) {
+    const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
+    return (
+      <div className={styles.activity}>
+        <Ico name="refresh" className={"sm " + styles.retrySpin} />
+        <RollText text={`Connection lost — reconnecting${progress}`} />
+        <LiveElapsed session={session} />
+      </div>
+    );
+  }
   return (
     <div className={styles.activity}>
       <span className={styles.typing} aria-hidden="true">

@@ -2708,6 +2708,22 @@ export type RepoRecord = { id: string; path: string;
  */
 added_at: number }
 /**
+ * An in-flight automatic retry of the current turn's API call.
+ */
+export type RetryState = { 
+/**
+ * Which attempt is being made (1-based), when the CLI reports it.
+ */
+attempt: number | null; 
+/**
+ * How many attempts the CLI will make in total.
+ */
+max: number | null; 
+/**
+ * Short human reason ("Connection error."), when one is available.
+ */
+reason: string | null }
+/**
  * What a rewind removed, returned to the UI.
  */
 export type RewindOutcome = { 
@@ -2841,6 +2857,16 @@ activity: string | null;
  * `true` while waiting on the user to answer a permission prompt.
  */
 awaiting_permission: boolean; 
+/**
+ * The API call for the current turn is being RETRIED after a connection failure
+ * (`system/api_error`, which the CLI emits before each automatic retry). Set while
+ * a retry is pending, cleared as soon as the turn produces anything else.
+ * 
+ * Without this the user sees a turn that simply hangs: the CLI recovers on its
+ * own, but nothing on screen explains the pause. Carries `attempt`/`max` so the UI
+ * can say how far along the recovery is.
+ */
+retry: RetryState | null; 
 /**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session

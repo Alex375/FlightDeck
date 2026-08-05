@@ -159,7 +159,15 @@ pub enum SystemMsg {
     /// would let the UI explain a slow turn ("reconnecting, 2/3") — a display feature,
     /// deliberately not built here.
     #[serde(rename = "api_error")]
-    ApiError,
+    ApiError {
+        #[serde(default)]
+        error: Value,
+        // camelCase on the wire (`rename_all` on this enum renames VARIANTS, not fields).
+        #[serde(default, rename = "retryAttempt")]
+        retry_attempt: Option<u32>,
+        #[serde(default, rename = "maxRetries")]
+        max_retries: Option<u32>,
+    },
     #[serde(rename = "local_command")]
     LocalCommand,
     #[serde(rename = "stop_hook_summary")]

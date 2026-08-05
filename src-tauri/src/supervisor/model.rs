@@ -41,6 +41,14 @@ pub struct SessionStatePayload {
     pub activity: Option<String>,
     /// `true` while waiting on the user to answer a permission prompt.
     pub awaiting_permission: bool,
+    /// The API call for the current turn is being RETRIED after a connection failure
+    /// (`system/api_error`, which the CLI emits before each automatic retry). Set while
+    /// a retry is pending, cleared as soon as the turn produces anything else.
+    ///
+    /// Without this the user sees a turn that simply hangs: the CLI recovers on its
+    /// own, but nothing on screen explains the pause. Carries `attempt`/`max` so the UI
+    /// can say how far along the recovery is.
+    pub retry: Option<RetryState>,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
@@ -269,6 +277,17 @@ pub enum ConversationItem {
         subtype: String,
         detail: Value,
     },
+}
+
+/// An in-flight automatic retry of the current turn's API call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct RetryState {
+    /// Which attempt is being made (1-based), when the CLI reports it.
+    pub attempt: Option<u32>,
+    /// How many attempts the CLI will make in total.
+    pub max: Option<u32>,
+    /// Short human reason ("Connection error."), when one is available.
+    pub reason: Option<String>,
 }
 
 /// A `can_use_tool` permission prompt surfaced to the UI. The UI answers it via

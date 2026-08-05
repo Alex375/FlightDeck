@@ -330,7 +330,17 @@ impl Transport {
             // same round-trip; (2) dogfooded against 2.1.187 — locally-typed messages
             // did NOT double. If a future build reassigns the uuid, the symptom is
             // loud & immediate (every local message doubles), not silent.
-            .arg("--replay-user-messages");
+            .arg("--replay-user-messages")
+            // Forward a sub-agent's OWN text and thinking, not just its tool calls.
+            // Without this the binary filters sub-agent messages before forwarding —
+            // `if (!forwardSubagentText && type !== "tool_use" && type !== "tool_result")
+            // continue;` — and that filter applies at depth 1 already, which is why a
+            // live sub-agent drill-in showed steps but no prose while the SAME
+            // conversation reloaded from disk showed both. It also carries nested
+            // (depth-2+) sub-agents, keyed by the Agent tool_use that spawned them.
+            //
+            // Flag verified present in 2.1.220 (the installed build) and 2.1.222.
+            .arg("--forward-subagent-text");
 
         if let Some(resume) = &cfg.resume {
             cmd.arg("--resume").arg(resume);

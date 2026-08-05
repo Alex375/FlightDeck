@@ -12,6 +12,7 @@ const base: SessionStatePayload = {
   ultracode: false,
   activity: null,
   awaiting_permission: false,
+    retry: null,
   ended: false,
   context_tokens: null,
   context_window: null,
@@ -49,7 +50,8 @@ describe("agentEventFor", () => {
   });
 
   it("no re-fire while awaiting_permission stays true", () => {
-    const a = s({ awaiting_permission: true, busy: true });
+    const a = s({ awaiting_permission: true,
+    retry: null, busy: true });
     expect(agentEventFor(a, a)).toBeNull();
   });
 
@@ -60,8 +62,10 @@ describe("agentEventFor", () => {
   it("granting a permission (awaiting true→false, busy stays true) fires nothing", () => {
     expect(
       agentEventFor(
-        s({ awaiting_permission: true, busy: true }),
-        s({ awaiting_permission: false, busy: true }),
+        s({ awaiting_permission: true,
+    retry: null, busy: true }),
+        s({ awaiting_permission: false,
+    retry: null, busy: true }),
       ),
     ).toBeNull();
   });

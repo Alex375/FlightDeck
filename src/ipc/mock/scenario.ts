@@ -208,6 +208,7 @@ const baseState: SessionStatePayload = {
   ultracode: false,
   activity: null,
   awaiting_permission: false,
+    retry: null,
   ended: false,
   context_tokens: 29756,
   context_window: 1000000,
