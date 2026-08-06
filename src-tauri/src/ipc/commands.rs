@@ -475,6 +475,423 @@ pub async fn account_codex_logout() -> Result<(), String> {
     codex::accounts::logout().await.map_err(|e| e.to_string())
 }
 
+// ── TOSSE (the internal CRM) — a THIRD connection, unrelated to the two agent backends
+// above: it authenticates the human to their CRM, not an agent to a model provider. Unlike
+// those, no CLI owns the credentials — we run the OAuth flow and hold the tokens ourselves
+// (see `crate::tosse`). The app is fully usable without it.
+
+/// The TOSSE connection state (identity when reachable). Never fails on a network
+/// outage — an offline machine still reports the session it holds.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_status() -> Result<crate::tosse::TosseAccountStatus, String> {
+    Ok(crate::tosse::status().await)
+}
+
+/// Start a TOSSE sign-in: returns the authorization URL to open. The flow completes
+/// ASYNCHRONOUSLY once the browser hits our loopback callback — the outcome lands as the
+/// app-global [`AccountLoginEvent`] with `backend: "tosse"`, exactly like the Codex login.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_login_start(app: tauri::AppHandle) -> Result<String, String> {
+    crate::tosse::login_start(move |success, error| {
+        crate::ipc::events::emit_account_login(&app, "tosse", success, error);
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Abort the in-flight TOSSE sign-in (drops the loopback listener). Safe when none runs.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_login_cancel() -> Result<(), String> {
+    crate::tosse::login_cancel().await;
+    Ok(())
+}
+
+/// Sign out of TOSSE: revokes the session server-side (best effort) and clears the local
+/// tokens. Errs only when revocation failed — the local sign-out has happened either way.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_logout() -> Result<(), String> {
+    crate::tosse::logout().await.map_err(|e| e.to_string())
+}
+
+/// How each of Flight Deck's folders relates to TOSSE, in one call.
+///
+/// One payload rather than a command per repo: the CRM's repository list is a single
+/// request, and matching needs all of it at once.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseRepoLinksPayload {
+    /// False when no TOSSE session is held. The app is fully usable in that state, so the
+    /// UI shows nothing at all — and this call costs nothing either (it returns before
+    /// reading a single git remote).
+    pub connected: bool,
+    /// One entry per Flight Deck repo, in the order the store holds them.
+    pub links: Vec<crate::tosse::TosseRepoLink>,
+    /// Every repository the CRM knows, for the manual picker. Empty when `error` is set.
+    pub repositories: Vec<crate::tosse::TosseRepository>,
+    /// Set when we ARE connected but the list could not be read (offline, server error).
+    /// The links then resolve to nothing, and the UI says why instead of showing a folder
+    /// as un-associated — which would look like the association was lost.
+    pub error: Option<String>,
+}
+
+/// Pair every Flight Deck folder with the TOSSE repository it belongs to.
+///
+/// A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's
+/// urls (normalized — see [`crate::git::normalize_remote_url`]). Names are NEVER matched.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_repo_links(
+    store: tauri::State<'_, Store>,
+) -> Result<TosseRepoLinksPayload, String> {
+    let rows = store.repo_tosse_links().map_err(|e| e.to_string())?;
+
+    // Ask TOSSE FIRST: a signed-out user must not pay for a git spawn per folder just to
+    // be told there is nothing to show.
+    let listed = match crate::tosse::list_repositories().await {
+        Ok(list) => Ok(list),
+        Err(crate::tosse::TosseError::NotConnected) => {
+            return Ok(TosseRepoLinksPayload {
+                connected: false,
+                links: Vec::new(),
+                repositories: Vec::new(),
+                error: None,
+            })
+        }
+        // A refused grant means the stored session was just CLEARED (see `access_token`),
+        // so we are signed out, not "connected but failing". Reporting `connected: true`
+        // here would make the UI diagnose the CRM's data while the real answer is "sign in
+        // again" — the reason travels in `error` so it can be said out loud.
+        Err(e @ crate::tosse::TosseError::Denied(_)) => {
+            return Ok(TosseRepoLinksPayload {
+                connected: false,
+                links: Vec::new(),
+                repositories: Vec::new(),
+                error: Some(e.to_string()),
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+
+    // Reading remotes shells out to `git` once per folder — off the async runtime.
+    let locals = tauri::async_runtime::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|row| {
+                use crate::git::RemoteLookup;
+                // Three ordinary answers, one fault. A folder that is not a repository is
+                // COMMON here (Flight Deck opens folders, not only clones) and must not be
+                // dressed up as a failure; a folder that vanished, or that git cannot read,
+                // must SAY so rather than pass for "simply un-associated".
+                let (remote_url, not_a_repository, remote_error) =
+                    match crate::git::remote_url(&row.path) {
+                        Ok(RemoteLookup::Url(url)) => (Some(url), false, None),
+                        Ok(RemoteLookup::NoRemote) => (None, false, None),
+                        Ok(RemoteLookup::NotARepository) => (None, true, None),
+                        Err(e) => (None, false, Some(e.to_string())),
+                    };
+                (
+                    crate::tosse::LocalRepo {
+                        repo_id: row.repo_id,
+                        remote_url,
+                        manual_repository_id: row.tosse_repository_id,
+                    },
+                    (not_a_repository, remote_error),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("could not read the repositories' git remotes: {e}"))?;
+
+    let (inputs, git_outcomes): (Vec<_>, Vec<_>) = locals.into_iter().unzip();
+    // ⚠️ `None` (not an empty slice) when the list failed to load: matching must not RUN
+    // against data we never received, or "we could not look" becomes indistinguishable
+    // from "we looked and found nothing" — and the UI announces a deletion that never
+    // happened, next to a button that destroys the association for good.
+    let mut links = crate::tosse::resolve_links(&inputs, listed.as_deref().ok());
+    let repositories = listed.as_ref().cloned().unwrap_or_default();
+    for (link, (not_a_repository, err)) in links.iter_mut().zip(git_outcomes) {
+        link.not_a_repository = not_a_repository;
+        link.remote_error = err;
+    }
+
+    Ok(TosseRepoLinksPayload {
+        connected: true,
+        links,
+        repositories,
+        error: listed.err(),
+    })
+}
+
+/// Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
+///
+/// Local only — the CRM has no field for a machine path, and this is never written back.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_link_repository(
+    store: tauri::State<'_, Store>,
+    repo_id: String,
+    repository_id: Option<String>,
+) -> Result<(), String> {
+    let touched = store
+        .set_repo_tosse_link(&repo_id, repository_id.as_deref())
+        .map_err(|e| e.to_string())?;
+    if touched == 0 {
+        // Reporting success here would leave the UI showing an association that was
+        // never stored, and that quietly vanishes on the next load.
+        return Err(format!("no repository with id {repo_id} is registered"));
+    }
+    Ok(())
+}
+
+/// A clone found on this Mac that matches one of the urls asked about.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRepoMatch {
+    pub path: String,
+    /// The clone's own `origin`, so two same-named folders can be told apart.
+    pub remote_url: String,
+    /// The url FROM THE CRM that this clone matched, verbatim as it was passed in.
+    ///
+    /// Returned so the UI can name the repository ("matches « CRM_max »") by plain
+    /// equality, instead of re-implementing url normalisation in TypeScript — that
+    /// comparison has exactly one home, [`crate::git::normalize_remote_url`], and a second
+    /// implementation would drift from it the first time either side gains a case.
+    pub matched_url: String,
+}
+
+/// The answer to "is this project's repository already cloned here?", INCLUDING what the
+/// scan could not do.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRepoScan {
+    pub matches: Vec<LocalRepoMatch>,
+    /// The walk stopped on its budget rather than on running out of folders — so "no
+    /// match" here means "not found in what we looked at", and the UI says so.
+    pub truncated: bool,
+    /// Folders macOS would not let us read (a privacy-guarded folder with no grant yet).
+    /// Surfaced for the same reason: an empty result must never pass for a verdict.
+    pub unreadable: Vec<String>,
+    /// How much ground was actually covered. Reported so a truncated scan can say WHICH
+    /// limit it hit — "stopped early" alone is a message neither the user nor we can act
+    /// on, which is precisely how a blocked privacy prompt hid itself once.
+    pub visited: u32,
+    pub elapsed_ms: u32,
+}
+
+/// Find the clones already on this Mac whose `origin` matches one of `urls`.
+///
+/// The caller passes the CRM urls of the project's repositories — they are already in the
+/// front's cached payload, so this needs no network of its own and stays a pure local
+/// question. Only MATCHES come back: the app has no business shipping an inventory of
+/// every repository on the disk to the webview.
+///
+/// Measured on a real home directory: ~130 ms for 49 repositories. Cheap because it reads
+/// `.git/config` instead of spawning `git` per folder, and never descends into a
+/// repository or a dependency tree. Runs off the async runtime all the same.
+#[tauri::command]
+#[specta::specta]
+pub async fn scan_local_git_repos(
+    store: tauri::State<'_, Store>,
+    urls: Vec<String>,
+) -> Result<LocalRepoScan, String> {
+    // Nothing to match against — don't touch the disk at all.
+    let wanted: std::collections::HashSet<String> = urls
+        .iter()
+        .filter_map(|u| crate::git::normalize_remote_url(u))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(LocalRepoScan {
+            matches: Vec::new(),
+            truncated: false,
+            unreadable: Vec::new(),
+            visited: 0,
+            elapsed_ms: 0,
+        });
+    }
+
+    // Where to look: the home directory covers the usual cases, plus the PARENT of every
+    // folder already in Flight Deck — that is where this user demonstrably keeps clones,
+    // including outside home (an external volume, /Volumes/…).
+    let known = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        // `$HOME` directly, as every other module here resolves it — no new dependency
+        // for one lookup.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
+        if let Some(home) = home {
+            roots.push(home.clone());
+            for row in &known {
+                let path = PathBuf::from(&row.path);
+                if let Some(parent) = path.parent() {
+                    if !parent.starts_with(&home) && !roots.iter().any(|r| r == parent) {
+                        roots.push(parent.to_path_buf());
+                    }
+                }
+            }
+        } else {
+            for row in &known {
+                if let Some(parent) = PathBuf::from(&row.path).parent() {
+                    roots.push(parent.to_path_buf());
+                }
+            }
+        }
+        // Depth 4 from home reaches `~/Repos/client/project` and the like; deeper is
+        // where the cost is, and where clones essentially never are.
+        crate::git::scan_repos(&roots, 4)
+    })
+    .await
+    .map_err(|e| format!("could not scan for local repositories: {e}"))?;
+
+    // Keyed by normalized url so a match can report WHICH CRM url it answered.
+    let by_key: std::collections::HashMap<String, String> = urls
+        .iter()
+        .filter_map(|u| crate::git::normalize_remote_url(u).map(|k| (k, u.clone())))
+        .collect();
+    let matches = scan
+        .repos
+        .into_iter()
+        .filter_map(|repo| {
+            let key = crate::git::normalize_remote_url(&repo.remote_url)?;
+            let matched_url = by_key.get(&key)?.clone();
+            Some(LocalRepoMatch {
+                path: repo.path,
+                remote_url: repo.remote_url,
+                matched_url,
+            })
+        })
+        .collect();
+
+    Ok(LocalRepoScan {
+        matches,
+        truncated: scan.truncated,
+        unreadable: scan.unreadable,
+        visited: scan.visited,
+        elapsed_ms: scan.elapsed_ms,
+    })
+}
+
+/// Which local folder each TOSSE project's work happens in, as the user pinned it.
+///
+/// Local only, and deliberately so: the CRM holds no field for a machine path, and a
+/// path on this Mac would mean nothing on a colleague's. Read as a whole — there are a
+/// handful of pins at most, and the tasks view needs all of them to resolve any task.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_project_repos(
+    store: tauri::State<'_, Store>,
+) -> Result<Vec<crate::store::TosseProjectRepo>, String> {
+    store.tosse_project_repos().map_err(|e| e.to_string())
+}
+
+/// Pin a TOSSE project to a local folder, or forget the pin with `None`.
+///
+/// Keyed by PROJECT, not by task: every task of a project is worked on in the same
+/// folder, so the question is asked once and the answer reused. Always reversible from
+/// the project's card.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_link_project_repo(
+    store: tauri::State<'_, Store>,
+    project_id: String,
+    repo_id: Option<String>,
+) -> Result<(), String> {
+    store
+        .set_tosse_project_repo(&project_id, repo_id.as_deref())
+        // The foreign key refuses a folder the app does not know. Surfaced rather than
+        // swallowed: the view would otherwise offer to open a folder that is not there.
+        .map_err(|e| format!("could not save the folder for this project: {e}"))?;
+    Ok(())
+}
+
+/// Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
+///
+/// The CRM assembles this shape for its own Briefing page — active projects with their
+/// client, their open tasks and their progress counts — so the view reads that instead of
+/// stitching `/clients` + `/projects` + `/tasks` together and re-deriving it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_briefing() -> Result<crate::tosse::TosseBriefing, String> {
+    crate::tosse::briefing().await.map_err(|e| e.to_string())
+}
+
+/// The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
+/// the view can offer them as a section of their own — see `tosse::backlog`.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_backlog() -> Result<Vec<crate::tosse::TosseBacklogTask>, String> {
+    crate::tosse::backlog().await.map_err(|e| e.to_string())
+}
+
+/// Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
+/// the CRM for everything it deliberately does not edit (title, priority, assignee, due
+/// date, deletion). Discovered, not hard-coded — see `tosse::web_url`.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_web_url() -> Result<String, String> {
+    crate::tosse::web_url().await.map_err(|e| e.to_string())
+}
+
+/// One task in full — the Markdown fields and relations the briefing leaves out. Fetched
+/// when a row is actually opened, never for a list.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_task_detail(task_id: String) -> Result<crate::tosse::TosseTaskDetail, String> {
+    crate::tosse::task_detail(&task_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Move a task to another status.
+///
+/// ⚠️ `"Fait"` is reachable from here, and that is deliberate: the repo's rule is that no
+/// AGENT closes a task, and this command only ever runs because a human clicked a status in
+/// the UI. Nothing in the agent surface calls it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_set_task_status(task_id: String, status: String) -> Result<(), String> {
+    crate::tosse::set_task_status(&task_id, &status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Move a project to another status — the Start / Pause / Finish control on a project card.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_set_project_status(project_id: String, status: String) -> Result<(), String> {
+    crate::tosse::set_project_status(&project_id, &status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Create a task in a project, with the status of the group it was typed into.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_create_task(
+    project_id: String,
+    title: String,
+    status: String,
+    kind: Option<String>,
+    priority: Option<String>,
+    assigned_to: Option<String>,
+) -> Result<crate::tosse::TosseTask, String> {
+    crate::tosse::create_task(
+        &project_id,
+        &title,
+        &status,
+        kind.as_deref(),
+        priority.as_deref(),
+        assigned_to.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Fetch the slash commands available in `cwd` WITHOUT starting a persistent
 /// session. Spawns a short-lived `claude`, performs the `initialize` handshake
 /// (spec §4.4), reads the advertised commands from its `control_response`, and

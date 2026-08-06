@@ -71,6 +71,30 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
+   *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
+   *  associate it by hand). Clicking it opens that repository's TOSSE card. ON by default.
+   *  Off → the header looks exactly as it did before the feature, and the association is
+   *  not even computed (no repository list fetched, no git remote read). Nothing shows in
+   *  either case when TOSSE is not connected. Read by {@link TosseRepoBadge}. */
+  tosseRepoBadge: boolean;
+
+  /** Warn before deleting a conversation that is linked to a TOSSE task in « En cours »
+   *  or « Review ». ON by default — the delete is otherwise friction-free (one click,
+   *  ⌘Z to undo), and dropping the conversation someone's live task is being worked in
+   *  deserves a question. Off → linked conversations delete like any other (a RUNNING
+   *  conversation still asks: that guard is about killing a live session, not about
+   *  TOSSE). Read by {@link deleteReason}; the status compared is the one stored ON the
+   *  conversation, so the warning still works offline. */
+  tosseTaskDeleteWarning: boolean;
+
+  /** Show the TOSSE tasks view — the third top-level view (⌘3), listing the CRM's projects
+   *  by client. ON by default. Off → the tab disappears and the view is never mounted, so
+   *  the briefing is not fetched either. Note this preference only ever MATTERS while
+   *  signed in to TOSSE: signed out, the tab is absent regardless (an empty shell would be
+   *  worse than no tab, per the feature's spec). Read by {@link App}. */
+  tosseTasksView: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -144,6 +168,9 @@ const DEFAULTS: DisplayPrefs = {
   showLastMessagePreview: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseRepoBadge: true,
+  tosseTasksView: true,
+  tosseTaskDeleteWarning: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -196,6 +223,9 @@ export const useDisplay = create<DisplayState>((set) => ({
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
+        tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,

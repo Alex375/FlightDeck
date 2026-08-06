@@ -11,7 +11,10 @@ import { useAgentStatus } from "../../agent/useAgentStatus";
 import { agentStatusToDot, backgroundCount, isActivelyRunning, railState, rowAttention } from "../../agent/status";
 import { useLastMessageSummary } from "../../store/lastMessageSummary";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
-import { ConfirmDialog } from "../../ui/ConfirmDialog";
+import { DeleteConversationDialog } from "../conversation/DeleteConversationDialog";
+import { deleteReasonFor } from "../conversation/deleteGuard";
+import { useDisplay } from "../../store/display";
+import { TosseTaskChip } from "../tosse/TosseTaskChip";
 import { WorktreeIndicator } from "../git/WorktreeIndicator";
 import { useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { StateBlock } from "./StateBlock";
@@ -63,10 +66,14 @@ export function StreamCard({
   const runningBgTasks = useRunningTaskCount(conv.id);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
-  // If the work settles while the confirm is open, close it (the danger is gone).
+  // …and the TOSSE side: a conversation carrying a live task earns the same question.
+  // Shared predicate + shared dialog with the sidebar row — one rule, one wording.
+  const warnOnLinkedTask = useDisplay((d) => d.tosseTaskDeleteWarning);
+  const deleteAsk = deleteReasonFor(conv, busyForDelete, warnOnLinkedTask);
+  // If the reason evaporates while the confirm is open, close it (the danger is gone).
   useEffect(() => {
-    if (confirmingDelete && !busyForDelete) setConfirmingDelete(false);
-  }, [confirmingDelete, busyForDelete]);
+    if (confirmingDelete && !deleteAsk) setConfirmingDelete(false);
+  }, [confirmingDelete, deleteAsk]);
 
   // The importance rail (left edge) lights up only for states that deserve a glance;
   // `off` (shut down) and `idle` (at rest) get no rail and recede — `dim` a touch more
@@ -136,7 +143,7 @@ export function StreamCard({
           aria-label="Delete conversation"
           onClick={(e) => {
             e.stopPropagation();
-            if (busyForDelete) setConfirmingDelete(true);
+            if (deleteAsk) setConfirmingDelete(true);
             else remove(conv.id);
           }}
         >
@@ -153,6 +160,9 @@ export function StreamCard({
           {conv.kind === "codex" ? <CodexMark /> : <ClaudeMark />}
         </span>
         <WorktreeIndicator conv={conv} repoPath={repoPath} />
+        {/* The TOSSE task this agent is on, if any — compact: the mark plus the task's
+            own status colour, with the title in the tooltip. */}
+        <TosseTaskChip conv={conv} compact />
         {/* Reasoning effort — now a real, clickable slider (the composer's EffortGauge),
             set live per conversation. Renders nothing until an effort is known. */}
         <CardEffort convId={conv.id} />
@@ -179,25 +189,18 @@ export function StreamCard({
 
       <StateActions convId={conv.id} status={status} />
 
-      {/* Portaled to document.body (escapes the .ag-grid overflow clip), shown only while
-          the conversation is actively running — same copy as the sidebar's ConvRow. */}
-      {confirmingDelete ? (
-        <ConfirmDialog
-          open
-          danger
-          title={`Delete "${conv.name}"?`}
-          confirmLabel="Delete anyway"
+      {/* Portaled to document.body (escapes the .ag-grid overflow clip). Same component
+          as the sidebar's ConvRow, so the question reads identically in both places. */}
+      {confirmingDelete && deleteAsk ? (
+        <DeleteConversationDialog
+          conv={conv}
+          reason={deleteAsk}
           onCancel={() => setConfirmingDelete(false)}
           onConfirm={() => {
             setConfirmingDelete(false);
             remove(conv.id);
           }}
-        >
-          This conversation is <strong>running</strong>. Deleting it will{" "}
-          <strong>stop the {conv.kind === "codex" ? "Codex" : "Claude"} session</strong> and
-          unfinished work may be lost. The conversation can still be recovered with ⌘Z, but
-          not the interrupted run.
-        </ConfirmDialog>
+        />
       ) : null}
     </div>
   );

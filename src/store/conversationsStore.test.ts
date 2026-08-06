@@ -37,6 +37,9 @@ import {
   ensureConversationSession,
   loadConversationHistory,
   reactivateDiskConversation,
+  conversationForTask,
+  conversationsForTask,
+  refreshLinkedTaskMeta,
   useConversationsStore,
   type Conversation,
 } from "./conversationsStore";
@@ -59,6 +62,9 @@ const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   ultracode: false,
   permissionMode: "default",
   pendingReminder: null,
+  tosseTaskId: null,
+  tosseTaskTitle: null,
+  tosseTaskStatus: null,
   cleanOutput: null,
   kind: "claude",
   ...over,
@@ -602,5 +608,71 @@ describe("reactivateDiskConversation — backend-aware", () => {
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
     expect(conv.kind).toBe("claude");
     expect(conv.model).toBe(DEFAULT_MODEL);
+  });
+});
+
+describe("conversationsStore — the TOSSE task link", () => {
+  it("stores the task with its title and status, and clears them together", () => {
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    expect(conv0().tosseTaskId).toBe("t-1");
+    // The denormalised pair is what keeps the link legible — and the delete warning
+    // working — with no network.
+    expect(conv0().tosseTaskTitle).toBe("Fix login");
+    expect(conv0().tosseTaskStatus).toBe("En cours");
+    expect(commands.upsertConversation).toHaveBeenCalled();
+
+    useConversationsStore.getState().linkConversationToTask("c1", null);
+    expect(conv0().tosseTaskId).toBeNull();
+    expect(conv0().tosseTaskTitle).toBeNull();
+    expect(conv0().tosseTaskStatus).toBeNull();
+  });
+
+  it("does not re-persist an unchanged link", () => {
+    const link = { id: "t-1", title: "Fix login", status: "En cours" };
+    useConversationsStore.getState().linkConversationToTask("c1", link);
+    vi.clearAllMocks();
+    useConversationsStore.getState().linkConversationToTask("c1", link);
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
+  });
+
+  it("lists a task's conversations, most recently active first", () => {
+    const a = baseConv({ id: "c1", tosseTaskId: "t-1", lastActivityAt: 10 });
+    const b = baseConv({ id: "c2", tosseTaskId: "t-1", lastActivityAt: 20 });
+    const other = baseConv({ id: "c3", tosseTaskId: "t-2", lastActivityAt: 30 });
+    // A task legitimately carries several (a retry, a second opinion): they are all
+    // listed, and the one being worked in comes first — that ordering is what makes
+    // "open the conversation on this task" unambiguous.
+    expect(conversationsForTask([a, b, other], "t-1").map((c) => c.id)).toEqual(["c2", "c1"]);
+    expect(conversationForTask([a, b, other], "t-1")?.id).toBe("c2");
+    expect(conversationsForTask([a, b, other], "t-9")).toEqual([]);
+    expect(conversationForTask([a], null)).toBeNull();
+  });
+
+  it("re-stamps a linked conversation when the CRM's copy moved on", () => {
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    const changed = refreshLinkedTaskMeta([
+      { id: "t-1", title: "Fix the login bug", status: "Review" },
+    ]);
+    expect(changed).toBe(1);
+    expect(conv0().tosseTaskStatus).toBe("Review");
+    expect(conv0().tosseTaskTitle).toBe("Fix the login bug");
+    // Nothing moved → nothing written.
+    expect(refreshLinkedTaskMeta([{ id: "t-1", title: "Fix the login bug", status: "Review" }])).toBe(0);
+  });
+
+  it("leaves a link alone when the task is absent from the payload", () => {
+    // The briefing deliberately omits whole categories (done, backlog, parked). Treating
+    // "absent" as "gone" would erase the link the moment a task is finished — exactly
+    // when the user still wants to know which conversation did it.
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    expect(refreshLinkedTaskMeta([{ id: "t-other", title: "x", status: "En cours" }])).toBe(0);
+    expect(conv0().tosseTaskId).toBe("t-1");
+    expect(conv0().tosseTaskStatus).toBe("En cours");
   });
 });

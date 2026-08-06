@@ -14,7 +14,11 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   return res.data;
 }
 
-export const accountStatusKey = (backend: "claude" | "codex") =>
+/** Query key for any account-like connection. The shared `["account-status"]` prefix is
+ *  load-bearing: the global `account_login` handler invalidates on it, so a sign-in that
+ *  completes asynchronously refreshes whichever card it belongs to — including TOSSE
+ *  (`useTosse.ts`), which is not an agent backend but rides the same event. */
+export const accountStatusKey = (backend: "claude" | "codex" | "tosse") =>
   ["account-status", backend] as const;
 
 /** The signed-in Claude account (`claude auth status --json`). Refetches on window

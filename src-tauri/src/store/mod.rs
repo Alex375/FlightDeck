@@ -9,4 +9,4 @@ pub mod db;
 pub mod model;
 
 pub use db::Store;
-pub use model::{ConversationRecord, PersistedState, RepoRecord};
+pub use model::{ConversationRecord, PersistedState, RepoRecord, TosseProjectRepo};

@@ -227,6 +227,16 @@ interface EditorState {
   /** Close the artifact viewer (the side region falls back to editor/terminal if open). */
   closeArtifact: () => void;
 
+  // ---- TOSSE task panel (in-memory, transient) ----
+  /** The TOSSE task open in the side region, or null. Same contract as the artifact
+   *  viewer: transient, cleared by every side-region toggle, mutually exclusive with Git
+   *  AND with the artifact viewer — the side region shows one thing at a time. Holds only
+   *  the id; the panel fetches the task itself. */
+  tosseTaskView: { convId: string; taskId: string } | null;
+  /** Open a TOSSE task in the side region. */
+  openTosseTask: (view: { convId: string; taskId: string }) => void;
+  closeTosseTask: () => void;
+
   // ---- Per conversation ----
   byConv: Record<string, ConvEditor>;
 
@@ -733,6 +743,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
   // Clearing unconditionally keeps the rule "one press = one visible effect".
   const clearArtifact = () => {
     if (get().artifactView) set({ artifactView: null });
+    if (get().tosseTaskView) set({ tosseTaskView: null });
   };
 
   return {
@@ -740,6 +751,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     byConv: {},
     clipboard: null,
     artifactView: null,
+    tosseTaskView: null,
 
     openArtifact: (view) => {
       // ⚠️ ORDER MATTERS — close Git BEFORE setting the view, never after. `setGitOpen` clears the
@@ -750,6 +762,15 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       set({ artifactView: view });
     },
     closeArtifact: () => set({ artifactView: null }),
+
+    openTosseTask: (view) => {
+      // Same ordering trap as `openArtifact`: `setGitOpen` clears the transient side-region
+      // views unconditionally, so Git must be closed BEFORE the view is set, never after.
+      if (get().gitOpen) get().setGitOpen(false);
+      // One transient view at a time — the side region cannot show two things.
+      set({ artifactView: null, tosseTaskView: view });
+    },
+    closeTosseTask: () => set({ tosseTaskView: null }),
 
     // Git is a mutually-exclusive mode: opening it hides the editor/terminal
     // region, and opening the editor or terminal closes Git — so a lit toggle
