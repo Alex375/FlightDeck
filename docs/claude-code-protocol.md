@@ -376,10 +376,13 @@ token usage / "current model" ONLY when `parent_tool_use_id` is null** (avoid do
 > keeps `spawnDepth` / `parentAgentId` internal. Depth can only be derived from the
 > `parent_tool_use_id` of the assistant message carrying the spawning tool_use.
 >
-> Related: without `--forward-subagent-text` (which the app does not pass) the binary forwards
-> ONLY a sub-agent's `tool_use` / `tool_result` blocks — its text and thinking are filtered out
-> **at depth 1 already**, which is why the live sub-agent drill-in shows steps but no prose
-> while the on-disk transcript has both.
+> Related: without `--forward-subagent-text` the binary forwards ONLY a sub-agent's `tool_use`
+> / `tool_result` blocks — its text and thinking are filtered out **at depth 1 already**, which
+> is why the live sub-agent drill-in showed steps but no prose while the on-disk transcript had
+> both. **The app now passes the flag unconditionally** (`supervisor::transport`, since
+> v1.5.0), so sub-agent prose and thinking DO arrive live — and so do nested (depth-2+)
+> sub-agents' messages, which is why anything collecting agent ids from the stream must scope
+> itself to `parent_tool_use_id === null` (see `conversationStore.bgAgentIds`).
 
 ### 3.9 `result` (`confirmed`, capture L12)
 

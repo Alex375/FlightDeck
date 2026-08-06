@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { assigneeInitials, splitMcpActor } from "./AssigneeAvatar";
-import { clientInitials, faviconDomain, hashString } from "./ClientAvatar";
+import { clientInitials, faviconDomain, faviconUrl, hashString } from "./ClientAvatar";
 
 describe("assignee initials", () => {
   // Verbatim from CRM_max/apps/frontend/components/shared/person-avatar.tsx.
@@ -54,6 +54,25 @@ describe("client avatar", () => {
     expect(clientInitials("Webdentiste")).toBe("W");
     expect(clientInitials("Jean Dupont")).toBe("JD");
     expect(clientInitials("")).toBe("?");
+  });
+
+  // ⚠️ The one call in this app that leaves the machine. Off, nothing is requested at all —
+  // not a blocked image, not a request Google could log: the URL is never built.
+  it("asks Google for a favicon ONLY when the preference is on", () => {
+    expect(faviconUrl("webdentiste.fr", false)).toBeNull();
+    expect(faviconUrl("webdentiste.fr", true)).toBe(
+      "https://www.google.com/s2/favicons?domain=webdentiste.fr&sz=128",
+    );
+    // Nothing to ask about is still nothing, whatever the preference says.
+    expect(faviconUrl(null, true)).toBeNull();
+  });
+
+  it("escapes the domain it puts in the query string", () => {
+    // `website` is CRM free text; an unescaped value would rewrite the query rather than
+    // travel in it.
+    expect(faviconUrl("evil.example&sz=1", true)).toBe(
+      "https://www.google.com/s2/favicons?domain=evil.example%26sz%3D1&sz=128",
+    );
   });
 
   it("gives a client a STABLE colour (the hash is the CRM's)", () => {

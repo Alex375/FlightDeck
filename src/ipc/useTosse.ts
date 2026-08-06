@@ -21,6 +21,9 @@ import type {
   TosseTaskDetail,
 } from "./client";
 import { accountStatusKey } from "./useAccounts";
+// "The session is gone" vs "one request failed" — a wording CONTRACT with the Rust side,
+// so it lives in its own tested module rather than as a local predicate here.
+import { isSessionGone } from "./tosseErrors";
 import { applyStatusToBoard } from "../features/tosse/tosseModel";
 import { refreshLinkedTaskMeta, useConversationsStore } from "../store/conversationsStore";
 
@@ -28,19 +31,6 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
   if (res.status === "error") throw new Error(res.error);
   return res.data;
-}
-
-/**
- * Whether a failure means the SESSION is gone, as opposed to a request going wrong.
- *
- * Matches what the core says when it holds no usable credentials — `TosseError::NotConnected`
- * ("not connected to TOSSE") and `TosseError::Denied` (the revoked/expired grant, which
- * carries "connect again"). Everything else — a 502, an offline machine, a bad payload — is
- * transient and must NOT be read as a sign-out.
- */
-function isSessionGone(error: unknown): boolean {
-  const msg = String((error as Error)?.message ?? "").toLowerCase();
-  return msg.includes("not connected to tosse") || msg.includes("connect again");
 }
 
 export const tosseStatusKey = () => accountStatusKey("tosse");

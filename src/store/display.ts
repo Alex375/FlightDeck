@@ -95,6 +95,19 @@ export interface DisplayPrefs {
    *  worse than no tab, per the feature's spec). Read by {@link App}. */
   tosseTasksView: boolean;
 
+  /** Fetch a client's mark from Google's favicon service when the CRM holds no uploaded
+   *  logo for it.
+   *
+   *  ⚠️ **OFF by default, and that default is the point.** Turning it on sends every such
+   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP to
+   *  `google.com/s2/favicons`, one request per client shown. The CRM's own web page does
+   *  the same, so this is parity rather than a new exposure, but a desktop app that sits
+   *  open all day should not make that call on the strength of a default nobody chose.
+   *  Off → the cascade stops at the CRM's uploaded logo, then the client's initials on a
+   *  colour derived from its name (no network, and already what most clients show).
+   *  Read by {@link ClientAvatar}. */
+  tosseClientFavicons: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -171,6 +184,8 @@ const DEFAULTS: DisplayPrefs = {
   tosseRepoBadge: true,
   tosseTasksView: true,
   tosseTaskDeleteWarning: true,
+  // OFF: the only preference here that reaches a THIRD PARTY (see its doc above).
+  tosseClientFavicons: false,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -226,6 +241,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
+        tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,

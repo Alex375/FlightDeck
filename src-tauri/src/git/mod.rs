@@ -881,11 +881,28 @@ mod tests {
     #[test]
     fn an_unreadable_root_is_reported() {
         let missing = std::env::temp_dir().join("tosse-scan-does-not-exist-xyz");
-        let scan = scan_repos(&[missing], 3);
+        let scan = scan_repos(&[missing.clone()], 3);
         assert!(scan.repos.is_empty());
-        // A path that cannot even be canonicalized is skipped silently; one that exists
-        // but refuses `read_dir` lands in `unreadable`. Both keep `matches` honest.
+        // ⚠️ THE assertion this test exists for. Anything `read_dir` refuses — a vanished
+        // folder here, a TCC-guarded one on a real machine — must land in `unreadable`, so
+        // the caller can say "we could not look there" instead of letting an empty result
+        // pass for "your clone is not on this disk".
+        assert_eq!(
+            scan.unreadable,
+            vec![missing.to_string_lossy().to_string()],
+            "a root we could not read must be named, not silently dropped"
+        );
+        // Stopping on an unreadable root is not the same as running out of budget: the walk
+        // completed, it simply had nothing it was allowed to see.
         assert!(!scan.truncated);
+
+        // …and the list stays BOUNDED: a broken disk must not stream every failing path
+        // into the payload. Beyond the cap the scan still reports what it can name.
+        let many: Vec<PathBuf> = (0..MAX_UNREADABLE_REPORTED + 4)
+            .map(|i| std::env::temp_dir().join(format!("tosse-scan-missing-{i}")))
+            .collect();
+        let scan = scan_repos(&many, 3);
+        assert_eq!(scan.unreadable.len(), MAX_UNREADABLE_REPORTED);
     }
 
     /// The pair that motivates the whole normalizer: a local SSH remote and the

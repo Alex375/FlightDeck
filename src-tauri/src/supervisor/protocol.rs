@@ -152,12 +152,14 @@ pub enum SystemMsg {
     /// `{level:"error", error, retryInMs, retryAttempt, maxRetries, source}` where
     /// `source` is `connection_retry` | `request_retry`.
     ///
-    /// It is consumed SILENTLY on purpose: each one announces a retry the CLI performs
-    /// by itself, the turn continues, and a genuinely failed turn already surfaces
-    /// through `result` (`api_error_status` → ErrorBlock). A thread notice per retry
-    /// would be noise. The unexploited signal is `retryAttempt`/`maxRetries`, which
-    /// would let the UI explain a slow turn ("reconnecting, 2/3") — a display feature,
-    /// deliberately not built here.
+    /// It produces NO thread notice on purpose: each one announces a retry the CLI
+    /// performs by itself, the turn continues, and a genuinely failed turn already
+    /// surfaces through `result` (`api_error_status` → ErrorBlock) — one bubble per
+    /// retry would be noise. What it DOES drive is transient session state:
+    /// `retryAttempt`/`maxRetries` become [`crate::supervisor::model::RetryState`], so the
+    /// UI can say "reconnecting, 2/3" instead of showing a turn that merely appears to
+    /// hang. The assembler clears it as soon as anything else arrives from the model
+    /// (`Assembler::clear_retry`), which is the proof the connection came back.
     #[serde(rename = "api_error")]
     ApiError {
         #[serde(default)]

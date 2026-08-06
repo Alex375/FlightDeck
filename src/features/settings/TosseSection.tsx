@@ -44,17 +44,19 @@ export function TosseSection() {
   );
 }
 
-/** What TOSSE is allowed to show elsewhere in the app.
+/** What TOSSE is allowed to show elsewhere in the app — and, for the last one, what it may
+ *  fetch from outside.
  *
- *  These two live HERE rather than in General → Display, where they started: someone looking
- *  for "the TOSSE settings" opens the TOSSE tab, and a preference filed under Display is one
+ *  They live HERE rather than in General → Display, where they started: someone looking for
+ *  "the TOSSE settings" opens the TOSSE tab, and a preference filed under Display is one
  *  they have to already know about to find. They stay together, right under the connection
- *  that makes either of them mean anything — switched off, both surfaces stop FETCHING, not
+ *  that makes any of them mean anything — switched off, these surfaces stop FETCHING, not
  *  merely stop drawing. */
 function TosseDisplayPrefs() {
   const tosseRepoBadge = useDisplay((d) => d.tosseRepoBadge);
   const tosseTasksView = useDisplay((d) => d.tosseTasksView);
   const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
+  const tosseClientFavicons = useDisplay((d) => d.tosseClientFavicons);
   const set = useDisplay((d) => d.set);
   return (
     <SettingsGroup title="In the app" icon="list">
@@ -101,6 +103,23 @@ function TosseDisplayPrefs() {
         checked={tosseTaskDeleteWarning}
         onChange={(v) => set({ tosseTaskDeleteWarning: v })}
         label="Warn when deleting a conversation linked to an active task"
+      />
+      <ToggleRow
+        title="Client logos from the web"
+        hint={
+          <>
+            When a client has no logo uploaded in the CRM, fetch its website's favicon from
+            Google to use as its mark. <strong>Off by default</strong>, because it is the only
+            thing Flight Deck sends outside your machine: each such client's{" "}
+            <strong>domain</strong>, plus your IP, go to <code>google.com</code> — one request
+            per client shown. The CRM's own page does this too, so turning it on only matches
+            what your browser already does. Off → clients show their uploaded logo, or their
+            initials.
+          </>
+        }
+        checked={tosseClientFavicons}
+        onChange={(v) => set({ tosseClientFavicons: v })}
+        label="Fetch client logos from Google"
       />
     </SettingsGroup>
   );

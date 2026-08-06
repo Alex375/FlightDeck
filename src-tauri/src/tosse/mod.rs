@@ -152,9 +152,32 @@ pub struct TosseAccountStatus {
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────
 
+/// The wording the FRONT matches on to tell "this session is gone" from a failure that is
+/// merely transient — `src/ipc/tosseErrors.ts::SESSION_GONE_MARKERS`, kept identical.
+///
+/// ⚠️ These strings are a CONTRACT, not prose. Errors cross the IPC boundary as plain
+/// `String` (every command is `Result<T, String>`), so the front has nothing but the text
+/// to go on. Reword one of them here and the tasks view silently stops noticing a dead
+/// session: it keeps retrying a board it can never load, and never points at the one thing
+/// that would fix it — signing in again, in a Settings tab the view does not link to.
+///
+/// [`session_gone_errors_keep_the_wording_the_front_matches_on`] is what makes that break
+/// LOUD: it fails here, in CI, naming the TypeScript file to change alongside.
+pub const SESSION_GONE_MARKERS: [&str; 2] = ["not connected to TOSSE", "connect again"];
+
+/// Why a stored session stopped working, recorded when the server REJECTS the grant.
+///
+/// A constant because it is one half of [`SESSION_GONE_MARKERS`]: it is both persisted (so
+/// a later `status()` can explain the sign-out) and returned to whoever triggered the
+/// refresh, which is where the front reads it.
+const SESSION_REVOKED_REASON: &str = "your TOSSE session expired or was revoked — connect again";
+
 /// Every failure mode carries its cause, so the Settings card can say what to do instead
 /// of a dead-end "unavailable". Rendered to a string at the IPC boundary (the front only
 /// ever displays it).
+///
+/// ⚠️ [`Self::NotConnected`] and [`Self::Denied`] are the two the front reads as "the
+/// session is gone" — see [`SESSION_GONE_MARKERS`] before touching their wording.
 #[derive(Debug)]
 pub enum TosseError {
     /// Network-level failure (DNS, TLS, timeout, offline).
@@ -1142,9 +1165,10 @@ pub async fn access_token() -> R<String> {
             // The reason is PERSISTED, because this error is returned to whoever triggered
             // the refresh — often a background query nothing renders. Stored, it survives to
             // the next `status()` and the Settings card explains what happened.
-            let reason = "your TOSSE session expired or was revoked — connect again";
-            clear_tokens(Some(reason.to_string())).await?;
-            return Err(TosseError::Denied(reason.to_string()));
+            // The wording is a constant because the front keys off it — see
+            // [`SESSION_GONE_MARKERS`].
+            clear_tokens(Some(SESSION_REVOKED_REASON.to_string())).await?;
+            return Err(TosseError::Denied(SESSION_REVOKED_REASON.to_string()));
         }
         return Err(TosseError::Http {
             status: status.as_u16(),
@@ -2513,6 +2537,57 @@ mod tests {
         assert_eq!(readable_error(&long).chars().count(), 300);
     }
 
+    /// CONTRACT with the front (`src/ipc/tosseErrors.ts`).
+    ///
+    /// Errors reach the UI as bare strings — every TOSSE command is `Result<T, String>` —
+    /// so "is this session dead or is the network merely down?" is decided by matching the
+    /// TEXT. That coupling is invisible from either side alone: reword a message here and
+    /// nothing fails to compile, nothing fails to run; the tasks view simply keeps hammering
+    /// a board it can never load and never suggests signing in again.
+    ///
+    /// This test is the tripwire. If it fails, change
+    /// `SESSION_GONE_MARKERS` in BOTH files (and `tosseErrors.test.ts` carries these exact
+    /// strings, so the other half stays honest too).
+    #[test]
+    fn session_gone_errors_keep_the_wording_the_front_matches_on() {
+        let contains = |haystack: &str, needle: &str| {
+            haystack.to_lowercase().contains(&needle.to_lowercase())
+        };
+
+        // The two states that mean "there is no usable session any more".
+        let no_session = TosseError::NotConnected.to_string();
+        let revoked = TosseError::Denied(SESSION_REVOKED_REASON.to_string()).to_string();
+        assert!(
+            contains(&no_session, SESSION_GONE_MARKERS[0]),
+            "`{no_session}` must carry the marker the front matches on"
+        );
+        assert!(
+            contains(&revoked, SESSION_GONE_MARKERS[1]),
+            "`{revoked}` must carry the marker the front matches on"
+        );
+
+        // ⚠️ And the other direction, which matters just as much: a TRANSIENT failure must
+        // NOT look like a dead session. A false positive here signs the user out of the UI
+        // (the view withdraws, the card invites a fresh sign-in) over a 502 or a lost
+        // Wi-Fi — while the stored session is still perfectly valid.
+        for transient in [
+            TosseError::Network("dns error".into()),
+            TosseError::Http { status: 502, body: "Bad Gateway".into() },
+            TosseError::Http { status: 429, body: "Too many requests".into() },
+            TosseError::Protocol("the briefing carried no `projects` list".into()),
+            TosseError::Keychain("security exit 51".into()),
+            TosseError::Local("no local port available for the sign-in callback".into()),
+        ] {
+            let text = transient.to_string();
+            for marker in SESSION_GONE_MARKERS {
+                assert!(
+                    !contains(&text, marker),
+                    "`{text}` must not read as a dead session (marker `{marker}`)"
+                );
+            }
+        }
+    }
+
     #[test]
     fn token_response_parsing_requires_an_access_token() {
         let t = parse_token_response(
@@ -2752,10 +2827,10 @@ mod tests {
 
     #[test]
     fn credentials_written_before_the_reason_field_existed_still_parse() {
-        // Rétrocompatibilité du format stocké : un item écrit par une version précédente n'a
-        // pas `signed_out_reason`. S'il cessait de se parser, `read_stored` renverrait une
-        // erreur Keychain et TOUS les utilisateurs installés seraient déconnectés à la mise
-        // à jour — la panne la plus chère que ce champ pouvait provoquer.
+        // Backward compatibility of the stored format: an item written by an earlier
+        // version carries no `signed_out_reason`. If it stopped parsing, `read_stored`
+        // would return a Keychain error and EVERY existing install would be signed out on
+        // upgrade — the most expensive failure this field could have caused.
         let old = r#"{"client_id":"cid","access_token":"at","refresh_token":"rt"}"#;
         let parsed: StoredAuth = serde_json::from_str(old).expect("an older item must parse");
         assert_eq!(parsed.refresh_token.as_deref(), Some("rt"));

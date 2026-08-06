@@ -15,6 +15,7 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 - New: a "TOSSE Tasks" view listing your projects by client and their tasks, readable and editable from the app — with a Backlog section folded by default and an "Open in TOSSE" shortcut.
 - New: start working on a task straight from the TOSSE view — it opens a conversation on the right repository.
 - New: a setting to unlock the "Bypass permissions" mode, for when you deliberately want the agent to run without asking.
+- New: an off-by-default setting to fetch client logos from the web. Clients without a logo in the CRM show their initials; switch it on and Flight Deck asks Google for their website's favicon instead — which means telling Google their domain, so it is your call to make.
 - Improved: sub-agent text now streams live. Drilling into a running sub-agent shows its prose and reasoning as it happens, instead of only its tool calls; a reconnection indicator tells you when the link is being re-established.
 - Fixed: a permission request withdrawn by the CLI no longer leaves a dead card that swallows your next click.
 
