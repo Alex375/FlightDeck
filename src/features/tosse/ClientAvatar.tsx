@@ -9,13 +9,18 @@
 // Each step falls to the next when the image cannot be loaded, so a dead URL degrades to a
 // readable mark instead of leaving a hole.
 //
-// ⚠️ Step 2 is the only thing in this app that talks to a THIRD PARTY, and it is therefore
-// OPT-IN (`tosseClientFavicons`, off by default — see the preference's own doc). Resolving a
-// favicon means handing `google.com` the client's domain and this machine's IP, once per
-// client on screen: a slice of Tosse's client list, leaving the building. The CRM's web page
-// already does it, so this is parity, not a new exposure — but parity is a reason to OFFER
-// the step, not to take it silently on everyone's behalf. Off, the cascade is 1 → 3, entirely
-// local, and that is what most clients render anyway.
+// ⚠️ Step 2 is OPT-IN (`tosseClientFavicons`, off by default — see the preference's own
+// doc): resolving a favicon hands `google.com` the client's domain and this machine's IP,
+// once per client on screen — a slice of Tosse's client list, leaving the building.
+//
+// The app already calls that same service elsewhere (`webResults.faviconUrl`, one per
+// web-search result chip), and that one is not a choice — which is the distinction worth
+// keeping straight: it is not "does this reach a third party", it is WHAT reaches it. A
+// search result is a public site the model just visited; these domains are who Tosse works
+// for. The CRM's own page resolves them the same way, so this is parity rather than a new
+// exposure — but parity is a reason to OFFER the step, not to take it silently on everyone's
+// behalf. Off, the cascade is 1 → 3, entirely local, and that is what most clients render
+// anyway.
 
 import { useEffect, useMemo, useState } from "react";
 import { useDisplay } from "../../store/display";

@@ -109,11 +109,11 @@ function TosseDisplayPrefs() {
         hint={
           <>
             When a client has no logo uploaded in the CRM, fetch its website's favicon from
-            Google to use as its mark. <strong>Off by default</strong>, because it is the only
-            thing Flight Deck sends outside your machine: each such client's{" "}
-            <strong>domain</strong>, plus your IP, go to <code>google.com</code> — one request
-            per client shown. The CRM's own page does this too, so turning it on only matches
-            what your browser already does. Off → clients show their uploaded logo, or their
+            Google to use as its mark. <strong>Off by default</strong>, because of what it
+            sends: each such client's <strong>domain</strong>, plus your IP, go to{" "}
+            <code>google.com</code> — one request per client shown, which is a slice of who
+            you work for. The CRM's own page does this too, so turning it on only matches what
+            your browser already does. Off → clients show their uploaded logo, or their
             initials.
           </>
         }

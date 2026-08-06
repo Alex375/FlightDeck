@@ -100,9 +100,16 @@ export interface DisplayPrefs {
    *
    *  ⚠️ **OFF by default, and that default is the point.** Turning it on sends every such
    *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP to
-   *  `google.com/s2/favicons`, one request per client shown. The CRM's own web page does
-   *  the same, so this is parity rather than a new exposure, but a desktop app that sits
-   *  open all day should not make that call on the strength of a default nobody chose.
+   *  `google.com/s2/favicons`, one request per client shown.
+   *
+   *  It is not the app's only call to that service ({@link webResultFaviconUrl} resolves
+   *  one per web-search result chip, and always has). What is different here is the
+   *  DATA, which is why only this one is a choice: a search result is a public site the
+   *  model just visited, whereas these domains are who Tosse works for. The CRM's own web
+   *  page resolves them the same way, so switching this on only matches what the browser
+   *  already does — but a desktop app that sits open all day should not make that call on
+   *  the strength of a default nobody chose.
+   *
    *  Off → the cascade stops at the CRM's uploaded logo, then the client's initials on a
    *  colour derived from its name (no network, and already what most clients show).
    *  Read by {@link ClientAvatar}. */
@@ -184,7 +191,7 @@ const DEFAULTS: DisplayPrefs = {
   tosseRepoBadge: true,
   tosseTasksView: true,
   tosseTaskDeleteWarning: true,
-  // OFF: the only preference here that reaches a THIRD PARTY (see its doc above).
+  // OFF: the only preference here that sends CRM data to a third party (see its doc).
   tosseClientFavicons: false,
   showTurnDuration: true,
   showModelTime: true,
