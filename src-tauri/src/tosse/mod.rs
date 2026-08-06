@@ -153,7 +153,11 @@ pub struct TosseAccountStatus {
 // ── Errors ───────────────────────────────────────────────────────────────────────────
 
 /// The wording the FRONT matches on to tell "this session is gone" from a failure that is
-/// merely transient — `src/ipc/tosseErrors.ts::SESSION_GONE_MARKERS`, kept identical.
+/// merely transient — the twin of `src/ipc/tosseErrors.ts::SESSION_GONE_MARKERS`.
+///
+/// Same substrings, matched case-INSENSITIVELY on both sides; the TypeScript copy is
+/// therefore spelled lower-case (it folds the message before comparing) while this one is
+/// spelled as the messages actually read. Only the letters have to agree, not their case.
 ///
 /// ⚠️ These strings are a CONTRACT, not prose. Errors cross the IPC boundary as plain
 /// `String` (every command is `Result<T, String>`), so the front has nothing but the text

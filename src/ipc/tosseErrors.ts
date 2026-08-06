@@ -18,7 +18,9 @@
 /**
  * The substrings that mean "there is no usable TOSSE session any more".
  *
- * Kept identical to `SESSION_GONE_MARKERS` in `src-tauri/src/tosse/mod.rs`:
+ * The twin of `SESSION_GONE_MARKERS` in `src-tauri/src/tosse/mod.rs` — same substrings,
+ * spelled lower-case HERE because the match folds the message's case (the Rust copy is
+ * spelled as the messages actually read). Only the letters have to agree:
  *  - `TosseError::NotConnected` → "not connected to TOSSE" (nothing stored at all);
  *  - the revoked/expired grant, whose reason ends in "connect again", surfaced as
  *    `TosseError::Denied` after the stored tokens have been cleared.
