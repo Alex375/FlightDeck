@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.5.0
+
+- New: connect the app to your TOSSE CRM — sign in from Settings → TOSSE, and link each local folder to its TOSSE repository.
+- New: a "TOSSE Tasks" view listing your projects by client and their tasks, readable and editable from the app — with a Backlog section folded by default and an "Open in TOSSE" shortcut.
+- New: start working on a task straight from the TOSSE view — it opens a conversation on the right repository.
+- New: a setting to unlock the "Bypass permissions" mode, for when you deliberately want the agent to run without asking.
+- Improved: sub-agent text now streams live. Drilling into a running sub-agent shows its prose and reasoning as it happens, instead of only its tool calls; a reconnection indicator tells you when the link is being re-established.
+- Fixed: a permission request withdrawn by the CLI no longer leaves a dead card that swallows your next click.
+
 ## v1.4.0
 
 - New: Opus 5 and Sonnet 5 in the model menu, and Sonnet 5 now offers the "Extra" reasoning effort — and with it Ultra code — which the previous Sonnet didn't accept.
