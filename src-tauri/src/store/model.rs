@@ -33,6 +33,21 @@ pub struct RepoTosseLink {
     pub tosse_repository_id: Option<String>,
 }
 
+/// A TOSSE project pinned to one of the app's local folders.
+///
+/// The CRM has no field for a machine path (and a path on this Mac would be
+/// meaningless on a colleague's), so the association only ever lives here. Keyed by
+/// the PROJECT rather than by the task: every task of a project resolves to the same
+/// working folder, so the question is asked once and answered for all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct TosseProjectRepo {
+    /// The CRM project id. Deliberately NOT a foreign key — it belongs to another
+    /// system, so nothing local can enforce it.
+    pub project_id: String,
+    /// FK to [`RepoRecord::id`] — the local folder. Cascades away with the repo.
+    pub repo_id: String,
+}
+
 /// A conversation's persisted metadata.
 ///
 /// The stable `id` is the identity the whole app keys off. It is deliberately
@@ -98,6 +113,22 @@ pub struct ConversationRecord {
     /// part of the derived `AgentStatus` (see the front's `agent/status.ts`), the
     /// single thing that, when off, can't be re-derived from the on-disk transcript.
     pub pending_reminder: Option<String>,
+    /// The TOSSE task this conversation was opened on, when it was started from the
+    /// tasks view ("Start" / "Discuss"). `None` for every conversation created any
+    /// other way — which is most of them, and stays the unchanged default.
+    ///
+    /// It is what makes a second click REOPEN the conversation instead of starting a
+    /// second agent on the same task.
+    pub tosse_task_id: Option<String>,
+    /// The task's title and status AS THEY WERE when the link was made, refreshed
+    /// whenever the CRM is reachable.
+    ///
+    /// ⚠️ Denormalised on purpose. The id ALONE leaves a linked conversation mute
+    /// offline — no title to name the task, and no status at all — while the delete
+    /// warning is a function of precisely that status. Storing the id only would mean
+    /// the warning silently stops warning the moment the network is down.
+    pub tosse_task_title: Option<String>,
+    pub tosse_task_status: Option<String>,
 }
 
 /// The full persisted snapshot the UI hydrates from at boot.

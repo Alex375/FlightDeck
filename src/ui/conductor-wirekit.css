@@ -83,8 +83,23 @@
 .wf-traffic i:nth-child(1){ background:#f0625c; }
 .wf-traffic i:nth-child(2){ background:#f5bb40; }
 .wf-traffic i:nth-child(3){ background:#54c050; }
-.wf-title { font-size: 12px; color: var(--wf-tx-lo); letter-spacing: .2px; }
-.wf-tbnav { display: flex; gap: 2px; margin-left: 4px; background: var(--wf-panel); padding: 3px; border-radius: 8px; border: 1px solid var(--wf-line); }
+/* The window title — the active conversation's name, which since tasks name their own
+   conversations can be a full sentence.
+   ⚠️ All three properties are load-bearing. The bar is a 38px-tall flex row, so an
+   unconstrained title WRAPPED (breaking the bar's layout) or pushed the controls off the
+   right edge. `min-width: 0` is what actually lets it shrink — a flex item defaults to
+   `min-width: auto` = min-content, and `text-overflow` never triggers without it. It is
+   also the FIRST thing to give way (`flex: 0 1 auto` here, `0 0 auto` on the nav and the
+   controls): the title is the one part already shown elsewhere, in the sidebar. */
+.wf-title {
+  font-size: 12px; color: var(--wf-tx-lo); letter-spacing: .2px;
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-tbnav { flex: 0 0 auto; display: flex; gap: 2px; margin-left: 4px; background: var(--wf-panel); padding: 3px; border-radius: 8px; border: 1px solid var(--wf-line); }
 .wf-tbnav button {
   font: inherit; font-size: 11.5px; color: var(--wf-tx-lo);
   background: transparent; border: 0; padding: 4px 11px; border-radius: 6px; cursor: default;
@@ -92,7 +107,12 @@
 }
 .wf-tbnav button[data-on] { background: var(--wf-panel-3); color: var(--wf-tx-hi); }
 .wf-tbnav .wf-badge { font-size: 9.5px; padding: 0 5px; }
-.wf-tbright { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+/* The controls are allowed to SHRINK, but their buttons are not: `flex: 0 1 auto` +
+   `min-width: 0` is what passes the pressure down to the one child with variable-width
+   content (the TOSSE task chip, which truncates), instead of the whole row spilling past
+   the window. A fixed-size button has no give and keeps its hit area — half a button
+   would be worse than a shorter caption. Order of sacrifice: the title, then that chip. */
+.wf-tbright { flex: 0 1 auto; margin-left: auto; display: flex; align-items: center; gap: 10px; min-width: 0; }
 
 .wf-body { flex: 1; display: flex; min-height: 0; }
 .wf-col  { display: flex; flex-direction: column; min-height: 0; min-width: 0; }

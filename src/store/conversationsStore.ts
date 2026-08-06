@@ -172,6 +172,32 @@ export interface Conversation {
    * (permission / questionnaire) — those exist only while live.
    */
   pendingReminder: ReminderKind | null;
+  /**
+   * The TOSSE task this conversation was started on (from the tasks view's "Start" /
+   * "Discuss"), or null for every conversation created any other way. PERSISTED.
+   *
+   * It is what makes a second click on that task REOPEN this conversation instead of
+   * starting a second agent on the same work — the thing the tasks view exists to
+   * prevent.
+   */
+  tosseTaskId: string | null;
+  /**
+   * The linked task's title and status as of the last time the CRM could be read.
+   * PERSISTED — deliberately DENORMALISED: the id alone leaves a linked conversation
+   * mute offline (no name to show, no status), and the delete warning is a function of
+   * precisely that status, so it would stop warning exactly when the network is down.
+   * Both null when nothing is linked. Refreshed by {@link refreshLinkedTaskMeta}.
+   */
+  tosseTaskTitle: string | null;
+  tosseTaskStatus: string | null;
+}
+
+/** A TOSSE task as a conversation remembers it — the denormalised trio, kept together
+ *  so linking and refreshing can't set one without the others. */
+export interface LinkedTosseTask {
+  id: string;
+  title: string;
+  status: string;
 }
 
 /** Coerce a persisted (untyped) reminder string back to the union, defaulting any
@@ -261,6 +287,9 @@ const convToRecord = (c: Conversation): ConversationRecord => ({
   pending_reminder: c.pendingReminder,
   clean_output: c.cleanOutput,
   backend: c.kind,
+  tosse_task_id: c.tosseTaskId,
+  tosse_task_title: c.tosseTaskTitle,
+  tosse_task_status: c.tosseTaskStatus,
 });
 
 const recordToRepo = (r: RepoRecord): Repo => ({
@@ -287,6 +316,9 @@ const recordToConv = (c: ConversationRecord): Conversation => ({
   cleanOutput: c.clean_output,
   // Defensive: any unexpected/legacy value decodes to "claude" (the default backend).
   kind: c.backend === "codex" ? "codex" : "claude",
+  tosseTaskId: c.tosse_task_id,
+  tosseTaskTitle: c.tosse_task_title,
+  tosseTaskStatus: c.tosse_task_status,
 });
 
 // The one user-facing message for any persistence failure (deduped in the banner),
@@ -416,6 +448,15 @@ interface ConversationsState {
    * Armed from the live status on a finished turn; cleared on "Seen" / next message.
    */
   setReminder: (id: string, reminder: ReminderKind | null) => void;
+  /**
+   * Link this conversation to a TOSSE task (or unlink it with null). Persisted with
+   * the task's title and status alongside its id — see {@link Conversation.tosseTaskTitle}.
+   *
+   * Written once, when the tasks view opens a conversation on a task. A conversation
+   * is never re-linked to a DIFFERENT task afterwards: the view reopens the existing
+   * one instead, so one task keeps one agent.
+   */
+  linkConversationToTask: (id: string, task: LinkedTosseTask | null) => void;
 }
 
 export const useConversationsStore = create<ConversationsState>()((set, get) => ({
@@ -803,7 +844,59 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
     syncToCore("upsertConversation(reminder)", () => commands.upsertConversation(convToRecord(updated)));
   },
+
+  linkConversationToTask: (id, task) => {
+    const conv = get().conversations.find((c) => c.id === id);
+    if (!conv) return;
+    const updated = {
+      ...conv,
+      tosseTaskId: task?.id ?? null,
+      tosseTaskTitle: task?.title ?? null,
+      tosseTaskStatus: task?.status ?? null,
+    };
+    // Idempotent: linking the same task twice must not queue a redundant write (the
+    // tasks view calls this on every "Start", including the ones that reopen).
+    if (
+      conv.tosseTaskId === updated.tosseTaskId &&
+      conv.tosseTaskTitle === updated.tosseTaskTitle &&
+      conv.tosseTaskStatus === updated.tosseTaskStatus
+    ) {
+      return;
+    }
+    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+    syncToCore("upsertConversation(tosseTask)", () =>
+      commands.upsertConversation(convToRecord(updated)),
+    );
+  },
 }));
+
+/**
+ * Re-stamp every linked conversation with its task's CURRENT title and status.
+ *
+ * Called whenever the CRM has just been read (the tasks view's briefing / backlog), so
+ * the denormalised copy tracks reality while there IS a network — and stays legible,
+ * frozen at its last-known value, when there is not. A task the CRM no longer returns
+ * is deliberately LEFT ALONE rather than blanked: the briefing omits whole categories
+ * of tasks on purpose (done, backlog, parked), and treating "absent from this payload"
+ * as "gone" would erase the link the moment a task is finished — exactly when the user
+ * still wants to see which conversation did it.
+ *
+ * Returns the number of conversations actually re-stamped (0 = nothing to do), which
+ * is what makes it cheap to call on every refetch.
+ */
+export function refreshLinkedTaskMeta(tasks: LinkedTosseTask[]): number {
+  if (tasks.length === 0) return 0;
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const store = useConversationsStore.getState();
+  const stale = store.conversations.filter((c) => {
+    const task = c.tosseTaskId ? byId.get(c.tosseTaskId) : undefined;
+    return task != null && (task.title !== c.tosseTaskTitle || task.status !== c.tosseTaskStatus);
+  });
+  for (const conv of stale) {
+    store.linkConversationToTask(conv.id, byId.get(conv.tosseTaskId!)!);
+  }
+  return stale.length;
+}
 
 /**
  * Create a new conversation in `repoPath` (registering the repo if new) with a
@@ -845,6 +938,11 @@ export function createConversationInRepo(
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // Not started from the TOSSE tasks view: that surface links the conversation
+    // itself, right after creating it (linkConversationToTask).
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -888,6 +986,11 @@ export function createConversationInWorktree(
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // Not started from the TOSSE tasks view: that surface links the conversation
+    // itself, right after creating it (linkConversationToTask).
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -968,6 +1071,12 @@ export function reactivateDiskConversation(d: DiskConversation): string {
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // A conversation brought back from disk gets a FRESH stable id — the row that
+    // carried any TOSSE link was forgotten with the old one, and the transcript holds
+    // no trace of it. Relinking is a click away in the tasks view.
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -1007,6 +1116,13 @@ export function materializeCodexBranch(
     pendingReminder: null,
     cleanOutput: null,
     kind: "codex",
+    // A fork deliberately does NOT inherit the source's TOSSE link: one task keeps one
+    // conversation, so two rows claiming the same task would make "reopen the linked
+    // conversation" ambiguous. Link the branch by hand from the tasks view if it is the
+    // one that should carry the work.
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -1578,6 +1694,38 @@ export const useConversations = () =>
   useConversationsStore(useShallow((s) => s.conversations));
 export const useRepos = () => useConversationsStore(useShallow((s) => s.repos));
 export const useActiveConversationId = () => useConversationsStore((s) => s.activeId);
+
+/**
+ * Every conversation opened on a TOSSE task, most recently active FIRST.
+ *
+ * A task can carry several: a first pass, a second opinion, a retry after a rewind. The
+ * ordering is what makes "open the one on this task" unambiguous when there are several —
+ * the one being worked in is the one you meant.
+ */
+export function conversationsForTask(
+  conversations: Conversation[],
+  taskId: string | null | undefined,
+): Conversation[] {
+  if (!taskId) return [];
+  return conversations
+    .filter((c) => c.tosseTaskId === taskId)
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+}
+
+/** The most recently active conversation on a task, or null. */
+export function conversationForTask(
+  conversations: Conversation[],
+  taskId: string | null | undefined,
+): Conversation | null {
+  return conversationsForTask(conversations, taskId)[0] ?? null;
+}
+
+/** Every conversation on `taskId`, live from the store (most recent first). */
+export function useConversationsForTask(taskId: string | null | undefined): Conversation[] {
+  return useConversationsStore(
+    useShallow((s) => conversationsForTask(s.conversations, taskId)),
+  );
+}
 
 /** The repo (working folder) a conversation belongs to. */
 export function useConversationRepo(convId: string | null): Repo | null {

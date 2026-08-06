@@ -630,6 +630,168 @@ pub fn tosse_link_repository(
     Ok(())
 }
 
+/// A clone found on this Mac that matches one of the urls asked about.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRepoMatch {
+    pub path: String,
+    /// The clone's own `origin`, so two same-named folders can be told apart.
+    pub remote_url: String,
+    /// The url FROM THE CRM that this clone matched, verbatim as it was passed in.
+    ///
+    /// Returned so the UI can name the repository ("matches « CRM_max »") by plain
+    /// equality, instead of re-implementing url normalisation in TypeScript — that
+    /// comparison has exactly one home, [`crate::git::normalize_remote_url`], and a second
+    /// implementation would drift from it the first time either side gains a case.
+    pub matched_url: String,
+}
+
+/// The answer to "is this project's repository already cloned here?", INCLUDING what the
+/// scan could not do.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRepoScan {
+    pub matches: Vec<LocalRepoMatch>,
+    /// The walk stopped on its budget rather than on running out of folders — so "no
+    /// match" here means "not found in what we looked at", and the UI says so.
+    pub truncated: bool,
+    /// Folders macOS would not let us read (a privacy-guarded folder with no grant yet).
+    /// Surfaced for the same reason: an empty result must never pass for a verdict.
+    pub unreadable: Vec<String>,
+    /// How much ground was actually covered. Reported so a truncated scan can say WHICH
+    /// limit it hit — "stopped early" alone is a message neither the user nor we can act
+    /// on, which is precisely how a blocked privacy prompt hid itself once.
+    pub visited: u32,
+    pub elapsed_ms: u32,
+}
+
+/// Find the clones already on this Mac whose `origin` matches one of `urls`.
+///
+/// The caller passes the CRM urls of the project's repositories — they are already in the
+/// front's cached payload, so this needs no network of its own and stays a pure local
+/// question. Only MATCHES come back: the app has no business shipping an inventory of
+/// every repository on the disk to the webview.
+///
+/// Measured on a real home directory: ~130 ms for 49 repositories. Cheap because it reads
+/// `.git/config` instead of spawning `git` per folder, and never descends into a
+/// repository or a dependency tree. Runs off the async runtime all the same.
+#[tauri::command]
+#[specta::specta]
+pub async fn scan_local_git_repos(
+    store: tauri::State<'_, Store>,
+    urls: Vec<String>,
+) -> Result<LocalRepoScan, String> {
+    // Nothing to match against — don't touch the disk at all.
+    let wanted: std::collections::HashSet<String> = urls
+        .iter()
+        .filter_map(|u| crate::git::normalize_remote_url(u))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(LocalRepoScan {
+            matches: Vec::new(),
+            truncated: false,
+            unreadable: Vec::new(),
+            visited: 0,
+            elapsed_ms: 0,
+        });
+    }
+
+    // Where to look: the home directory covers the usual cases, plus the PARENT of every
+    // folder already in Flight Deck — that is where this user demonstrably keeps clones,
+    // including outside home (an external volume, /Volumes/…).
+    let known = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        // `$HOME` directly, as every other module here resolves it — no new dependency
+        // for one lookup.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
+        if let Some(home) = home {
+            roots.push(home.clone());
+            for row in &known {
+                let path = PathBuf::from(&row.path);
+                if let Some(parent) = path.parent() {
+                    if !parent.starts_with(&home) && !roots.iter().any(|r| r == parent) {
+                        roots.push(parent.to_path_buf());
+                    }
+                }
+            }
+        } else {
+            for row in &known {
+                if let Some(parent) = PathBuf::from(&row.path).parent() {
+                    roots.push(parent.to_path_buf());
+                }
+            }
+        }
+        // Depth 4 from home reaches `~/Repos/client/project` and the like; deeper is
+        // where the cost is, and where clones essentially never are.
+        crate::git::scan_repos(&roots, 4)
+    })
+    .await
+    .map_err(|e| format!("could not scan for local repositories: {e}"))?;
+
+    // Keyed by normalized url so a match can report WHICH CRM url it answered.
+    let by_key: std::collections::HashMap<String, String> = urls
+        .iter()
+        .filter_map(|u| crate::git::normalize_remote_url(u).map(|k| (k, u.clone())))
+        .collect();
+    let matches = scan
+        .repos
+        .into_iter()
+        .filter_map(|repo| {
+            let key = crate::git::normalize_remote_url(&repo.remote_url)?;
+            let matched_url = by_key.get(&key)?.clone();
+            Some(LocalRepoMatch {
+                path: repo.path,
+                remote_url: repo.remote_url,
+                matched_url,
+            })
+        })
+        .collect();
+
+    Ok(LocalRepoScan {
+        matches,
+        truncated: scan.truncated,
+        unreadable: scan.unreadable,
+        visited: scan.visited,
+        elapsed_ms: scan.elapsed_ms,
+    })
+}
+
+/// Which local folder each TOSSE project's work happens in, as the user pinned it.
+///
+/// Local only, and deliberately so: the CRM holds no field for a machine path, and a
+/// path on this Mac would mean nothing on a colleague's. Read as a whole — there are a
+/// handful of pins at most, and the tasks view needs all of them to resolve any task.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_project_repos(
+    store: tauri::State<'_, Store>,
+) -> Result<Vec<crate::store::TosseProjectRepo>, String> {
+    store.tosse_project_repos().map_err(|e| e.to_string())
+}
+
+/// Pin a TOSSE project to a local folder, or forget the pin with `None`.
+///
+/// Keyed by PROJECT, not by task: every task of a project is worked on in the same
+/// folder, so the question is asked once and the answer reused. Always reversible from
+/// the project's card.
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_link_project_repo(
+    store: tauri::State<'_, Store>,
+    project_id: String,
+    repo_id: Option<String>,
+) -> Result<(), String> {
+    store
+        .set_tosse_project_repo(&project_id, repo_id.as_deref())
+        // The foreign key refuses a folder the app does not know. Surfaced rather than
+        // swallowed: the view would otherwise offer to open a folder that is not there.
+        .map_err(|e| format!("could not save the folder for this project: {e}"))?;
+    Ok(())
+}
+
 /// Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
 ///
 /// The CRM assembles this shape for its own Briefing page — active projects with their

@@ -29,6 +29,8 @@ import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
 import { Dot, Ico, Menu, MenuItem, MenuLabel, RunPulse } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
+import { DeleteConversationDialog } from "./DeleteConversationDialog";
+import { deleteReasonFor } from "./deleteGuard";
 import { WorktreeBadge } from "../git/WorktreeBadge";
 import { useWorktreeUi } from "../git/worktreeUiStore";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
@@ -88,12 +90,16 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
 
   // "Busy" for delete-safety: a turn in flight OR any background work still running.
   const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
-  // If the work settles while the confirm is open, its "still running / work may be
-  // lost" copy is stale and no confirm is warranted anymore — close it (the × goes
-  // back to friction-free). Guarded on `confirmingDelete` so it's a no-op otherwise.
+  // …plus the TOSSE side: a conversation carrying a live task earns the same question.
+  // One shared predicate with the Flight Deck card, so the two can't disagree.
+  const warnOnLinkedTask = useDisplay((d) => d.tosseTaskDeleteWarning);
+  const deleteAsk = deleteReasonFor(conv, busyForDelete, warnOnLinkedTask);
+  // If the reason evaporates while the confirm is open (the run settled, the task moved
+  // on), its copy is stale and no confirm is warranted anymore — close it, and the ×
+  // goes back to friction-free. Guarded on `confirmingDelete` so it's a no-op otherwise.
   useEffect(() => {
-    if (confirmingDelete && !busyForDelete) setConfirmingDelete(false);
-  }, [confirmingDelete, busyForDelete]);
+    if (confirmingDelete && !deleteAsk) setConfirmingDelete(false);
+  }, [confirmingDelete, deleteAsk]);
 
   function startEdit() {
     settled.current = false;
@@ -193,28 +199,22 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         aria-label="Delete conversation"
         onClick={(e) => {
           e.stopPropagation();
-          if (busyForDelete) setConfirmingDelete(true);
+          if (deleteAsk) setConfirmingDelete(true);
           else remove(conv.id);
         }}
       >
         <Ico name="x" className="sm" />
       </button>
-      {confirmingDelete ? (
-        <ConfirmDialog
-          open
-          danger
-          title={`Delete "${conv.name}"?`}
-          confirmLabel="Delete anyway"
+      {confirmingDelete && deleteAsk ? (
+        <DeleteConversationDialog
+          conv={conv}
+          reason={deleteAsk}
           onCancel={() => setConfirmingDelete(false)}
           onConfirm={() => {
             setConfirmingDelete(false);
             remove(conv.id);
           }}
-        >
-          This conversation is <strong>running</strong>. Deleting it will{" "}
-          <strong>stop the Claude session</strong> and unfinished work may be lost. The
-          conversation can still be restored with ⌘Z, but not the interrupted run.
-        </ConfirmDialog>
+        />
       ) : null}
     </div>
   );

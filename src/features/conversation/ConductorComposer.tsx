@@ -557,12 +557,8 @@ export const ConductorComposer = forwardRef<
         ? ("set" as const)
         : ("plumbing" as const)
       : undefined;
-    // Same invariant for the optimistic PLACEHOLDER name — hence computed BEFORE this call: a
-    // fresh conversation whose first message is `/goal <condition>` must not end up named after
-    // that command in the sidebar and on its Flight Deck card. Even though a goal SET now shows
-    // as a card in the thread, a (often long) goal directive is a poor conversation NAME; the
-    // conversation stays auto-title-eligible and gets named by the first REAL message instead.
-    if (!goalCmd) useConversationsStore.getState().noteFirstMessage(session, t);
+    // (The optimistic placeholder name is set by the send path itself — see
+    // `sendConversationMessage`, which skips it for a `/goal` exactly as this did.)
     // The worktree toggle only applies to the very first spawn of a conversation.
     // `queued`: busy at send time → the CLI will inject this mid-turn, so the
     // bubble shows a "pending" badge until the turn ends.

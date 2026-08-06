@@ -1,0 +1,104 @@
+/* The task a conversation carries. Quiet by default — it states a fact, next to the
+   worktree and backend marks — and only lights up when it is clickable. */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 180px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11px;
+  /* The only control on the bar with variable-width content, so it is the one that gives
+     way once the title has run out of room: `min-width: 0` lets it shrink past its own
+     content (its title truncates), instead of the whole row overflowing the window. */
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.clickable {
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.clickable:hover {
+  background: var(--wf-panel-2);
+  border-color: var(--wf-tx-xlo);
+  color: var(--wf-tx-hi);
+}
+/* On a Flight Deck card the chip sits among the other marks: the title would not fit and
+   the mark + status dot already answer "which task". */
+.compact {
+  max-width: none;
+  padding: 0 6px;
+  gap: 5px;
+}
+
+.mark {
+  color: var(--wf-tosse-accent);
+  flex: 0 0 auto;
+}
+
+/* The TASK's status, in the CRM's own colours — the same language the tasks view speaks,
+   since this dot describes a CRM value, not an agent state. */
+.dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--wf-tx-xlo);
+  background: transparent;
+}
+.dot_run {
+  background: #3b82f6;
+  border-color: #3b82f6;
+}
+.dot_wait {
+  background: #f59e0b;
+  border-color: #f59e0b;
+}
+.dot_hold {
+  background: #8b5cf6;
+  border-color: #8b5cf6;
+}
+.dot_done {
+  background: #34d399;
+  border-color: #34d399;
+}
+.dot_todo {
+  background: transparent;
+  border-color: #9ca3af;
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.go {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.clickable:hover .go {
+  opacity: 0.7;
+}
+
+/* On a narrow window the chip goes altogether rather than pushing the buttons off the
+   screen. Shrinking it instead was tried and dropped: past its title it became an 18px
+   sliver that still ate room, and a half-width mark says less than no mark. Nothing is
+   lost — the conversation's task is also named in its side panel and, from the other
+   direction, on the task's own row.
+
+   `:not(.compact)` spares the Flight Deck card's copy: that one lives in a card with its
+   own room, and the window's width says nothing about it. */
+@media (max-width: 1100px) {
+  .chip:not(.compact) {
+    display: none;
+  }
+}

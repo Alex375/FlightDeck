@@ -220,7 +220,13 @@ export function Win({
     <div className="wf-win">
       <div className="wf-titlebar">
         {nav ? <div className="wf-tbnav">{nav}</div> : null}
-        {title ? <span className="wf-title">{title}</span> : null}
+        {/* `title` attribute when the caption is a plain string: it is truncated with an
+            ellipsis, so the full name has to stay readable somewhere. */}
+        {title ? (
+          <span className="wf-title" title={typeof title === "string" ? title : undefined}>
+            {title}
+          </span>
+        ) : null}
         {right ? <div className="wf-tbright">{right}</div> : null}
       </div>
       {banner}

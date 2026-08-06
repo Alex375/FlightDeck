@@ -1,0 +1,322 @@
+/* The shared folder picker — used by the "Start / Discuss" dialog and by a project card's
+   own folder chip. Its metrics are its own so neither caller's stylesheet owns it. */
+
+/* ── Choosing a folder ──────────────────────────────────────────────────────────────
+   Two groups, and the difference between them is the whole point: what BELONGS to this
+   project (the CRM's own answer) versus what merely happens to be open in Flight Deck.
+   They used to look alike, which let a list of unrelated folders pass for a set of
+   matches.
+
+   ⚠️ The brand accent is used SPARINGLY here — a coral fill, a coral border, a coral pill
+   and a coral badge on one row made the whole dialog shout, and nothing stood out because
+   everything did. A match is now an ordinary, roomy card; the accent is one hairline and
+   one icon, which is enough to say "this one is the project's". */
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Section headings are a real size: this dialog asks two questions, and they should read
+   as questions rather than as form labels. */
+.sectionTitle {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+  letter-spacing: -0.01em;
+}
+.sectionHint {
+  font-size: 12px;
+  color: var(--wf-tx-lo);
+  line-height: 1.5;
+}
+
+.groupHead {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 20px;
+}
+.groupMark {
+  color: var(--wf-tosse-accent);
+  flex: 0 0 auto;
+}
+.groupTitle {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+}
+/* The search says so where the results will appear, not in a corner. */
+.searching {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--wf-tx-lo);
+}
+.searchingBlock {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 18px 14px;
+  border: 1px dashed var(--wf-line);
+  border-radius: 10px;
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+}
+
+.matchList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* A match is a real proposition: roomy, and it names the repository it answers to — a bare
+   path would not say WHY it is being offered. Neutral surface, with a single accent rule
+   down its left edge. */
+.match {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 14px;
+  border: 1px solid var(--wf-line);
+  border-left: 2px solid color-mix(in srgb, var(--wf-tosse-accent) 60%, transparent);
+  border-radius: 10px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.match:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  border-color: var(--wf-tx-xlo);
+  border-left-color: var(--wf-tosse-accent);
+}
+.match:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.matchIco {
+  color: color-mix(in srgb, var(--wf-tosse-accent) 75%, var(--wf-tx-lo));
+  flex: 0 0 auto;
+}
+.matchBody {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.matchName {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+/* The CRM repository this folder answers to — the reason it is in this group at all.
+   Stated, not shouted: it is a fact about the folder, like its path. */
+.matchRepo {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--wf-panel-3);
+  border: 1px solid var(--wf-line);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+}
+.matchPath {
+  font-family: var(--wf-mono);
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* This row also REGISTERS the folder — said plainly, since the two kinds look alike. */
+.matchAdd {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--wf-tx-xlo);
+  white-space: nowrap;
+}
+
+/* Nothing matched. A glyph and a few words, sized to be READ at a glance — the paragraph
+   that used to sit here explained three different situations nobody got to the end of. */
+.empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 14px;
+  border: 1px dashed var(--wf-line);
+  border-radius: 10px;
+  color: var(--wf-tx-lo);
+}
+.emptyIco {
+  color: var(--wf-tx-xlo);
+  flex: 0 0 auto;
+}
+.emptyText {
+  font-size: 12.5px;
+}
+
+/* A scan that was cut short or refused: a badge of FACTS, with the sentence in its
+   tooltip. Never silent — but never a paragraph either. */
+.note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+  font-size: 11.5px;
+  color: var(--wf-tx-lo);
+  cursor: default;
+}
+.note > :global(.wf-ico) {
+  color: var(--wf-tx-xlo);
+  flex: 0 0 auto;
+}
+/* The numbers / paths themselves, set apart from the label that introduces them. */
+.noteFact {
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  color: var(--wf-tx);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Everything else ── */
+.otherHead {
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-tx-xlo);
+}
+.otherList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Bounded: a fleet of open folders must not push the footer off a short window. */
+  max-height: 180px;
+  overflow-y: auto;
+}
+/* Deliberately quieter than a match: one line, no accent, no frame at rest. */
+.other {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.other:hover:not(:disabled) {
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+}
+.other:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.otherName {
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+.otherPath {
+  font-family: var(--wf-mono);
+  font-size: 11px;
+  color: var(--wf-tx-xlo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Short windows ──────────────────────────────────────────────────────────────────
+   The dialog already scrolls and always keeps its footer reachable, but on a short
+   window that meant a field sliced in half right above the buttons. Compacting the
+   spacing (rather than letting it scroll harder) is what keeps the whole decision
+   visible at once — verified at 900×600, the smallest size this app is used at. */
+@media (max-height: 720px) {
+  .body {
+    padding: 16px 20px 18px;
+    gap: 16px;
+  }
+  .section {
+    gap: 8px;
+  }
+  .sectionTitle {
+    font-size: 13.5px;
+  }
+  .match {
+    padding: 10px 12px;
+  }
+  .question {
+    min-height: 58px;
+  }
+  .otherList {
+    max-height: 108px;
+  }
+  .searchingBlock {
+    padding: 13px 12px;
+  }
+}
+
+/* Its own ghost button: the picker is mounted by two different dialogs, and borrowing one
+   of their stylesheets would make the other's copy drift. */
+.ghostBtn {
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.ghostBtn:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.ghostBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The picker's own empty/failure prose. */
+.hint {
+  font-size: 12px;
+  color: var(--wf-tx-lo);
+  line-height: 1.5;
+}
+
+/* "This is the one in force" — a tick on the row itself, in place of the badge that says
+   what a click would do. The folder is never listed twice. */
+.currentFlag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--wf-tosse-accent);
+  white-space: nowrap;
+}

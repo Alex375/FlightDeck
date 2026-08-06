@@ -28,6 +28,9 @@ function codexConv(over: Partial<Conversation> = {}): Conversation {
     permissionMode: null,
     cleanOutput: null,
     pendingReminder: null,
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
     ...over,
   };
 }

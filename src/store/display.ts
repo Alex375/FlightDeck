@@ -79,6 +79,15 @@ export interface DisplayPrefs {
    *  either case when TOSSE is not connected. Read by {@link TosseRepoBadge}. */
   tosseRepoBadge: boolean;
 
+  /** Warn before deleting a conversation that is linked to a TOSSE task in « En cours »
+   *  or « Review ». ON by default — the delete is otherwise friction-free (one click,
+   *  ⌘Z to undo), and dropping the conversation someone's live task is being worked in
+   *  deserves a question. Off → linked conversations delete like any other (a RUNNING
+   *  conversation still asks: that guard is about killing a live session, not about
+   *  TOSSE). Read by {@link deleteReason}; the status compared is the one stored ON the
+   *  conversation, so the warning still works offline. */
+  tosseTaskDeleteWarning: boolean;
+
   /** Show the TOSSE tasks view — the third top-level view (⌘3), listing the CRM's projects
    *  by client. ON by default. Off → the tab disappears and the view is never mounted, so
    *  the briefing is not fetched either. Note this preference only ever MATTERS while
@@ -161,6 +170,7 @@ const DEFAULTS: DisplayPrefs = {
   clickableFileMentions: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
+  tosseTaskDeleteWarning: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -215,6 +225,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,

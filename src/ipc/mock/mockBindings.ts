@@ -62,6 +62,8 @@ import type {
   TosseBacklogTask,
   TosseBriefing,
   TosseProject,
+  LocalRepoScan,
+  TosseProjectRepo,
   TosseRepoLink,
   TosseRepoLinksPayload,
   TosseRepository,
@@ -240,6 +242,11 @@ const demoClientInterne = {
   website: "https://anthropic.com",
 };
 const demoClientWd = { id: "c-wd", name: "Webdentiste", logoUrl: null, website: null };
+
+// The project → folder pins a demo run has made so far. In memory only: the mock has no
+// database, and starting fresh on every reload is what makes the "asked once" behaviour
+// visible in a demo.
+const demoProjectRepos: TosseProjectRepo[] = [];
 
 const demoBriefing: TosseBriefing = {
   projects: [
@@ -588,7 +595,7 @@ export const mockCommands = {
         status: "Actif",
         context:
           "# tosse-code\n\nDesktop app to drive Claude Code.\n\n- **Stack**: Tauri 2, Rust, React\n- Ships as *Flight Deck*.",
-        projects: [{ id: "p-1", name: "Tosse Code", status: "En cours" }],
+        projects: [{ id: "p-tosse-code", name: "Tosse Code", status: "En cours" }],
       },
       {
         id: "crm-api",
@@ -597,7 +604,7 @@ export const mockCommands = {
         host: "github",
         status: "Actif",
         context: null,
-        projects: [{ id: "p-2", name: "CRM TOSSE", status: "En cours" }],
+        projects: [{ id: "p-crm", name: "TOSSE", status: "En cours" }],
       },
       {
         id: "crm-archived",
@@ -625,6 +632,37 @@ export const mockCommands = {
     return ok({ connected: true, links, repositories, error: null });
   },
   async tosseLinkRepository(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  // Project → local folder pins. MUTABLE (like the briefing below), so a demo run
+  // exercises the real "asked once, then remembered" path: pick a folder for a project
+  // and the next Start goes straight there instead of asking again.
+  // Two clones "on disk" the demo repo does not know about, so the "found on this Mac"
+  // path is exercisable without touching a real filesystem.
+  async scanLocalGitRepos(urls: string[]): Promise<Result<LocalRepoScan, string>> {
+    const known: Record<string, { path: string; remoteUrl: string }[]> = {
+      "https://github.com/Alex375/CRM_max": [
+        { path: "/Users/dev/work/CRM_max", remoteUrl: "git@github.com:Alex375/CRM_max.git" },
+      ],
+      "https://github.com/Alex375/tosse-code": [
+        { path: "/Users/dev/demo-repo", remoteUrl: "git@github.com:Alex375/tosse-code.git" },
+      ],
+    };
+    const matches = urls.flatMap((u) =>
+      (known[u] ?? []).map((m) => ({ ...m, matchedUrl: u })),
+    );
+    return ok({ matches, truncated: false, unreadable: [], visited: 42, elapsedMs: 12 });
+  },
+  async tosseProjectRepos(): Promise<Result<TosseProjectRepo[], string>> {
+    return ok([...demoProjectRepos]);
+  },
+  async tosseLinkProjectRepo(
+    projectId: string,
+    repoId: string | null,
+  ): Promise<Result<null, string>> {
+    const at = demoProjectRepos.findIndex((p) => p.project_id === projectId);
+    if (at >= 0) demoProjectRepos.splice(at, 1);
+    if (repoId) demoProjectRepos.push({ project_id: projectId, repo_id: repoId });
     return ok(null);
   },
   // ---- TOSSE tasks view -------------------------------------------------------------
@@ -1105,6 +1143,9 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
+          tosse_task_id: null,
+          tosse_task_title: null,
+          tosse_task_status: null,
           backend: "claude",
         },
         // A Codex conversation so the mixed-fleet identity (backend badge, neutral avatar,
@@ -1126,6 +1167,9 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
+          tosse_task_id: null,
+          tosse_task_title: null,
+          tosse_task_status: null,
           backend: "codex",
         },
       ],

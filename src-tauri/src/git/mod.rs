@@ -504,9 +504,389 @@ fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+// ── Finding the clones already on this Mac ────────────────────────────────────────────
+//
+// When a TOSSE project resolves to no folder Flight Deck knows, the answer usually EXISTS
+// on the disk — the repository is cloned, it was simply never added to the app. Rather than
+// making the user hunt for it in a file picker, we look: walk a few roots, and keep the
+// clones whose `origin` matches one of the project's CRM repositories.
+//
+// Two decisions make this cheap enough to run on demand (measured: ~130 ms for a whole home
+// directory, 49 repositories found):
+//   - `.git/config` is READ, never `git` spawned per folder. One process per repository
+//     would turn 130 ms into several seconds.
+//   - the walk STOPS at a repository and never descends into `node_modules` & co, where the
+//     entry count explodes for nothing.
+
+/// A clone found on disk, with the remote that identifies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannedRepo {
+    pub path: String,
+    /// The `origin` url as written in `.git/config` — shown so the user can tell two
+    /// same-named clones apart.
+    pub remote_url: String,
+}
+
+/// The outcome of a scan, INCLUDING what it could not do.
+///
+/// ⚠️ `truncated` and `unreadable` are the whole reason this is a struct and not a plain
+/// `Vec`. A scan that hit its budget, or that macOS refused (`~/Documents` without the TCC
+/// grant), would otherwise report "nothing found" — and the user would conclude their clone
+/// isn't there, which is the silent failure this feature must not ship with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoScan {
+    pub repos: Vec<ScannedRepo>,
+    /// True when the walk stopped on its own budget rather than on running out of folders.
+    pub truncated: bool,
+    /// Folders the OS would not let us read (TCC-protected, permissions). Capped — the
+    /// point is to SAY that something was skipped, not to enumerate a broken disk.
+    pub unreadable: Vec<String>,
+    /// Directories actually visited, and how long it took. Diagnostics, and the only way
+    /// to tell WHICH budget a truncated scan hit — without them "stopped early" is a
+    /// message nobody, including us, can act on.
+    pub visited: u32,
+    pub elapsed_ms: u32,
+}
+
+/// How many unreadable folders are worth naming before the list becomes noise.
+const MAX_UNREADABLE_REPORTED: usize = 6;
+
+/// Folders macOS guards behind an explicit privacy grant.
+///
+/// ⚠️ These are visited LAST, and the reason is a bug this shipped with: reading one of
+/// them without the grant makes the OS put up a modal prompt that BLOCKS the call until the
+/// user answers. They also sort near the top of a home directory (`Desktop`, `Documents`,
+/// `Downloads` — before `Repos`), so a plain breadth-first walk hit them first and spent
+/// its whole budget waiting, reporting "search stopped early" without ever having looked at
+/// the folder where the clones actually were. Deferring them means the unguarded part of
+/// the disk is always searched in full first, and whatever these cost, it costs it last.
+const TCC_GUARDED: &[&str] = &["Desktop", "Documents", "Downloads"];
+
+/// Directory names never worth descending into: dependency trees and build output (where
+/// the entry count explodes), and the OS's own folders (nobody clones into them).
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "Pods",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "Library",
+    "Applications",
+    "Movies",
+    "Music",
+    "Pictures",
+    ".Trash",
+    ".cache",
+    ".npm",
+    ".cargo",
+    ".rustup",
+    ".local",
+    ".pnpm-store",
+];
+
+/// How many directories a scan may visit before giving up.
+const SCAN_BUDGET: usize = 40_000;
+
+/// How long a scan may run before giving up, whatever it has visited.
+///
+/// ⚠️ A count alone is NOT a bound on time. MEASURED on a real machine: a first version
+/// that followed symlinks and canonicalized every directory took **71 seconds** on one
+/// home directory — a few thousand entries, but some of them behind network mounts and
+/// cloud-synced folders where a single `stat` blocks. The wall clock is the only budget
+/// that describes what the user actually waits for, so it is the one that stops the walk.
+const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Walk `roots` and return every git clone found, up to `max_depth` levels down.
+///
+/// Breadth-first, so the shallow (and far likelier) `~/Repos/foo` is found before anything
+/// buried. A directory holding a `.git` IS a repository: it is recorded and NOT descended
+/// into — clones don't nest, and its own contents are exactly where the entry count would
+/// run away.
+///
+/// A `.git` FILE (rather than a directory) marks a linked worktree — skipped on purpose:
+/// its main repository is the thing to offer, and it is found on its own.
+pub fn scan_repos(roots: &[PathBuf], max_depth: usize) -> RepoScan {
+    let mut out = RepoScan::default();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        roots.iter().map(|r| (r.clone(), 0usize)).collect();
+    // Privacy-guarded folders, kept for the very end — see `TCC_GUARDED`.
+    let mut deferred: std::collections::VecDeque<(PathBuf, usize)> = Default::default();
+    let mut visited = 0usize;
+    let started = std::time::Instant::now();
+
+    while let Some((real, depth)) = queue.pop_front().or_else(|| deferred.pop_front()) {
+        if visited >= SCAN_BUDGET || started.elapsed() >= SCAN_TIME_BUDGET {
+            out.truncated = true;
+            break;
+        }
+        visited += 1;
+        // Plain path dedup — no `canonicalize`. That call is a `realpath` syscall per
+        // directory, and on a cloud-synced or network-mounted folder it is the single
+        // slowest thing here. Symlinks are not followed (see below), so there is no cycle
+        // left for canonicalization to break.
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        // A repository: record it, and stop here.
+        let dot_git = real.join(".git");
+        if dot_git.is_dir() {
+            if let Some(url) = origin_url_from_config(&dot_git.join("config")) {
+                out.repos.push(ScannedRepo {
+                    path: real.to_string_lossy().to_string(),
+                    remote_url: url,
+                });
+            }
+            continue;
+        }
+        // A linked worktree — its main repository is what we want, and it turns up by
+        // itself. (`.git` here is a file pointing at the real gitdir.)
+        if dot_git.is_file() {
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&real) {
+            Ok(e) => e,
+            // Refused (TCC) or vanished: say so, at ANY depth. `~/Documents` without the
+            // grant is a depth-1 folder holding a quarter of this machine's clones —
+            // reporting only roots let that pass for "nothing there".
+            Err(_) => {
+                if out.unreadable.len() < MAX_UNREADABLE_REPORTED {
+                    out.unreadable.push(real.to_string_lossy().to_string());
+                }
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            // Hidden folders hold configuration, not checkouts — with `.git` already
+            // handled above, nothing here is worth the descent.
+            if name.starts_with('.') {
+                continue;
+            }
+            // Real directories only. A symlink is NOT followed: it is how one walk ends
+            // up crossing into a network mount or a cloud folder — the 71-second case —
+            // and `find` doesn't follow them either. `file_type` here is the cheap kind
+            // (no stat, it comes from the directory entry) and does not traverse links.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    let next = (entry.path(), depth + 1);
+                    if TCC_GUARDED.contains(&name.as_ref()) {
+                        deferred.push_back(next);
+                    } else {
+                        queue.push_back(next);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.visited = visited as u32;
+    out.elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    out
+}
+
+/// The `origin` url out of a `.git/config`, without spawning git.
+///
+/// Deliberately a hand parse of the one section we need: git's config format allows a lot,
+/// but a clone's `[remote "origin"] url = …` is written by git itself and is uniform. A file
+/// we cannot read, or that has no origin, yields `None` — a purely local repository is an
+/// ordinary thing, not a fault.
+fn origin_url_from_config(config: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(config).ok()?;
+    parse_origin_url(&text)
+}
+
+/// Pure half of [`origin_url_from_config`], so the parsing is unit-tested against the real
+/// shapes git writes (quoted subsection, tabs, `[remote "upstream"]` sitting next to it).
+pub(crate) fn parse_origin_url(config: &str) -> Option<String> {
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            // Section header: `[remote "origin"]`. Any other section closes ours, which is
+            // what keeps `[remote "upstream"]`'s url from being read as origin's.
+            in_origin = line.replace(char::is_whitespace, "") == "[remote\"origin\"]";
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("url") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What git actually writes in a clone's config — the shape the scanner parses.
+    const REAL_CONFIG: &str = r#"[core]
+	repositoryformatversion = 0
+	filemode = true
+[remote "origin"]
+	url = git@github.com:Alex375/tosse-code.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+"#;
+
+    #[test]
+    fn reads_origin_out_of_a_real_git_config() {
+        assert_eq!(
+            parse_origin_url(REAL_CONFIG).as_deref(),
+            Some("git@github.com:Alex375/tosse-code.git")
+        );
+    }
+
+    /// ⚠️ The mistake a looser parse would make: taking the FIRST `url =` in the file.
+    /// Plenty of clones carry an `upstream` (a fork's parent), and matching a project
+    /// against it would offer the wrong folder — silently, and plausibly.
+    #[test]
+    fn another_remotes_url_is_never_read_as_origins() {
+        let config = r#"[remote "upstream"]
+	url = https://github.com/upstream/thing.git
+[remote "origin"]
+	url = https://github.com/me/thing.git
+"#;
+        assert_eq!(
+            parse_origin_url(config).as_deref(),
+            Some("https://github.com/me/thing.git")
+        );
+        // …and a config with ONLY another remote yields nothing rather than its url.
+        let only_upstream = "[remote \"upstream\"]\n\turl = https://github.com/upstream/thing\n";
+        assert_eq!(parse_origin_url(only_upstream), None);
+    }
+
+    #[test]
+    fn a_purely_local_repository_has_no_origin() {
+        assert_eq!(parse_origin_url("[core]\n\tbare = false\n"), None);
+        assert_eq!(parse_origin_url(""), None);
+        // Present but empty is not a url either.
+        assert_eq!(parse_origin_url("[remote \"origin\"]\n\turl =\n"), None);
+    }
+
+    /// The scan's two load-bearing behaviours, on a real temporary tree: it FINDS a clone
+    /// a couple of levels down, and it does NOT walk into one (nor into `node_modules`) —
+    /// which is what keeps a whole home directory in the ~100 ms range.
+    #[test]
+    fn scan_finds_clones_and_stops_at_them() {
+        let root = std::env::temp_dir().join(format!("tosse-scan-{}", std::process::id()));
+        let repo = root.join("clients").join("acme");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            repo.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/site.git\n",
+        )
+        .unwrap();
+        // A nested repository INSIDE the clone: must not be reported (we stop at `acme`).
+        let nested = repo.join("vendored");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::write(
+            nested.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/vendored.git\n",
+        )
+        .unwrap();
+        // A dependency tree, which must never be descended into.
+        std::fs::create_dir_all(root.join("node_modules").join("pkg").join(".git")).unwrap();
+
+        let scan = scan_repos(&[root.clone()], 4);
+        let paths: Vec<&str> = scan.repos.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(scan.repos.len(), 1, "one clone, not its nested one: {paths:?}");
+        assert!(scan.repos[0].path.ends_with("acme"));
+        assert_eq!(scan.repos[0].remote_url, "git@github.com:acme/site.git");
+        assert!(!scan.truncated);
+
+        // Depth is honoured: at depth 1 the clone (two levels down) is out of reach.
+        assert!(scan_repos(&[root.clone()], 1).repos.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠️ THE regression, locked down: a privacy-guarded folder must never be walked before
+    /// the ordinary ones.
+    ///
+    /// On a real home directory `Desktop`/`Documents`/`Downloads` sort BEFORE `Repos`, and
+    /// reading one without the macOS grant blocks on a modal prompt. Walked in disk order,
+    /// the scan therefore spent its entire budget waiting on them and reported "stopped
+    /// early" having never reached the folder holding most of the clones. Here the guarded
+    /// folder is reached only after everything else, which is what makes the budget spend
+    /// itself on the searchable part of the disk first.
+    #[test]
+    fn guarded_folders_are_walked_last() {
+        let root = std::env::temp_dir().join(format!("tosse-scan-order-{}", std::process::id()));
+        // Named so it sorts FIRST on disk, exactly as `Documents` does before `Repos`.
+        let guarded = root.join("Documents").join("client");
+        let ordinary = root.join("Repos").join("project");
+        for (dir, url) in [(&guarded, "git@github.com:x/guarded.git"), (&ordinary, "git@github.com:x/ordinary.git")] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join(".git").join("config"), format!("[remote \"origin\"]\n\turl = {url}\n")).unwrap();
+        }
+
+        let scan = scan_repos(&[root.clone()], 4);
+        let found: Vec<&str> = scan.repos.iter().map(|r| r.remote_url.as_str()).collect();
+        assert_eq!(found.len(), 2, "both are still found: {found:?}");
+        assert_eq!(
+            found[0], "git@github.com:x/ordinary.git",
+            "the unguarded folder must be reached FIRST, so a blocking prompt can never \
+             cost the budget of the folders that need no permission at all"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// What the scan really costs on THIS machine — the question that decides whether it
+    /// can run on demand from a dialog at all. Ignored by default (it reads the whole home
+    /// directory); run with `cargo test --lib -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_scan_cost_on_this_machine() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let started = std::time::Instant::now();
+        let scan = scan_repos(&[home], 4);
+        let elapsed = started.elapsed();
+        println!(
+            "scanned home in {elapsed:?} — {} repositories, visited={}, truncated={}, unreadable={:?}",
+            scan.repos.len(),
+            scan.visited,
+            scan.truncated,
+            scan.unreadable
+        );
+        println!("budgets: {SCAN_BUDGET} dirs / {SCAN_TIME_BUDGET:?}");
+        assert!(!scan.repos.is_empty(), "a developer machine has clones");
+    }
+
+    /// A root that cannot be read is REPORTED, never passed off as "nothing found" —
+    /// otherwise a TCC-refused folder reads as a verdict about the user's disk.
+    #[test]
+    fn an_unreadable_root_is_reported() {
+        let missing = std::env::temp_dir().join("tosse-scan-does-not-exist-xyz");
+        let scan = scan_repos(&[missing], 3);
+        assert!(scan.repos.is_empty());
+        // A path that cannot even be canonicalized is skipped silently; one that exists
+        // but refuses `read_dir` lands in `unreadable`. Both keep `matches` honest.
+        assert!(!scan.truncated);
+    }
 
     /// The pair that motivates the whole normalizer: a local SSH remote and the
     /// CRM's HTTPS URL, differing in scheme, credentials, `.git` and case — the

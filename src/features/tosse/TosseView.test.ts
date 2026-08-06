@@ -62,6 +62,11 @@ vi.mock("../../ipc/useTosse", () => ({
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),
   useTosseWebUrl: () => ({ data: "https://tosse.example", error: null }),
+  // Lot 3's launch path: these tests are about the board, so the folder resolution has
+  // nothing to answer with — which is also the honest state before any pin is made.
+  useTosseProjectRepos: () => ({ data: [] }),
+  useTosseRepoLinks: () => ({ data: undefined }),
+  useLinkTosseProjectRepo: () => mutation(),
 }));
 
 // The opener plugin has no Tauri host under vitest.
@@ -113,7 +118,7 @@ afterEach(() => {
 });
 
 function render() {
-  act(() => root.render(createElement(TosseView)));
+  act(() => root.render(createElement(TosseView, { onOpenConversation: () => {} })));
 }
 
 /** Drive a real status change: click the row's status dot, then the menu entry.

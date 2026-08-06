@@ -9,10 +9,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
 import type {
+  LocalRepoScan,
   Result,
   TosseAccountStatus,
   TosseBacklogTask,
   TosseBriefing,
+  TosseProjectRepo,
   TosseRepoLink,
   TosseRepoLinksPayload,
   TosseTask,
@@ -20,7 +22,7 @@ import type {
 } from "./client";
 import { accountStatusKey } from "./useAccounts";
 import { applyStatusToBoard } from "../features/tosse/tosseModel";
-import { useConversationsStore } from "../store/conversationsStore";
+import { refreshLinkedTaskMeta, useConversationsStore } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
@@ -156,6 +158,61 @@ export function useLinkTosseRepository() {
   });
 }
 
+export const localRepoScanKey = (urls: string[]) =>
+  ["local-repo-scan", [...urls].sort().join("|")] as const;
+
+/**
+ * The clones of a project's repositories ALREADY on this Mac — including the ones Flight
+ * Deck has never been told about.
+ *
+ * This is what turns "no folder is associated with this project" from a dead end into a
+ * one-click answer: the repository is usually cloned, it was simply never added to the app.
+ *
+ * Local and on demand: it only runs when a dialog actually needs a folder (`enabled`), and
+ * it reads `.git/config` rather than spawning git per folder — MEASURED at ~19 ms for a
+ * whole home directory. `staleTime` is long because clones do not appear by the minute.
+ */
+export function useLocalRepoScan(urls: string[], enabled: boolean) {
+  return useQuery<LocalRepoScan>({
+    queryKey: localRepoScanKey(urls),
+    enabled: enabled && urls.length > 0,
+    queryFn: () => unwrap(commands.scanLocalGitRepos(urls)),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+export const tosseProjectReposKey = ["tosse-project-repos"] as const;
+
+/**
+ * Which local folder each TOSSE project's work happens in, as the user pinned it.
+ *
+ * Local data (SQLite), so this never touches the network and stays valid offline — it is
+ * what lets "Start" work on a task whose project was already answered for, whatever the
+ * CRM is doing. One shared query for the whole view; there are a handful of rows.
+ */
+export function useTosseProjectRepos(enabled = true) {
+  return useQuery<TosseProjectRepo[]>({
+    queryKey: tosseProjectReposKey,
+    enabled,
+    queryFn: () => unwrap(commands.tosseProjectRepos()),
+    // Only this app writes them, and the mutation below invalidates on success.
+    staleTime: Infinity,
+  });
+}
+
+/** Pin a TOSSE project to a local folder, or forget the pin with `null`. */
+export function useLinkTosseProjectRepo() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { projectId: string; repoId: string | null }): Promise<null> =>
+      unwrap(commands.tosseLinkProjectRepo(v.projectId, v.repoId)),
+    // Success only: a refused write must leave the displayed folder alone rather than
+    // flicker to one the database never stored.
+    onSuccess: () => qc.invalidateQueries({ queryKey: tosseProjectReposKey }),
+  });
+}
+
 // ── Tasks view ──────────────────────────────────────────────────────────────────────
 
 export const tosseBriefingKey = ["tosse-briefing"] as const;
@@ -178,7 +235,20 @@ export function useTosseBriefing(enabled = true) {
     enabled,
     queryFn: async () => {
       try {
-        return await unwrap(commands.tosseBriefing());
+        const briefing = await unwrap(commands.tosseBriefing());
+        // The CRM was just read, so this is the moment to re-stamp the title + status
+        // every LINKED conversation keeps its own copy of. Done here rather than in a
+        // component effect because the answer belongs to the fetch, not to whichever
+        // view happens to be mounted: the delete warning reads that copy, and it must
+        // not go stale just because the tasks view was never opened this run.
+        refreshLinkedTaskMeta(
+          [...briefing.projects.flatMap((p) => p.tasks), ...briefing.generalTasks].map((t) => ({
+            id: t.id,
+            title: t.title,
+            status: t.status,
+          })),
+        );
+        return briefing;
       } catch (e) {
         // A session that died between two refreshes has to reach the CONNECTION state, or
         // the tab stays up over a board it can no longer load: every retry fails the same

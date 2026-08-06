@@ -10,7 +10,9 @@
 // only when a row is opened. Writes are optimistic with a whole-board rollback, and a
 // refused write says why — see `useTosse`.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
+import { Dot, Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
+import { agentStatusToDot } from "../../agent/status";
+import { useAgentStatus } from "../../agent/useAgentStatus";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { Splitter } from "../editor/Splitter";
 import { useSettingsUi } from "../../store/settingsUi";
@@ -29,9 +31,14 @@ import {
 } from "../../ipc/useTosse";
 import { AssigneeAvatar, splitMcpActor } from "./AssigneeAvatar";
 import { ClientAvatar } from "./ClientAvatar";
+import { ProjectFolderChip } from "./ProjectFolderChip";
+import { TaskLaunchProvider, useTaskLaunch } from "./TaskLaunch";
+import { launchTask } from "./taskPrompts";
+import type { LaunchMode } from "./taskConversation";
+import { useConversationsForTask, type Conversation } from "../../store/conversationsStore";
 import { useTosseFold } from "../../store/tosseFold";
 
-import type { TosseProject, TosseTask } from "../../ipc/client";
+import type { TosseProject, TosseTask, TosseTaskDetail } from "../../ipc/client";
 import {
   briefingTotals,
   groupBacklogByProject,
@@ -146,6 +153,8 @@ function MiniRing({ done, total }: { done: number; total: number }) {
 function BacklogSection({
   foldKey,
   tasks,
+  projectId,
+  projectName,
   selectedTaskId,
   onOpenTask,
   onStatus,
@@ -153,6 +162,9 @@ function BacklogSection({
 }: {
   foldKey: string;
   tasks: TosseTask[];
+  /** The card's project — what a launch from one of these rows resolves its folder from. */
+  projectId: string | null;
+  projectName: string | null;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
   onStatus: (task: TosseTask, status: string) => void;
@@ -182,6 +194,8 @@ function BacklogSection({
             <div key={task.id}>
               <TaskRow
                 task={task}
+                projectId={projectId}
+                projectName={projectName}
                 selected={task.id === selectedTaskId}
                 onOpen={() => onOpenTask(task.id)}
                 onStatus={(status) => onStatus(task, status)}
@@ -196,16 +210,250 @@ function BacklogSection({
   );
 }
 
+/**
+ * What you can do with a task from here: open a conversation it already has, and start
+ * another one.
+ *
+ * Both, deliberately. An earlier version hid "Start" as soon as one conversation existed —
+ * "one task, one agent" — but a task legitimately gets a second pass: a retry after a
+ * rewind, a second opinion, a discussion alongside the work. Reopening stays the FIRST
+ * offer (it is what you usually want, and it is what stops an accidental double-click from
+ * spawning a twin), while starting another is one button further along.
+ */
+function TaskActions({
+  task,
+  projectId,
+  projectName,
+  detail,
+  className,
+}: {
+  task: TosseTask;
+  projectId: string | null;
+  projectName: string | null;
+  /** The open detail panel's payload, when this row is the one being read: its
+   *  long-form fields ride along in the "Discuss" prompt instead of being re-fetched. */
+  detail?: TosseTaskDetail | null;
+  className?: string;
+}) {
+  const api = useTaskLaunch();
+  const linked = useConversationsForTask(task.id);
+  if (!api) return null;
+  const busy = api.busyTaskId === task.id;
+  const built = () => launchTask(task, projectName, detail);
+  const go = (mode: LaunchMode) => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    api.launch(built(), projectId, mode);
+  };
+  return (
+    <span className={className}>
+      {/* One conversation: a plain button. Several: the same button plus a menu to pick
+          which — the count is on it, so the row says how many agents this task carries
+          without being hovered for a tooltip. */}
+      {linked.length === 1 ? (
+        <button
+          className={`${s.act} ${s.act_go}`}
+          title={`Open « ${linked[0].name} »`}
+          onClick={(e) => {
+            e.stopPropagation();
+            api.open(linked[0].id);
+          }}
+        >
+          <Ico name="chat" className="sm" />
+          Open
+        </button>
+      ) : linked.length > 1 ? (
+        <Menu
+          portal
+          trigger={
+            <button
+              className={`${s.act} ${s.act_go}`}
+              title={`${linked.length} conversations on this task`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Ico name="chat" className="sm" />
+              Open {linked.length}
+            </button>
+          }
+        >
+          {linked.map((c) => (
+            <MenuItem key={c.id} icon="chat" onClick={() => api.open(c.id)}>
+              {c.name}
+            </MenuItem>
+          ))}
+        </Menu>
+      ) : null}
+      <button
+        className={s.act}
+        disabled={busy}
+        title={
+          linked.length > 0
+            ? "Open ANOTHER conversation that thinks this task through, without starting it"
+            : "Open a conversation that thinks this task through, without starting it"
+        }
+        onClick={go("discuss")}
+      >
+        Discuss
+      </button>
+      {/* A split button: "Start" runs it, the caret adds a word about HOW this particular
+          run should go. Always "Start", whether or not the task already has a conversation
+          — what the button does never changes, so its label should not either. */}
+      <span className={s.split}>
+        <button
+          className={`${s.act} ${s.act_go} ${s.splitMain}`}
+          disabled={busy}
+          title={
+            linked.length > 0
+              ? "Start another conversation on this task and hand it to the pickup skill"
+              : "Open a conversation on this task and hand it to the pickup skill"
+          }
+          onClick={go("pickup")}
+        >
+          {busy ? "Opening…" : "Start"}
+        </button>
+        <Menu
+          portal
+          align="right"
+          trigger={
+            <button
+              className={`${s.act} ${s.act_go} ${s.splitCaret}`}
+              disabled={busy}
+              title="Start with an extra instruction"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Ico name="chevron" className="sm" />
+            </button>
+          }
+        >
+          <StartWithNote onStart={(note) => api.launch(built(), projectId, "pickup", note)} />
+        </Menu>
+      </span>
+    </span>
+  );
+}
+
+/**
+ * The Start button's drop-down: one instruction for THIS run, on top of what the pickup
+ * skill already does ("plan first", "don't touch the CSS", "start with the tests").
+ *
+ * Deliberately not a second dialog — it is a sentence, and a modal for a sentence is the
+ * kind of friction that makes people stop using the button at all.
+ */
+function StartWithNote({ onStart }: { onStart: (note: string) => void }) {
+  const [note, setNote] = useState("");
+  const ref = useRef<HTMLTextAreaElement>(null);
+  // ⚠️ Focused on the NEXT FRAME, not at mount. The menu renders its popover
+  // `visibility: hidden` and only positions it in a layout effect — and a hidden element
+  // cannot take focus, so both `autoFocus` and a plain mount effect silently did nothing
+  // and the caret stayed on the button. This drop-down exists to type one sentence; the
+  // caret has to be in the field when it appears.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => ref.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, []);
+  const send = () => {
+    const trimmed = note.trim();
+    if (trimmed) onStart(trimmed);
+  };
+  return (
+    <div className={s.noteBox}>
+      <div className={s.noteLabel}>Extra instruction for this run</div>
+      <textarea
+        ref={ref}
+        className={s.noteInput}
+        rows={3}
+        // ⚠️ The menu closes on ANY click inside its popover — that is how a MenuItem
+        // dismisses it. Without this, clicking into the field tore the field away (and
+        // the click landed on the row underneath, opening the task). Stopped HERE only:
+        // the "Start with this" button below still propagates, so pressing it both
+        // launches and closes the menu, which is what it should do.
+        onClick={(e) => e.stopPropagation()}
+        value={note}
+        placeholder="e.g. plan it out first, don't touch the CSS…"
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => {
+          // ⌘↵ sends, like the composer. A bare ↵ writes a newline.
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
+        }}
+      />
+      <button className={`${s.act} ${s.act_go} ${s.noteGo}`} disabled={!note.trim()} onClick={send}>
+        Start with this
+      </button>
+    </div>
+  );
+}
+
+/** Every conversation opened on a task, with its agent's live state. Rendered in the
+ *  detail panel; nothing at all when the task has none. */
+function TaskConversations({ taskId }: { taskId: string }) {
+  const api = useTaskLaunch();
+  const convs = useConversationsForTask(taskId);
+  if (convs.length === 0) return null;
+  return (
+    <section>
+      <div className={s.detailKey}>Conversations {convs.length}</div>
+      {convs.map((c) => (
+        <button
+          key={c.id}
+          className={s.convRow}
+          title={`Open « ${c.name} »`}
+          onClick={() => api?.open(c.id)}
+        >
+          <ConvStateDot convId={c.id} />
+          <span className={s.convName}>{c.name}</span>
+          <Ico name="arrow" className={`sm ${s.convGo}`} />
+        </button>
+      ))}
+    </section>
+  );
+}
+
+/** The agent's live state for one conversation — its own hook, so a row re-renders on its
+ *  own state rather than the whole list on any of them. */
+function ConvStateDot({ convId }: { convId: string }) {
+  const status = useAgentStatus(convId);
+  return <Dot s={agentStatusToDot(status)} pulse />;
+}
+
+/**
+ * "Someone is already on this" — the smallest mark that answers it, visible at rest.
+ *
+ * Deliberately just the glyph (and a count past one): the AGENT's state belongs to the
+ * conversation surfaces, and a second coloured dot on a row that already carries the CRM's
+ * own status would read as a contradiction. Everything else is in the tooltip.
+ */
+function LinkedMark({ convs }: { convs: Conversation[] }) {
+  if (convs.length === 0) return null;
+  return (
+    <span
+      className={s.linked}
+      title={
+        convs.length === 1
+          ? `« ${convs[0].name} » is on this task`
+          : `${convs.length} conversations on this task`
+      }
+    >
+      <Ico name="chat" className="sm" />
+      {convs.length > 1 ? convs.length : null}
+    </span>
+  );
+}
+
 /** A task row. The status dot is the write surface: click it, pick a status. NOT a drag —
  *  dragging means "manual order" everywhere else in this app, and a mis-drop here would
  *  write to the CRM. */
 function TaskRow({
   task,
+  projectId,
+  projectName,
   selected,
   onOpen,
   onStatus,
 }: {
   task: TosseTask;
+  /** The project this row's card belongs to — how the launch resolves a folder. Null in
+   *  the project-less band, where the dialog asks for one. */
+  projectId: string | null;
+  projectName: string | null;
   selected: boolean;
   onOpen: () => void;
   onStatus: (status: string) => void;
@@ -213,14 +461,26 @@ function TaskRow({
   const tone = STATUS_TONE[task.status] ?? "todo";
   const due = shortDate(task.dueDate);
   const late = isOverdue(task.dueDate, Date.now());
+  const linked = useConversationsForTask(task.id);
   return (
     <div
       className={`${s.row} ${selected ? s.rowSel : ""}`}
       data-tone={tone}
-      onClick={onOpen}
+      // ⚠️ Both handlers ignore anything that did not happen INSIDE this row's DOM.
+      // React bubbles events through the COMPONENT tree, so a popover this row opens in a
+      // portal (the Start button's instruction field) sends its clicks and keystrokes
+      // here too: clicking that field opened the task underneath, and typing a space in
+      // it opened the task AND swallowed the space (`preventDefault` below). The portal's
+      // node is not a DOM descendant, so `contains` rejects it — the same guard the
+      // Flight Deck card uses for its own portalled popovers.
+      onClick={(e) => {
+        if (!e.currentTarget.contains(e.target as Node)) return;
+        onOpen();
+      }}
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
+        if (!e.currentTarget.contains(e.target as Node)) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onOpen();
@@ -263,8 +523,17 @@ function TaskRow({
           {task.subtaskDone}/{task.subtaskCount}
         </span>
       ) : null}
+      <LinkedMark convs={linked} />
       {task.assignedTo ? <AssigneeAvatar name={task.assignedTo} /> : null}
       {due ? <span className={`${s.due} ${late ? s.dueLate : ""}`}>{due}</span> : null}
+      {/* Revealed on hover, at the end of the row — the row's own click still opens the
+          task, so these must not sit in the way of it. */}
+      <TaskActions
+        task={task}
+        projectId={projectId}
+        projectName={projectName}
+        className={s.rowActs}
+      />
     </div>
   );
 }
@@ -361,12 +630,17 @@ function useTaskWriteErrors() {
  */
 function StatusSections({
   sections,
+  projectId,
+  projectName,
   selectedTaskId,
   onOpenTask,
   onStatus,
   writeErrors,
 }: {
   sections: StatusSection[];
+  /** The card's project — what a launch from one of these rows resolves its folder from. */
+  projectId: string | null;
+  projectName: string | null;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
   onStatus: (task: TosseTask, status: string) => void;
@@ -395,6 +669,8 @@ function StatusSections({
             <div key={task.id}>
               <TaskRow
                 task={task}
+                projectId={projectId}
+                projectName={projectName}
                 selected={task.id === selectedTaskId}
                 onOpen={() => onOpenTask(task.id)}
                 onStatus={(status) => onStatus(task, status)}
@@ -463,6 +739,9 @@ function ProjectCard({
           </div>
         </div>
         <div className={s.cardTools}>
+          {/* Where this project's work happens on this Mac — stated, and re-pickable.
+              An association decided once inside a dialog would otherwise be invisible. */}
+          <ProjectFolderChip projectId={project.id} projectName={project.name} />
           {project.taskCount > 0 ? (
             <ProgressRing done={project.taskDone} total={project.taskCount} />
           ) : null}
@@ -501,6 +780,8 @@ function ProjectCard({
           <div className={s.cardRule} />
           <StatusSections
             sections={sections}
+            projectId={project.id}
+            projectName={project.name}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
             writeErrors={taskErrors.errors}
@@ -517,6 +798,8 @@ function ProjectCard({
           <BacklogSection
             foldKey={backlogKey(project.id)}
             tasks={backlog}
+            projectId={project.id}
+            projectName={project.name}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
             writeErrors={taskErrors.errors}
@@ -571,15 +854,24 @@ function stateClass(status: string | null): string {
   }
 }
 
-/** The detail panel: the CRM's task panel, trimmed to what this app can act on. */
-function TaskDetail({
+/**
+ * The detail panel: the CRM's task panel, trimmed to what this app can act on.
+ *
+ * Exported because the conversation's side region shows the SAME panel — a task read from
+ * a conversation and a task read from the board must not be two different screens. There it
+ * is `embedded`: the host owns the width, so the panel drops its own sizing and border.
+ */
+export function TaskDetail({
   taskId,
   width,
   onClose,
+  embedded,
 }: {
   taskId: string;
-  width: number;
+  /** Ignored when `embedded` — the side region sizes the panel itself. */
+  width?: number;
   onClose: () => void;
+  embedded?: boolean;
 }) {
   const { data, isLoading, error } = useTosseTaskDetail(taskId);
   const setTaskStatus = useSetTosseTaskStatus();
@@ -610,8 +902,8 @@ function TaskDetail({
 
   return (
     <aside
-      className={s.detail}
-      style={{ "--tosse-detail-w": `${width}px` } as React.CSSProperties}
+      className={`${s.detail} ${embedded ? s.detailEmbedded : ""}`}
+      style={embedded ? undefined : ({ "--tosse-detail-w": `${width}px` } as React.CSSProperties)}
     >
       <div className={s.detailHead}>
         <div className={s.detailKicker}>
@@ -695,6 +987,13 @@ function TaskDetail({
           </section>
         ) : null}
 
+        {/* The conversations this task carries, HIGH in the panel — ahead of the prose,
+            because "is someone already on this, and can I jump in?" is what you come here
+            to answer first. Their dot is the AGENT's live state (the app's own language),
+            which is why it sits inside a chat row rather than next to the task's own CRM
+            status above. */}
+        <TaskConversations taskId={taskId} />
+
         {/* The task's BODY. It was fetched, crossed the IPC and was then dropped on the
             floor — so a task whose description lives in `content` (the CRM's long-form
             field, distinct from the one-line `notes`) opened onto an empty panel and read as
@@ -757,10 +1056,19 @@ function TaskDetail({
         ) : null}
       </div>
 
-      {/* Lot 3 wires "Discuss" and "Start" here — the space is reserved, not faked: an
-          inert button that looks live would be worse than none. */}
       <div className={s.detailFoot}>
-        <div className={s.muted}>Discuss / Start land here (lot 3).</div>
+        {/* The same two buttons as the row, with the panel's own payload: its long-form
+            fields (description, notes, context) are already on screen, so "Discuss"
+            pastes them into the prompt instead of making the agent fetch them back. */}
+        {data ? (
+          <TaskActions
+            task={data.task}
+            projectId={data.projectId}
+            projectName={data.projectName}
+            detail={data}
+            className={s.detailActs}
+          />
+        ) : null}
         <span className={s.spacer} />
         {/* Said ONCE, here, rather than on every card that would have carried a link: the
             title/priority/assignee edits this view doesn't do all point at TOSSE, so an
@@ -840,9 +1148,25 @@ function ClientBand({
   );
 }
 
-export function TosseView() {
+export function TosseView({
+  onOpenConversation,
+}: {
+  /** Hand over to the conversation a launch just opened (or reopened). */
+  onOpenConversation: (convId: string) => void;
+}) {
+  // The provider owns "Start"/"Discuss" for every row and panel below it — one place
+  // that knows the folder rules, the `/pickup` guard and the one-task-one-agent rule.
+  return (
+    <TaskLaunchProvider onOpenConversation={onOpenConversation}>
+      <TosseBoard />
+    </TaskLaunchProvider>
+  );
+}
+
+function TosseBoard() {
   const { data, isLoading, isFetching, error, refetch, dataUpdatedAt } = useTosseBriefing();
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+
   const bodyRef = useRef<HTMLDivElement>(null);
   const detailWidth = useTosseDetail((d) => d.width);
   const setDetailWidth = useTosseDetail((d) => d.setWidth);
@@ -1030,6 +1354,8 @@ function GeneralTaskBand({
         <div className={s.card}>
           <StatusSections
             sections={sections}
+            projectId={null}
+            projectName={null}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
             writeErrors={taskErrors.errors}
@@ -1046,6 +1372,8 @@ function GeneralTaskBand({
           <BacklogSection
             foldKey={backlogKey(GENERAL_FOLD_KEY)}
             tasks={backlog}
+            projectId={null}
+            projectName={null}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
             writeErrors={taskErrors.errors}

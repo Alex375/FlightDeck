@@ -54,6 +54,7 @@ export function TosseSection() {
 function TosseDisplayPrefs() {
   const tosseRepoBadge = useDisplay((d) => d.tosseRepoBadge);
   const tosseTasksView = useDisplay((d) => d.tosseTasksView);
+  const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
   const set = useDisplay((d) => d.set);
   return (
     <SettingsGroup title="In the app" icon="list">
@@ -84,6 +85,22 @@ function TosseDisplayPrefs() {
         checked={tosseTasksView}
         onChange={(v) => set({ tosseTasksView: v })}
         label="Show the TOSSE tasks view"
+      />
+      <ToggleRow
+        title="Warn before deleting a linked conversation"
+        hint={
+          <>
+            Deleting a conversation is normally one click (⌘Z undoes it). This asks first
+            when the conversation is the one opened on a task that is{" "}
+            <strong>« En cours »</strong> or <strong>« Review »</strong>.{" "}
+            <strong>On by default.</strong> Off → those delete like any other. The task
+            itself is never changed either way, and a <em>running</em> conversation still
+            asks — that warning is about stopping a live session, not about TOSSE.
+          </>
+        }
+        checked={tosseTaskDeleteWarning}
+        onChange={(v) => set({ tosseTaskDeleteWarning: v })}
+        label="Warn when deleting a conversation linked to an active task"
       />
     </SettingsGroup>
   );

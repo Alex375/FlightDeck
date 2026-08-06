@@ -16,6 +16,7 @@ import { Splitter } from "../editor/Splitter";
 import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
 import { SidePanel } from "./SidePanel";
 import { ArtifactViewer } from "./ArtifactViewer";
+import { TaskDetail } from "../tosse/TosseView";
 import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
@@ -113,6 +114,8 @@ function MainArea({
   const setEditorFraction = useEditorStore((s) => s.setEditorFraction);
   const artifactView = useEditorStore((s) => s.artifactView);
   const closeArtifact = useEditorStore((s) => s.closeArtifact);
+  const tosseTaskView = useEditorStore((s) => s.tosseTaskView);
+  const closeTosseTask = useEditorStore((s) => s.closeTosseTask);
   const liveState = useSessionState(conv.id);
   const cwd = effectiveCwd(conv, liveState);
   const areaRef = useRef<HTMLDivElement>(null);
@@ -120,7 +123,10 @@ function MainArea({
   // The artifact viewer takes over the side region (for THIS conversation) while set; the side
   // region otherwise shows when the editor or terminal is open.
   const showArtifact = !!artifactView && artifactView.convId === conv.id;
-  const sideOpen = open || terminalOpen || showArtifact;
+  // The TOSSE task panel shares the artifact viewer's contract: it takes over the side
+  // region for THIS conversation, and holds that region open on its own.
+  const showTosseTask = !!tosseTaskView && tosseTaskView.convId === conv.id;
+  const sideOpen = open || terminalOpen || showArtifact || showTosseTask;
 
   // Git mode takes over the whole area with its own 2x2 workspace (conversation
   // minimized top-left, diff top-right, history + files strip at the bottom),
@@ -194,7 +200,16 @@ function MainArea({
               display: "flex",
             }}
           >
-            {showArtifact && artifactView ? (
+            {showTosseTask && tosseTaskView ? (
+              // Keyed by task id so switching tasks remounts the panel (it replays its
+              // section cascade), as the board's own panel does.
+              <TaskDetail
+                key={tosseTaskView.taskId}
+                taskId={tosseTaskView.taskId}
+                onClose={closeTosseTask}
+                embedded
+              />
+            ) : showArtifact && artifactView ? (
               <ArtifactViewer view={artifactView} onClose={closeArtifact} />
             ) : (
               <SidePanel convId={conv.id} cwd={cwd} sideBySide={sideBySide} />

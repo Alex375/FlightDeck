@@ -691,6 +691,36 @@
 }
 .dueLate { color: var(--wf-err); }
 
+/* ---- "Start" / "Discuss" on a row ------------------------------------- */
+/* Revealed on row hover, like the sidebar's own row tools. `display: none` → `inline-flex`
+   rather than an opacity fade with reserved space: the title flexes, so the buttons take
+   their room from IT when they appear, and the row never reflows the parts that matter
+   (dot, priority, title start). Keyboard focus reveals them too — a control that only
+   exists under a pointer is unreachable otherwise. */
+.rowActs {
+  display: none;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+.row:hover .rowActs,
+.rowActs:focus-within {
+  display: inline-flex;
+  animation: actsIn 0.12s ease-out;
+}
+@keyframes actsIn {
+  from { opacity: 0; transform: translateX(3px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* In the detail panel's foot the same buttons are permanent: that panel IS the place you
+   decide from, so hiding them until hover would be a riddle. */
+.detailActs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .rowError {
   font-size: 11.5px;
   color: #f3aeb4;
@@ -1027,4 +1057,125 @@
   .band {
     transition: none;
   }
+}
+
+/* The same panel, hosted by the conversation's side region instead of the board: the host
+   owns the width there, so the panel stops asserting one (and drops the left border the
+   side region already draws). */
+.detailEmbedded {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  border-left: none;
+}
+
+/* ---- conversations on a task (detail panel) --------------------------- */
+/* One row per agent working the task. Same shape as the subtask rows just below, so the
+   panel reads as one list of things you can act on rather than two designs. */
+.convRow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  margin: 0 -8px;
+  border: none;
+  border-radius: var(--wf-r-l);
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.convRow:hover {
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+}
+.convName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.convGo {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.convRow:hover .convGo {
+  opacity: 0.6;
+}
+
+/* ---- "Start" as a split button ---------------------------------------- */
+/* The main action and its drop-down read as ONE control: they share a border, and only
+   the hairline between them says there are two hit areas. */
+.split {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.splitMain {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right-color: transparent;
+}
+.splitCaret {
+  padding: 0 5px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid color-mix(in srgb, #cfd8fb 22%, transparent);
+}
+
+/* The drop-down's body: a sentence, not a form. */
+.noteBox {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  width: 300px;
+}
+.noteLabel {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+}
+.noteInput {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.noteInput:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--wf-tosse-accent) 55%, var(--wf-line));
+}
+.noteGo {
+  align-self: flex-end;
+}
+
+/* ---- "a conversation is on this task" --------------------------------- */
+/* The quietest possible mark: the chat glyph, plus a count when there is more than one.
+   No colour of its own — the row already carries the CRM's status dot, and a second
+   coloured signal would read as a second, contradicting verdict. */
+.linked {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wf-tx-xlo);
 }

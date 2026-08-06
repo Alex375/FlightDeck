@@ -16,6 +16,7 @@ import { CaffeinateHost } from "./features/power/CaffeinateHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
+import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
 import { useTosseConnection } from "./ipc/useTosse";
 import { useExtensionsUi } from "./features/extensions/extensionsUiStore";
 import { HistoryPanel } from "./features/history/HistoryPanel";
@@ -35,7 +36,6 @@ import {
   bootConversations,
   createConversationInRepo,
   groupConversationsByRepo,
-  repoName,
   useActiveConversationId,
   useConversationRepo,
   useConversations,
@@ -44,7 +44,7 @@ import {
 import { useDisplay, resolveCleanOutput } from "./store/display";
 import { useNotifications } from "./store/notifications";
 import { useSettingsUi } from "./store/settingsUi";
-import { NavBtn, Tag, TosseCrmMark, Win } from "./ui/kit";
+import { NavBtn, TosseCrmMark, Win } from "./ui/kit";
 import {
   ACTION_BINDINGS,
   isEditableTarget,
@@ -326,6 +326,21 @@ export default function App() {
           <CaffeinateToggle />
           {view === "conversation" && activeRepo ? (
             <>
+              {/* Which TOSSE task this conversation carries. Only for a conversation
+                  started from the tasks view; a click goes back to it. */}
+              {active && tosseAvailable ? (
+                <TosseTaskChip
+                  conv={active}
+                  // Reads in the side panel rather than switching views: you are working IN
+                  // this conversation, and going to look at the task should not take the
+                  // conversation off screen.
+                  onOpen={() =>
+                    useEditorStore
+                      .getState()
+                      .openTosseTask({ convId: active.id, taskId: active.tosseTaskId! })
+                  }
+                />
+              ) : null}
               {active ? <WorktreeIndicator conv={active} repoPath={activeRepo.path} /> : null}
               {active ? <StreamControl key={active.id} conv={active} /> : null}
               {active ? <EditorToggle /> : null}
@@ -338,9 +353,6 @@ export default function App() {
                   backend={active.kind}
                 />
               ) : null}
-              <Tag icon="folder" title={activeRepo.path}>
-                {repoName(activeRepo.path)}
-              </Tag>
             </>
           ) : null}
         </>
@@ -349,7 +361,7 @@ export default function App() {
       {view === "conversation" ? (
         <ConductorConversation active={active} />
       ) : view === "tosse" ? (
-        <TosseView />
+        <TosseView onOpenConversation={openConversation} />
       ) : (
         <FlightDeck onOpen={openConversation} />
       )}

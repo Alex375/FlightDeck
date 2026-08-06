@@ -436,6 +436,56 @@ async tosseLinkRepository(repoId: string, repositoryId: string | null) : Promise
 }
 },
 /**
+ * Which local folder each TOSSE project's work happens in, as the user pinned it.
+ * 
+ * Local only, and deliberately so: the CRM holds no field for a machine path, and a
+ * path on this Mac would mean nothing on a colleague's. Read as a whole — there are a
+ * handful of pins at most, and the tasks view needs all of them to resolve any task.
+ */
+async tosseProjectRepos() : Promise<Result<TosseProjectRepo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_project_repos") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pin a TOSSE project to a local folder, or forget the pin with `None`.
+ * 
+ * Keyed by PROJECT, not by task: every task of a project is worked on in the same
+ * folder, so the question is asked once and the answer reused. Always reversible from
+ * the project's card.
+ */
+async tosseLinkProjectRepo(projectId: string, repoId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_link_project_repo", { projectId, repoId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Find the clones already on this Mac whose `origin` matches one of `urls`.
+ * 
+ * The caller passes the CRM urls of the project's repositories — they are already in the
+ * front's cached payload, so this needs no network of its own and stays a pure local
+ * question. Only MATCHES come back: the app has no business shipping an inventory of
+ * every repository on the disk to the webview.
+ * 
+ * Measured on a real home directory: ~130 ms for 49 repositories. Cheap because it reads
+ * `.git/config` instead of spawning `git` per folder, and never descends into a
+ * repository or a dependency tree. Runs off the async runtime all the same.
+ */
+async scanLocalGitRepos(urls: string[]) : Promise<Result<LocalRepoScan, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("scan_local_git_repos", { urls }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
  * 
  * The CRM assembles this shape for its own Briefing page — active projects with their
@@ -2279,7 +2329,26 @@ clean_output: boolean | null;
  * part of the derived `AgentStatus` (see the front's `agent/status.ts`), the
  * single thing that, when off, can't be re-derived from the on-disk transcript.
  */
-pending_reminder: string | null }
+pending_reminder: string | null; 
+/**
+ * The TOSSE task this conversation was opened on, when it was started from the
+ * tasks view ("Start" / "Discuss"). `None` for every conversation created any
+ * other way — which is most of them, and stays the unchanged default.
+ * 
+ * It is what makes a second click REOPEN the conversation instead of starting a
+ * second agent on the same task.
+ */
+tosse_task_id: string | null; 
+/**
+ * The task's title and status AS THEY WERE when the link was made, refreshed
+ * whenever the CRM is reachable.
+ * 
+ * ⚠️ Denormalised on purpose. The id ALONE leaves a linked conversation mute
+ * offline — no title to name the task, and no status at all — while the delete
+ * warning is a function of precisely that status. Storing the id only would mean
+ * the warning silently stops warning the moment the network is down.
+ */
+tosse_task_title: string | null; tosse_task_status: string | null }
 /**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
@@ -2566,6 +2635,44 @@ data_base64: string; too_large: boolean; size: number;
  */
 mtime_ms: number | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * A clone found on this Mac that matches one of the urls asked about.
+ */
+export type LocalRepoMatch = { path: string; 
+/**
+ * The clone's own `origin`, so two same-named folders can be told apart.
+ */
+remoteUrl: string; 
+/**
+ * The url FROM THE CRM that this clone matched, verbatim as it was passed in.
+ * 
+ * Returned so the UI can name the repository ("matches « CRM_max »") by plain
+ * equality, instead of re-implementing url normalisation in TypeScript — that
+ * comparison has exactly one home, [`crate::git::normalize_remote_url`], and a second
+ * implementation would drift from it the first time either side gains a case.
+ */
+matchedUrl: string }
+/**
+ * The answer to "is this project's repository already cloned here?", INCLUDING what the
+ * scan could not do.
+ */
+export type LocalRepoScan = { matches: LocalRepoMatch[]; 
+/**
+ * The walk stopped on its budget rather than on running out of folders — so "no
+ * match" here means "not found in what we looked at", and the UI says so.
+ */
+truncated: boolean; 
+/**
+ * Folders macOS would not let us read (a privacy-guarded folder with no grant yet).
+ * Surfaced for the same reason: an empty result must never pass for a verdict.
+ */
+unreadable: string[]; 
+/**
+ * How much ground was actually covered. Reported so a truncated scan can say WHICH
+ * limit it hit — "stopped early" alone is a message neither the user nor we can act
+ * on, which is precisely how a blocked privacy prompt hid itself once.
+ */
+visited: number; elapsedMs: number }
 /**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
@@ -3149,6 +3256,24 @@ taskCount: number; taskDone: number }
  * repository↔project as N-N, so this is a list, and it can legitimately be empty.
  */
 export type TosseProjectRef = { id: string; name: string; status: string | null }
+/**
+ * A TOSSE project pinned to one of the app's local folders.
+ * 
+ * The CRM has no field for a machine path (and a path on this Mac would be
+ * meaningless on a colleague's), so the association only ever lives here. Keyed by
+ * the PROJECT rather than by the task: every task of a project resolves to the same
+ * working folder, so the question is asked once and answered for all of them.
+ */
+export type TosseProjectRepo = { 
+/**
+ * The CRM project id. Deliberately NOT a foreign key — it belongs to another
+ * system, so nothing local can enforce it.
+ */
+project_id: string; 
+/**
+ * FK to [`RepoRecord::id`] — the local folder. Cascades away with the repo.
+ */
+repo_id: string }
 /**
  * One local folder's relationship to TOSSE, as the UI shows it.
  */
