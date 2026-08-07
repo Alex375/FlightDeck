@@ -3,6 +3,7 @@ import { TodoBar } from "../todos/TodoBar";
 import { ConductorComposer, type ComposerHandle } from "./ConductorComposer";
 import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
+import { MessageMinimap } from "./MessageMinimap";
 import { FileMentionProvider } from "./FileMention";
 import { ReviewBar } from "./ReviewBar";
 import { AuthWarningBar } from "./AuthWarningBar";
@@ -62,6 +63,10 @@ export function ConversationPane({
     >
       {/* Floating "last message you sent" pin, pinned over the top of the thread. */}
       <LastMessagePin session={session} paneRef={paneRef} />
+      {/* Floating column of bars over the thread's right edge — one per message sent.
+          Mounted on EVERY surface that shows the thread (including the Flight Deck reply
+          modal): one navigation affordance, everywhere. */}
+      <MessageMinimap session={session} paneRef={paneRef} />
       {/* Provide the conversation id + live cwd so file mentions in the thread
           resolve + open in this conversation's editor. */}
       <FileMentionProvider convId={session} cwd={cwd} inert={inertMentions}>

@@ -13,10 +13,14 @@ import {
   isTrivialToSummarize,
   triggerLastMessageSummary,
   useLastMessageSummaryStore,
+  summaryKey,
+  cacheSummary,
 } from "./lastMessageSummary";
 
 const genMock = commands.generateMessageSummary as unknown as ReturnType<typeof vi.fn>;
 const valueOf = (id: string) => useLastMessageSummaryStore.getState().byConv[id];
+const cacheOf = (id: string) => useLastMessageSummaryStore.getState().cache[id] ?? {};
+const cachedFor = (id: string, text: string) => cacheOf(id)[summaryKey(text)];
 
 beforeEach(() => {
   genMock.mockClear();
@@ -109,5 +113,99 @@ describe("apply (seq gate)", () => {
     // After clear, the next send starts a fresh seq at 1 (a late seq-2 from before is dropped).
     useLastMessageSummaryStore.getState().apply("c1", "ghost", 2);
     expect(valueOf("c1")).toBeUndefined();
+  });
+});
+
+describe("summaryKey", () => {
+  it("is stable per text and differs between messages", () => {
+    expect(summaryKey("hello")).toBe(summaryKey("hello"));
+    expect(summaryKey("hello")).not.toBe(summaryKey("hello "));
+  });
+
+  it("never produces an all-digit key — that would reorder as an array index and break FIFO", () => {
+    // Object key ordering puts integer-like keys FIRST, in numeric order, which would
+    // silently corrupt the oldest-first eviction below.
+    for (let i = 0; i < 500; i++) expect(/^\d+$/.test(summaryKey("msg-" + i))).toBe(false);
+  });
+});
+
+describe("cacheSummary (pure, oldest-first eviction)", () => {
+  it("adds an entry without touching the other conversations", () => {
+    const next = cacheSummary({ other: { hX: "keep" } }, "c1", "hA", "summary A");
+    expect(next.c1).toEqual({ hA: "summary A" });
+    expect(next.other).toEqual({ hX: "keep" });
+  });
+
+  it("returns the SAME cache object when nothing changes (no needless write/re-render)", () => {
+    const cache = { c1: { hA: "summary A" } };
+    expect(cacheSummary(cache, "c1", "hA", "summary A")).toBe(cache);
+  });
+
+  it("evicts the OLDEST entries past the cap", () => {
+    let cache = {};
+    for (let i = 0; i < 205; i++) cache = cacheSummary(cache, "c1", "h" + i, "s" + i);
+    const keys = Object.keys((cache as Record<string, Record<string, string>>).c1);
+    expect(keys).toHaveLength(200);
+    expect(keys[0]).toBe("h5"); // h0…h4 evicted
+    expect(keys[keys.length - 1]).toBe("h204");
+  });
+
+  it("re-inserting an existing message refreshes its recency", () => {
+    let cache = cacheSummary({}, "c1", "hA", "first");
+    cache = cacheSummary(cache, "c1", "hB", "second");
+    cache = cacheSummary(cache, "c1", "hA", "first again");
+    expect(Object.keys(cache.c1)).toEqual(["hB", "hA"]);
+  });
+});
+
+describe("per-message summary cache (what the minimap reads)", () => {
+  it("files an arriving summary under the message it was generated for", () => {
+    const msg = "a long message that earns a real Haiku summary";
+    triggerLastMessageSummary("c1", "session-1", msg);
+    useLastMessageSummaryStore.getState().apply("c1", "Real summary", 1);
+    expect(cachedFor("c1", msg)).toBe("Real summary");
+  });
+
+  it("still caches a summary that arrives LATE, after a newer message superseded it", () => {
+    const first = "first long message that earns a real Haiku summary";
+    const second = "second long message that earns a real Haiku summary";
+    triggerLastMessageSummary("c1", "session-1", first);
+    triggerLastMessageSummary("c1", "session-1", second);
+    // Message #1's summary lands after #2 was sent. It is stale for the "last message"
+    // line, but it is still the correct summary for #1 — the minimap shows every message.
+    useLastMessageSummaryStore.getState().apply("c1", "Summary of #1", 1);
+    expect(valueOf("c1")).toBe(summaryPreview(second)); // display untouched
+    expect(cachedFor("c1", first)).toBe("Summary of #1"); // …but filed
+  });
+
+  it("cleans the summary before caching it (quotes the small model sometimes adds)", () => {
+    const msg = "another long message that earns a real Haiku summary";
+    triggerLastMessageSummary("c1", "session-1", msg);
+    useLastMessageSummaryStore.getState().apply("c1", '  "Quoted summary"  ', 1);
+    expect(cachedFor("c1", msg)).toBe("Quoted summary");
+  });
+
+  it("survives a reload — the whole point of persisting it", () => {
+    const msg = "a long message whose summary must outlive this run";
+    triggerLastMessageSummary("c1", "session-1", msg);
+    useLastMessageSummaryStore.getState().apply("c1", "Persisted summary", 1);
+    const raw = localStorage.getItem("tosse:msgsummaries");
+    expect(raw).toBeTruthy();
+    expect(JSON.parse(raw as string).c1[summaryKey(msg)]).toBe("Persisted summary");
+  });
+
+  it("clear() drops the conversation's cached summaries, from storage too", () => {
+    const msg = "a long message that earns a real Haiku summary";
+    triggerLastMessageSummary("c1", "session-1", msg);
+    useLastMessageSummaryStore.getState().apply("c1", "Doomed summary", 1);
+    useLastMessageSummaryStore.getState().clear("c1");
+    expect(cachedFor("c1", msg)).toBeUndefined();
+    expect(JSON.parse(localStorage.getItem("tosse:msgsummaries") as string).c1).toBeUndefined();
+  });
+
+  it("does not cache anything for a message that was never sent for generation", () => {
+    // A summary for an unknown seq (nothing pending) has no message to be filed under.
+    useLastMessageSummaryStore.getState().apply("c1", "Orphan summary", 99);
+    expect(cacheOf("c1")).toEqual({});
   });
 });

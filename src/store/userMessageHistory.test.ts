@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { selectUserMessageHistory, memoizedUserMessageHistory } from "./conversationStore";
+import {
+  selectUserMessageHistory,
+  memoizedUserMessageHistory,
+  selectUserMessageMarks,
+  memoizedUserMessageMarks,
+} from "./conversationStore";
 import type { SessionEntry, Turn, TimelineEntry } from "./types";
 
 function userTurn(id: string, text: string, parentToolUseId: string | null = null): Turn {
@@ -98,6 +103,88 @@ describe("selectUserMessageHistory", () => {
     expect(selectUserMessageHistory(e)).toEqual([]);
     // Same reference for the empty case (stable → no needless re-render).
     expect(selectUserMessageHistory(undefined)).toBe(selectUserMessageHistory(e));
+  });
+});
+
+describe("selectUserMessageMarks (minimap anchors)", () => {
+  it("carries each message's turn id, in timeline order", () => {
+    const e = entry([turnLine("u1"), turnLine("a1"), turnLine("u2")], {
+      u1: userTurn("u1", "first"),
+      a1: asstTurn("a1", "reply"),
+      u2: userTurn("u2", "second"),
+    });
+    expect(selectUserMessageMarks(e)).toEqual([
+      { id: "u1", text: "first" },
+      { id: "u2", text: "second" },
+    ]);
+  });
+
+  it("KEEPS consecutive duplicates — two identical sends are two places in the thread", () => {
+    const e = entry([turnLine("u1"), turnLine("u2")], {
+      u1: userTurn("u1", "ok"),
+      u2: userTurn("u2", "ok"),
+    });
+    // The history collapses them (shell recall); the minimap must not, or the second
+    // bubble would have no bar and be unreachable.
+    expect(selectUserMessageHistory(e)).toEqual(["ok"]);
+    expect(selectUserMessageMarks(e).map((m) => m.id)).toEqual(["u1", "u2"]);
+  });
+
+  it("keeps an IMAGE-ONLY send (it is a bubble) while the history drops it", () => {
+    const imgTurn = { ...userTurn("u2", ""), images: [{ data: "x", mediaType: "image/png" }] };
+    const e = entry([turnLine("u1"), turnLine("u2")], {
+      u1: userTurn("u1", "look at this"),
+      u2: imgTurn as unknown as Turn,
+    });
+    expect(selectUserMessageMarks(e).map((m) => m.id)).toEqual(["u1", "u2"]);
+    // Nothing to recall into the composer for an image-only turn.
+    expect(selectUserMessageHistory(e)).toEqual(["look at this"]);
+  });
+
+  it("applies the same exclusions as the history (sub-agent turns, injected markers, blanks)", () => {
+    const notif = "<task-notification>\n<status>completed</status>\n</task-notification>";
+    const e = entry(
+      [turnLine("u1"), turnLine("sub"), turnLine("tn"), turnLine("blank")],
+      {
+        u1: userTurn("u1", "real"),
+        sub: userTurn("sub", "tool injected", "toolu_1"),
+        tn: userTurn("tn", notif),
+        blank: userTurn("blank", "   "),
+      },
+    );
+    expect(selectUserMessageMarks(e).map((m) => m.id)).toEqual(["u1"]);
+  });
+
+  it("returns a shared empty array when there is nothing to map", () => {
+    expect(selectUserMessageMarks(undefined)).toEqual([]);
+    const e = entry([turnLine("a1")], { a1: asstTurn("a1", "only assistant") });
+    expect(selectUserMessageMarks(e)).toBe(selectUserMessageMarks(undefined));
+  });
+});
+
+describe("memoizedUserMessageMarks (timeline-identity memo)", () => {
+  it("keeps the SAME array reference across a streamed token", () => {
+    const timeline = [turnLine("u1"), turnLine("u2")];
+    const turns = { u1: userTurn("u1", "a"), u2: userTurn("u2", "b") };
+    const r1 = memoizedUserMessageMarks("mm-1", entry(timeline, turns));
+    // New entry + new turns map, same timeline reference — the marks are OBJECTS, so a
+    // re-walk here would re-render the minimap on every token.
+    const r2 = memoizedUserMessageMarks(
+      "mm-1",
+      entry(timeline, { ...turns, a1: asstTurn("a1", "streaming…") }),
+    );
+    expect(r2).toBe(r1);
+  });
+
+  it("recomputes when a message is appended", () => {
+    const t1 = [turnLine("u1")];
+    const r1 = memoizedUserMessageMarks("mm-2", entry(t1, { u1: userTurn("u1", "a") }));
+    const r2 = memoizedUserMessageMarks(
+      "mm-2",
+      entry([...t1, turnLine("u2")], { u1: userTurn("u1", "a"), u2: userTurn("u2", "b") }),
+    );
+    expect(r2).not.toBe(r1);
+    expect(r2.map((m) => m.id)).toEqual(["u1", "u2"]);
   });
 });
 
