@@ -98,20 +98,22 @@ export interface DisplayPrefs {
   /** Fetch a client's mark from Google's favicon service when the CRM holds no uploaded
    *  logo for it.
    *
-   *  ⚠️ **OFF by default, and that default is the point.** Turning it on sends every such
-   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP to
+   *  ⚠️ **ON by default since 2026-08-07, reversing the default it shipped with.** What it
+   *  sends has not changed and is still the reason this is a SWITCH at all: every such
+   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP go to
    *  `google.com/s2/favicons`, one request per client shown.
    *
    *  It is not the app's only call to that service ({@link webResultFaviconUrl} resolves
-   *  one per web-search result chip, and always has). What is different here is the
-   *  DATA, which is why only this one is a choice: a search result is a public site the
-   *  model just visited, whereas these domains are who Tosse works for. The CRM's own web
-   *  page resolves them the same way, so switching this on only matches what the browser
-   *  already does — but a desktop app that sits open all day should not make that call on
-   *  the strength of a default nobody chose.
+   *  one per web-search result chip, and always has). What is different here is the DATA:
+   *  a search result is a public site the model just visited, whereas these domains are
+   *  who Tosse works for. The CRM's own web page resolves them the same way, so the app is
+   *  matching a call the browser already makes for the same person looking at the same
+   *  list — which is what settled the default: shipped off, the marks looked broken (they
+   *  read as "the logos don't work"), and the privacy question stays answerable by one
+   *  visible toggle in Settings → TOSSE.
    *
    *  Off → the cascade stops at the CRM's uploaded logo, then the client's initials on a
-   *  colour derived from its name (no network, and already what most clients show).
+   *  colour derived from its name (no network at all).
    *  Read by {@link ClientAvatar}. */
   tosseClientFavicons: boolean;
 
@@ -191,8 +193,10 @@ const DEFAULTS: DisplayPrefs = {
   tosseRepoBadge: true,
   tosseTasksView: true,
   tosseTaskDeleteWarning: true,
-  // OFF: the only preference here that sends CRM data to a third party (see its doc).
-  tosseClientFavicons: false,
+  // ON, though it is the only preference here that sends CRM data to a third party: the
+  // CRM's own page makes the same call for the same person, and off, the marks read as
+  // broken rather than as a choice. Switchable in Settings → TOSSE (see its doc).
+  tosseClientFavicons: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
