@@ -52,6 +52,7 @@ import type {
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
+  SessionPermissionResolvedEvent,
   SessionRemoteControlEvent,
   SessionStatePayload,
   SessionStateEvent,
@@ -130,6 +131,11 @@ class MockEmitter<T> {
 
 const sessionMessageEvent = new MockEmitter<SessionMessageEvent>();
 const sessionPermissionEvent = new MockEmitter<SessionPermissionEvent>();
+// Never emitted by a scenario (nothing withdraws a mock permission), but it MUST exist:
+// `useGlobalSessionEvents` attaches every listener at App mount, so a missing emitter is
+// `undefined.listen()` — which takes the whole app down in the browser mock, not just the
+// events it carries. Any event added to `bindings.ts` has to be mirrored here.
+const sessionPermissionResolvedEvent = new MockEmitter<SessionPermissionResolvedEvent>();
 const sessionStateEvent = new MockEmitter<SessionStateEvent>();
 const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
@@ -157,6 +163,7 @@ const terminalExitEvent = new MockEmitter<TerminalExitEvent>();
 export const mockEvents = {
   sessionMessageEvent,
   sessionPermissionEvent,
+  sessionPermissionResolvedEvent,
   sessionStateEvent,
   sessionCommandsEvent,
   sessionTaskEvent,
