@@ -12,7 +12,14 @@ vi.mock("../ipc/client", () => ({
 vi.mock("./sound", () => ({ playChime: vi.fn() }));
 
 import type { AgentNotification } from "./notify";
-import { dispatchAgentNotification, noteInterrupt, initNotifications } from "./notify";
+import {
+  armAgentNotification,
+  armedAgentNotificationKind,
+  cancelAgentNotification,
+  dispatchAgentNotification,
+  noteInterrupt,
+  initNotifications,
+} from "./notify";
 import { playChime } from "./sound";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { commands } from "../ipc/client";
@@ -162,5 +169,79 @@ describe("dispatchAgentNotification — interrupt window", () => {
     vi.setSystemTime(20_000);
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" }));
     expect(playChime).toHaveBeenCalledOnce();
+  });
+});
+
+// The settle window: a state edge ARMS a notification, and the conversation has a
+// short grace period to disprove it before the user hears anything. This table only
+// holds the timers — the policy that cancels lives in transition.ts.
+describe("armAgentNotification — settle window", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    cancelAgentNotification("c1");
+    cancelAgentNotification("c2");
+    vi.useRealTimers();
+  });
+
+  it("fires only once the delay has elapsed", () => {
+    const fire = vi.fn();
+    armAgentNotification("c1", "done", 3_000, fire);
+    vi.advanceTimersByTime(2_999);
+    expect(fire).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fire).toHaveBeenCalledOnce();
+  });
+
+  it("cancelling before the delay keeps it silent — the resumed-turn case", () => {
+    const fire = vi.fn();
+    armAgentNotification("c1", "done", 3_000, fire);
+    cancelAgentNotification("c1");
+    vi.advanceTimersByTime(10_000);
+    expect(fire).not.toHaveBeenCalled();
+  });
+
+  it("exposes what is armed, so the caller can re-check it", () => {
+    expect(armedAgentNotificationKind("c1")).toBeNull();
+    armAgentNotification("c1", "attention", 1_000, vi.fn());
+    expect(armedAgentNotificationKind("c1")).toBe("attention");
+    vi.advanceTimersByTime(1_000);
+    expect(armedAgentNotificationKind("c1")).toBeNull(); // cleared once delivered
+  });
+
+  it("a newer edge replaces the armed one — only the latest fires", () => {
+    const stale = vi.fn();
+    const fresh = vi.fn();
+    armAgentNotification("c1", "done", 3_000, stale);
+    vi.advanceTimersByTime(500);
+    armAgentNotification("c1", "attention", 1_000, fresh);
+    vi.advanceTimersByTime(10_000);
+    expect(stale).not.toHaveBeenCalled();
+    expect(fresh).toHaveBeenCalledOnce();
+  });
+
+  it("is per conversation — cancelling one leaves the other armed", () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    armAgentNotification("c1", "done", 3_000, a);
+    armAgentNotification("c2", "done", 3_000, b);
+    cancelAgentNotification("c1");
+    vi.advanceTimersByTime(3_000);
+    expect(a).not.toHaveBeenCalled();
+    expect(b).toHaveBeenCalledOnce();
+  });
+
+  it("cancelling nothing is a no-op", () => {
+    expect(() => cancelAgentNotification("nope")).not.toThrow();
+  });
+
+  it("the fired callback may arm again (the entry is already dropped)", () => {
+    const second = vi.fn();
+    armAgentNotification("c1", "done", 1_000, () =>
+      armAgentNotification("c1", "done", 1_000, second),
+    );
+    vi.advanceTimersByTime(1_000);
+    expect(armedAgentNotificationKind("c1")).toBe("done");
+    vi.advanceTimersByTime(1_000);
+    expect(second).toHaveBeenCalledOnce();
   });
 });

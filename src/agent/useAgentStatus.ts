@@ -11,7 +11,7 @@ import { useConversationStore } from "../store/conversationStore";
 import { useConversationsStore } from "../store/conversationsStore";
 import { useRunningTaskCount, useRunningBashTaskCount } from "../store/backgroundTasksStore";
 import { useDisplay } from "../store/display";
-import type { SessionEntry } from "../store/types";
+import type { SessionEntry, TurnResultMeta } from "../store/types";
 import {
   deriveAgentStatus,
   type AgentSignals,
@@ -65,15 +65,26 @@ function lastAssistantText(entry: SessionEntry): string | null {
   return null;
 }
 
-/** subtype + is_error of the most recent finished turn (its turn_result). */
-function lastTurnOutcome(entry: SessionEntry): { subtype: string | null; isError: boolean } {
+/**
+ * Metadata of the most recent finished turn (its turn_result), or null when the
+ * session has none yet. Scans the timeline tail backwards, so it visits only a few
+ * entries in practice. Shared with the notification router, which reads `numTurns`
+ * off it to tell a real completion from a local command the CLI answered itself.
+ */
+export function lastTurnResultMeta(entry: SessionEntry): TurnResultMeta | null {
   for (let i = entry.timeline.length - 1; i >= 0; i--) {
     const e = entry.timeline[i];
     if (e.kind !== "turn_result") continue;
     const meta = entry.turnResults[e.id];
-    if (meta) return { subtype: meta.subtype, isError: meta.isError };
+    if (meta) return meta;
   }
-  return { subtype: null, isError: false };
+  return null;
+}
+
+/** subtype + is_error of the most recent finished turn (its turn_result). */
+function lastTurnOutcome(entry: SessionEntry): { subtype: string | null; isError: boolean } {
+  const meta = lastTurnResultMeta(entry);
+  return { subtype: meta?.subtype ?? null, isError: meta?.isError ?? false };
 }
 
 /** Flatten a session entry into the shallow-stable signal slice. The timeline
