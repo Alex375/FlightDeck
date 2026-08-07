@@ -212,25 +212,56 @@ describe("ACTION_BINDINGS / SHORTCUT_GROUPS", () => {
     }
   });
 
-  it("answers the zoom chords on QWERTY, AZERTY and the numeric keypad", () => {
+  it("answers the zoom chords on a US layout", () => {
     const bind = (e: ChordEvent) => ACTION_BINDINGS.find((b) => matchChord(e, b.spec))?.action;
-    // QWERTY: "=" bare and "+" (Shift+Equal) both zoom in; "-" is on `Minus`.
+    // "=" bare and "+" (Shift+Equal) both zoom in; "-" and "_" both zoom out.
     expect(bind(chord({ metaKey: true, code: "Equal", key: "=" }))).toBe("zoom-in");
     expect(bind(chord({ metaKey: true, shiftKey: true, code: "Equal", key: "+" }))).toBe("zoom-in");
     expect(bind(chord({ metaKey: true, code: "Minus", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Minus", key: "_" }))).toBe("zoom-out");
     expect(bind(chord({ metaKey: true, code: "Digit0", key: "0" }))).toBe("zoom-reset");
-    // AZERTY: "-" is the DIGIT-6 key, and the digits need Shift — so `code` alone would miss
-    // zoom-out entirely and zoom-reset whenever the user reads the key by its printed "0".
-    expect(bind(chord({ metaKey: true, code: "Digit6", key: "-" }))).toBe("zoom-out");
-    expect(bind(chord({ metaKey: true, code: "Digit0", key: "à" }))).toBe("zoom-reset");
-    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Digit0", key: "0" }))).toBe("zoom-reset");
-    // Numeric keypad, on every layout.
-    expect(bind(chord({ metaKey: true, code: "NumpadAdd", key: "+" }))).toBe("zoom-in");
-    expect(bind(chord({ metaKey: true, code: "NumpadSubtract", key: "-" }))).toBe("zoom-out");
-    expect(bind(chord({ metaKey: true, code: "Numpad0", key: "0" }))).toBe("zoom-reset");
     // Still ⌘-gated, and Alt still disqualifies.
     expect(bind(chord({ code: "Equal", key: "=" }))).toBeUndefined();
     expect(bind(chord({ metaKey: true, altKey: true, code: "Equal", key: "=" }))).toBeUndefined();
+  });
+
+  it("answers them on a FRENCH APPLE layout, where the punctuation codes lie", () => {
+    // Regression: the shipped-then-fixed bug. On this layout the key PRINTED "-" reports
+    // `code: "Equal"` (QWERTY's "=" position) and "=" lives on `Slash` — so binding the
+    // main row by `code` made ⌘- zoom IN (zoom-in is tested first) and left the user with
+    // no way to zoom out at all, while ⌘= matched nothing.
+    const bind = (e: ChordEvent) => ACTION_BINDINGS.find((b) => matchChord(e, b.spec))?.action;
+    expect(bind(chord({ metaKey: true, code: "Equal", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Equal", key: "_" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, code: "Slash", key: "=" }))).toBe("zoom-in");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Slash", key: "+" }))).toBe("zoom-in");
+    // ⌘0 works both ways: the key printed "0" (which types "à" unshifted here), and the
+    // shifted digit the user actually reads as zero.
+    expect(bind(chord({ metaKey: true, code: "Digit0", key: "à" }))).toBe("zoom-reset");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Digit0", key: "0" }))).toBe("zoom-reset");
+    // The ")" key (`code: "Minus"` here) must NOT be a zoom chord — it is not printed with
+    // any zoom symbol, so it would fire on a keystroke the user never meant as one.
+    expect(bind(chord({ metaKey: true, code: "Minus", key: ")" }))).toBeUndefined();
+  });
+
+  it("answers the zoom chords on the numeric keypad", () => {
+    const bind = (e: ChordEvent) => ACTION_BINDINGS.find((b) => matchChord(e, b.spec))?.action;
+    expect(bind(chord({ metaKey: true, code: "NumpadAdd", key: "+" }))).toBe("zoom-in");
+    expect(bind(chord({ metaKey: true, code: "NumpadSubtract", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, code: "Numpad0", key: "0" }))).toBe("zoom-reset");
+  });
+
+  it("binds no main-row punctuation by PHYSICAL code (the layout trap)", () => {
+    // The guard that keeps the fix from being undone: a `code` on the main row names a
+    // QWERTY position that carries a different character elsewhere, so a zoom chord must
+    // never claim one. Only the keypad (stable symbols) and the digit row may.
+    const MAIN_ROW_PUNCTUATION = ["Equal", "Minus", "Slash", "Backslash", "Semicolon", "Quote", "Comma", "Period", "Backquote", "BracketLeft", "BracketRight"];
+    for (const b of ACTION_BINDINGS) {
+      const codes = b.spec.codes ?? (b.spec.code ? [b.spec.code] : []);
+      for (const code of codes) {
+        expect(MAIN_ROW_PUNCTUATION, `${b.action} binds ${code} positionally`).not.toContain(code);
+      }
+    }
   });
 
   it("leaves the view chords alone (⌘1/⌘2/⌘3 are not zoom keys)", () => {
