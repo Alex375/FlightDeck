@@ -55,6 +55,7 @@ export function TosseSection() {
 function TosseDisplayPrefs() {
   const tosseRepoBadge = useDisplay((d) => d.tosseRepoBadge);
   const tosseTasksView = useDisplay((d) => d.tosseTasksView);
+  const tosseStartStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
   const tosseClientFavicons = useDisplay((d) => d.tosseClientFavicons);
   const set = useDisplay((d) => d.set);
@@ -87,6 +88,22 @@ function TosseDisplayPrefs() {
         checked={tosseTasksView}
         onChange={(v) => set({ tosseTasksView: v })}
         label="Show the TOSSE tasks view"
+      />
+      <ToggleRow
+        title="Stay on the tasks view when you press Start"
+        hint={
+          <>
+            <strong>Start</strong> opens a conversation on the task and hands it to the
+            pickup skill. <strong>On by default</strong> — the window stays here, so you can
+            keep reading and start the next one; the task row gains an{" "}
+            <strong>« Open »</strong> button to go to it whenever you want. Off → the window
+            switches to the new conversation. <strong>Discuss</strong> always switches, either
+            way: you asked it something, so the answer is what you want to see.
+          </>
+        }
+        checked={tosseStartStaysOnTasks}
+        onChange={(v) => set({ tosseStartStaysOnTasks: v })}
+        label="Stay on the tasks view after Start"
       />
       <ToggleRow
         title="Warn before deleting a linked conversation"

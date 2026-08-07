@@ -1,9 +1,10 @@
 // "Start" and "Discuss" — turning a TOSSE task into a conversation.
 //
 // One provider owns the whole gesture (resolve the folder, ask what has to be asked,
-// send, navigate) and every task row / detail panel reaches it through context, rather
-// than each row carrying its own copy of the queries and the rules. That is what keeps
-// the two buttons meaning the same thing wherever they are pressed.
+// send, and decide whether to navigate) and every task row / detail panel reaches it
+// through context, rather than each row carrying its own copy of the queries and the
+// rules. That is what keeps the two buttons meaning the same thing wherever they are
+// pressed — including the last step, which is NOT the same for both: see `handOff`.
 //
 // The dialog is deliberately NOT always shown. A project whose folder is already known
 // and whose repo has the `/pickup` skill starts in one click — "ask once, then remember"
@@ -18,7 +19,8 @@ import { create } from "zustand";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { repoName, useConversationsStore, useRepos } from "../../store/conversationsStore";
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
-import { launchTaskConversation, type LaunchMode } from "./taskConversation";
+import { launchFocusesConversation, launchTaskConversation, type LaunchMode } from "./taskConversation";
+import { useDisplay } from "../../store/display";
 import { resolveTaskFolder } from "./taskFolder";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
@@ -74,7 +76,8 @@ export function TaskLaunchProvider({
   onOpenConversation,
   children,
 }: {
-  /** Focus the conversation once it is open — the tasks view hands over to the thread. */
+  /** Focus a conversation — the tasks view hands over to the thread. Called for "Open",
+   *  and after a launch only when that launch focuses (see `handOff`). */
   onOpenConversation: (convId: string) => void;
   children: React.ReactNode;
 }) {
@@ -86,6 +89,16 @@ export function TaskLaunchProvider({
   const { data: pins } = useTosseProjectRepos();
   const { data: links } = useTosseRepoLinks();
   const repos = useRepos();
+  const startStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
+
+  // Every successful launch ends here — the one-click path AND the dialog's — so the
+  // "does the window move" decision is taken in ONE place, whichever route got there.
+  const handOff = useCallback(
+    (mode: LaunchMode, convId: string) => {
+      if (launchFocusesConversation(mode, startStaysOnTasks)) onOpenConversation(convId);
+    },
+    [onOpenConversation, startStaysOnTasks],
+  );
 
   const launch = useCallback(
     (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => {
@@ -110,11 +123,11 @@ export function TaskLaunchProvider({
       }
       setBusyTaskId(task.id);
       void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
-        .then((out) => onOpenConversation(out.convId))
+        .then((out) => handOff(mode, out.convId))
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
-    [links, onOpenConversation, openDialog, pins, repos],
+    [handOff, links, openDialog, pins, repos],
   );
 
   const open = useCallback(
@@ -156,7 +169,7 @@ export function TaskLaunchProvider({
           key={`${pending.task.id}:${pending.mode}`}
           pending={pending}
           onClose={closeDialog}
-          onOpenConversation={onOpenConversation}
+          onLaunched={(convId) => handOff(pending.mode, convId)}
         />
       ) : null}
     </Ctx.Provider>
@@ -167,11 +180,13 @@ export function TaskLaunchProvider({
 function TaskLaunchDialog({
   pending,
   onClose,
-  onOpenConversation,
+  onLaunched,
 }: {
   pending: Pending;
   onClose: () => void;
-  onOpenConversation: (id: string) => void;
+  /** The launch went through. Whether that also focuses the conversation is the
+   *  provider's call (see `handOff`) — the dialog only reports the outcome. */
+  onLaunched: (convId: string) => void;
 }) {
   const repos = useRepos();
   const { data: pins } = useTosseProjectRepos();
@@ -289,7 +304,7 @@ function TaskLaunchDialog({
         return;
       }
       onClose();
-      onOpenConversation(out.convId);
+      onLaunched(out.convId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSending(false);

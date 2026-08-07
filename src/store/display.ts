@@ -95,6 +95,19 @@ export interface DisplayPrefs {
    *  worse than no tab, per the feature's spec). Read by {@link App}. */
   tosseTasksView: boolean;
 
+  /** Keep the window on the TASKS view after pressing « Start » on a task — the conversation
+   *  opens and its first message goes out, but the app does not follow it. ON by default:
+   *  starting is a HAND-OFF (the agent picks the task up on its own), so being thrown into a
+   *  thread that has nothing to show yet only costs the place in the list one was reading.
+   *  Off → the window switches to the new conversation, as it did before.
+   *
+   *  Deliberately « Start » only. « Discuss » always hands over whatever this says: that
+   *  button exists to ASK something, and the answer is the point of pressing it.
+   *
+   *  Nothing is lost either way — the task row gains its « Open » button as soon as the
+   *  conversation is linked. Read via {@link launchFocusesConversation}. */
+  tosseStartStaysOnTasks: boolean;
+
   /** Fetch a client's mark from Google's favicon service when the CRM holds no uploaded
    *  logo for it.
    *
@@ -192,6 +205,7 @@ const DEFAULTS: DisplayPrefs = {
   clickableFileMentions: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
+  tosseStartStaysOnTasks: true,
   tosseTaskDeleteWarning: true,
   // ON, though it is the only preference here that sends CRM data to a third party: the
   // CRM's own page makes the same call for the same person, and off, the marks read as
@@ -251,6 +265,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,

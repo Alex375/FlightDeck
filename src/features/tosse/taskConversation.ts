@@ -26,6 +26,23 @@ import {
 /** Which button was pressed. See `taskLaunch` for what each one means. */
 export type LaunchMode = "pickup" | "discuss";
 
+/**
+ * Whether a successful launch should hand the WINDOW over to the new conversation.
+ *
+ * The two buttons are not the same gesture, so one preference cannot govern both:
+ *   - "Discuss" ALWAYS hands over — it exists to ask something, and the answer is the
+ *     point of pressing it. `startStaysOnTasks` deliberately has no say here.
+ *   - "Start" hands the task to the pickup skill and has nothing to show yet, so it
+ *     follows the preference (which defaults to staying, see `tosseStartStaysOnTasks`).
+ *
+ * Pure, because it is the whole product decision: the launch itself is identical either
+ * way (the conversation is created, linked and sent to regardless), and only this answers
+ * "does the window move".
+ */
+export function launchFocusesConversation(mode: LaunchMode, startStaysOnTasks: boolean): boolean {
+  return mode !== "pickup" || !startStaysOnTasks;
+}
+
 export interface LaunchRequest {
   task: LaunchTask;
   /** The local folder to open the conversation in — already resolved (or picked) by
