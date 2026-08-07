@@ -1200,6 +1200,34 @@ pub async fn load_workflow_journal(
     .map_err(|e| e.to_string())?
 }
 
+/// Start (or join) a live watch on a RUNNING workflow's journal. Each change pushes a
+/// `WorkflowJournalEvent` carrying the run's fresh per-agent progress, so the pinned bar, the
+/// inline card and the Flight Deck card stay live WITHOUT any of them polling. Ref-counted:
+/// every call must be paired with [`unwatch_workflow_journal`].
+#[tauri::command]
+#[specta::specta]
+pub fn watch_workflow_journal(
+    app: tauri::AppHandle,
+    watchers: tauri::State<'_, crate::supervisor::workflow_watch::WorkflowWatchers>,
+    session_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    watchers.watch(app, session_id, run_id);
+    Ok(())
+}
+
+/// Drop one reference to a run's journal watch (the last one stops it).
+#[tauri::command]
+#[specta::specta]
+pub fn unwatch_workflow_journal(
+    watchers: tauri::State<'_, crate::supervisor::workflow_watch::WorkflowWatchers>,
+    session_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    watchers.unwatch(&session_id, &run_id);
+    Ok(())
+}
+
 /// The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
 /// the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
 /// run. Empty if no script/phases. Lets the live overview show upcoming steps.

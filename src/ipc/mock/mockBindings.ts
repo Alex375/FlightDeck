@@ -76,12 +76,13 @@ import type {
   TickEvent,
   UsageError,
   WorkflowJournal,
+  WorkflowJournalEvent,
   WorkflowPhase,
   WorkflowRun,
   WorktreeInfo,
   WorktreeStatus,
 } from "../bindings";
-import { DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -154,6 +155,8 @@ const tickEvent = new MockEmitter<TickEvent>();
 // No real filesystem in the browser mock — these never fire, but must exist so
 // the editor's `useFsWatch` can subscribe without crashing.
 const fsChangeEvent = new MockEmitter<FsChangeEvent>();
+// Pushed by `watchWorkflowJournal` below, so the workflow demo exercises the live readout.
+const workflowJournalEvent = new MockEmitter<WorkflowJournalEvent>();
 const fsWatchErrorEvent = new MockEmitter<FsWatchErrorEvent>();
 // No real PTY in the browser mock — these never fire, but must exist so the
 // integrated terminal can subscribe without crashing.
@@ -176,6 +179,7 @@ export const mockEvents = {
   tickEvent,
   fsChangeEvent,
   fsWatchErrorEvent,
+  workflowJournalEvent,
   terminalOutputEvent,
   terminalExitEvent,
 };
@@ -1024,9 +1028,29 @@ export const mockCommands = {
     _sessionId: string,
     _runId: string,
   ): Promise<Result<WorkflowJournal | null, string>> {
-    // Live progress counts (the mid-run signal), kept consistent with the demo's 2 wire ticks
+    // Live per-agent progress (the mid-run signal), consistent with the demo's 2 wire ticks
     // (r-correctness done, r-perf running). Grows to "all done" once the run finishes.
-    return ok(isDemoWorkflowDone() ? { started: 3, done: 3 } : { started: 2, done: 1 });
+    return ok(demoWorkflowJournal());
+  },
+
+  async watchWorkflowJournal(sessionId: string, runId: string): Promise<Result<null, string>> {
+    // The real watcher pushes a snapshot as soon as it attaches; mirror that, or the mock's
+    // card and detail modal would sit at "starting…" forever (no filesystem in the browser).
+    setTimeout(
+      () =>
+        workflowJournalEvent.emit({
+          session_id: sessionId,
+          run_id: runId,
+          journal: demoWorkflowJournal(),
+          error: null,
+        }),
+      0,
+    );
+    return ok(null);
+  },
+
+  async unwatchWorkflowJournal(_sessionId: string, _runId: string): Promise<Result<null, string>> {
+    return ok(null);
   },
 
   async loadWorkflowPhases(

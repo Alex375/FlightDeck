@@ -14,6 +14,7 @@ import { Dot, Ico } from "../../ui/kit";
 import { useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
+import { useWorkflowJournal } from "../../store/workflowJournal";
 import { useToolResult } from "../../store/conversationStore";
 import type { BackgroundTask, BackgroundTaskKind } from "../../ipc/client";
 import { resolveAgentId, runIdFromResult, shortModel, taskStatusDot } from "../../agent/subagentMeta";
@@ -70,6 +71,9 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   // Per-phase live activity for the opened workflow (else the detail's live overview shows
   // every phase as "upcoming"). The hook is unconditional, so an empty task_id is safe.
   const openedLiveActivity = useWorkflowLive(convId, openTask?.task_id ?? "");
+  // Live per-agent progress of the opened run, pushed from its journal (unconditional hook —
+  // a null run id resolves to the shared empty view).
+  const openedJournal = useWorkflowJournal(convId, openedRunId);
 
   // Close the popover on Escape while it's open. This popover owns Escape while open, so
   // stopPropagation keeps an outer window-level modal (the Flight Deck reply modal) from
@@ -214,6 +218,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         workflowName={openTask?.label ?? null}
         currentProgress={openTask?.progress ?? null}
         liveActivity={openedLiveActivity}
+        journal={openedJournal}
         onClose={() => setOpenTask(null)}
       />
     </>

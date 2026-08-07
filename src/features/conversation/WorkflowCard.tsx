@@ -16,6 +16,7 @@ import { useTaskByToolUse } from "../../store/backgroundTasksStore";
 import { useToolResult } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
+import { journalTally, useWorkflowJournal } from "../../store/workflowJournal";
 import { Dot, Ico, RunDots } from "../../ui/kit";
 import { useIsCodex } from "./ConvMark";
 import { WorkflowDetail } from "./WorkflowDetail";
@@ -35,6 +36,9 @@ export function WorkflowCard({
     (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
   );
   const liveActivity = useWorkflowLive(session, task?.task_id ?? "");
+  // Live per-agent progress, pushed from the run's journal. Keyed by the run id parsed from the
+  // tool_result, so it is available whether or not the detail modal has ever been opened.
+  const journal = useWorkflowJournal(session, runIdFromResult(result?.content));
   const [open, setOpen] = useState(false);
   // Bloc A (Phase 4.5): defensive — `Workflow` is a Claude-only tool, so a Codex thread
   // never yields a workflow segment; guard anyway so a drifting classification can never
@@ -47,6 +51,11 @@ export function WorkflowCard({
   const running = task?.status === "running";
   // Current phase (running) from the wire's "<phase>: <label>".
   const phase = running && task?.progress ? task.progress.split(":")[0]?.trim() : null;
+  // The fleet behind that phase, worded exactly as the pinned bar words it (null until the run
+  // has an agent). `running` is passed because this card OUTLIVES the run: once settled, an
+  // unclosed journal entry no longer means "an agent is working" — the CLI does not guarantee
+  // a `result` line per agent, and a real run on disk ends 38-started / 0-result.
+  const tally = journalTally(journal, running);
 
   return (
     <div className="cv-tool">
@@ -62,6 +71,7 @@ export function WorkflowCard({
         <span className="cv-tool-m" title={name}>
           {name}
           {phase ? ` · ${phase}` : null}
+          {tally ? ` · ${tally}` : null}
         </span>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
           {running ? <RunDots /> : <Dot s={taskStatusDot(task?.status ?? "completed")} />}
@@ -77,6 +87,7 @@ export function WorkflowCard({
         workflowName={name}
         currentProgress={task?.progress ?? null}
         liveActivity={liveActivity}
+        journal={journal}
         onClose={() => setOpen(false)}
       />
     </div>

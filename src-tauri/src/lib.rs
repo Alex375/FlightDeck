@@ -23,6 +23,7 @@ use ipc::commands::{
     list_worktrees, load_persisted_state, load_session_context, load_session_goal,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
+    unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
     account_claude_logout, account_claude_status, account_codex_login_cancel,
@@ -55,6 +56,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
@@ -118,6 +120,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_subagent_transcript,
             load_workflow_run,
             load_workflow_journal,
+            watch_workflow_journal,
+            unwatch_workflow_journal,
             load_workflow_phases,
             list_disk_conversations,
             prime_history_index,
@@ -212,6 +216,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             AccountLoginEvent,
             FsChangeEvent,
             FsWatchErrorEvent,
+            WorkflowJournalEvent,
             TerminalOutputEvent,
             TerminalExitEvent,
         ])
@@ -450,6 +455,8 @@ pub fn run() {
         .manage(HistoryIndex::new())
         // The editor's single active filesystem watch (live file/tree refresh).
         .manage(fs::FsWatcher::new())
+        // Live watches on running workflows' journals (per-agent progress from disk).
+        .manage(supervisor::workflow_watch::WorkflowWatchers::new())
         // The live integrated terminals (one PTY-backed shell per conversation).
         .manage(terminal::Terminals::new())
         // The single app-wide macOS keep-awake assertion (managed `caffeinate` child).

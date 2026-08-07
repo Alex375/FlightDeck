@@ -13,6 +13,7 @@ import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
@@ -386,6 +387,9 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Mounted once, globally (render-null): one live disk watch per RUNNING workflow, so
+          every surface sees its real per-agent progress even with the detail modal closed. */}
+      <WorkflowWatchHost />
     </Win>
   );
 }

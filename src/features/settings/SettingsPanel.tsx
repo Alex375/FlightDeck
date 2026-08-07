@@ -234,6 +234,7 @@ function DisplayPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
@@ -280,6 +281,21 @@ function DisplayPrefs() {
         checked={showLastMessagePreview}
         onChange={(v) => set({ showLastMessagePreview: v })}
         label="Preview of the last sent message"
+      />
+      <ToggleRow
+        title="Live workflow on the Flight Deck card"
+        hint={
+          <>
+            While a <strong>workflow</strong> is running, shows its live progress on the card:
+            current phase, <strong>how many of its agents are working</strong>, and how far along
+            the run is — read from the run's own journal, so the counts are exact. The wire
+            reports a whole run as a single task, so without this the card only shows the
+            generic background-task chip. <strong>On by default.</strong>
+          </>
+        }
+        checked={workflowLiveCard}
+        onChange={(v) => set({ workflowLiveCard: v })}
+        label="Show live workflow progress on cards"
       />
       <ToggleRow
         title="Message controls"
