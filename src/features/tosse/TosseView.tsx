@@ -449,9 +449,25 @@ function ConvStateDot({ convId }: { convId: string }) {
  * Deliberately just the glyph (and a count past one): the AGENT's state belongs to the
  * conversation surfaces, and a second coloured dot on a row that already carries the CRM's
  * own status would read as a contradiction. Everything else is in the tooltip.
+ *
+ * For a few seconds after a "Start" that stayed on this view, the SAME chip says « Started »
+ * in words instead. The mark that this task is taken is exactly what the click produced, so
+ * it is the honest thing to announce with — and reusing the chip means the confirmation
+ * fades back into the row's resting state rather than being a second thing to dismiss.
  */
-function LinkedMark({ convs }: { convs: Conversation[] }) {
+function LinkedMark({ convs, justStarted }: { convs: Conversation[]; justStarted?: boolean }) {
   if (convs.length === 0) return null;
+  if (justStarted) {
+    return (
+      <span
+        className={`${s.linked} ${s.linkedStarted}`}
+        title={`« ${convs[convs.length - 1].name} » was just started on this task`}
+      >
+        <Ico name="check" className="sm" />
+        Started
+      </span>
+    );
+  }
   return (
     <span
       className={s.linked}
@@ -491,10 +507,15 @@ function TaskRow({
   const due = shortDate(task.dueDate);
   const late = isOverdue(task.dueDate, Date.now());
   const linked = useConversationsForTask(task.id);
+  // Set for a few seconds after a "Start" that stayed on this view — see `startedTaskIds`.
+  const justStarted = useTaskLaunch()?.startedTaskIds.has(task.id) === true;
   return (
     <div
       className={`${s.row} ${selected ? s.rowSel : ""}`}
       data-tone={tone}
+      // Drives the one-shot flash. An ATTRIBUTE rather than a class so the animation is
+      // restarted by React swapping it, and so it costs nothing at rest.
+      data-started={justStarted ? "" : undefined}
       // ⚠️ Both handlers ignore anything that did not happen INSIDE this row's DOM.
       // React bubbles events through the COMPONENT tree, so a popover this row opens in a
       // portal (the Start button's instruction field) sends its clicks and keystrokes
@@ -552,7 +573,7 @@ function TaskRow({
           {task.subtaskDone}/{task.subtaskCount}
         </span>
       ) : null}
-      <LinkedMark convs={linked} />
+      <LinkedMark convs={linked} justStarted={justStarted} />
       {task.assignedTo ? <AssigneeAvatar name={task.assignedTo} /> : null}
       {due ? <span className={`${s.due} ${late ? s.dueLate : ""}`}>{due}</span> : null}
       {/* Revealed on hover, at the end of the row — the row's own click still opens the
