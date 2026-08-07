@@ -12,6 +12,7 @@ import { useDisplay } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
+import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, formatZoom, nextZoom, prevZoom } from "../../ui/zoom";
 import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
@@ -231,6 +232,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
  *  clear. This is the default applied to conversations that haven't set their own choice;
  *  each conversation's composer chip can override it (per-conversation, persisted). */
 function DisplayPrefs() {
+  const uiZoom = useDisplay((s) => s.uiZoom);
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
@@ -239,6 +241,18 @@ function DisplayPrefs() {
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Display" icon="list">
+      <ToggleRow
+        title="Interface zoom"
+        hint={
+          <>
+            Scales the <strong>whole app</strong> — conversation, Flight Deck, editor and
+            terminal — like a browser's zoom. <strong>100% by default.</strong> Also on{" "}
+            <strong>⌘+</strong> / <strong>⌘−</strong>, and <strong>⌘0</strong> to come back
+            to 100%.
+          </>
+        }
+        control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+      />
       <ToggleRow
         title="Clean output (default)"
         hint={
@@ -311,6 +325,52 @@ function DisplayPrefs() {
         label="Make the filename on Read/Write rows clickable"
       />
     </SettingsGroup>
+  );
+}
+
+/** The zoom control of the "Interface zoom" row: −, the current percentage, +, and a Reset
+ *  back to 100%. Steps through the shared {@link ZOOM_STEPS} ladder, so clicking here and
+ *  pressing ⌘+ land on exactly the same levels.
+ *
+ *  Reset stays in place (disabled at 100%) rather than appearing only when zoomed: a button
+ *  that comes and goes would shift the row's layout on every step. The −/+ buttons disable at
+ *  the ends of the ladder for the same reason — the state is visible in the percentage next
+ *  to them, so nothing needs a tooltip a disabled control could never show. */
+function ZoomStepper({ zoom, onChange }: { zoom: number; onChange: (next: number) => void }) {
+  const atMin = zoom <= MIN_ZOOM;
+  const atMax = zoom >= MAX_ZOOM;
+  return (
+    <div className={styles.zoomCtl}>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(prevZoom(zoom))}
+        disabled={atMin}
+        aria-label="Zoom out"
+      >
+        −
+      </button>
+      <span className={styles.zoomVal} aria-live="polite">
+        {formatZoom(zoom)}
+      </span>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(nextZoom(zoom))}
+        disabled={atMax}
+        aria-label="Zoom in"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        className={styles.zoomReset}
+        onClick={() => onChange(DEFAULT_ZOOM)}
+        disabled={zoom === DEFAULT_ZOOM}
+      >
+        Reset
+      </button>
+    </div>
   );
 }
 

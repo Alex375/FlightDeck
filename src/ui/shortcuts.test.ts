@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ACTION_BINDINGS,
+  type ChordSpec,
   isEditableTarget,
   isSettingsChord,
   isSoundToggleChord,
@@ -33,6 +34,24 @@ function sev(p: Partial<SoundToggleChordEvent>): SoundToggleChordEvent {
 
 function cev(p: Partial<SettingsChordEvent>): SettingsChordEvent {
   return { key: ",", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...p };
+}
+
+/** Every keystroke a spec claims: one per listed code, one per listed key, ×(Shift on/off)
+ *  when the spec is shift-agnostic. Used to check bindings against each other by behaviour. */
+function keystrokesFor(spec: ChordSpec): ChordEvent[] {
+  const codes = spec.codes ?? (spec.code ? [spec.code] : []);
+  const keys = spec.keys ?? (spec.key ? [spec.key] : []);
+  const shifts = spec.shift === "any" ? [false, true] : [spec.shift ?? false];
+  const out: ChordEvent[] = [];
+  for (const shiftKey of shifts) {
+    for (const code of codes) {
+      out.push(chord({ metaKey: true, altKey: spec.alt ?? false, shiftKey, code }));
+    }
+    for (const key of keys) {
+      out.push(chord({ metaKey: true, altKey: spec.alt ?? false, shiftKey, key }));
+    }
+  }
+  return out;
 }
 
 describe("viewForShortcut", () => {
@@ -150,6 +169,27 @@ describe("matchChord", () => {
     expect(matchChord(chord({ metaKey: true, key: "g" }), { key: "g", shift: true })).toBe(false);
   });
 
+  it("matches ANY of `codes` / `keys`, and OR's the two", () => {
+    const spec = { codes: ["Equal", "NumpadAdd"], keys: ["+"] };
+    expect(matchChord(chord({ metaKey: true, code: "Equal" }), spec)).toBe(true);
+    expect(matchChord(chord({ metaKey: true, code: "NumpadAdd" }), spec)).toBe(true);
+    // key-only match: the physical code is something else entirely
+    expect(matchChord(chord({ metaKey: true, code: "Digit8", key: "+" }), spec)).toBe(true);
+    expect(matchChord(chord({ metaKey: true, code: "Digit8", key: "8" }), spec)).toBe(false);
+  });
+
+  it('ignores Shift only when asked to (shift: "any")', () => {
+    // ⌘+ is ⌘⇧= on a US layout and a bare ⌘= elsewhere — one chord, two shift states.
+    const zoomIn = { codes: ["Equal"], shift: "any" as const };
+    expect(matchChord(chord({ metaKey: true, code: "Equal" }), zoomIn)).toBe(true);
+    expect(matchChord(chord({ metaKey: true, shiftKey: true, code: "Equal" }), zoomIn)).toBe(true);
+    // …but Alt still disqualifies, and a shift-agnostic chord stays ⌘-gated
+    expect(matchChord(chord({ metaKey: true, altKey: true, code: "Equal" }), zoomIn)).toBe(false);
+    expect(matchChord(chord({ code: "Equal" }), zoomIn)).toBe(false);
+    // absent the opt-in, Shift is still matched exactly
+    expect(matchChord(chord({ metaKey: true, shiftKey: true, code: "Equal" }), { codes: ["Equal"] })).toBe(false);
+  });
+
   it("matches an arrow chord via the PHYSICAL code (⌘⌥↑ / ⌘⌥↓)", () => {
     expect(matchChord(chord({ metaKey: true, altKey: true, code: "ArrowUp" }), { code: "ArrowUp", alt: true })).toBe(true);
     expect(matchChord(chord({ metaKey: true, altKey: true, code: "ArrowDown" }), { code: "ArrowUp", alt: true })).toBe(false);
@@ -160,11 +200,45 @@ describe("matchChord", () => {
 
 describe("ACTION_BINDINGS / SHORTCUT_GROUPS", () => {
   it("has a unique chord per action (no two bindings collide)", () => {
-    const seen = new Set<string>();
+    // Compare on BEHAVIOUR, not on the spec's spelling: since a spec can list several codes
+    // and keys, two differently-written specs can still answer to the same keystroke — and
+    // the App handler runs the FIRST match, so a collision would silently shadow an action.
+    // We replay every keystroke each binding claims and require exactly one taker.
     for (const b of ACTION_BINDINGS) {
-      const sig = `${b.spec.key ?? ""}|${b.spec.code ?? ""}|${b.spec.shift ? "S" : ""}|${b.spec.alt ? "A" : ""}`;
-      expect(seen.has(sig), `duplicate chord for ${b.action}`).toBe(false);
-      seen.add(sig);
+      for (const e of keystrokesFor(b.spec)) {
+        const takers = ACTION_BINDINGS.filter((other) => matchChord(e, other.spec));
+        expect(takers.map((t) => t.action), `${b.action} on ${e.code || e.key}`).toEqual([b.action]);
+      }
+    }
+  });
+
+  it("answers the zoom chords on QWERTY, AZERTY and the numeric keypad", () => {
+    const bind = (e: ChordEvent) => ACTION_BINDINGS.find((b) => matchChord(e, b.spec))?.action;
+    // QWERTY: "=" bare and "+" (Shift+Equal) both zoom in; "-" is on `Minus`.
+    expect(bind(chord({ metaKey: true, code: "Equal", key: "=" }))).toBe("zoom-in");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Equal", key: "+" }))).toBe("zoom-in");
+    expect(bind(chord({ metaKey: true, code: "Minus", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, code: "Digit0", key: "0" }))).toBe("zoom-reset");
+    // AZERTY: "-" is the DIGIT-6 key, and the digits need Shift — so `code` alone would miss
+    // zoom-out entirely and zoom-reset whenever the user reads the key by its printed "0".
+    expect(bind(chord({ metaKey: true, code: "Digit6", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, code: "Digit0", key: "à" }))).toBe("zoom-reset");
+    expect(bind(chord({ metaKey: true, shiftKey: true, code: "Digit0", key: "0" }))).toBe("zoom-reset");
+    // Numeric keypad, on every layout.
+    expect(bind(chord({ metaKey: true, code: "NumpadAdd", key: "+" }))).toBe("zoom-in");
+    expect(bind(chord({ metaKey: true, code: "NumpadSubtract", key: "-" }))).toBe("zoom-out");
+    expect(bind(chord({ metaKey: true, code: "Numpad0", key: "0" }))).toBe("zoom-reset");
+    // Still ⌘-gated, and Alt still disqualifies.
+    expect(bind(chord({ code: "Equal", key: "=" }))).toBeUndefined();
+    expect(bind(chord({ metaKey: true, altKey: true, code: "Equal", key: "=" }))).toBeUndefined();
+  });
+
+  it("leaves the view chords alone (⌘1/⌘2/⌘3 are not zoom keys)", () => {
+    // ⌘0 sits one key away from ⌘1; a spec matching digits too loosely would eat the view
+    // switch, which the App handler resolves BEFORE this table.
+    for (const code of ["Digit1", "Digit2", "Digit3"]) {
+      const hit = ACTION_BINDINGS.find((b) => matchChord(chord({ metaKey: true, code }), b.spec));
+      expect(hit, `${code} must stay a view chord`).toBeUndefined();
     }
   });
 

@@ -1704,6 +1704,32 @@ pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+/// The widest zoom factor the webview will be asked for — the front's ladder
+/// (`src/ui/zoom.ts`) stays well inside this. These are a BACKSTOP, not the product
+/// range: `setPageZoom(0)` (or a NaN) would leave the window unreadable with no way
+/// back through the UI, so a nonsense factor is refused here rather than applied.
+const MIN_UI_ZOOM: f64 = 0.25;
+const MAX_UI_ZOOM: f64 = 4.0;
+
+/// Scale the whole interface by `factor` (1.0 = 100 %), the way a browser's ⌘+ does:
+/// this drives the OS webview's own page zoom (WKWebView `pageZoom` on macOS), so
+/// every pixel of the UI — thread, Flight Deck, Monaco, xterm, PDF viewer, popovers —
+/// scales together and each surface re-layouts from its own size observer.
+///
+/// The zoom is NOT persisted by the webview: the front holds it in its display prefs
+/// and re-applies it on mount (see `ZoomHost`). A no-op if the main window is gone.
+#[tauri::command]
+#[specta::specta]
+pub fn set_ui_zoom(app: tauri::AppHandle, factor: f64) -> Result<(), String> {
+    if !factor.is_finite() || !(MIN_UI_ZOOM..=MAX_UI_ZOOM).contains(&factor) {
+        return Err(format!("zoom factor out of range: {factor}"));
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(()); // window already closed — nothing to scale
+    };
+    window.set_zoom(factor).map_err(|e| e.to_string())
+}
+
 // ---- Git worktrees --------------------------------------------------------
 //
 // These commands are the front's single boundary to git worktree management.

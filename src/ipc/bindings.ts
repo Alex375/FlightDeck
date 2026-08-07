@@ -1662,6 +1662,23 @@ async setAwake(awake: boolean) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Scale the whole interface by `factor` (1.0 = 100 %), the way a browser's ⌘+ does:
+ * this drives the OS webview's own page zoom (WKWebView `pageZoom` on macOS), so
+ * every pixel of the UI — thread, Flight Deck, Monaco, xterm, PDF viewer, popovers —
+ * scales together and each surface re-layouts from its own size observer.
+ * 
+ * The zoom is NOT persisted by the webview: the front holds it in its display prefs
+ * and re-applies it on mount (see `ZoomHost`). A no-op if the main window is gone.
+ */
+async setUiZoom(factor: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_ui_zoom", { factor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read the Claude CLI (`claude` binary) update status: installed + latest published version,
  * whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
  * missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel

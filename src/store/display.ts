@@ -4,6 +4,7 @@
 // metadata store.
 import { create } from "zustand";
 import { useConversationsStore } from "./conversationsStore";
+import { DEFAULT_ZOOM, sanitizeZoom } from "../ui/zoom";
 
 const STORAGE_KEY = "tosse:display";
 
@@ -33,6 +34,16 @@ export interface DisplayPrefs {
   /** The Markdown rendering look, applied globally to every surface that renders
    *  Markdown. See {@link MarkdownMode}. Set from Settings → Conversation. */
   markdownMode: MarkdownMode;
+
+  /** How much the WHOLE interface is scaled — conversation, Flight Deck, editor, terminal,
+   *  popovers, everything — as a factor on the {@link ZOOM_STEPS} ladder (1 = 100 %, the
+   *  default). Set from Settings → General → Display, or from anywhere with ⌘+ / ⌘− / ⌘0.
+   *
+   *  Applied by the OS webview rather than by CSS (see `ui/zoom.ts` for why), so this value
+   *  is pushed to the Rust side by {@link ZoomHost} — nothing reads it to render with. It is
+   *  {@link sanitizeZoom}d on load AND on write: a corrupted entry that reached the webview
+   *  could leave the window unreadable with no way back through the UI. */
+  uiZoom: number;
 
   /** Show the "Fleet readout" banner (the adaptive "N Running · N Review · …" stage
    *  counts across the whole fleet) at the TOP of the FlightDeck. On by default. Set
@@ -184,6 +195,7 @@ export interface DisplayPrefs {
 const DEFAULTS: DisplayPrefs = {
   cleanOutput: false,
   markdownMode: "warm",
+  uiZoom: DEFAULT_ZOOM,
   fleetBannerFlightDeck: true,
   fleetBannerConversation: true,
   showTaskNotifications: false,
@@ -216,8 +228,11 @@ function load(): DisplayPrefs {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULTS;
     // Merge over defaults so a newly-added pref defaults sanely for users who already
-    // have a stored (older, smaller) prefs object.
-    return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<DisplayPrefs>) };
+    // have a stored (older, smaller) prefs object. The zoom is the one pref a bad stored
+    // value could make the app unusable with (see `sanitizeZoom`), so it is re-checked
+    // here rather than trusted from storage.
+    const stored = JSON.parse(raw) as Partial<DisplayPrefs>;
+    return { ...DEFAULTS, ...stored, uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM) };
   } catch {
     return DEFAULTS;
   }
@@ -243,6 +258,7 @@ export const useDisplay = create<DisplayState>((set) => ({
       const next: DisplayPrefs = {
         cleanOutput: patch.cleanOutput ?? s.cleanOutput,
         markdownMode: patch.markdownMode ?? s.markdownMode,
+        uiZoom: sanitizeZoom(patch.uiZoom ?? s.uiZoom),
         fleetBannerFlightDeck: patch.fleetBannerFlightDeck ?? s.fleetBannerFlightDeck,
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,

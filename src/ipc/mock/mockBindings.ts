@@ -1214,6 +1214,18 @@ export const mockCommands = {
     return ok(null);
   },
 
+  async setUiZoom(factor: number): Promise<Result<null, string>> {
+    // There is no OS webview to ask in the browser/dev mock, so approximate its page zoom
+    // with the CSS one — enough to see the stepper and ⌘+/⌘−/⌘0 actually do something while
+    // developing. ⚠️ It is an APPROXIMATION, not the shipped mechanism: CSS zoom scales the
+    // coordinate space that `position: fixed` popovers measure themselves against, so a
+    // portalled menu can land slightly off HERE and be perfectly placed in the real app
+    // (which scales the whole page at the webview level). Judge popover placement under
+    // `/build-app`, not in the browser.
+    document.documentElement.style.zoom = factor === 1 ? "" : String(factor);
+    return ok(null);
+  },
+
   async claudeCliStatus(): Promise<ClaudeCliStatus> {
     // Dev/Playwright: pretend the CLI is installed and current, auto-update on. Add
     // `?cliUpdate` to the URL to get the "update available" state instead (banner + the

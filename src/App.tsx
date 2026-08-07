@@ -13,6 +13,7 @@ import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { ZoomHost } from "./ui/ZoomHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
@@ -56,6 +57,7 @@ import {
   type ShortcutAction,
   type View,
 } from "./ui/shortcuts";
+import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./ui/zoom";
 
 export default function App() {
   useGlobalSessionEvents();
@@ -252,6 +254,24 @@ export default function App() {
         case "open-history":
           useHistoryUi.getState().openPanel();
           return true;
+        case "zoom-in":
+        case "zoom-out":
+        case "zoom-reset": {
+          const display = useDisplay.getState();
+          const current = display.uiZoom;
+          const next =
+            action === "zoom-reset"
+              ? DEFAULT_ZOOM
+              : action === "zoom-in"
+                ? nextZoom(current)
+                : prevZoom(current);
+          // Persist only a real change, but claim the key either way: at either end of the
+          // ladder the app HAS handled the zoom request (there is just nowhere further to
+          // go), and letting ⌘+ fall through to the webview would hand it a second, hidden
+          // zoom of its own on top of ours.
+          if (next !== current) display.set({ uiZoom: next });
+          return true;
+        }
       }
     }
     window.addEventListener("keydown", onKey);
@@ -386,6 +406,9 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): pushes the interface-zoom preference to the OS webview, on
+          mount and on every change. */}
+      <ZoomHost />
     </Win>
   );
 }
