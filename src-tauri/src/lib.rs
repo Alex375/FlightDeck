@@ -9,6 +9,7 @@ pub mod power;
 pub mod store;
 pub mod supervisor;
 pub mod terminal;
+pub mod tosse;
 pub mod usage;
 
 use ipc::commands::{
@@ -41,14 +42,18 @@ use ipc::commands::{
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ultracode,
-    spawn_session, stat_files, stop_session, stop_task, update_plugin,
+    scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
+    tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
+    tosse_link_project_repo, tosse_login_start, tosse_logout, tosse_project_repos,
+    tosse_repo_links, tosse_set_project_status,
+    tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_backlog,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
     AccountLoginEvent, FsChangeEvent, FsWatchErrorEvent, SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
-    SessionPermissionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
+    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -87,6 +92,22 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             account_codex_login_start,
             account_codex_login_cancel,
             account_codex_logout,
+            tosse_status,
+            tosse_login_start,
+            tosse_login_cancel,
+            tosse_logout,
+            tosse_repo_links,
+            tosse_link_repository,
+            tosse_project_repos,
+            tosse_link_project_repo,
+            scan_local_git_repos,
+            tosse_briefing,
+            tosse_backlog,
+            tosse_web_url,
+            tosse_task_detail,
+            tosse_set_task_status,
+            tosse_set_project_status,
+            tosse_create_task,
             fetch_slash_commands,
             load_session_history,
             load_session_context,
@@ -180,6 +201,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionStateEvent,
             SessionMessageEvent,
             SessionPermissionEvent,
+            SessionPermissionResolvedEvent,
             SessionCommandsEvent,
             SessionTaskEvent,
             SessionTitleEvent,
@@ -476,6 +498,13 @@ pub fn run() {
                     .build()?;
                 app.set_menu(menu)?;
             }
+
+            // Tell the TOSSE credential store which bundle this is, BEFORE anything can
+            // touch the Keychain. Its item used to be one fixed name shared by every build,
+            // so a `/build-app` test build refreshing its token revoked production's and
+            // signed both out; test builds now get their own item, production keeps the
+            // historic one (renaming it there would orphan every existing install's).
+            tosse::set_bundle_identifier(app.config().identifier.clone());
 
             // Open the persistence store in the app data dir (created if absent).
             // The store is the single owner of SQLite; the rest of the core and

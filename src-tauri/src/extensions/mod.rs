@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use specta::Type;
 
 /// Where a configuration entry originates. Drives the "by scope" grouping in the
@@ -82,14 +83,22 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub enabled: bool,
     pub scope: ExtScope,
-    /// Whether the plugin's installed pin differs from its marketplace's currently
-    /// downloaded pin (compared on-disk — see [`compute_update`]). Only as fresh as
-    /// the last `claude plugin marketplace update`; the UI's "Check" button runs
-    /// that refresh then re-reads. Never a false positive: unknown pins → `false`.
+    /// A PROVEN update: the marketplace's version is known and differs from the
+    /// installed one (see [`compute_update`]). Only as fresh as the last `claude
+    /// plugin marketplace update`; the UI's "Check" button runs that refresh then
+    /// re-reads. When this is true, [`Self::latest_version`] is always populated.
     pub update_available: bool,
+    /// The upstream commit moved but no version is resolvable on either side, so we
+    /// can NEITHER prove nor rule out an update — the honest third state.
+    ///
+    /// This is the dominant shape of the official marketplace (278 entries: 225 carry
+    /// a `source.sha`, only 14 any version), and it is why neither boolean answer
+    /// works alone: claiming an update produces a badge `claude plugin update` refuses
+    /// to clear ("already at the latest version"), while claiming currency hides real
+    /// releases. The UI must say "unknown", not pick a side.
+    pub update_unproven: bool,
     /// The marketplace's human version when it is KNOWN and DIFFERS from the installed
-    /// one (for a "vX → vY" badge). `None` for sha-only updates (a new commit with the
-    /// same semver) — the UI falls back to a generic "Update available" then.
+    /// one (for a "vX → vY" badge). Always `Some` when `update_available` is true.
     pub latest_version: Option<String>,
     /// What the plugin provides (scanned from its cache dir), regardless of
     /// enabled state — so the UI can show "5 skills" even when toggled off.
@@ -313,6 +322,116 @@ struct PluginManifest {
     description: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    /// Where the plugin keeps its skills, relative to the install dir. The CLI
+    /// accepts a single path OR a list, and `"."` (the plugin root) is explicitly
+    /// supported. Absent → the `skills/` default.
+    ///
+    /// ⚠️ Kept as a raw [`Value`], NOT a typed enum. `commands` also has a legal
+    /// OBJECT form (`{"deploy": {"source": "./commands/deploy.md"}}` — accepted by
+    /// `claude plugin validate` and loaded by the CLI), and serde has no per-field
+    /// error recovery: a strictly-typed field that fails to deserialize takes the
+    /// WHOLE struct down with it, and `read_json(…).ok()` then swallows the error, so
+    /// the plugin silently loses its name, description AND version. Typing these
+    /// loosely and normalizing in [`manifest_paths`] keeps an unrecognised shape
+    /// local to the field it came from.
+    #[serde(default)]
+    skills: Option<Value>,
+    #[serde(default)]
+    agents: Option<Value>,
+    #[serde(default)]
+    commands: Option<Value>,
+}
+
+/// Normalize a manifest contribution declaration into relative paths, mirroring the
+/// shapes the CLI accepts: a single string, an array of strings, or an object whose
+/// values carry a `source` (the map form of `commands`). Anything else yields an
+/// empty list — meaning "no usable declaration", which callers treat exactly like an
+/// absent field rather than as an error.
+fn manifest_paths(declared: Option<&Value>) -> Vec<String> {
+    match declared {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::Object(map)) => map
+            .values()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(o) => o.get("source").and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve a plugin's contribution directories: the manifest's declared paths when
+/// present, else the conventional `<default>` subdirectory.
+///
+/// Hardcoding `<install>/skills` under-reported every plugin that declares its own
+/// layout — the CLI loads those skills fine while the Extensions manager showed 0.
+/// Paths are resolved relative to the install dir, and `"."` (the documented
+/// single-skill-at-root layout) resolves to the dir itself.
+///
+/// **`additive` mirrors the CLI's own asymmetry.** For `agents`/`commands` a manifest
+/// declaration REPLACES the conventional folder (the CLI only auto-loads `agents/` /
+/// `commands/` when the manifest is silent, and warns `folder-shadowed-by-manifest`).
+/// For `skills` it does NOT: `skills/` is loaded whenever it exists and declared paths
+/// are ADDITIONAL. Replacing there would hide a conventional `skills/` tree behind an
+/// extra declared path — the same under-report, mirrored.
+///
+/// ⚠️ **Declared paths are attacker-controlled** (a third-party plugin's manifest), so
+/// they are confined to the install dir: an absolute path would make `Path::join`
+/// discard the base entirely, and `..` would climb out — either would point the
+/// scanner at arbitrary files (`~/.claude/.credentials.json` is one `../../../..`
+/// away) and publish their contents into the Extensions UI. Escaping entries are
+/// dropped, not clamped.
+fn contribution_dirs(
+    dir: &Path,
+    declared: Option<&Value>,
+    default: &str,
+    additive: bool,
+) -> Vec<PathBuf> {
+    let declared_paths = manifest_paths(declared);
+    if declared_paths.is_empty() {
+        return vec![dir.join(default)];
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    // Skills keep the conventional folder alongside whatever the manifest adds.
+    if additive {
+        out.push(dir.join(default));
+    }
+    for p in declared_paths {
+        if let Some(resolved) = confine_to(dir, &p) {
+            if !out.contains(&resolved) {
+                out.push(resolved);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve `rel` under `base`, returning `None` when it would escape. Rejects absolute
+/// paths, any `..` component, and anything that does not end up under `base`. `"."`
+/// (and `"./"`) legitimately resolve to `base` itself.
+fn confine_to(base: &Path, rel: &str) -> Option<PathBuf> {
+    let trimmed = rel.trim().trim_start_matches("./").trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        return Some(base.to_path_buf());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return None;
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let joined = base.join(candidate);
+    joined.starts_with(base).then_some(joined)
 }
 
 // ---- public entry point ----------------------------------------------------
@@ -423,24 +542,41 @@ pub fn list_extensions(repo_path: &str) -> ExtensionsSnapshot {
             .entry(marketplace.clone())
             .or_insert_with(|| read_marketplace_pins(&home, &marketplace, known.get(&marketplace)));
         let installed_ver = manifest.version.as_deref().or(install.version.as_deref());
-        let (update_available, latest_version) = compute_update(
+        let update = compute_update(
             install.git_commit_sha.as_deref(),
             installed_ver,
             pins.get(plugin_key),
         );
 
         // Scan what the plugin provides (counts always; entries only when enabled).
+        // The manifest may redirect any of the three, so honour it before falling back
+        // to the conventional subdirectory.
         let skills = dir
             .as_ref()
-            .map(|d| scan_skills(&d.join("skills"), ExtScope::Plugin, Some(id)))
+            .map(|d| {
+                contribution_dirs(d, manifest.skills.as_ref(), "skills", true)
+                    .iter()
+                    .flat_map(|p| scan_skills(p, ExtScope::Plugin, Some(id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let agents = dir
             .as_ref()
-            .map(|d| scan_agents(&d.join("agents"), ExtScope::Plugin, Some(id)))
+            .map(|d| {
+                contribution_dirs(d, manifest.agents.as_ref(), "agents", false)
+                    .iter()
+                    .flat_map(|p| scan_agents(p, ExtScope::Plugin, Some(id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let command_count = dir
             .as_ref()
-            .map(|d| count_markdown(&d.join("commands")))
+            .map(|d| {
+                contribution_dirs(d, manifest.commands.as_ref(), "commands", false)
+                    .iter()
+                    .map(|p| count_markdown(p))
+                    .sum()
+            })
             .unwrap_or(0);
         let plugin_mcp: McpJsonFile = dir
             .as_ref()
@@ -457,8 +593,9 @@ pub fn list_extensions(repo_path: &str) -> ExtensionsSnapshot {
             description: manifest.description,
             enabled,
             scope,
-            update_available,
-            latest_version,
+            update_available: update.available,
+            update_unproven: update.unproven,
+            latest_version: update.latest,
             skill_count: skills.len() as u32,
             agent_count: agents.len() as u32,
             command_count,
@@ -512,9 +649,18 @@ pub fn list_plugin_contents(repo_path: &str, plugin_id: &str) -> PluginContents 
     };
 
     let plugin_mcp: McpJsonFile = read_json(&dir.join(".mcp.json")).unwrap_or_default();
+    // Mirror the inventory scan: the manifest decides where skills/agents live.
+    let manifest: PluginManifest =
+        read_json(&dir.join(".claude-plugin/plugin.json")).unwrap_or_default();
     PluginContents {
-        skills: scan_skills(&dir.join("skills"), ExtScope::Plugin, Some(plugin_id)),
-        agents: scan_agents(&dir.join("agents"), ExtScope::Plugin, Some(plugin_id)),
+        skills: contribution_dirs(&dir, manifest.skills.as_ref(), "skills", true)
+            .iter()
+            .flat_map(|p| scan_skills(p, ExtScope::Plugin, Some(plugin_id)))
+            .collect(),
+        agents: contribution_dirs(&dir, manifest.agents.as_ref(), "agents", false)
+            .iter()
+            .flat_map(|p| scan_agents(p, ExtScope::Plugin, Some(plugin_id)))
+            .collect(),
         mcp_servers: plugin_mcp
             .mcp_servers
             .iter()
@@ -910,10 +1056,31 @@ fn read_marketplace_pins(
     let mut out = BTreeMap::new();
     for entry in &manifest.plugins {
         if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-            out.insert(name.to_string(), extract_pin(entry));
+            let mut pin = extract_pin(entry);
+            // A catalogue entry rarely carries a version (14 of 278 on the official
+            // marketplace). When the marketplace SHIPS the plugin itself — a local
+            // `./plugins/<x>` source — its `plugin.json` is right there, so resolve
+            // the version from it. That is what the CLI compares against, and every
+            // entry we can resolve is one that moves out of the "unproven" bucket.
+            if pin.version.is_none() {
+                pin.version = local_source_version(&dir, entry);
+            }
+            out.insert(name.to_string(), pin);
         }
     }
     out
+}
+
+/// Version from the plugin manifest the MARKETPLACE ships locally, when it does.
+///
+/// `source` is either a relative path string (`"./plugins/foo"`) or an object; for a
+/// `git-subdir` object, `source.path` addresses the REMOTE repository, not this
+/// checkout, so it is deliberately not followed — resolving it would need the network.
+fn local_source_version(marketplace_dir: &Path, entry: &Value) -> Option<String> {
+    let rel = entry.get("source")?.as_str()?;
+    let plugin_dir = confine_to(marketplace_dir, rel)?;
+    let manifest: PluginManifest = read_json(&plugin_dir.join(".claude-plugin/plugin.json"))?;
+    manifest.version
 }
 
 /// Pluck the pin (git `sha` + human `version`) out of one marketplace `plugins[]`
@@ -942,37 +1109,73 @@ fn extract_pin(entry: &serde_json::Value) -> MarketplacePin {
 /// Decide whether a plugin has an update and, when meaningful, the target human
 /// version. Pure and total, so it is unit-tested against every pin combination.
 ///
-/// Priority: a git `sha` mismatch is authoritative (a new commit) — the human version
-/// may be unchanged, so a "vX → vY" label is offered only when the versions DO differ.
-/// Falls back to a pure `version` comparison for path/version sources. Anything unknown
-/// (missing installed OR marketplace pin) is "no update": we never flag one we can't
-/// prove, so a plugin never nags without cause.
+/// Anything unknown (missing installed OR marketplace pin) is "no update": we never
+/// flag one we can't prove, so a plugin never nags without cause.
+///
+/// ⚠️ **A sha mismatch alone is NOT an update.** `claude plugin update` — the command
+/// this badge invites the user to run — decides by VERSION, not by commit:
+///
+/// ```text
+/// if (!isUnknown && (installed.version === resolved || installed.installPath === …))
+///     → "<plugin> is already at the latest version (<v>)."   // outcome: up_to_date
+/// ```
+///
+/// So when upstream has new commits but the plugin's version is unchanged, the CLI
+/// refuses to do anything — and a badge raised on the sha alone can NEVER be cleared
+/// by the action it offers. That is exactly what happened to `railway`
+/// (installed `191601b4…` v1.3.6 vs catalogue `c8b14877…`, no catalogue version):
+/// a permanent "Update available" whose button always answered "already at the latest
+/// version". A sha difference therefore only CONFIRMS an update we can already prove
+/// from the versions; on its own it is not actionable.
 fn compute_update(
     installed_sha: Option<&str>,
     installed_ver: Option<&str>,
     pin: Option<&MarketplacePin>,
-) -> (bool, Option<String>) {
+) -> UpdateState {
     let Some(pin) = pin else {
-        return (false, None);
+        return UpdateState::none();
     };
-    // Git-pinned: the commit sha is the truth (tolerating abbreviation — see sha_eq).
+    // Git-pinned: an EQUAL sha proves there is nothing to fetch (tolerating
+    // abbreviation — see sha_eq), whatever the versions say.
     if let (Some(a), Some(b)) = (installed_sha, pin.sha.as_deref()) {
         if sha_eq(a, b) {
-            return (false, None);
+            return UpdateState::none();
         }
-        let target = match (installed_ver, pin.version.as_deref()) {
-            (Some(iv), Some(pv)) if iv != pv => Some(pv.to_string()),
-            _ => None,
+        // Shas differ. Only a provable VERSION change is actionable; without one we
+        // report "unproven" rather than inventing either answer.
+        return match (installed_ver, pin.version.as_deref()) {
+            (Some(iv), Some(pv)) if iv != pv => UpdateState::available(pv),
+            (Some(iv), Some(pv)) if iv == pv => UpdateState::none(),
+            _ => UpdateState::unproven(),
         };
-        return (true, target);
     }
     // Version-pinned (path sources) or a plugin.json version bump.
     if let (Some(a), Some(b)) = (installed_ver, pin.version.as_deref()) {
         if a != b {
-            return (true, Some(b.to_string()));
+            return UpdateState::available(b);
         }
     }
-    (false, None)
+    UpdateState::none()
+}
+
+/// The three honest answers to "does this plugin have an update?".
+#[derive(Debug, Clone, PartialEq, Default)]
+struct UpdateState {
+    available: bool,
+    unproven: bool,
+    latest: Option<String>,
+}
+
+impl UpdateState {
+    fn none() -> Self {
+        Self::default()
+    }
+    fn available(target: &str) -> Self {
+        Self { available: true, unproven: false, latest: Some(target.to_string()) }
+    }
+    fn unproven() -> Self {
+        Self { available: false, unproven: true, latest: None }
+    }
 }
 
 /// Whether two git shas denote the same commit, tolerating abbreviation: equal when
@@ -1022,6 +1225,19 @@ fn install_scope(install: &PluginInstall) -> ExtScope {
 /// `SKILL.md` whose frontmatter carries `name`/`description`. Missing dir → empty.
 fn scan_skills(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<SkillInfo> {
     let mut out = Vec::new();
+    // A manifest may name the SKILL.md file itself rather than a directory.
+    if dir.is_file() {
+        if let Some(info) = skill_from_md(dir, dir.parent().unwrap_or(dir), scope, source) {
+            out.push(info);
+        }
+        return out;
+    }
+    // A `SKILL.md` sitting directly in the scanned directory IS a skill — that is the
+    // single-skill layout the CLI suggests when a manifest points at the plugin root
+    // (`"skills": "."`). Requiring a subdirectory missed it entirely.
+    if let Some(info) = skill_from_md(&dir.join("SKILL.md"), dir, scope, source) {
+        out.push(info);
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
@@ -1030,60 +1246,96 @@ fn scan_skills(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<SkillIn
         if !path.is_dir() {
             continue;
         }
-        let skill_md = path.join("SKILL.md");
-        let front = std::fs::read_to_string(&skill_md)
-            .ok()
-            .map(|c| parse_frontmatter(&c))
-            .unwrap_or_default();
-        let name = front.name.unwrap_or_else(|| dir_name(&path));
-        out.push(SkillInfo {
-            name,
-            description: front.description,
-            scope,
-            source: source.map(str::to_string),
-            path: skill_md.to_string_lossy().into_owned(),
-            // Claude exposes no per-skill toggle — a discovered skill is active.
-            enabled: true,
-        });
+        if let Some(info) = skill_from_md(&path.join("SKILL.md"), &path, scope, source) {
+            out.push(info);
+        }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// One `SKILL.md` → [`SkillInfo`], named after its frontmatter or `owner` (the
+/// directory the skill belongs to). `None` when the file is absent.
+fn skill_from_md(
+    skill_md: &Path,
+    owner: &Path,
+    scope: ExtScope,
+    source: Option<&str>,
+) -> Option<SkillInfo> {
+    // Require the conventional filename, not just "some readable file": the manifest
+    // path branch reaches this with an attacker-influenced path, and accepting any
+    // file would publish its first lines into the UI as a skill description.
+    if skill_md.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") || !skill_md.is_file() {
+        return None;
+    }
+    let front = std::fs::read_to_string(skill_md)
+        .ok()
+        .map(|c| parse_frontmatter(&c))
+        .unwrap_or_default();
+    Some(SkillInfo {
+        name: front.name.unwrap_or_else(|| dir_name(owner)),
+        description: front.description,
+        scope,
+        source: source.map(str::to_string),
+        path: skill_md.to_string_lossy().into_owned(),
+        // Claude exposes no per-skill toggle — a discovered skill is active.
+        enabled: true,
+    })
 }
 
 /// Scan an `agents/` directory: one `*.md` per sub-agent, frontmatter carries
 /// `name`/`description`/`model`. Missing dir → empty.
 fn scan_agents(dir: &Path, scope: ExtScope, source: Option<&str>) -> Vec<AgentInfo> {
     let mut out = Vec::new();
+    // A manifest may name individual FILES rather than a directory
+    // (`"agents": ["./agents/a.md", "./agents/b.md"]` is real, and common) — treat a
+    // path that IS a markdown file as a single contribution.
+    if dir.is_file() {
+        if let Some(info) = agent_from_md(dir, scope, source) {
+            out.push(info);
+        }
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
+        if let Some(info) = agent_from_md(&entry.path(), scope, source) {
+            out.push(info);
         }
-        let front = std::fs::read_to_string(&path)
-            .ok()
-            .map(|c| parse_frontmatter(&c))
-            .unwrap_or_default();
-        let name = front
-            .name
-            .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string());
-        out.push(AgentInfo {
-            name,
-            description: front.description,
-            model: front.model,
-            scope,
-            source: source.map(str::to_string),
-            path: path.to_string_lossy().into_owned(),
-        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
+/// One `*.md` sub-agent definition → [`AgentInfo`]. `None` for a non-markdown path.
+fn agent_from_md(path: &Path, scope: ExtScope, source: Option<&str>) -> Option<AgentInfo> {
+    if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        return None;
+    }
+    let front = std::fs::read_to_string(path)
+        .ok()
+        .map(|c| parse_frontmatter(&c))
+        .unwrap_or_default();
+    let name = front
+        .name
+        .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string());
+    Some(AgentInfo {
+        name,
+        description: front.description,
+        model: front.model,
+        scope,
+        source: source.map(str::to_string),
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
 /// Count `*.md` files directly in `dir` (for a plugin's `commands/`). 0 if absent.
 fn count_markdown(dir: &Path) -> u32 {
+    // Same as scan_agents: a manifest may list individual command files.
+    if dir.is_file() {
+        return u32::from(dir.extension().and_then(|x| x.to_str()) == Some("md"));
+    }
     std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -1356,31 +1608,44 @@ mod tests {
     }
 
     #[test]
-    fn compute_update_sha_is_authoritative_and_version_labels_only_when_differ() {
-        // Same sha → no update, regardless of version.
-        let pin = MarketplacePin { sha: Some("abc".into()), version: Some("1.1.0".into()) };
-        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), (false, None));
-        // Different sha, same version → update, but no "vX → vY" label (sha-only bump).
+    fn compute_update_needs_a_provable_version_change_not_just_a_new_commit() {
+        // Same sha → nothing to fetch, whatever the versions say.
+        let pin = MarketplacePin { sha: Some("abc".into()), version: Some("1.0.0".into()) };
+        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), UpdateState::none());
+
+        // REGRESSION (railway): shas differ, SAME version → NOT an update. The CLI
+        // decides by version and answers "already at the latest version", so a badge
+        // here could never be cleared by the button it offers.
         let pin = MarketplacePin { sha: Some("def".into()), version: Some("1.0.0".into()) };
-        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), (true, None));
-        // Different sha AND version → update with the target version to display.
+        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&pin)), UpdateState::none());
+
+        // Shas differ AND a target version is known → a proven, actionable update.
         let pin = MarketplacePin { sha: Some("def".into()), version: Some("1.1.0".into()) };
         assert_eq!(
             compute_update(Some("abc"), Some("1.0.0"), Some(&pin)),
-            (true, Some("1.1.0".into()))
+            UpdateState::available("1.1.0")
+        );
+
+        // REGRESSION (railway, real shape): shas differ and the catalogue carries NO
+        // version → UNPROVEN. Reporting "no update" here would hide every real release
+        // of the ~225 sha-only entries of the official marketplace; reporting one would
+        // resurrect the badge the CLI refuses to clear.
+        let no_ver = MarketplacePin { sha: Some("c8b14877".into()), version: None };
+        assert_eq!(
+            compute_update(Some("191601b4"), Some("1.3.6"), Some(&no_ver)),
+            UpdateState::unproven()
         );
     }
 
     #[test]
     fn compute_update_tolerates_abbreviated_marketplace_sha() {
-        // Installed is the full 40-char sha; the marketplace pins an abbreviated one for
-        // the SAME commit → no phantom update (exact `==` would wrongly flag it forever).
-        let full = "aa1e055b0f18d13787232b164cfb7416b553bd03";
-        let pin = MarketplacePin { sha: Some("aa1e055b".into()), version: None };
-        assert_eq!(compute_update(Some(full), None, Some(&pin)), (false, None));
-        // A DIFFERENT abbreviated sha is still an update.
+        let full = "aa1e055b2c3d4e5f60718293a4b5c6d7e8f90123";
+        // The marketplace pins an ABBREVIATED sha of the same commit → not an update.
+        let pin = MarketplacePin { sha: Some("aa1e055".into()), version: None };
+        assert_eq!(compute_update(Some(full), None, Some(&pin)), UpdateState::none());
+        // A DIFFERENT abbreviated sha with no resolvable version → unproven, not a claim.
         let other = MarketplacePin { sha: Some("bbbbbbb".into()), version: None };
-        assert_eq!(compute_update(Some(full), None, Some(&other)), (true, None));
+        assert_eq!(compute_update(Some(full), None, Some(&other)), UpdateState::unproven());
         // Guard: a too-short (<7) prefix is NOT treated as equal (avoids coincidences).
         assert!(!sha_eq(full, "aa1e0"));
         assert!(sha_eq(full, "aa1e055b"));
@@ -1388,21 +1653,21 @@ mod tests {
     }
 
     #[test]
-    fn compute_update_version_only_and_unknown_pins() {
-        // No installed sha (path source): compare versions.
+    fn compute_update_falls_back_to_versions_and_never_guesses() {
+        // No installed sha (path source): a pure version comparison decides.
         let pin = MarketplacePin { sha: None, version: Some("2.0.0".into()) };
         assert_eq!(
             compute_update(None, Some("1.0.0"), Some(&pin)),
-            (true, Some("2.0.0".into()))
+            UpdateState::available("2.0.0")
         );
-        assert_eq!(compute_update(None, Some("2.0.0"), Some(&pin)), (false, None));
+        assert_eq!(compute_update(None, Some("2.0.0"), Some(&pin)), UpdateState::none());
         // No marketplace pin at all, or no overlapping fields → never an update.
-        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), None), (false, None));
+        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), None), UpdateState::none());
         let empty = MarketplacePin::default();
-        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&empty)), (false, None));
-        // Installed has only a sha, marketplace has only a version → can't compare → none.
+        assert_eq!(compute_update(Some("abc"), Some("1.0.0"), Some(&empty)), UpdateState::none());
+        // Installed has only a sha, marketplace only a version → can't compare → none.
         let ver_only = MarketplacePin { sha: None, version: Some("1.1.0".into()) };
-        assert_eq!(compute_update(Some("abc"), None, Some(&ver_only)), (false, None));
+        assert_eq!(compute_update(Some("abc"), None, Some(&ver_only)), UpdateState::none());
     }
 
     #[test]
@@ -1500,6 +1765,177 @@ mod tests {
         assert_eq!(info.url.as_deref(), Some("https://h/mcp"));
         assert_eq!(info.source.as_deref(), Some("p@m"));
         assert!(info.enabled);
+    }
+
+    /// REGRESSION: a plugin manifest may redirect where its skills/agents/commands
+    /// live, including to the plugin ROOT (`"skills": "."`). Hardcoding
+    /// `<install>/skills` reported 0 skills for such a plugin while the CLI loaded
+    /// them fine.
+    #[test]
+    fn contribution_dirs_honour_the_manifest_and_default_without_one() {
+        let root = Path::new("/p");
+        let j = |v: serde_json::Value| v;
+
+        // No declaration → the conventional subdirectory (both policies).
+        assert_eq!(contribution_dirs(root, None, "skills", true), vec![root.join("skills")]);
+        assert_eq!(contribution_dirs(root, None, "agents", false), vec![root.join("agents")]);
+
+        // agents/commands: a declaration REPLACES the conventional folder (CLI parity).
+        let one = j(serde_json::json!("lib/agents"));
+        assert_eq!(
+            contribution_dirs(root, Some(&one), "agents", false),
+            vec![root.join("lib/agents")]
+        );
+
+        // skills: a declaration is ADDITIONAL — `skills/` is still loaded by the CLI,
+        // so hiding it behind the declared path would under-report all over again.
+        let extra = j(serde_json::json!("extra/skills"));
+        assert_eq!(
+            contribution_dirs(root, Some(&extra), "skills", true),
+            vec![root.join("skills"), root.join("extra/skills")]
+        );
+        // …and the default is never listed twice when it is also declared.
+        let dup = j(serde_json::json!(["skills", "extra/skills"]));
+        assert_eq!(
+            contribution_dirs(root, Some(&dup), "skills", true),
+            vec![root.join("skills"), root.join("extra/skills")]
+        );
+
+        // "." (and "./") mean the plugin root itself, NOT a "." subdirectory.
+        for spelling in [".", "./", "./."] {
+            let at_root = j(serde_json::json!(spelling));
+            assert_eq!(
+                contribution_dirs(root, Some(&at_root), "agents", false),
+                vec![root.to_path_buf()],
+                "{spelling} should resolve to the plugin root"
+            );
+        }
+
+        // The object form of `commands` is legal and must be understood, not rejected.
+        let obj = j(serde_json::json!({ "deploy": { "source": "./commands/deploy.md" } }));
+        assert_eq!(
+            contribution_dirs(root, Some(&obj), "commands", false),
+            vec![root.join("commands/deploy.md")]
+        );
+
+        // A shape we do not understand degrades to "no declaration", never to a panic.
+        let junk = j(serde_json::json!({ "recursive": true }));
+        assert_eq!(
+            contribution_dirs(root, Some(&junk), "skills", true),
+            vec![root.join("skills")]
+        );
+    }
+
+    /// SECURITY: declared paths come from a third-party plugin's manifest. An absolute
+    /// path would make `Path::join` drop the install dir entirely, and `..` would climb
+    /// out — either would point the scanner at arbitrary files (`~/.claude/.credentials.json`
+    /// sits a few levels up from a plugin cache dir) and publish them as "contributions".
+    #[test]
+    fn contribution_dirs_refuse_to_escape_the_install_dir() {
+        let root = Path::new("/p/cache/mkt/plug/1.0.0");
+        for escape in [
+            "/etc",
+            "/Users/me/.claude/.credentials.json",
+            "../../../../.credentials.json",
+            "..",
+            "skills/../../..",
+        ] {
+            let v = serde_json::json!(escape);
+            // agents: replace policy → an escaping declaration leaves NOTHING to scan.
+            assert!(
+                contribution_dirs(root, Some(&v), "agents", false).is_empty(),
+                "{escape} must be rejected, not resolved"
+            );
+            // skills: additive → only the conventional folder survives.
+            assert_eq!(
+                contribution_dirs(root, Some(&v), "skills", true),
+                vec![root.join("skills")],
+                "{escape} must not add a scan target"
+            );
+        }
+
+        // A legitimate nested path still resolves.
+        let ok = serde_json::json!("pkg/skills");
+        assert_eq!(
+            contribution_dirs(root, Some(&ok), "agents", false),
+            vec![root.join("pkg/skills")]
+        );
+    }
+
+    /// REGRESSION: an unrecognised contribution shape must not take the WHOLE manifest
+    /// down. `commands` has a legal object form; with strictly-typed fields serde fails
+    /// the entire struct and `read_json(…).ok()` swallows it, so the plugin silently
+    /// loses its name, description and version.
+    #[test]
+    fn a_manifest_with_an_object_commands_field_still_yields_name_and_version() {
+        let raw = r#"{
+            "name": "deployer",
+            "description": "Ships things",
+            "version": "2.1.0",
+            "commands": { "deploy": { "source": "./commands/deploy.md" } }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(raw).expect("object commands must parse");
+        assert_eq!(m.name.as_deref(), Some("deployer"));
+        assert_eq!(m.version.as_deref(), Some("2.1.0"));
+        assert_eq!(m.description.as_deref(), Some("Ships things"));
+
+        // Even a shape nobody anticipated leaves the identity fields intact.
+        let weird = r#"{"name":"x","version":"1.0.0","skills":{"path":"./s","recursive":true}}"#;
+        let m: PluginManifest = serde_json::from_str(weird).expect("unknown shape must parse");
+        assert_eq!(m.name.as_deref(), Some("x"));
+        assert_eq!(m.version.as_deref(), Some("1.0.0"));
+    }
+
+    /// REGRESSION: a `SKILL.md` directly inside the scanned directory IS a skill —
+    /// the single-skill layout a root-pointing manifest produces. Requiring a
+    /// subdirectory skipped it silently.
+    #[test]
+    fn scan_skills_accepts_a_skill_md_at_the_scanned_root() {
+        let dir = std::env::temp_dir().join(format!("tosse-skills-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: at-root\n---\nbody").unwrap();
+        std::fs::write(nested.join("SKILL.md"), "---\nname: nested-one\n---\nbody").unwrap();
+
+        let found = scan_skills(&dir, ExtScope::Plugin, Some("p@m"));
+        let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"at-root"), "root SKILL.md must be found: {names:?}");
+        assert!(names.contains(&"nested-one"), "nested skills still found: {names:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// REGRESSION: a manifest may list individual FILES, not a directory — real
+    /// plugins on this machine do (`"agents": ["./agents/a.md", "./agents/b.md"]`,
+    /// `"commands": [...]`). Honouring the manifest naively (scanning each entry as a
+    /// directory) would report 0 agents for exactly those plugins, which is WORSE
+    /// than the hardcoded path it replaced.
+    #[test]
+    fn scanners_accept_a_manifest_path_that_names_a_file() {
+        let dir = std::env::temp_dir().join(format!("tosse-files-{}", std::process::id()));
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("one.md"), "---\nname: solo-agent\n---\nbody").unwrap();
+        std::fs::write(agents.join("two.md"), "---\nname: other-agent\n---\nbody").unwrap();
+        std::fs::write(agents.join("notes.txt"), "not an agent").unwrap();
+
+        // A file-valued entry contributes exactly that agent.
+        let one = scan_agents(&agents.join("one.md"), ExtScope::Plugin, Some("p@m"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "solo-agent");
+
+        // A non-markdown path contributes nothing rather than erroring.
+        assert!(scan_agents(&agents.join("notes.txt"), ExtScope::Plugin, None).is_empty());
+
+        // A directory-valued entry still scans the whole directory.
+        assert_eq!(scan_agents(&agents, ExtScope::Plugin, None).len(), 2);
+
+        // Command counting follows the same rule.
+        assert_eq!(count_markdown(&agents.join("one.md")), 1);
+        assert_eq!(count_markdown(&agents.join("notes.txt")), 0);
+        assert_eq!(count_markdown(&agents), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Smoke test against the real `~/.claude` of the machine running it. Ignored

@@ -1,4 +1,4 @@
-# Claude Code stream-json protocol (v2.1.178) — clean-room client spec
+# Claude Code stream-json protocol (v2.1.178, spot-checked against 2.1.220/2.1.222) — clean-room client spec
 
 > Authoritative, implementation-ready spec for re-implementing in Rust the **client** of the
 > stream-json protocol that drives the `claude` binary (v2.1.178). This is a clean-room spec
@@ -365,6 +365,25 @@ guard was dead code). Any new injected shape belongs in that table.
 top level. It groups all of a sub-agent's stream_events/assistant/user messages. **Aggregate
 token usage / "current model" ONLY when `parent_tool_use_id` is null** (avoid double counting).
 
+> ⚠️ **NOT a two-level model any more.** Since **2.1.219** sub-agents spawn nested sub-agents
+> up to **depth 3 by default** (was 1; `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` disables it).
+> A grandchild's `parent_tool_use_id` names the tool_use of its SUB-AGENT parent, not the root,
+> so "null vs non-null" no longer tells you the depth. Anything walking this must not assume a
+> non-null parent is a direct child of the main thread.
+>
+> Also note `task_started` carries **no nesting information** (`{task_id, tool_use_id,
+> description, subagent_type, task_type, workflow_name, prompt, skip_transcript}`) — the CLI
+> keeps `spawnDepth` / `parentAgentId` internal. Depth can only be derived from the
+> `parent_tool_use_id` of the assistant message carrying the spawning tool_use.
+>
+> Related: without `--forward-subagent-text` the binary forwards ONLY a sub-agent's `tool_use`
+> / `tool_result` blocks — its text and thinking are filtered out **at depth 1 already**, which
+> is why the live sub-agent drill-in showed steps but no prose while the on-disk transcript had
+> both. **The app now passes the flag unconditionally** (`supervisor::transport`, since
+> v1.5.0), so sub-agent prose and thinking DO arrive live — and so do nested (depth-2+)
+> sub-agents' messages, which is why anything collecting agent ids from the stream must scope
+> itself to `parent_tool_use_id === null` (see `conversationStore.bgAgentIds`).
+
 ### 3.9 `result` (`confirmed`, capture L12)
 
 ```json
@@ -463,6 +482,10 @@ the initialize response** (ignored with a warn on any other response). Feed
 
 ### 4.5 Outbound control requests we send (`confirmed`)
 
+> ⚠️ **This table was written at v2.1.178 and listed only 5 subtypes while the app shipped
+> 14.** It is now complete as of the 2026-08-05 audit; `src-tauri/src/supervisor/control.rs`
+> remains the source of truth — add a row here whenever you add a request there.
+
 | subtype | fields | response handling |
 |---|---|---|
 | `initialize` | see §4.4 | yields commands/models/agents |
@@ -470,6 +493,20 @@ the initialize response** (ignored with a warn on any other response). Feed
 | `set_permission_mode` | `{mode}` | await success |
 | `set_model` | `{model}` | await success |
 | `mcp_reconnect` / `mcp_toggle` | `{serverName[, enabled]}` | manage MCP servers |
+| `mcp_status` | none | live MCP server list + health |
+| `mcp_authenticate` / `mcp_clear_auth` | `{serverName}` | OAuth for one server |
+| `stop_task` | `{task_id}` | stop ONE background task. ⚠️ the wire subtype is `stop_task`, NOT `task_stop` |
+| `apply_flag_settings` | `{settings:{effortLevel}}` or `{settings:{ultracode}}` | set effort / the ultracode tier; read back with `get_settings` |
+| `get_settings` | none | authoritative model / effort / ultracode read-back |
+| `generate_session_title` | `{description, persist}` | server-side titling; also reused for the last-message summary |
+| `reload_plugins` | none | hot-reload plugins in a LIVE session. Its response carries a FRESH `commands` catalogue (same shape as `initialize`) — harvest it, do not discard it |
+| `remote_control` | `{enabled[, name]}` | bridge to claude.ai/code; the reply nests `response.response.{session_url, connect_url}` |
+
+Subtypes the binary accepts but the app does NOT use (verified by diffing the 2.1.220 and
+2.1.222 binaries — the set is IDENTICAL across those two versions, so none of this is new):
+`rename_session`, `set_color`, `set_max_thinking_tokens` (+ `thinking_display`),
+`get_context_usage`, `get_usage`, `get_session_cost`, `get_workspace_diff`, `list_models`,
+`file_suggestions`, `read_file`, `rewind_files`, `set_cwd`, `seed_read_state`.
 
 `set_permission_mode` mode enum (exact, `confirmed`): **`["acceptEdits","auto",
 "bypassPermissions","default","dontAsk","plan"]`**. (`"bubble"` exists as a UI-only pseudo-mode

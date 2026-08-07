@@ -14,6 +14,20 @@
   padding: 2px 0;
 }
 
+/* Connection lost: the icon spins while Claude Code retries on its own. Amber, not
+   red — the CLI usually recovers, so this explains a pause rather than announcing a
+   failure. A failed turn still surfaces as a real error afterwards. */
+.retrySpin {
+  color: #f0b15a;
+  animation: retry-spin 1.1s linear infinite;
+}
+@keyframes retry-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .retrySpin { animation: none; }
+}
+
 /* "Claude is working" — three coral dots bouncing in a wave (typing-style). */
 .typing {
   display: inline-flex;

@@ -1,12 +1,22 @@
-# Tests — tournent UNIQUEMENT à l'ouverture/MAJ d'une PR vers `main`.
+# Tests — tournent à l'ouverture/MAJ d'une PR vers `main`.
 # PAS sur push (on pousse librement dans `dev`) : la validation se fait au
 # moment de la PR dev → main. Ce check est requis par la protection de `main`
 # (la PR ne peut pas être mergée tant qu'il n'est pas vert).
+#
+# ⚠️ `workflow_dispatch` est là parce que le déclencheur `pull_request` a déjà
+# fait défaut UNE fois : la PR #42 (release v1.5.0) a été ouverte sans qu'aucun
+# run ne parte — workflow `active`, repo public (donc pas de quota), `ci.yml`
+# inchangé depuis le dernier run vert. Sans issue de secours, la seule façon de
+# récupérer était de pousser un commit vide ou de fermer/rouvrir la PR, ce qui
+# revient à bricoler l'historique pour réveiller la CI. Ici on relance à la
+# demande sur n'importe quelle branche :
+#   gh workflow run ci.yml --ref dev
 name: CI
 
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}

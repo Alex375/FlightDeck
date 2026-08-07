@@ -22,12 +22,16 @@ function codexConv(over: Partial<Conversation> = {}): Conversation {
     kind: "codex",
     handle: null,
     liveCwd: null,
+    bypassAllowed: false,
     model: "gpt-5.5",
     effort: "high",
     ultracode: false,
     permissionMode: null,
     cleanOutput: null,
     pendingReminder: null,
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
     ...over,
   };
 }

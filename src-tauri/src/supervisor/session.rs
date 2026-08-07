@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::assembler::Assembler;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
-    ConversationItem, McpAuthResult, McpServerLive, PermissionRequestPayload, RemoteControlState,
-    SessionEmitter, SessionEvent,
+    ConversationItem, McpAuthResult, McpServerLive, PermissionRequestPayload,
+    PermissionResolvedPayload, RemoteControlState, SessionEmitter, SessionEvent,
 };
 use super::protocol::CliMessage;
 use super::transport::{self, SpawnConfig, Transport, TransportError};
@@ -628,11 +628,27 @@ impl SessionCore {
         );
     }
 
+    /// State event carrying whether ANY permission prompt is still outstanding.
+    ///
+    /// The CLI checks permissions for parallel tool calls concurrently, so several
+    /// `can_use_tool` requests can be in flight at once and `self.pending` is the
+    /// only truth. Every site that resolves ONE prompt must go through this rather
+    /// than hardcoding `false`: the flag drives the Flight Deck card, the fleet
+    /// readout and the attention ping, so clearing it early makes a still-blocked
+    /// agent look free and suppresses the notification for the prompts left over.
+    fn awaiting_permission_event(&mut self) -> SessionEvent {
+        self.assembler
+            .set_awaiting_permission(!self.pending.is_empty())
+    }
+
     fn emit(&self, ev: SessionEvent) {
         match ev {
             SessionEvent::State(s) => self.emitter.emit_state(&self.id, &s),
             SessionEvent::Item(i) => self.emitter.emit_item(&self.id, &i),
             SessionEvent::Permission(p) => self.emitter.emit_permission(&self.id, &p),
+            SessionEvent::PermissionResolved(r) => {
+                self.emitter.emit_permission_resolved(&self.id, &r)
+            }
             SessionEvent::Commands(c) => self.emitter.emit_commands(&self.id, &c),
             SessionEvent::Task(t) => self.emitter.emit_task(&self.id, &t),
             SessionEvent::Title { title, seq } => self.emitter.emit_title(&self.id, &title, seq),
@@ -679,7 +695,13 @@ impl SessionCore {
             CliMessage::ControlRequest(v) => self.on_control_request(v),
             CliMessage::ControlCancelRequest { request_id } => {
                 if self.pending.remove(&request_id).is_some() {
-                    let ev = self.assembler.set_awaiting_permission(false);
+                    // Tell the front the card is gone: it prunes `pendingPermissions`
+                    // only when the USER answers, so without this a cancelled prompt
+                    // stays on screen, clickable and answering nothing.
+                    self.emit(SessionEvent::PermissionResolved(PermissionResolvedPayload {
+                        request_id,
+                    }));
+                    let ev = self.awaiting_permission_event();
                     self.emit(ev);
                 }
             }
@@ -829,8 +851,16 @@ impl SessionCore {
             | PendingControl::StopTask
             | PendingControl::McpToggle
             | PendingControl::McpReconnect
-            | PendingControl::McpClearAuth
-            | PendingControl::ReloadPlugins => {}
+            | PendingControl::McpClearAuth => {}
+            // A hot-reload's ack is NOT bare: it returns the same
+            // `response.response.commands` catalogue as `initialize`, freshly rescanned
+            // (a plugin's skills appear/disappear here). Harvesting it means the `/`
+            // menu is correct the moment the reload lands, without a second round trip.
+            PendingControl::ReloadPlugins => {
+                if let Some(cmds) = control::parse_initialize_commands(&v) {
+                    self.emit(SessionEvent::Commands(cmds));
+                }
+            }
         }
     }
 
@@ -875,6 +905,9 @@ impl SessionCore {
                     title: req.title,
                     description: req.description,
                     suggestions: req.permission_suggestions,
+                    blocked_path: req.blocked_path,
+                    decision_reason: req.decision_reason,
+                    agent_id: req.agent_id,
                 };
                 self.pending.insert(
                     request_id,
@@ -933,10 +966,12 @@ impl SessionCore {
                             }
                         };
                         let delivered = self.send(line);
-                        // Clear the prompt either way (it's no longer answerable); but if
-                        // the response never reached the process, surface it — otherwise
-                        // the agent stays blocked CLI-side with nothing in the thread.
-                        let ev = self.assembler.set_awaiting_permission(false);
+                        // This prompt is answered, but OTHER prompts may still be
+                        // outstanding: the CLI runs permission checks for parallel tool
+                        // calls concurrently. Derive the flag from the map instead of
+                        // forcing `false`, otherwise answering one of N tells the UI the
+                        // agent is free while it is still blocked on the rest.
+                        let ev = self.awaiting_permission_event();
                         self.emit(ev);
                         if !delivered {
                             self.emit_error_notice("send_failed", json!({
@@ -944,10 +979,18 @@ impl SessionCore {
                             }));
                         }
                     }
-                    None => eprintln!(
-                        "[session {}] answer for unknown permission request '{request_id}'",
-                        self.id
-                    ),
+                    // The prompt is gone (cancelled by the CLI, or already answered), so
+                    // the user's click did nothing. Say so in the thread: swallowing it
+                    // to stderr leaves them believing they answered something.
+                    None => {
+                        eprintln!(
+                            "[session {}] answer for unknown permission request '{request_id}'",
+                            self.id
+                        );
+                        self.emit_error_notice("permission_error", json!({
+                            "message": "That permission prompt is no longer awaiting an answer — Claude Code withdrew it. If it still matters, Claude will ask again.",
+                        }));
+                    }
                 }
             }
             SessionCommand::SetPermissionMode(mode) => {
@@ -1128,6 +1171,13 @@ mod tests {
         fn emit_permission(&self, _session: &str, request: &PermissionRequestPayload) {
             let _ = self.tx.send(SessionEvent::Permission(request.clone()));
         }
+        fn emit_permission_resolved(
+            &self,
+            _session: &str,
+            resolved: &crate::supervisor::model::PermissionResolvedPayload,
+        ) {
+            let _ = self.tx.send(SessionEvent::PermissionResolved(resolved.clone()));
+        }
         fn emit_commands(&self, _session: &str, commands: &[crate::supervisor::model::SlashCommand]) {
             let _ = self.tx.send(SessionEvent::Commands(commands.to_vec()));
         }
@@ -1225,6 +1275,93 @@ mod tests {
         assert_eq!(line["response"]["response"]["behavior"], json!("deny"));
         assert_eq!(line["response"]["response"]["message"], json!("no"));
         assert_eq!(line["response"]["response"]["toolUseID"], json!("toolu_1"));
+    }
+
+    /// REGRESSION: the CLI checks permissions for parallel tool calls concurrently,
+    /// so several prompts can be outstanding at once. Answering ONE must not report
+    /// the session as free — the flag drives the Flight Deck card, the fleet readout
+    /// and the attention ping, so clearing it early makes a still-blocked agent look
+    /// idle and suppresses the notification for the prompt left behind.
+    #[test]
+    fn answering_one_of_two_parallel_prompts_keeps_awaiting_permission() {
+        let (mut core, mut events, _out) = test_core();
+
+        core.on_message(can_use_tool("req-1", "Bash"));
+        core.on_message(can_use_tool("req-2", "Read"));
+        let _ = drain(&mut events);
+
+        // Answer only the first: the second is still blocking the agent.
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "req-1".to_string(),
+            decision: PermissionDecision::Allow { updated_input: None },
+        });
+        let awaiting = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s.awaiting_permission),
+                _ => None,
+            })
+            .next_back()
+            .expect("answering should emit a state event");
+        assert!(
+            awaiting,
+            "one prompt is still pending — the session is NOT free"
+        );
+
+        // Answering the last one finally clears it.
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "req-2".to_string(),
+            decision: PermissionDecision::Allow { updated_input: None },
+        });
+        let awaiting = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s.awaiting_permission),
+                _ => None,
+            })
+            .next_back()
+            .expect("answering should emit a state event");
+        assert!(!awaiting, "no prompt left — the session is free again");
+    }
+
+    /// REGRESSION: a withdrawn prompt must be retracted from the UI. The front prunes
+    /// `pendingPermissions` only when the USER answers, so without this event the
+    /// card stays on screen, clickable, and answering it does nothing.
+    #[test]
+    fn a_cancelled_prompt_is_retracted_and_answering_it_is_surfaced() {
+        let (mut core, mut events, _out) = test_core();
+
+        core.on_message(can_use_tool("req-1", "Bash"));
+        let _ = drain(&mut events);
+
+        core.on_message(CliMessage::ControlCancelRequest {
+            request_id: "req-1".to_string(),
+        });
+        let evs = drain(&mut events);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                SessionEvent::PermissionResolved(r) if r.request_id == "req-1"
+            )),
+            "the cancelled prompt must be retracted from the UI"
+        );
+
+        // Answering the now-gone prompt must not be swallowed to stderr.
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "req-1".to_string(),
+            decision: PermissionDecision::Allow { updated_input: None },
+        });
+        let notice = drain(&mut events).into_iter().any(|e| {
+            matches!(
+                e,
+                SessionEvent::Item(ConversationItem::Notice { ref subtype, .. })
+                    if subtype == "permission_error"
+            )
+        });
+        assert!(
+            notice,
+            "answering a withdrawn prompt must say so in the thread"
+        );
     }
 
     /// ACCEPTANCE (deterministic): answering ALLOW echoes the original tool input

@@ -20,6 +20,9 @@
   --wf-accent:    #d97757;   /* Claude brand mark (coral) — rare use */
   --wf-accent-dim:#3a2a24;
   --wf-codex-accent:#10a37f; /* Codex brand mark (OpenAI green) — Accounts cards, Extensions tab, Plan pill */
+  --wf-tosse-accent:#e05a40; /* TOSSE (the CRM) brand mark — Settings → TOSSE card. The CRM's
+                                own dark-scheme accent, taken from its "La Rose" logo asset
+                                (its light-scheme value is #c2402a). */
   --wf-ultra:     #b483e0;   /* "Ultra code" tier — premium violet */
   --wf-ultra-dim: #2e2440;
 
@@ -80,8 +83,23 @@
 .wf-traffic i:nth-child(1){ background:#f0625c; }
 .wf-traffic i:nth-child(2){ background:#f5bb40; }
 .wf-traffic i:nth-child(3){ background:#54c050; }
-.wf-title { font-size: 12px; color: var(--wf-tx-lo); letter-spacing: .2px; }
-.wf-tbnav { display: flex; gap: 2px; margin-left: 4px; background: var(--wf-panel); padding: 3px; border-radius: 8px; border: 1px solid var(--wf-line); }
+/* The window title — the active conversation's name, which since tasks name their own
+   conversations can be a full sentence.
+   ⚠️ All three properties are load-bearing. The bar is a 38px-tall flex row, so an
+   unconstrained title WRAPPED (breaking the bar's layout) or pushed the controls off the
+   right edge. `min-width: 0` is what actually lets it shrink — a flex item defaults to
+   `min-width: auto` = min-content, and `text-overflow` never triggers without it. It is
+   also the FIRST thing to give way (`flex: 0 1 auto` here, `0 0 auto` on the nav and the
+   controls): the title is the one part already shown elsewhere, in the sidebar. */
+.wf-title {
+  font-size: 12px; color: var(--wf-tx-lo); letter-spacing: .2px;
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-tbnav { flex: 0 0 auto; display: flex; gap: 2px; margin-left: 4px; background: var(--wf-panel); padding: 3px; border-radius: 8px; border: 1px solid var(--wf-line); }
 .wf-tbnav button {
   font: inherit; font-size: 11.5px; color: var(--wf-tx-lo);
   background: transparent; border: 0; padding: 4px 11px; border-radius: 6px; cursor: default;
@@ -89,7 +107,12 @@
 }
 .wf-tbnav button[data-on] { background: var(--wf-panel-3); color: var(--wf-tx-hi); }
 .wf-tbnav .wf-badge { font-size: 9.5px; padding: 0 5px; }
-.wf-tbright { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+/* The controls are allowed to SHRINK, but their buttons are not: `flex: 0 1 auto` +
+   `min-width: 0` is what passes the pressure down to the one child with variable-width
+   content (the TOSSE task chip, which truncates), instead of the whole row spilling past
+   the window. A fixed-size button has no give and keeps its hit area — half a button
+   would be worse than a shorter caption. Order of sacrifice: the title, then that chip. */
+.wf-tbright { flex: 0 1 auto; margin-left: auto; display: flex; align-items: center; gap: 10px; min-width: 0; }
 
 .wf-body { flex: 1; display: flex; min-height: 0; }
 .wf-col  { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -230,8 +253,19 @@
 .wf-ico { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .wf-ico.sm { width: 13px; height: 13px; }
 
-/* Brand marks (filled, currentColor) — Claude sunburst + user silhouette. */
-.wf-claude, .wf-user-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
+/* Brand marks (filled, currentColor) — Claude sunburst + user silhouette + the TOSSE rose.
+   Sized here rather than via `.wf-ico`: that class is for STROKED glyphs (`fill: none`),
+   which would erase a filled logo. */
+.wf-claude, .wf-user-mark, .wf-tosse-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
+/* The rose is landscape (≈1.4:1), so matching the 13px square glyphs on WIDTH would make it
+   read smaller than its neighbours. Match their HEIGHT instead and let the width follow the
+   artwork's ratio, so the rail's icons carry the same optical weight. */
+.wf-tosse-mark.sm { width: 18px; height: 13px; }
+/* The rose is BICHROME in TOSSE's own UI: body in the text colour, north needle in the
+   brand accent. Carrying that here (rather than flattening it to one colour) is what makes
+   it read as the actual logo. Value = the CRM's dark-scheme `--logo-accent`; its body
+   follows `currentColor` like every other mark. */
+.wf-tosse-mark { --logo-accent: #e05a40; }
 /* The model picker chip wears the Claude logo, tinted with the brand coral. */
 .wf-chip .wf-claude { width: 14px; height: 14px; color: var(--wf-accent); }
 /* Codex/OpenAI brand mark — monochrome (currentColor), NO background. Inherits the
@@ -322,6 +356,8 @@
 .wf-ask-q li { font-size:12px; line-height:1.45; color:var(--wf-tx-hi); }
 .wf-ask.compact .wf-ask-q li { font-size:11.5px; }
 .wf-ask-cmd { font-size:11.5px; color:#f0cd97; background:#0e0e11; border:1px solid #4a3a22; border-radius:5px; padding:6px 9px; display:block; }
+/* Why the CLI is asking (blocked path / stated reason) — secondary to the ask itself. */
+.wf-ask-why { font-size:11.5px; line-height:1.45; color:var(--wf-tx-dim); overflow-wrap:anywhere; }
 
 /* ---- dropdown menus + compact chips ------------------------ */
 .wf-menu { position:relative; display:inline-flex; }
@@ -418,6 +454,13 @@
 
 /* mode dot in the dropdown menu */
 .cv-perm-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+/* Why "Bypass permissions" is greyed out. Sits BELOW the rows rather than inside the
+   disabled one: `.wf-mi:disabled` dims to .36 (an opacity an inner element cannot climb
+   back out of) and takes no pointer events, so neither a hint nor a title would read.
+   Wraps — unlike .wf-mi-t/.wf-mi-h, this is a sentence, so it gets a width to wrap in
+   instead of stretching the popover. */
+.cv-perm-note { max-width:212px; margin:4px 6px 2px; padding-top:6px; border-top:1px solid var(--wf-line);
+  font-size:10px; line-height:1.35; color:var(--wf-tx-lo); white-space:normal; }
 
 @media (prefers-reduced-motion: reduce) {
   .wf-eff-fill, .wf-eff-thumb { transition:none; }

@@ -71,6 +71,50 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
+   *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
+   *  associate it by hand). Clicking it opens that repository's TOSSE card. ON by default.
+   *  Off → the header looks exactly as it did before the feature, and the association is
+   *  not even computed (no repository list fetched, no git remote read). Nothing shows in
+   *  either case when TOSSE is not connected. Read by {@link TosseRepoBadge}. */
+  tosseRepoBadge: boolean;
+
+  /** Warn before deleting a conversation that is linked to a TOSSE task in « En cours »
+   *  or « Review ». ON by default — the delete is otherwise friction-free (one click,
+   *  ⌘Z to undo), and dropping the conversation someone's live task is being worked in
+   *  deserves a question. Off → linked conversations delete like any other (a RUNNING
+   *  conversation still asks: that guard is about killing a live session, not about
+   *  TOSSE). Read by {@link deleteReason}; the status compared is the one stored ON the
+   *  conversation, so the warning still works offline. */
+  tosseTaskDeleteWarning: boolean;
+
+  /** Show the TOSSE tasks view — the third top-level view (⌘3), listing the CRM's projects
+   *  by client. ON by default. Off → the tab disappears and the view is never mounted, so
+   *  the briefing is not fetched either. Note this preference only ever MATTERS while
+   *  signed in to TOSSE: signed out, the tab is absent regardless (an empty shell would be
+   *  worse than no tab, per the feature's spec). Read by {@link App}. */
+  tosseTasksView: boolean;
+
+  /** Fetch a client's mark from Google's favicon service when the CRM holds no uploaded
+   *  logo for it.
+   *
+   *  ⚠️ **OFF by default, and that default is the point.** Turning it on sends every such
+   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP to
+   *  `google.com/s2/favicons`, one request per client shown.
+   *
+   *  It is not the app's only call to that service ({@link webResultFaviconUrl} resolves
+   *  one per web-search result chip, and always has). What is different here is the
+   *  DATA, which is why only this one is a choice: a search result is a public site the
+   *  model just visited, whereas these domains are who Tosse works for. The CRM's own web
+   *  page resolves them the same way, so switching this on only matches what the browser
+   *  already does — but a desktop app that sits open all day should not make that call on
+   *  the strength of a default nobody chose.
+   *
+   *  Off → the cascade stops at the CRM's uploaded logo, then the client's initials on a
+   *  colour derived from its name (no network, and already what most clients show).
+   *  Read by {@link ClientAvatar}. */
+  tosseClientFavicons: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -144,6 +188,11 @@ const DEFAULTS: DisplayPrefs = {
   showLastMessagePreview: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseRepoBadge: true,
+  tosseTasksView: true,
+  tosseTaskDeleteWarning: true,
+  // OFF: the only preference here that sends CRM data to a third party (see its doc).
+  tosseClientFavicons: false,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -196,6 +245,10 @@ export const useDisplay = create<DisplayState>((set) => ({
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
+        tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
+        tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,

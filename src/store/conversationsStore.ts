@@ -36,6 +36,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
+import { bypassPermissionsAllowed } from "./permissions";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
@@ -138,6 +139,15 @@ export interface Conversation {
    * worktree indicator/badge so they follow the agent. Cleared on `ExitWorktree`.
    */
   liveCwd: string | null;
+  /**
+   * Whether the LIVE process was spawned with `--allow-dangerously-skip-permissions`,
+   * i.e. whether it can actually honour "Bypass permissions". In-memory ONLY, and only
+   * meaningful while {@link handle} is set: the flag exists solely at spawn, so a
+   * session started before the user opted in can never gain it — it must be restarted.
+   * The composer reads this to grey out the Bypass choice (with the reason) instead of
+   * offering a pick the CLI would silently downgrade to `default`.
+   */
+  bypassAllowed: boolean;
   // ---- Per-conversation controls (persisted) -------------------------------
   // Last-known model / effort / ultracode / permission, persisted so they survive
   // a restart and are re-applied at the next (lazy) spawn. While a session is LIVE,
@@ -172,6 +182,32 @@ export interface Conversation {
    * (permission / questionnaire) — those exist only while live.
    */
   pendingReminder: ReminderKind | null;
+  /**
+   * The TOSSE task this conversation was started on (from the tasks view's "Start" /
+   * "Discuss"), or null for every conversation created any other way. PERSISTED.
+   *
+   * It is what makes a second click on that task REOPEN this conversation instead of
+   * starting a second agent on the same work — the thing the tasks view exists to
+   * prevent.
+   */
+  tosseTaskId: string | null;
+  /**
+   * The linked task's title and status as of the last time the CRM could be read.
+   * PERSISTED — deliberately DENORMALISED: the id alone leaves a linked conversation
+   * mute offline (no name to show, no status), and the delete warning is a function of
+   * precisely that status, so it would stop warning exactly when the network is down.
+   * Both null when nothing is linked. Refreshed by {@link refreshLinkedTaskMeta}.
+   */
+  tosseTaskTitle: string | null;
+  tosseTaskStatus: string | null;
+}
+
+/** A TOSSE task as a conversation remembers it — the denormalised trio, kept together
+ *  so linking and refreshing can't set one without the others. */
+export interface LinkedTosseTask {
+  id: string;
+  title: string;
+  status: string;
 }
 
 /** Coerce a persisted (untyped) reminder string back to the union, defaulting any
@@ -261,6 +297,9 @@ const convToRecord = (c: Conversation): ConversationRecord => ({
   pending_reminder: c.pendingReminder,
   clean_output: c.cleanOutput,
   backend: c.kind,
+  tosse_task_id: c.tosseTaskId,
+  tosse_task_title: c.tosseTaskTitle,
+  tosse_task_status: c.tosseTaskStatus,
 });
 
 const recordToRepo = (r: RepoRecord): Repo => ({
@@ -279,6 +318,7 @@ const recordToConv = (c: ConversationRecord): Conversation => ({
   sessionId: c.session_id,
   handle: null,
   liveCwd: null,
+  bypassAllowed: false,
   model: c.model,
   effort: c.effort,
   ultracode: c.ultracode,
@@ -287,6 +327,9 @@ const recordToConv = (c: ConversationRecord): Conversation => ({
   cleanOutput: c.clean_output,
   // Defensive: any unexpected/legacy value decodes to "claude" (the default backend).
   kind: c.backend === "codex" ? "codex" : "claude",
+  tosseTaskId: c.tosse_task_id,
+  tosseTaskTitle: c.tosse_task_title,
+  tosseTaskStatus: c.tosse_task_status,
 });
 
 // The one user-facing message for any persistence failure (deduped in the banner),
@@ -366,7 +409,7 @@ interface ConversationsState {
   /** Store Claude's session_id on the conversation for --resume (keyed by stable id). */
   noteSessionId: (id: string, sessionId: string) => void;
   /** Bind a conversation (by stable id) to its live Rust session handle. In-memory only. */
-  setHandle: (id: string, handle: string | null) => void;
+  setHandle: (id: string, handle: string | null, bypassAllowed?: boolean) => void;
   /** Set/clear the worktree the session moved into (EnterWorktree/ExitWorktree). In-memory only. */
   setLiveCwd: (id: string, cwd: string | null) => void;
   /** Repoint a conversation's working directory (e.g. into a freshly created worktree) and persist it. */
@@ -416,6 +459,15 @@ interface ConversationsState {
    * Armed from the live status on a finished turn; cleared on "Seen" / next message.
    */
   setReminder: (id: string, reminder: ReminderKind | null) => void;
+  /**
+   * Link this conversation to a TOSSE task (or unlink it with null). Persisted with
+   * the task's title and status alongside its id — see {@link Conversation.tosseTaskTitle}.
+   *
+   * Written once, when the tasks view opens a conversation on a task. A conversation
+   * is never re-linked to a DIFFERENT task afterwards: the view reopens the existing
+   * one instead, so one task keeps one agent.
+   */
+  linkConversationToTask: (id: string, task: LinkedTosseTask | null) => void;
 }
 
 export const useConversationsStore = create<ConversationsState>()((set, get) => ({
@@ -684,9 +736,14 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     );
   },
 
-  setHandle: (id, handle) =>
+  // `bypassAllowed` is a property of the PROCESS just spawned (it carries the unlock
+  // flag or it doesn't), so it is set here alongside the handle and cleared with it: a
+  // conversation with no live process has nothing to allow.
+  setHandle: (id, handle, bypassAllowed = false) =>
     set((s) => ({
-      conversations: s.conversations.map((c) => (c.id === id ? { ...c, handle } : c)),
+      conversations: s.conversations.map((c) =>
+        c.id === id ? { ...c, handle, bypassAllowed: handle ? bypassAllowed : false } : c,
+      ),
     })),
 
   setLiveCwd: (id, cwd) =>
@@ -803,7 +860,59 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
     syncToCore("upsertConversation(reminder)", () => commands.upsertConversation(convToRecord(updated)));
   },
+
+  linkConversationToTask: (id, task) => {
+    const conv = get().conversations.find((c) => c.id === id);
+    if (!conv) return;
+    const updated = {
+      ...conv,
+      tosseTaskId: task?.id ?? null,
+      tosseTaskTitle: task?.title ?? null,
+      tosseTaskStatus: task?.status ?? null,
+    };
+    // Idempotent: linking the same task twice must not queue a redundant write (the
+    // tasks view calls this on every "Start", including the ones that reopen).
+    if (
+      conv.tosseTaskId === updated.tosseTaskId &&
+      conv.tosseTaskTitle === updated.tosseTaskTitle &&
+      conv.tosseTaskStatus === updated.tosseTaskStatus
+    ) {
+      return;
+    }
+    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+    syncToCore("upsertConversation(tosseTask)", () =>
+      commands.upsertConversation(convToRecord(updated)),
+    );
+  },
 }));
+
+/**
+ * Re-stamp every linked conversation with its task's CURRENT title and status.
+ *
+ * Called whenever the CRM has just been read (the tasks view's briefing / backlog), so
+ * the denormalised copy tracks reality while there IS a network — and stays legible,
+ * frozen at its last-known value, when there is not. A task the CRM no longer returns
+ * is deliberately LEFT ALONE rather than blanked: the briefing omits whole categories
+ * of tasks on purpose (done, backlog, parked), and treating "absent from this payload"
+ * as "gone" would erase the link the moment a task is finished — exactly when the user
+ * still wants to see which conversation did it.
+ *
+ * Returns the number of conversations actually re-stamped (0 = nothing to do), which
+ * is what makes it cheap to call on every refetch.
+ */
+export function refreshLinkedTaskMeta(tasks: LinkedTosseTask[]): number {
+  if (tasks.length === 0) return 0;
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const store = useConversationsStore.getState();
+  const stale = store.conversations.filter((c) => {
+    const task = c.tosseTaskId ? byId.get(c.tosseTaskId) : undefined;
+    return task != null && (task.title !== c.tosseTaskTitle || task.status !== c.tosseTaskStatus);
+  });
+  for (const conv of stale) {
+    store.linkConversationToTask(conv.id, byId.get(conv.tosseTaskId!)!);
+  }
+  return stale.length;
+}
 
 /**
  * Create a new conversation in `repoPath` (registering the repo if new) with a
@@ -833,6 +942,7 @@ export function createConversationInRepo(
     sessionId: null,
     handle: null, // no live process until the first message
     liveCwd: null,
+    bypassAllowed: false,
     // Seed the backend's own default model so a Codex conversation never carries a
     // Claude alias (which its binary would reject at thread/start).
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
@@ -845,6 +955,11 @@ export function createConversationInRepo(
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // Not started from the TOSSE tasks view: that surface links the conversation
+    // itself, right after creating it (linkConversationToTask).
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -876,6 +991,7 @@ export function createConversationInWorktree(
     sessionId: null,
     handle: null, // no live process until the first message
     liveCwd: null,
+    bypassAllowed: false,
     // Seed the backend's own default model so a Codex conversation never carries a
     // Claude alias (which its binary would reject at thread/start).
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
@@ -888,6 +1004,11 @@ export function createConversationInWorktree(
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // Not started from the TOSSE tasks view: that surface links the conversation
+    // itself, right after creating it (linkConversationToTask).
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -959,6 +1080,7 @@ export function reactivateDiskConversation(d: DiskConversation): string {
     sessionId: d.session_id,
     handle: null, // no live process until the first message (lazy)
     liveCwd: null,
+    bypassAllowed: false,
     model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
     effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
     ultracode: false,
@@ -968,6 +1090,12 @@ export function reactivateDiskConversation(d: DiskConversation): string {
     // explicit per-conversation override.
     cleanOutput: null,
     kind,
+    // A conversation brought back from disk gets a FRESH stable id — the row that
+    // carried any TOSSE link was forgotten with the old one, and the transcript holds
+    // no trace of it. Relinking is a click away in the tasks view.
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -999,6 +1127,7 @@ export function materializeCodexBranch(
     sessionId: forkThreadId,
     handle: null,
     liveCwd: null,
+    bypassAllowed: false,
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
     model: forkModel ?? source.model ?? DEFAULT_CODEX_MODEL,
     effort: source.effort ?? DEFAULT_CODEX_EFFORT,
@@ -1007,6 +1136,13 @@ export function materializeCodexBranch(
     pendingReminder: null,
     cleanOutput: null,
     kind: "codex",
+    // A fork deliberately does NOT inherit the source's TOSSE link: one task keeps one
+    // conversation, so two rows claiming the same task would make "reopen the linked
+    // conversation" ambiguous. Link the branch by hand from the tasks view if it is the
+    // one that should carry the work.
+    tosseTaskId: null,
+    tosseTaskTitle: null,
+    tosseTaskStatus: null,
   });
   return id;
 }
@@ -1125,6 +1261,11 @@ export async function ensureConversationSession(
     // setConvBackend spawning guard: whatever kind spawns is the kind persisted).
     const atSpawn =
       useConversationsStore.getState().conversations.find((c) => c.id === convId) ?? before;
+    // App-wide opt-in, read at spawn (the ONLY moment it can be applied): it unlocks
+    // "Bypass permissions" as a choosable mode for this process without enabling it.
+    // Remembered on the conversation below so the composer knows what this live session
+    // can actually honour.
+    const allowBypass = bypassPermissionsAllowed();
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1134,6 +1275,7 @@ export async function ensureConversationSession(
       atSpawn.ultracode,
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
+      allowBypass,
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1168,11 +1310,12 @@ export async function ensureConversationSession(
           atSpawn.ultracode,
           // Same backend on the fresh-worktree re-spawn.
           atSpawn.kind,
+          allowBypass,
         );
       }
     }
     if (res.status !== "ok") throw new Error(res.error);
-    useConversationsStore.getState().setHandle(convId, res.data);
+    useConversationsStore.getState().setHandle(convId, res.data, allowBypass);
     return res.data;
   })();
   spawning.set(convId, promise);
@@ -1236,6 +1379,23 @@ export async function startConversationSession(convId: string): Promise<string> 
 export async function restartConversationSession(convId: string): Promise<string> {
   await stopConversationSession(convId);
   return startConversationSession(convId);
+}
+
+/**
+ * Put every conversation still set to "Bypass permissions" back to `default` — called
+ * when the app-wide opt-in is turned OFF (Settings → General → Permissions).
+ *
+ * Withdrawing the permission to bypass has to take effect NOW, not at the next spawn:
+ * a live session already running in bypass would otherwise keep skipping every prompt
+ * until it is restarted, while the setting claims bypass is off. `setConvPermission`
+ * both persists the demotion and pushes it to the live stream, so the two agree.
+ * Conversations already on another mode are untouched (it is idempotent).
+ */
+export function demoteBypassConversations(): void {
+  const store = useConversationsStore.getState();
+  for (const c of store.conversations) {
+    if (c.permissionMode === "bypassPermissions") store.setConvPermission(c.id, "default");
+  }
 }
 
 // Conversations whose on-disk transcript has already been replayed this run.
@@ -1578,6 +1738,38 @@ export const useConversations = () =>
   useConversationsStore(useShallow((s) => s.conversations));
 export const useRepos = () => useConversationsStore(useShallow((s) => s.repos));
 export const useActiveConversationId = () => useConversationsStore((s) => s.activeId);
+
+/**
+ * Every conversation opened on a TOSSE task, most recently active FIRST.
+ *
+ * A task can carry several: a first pass, a second opinion, a retry after a rewind. The
+ * ordering is what makes "open the one on this task" unambiguous when there are several —
+ * the one being worked in is the one you meant.
+ */
+export function conversationsForTask(
+  conversations: Conversation[],
+  taskId: string | null | undefined,
+): Conversation[] {
+  if (!taskId) return [];
+  return conversations
+    .filter((c) => c.tosseTaskId === taskId)
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+}
+
+/** The most recently active conversation on a task, or null. */
+export function conversationForTask(
+  conversations: Conversation[],
+  taskId: string | null | undefined,
+): Conversation | null {
+  return conversationsForTask(conversations, taskId)[0] ?? null;
+}
+
+/** Every conversation on `taskId`, live from the store (most recent first). */
+export function useConversationsForTask(taskId: string | null | undefined): Conversation[] {
+  return useConversationsStore(
+    useShallow((s) => conversationsForTask(s.conversations, taskId)),
+  );
+}
 
 /** The repo (working folder) a conversation belongs to. */
 export function useConversationRepo(convId: string | null): Repo | null {

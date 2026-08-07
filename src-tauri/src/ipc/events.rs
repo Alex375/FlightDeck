@@ -3,8 +3,8 @@ use specta::Type;
 use tauri_specta::Event;
 
 use crate::supervisor::model::{
-    BackgroundTask, ConversationItem, PermissionRequestPayload, RemoteControlState, SessionEmitter,
-    SessionStatePayload, SlashCommand,
+    BackgroundTask, ConversationItem, PermissionRequestPayload, PermissionResolvedPayload,
+    RemoteControlState, SessionEmitter, SessionStatePayload, SlashCommand,
 };
 use crate::usage::PlanUsage;
 
@@ -35,6 +35,15 @@ pub struct SessionMessageEvent {
 pub struct SessionPermissionEvent {
     pub session: String,
     pub request: PermissionRequestPayload,
+}
+
+/// A pending permission prompt was withdrawn by the CLI and can no longer be
+/// answered. The UI drops the card: it otherwise prunes only on a user answer,
+/// leaving a dead prompt on screen that silently swallows the next click.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct SessionPermissionResolvedEvent {
+    pub session: String,
+    pub request_id: String,
 }
 
 /// The session's available slash commands (one-shot, at `initialize`). Drives the
@@ -195,6 +204,13 @@ impl SessionEmitter for TauriEmitter {
         emit_logged(&self.app, "session_permission", SessionPermissionEvent {
             session: session.to_string(),
             request: request.clone(),
+        });
+    }
+
+    fn emit_permission_resolved(&self, session: &str, resolved: &PermissionResolvedPayload) {
+        emit_logged(&self.app, "session_permission_resolved", SessionPermissionResolvedEvent {
+            session: session.to_string(),
+            request_id: resolved.request_id.clone(),
         });
     }
 

@@ -20,13 +20,15 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::model::{ConversationRecord, PersistedState, RepoRecord};
+use super::model::{
+    ConversationRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
+};
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -47,7 +49,16 @@ type Migration = fn(&Connection) -> rusqlite::Result<()>;
 /// OFF — and that pragma is a NO-OP inside a transaction. Since the runner wraps
 /// each migration in one, such a migration must toggle foreign-key enforcement
 /// outside it; do not assume you can flip it from inside a `migrate_vN` body.
-const MIGRATIONS: &[Migration] = &[migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5];
+const MIGRATIONS: &[Migration] = &[
+    migrate_v1,
+    migrate_v2,
+    migrate_v3,
+    migrate_v4,
+    migrate_v5,
+    migrate_v6,
+    migrate_v7,
+    migrate_v8,
+];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
@@ -192,6 +203,81 @@ fn migrate_v5(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v6 — the TOSSE repository a local folder is pinned to, when the user picked one
+/// by hand. NULL (the default for every existing row) means "no manual choice": the
+/// app then derives the link from the folder's git remote, so nothing changes for a
+/// user who never opens the feature — or who never connects to TOSSE at all.
+///
+/// It lives in SQLite rather than in the `tosse:display` localStorage prefs because
+/// it records a decision about a repository, not a display preference: it must
+/// survive a settings reset and belongs next to the row it qualifies.
+///
+/// ⚠️ Deliberately NOT a foreign key: the id belongs to another system (the CRM's
+/// database), so nothing local can enforce it, and a repository deleted server-side
+/// must degrade to "the repository you picked is gone" rather than corrupt the row.
+fn migrate_v6(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "tosse_repository_id",
+        "ALTER TABLE repos ADD COLUMN tosse_repository_id TEXT",
+    )
+}
+
+/// v7 — the TOSSE task a conversation was started on, plus that task's title and
+/// status as they stood when the link was made. NULL (every existing row) means the
+/// conversation was not started from the tasks view, which is the unchanged default.
+///
+/// The two denormalised columns are not a cache for speed: they are what keeps a
+/// linked conversation legible with no network. The delete warning is a function of
+/// the task's STATUS, so storing the id alone would make that warning quietly stop
+/// warning while offline — see [`super::model::ConversationRecord::tosse_task_title`].
+///
+/// ⚠️ Deliberately NOT foreign keys: the ids belong to the CRM's database, so nothing
+/// local can enforce them, and a task deleted server-side must degrade to a stale
+/// title rather than corrupt the row.
+fn migrate_v7(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "tosse_task_id",
+        "ALTER TABLE conversations ADD COLUMN tosse_task_id TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "tosse_task_title",
+        "ALTER TABLE conversations ADD COLUMN tosse_task_title TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "tosse_task_status",
+        "ALTER TABLE conversations ADD COLUMN tosse_task_status TEXT",
+    )?;
+    Ok(())
+}
+
+/// v8 — which local folder a TOSSE PROJECT's work happens in.
+///
+/// Its own table rather than a column, because the key is a CRM project id: there is
+/// no local row it could hang off (a project may resolve to a folder the CRM knows
+/// nothing about, and most of them — 15 of 26 measured on real data — resolve to
+/// none at all until the user points at one).
+///
+/// Keyed by project, not by task: every task of a project is worked on in the same
+/// folder, so the question is asked once. `ON DELETE CASCADE` on `repo_id` means
+/// removing a folder from Flight Deck takes its project pins with it, instead of
+/// leaving rows pointing at a repo that no longer exists.
+fn migrate_v8(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tosse_project_repos (
+             project_id TEXT PRIMARY KEY,
+             repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE
+         );",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -303,7 +389,8 @@ impl Store {
         let mut conv_stmt = conn.prepare(
             "SELECT id, name, repo_id, cwd, created_at, last_activity_at, session_id,
                     model, effort, ultracode, permission_mode, pending_reminder, clean_output,
-                    COALESCE(backend, 'claude')
+                    COALESCE(backend, 'claude'),
+                    tosse_task_id, tosse_task_title, tosse_task_status
              FROM conversations ORDER BY created_at ASC",
         )?;
         let conversations = conv_stmt
@@ -324,6 +411,9 @@ impl Store {
                     clean_output: row.get(12)?,
                     // NULL (pre-v5 rows) is COALESCEd to "claude" in SQL above.
                     backend: row.get(13)?,
+                    tosse_task_id: row.get(14)?,
+                    tosse_task_title: row.get(15)?,
+                    tosse_task_status: row.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -353,6 +443,87 @@ impl Store {
         Ok(())
     }
 
+    /// Every repo with the TOSSE repository it is pinned to, if any. Feeds the
+    /// association matcher, which also needs `path` to read each folder's git remote.
+    pub fn repo_tosse_links(&self) -> rusqlite::Result<Vec<RepoTosseLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, path, tosse_repository_id FROM repos ORDER BY added_at ASC")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RepoTosseLink {
+                    repo_id: row.get(0)?,
+                    path: row.get(1)?,
+                    tosse_repository_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Pin a repo to a TOSSE repository, or clear the pin with `None`.
+    ///
+    /// The ONLY writer of that column — see [`RepoTosseLink`] for why it is not part of
+    /// the record `upsert_repo` writes. Returns the number of rows touched so the caller
+    /// can tell "cleared" from "that repo does not exist" instead of reporting success.
+    pub fn set_repo_tosse_link(
+        &self,
+        repo_id: &str,
+        repository_id: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE repos SET tosse_repository_id = ?2 WHERE id = ?1",
+            params![repo_id, repository_id],
+        )
+    }
+
+    /// Every TOSSE project pinned to a local folder. The whole table in one read —
+    /// there are a handful of rows at most, and the resolver needs all of them to
+    /// answer "where does this task's project live" without a round-trip per task.
+    pub fn tosse_project_repos(&self) -> rusqlite::Result<Vec<TosseProjectRepo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT project_id, repo_id FROM tosse_project_repos")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TosseProjectRepo {
+                    project_id: row.get(0)?,
+                    repo_id: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Pin a TOSSE project to a local folder, or forget the pin with `None`.
+    ///
+    /// Returns whether a row now exists for the project, so the caller can tell a
+    /// stored pin from a write the database refused instead of reporting success.
+    /// A pin to a repo that does not exist is rejected by the foreign key.
+    pub fn set_tosse_project_repo(
+        &self,
+        project_id: &str,
+        repo_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        match repo_id {
+            Some(repo_id) => {
+                conn.execute(
+                    "INSERT INTO tosse_project_repos (project_id, repo_id) VALUES (?1, ?2)
+                     ON CONFLICT(project_id) DO UPDATE SET repo_id = excluded.repo_id",
+                    params![project_id, repo_id],
+                )?;
+                Ok(true)
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM tosse_project_repos WHERE project_id = ?1",
+                    params![project_id],
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Delete a repo; its conversations cascade away via the FK.
     pub fn delete_repo(&self, id: &str) -> rusqlite::Result<()> {
         self.conn
@@ -367,22 +538,26 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO conversations
                  (id, name, repo_id, cwd, created_at, last_activity_at, session_id,
-                  model, effort, ultracode, permission_mode, pending_reminder, clean_output, backend)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                  model, effort, ultracode, permission_mode, pending_reminder, clean_output, backend,
+                  tosse_task_id, tosse_task_title, tosse_task_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
-                 name             = excluded.name,
-                 repo_id          = excluded.repo_id,
-                 cwd              = excluded.cwd,
-                 created_at       = excluded.created_at,
-                 last_activity_at = excluded.last_activity_at,
-                 session_id       = excluded.session_id,
-                 model            = excluded.model,
-                 effort           = excluded.effort,
-                 ultracode        = excluded.ultracode,
-                 permission_mode  = excluded.permission_mode,
-                 pending_reminder = excluded.pending_reminder,
-                 clean_output     = excluded.clean_output,
-                 backend          = excluded.backend",
+                 name              = excluded.name,
+                 repo_id           = excluded.repo_id,
+                 cwd               = excluded.cwd,
+                 created_at        = excluded.created_at,
+                 last_activity_at  = excluded.last_activity_at,
+                 session_id        = excluded.session_id,
+                 model             = excluded.model,
+                 effort            = excluded.effort,
+                 ultracode         = excluded.ultracode,
+                 permission_mode   = excluded.permission_mode,
+                 pending_reminder  = excluded.pending_reminder,
+                 clean_output      = excluded.clean_output,
+                 backend           = excluded.backend,
+                 tosse_task_id     = excluded.tosse_task_id,
+                 tosse_task_title  = excluded.tosse_task_title,
+                 tosse_task_status = excluded.tosse_task_status",
             params![
                 c.id,
                 c.name,
@@ -397,7 +572,10 @@ impl Store {
                 c.permission_mode,
                 c.pending_reminder,
                 c.clean_output,
-                c.backend
+                c.backend,
+                c.tosse_task_id,
+                c.tosse_task_title,
+                c.tosse_task_status
             ],
         )?;
         Ok(())
@@ -485,6 +663,7 @@ impl Store {
     pub fn wipe_all(&self) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute_batch(
             "DELETE FROM conversations;
+             DELETE FROM tosse_project_repos;
              DELETE FROM repos;
              DELETE FROM meta WHERE key = 'active_id';",
         )?;
@@ -544,6 +723,11 @@ mod tests {
             permission_mode: None,
             pending_reminder: None,
             clean_output: None,
+            // Default helper conversations were not started from the TOSSE tasks view
+            // — the state every conversation is in unless the user starts one there.
+            tosse_task_id: None,
+            tosse_task_title: None,
+            tosse_task_status: None,
         }
     }
 
@@ -681,6 +865,108 @@ mod tests {
         c.clean_output = None;
         store.upsert_conversation(&c).unwrap();
         assert_eq!(store.load_state().unwrap().conversations[0].clean_output, None);
+    }
+
+    #[test]
+    fn tosse_link_round_trips_and_survives_a_repo_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        // Unset by default — a user who never touches the feature has no association.
+        assert_eq!(store.repo_tosse_links().unwrap()[0].tosse_repository_id, None);
+
+        assert_eq!(store.set_repo_tosse_link("r1", Some("crm-abc")).unwrap(), 1);
+        assert_eq!(
+            store.repo_tosse_links().unwrap()[0].tosse_repository_id.as_deref(),
+            Some("crm-abc")
+        );
+
+        // The regression this column is shaped to avoid: re-upserting the repo (adding
+        // the same folder again, an undo, a path fix) must NOT blank the association.
+        store.upsert_repo(&repo("r1")).unwrap();
+        assert_eq!(
+            store.repo_tosse_links().unwrap()[0].tosse_repository_id.as_deref(),
+            Some("crm-abc"),
+            "upsert_repo must not clear a link it knows nothing about"
+        );
+
+        // Clearing is explicit, and only ever via its own call.
+        assert_eq!(store.set_repo_tosse_link("r1", None).unwrap(), 1);
+        assert_eq!(store.repo_tosse_links().unwrap()[0].tosse_repository_id, None);
+
+        // A repo that does not exist reports zero rows rather than a silent success.
+        assert_eq!(store.set_repo_tosse_link("ghost", Some("x")).unwrap(), 0);
+    }
+
+    #[test]
+    fn tosse_task_link_round_trips_with_its_denormalised_title_and_status() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        let mut c = conv("c1", "r1", None);
+        // Unlinked by default — a conversation started any other way carries nothing.
+        store.upsert_conversation(&c).unwrap();
+        let loaded = &store.load_state().unwrap().conversations[0];
+        assert_eq!(loaded.tosse_task_id, None);
+        assert_eq!(loaded.tosse_task_title, None);
+        assert_eq!(loaded.tosse_task_status, None);
+
+        c.tosse_task_id = Some("task-42".into());
+        c.tosse_task_title = Some("Fix the login bug".into());
+        c.tosse_task_status = Some("En cours".into());
+        store.upsert_conversation(&c).unwrap();
+        let loaded = &store.load_state().unwrap().conversations[0];
+        assert_eq!(loaded.tosse_task_id.as_deref(), Some("task-42"));
+        // The title and status are what keep the link legible — and the delete warning
+        // working — with no network, so they must survive the round-trip too.
+        assert_eq!(loaded.tosse_task_title.as_deref(), Some("Fix the login bug"));
+        assert_eq!(loaded.tosse_task_status.as_deref(), Some("En cours"));
+
+        // Unlinking is a plain write of the same record: the CRM is never consulted.
+        c.tosse_task_id = None;
+        c.tosse_task_title = None;
+        c.tosse_task_status = None;
+        store.upsert_conversation(&c).unwrap();
+        assert_eq!(store.load_state().unwrap().conversations[0].tosse_task_id, None);
+    }
+
+    #[test]
+    fn tosse_project_repo_pins_round_trip_and_cascade_with_their_folder() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        assert!(store.tosse_project_repos().unwrap().is_empty());
+
+        assert!(store.set_tosse_project_repo("proj-1", Some("r1")).unwrap());
+        let pins = store.tosse_project_repos().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].project_id, "proj-1");
+        assert_eq!(pins[0].repo_id, "r1");
+
+        // Re-pinning the same project MOVES it rather than adding a second row: a
+        // project is worked on in one folder, and two rows would make "which one?"
+        // unanswerable.
+        store.upsert_repo(&repo("r2")).unwrap();
+        assert!(store.set_tosse_project_repo("proj-1", Some("r2")).unwrap());
+        let pins = store.tosse_project_repos().unwrap();
+        assert_eq!(pins.len(), 1, "one pin per project");
+        assert_eq!(pins[0].repo_id, "r2");
+
+        // Clearing is explicit and reports that no pin remains.
+        assert!(!store.set_tosse_project_repo("proj-1", None).unwrap());
+        assert!(store.tosse_project_repos().unwrap().is_empty());
+
+        // A folder removed from Flight Deck takes its project pins with it, instead of
+        // leaving rows pointing at a repo that is gone.
+        store.set_tosse_project_repo("proj-2", Some("r2")).unwrap();
+        store.delete_repo("r2").unwrap();
+        assert!(store.tosse_project_repos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinning_a_project_to_an_unknown_folder_is_refused() {
+        // The foreign key is the guard: reporting success here would store a pin that
+        // resolves to nothing, and the view would then offer to open a folder that does
+        // not exist.
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.set_tosse_project_repo("proj-1", Some("ghost")).is_err());
     }
 
     #[test]

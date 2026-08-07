@@ -27,14 +27,19 @@ vi.mock("../ipc/client", () => {
 
 import { commands } from "../ipc/client";
 import type { DiskConversation } from "../ipc/client";
+import { usePermissionPrefs } from "./permissions";
 import {
   acknowledgeConversation,
   createConversationInRepo,
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
+  demoteBypassConversations,
   ensureConversationSession,
   loadConversationHistory,
   reactivateDiskConversation,
+  conversationForTask,
+  conversationsForTask,
+  refreshLinkedTaskMeta,
   useConversationsStore,
   type Conversation,
 } from "./conversationsStore";
@@ -51,11 +56,15 @@ const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   sessionId: null,
   handle: null,
   liveCwd: null,
+  bypassAllowed: false,
   model: "opus",
   effort: "xhigh",
   ultracode: false,
   permissionMode: "default",
   pendingReminder: null,
+  tosseTaskId: null,
+  tosseTaskTitle: null,
+  tosseTaskStatus: null,
   cleanOutput: null,
   kind: "claude",
   ...over,
@@ -138,6 +147,52 @@ describe("conversationsStore — per-conversation controls", () => {
     // Persisted, but there is no live-stream command for a pure display pref.
     expect(commands.upsertConversation).toHaveBeenCalled();
     expect(commands.setModel).not.toHaveBeenCalled();
+    expect(commands.setPermissionMode).not.toHaveBeenCalled();
+  });
+});
+
+describe("conversationsStore — bypass-permissions unlock", () => {
+  beforeEach(() => {
+    usePermissionPrefs.setState({ allowBypassPermissions: false });
+  });
+
+  it("passes the app-wide opt-in to the spawn and remembers it on the conversation", async () => {
+    usePermissionPrefs.setState({ allowBypassPermissions: true });
+    await ensureConversationSession("c1");
+    // Last positional arg of spawnSession — the process gets the unlock flag…
+    const args = vi.mocked(commands.spawnSession).mock.calls[0];
+    expect(args[args.length - 1]).toBe(true);
+    // …and the conversation records that THIS live session can honour bypass.
+    expect(conv0().bypassAllowed).toBe(true);
+  });
+
+  it("spawns WITHOUT the flag while the opt-in is off", async () => {
+    await ensureConversationSession("c1");
+    const args = vi.mocked(commands.spawnSession).mock.calls[0];
+    expect(args[args.length - 1]).toBe(false);
+    expect(conv0().bypassAllowed).toBe(false);
+  });
+
+  it("clearing the handle clears bypassAllowed — nothing to allow with no process", async () => {
+    usePermissionPrefs.setState({ allowBypassPermissions: true });
+    await ensureConversationSession("c1");
+    expect(conv0().bypassAllowed).toBe(true);
+    useConversationsStore.getState().setHandle("c1", null);
+    expect(conv0().bypassAllowed).toBe(false);
+  });
+
+  it("demoteBypassConversations returns bypassing conversations to default, live ones included", () => {
+    seed(baseConv({ handle: "session-7", permissionMode: "bypassPermissions" }));
+    demoteBypassConversations();
+    expect(conv0().permissionMode).toBe("default");
+    // Withdrawing the permission has to bite NOW, not at the next spawn.
+    expect(commands.setPermissionMode).toHaveBeenCalledWith("session-7", "default");
+  });
+
+  it("demoteBypassConversations leaves every other mode alone", () => {
+    seed(baseConv({ handle: "session-7", permissionMode: "acceptEdits" }));
+    demoteBypassConversations();
+    expect(conv0().permissionMode).toBe("acceptEdits");
     expect(commands.setPermissionMode).not.toHaveBeenCalled();
   });
 });
@@ -498,8 +553,9 @@ describe("conversationsStore — controls applied at spawn", () => {
     );
     const handle = await ensureConversationSession("c1");
     expect(handle).toBe("session-1");
-    // (cwd, resume, model, effort, permissionMode, ultracode, backend) — the
-    // conversation's own controls + its backend, NOT the old hardcoded defaults.
+    // (cwd, resume, model, effort, permissionMode, ultracode, backend,
+    // allowBypassPermissions) — the conversation's own controls + its backend + the
+    // app-wide bypass opt-in, NOT the old hardcoded defaults.
     expect(commands.spawnSession).toHaveBeenCalledWith(
       "/tmp/r1",
       null,
@@ -508,6 +564,7 @@ describe("conversationsStore — controls applied at spawn", () => {
       "plan",
       false,
       "claude",
+      false,
     );
   });
 });
@@ -551,5 +608,71 @@ describe("reactivateDiskConversation — backend-aware", () => {
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
     expect(conv.kind).toBe("claude");
     expect(conv.model).toBe(DEFAULT_MODEL);
+  });
+});
+
+describe("conversationsStore — the TOSSE task link", () => {
+  it("stores the task with its title and status, and clears them together", () => {
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    expect(conv0().tosseTaskId).toBe("t-1");
+    // The denormalised pair is what keeps the link legible — and the delete warning
+    // working — with no network.
+    expect(conv0().tosseTaskTitle).toBe("Fix login");
+    expect(conv0().tosseTaskStatus).toBe("En cours");
+    expect(commands.upsertConversation).toHaveBeenCalled();
+
+    useConversationsStore.getState().linkConversationToTask("c1", null);
+    expect(conv0().tosseTaskId).toBeNull();
+    expect(conv0().tosseTaskTitle).toBeNull();
+    expect(conv0().tosseTaskStatus).toBeNull();
+  });
+
+  it("does not re-persist an unchanged link", () => {
+    const link = { id: "t-1", title: "Fix login", status: "En cours" };
+    useConversationsStore.getState().linkConversationToTask("c1", link);
+    vi.clearAllMocks();
+    useConversationsStore.getState().linkConversationToTask("c1", link);
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
+  });
+
+  it("lists a task's conversations, most recently active first", () => {
+    const a = baseConv({ id: "c1", tosseTaskId: "t-1", lastActivityAt: 10 });
+    const b = baseConv({ id: "c2", tosseTaskId: "t-1", lastActivityAt: 20 });
+    const other = baseConv({ id: "c3", tosseTaskId: "t-2", lastActivityAt: 30 });
+    // A task legitimately carries several (a retry, a second opinion): they are all
+    // listed, and the one being worked in comes first — that ordering is what makes
+    // "open the conversation on this task" unambiguous.
+    expect(conversationsForTask([a, b, other], "t-1").map((c) => c.id)).toEqual(["c2", "c1"]);
+    expect(conversationForTask([a, b, other], "t-1")?.id).toBe("c2");
+    expect(conversationsForTask([a, b, other], "t-9")).toEqual([]);
+    expect(conversationForTask([a], null)).toBeNull();
+  });
+
+  it("re-stamps a linked conversation when the CRM's copy moved on", () => {
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    const changed = refreshLinkedTaskMeta([
+      { id: "t-1", title: "Fix the login bug", status: "Review" },
+    ]);
+    expect(changed).toBe(1);
+    expect(conv0().tosseTaskStatus).toBe("Review");
+    expect(conv0().tosseTaskTitle).toBe("Fix the login bug");
+    // Nothing moved → nothing written.
+    expect(refreshLinkedTaskMeta([{ id: "t-1", title: "Fix the login bug", status: "Review" }])).toBe(0);
+  });
+
+  it("leaves a link alone when the task is absent from the payload", () => {
+    // The briefing deliberately omits whole categories (done, backlog, parked). Treating
+    // "absent" as "gone" would erase the link the moment a task is finished — exactly
+    // when the user still wants to know which conversation did it.
+    useConversationsStore
+      .getState()
+      .linkConversationToTask("c1", { id: "t-1", title: "Fix login", status: "En cours" });
+    expect(refreshLinkedTaskMeta([{ id: "t-other", title: "x", status: "En cours" }])).toBe(0);
+    expect(conv0().tosseTaskId).toBe("t-1");
+    expect(conv0().tosseTaskStatus).toBe("En cours");
   });
 });

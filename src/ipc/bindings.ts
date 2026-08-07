@@ -15,10 +15,15 @@ async ping(msg: string) : Promise<Pong> {
  * stream starts in EXACTLY the state the UI shows — never the old hardcoded
  * defaults. Returns our session id; conversation/state/permission events are
  * emitted on the Tauri event bus.
+ * 
+ * `allow_bypass_permissions` carries the user's app-wide opt-in (Settings → General →
+ * Permissions): it UNLOCKS `bypassPermissions` as a selectable mode for this process
+ * without turning it on. It can only be decided at spawn — a live session cannot gain
+ * it — so the front end restarts, or greys out the choice, accordingly.
  */
-async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend) : Promise<Result<string, string>> {
+async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend }) };
+    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -355,6 +360,220 @@ async accountCodexLoginCancel() : Promise<Result<null, string>> {
 async accountCodexLogout() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("account_codex_logout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The TOSSE connection state (identity when reachable). Never fails on a network
+ * outage — an offline machine still reports the session it holds.
+ */
+async tosseStatus() : Promise<Result<TosseAccountStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start a TOSSE sign-in: returns the authorization URL to open. The flow completes
+ * ASYNCHRONOUSLY once the browser hits our loopback callback — the outcome lands as the
+ * app-global [`AccountLoginEvent`] with `backend: "tosse"`, exactly like the Codex login.
+ */
+async tosseLoginStart() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_login_start") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Abort the in-flight TOSSE sign-in (drops the loopback listener). Safe when none runs.
+ */
+async tosseLoginCancel() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_login_cancel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Sign out of TOSSE: revokes the session server-side (best effort) and clears the local
+ * tokens. Errs only when revocation failed — the local sign-out has happened either way.
+ */
+async tosseLogout() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_logout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pair every Flight Deck folder with the TOSSE repository it belongs to.
+ * 
+ * A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's
+ * urls (normalized — see [`crate::git::normalize_remote_url`]). Names are NEVER matched.
+ */
+async tosseRepoLinks() : Promise<Result<TosseRepoLinksPayload, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_repo_links") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
+ * 
+ * Local only — the CRM has no field for a machine path, and this is never written back.
+ */
+async tosseLinkRepository(repoId: string, repositoryId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_link_repository", { repoId, repositoryId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Which local folder each TOSSE project's work happens in, as the user pinned it.
+ * 
+ * Local only, and deliberately so: the CRM holds no field for a machine path, and a
+ * path on this Mac would mean nothing on a colleague's. Read as a whole — there are a
+ * handful of pins at most, and the tasks view needs all of them to resolve any task.
+ */
+async tosseProjectRepos() : Promise<Result<TosseProjectRepo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_project_repos") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pin a TOSSE project to a local folder, or forget the pin with `None`.
+ * 
+ * Keyed by PROJECT, not by task: every task of a project is worked on in the same
+ * folder, so the question is asked once and the answer reused. Always reversible from
+ * the project's card.
+ */
+async tosseLinkProjectRepo(projectId: string, repoId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_link_project_repo", { projectId, repoId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Find the clones already on this Mac whose `origin` matches one of `urls`.
+ * 
+ * The caller passes the CRM urls of the project's repositories — they are already in the
+ * front's cached payload, so this needs no network of its own and stays a pure local
+ * question. Only MATCHES come back: the app has no business shipping an inventory of
+ * every repository on the disk to the webview.
+ * 
+ * Measured on a real home directory: ~130 ms for 49 repositories. Cheap because it reads
+ * `.git/config` instead of spawning `git` per folder, and never descends into a
+ * repository or a dependency tree. Runs off the async runtime all the same.
+ */
+async scanLocalGitRepos(urls: string[]) : Promise<Result<LocalRepoScan, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("scan_local_git_repos", { urls }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Everything the TOSSE view reads, in one call (`GET /api/v1/briefing/morning`).
+ * 
+ * The CRM assembles this shape for its own Briefing page — active projects with their
+ * client, their open tasks and their progress counts — so the view reads that instead of
+ * stitching `/clients` + `/projects` + `/tasks` together and re-deriving it.
+ */
+async tosseBriefing() : Promise<Result<TosseBriefing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_briefing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
+ * the view can offer them as a section of their own — see `tosse::backlog`.
+ */
+async tosseBacklog() : Promise<Result<TosseBacklogTask[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_backlog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to
+ * the CRM for everything it deliberately does not edit (title, priority, assignee, due
+ * date, deletion). Discovered, not hard-coded — see `tosse::web_url`.
+ */
+async tosseWebUrl() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_web_url") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * One task in full — the Markdown fields and relations the briefing leaves out. Fetched
+ * when a row is actually opened, never for a list.
+ */
+async tosseTaskDetail(taskId: string) : Promise<Result<TosseTaskDetail, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_task_detail", { taskId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move a task to another status.
+ * 
+ * ⚠️ `"Fait"` is reachable from here, and that is deliberate: the repo's rule is that no
+ * AGENT closes a task, and this command only ever runs because a human clicked a status in
+ * the UI. Nothing in the agent surface calls it.
+ */
+async tosseSetTaskStatus(taskId: string, status: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_task_status", { taskId, status }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move a project to another status — the Start / Pause / Finish control on a project card.
+ */
+async tosseSetProjectStatus(projectId: string, status: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_project_status", { projectId, status }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a task in a project, with the status of the group it was typed into.
+ */
+async tosseCreateTask(projectId: string, title: string, status: string, kind: string | null, priority: string | null, assignedTo: string | null) : Promise<Result<TosseTask, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_create_task", { projectId, title, status, kind, priority, assignedTo }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -995,7 +1214,7 @@ async setAllMarketplacesAutoUpdate(enabled: boolean) : Promise<Result<null, stri
  * null, refreshes all. Shells out to the `claude` CLI off the async runtime; a
  * refresh can take a few seconds (git fetches).
  */
-async refreshPluginMarketplaces(name: string | null) : Promise<Result<null, string>> {
+async refreshPluginMarketplaces(name: string | null) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("refresh_plugin_marketplaces", { name }) };
 } catch (e) {
@@ -1011,7 +1230,7 @@ async refreshPluginMarketplaces(name: string | null) : Promise<Result<null, stri
  * LIVE session should follow with `reload_plugins` to hot-apply; otherwise the new
  * version is picked up on the next session spawn. Shells out off the async runtime.
  */
-async updatePlugin(pluginId: string, scope: string | null, path: string) : Promise<Result<null, string>> {
+async updatePlugin(pluginId: string, scope: string | null, path: string) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_plugin", { pluginId, scope, path }) };
 } catch (e) {
@@ -1495,6 +1714,7 @@ sessionCommandsEvent: SessionCommandsEvent,
 sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
+sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
@@ -1512,6 +1732,7 @@ sessionCommandsEvent: "session-commands-event",
 sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
+sessionPermissionResolvedEvent: "session-permission-resolved-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
@@ -2115,7 +2336,26 @@ clean_output: boolean | null;
  * part of the derived `AgentStatus` (see the front's `agent/status.ts`), the
  * single thing that, when off, can't be re-derived from the on-disk transcript.
  */
-pending_reminder: string | null }
+pending_reminder: string | null; 
+/**
+ * The TOSSE task this conversation was opened on, when it was started from the
+ * tasks view ("Start" / "Discuss"). `None` for every conversation created any
+ * other way — which is most of them, and stays the unchanged default.
+ * 
+ * It is what makes a second click REOPEN the conversation instead of starting a
+ * second agent on the same task.
+ */
+tosse_task_id: string | null; 
+/**
+ * The task's title and status AS THEY WERE when the link was made, refreshed
+ * whenever the CRM is reachable.
+ * 
+ * ⚠️ Denormalised on purpose. The id ALONE leaves a linked conversation mute
+ * offline — no title to name the task, and no status at all — while the delete
+ * warning is a function of precisely that status. Storing the id only would mean
+ * the warning silently stops warning the moment the network is down.
+ */
+tosse_task_title: string | null; tosse_task_status: string | null }
 /**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
@@ -2403,6 +2643,44 @@ data_base64: string; too_large: boolean; size: number;
 mtime_ms: number | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * A clone found on this Mac that matches one of the urls asked about.
+ */
+export type LocalRepoMatch = { path: string; 
+/**
+ * The clone's own `origin`, so two same-named folders can be told apart.
+ */
+remoteUrl: string; 
+/**
+ * The url FROM THE CRM that this clone matched, verbatim as it was passed in.
+ * 
+ * Returned so the UI can name the repository ("matches « CRM_max »") by plain
+ * equality, instead of re-implementing url normalisation in TypeScript — that
+ * comparison has exactly one home, [`crate::git::normalize_remote_url`], and a second
+ * implementation would drift from it the first time either side gains a case.
+ */
+matchedUrl: string }
+/**
+ * The answer to "is this project's repository already cloned here?", INCLUDING what the
+ * scan could not do.
+ */
+export type LocalRepoScan = { matches: LocalRepoMatch[]; 
+/**
+ * The walk stopped on its budget rather than on running out of folders — so "no
+ * match" here means "not found in what we looked at", and the UI says so.
+ */
+truncated: boolean; 
+/**
+ * Folders macOS would not let us read (a privacy-guarded folder with no grant yet).
+ * Surfaced for the same reason: an empty result must never pass for a verdict.
+ */
+unreadable: string[]; 
+/**
+ * How much ground was actually covered. Reported so a truncated scan can say WHICH
+ * limit it hit — "stopped early" alone is a message neither the user nor we can act
+ * on, which is precisely how a blocked privacy prompt hid itself once.
+ */
+visited: number; elapsedMs: number }
+/**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
  * granularity the CLI exposes — there is no per-plugin auto-update). The count of
@@ -2547,7 +2825,24 @@ export type PermissionRequestPayload = { request_id: string; tool_name: string; 
 /**
  * CLI-provided suggestions (kept raw).
  */
-suggestions: JsonValue }
+suggestions: JsonValue; 
+/**
+ * The path that triggered the check, when the CLI blocked on one (e.g. an edit
+ * outside the session's worktree, or outside the allowed directories). Carries
+ * the "why" of a prompt that would otherwise read as an ordinary tool request.
+ */
+blocked_path: string | null; 
+/**
+ * The CLI's own reason for asking (kept raw — the shape is not contractual).
+ * Rendered as free text when it holds a human-readable string.
+ */
+decision_reason: JsonValue; 
+/**
+ * Set when the prompt comes from a background sub-agent task rather than the
+ * main thread, so the card can attribute it instead of implying the user's own
+ * turn is blocked.
+ */
+agent_id: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -2590,16 +2885,26 @@ export type PluginInfo = {
  */
 id: string; name: string; marketplace: string; version: string | null; description: string | null; enabled: boolean; scope: ExtScope; 
 /**
- * Whether the plugin's installed pin differs from its marketplace's currently
- * downloaded pin (compared on-disk — see [`compute_update`]). Only as fresh as
- * the last `claude plugin marketplace update`; the UI's "Check" button runs
- * that refresh then re-reads. Never a false positive: unknown pins → `false`.
+ * A PROVEN update: the marketplace's version is known and differs from the
+ * installed one (see [`compute_update`]). Only as fresh as the last `claude
+ * plugin marketplace update`; the UI's "Check" button runs that refresh then
+ * re-reads. When this is true, [`Self::latest_version`] is always populated.
  */
 update_available: boolean; 
 /**
+ * The upstream commit moved but no version is resolvable on either side, so we
+ * can NEITHER prove nor rule out an update — the honest third state.
+ * 
+ * This is the dominant shape of the official marketplace (278 entries: 225 carry
+ * a `source.sha`, only 14 any version), and it is why neither boolean answer
+ * works alone: claiming an update produces a badge `claude plugin update` refuses
+ * to clear ("already at the latest version"), while claiming currency hides real
+ * releases. The UI must say "unknown", not pick a side.
+ */
+update_unproven: boolean; 
+/**
  * The marketplace's human version when it is KNOWN and DIFFERS from the installed
- * one (for a "vX → vY" badge). `None` for sha-only updates (a new commit with the
- * same semver) — the UI falls back to a generic "Update available" then.
+ * one (for a "vX → vY" badge). Always `Some` when `update_available` is true.
  */
 latest_version: string | null; 
 /**
@@ -2674,6 +2979,22 @@ export type RepoRecord = { id: string; path: string;
  */
 added_at: number }
 /**
+ * An in-flight automatic retry of the current turn's API call.
+ */
+export type RetryState = { 
+/**
+ * Which attempt is being made (1-based), when the CLI reports it.
+ */
+attempt: number | null; 
+/**
+ * How many attempts the CLI will make in total.
+ */
+max: number | null; 
+/**
+ * Short human reason ("Connection error."), when one is available.
+ */
+reason: string | null }
+/**
  * What a rewind removed, returned to the UI.
  */
 export type RewindOutcome = { 
@@ -2744,6 +3065,12 @@ export type SessionMessageEvent = { session: string; item: ConversationItem }
  */
 export type SessionPermissionEvent = { session: string; request: PermissionRequestPayload }
 /**
+ * A pending permission prompt was withdrawn by the CLI and can no longer be
+ * answered. The UI drops the card: it otherwise prunes only on a user answer,
+ * leaving a dead prompt on screen that silently swallows the next click.
+ */
+export type SessionPermissionResolvedEvent = { session: string; request_id: string }
+/**
  * This session's Remote Control ("bridge") state changed — the ack of a
  * `remote_control` request, or an async `system/bridge_state` health downgrade. The
  * UI maps `session` (handle) → conversation and updates its Remote Control chip
@@ -2801,6 +3128,16 @@ activity: string | null;
  * `true` while waiting on the user to answer a permission prompt.
  */
 awaiting_permission: boolean; 
+/**
+ * The API call for the current turn is being RETRIED after a connection failure
+ * (`system/api_error`, which the CLI emits before each automatic retry). Set while
+ * a retry is pending, cleared as soon as the turn produces anything else.
+ * 
+ * Without this the user sees a turn that simply hangs: the CLI recovers on its
+ * own, but nothing on screen explains the pause. Carries `attempt`/`max` so the UI
+ * can say how far along the recovery is.
+ */
+retry: RetryState | null; 
 /**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session
@@ -2899,6 +3236,235 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * The TOSSE connection as the Settings tab shows it. `connected` false with a
+ * `signed_out_reason` means we HELD a session and it stopped working (revoked/expired
+ * refresh token) — a different story from "never signed in", and the UI says so.
+ */
+export type TosseAccountStatus = { connected: boolean; name: string | null; email: string | null; 
+/**
+ * Why a stored session is no longer usable. `None` when simply never connected.
+ */
+signedOutReason: string | null; 
+/**
+ * Set when we ARE connected but the identity probe could not run (offline, or the
+ * server does not accept Bearer on `/api/v1/*` yet). Never silently swallowed: the
+ * card stays "connected" and shows this as the reason the name/email are missing.
+ */
+identityError: string | null }
+/**
+ * A backlog task, plus the project it belongs to so the view can file it under the right
+ * card. `project_id` is `None` for a task that has no project at all.
+ */
+export type TosseBacklogTask = { projectId: string | null; task: TosseTask }
+/**
+ * `GET /api/v1/briefing/morning`, normalised.
+ * 
+ * ⚠️ What this endpoint deliberately LEAVES OUT: tasks in `Backlog`, `En attente` or
+ * `Fait`, and projects that are `Terminé`/`Archivé`. That is the right cut for a "what am
+ * I working on" screen — anything else is a targeted `/tasks?project_id=…` away.
+ */
+export type TosseBriefing = { projects: TosseProject[]; 
+/**
+ * Paused projects, metadata only (no tasks) — shown recessed rather than hidden, so a
+ * project you deliberately parked doesn't vanish from the app that manages it.
+ */
+pausedProjects: TosseProject[]; 
+/**
+ * Tasks attached to no project at all. They have no card to live in, so the view gives
+ * them their own band instead of dropping them.
+ */
+generalTasks: TosseTask[] }
+/**
+ * The client a project hangs off. Nullable in the CRM (a project reaches its client
+ * THROUGH a mission, and either link can be missing), which is why the view needs a
+ * "no client" band rather than assuming every project has one.
+ */
+export type TosseClientRef = { id: string; name: string; logoUrl: string | null; 
+/**
+ * The client's website, when the CRM has one.
+ * 
+ * Carried for its DOMAIN, not as a link: the CRM's own avatar falls back to that
+ * domain's favicon when no logo has been uploaded, which is how most of its clients
+ * end up with a mark at all.
+ */
+website: string | null }
+/**
+ * How a local folder came to be linked to a CRM repository.
+ */
+export type TosseLinkSource = 
+/**
+ * The user picked it — always wins over any automatic match.
+ */
+"manual" | 
+/**
+ * Derived from the folder's `origin` remote.
+ */
+"remote"
+/**
+ * A project with the tasks the briefing kept for it.
+ * 
+ * `tasks` is empty for a paused project: the endpoint reports those by name only, and the
+ * view says so instead of pretending the project has nothing left to do.
+ */
+export type TosseProject = { id: string; name: string; 
+/**
+ * `"En cours"` / `"En pause"` / `"À démarrer"` — drives the card's state control.
+ */
+status: string | null; client: TosseClientRef | null; startDate: string | null; dueDate: string | null; tasks: TosseTask[]; 
+/**
+ * Progress across ALL of the project's tasks, done included — the briefing counts them
+ * server-side, so the ring means the same thing here as on the CRM's own page.
+ */
+taskCount: number; taskDone: number }
+/**
+ * A project a repository is attached to, trimmed to what the app displays. The CRM models
+ * repository↔project as N-N, so this is a list, and it can legitimately be empty.
+ */
+export type TosseProjectRef = { id: string; name: string; status: string | null }
+/**
+ * A TOSSE project pinned to one of the app's local folders.
+ * 
+ * The CRM has no field for a machine path (and a path on this Mac would be
+ * meaningless on a colleague's), so the association only ever lives here. Keyed by
+ * the PROJECT rather than by the task: every task of a project resolves to the same
+ * working folder, so the question is asked once and answered for all of them.
+ */
+export type TosseProjectRepo = { 
+/**
+ * The CRM project id. Deliberately NOT a foreign key — it belongs to another
+ * system, so nothing local can enforce it.
+ */
+project_id: string; 
+/**
+ * FK to [`RepoRecord::id`] — the local folder. Cascades away with the repo.
+ */
+repo_id: string }
+/**
+ * One local folder's relationship to TOSSE, as the UI shows it.
+ */
+export type TosseRepoLink = { repoId: string; 
+/**
+ * Whether matching actually RAN. False when the CRM's repository list could not be
+ * read: the fields below then say nothing about reality.
+ * 
+ * ⚠️ The distinction that must never collapse: "we looked and found nothing" versus
+ * "we could not look". Resolving against an empty list makes the two identical, and
+ * the UI then tells the user their repository was deleted — during a 30-second outage,
+ * with a destructive button as the only way out.
+ */
+resolved: boolean; remoteUrl: string | null; 
+/**
+ * The linked repository. `None` covers three DIFFERENT situations the UI must not
+ * blur: nothing matched, the remote matched several (see `ambiguous`), or a manual
+ * link points at a repository the CRM no longer returns (see `manual_repository_id`).
+ */
+repository: TosseRepository | null; source: TosseLinkSource | null; 
+/**
+ * The id the user pinned. Kept even when it resolves to nothing, so the UI can say
+ * "the repository you picked is gone" instead of quietly falling back to unlinked.
+ */
+manualRepositoryId: string | null; 
+/**
+ * Candidates when one remote matches SEVERAL CRM repositories. We never pick for the
+ * user; the UI offers the choice.
+ */
+ambiguous: TosseRepository[]; 
+/**
+ * The folder is not a git repository at all — an ORDINARY situation here (Flight Deck
+ * works in folders, not only in clones), so it is not an error: it just means no
+ * automatic match is possible, and only a manual pick can associate it.
+ */
+notARepository: boolean; 
+/**
+ * Why the folder's remote could not be read — a genuine FAULT only (the folder has
+ * vanished, permissions, git missing). `None` on the happy path, when the repository
+ * simply has no remote, AND when the folder is not a repository: those are answers.
+ */
+remoteError: string | null }
+/**
+ * How each of Flight Deck's folders relates to TOSSE, in one call.
+ * 
+ * One payload rather than a command per repo: the CRM's repository list is a single
+ * request, and matching needs all of it at once.
+ */
+export type TosseRepoLinksPayload = { 
+/**
+ * False when no TOSSE session is held. The app is fully usable in that state, so the
+ * UI shows nothing at all — and this call costs nothing either (it returns before
+ * reading a single git remote).
+ */
+connected: boolean; 
+/**
+ * One entry per Flight Deck repo, in the order the store holds them.
+ */
+links: TosseRepoLink[]; 
+/**
+ * Every repository the CRM knows, for the manual picker. Empty when `error` is set.
+ */
+repositories: TosseRepository[]; 
+/**
+ * Set when we ARE connected but the list could not be read (offline, server error).
+ * The links then resolve to nothing, and the UI says why instead of showing a folder
+ * as un-associated — which would look like the association was lost.
+ */
+error: string | null }
+/**
+ * A repository as TOSSE knows it.
+ * 
+ * ⚠️ `url` is nullable in the CRM's schema and genuinely absent on a fair share of the
+ * rows — a repository with no url can never be matched automatically, which is the whole
+ * reason a manual association exists alongside.
+ */
+export type TosseRepository = { id: string; name: string; url: string | null; host: string | null; 
+/**
+ * `"Actif"` / `"Archivé"`. Shown, never used to filter: hiding an archived repository
+ * would silently break an association the user made deliberately.
+ */
+status: string | null; 
+/**
+ * The repo-level context the CRM keeps for agents — Markdown, rendered as-is.
+ */
+context: string | null; projects: TosseProjectRef[] }
+/**
+ * A task as the briefing lists it — enough to render a row, and no more.
+ * 
+ * ⚠️ Deliberately WITHOUT `context`/`content`: the briefing omits them, and pulling every
+ * task's Markdown into a list of dozens would cost far more than it shows. The detail
+ * panel fetches the full task by id when one is actually opened.
+ */
+export type TosseTask = { id: string; title: string; 
+/**
+ * Raw CRM value (`"En cours"`, `"À faire"`, `"Review"`…), shown as-is: it is data, like
+ * a project name, and translating it would drift from the CRM read in a browser.
+ */
+status: string; priority: string | null; 
+/**
+ * The CRM's `type` field (`"Code"`, `"Admin"`…). Renamed because `type` is a Rust
+ * keyword; the wire name is handled by the parser, not by serde.
+ */
+kind: string | null; assignedTo: string | null; dueDate: string | null; notes: string | null; subtaskCount: number; subtaskDone: number }
+/**
+ * Everything the detail panel shows for one task (`GET /api/v1/tasks/:id`).
+ */
+export type TosseTaskDetail = { 
+/**
+ * The same row shape the list uses, so the panel and the row can't disagree.
+ */
+task: TosseTask; projectId: string | null; projectName: string | null; 
+/**
+ * The long-form fields the briefing omits — Markdown, rendered as-is.
+ */
+context: string | null; content: string | null; subtasks: TosseTask[]; blockedBy: TosseTaskLink[]; blocks: TosseTaskLink[] }
+/**
+ * A task referenced by another — a blocker, or something this task blocks.
+ */
+export type TosseTaskLink = { id: string; title: string; status: string | null; 
+/**
+ * A resolved relation is history, not a live blocker: the panel keeps showing it, but
+ * dimmed, so "why was this stuck" stays answerable after the fact.
+ */
+resolved: boolean }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

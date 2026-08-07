@@ -208,6 +208,7 @@ const baseState: SessionStatePayload = {
   ultracode: false,
   activity: null,
   awaiting_permission: false,
+    retry: null,
   ended: false,
   context_tokens: 29756,
   context_window: 1000000,
@@ -271,6 +272,9 @@ const PERMISSION: PermissionRequestPayload = {
   title: "Edit src/App.tsx",
   description: "Apply the subscription-cleanup fix",
   suggestions: [],
+  blocked_path: null,
+  decision_reason: null,
+  agent_id: null,
 };
 
 const Q_INTRO =
@@ -316,6 +320,9 @@ const QUESTION: PermissionRequestPayload = {
   title: "Claude is asking you a question",
   description: "Your choice guides the rest of the implementation.",
   suggestions: [],
+  blocked_path: null,
+  decision_reason: null,
+  agent_id: null,
 };
 
 // ---- Driver ----------------------------------------------------------------

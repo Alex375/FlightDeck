@@ -1,8 +1,9 @@
-/* Settings → Accounts — graphical per-backend account cards. Each card carries a
-   brand accent (--brand, set per backend) driving a soft top glow, the mark tile,
-   the plan pill and the connect CTA. Three visual states via [data-state]:
-   connected (rich identity + brand glow), disconnected (muted + red status), and
-   loading (skeleton). Built on the shared wirekit + semantic tokens. */
+/* Settings — the graphical "connection to a service" card, shared by every account-like
+   surface (Accounts → Claude & Codex, TOSSE). Each card carries a brand accent (--brand,
+   set per service) driving a soft top glow, the mark tile, the plan pill and the connect
+   CTA. Three visual states via [data-state]: connected (rich identity + brand glow),
+   disconnected (muted + red status), and loading (skeleton). Built on the shared wirekit +
+   semantic tokens. Owned by ConnectionCard.tsx — see it before adding a class here. */
 
 .cards {
   display: flex;
@@ -73,6 +74,20 @@
 .tile svg {
   width: 24px;
   height: 24px;
+}
+/* Neutral plate — for a mark that carries its OWN colours (the TOSSE rose is bichrome: a
+   light body with a coral north needle). Filling the plate with the brand colour would sink
+   that needle into the background, so the logo keeps its native palette on a quiet surface
+   instead. Marks that are a flat silhouette (Claude, Codex) keep the brand plate above. */
+.tile[data-plate="neutral"] {
+  background: linear-gradient(145deg, var(--wf-panel-3), var(--wf-panel-2));
+  border: 1px solid var(--wf-line);
+  color: var(--wf-tx-hi);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.tile[data-plate="neutral"] svg {
+  width: 30px;
+  height: 30px;
 }
 /* Disconnected: drain the tile's colour so the eye goes to the CTA, not the logo. */
 .card[data-state="disconnected"] .tile {

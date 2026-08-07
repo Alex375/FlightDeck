@@ -36,17 +36,21 @@ function cev(p: Partial<SettingsChordEvent>): SettingsChordEvent {
 }
 
 describe("viewForShortcut", () => {
-  it("⌘1 / Ctrl+1 → conversation, ⌘2 / Ctrl+2 → flight deck", () => {
+  it("⌘1 → conversation, ⌘2 → flight deck, ⌘3 → TOSSE", () => {
     expect(viewForShortcut(ev({ metaKey: true, code: "Digit1" }))).toBe("conversation");
     expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit1" }))).toBe("conversation");
     expect(viewForShortcut(ev({ metaKey: true, code: "Digit2" }))).toBe("flightdeck");
     expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit2" }))).toBe("flightdeck");
+    // Resolving ⌘3 here says nothing about whether that view EXISTS right now — the TOSSE
+    // tab is conditional on being signed in, and App is what ignores an unavailable target.
+    expect(viewForShortcut(ev({ metaKey: true, code: "Digit3" }))).toBe("tosse");
+    expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit3" }))).toBe("tosse");
   });
 
   it("keys off the PHYSICAL e.code, so other digits/codes don't match (AZERTY safety)", () => {
     // On AZERTY ⌘1 fires with e.key="&" but e.code="Digit1"; matching e.code is what
-    // makes the chord layout-independent. A non-Digit1/2 code never matches.
-    expect(viewForShortcut(ev({ metaKey: true, code: "Digit3" }))).toBeNull();
+    // makes the chord layout-independent. A code outside Digit1-3 never matches.
+    expect(viewForShortcut(ev({ metaKey: true, code: "Digit4" }))).toBeNull();
     expect(viewForShortcut(ev({ metaKey: true, code: "Numpad1" }))).toBeNull();
     expect(viewForShortcut(ev({ metaKey: true, code: "KeyA" }))).toBeNull();
   });

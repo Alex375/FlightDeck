@@ -1,11 +1,12 @@
-// Settings → Accounts: the in-app login/logout/status for BOTH backends, as graphical
-// per-backend cards (brand accent, mark tile, live status chip, rich connected state).
-// The flows drive the OFFICIAL mechanisms only — `claude auth login|logout` for Claude
-// (URL + pasted code) and the app-server's `account/login/*` for Codex (URL + async
-// `account_login` completion event) — the app never touches a credential store itself.
-// Every failure surfaces inline.
-import { useEffect, useState, type ReactNode } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+// Settings → Accounts: the in-app login/logout/status for BOTH agent backends, as
+// graphical per-backend cards. The flows drive the OFFICIAL mechanisms only —
+// `claude auth login|logout` for Claude (URL + pasted code) and the app-server's
+// `account/login/*` for Codex (URL + async `account_login` completion event) — the app
+// never touches a credential store itself. Every failure surfaces inline.
+//
+// The card shell and its satellites live in `ConnectionCard.tsx`, shared with the TOSSE
+// tab (a third connection, with its own flow but the same visual language).
+import { useEffect, useState } from "react";
 import { events } from "../../ipc/client";
 import {
   useClaudeAccount,
@@ -17,7 +18,14 @@ import { useBackendAvailabilityState } from "../../store/binaryAvailable";
 import { useAccountLoginStore } from "../../store/accountLogin";
 import { ClaudeMark, CodexMark } from "../../ui/kit";
 import { PageHead } from "./SettingsKit";
-import s from "./AccountsSection.module.css";
+import {
+  ConnectionCard,
+  LogoutControl,
+  OpenUrlFallback,
+  connectionStyles as s,
+  useAuthUrlOpener,
+  type CardState,
+} from "./ConnectionCard";
 
 // The brand accent each card is themed with (drives the glow, tile, plan pill, CTA).
 // Shared design tokens (conductor-wirekit.css), never raw hex — so a brand tweak is
@@ -45,160 +53,6 @@ export function AccountsSection() {
         {codex === false ? <CodexUnavailableCard /> : <CodexAccountGroup />}
       </div>
     </div>
-  );
-}
-
-type CardState = "loading" | "connected" | "disconnected" | "error";
-
-/** The presentational shell shared by both backends: brand-themed card with the mark
- *  tile, a live status chip, an identity/invite body, an actions row and free-form
- *  sub-content (login sub-rows, errors). All logic lives in the callers. */
-function AccountCard({
-  brand,
-  mark,
-  name,
-  provider,
-  state,
-  email,
-  pills,
-  invite,
-  actions,
-  children,
-}: {
-  brand: "claude" | "codex";
-  mark: ReactNode;
-  name: string;
-  provider: string;
-  state: CardState;
-  email?: string | null;
-  pills?: { label: string; plan?: boolean }[];
-  invite?: string;
-  actions: ReactNode;
-  children?: ReactNode;
-}) {
-  const chip =
-    state === "connected"
-      ? { tone: "ok", label: "Connected" }
-      : state === "loading"
-        ? { tone: "idle", label: "Checking…" }
-        : state === "error"
-          ? { tone: "off", label: "Unavailable" }
-          : { tone: "off", label: "Not connected" };
-  return (
-    <section className={s.card} data-state={state} style={{ ["--brand" as string]: BRAND[brand] }}>
-      <div className={s.head}>
-        <span className={s.tile}>{mark}</span>
-        <div className={s.headText}>
-          <span className={s.brandName}>{name}</span>
-          <span className={s.provider}>{provider}</span>
-        </div>
-        <span className={s.chip} data-tone={chip.tone}>
-          <span className={s.chipDot} />
-          {chip.label}
-        </span>
-      </div>
-
-      <div className={s.body}>
-        {state === "loading" ? (
-          <>
-            <div className={s.skelLine} style={{ width: "45%" }} />
-            <div className={s.skelLine} style={{ width: "28%", marginTop: 10, height: 10 }} />
-          </>
-        ) : state === "connected" ? (
-          <>
-            <div className={s.email}>{email ?? "Connected"}</div>
-            {pills && pills.length ? (
-              <div className={s.pills}>
-                {pills.map((p) => (
-                  <span key={p.label} className={p.plan ? `${s.pill} ${s.pillPlan}` : s.pill}>
-                    {p.label}
-                  </span>
-                ))}
-              </div>
-            ) : null}
-          </>
-        ) : (
-          <p className={s.invite}>{invite}</p>
-        )}
-      </div>
-
-      <div className={s.actions}>{actions}</div>
-      {children}
-    </section>
-  );
-}
-
-/** Inline fallback when the browser open failed: the error plus the auth URL itself,
- *  clickable (retries the opener) and selectable (copy by hand). */
-function OpenUrlFallback({ error, url, onRetry }: { error: string; url: string; onRetry: () => void }) {
-  return (
-    <div className={s.err}>
-      {error}
-      {" — open this link manually: "}
-      <span
-        role="link"
-        tabIndex={0}
-        className={s.errLink}
-        title="Retry opening in the browser — the text stays selectable so you can copy it"
-        onClick={onRetry}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") onRetry();
-        }}
-      >
-        {url}
-      </span>
-    </div>
-  );
-}
-
-/** The browser-open step of a login flow. `openUrl`'s rejection is NEVER swallowed
- *  (zero-silent-error): it lands in `error`, and `url` keeps the auth link around so
- *  the UI can offer the manual fallback (clickable retry + copyable text) — the flow
- *  must stay completable even when the opener is broken (no default browser…). */
-function useAuthUrlOpener() {
-  const [url, setUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const open = (u: string) => {
-    setUrl(u);
-    setError(null);
-    openUrl(u).catch((e: unknown) => {
-      setError(`Unable to open the browser: ${e instanceof Error ? e.message : String(e)}`);
-    });
-  };
-  return { url, error, open };
-}
-
-/** Logout button with an inline two-step confirmation (shared by both backends). */
-function LogoutControl({ pending, onConfirm }: { pending: boolean; onConfirm: () => void }) {
-  const [confirming, setConfirming] = useState(false);
-  if (!confirming) {
-    return (
-      <>
-        <span className={s.spacer} />
-        <button className={`${s.btn} ${s.ghost}`} onClick={() => setConfirming(true)}>
-          Sign out…
-        </button>
-      </>
-    );
-  }
-  return (
-    <>
-      <span className={s.spacer} />
-      <button
-        className={`${s.btn} ${s.danger}`}
-        disabled={pending}
-        onClick={() => onConfirm()}
-      >
-        {pending ? "Signing out…" : "Confirm sign-out"}
-      </button>
-      <button
-        className={`${s.btn} ${s.ghost}`}
-        disabled={pending}
-        onClick={() => setConfirming(false)}
-      >
-        Cancel
-      </button>
-    </>
   );
 }
 
@@ -264,13 +118,13 @@ function ClaudeAccountGroup() {
   );
 
   return (
-    <AccountCard
-      brand="claude"
+    <ConnectionCard
+      accent={BRAND.claude}
       mark={<ClaudeMark />}
       name="Claude"
       provider="Anthropic · claude.ai"
       state={state}
-      email={status.data?.email}
+      identity={status.data?.email}
       pills={[
         status.data?.subscriptionType
           ? { label: `Plan ${status.data.subscriptionType}`, plan: true }
@@ -315,7 +169,7 @@ function ClaudeAccountGroup() {
         <OpenUrlFallback error={opener.error} url={opener.url} onRetry={() => opener.open(opener.url!)} />
       ) : null}
       {err ? <div className={s.err}>{err}</div> : null}
-    </AccountCard>
+    </ConnectionCard>
   );
 }
 
@@ -407,13 +261,13 @@ function CodexAccountGroup() {
   );
 
   return (
-    <AccountCard
-      brand="codex"
+    <ConnectionCard
+      accent={BRAND.codex}
       mark={<CodexMark />}
       name="Codex"
       provider="OpenAI · ChatGPT"
       state={state}
-      email={status.data?.email}
+      identity={status.data?.email}
       pills={[
         status.data?.planType ? { label: `Plan ${status.data.planType}`, plan: true } : null,
         status.data?.authMethod === "chatgpt" ? { label: "ChatGPT account" } : null,
@@ -429,7 +283,7 @@ function CodexAccountGroup() {
         <OpenUrlFallback error={opener.error} url={opener.url} onRetry={() => opener.open(opener.url!)} />
       ) : null}
       {err ? <div className={s.err}>{err}</div> : null}
-    </AccountCard>
+    </ConnectionCard>
   );
 }
 
@@ -439,8 +293,8 @@ function CodexAccountGroup() {
  *  show when the `claude auth status` probe fails for want of the binary. */
 function ClaudeUnavailableCard() {
   return (
-    <AccountCard
-      brand="claude"
+    <ConnectionCard
+      accent={BRAND.claude}
       mark={<ClaudeMark />}
       name="Claude"
       provider="Anthropic · claude.ai"
@@ -455,8 +309,8 @@ function ClaudeUnavailableCard() {
  *  dead "Sign in" (login is impossible without the CLI). */
 function CodexUnavailableCard() {
   return (
-    <AccountCard
-      brand="codex"
+    <ConnectionCard
+      accent={BRAND.codex}
       mark={<CodexMark />}
       name="Codex"
       provider="OpenAI · ChatGPT"

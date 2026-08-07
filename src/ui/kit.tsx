@@ -31,6 +31,14 @@ const WF_PATHS: Record<string, string> = {
   reply: "M9 7 5 11l4 4M5 11h7a4 4 0 0 0 4-4V5",
   bell: "M6 9a5 5 0 0 1 10 0c0 4 2 5 2 5H4s2-1 2-5ZM9 18a2 2 0 0 0 4 0",
   clock: "M11 5a6 6 0 1 1 0 12 6 6 0 0 1 0-12ZM11 8v3l2 2",
+  // The two glyphs the TOSSE view's status sections need, mirroring the CRM Briefing's own
+  // icons: an eye for « En revue » and a dotted circle for « En attente ».
+  eye: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM11 8.6a2.4 2.4 0 1 1 0 4.8 2.4 2.4 0 0 1 0-4.8Z",
+  /** Disclosure chevron, pointing DOWN (open). Rotate it to show a collapsed state. */
+  chevron: "M5.5 8.5 11 14l5.5-5.5",
+  /** A robot head — marks an action taken through the MCP server, as the CRM does. */
+  bot: "M7 9h8a1.5 1.5 0 0 1 1.5 1.5v4A1.5 1.5 0 0 1 15 16H7a1.5 1.5 0 0 1-1.5-1.5v-4A1.5 1.5 0 0 1 7 9ZM11 6.5V9M9 12.2h.01M13 12.2h.01M4 11.5v2M18 11.5v2",
+  circledot: "M11 4.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13ZM11 9.6a1.4 1.4 0 1 1 0 2.8 1.4 1.4 0 0 1 0-2.8Z",
   file: "M6 3h6l4 4v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1ZM12 3v4h4",
   diff: "M11 4v6m-3-3h6M5 16h12",
   term: "M4 5h14v12H4zM7 9l3 2-3 2M12 13h3",
@@ -93,6 +101,47 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">
       <path d={d} />
+    </svg>
+  );
+}
+
+/** The TOSSE (CRM) brand mark — "La Rose": a compass rose between two code chevrons.
+ *  Ported from the CRM's own asset (`apps/frontend/public/logo.svg` /
+ *  `components/shared/tosse-logo.tsx`), inlined so it tints crisply at small sizes with no
+ *  asset fetch — same approach as the Claude and Codex marks below.
+ *
+ *  ⚠️ NOT to be confused with `TosseMark` (src/ui/TosseMark.tsx), which is THIS app's own
+ *  logo (the Flight Deck aircraft). This one identifies the external CRM we connect to.
+ *
+ *  The source art tints its north needle with `--logo-accent`, falling back to
+ *  `currentColor`. That variable IS set, globally, by `.wf-tosse-mark` in
+ *  `conductor-wirekit.css` (to the CRM's own `#e05a40`): the rose is bichrome in TOSSE's UI
+ *  — body in the text colour, north needle in the brand accent — and carrying that here is
+ *  what makes it read as the real logo rather than a flattened silhouette. On the Settings
+ *  tile it therefore sits on a NEUTRAL plate (`plate="neutral"`), not a filled brand one,
+ *  which would swallow the needle. The one place that deliberately flattens it back to
+ *  monochrome is the hollow, unlinked repository badge (`.cv-tosse-badge:not(.linked)`).
+ *
+ *  The viewBox is cropped to the artwork (the standalone asset carries generous padding),
+ *  so the mark fills its 24px box instead of floating inside it. */
+export function TosseCrmMark({ className }: { className?: string }) {
+  return (
+    <svg
+      className={"wf-tosse-mark " + (className || "")}
+      viewBox="56 26 208 148"
+      fill="currentColor"
+      role="img"
+      aria-label="TOSSE"
+    >
+      <polygon points="157,90 160,32 163,90" />
+      <polygon points="163,110 160,168 157,110" />
+      <polygon points="150,103 88,100 150,97" />
+      <polygon points="170,97 232,100 170,103" />
+      <polygon points="196,52 174.2,94.4 161.4,84.8" fill="var(--logo-accent, currentColor)" />
+      <polygon points="124,148 145.8,105.6 158.6,115.2" />
+      <circle cx="160" cy="100" r="12" fill="none" stroke="currentColor" strokeWidth="8" />
+      <path d="M108 54 C90 66 72 84 62 100 C72 116 90 134 108 146 C100 132 86 116 78 100 C86 84 100 68 108 54 Z" />
+      <path d="M212 54 C230 66 248 84 258 100 C248 116 230 134 212 146 C220 132 234 116 242 100 C234 84 220 68 212 54 Z" />
     </svg>
   );
 }
@@ -171,7 +220,13 @@ export function Win({
     <div className="wf-win">
       <div className="wf-titlebar">
         {nav ? <div className="wf-tbnav">{nav}</div> : null}
-        {title ? <span className="wf-title">{title}</span> : null}
+        {/* `title` attribute when the caption is a plain string: it is truncated with an
+            ellipsis, so the full name has to stay readable somewhere. */}
+        {title ? (
+          <span className="wf-title" title={typeof title === "string" ? title : undefined}>
+            {title}
+          </span>
+        ) : null}
         {right ? <div className="wf-tbright">{right}</div> : null}
       </div>
       {banner}
@@ -182,6 +237,7 @@ export function Win({
 
 export function NavBtn({
   icon,
+  glyph,
   label,
   on,
   badge,
@@ -189,6 +245,9 @@ export function NavBtn({
   onClick,
 }: {
   icon?: string;
+  /** A ready-made mark, for a tab whose identity isn't one of the `WF_PATHS` glyphs — the
+   *  TOSSE tab wears the CRM's own brand mark. Takes precedence over `icon`. */
+  glyph?: React.ReactNode;
   label: string;
   on?: boolean;
   badge?: number | null;
@@ -197,7 +256,7 @@ export function NavBtn({
 }) {
   return (
     <button {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
-      {icon ? <Ico name={icon} className="sm" /> : null}
+      {glyph ?? (icon ? <Ico name={icon} className="sm" /> : null)}
       {label}
       {badge != null ? <span className="wf-badge att">{badge}</span> : null}
     </button>

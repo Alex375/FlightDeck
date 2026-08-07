@@ -29,6 +29,7 @@ import {
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
 import { useEffectiveCleanOutput } from "../../store/display";
+import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
 import { ChipBtn, ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useClaudeAvailable, useCodexAvailable } from "../../store/binaryAvailable";
@@ -82,14 +83,16 @@ import {
 import styles from "./ConductorComposer.module.css";
 
 // Exact Claude Code permission modes (Shift+Tab selector), in the same order/labels.
-// `bypassPermissions` is disabled: the server downgrades it to `default` unless the
-// binary is spawned with --allow-dangerously-skip-permissions (not passed yet).
-const PERM_OPTS: [string, PermissionMode, boolean?][] = [
+// `bypassPermissions` is only pickable once the user opts in (Settings → General →
+// Permissions), which makes the spawn pass --allow-dangerously-skip-permissions;
+// without it the CLI downgrades the mode to `default`. When it is not pickable the
+// menu says WHY (see bypassBlockedReason) instead of just greying the row out.
+const PERM_OPTS: [string, PermissionMode][] = [
   ["Auto mode", "auto"],
   ["Default", "default"],
   ["Auto-accept edits", "acceptEdits"],
   ["Plan mode", "plan"],
-  ["Bypass permissions", "bypassPermissions", true],
+  ["Bypass permissions", "bypassPermissions"],
 ];
 const PERM_LABEL: Record<string, string> = {
   auto: "Auto mode",
@@ -109,8 +112,12 @@ const PERM_TONE: Record<string, string> = {
   bypassPermissions: "var(--wf-perm-bypass)",
   dontAsk: "var(--wf-perm-bypass)",
 };
-// Modes the user can cycle through with Shift+Tab (bypass is disabled — see PERM_OPTS).
-const PERM_CYCLE = PERM_OPTS.filter(([, , disabled]) => !disabled).map(([, value]) => value);
+// Modes ⇧Tab cycles through. Bypass is deliberately NOT one of them, even when
+// unlocked: like the Claude Code terminal, the dangerous mode is an explicit menu pick,
+// never something a repeated keystroke can land on.
+const PERM_CYCLE: PermissionMode[] = PERM_OPTS.map(([, value]) => value).filter(
+  (v) => v !== "bypassPermissions",
+);
 
 // Codex-only composer options (applied as turn/start overrides). Display labels;
 // wire values are the ReasoningSummary / Personality enums.
@@ -158,6 +165,10 @@ export const ConductorComposer = forwardRef<
         ultracode: c?.ultracode ?? false,
         permissionMode: c?.permissionMode ?? null,
         kind: (c?.kind ?? "claude") as BackendKind,
+        // Live process + whether IT was spawned with the bypass unlock flag: together
+        // they say whether "Bypass permissions" is pickable right now (see PERM_OPTS).
+        live: !!c?.handle,
+        bypassAllowed: c?.bypassAllowed ?? false,
       };
     }),
   );
@@ -317,6 +328,10 @@ export const ConductorComposer = forwardRef<
     ctl.permissionMode ??
     DEFAULT_PERMISSION_MODE) as PermissionMode;
   const permLabel = PERM_LABEL[permMode] ?? PERM_LABEL[DEFAULT_PERMISSION_MODE];
+  // Why "Bypass permissions" can't be picked (null = it can). Subscribed, so flipping
+  // the Settings toggle updates the open menu without a remount.
+  const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
+  const bypassBlocked = bypassBlockedReason(allowBypass, ctl.live, ctl.bypassAllowed);
 
   // "Clean output" is PER-CONVERSATION: the chip shows this conversation's EFFECTIVE
   // value (its own explicit choice, else the global default from Settings → General)
@@ -557,12 +572,8 @@ export const ConductorComposer = forwardRef<
         ? ("set" as const)
         : ("plumbing" as const)
       : undefined;
-    // Same invariant for the optimistic PLACEHOLDER name — hence computed BEFORE this call: a
-    // fresh conversation whose first message is `/goal <condition>` must not end up named after
-    // that command in the sidebar and on its Flight Deck card. Even though a goal SET now shows
-    // as a card in the thread, a (often long) goal directive is a poor conversation NAME; the
-    // conversation stays auto-title-eligible and gets named by the first REAL message instead.
-    if (!goalCmd) useConversationsStore.getState().noteFirstMessage(session, t);
+    // (The optimistic placeholder name is set by the send path itself — see
+    // `sendConversationMessage`, which skips it for a `/goal` exactly as this did.)
     // The worktree toggle only applies to the very first spawn of a conversation.
     // `queued`: busy at send time → the CLI will inject this mid-turn, so the
     // bubble shows a "pending" badge until the turn ends.
@@ -877,17 +888,24 @@ export const ConductorComposer = forwardRef<
             }
           >
             <MenuLabel>Permission mode · ⇧Tab</MenuLabel>
-            {PERM_OPTS.map(([label, value, disabled]) => (
-              <MenuItem
-                key={value}
-                on={permMode === value}
-                disabled={disabled}
-                onClick={disabled ? undefined : () => choosePerm(value)}
-              >
-                <span className="cv-perm-dot" style={{ background: PERM_TONE[value] }} />
-                {label}
-              </MenuItem>
-            ))}
+            {PERM_OPTS.map(([label, value]) => {
+              const blocked = value === "bypassPermissions" && bypassBlocked;
+              return (
+                <MenuItem
+                  key={value}
+                  on={permMode === value}
+                  disabled={!!blocked}
+                  onClick={blocked ? undefined : () => choosePerm(value)}
+                >
+                  <span className="cv-perm-dot" style={{ background: PERM_TONE[value] }} />
+                  {label}
+                </MenuItem>
+              );
+            })}
+            {/* The reason lives OUTSIDE the disabled row on purpose: a disabled button
+                takes no pointer events (a `title` would never show) and is dimmed to
+                .36 opacity, which would bury the one sentence that explains the refusal. */}
+            {bypassBlocked ? <div className="cv-perm-note">{bypassBlocked}</div> : null}
           </Menu>
         ) : (
           /* Codex controls — all applied as per-turn overrides (see codexControls). */

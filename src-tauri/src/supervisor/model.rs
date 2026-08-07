@@ -41,6 +41,14 @@ pub struct SessionStatePayload {
     pub activity: Option<String>,
     /// `true` while waiting on the user to answer a permission prompt.
     pub awaiting_permission: bool,
+    /// The API call for the current turn is being RETRIED after a connection failure
+    /// (`system/api_error`, which the CLI emits before each automatic retry). Set while
+    /// a retry is pending, cleared as soon as the turn produces anything else.
+    ///
+    /// Without this the user sees a turn that simply hangs: the CLI recovers on its
+    /// own, but nothing on screen explains the pause. Carries `attempt`/`max` so the UI
+    /// can say how far along the recovery is.
+    pub retry: Option<RetryState>,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
@@ -271,9 +279,20 @@ pub enum ConversationItem {
     },
 }
 
+/// An in-flight automatic retry of the current turn's API call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct RetryState {
+    /// Which attempt is being made (1-based), when the CLI reports it.
+    pub attempt: Option<u32>,
+    /// How many attempts the CLI will make in total.
+    pub max: Option<u32>,
+    /// Short human reason ("Connection error."), when one is available.
+    pub reason: Option<String>,
+}
+
 /// A `can_use_tool` permission prompt surfaced to the UI. The UI answers it via
 /// the `answer_permission` command, echoing `request_id`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 pub struct PermissionRequestPayload {
     pub request_id: String,
     pub tool_name: String,
@@ -283,6 +302,25 @@ pub struct PermissionRequestPayload {
     pub description: Option<String>,
     /// CLI-provided suggestions (kept raw).
     pub suggestions: Value,
+    /// The path that triggered the check, when the CLI blocked on one (e.g. an edit
+    /// outside the session's worktree, or outside the allowed directories). Carries
+    /// the "why" of a prompt that would otherwise read as an ordinary tool request.
+    pub blocked_path: Option<String>,
+    /// The CLI's own reason for asking (kept raw — the shape is not contractual).
+    /// Rendered as free text when it holds a human-readable string.
+    pub decision_reason: Value,
+    /// Set when the prompt comes from a background sub-agent task rather than the
+    /// main thread, so the card can attribute it instead of implying the user's own
+    /// turn is blocked.
+    pub agent_id: Option<String>,
+}
+
+/// A pending permission prompt is no longer answerable — the CLI withdrew it
+/// (`control_cancel_request`). The UI drops the card: without this it prunes
+/// `pendingPermissions` only when the user answers, leaving a dead card on screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct PermissionResolvedPayload {
+    pub request_id: String,
 }
 
 /// One slash command available in the session, as advertised by the CLI in its
@@ -457,6 +495,8 @@ pub enum SessionEvent {
     State(SessionStatePayload),
     Item(ConversationItem),
     Permission(PermissionRequestPayload),
+    /// A permission prompt was withdrawn by the CLI and can no longer be answered.
+    PermissionResolved(PermissionResolvedPayload),
     /// The session's available slash commands (one-shot, from the `initialize`
     /// control response). Drives the composer's `/` autocomplete.
     Commands(Vec<SlashCommand>),
@@ -493,6 +533,9 @@ pub trait SessionEmitter: Send + Sync + 'static {
     fn emit_state(&self, session: &str, state: &SessionStatePayload);
     fn emit_item(&self, session: &str, item: &ConversationItem);
     fn emit_permission(&self, session: &str, request: &PermissionRequestPayload);
+    /// A permission prompt was withdrawn and must be removed from the UI. Default
+    /// no-op so test sinks that don't observe it stay unchanged.
+    fn emit_permission_resolved(&self, _session: &str, _resolved: &PermissionResolvedPayload) {}
     fn emit_commands(&self, session: &str, commands: &[SlashCommand]);
     fn emit_task(&self, session: &str, task: &BackgroundTask);
     fn emit_title(&self, session: &str, title: &str, seq: u32);

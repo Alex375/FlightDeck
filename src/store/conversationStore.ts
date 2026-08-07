@@ -54,6 +54,7 @@ const connectingState: SessionStatePayload = {
   ultracode: false,
   activity: null,
   awaiting_permission: false,
+  retry: null,
   ended: false,
   context_tokens: null,
   context_window: null,
@@ -610,9 +611,17 @@ export const useConversationStore = create<ConversationState>((set) => {
             // Record any detached sub-agent (`Agent` with run_in_background) launched in
             // this message, so the pinned AgentBar can list it WITHOUT re-scanning every
             // block on each streamed token. Done once per assistant_message.
-            const newBg = backgroundAgentIdsIn(item.blocks).filter(
-              (id) => !next.bgAgentIds.includes(id),
-            );
+            //
+            // MAIN THREAD ONLY (same scoping as the TodoWrite capture below). A sub-agent
+            // can spawn its own agents — the CLI nests them up to depth 3 by default, and
+            // we pass `--forward-subagent-text`, so those messages reach us. Collecting
+            // them here would list a GRANDCHILD in the conversation-level AgentBar as if
+            // the user had launched it, and hide its block from the parent sub-agent's own
+            // drill-in transcript (bgAgentIds also drives that fold).
+            const newBg = (item.parent_tool_use_id === null
+              ? backgroundAgentIdsIn(item.blocks)
+              : []
+            ).filter((id) => !next.bgAgentIds.includes(id));
             if (newBg.length > 0) {
               next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
             }

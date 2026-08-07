@@ -3,26 +3,33 @@
 // destructive "drop all", kept while the SQL model is still in flux). The active
 // section is shared state so deep-links (e.g. the update banner) can open it
 // straight onto a given tab.
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { wipeAllData } from "../../store/conversationsStore";
+import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
-import { Ico } from "../../ui/kit";
+import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { AccountsSection } from "./AccountsSection";
+import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
-const TABS: Array<{ id: SettingsSection; label: string; icon: string }> = [
+// `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
+// the rest of the rail stays on the shared icon set.
+const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: ReactNode }> = [
   { id: "general", label: "General", icon: "cog" },
   { id: "accounts", label: "Accounts", icon: "key" },
+  // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
+  // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
+  { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
@@ -108,7 +115,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 data-on={section === t.id ? "" : undefined}
                 onClick={() => setSection(t.id)}
               >
-                <Ico name={t.icon} className="sm" />
+                {t.mark ?? <Ico name={t.icon} className="sm" />}
                 <span>{t.label}</span>
               </button>
             ))}
@@ -136,11 +143,14 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 <TimingPrefs />
                 <FleetBannerPrefs />
                 <BackgroundTaskPrefs />
+                <PermissionPrefs />
                 <CaffeinatePrefs />
               </div>
             )}
 
             {section === "accounts" && <AccountsSection />}
+
+            {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
 
@@ -512,6 +522,41 @@ function BackgroundTaskPrefs() {
         checked={alertOnBackgroundBash}
         onChange={(v) => set({ alertOnBackgroundBash: v })}
         label="Alert for background shell commands"
+      />
+    </SettingsGroup>
+  );
+}
+
+/** Permission prefs in the General tab: unlock "Bypass permissions" as a mode a
+ *  conversation may be switched to. The unlock is a SPAWN flag
+ *  (`--allow-dangerously-skip-permissions`), so it only reaches sessions started after
+ *  it — the composer's menu says so when a running session can't honour it.
+ *
+ *  Turning it off demotes every conversation still in Bypass back to Default, live ones
+ *  included: withdrawing the permission has to bite immediately, not at the next spawn. */
+function PermissionPrefs() {
+  const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
+  const set = usePermissionPrefs((s) => s.set);
+  return (
+    <SettingsGroup title="Permissions" icon="shield">
+      <ToggleRow
+        title="Allow Bypass permissions mode"
+        hint={
+          <>
+            Makes <strong>Bypass permissions</strong> selectable in a conversation's permission
+            menu. In that mode the agent runs every tool — edits, shell commands, network calls —{" "}
+            <strong>without ever asking</strong>. Unlocking is not enabling: nothing changes until
+            a conversation is explicitly switched to it, and only conversations started afterwards
+            can use it (restart a running one). Turning this back off returns every conversation
+            still in Bypass to <strong>Default</strong> right away. <strong>Off by default.</strong>
+          </>
+        }
+        checked={allowBypass}
+        onChange={(v) => {
+          set({ allowBypassPermissions: v });
+          if (!v) demoteBypassConversations();
+        }}
+        label="Allow Bypass permissions mode"
       />
     </SettingsGroup>
   );

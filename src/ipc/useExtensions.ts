@@ -10,6 +10,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { refetchSlashCommands } from "../store/commandsStore";
 import { commands } from "./client";
 import type {
   ExtensionsSnapshot,
@@ -333,7 +334,7 @@ export function useMarketplaces(path: string | null) {
 export function useCheckPluginUpdates(path: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (name?: string | null): Promise<null> =>
+    mutationFn: (name?: string | null): Promise<string> =>
       unwrap(commands.refreshPluginMarketplaces(name ?? null)),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: extensionsKey(path) });
@@ -349,14 +350,23 @@ export function useCheckPluginUpdates(path: string | null) {
  * update is already on disk and lands on the next spawn; a genuine reject still
  * surfaces in the thread as a control error), so it never fails the mutation. On
  * success the extensions snapshot is invalidated so the "update available" badge clears.
+ *
+ * ⚠️ Two layers must be refreshed, not one: `reload_plugins` updates the session's
+ * CAPABILITY, `refetchSlashCommands` updates the `/` MENU. The plugin-toggle path in
+ * ExtensionsManager does both; this one used to do only the first, so updating a
+ * plugin whose new version adds or removes commands left the menu showing the old
+ * catalogue until the next spawn.
  */
 export function useUpdatePlugin(path: string | null, handle: string | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (args: { pluginId: string; scope: string | null }): Promise<null> => {
+    mutationFn: async (args: { pluginId: string; scope: string | null }): Promise<string> => {
       // Pass the repo/conversation cwd so project/local-scoped updates resolve the
       // right project (the CLI selects it from the working directory).
-      await unwrap(commands.updatePlugin(args.pluginId, args.scope, path ?? ""));
+      // The CLI's verdict is the RESULT: exit 0 does not mean the plugin moved (it
+      // exits 0 on "already at the latest version" and on "Skipped — …"), so the
+      // caller renders this line instead of implying success.
+      const verdict = await unwrap(commands.updatePlugin(args.pluginId, args.scope, path ?? ""));
       if (handle) {
         // Best-effort hot-apply; a dead session ("unknown session") is harmless here.
         try {
@@ -365,7 +375,10 @@ export function useUpdatePlugin(path: string | null, handle: string | null) {
           /* update already written to disk; it applies on the next session spawn */
         }
       }
-      return null;
+      // Refresh the `/` catalogue for this cwd even with no live session: it runs an
+      // ephemeral spawn that re-reads the disk, so the menu matches the new version.
+      await refetchSlashCommands(path);
+      return verdict;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: extensionsKey(path) }),
   });

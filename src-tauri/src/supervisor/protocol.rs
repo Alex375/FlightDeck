@@ -126,8 +126,66 @@ pub enum SystemMsg {
         state: Option<String>,
         detail: Option<String>,
     },
-    /// Other system subtypes (`compact_boundary`, `thinking_tokens`, …) are tolerated
-    /// here so they never drop to [`CliMessage::Unknown`].
+    /// `system/commands_changed` — the CLI PUSHES a fresh slash-command catalogue
+    /// mid-session (a plugin was toggled, installed, or hot-reloaded). Without it the
+    /// `/` menu only ever refreshes at `initialize` or on an explicit refetch, so it
+    /// goes stale as soon as the command set changes under a live session. Same shape
+    /// as the `initialize` response's catalogue; `commands` is optional because the
+    /// push may be a bare invalidation signal.
+    CommandsChanged {
+        #[serde(default)]
+        commands: Option<Vec<Value>>,
+    },
+    /// Routine subtypes we deliberately do NOT render, listed explicitly so they never
+    /// reach [`Self::Unknown`].
+    ///
+    /// This matters because `Unknown` is the app's protocol-drift canary: if ordinary
+    /// traffic fell into it, its warning would fire on every normal session and a
+    /// genuinely new subtype would be indistinguishable from the noise. The set below
+    /// is what actually occurs on this machine's transcripts (`api_error`,
+    /// `local_command`, `stop_hook_summary`, `compact_boundary`, `turn_duration`,
+    /// `informational`) plus the ones the spec documents.
+    ///
+    /// ⚠️ `api_error` is the most frequent by far (199 occurrences across this machine's
+    /// transcripts). VERIFIED against the 2.1.220 binary: it is `yield`ed into the live
+    /// message stream (alongside `stream_event`), not disk-only, and carries
+    /// `{level:"error", error, retryInMs, retryAttempt, maxRetries, source}` where
+    /// `source` is `connection_retry` | `request_retry`.
+    ///
+    /// It produces NO thread notice on purpose: each one announces a retry the CLI
+    /// performs by itself, the turn continues, and a genuinely failed turn already
+    /// surfaces through `result` (`api_error_status` → ErrorBlock) — one bubble per
+    /// retry would be noise. What it DOES drive is transient session state:
+    /// `retryAttempt`/`maxRetries` become [`crate::supervisor::model::RetryState`], so the
+    /// UI can say "reconnecting, 2/3" instead of showing a turn that merely appears to
+    /// hang. The assembler clears it as soon as anything else arrives from the model
+    /// (`Assembler::clear_retry`), which is the proof the connection came back.
+    #[serde(rename = "api_error")]
+    ApiError {
+        #[serde(default)]
+        error: Value,
+        // camelCase on the wire (`rename_all` on this enum renames VARIANTS, not fields).
+        #[serde(default, rename = "retryAttempt")]
+        retry_attempt: Option<u32>,
+        #[serde(default, rename = "maxRetries")]
+        max_retries: Option<u32>,
+    },
+    #[serde(rename = "local_command")]
+    LocalCommand,
+    #[serde(rename = "stop_hook_summary")]
+    StopHookSummary,
+    #[serde(rename = "compact_boundary")]
+    CompactBoundary,
+    #[serde(rename = "turn_duration")]
+    TurnDuration,
+    #[serde(rename = "informational")]
+    Informational,
+    #[serde(rename = "thinking_tokens")]
+    ThinkingTokens,
+    #[serde(rename = "model_refusal_fallback")]
+    ModelRefusalFallback,
+    /// A subtype we do not model at all — the drift canary. Reaching this arm should be
+    /// rare enough that its log line is worth reading.
     #[serde(other)]
     Unknown,
 }

@@ -58,6 +58,17 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  TosseAccountStatus,
+  TosseBacklogTask,
+  TosseBriefing,
+  TosseProject,
+  LocalRepoScan,
+  TosseProjectRepo,
+  TosseRepoLink,
+  TosseRepoLinksPayload,
+  TosseRepository,
+  TosseTask,
+  TosseTaskDetail,
   SlashCommand,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -191,8 +202,190 @@ function getRecord(session: string): SessionRecord {
 }
 
 const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
+const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 let mockCounter = 0;
+
+// ---- TOSSE briefing fixture ------------------------------------------------
+// Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
+// tasks, paused projects by name only, and the project-less tasks. Mutated in place by the
+// write commands so the demo behaves like the real thing.
+
+function demoTask(
+  id: string,
+  title: string,
+  status: string,
+  extra: Partial<TosseTask> = {},
+): TosseTask {
+  return {
+    id,
+    title,
+    status,
+    priority: "Moyenne",
+    kind: "Code",
+    assignedTo: "Alexandre",
+    dueDate: null,
+    notes: null,
+    subtaskCount: 0,
+    subtaskDone: 0,
+    ...extra,
+  };
+}
+
+// One client with a website (its mark resolves to that domain's favicon) and one with
+// neither logo nor site (it falls back to initials on a hashed gradient) — so a demo run
+// exercises BOTH ends of the avatar cascade instead of only the empty one.
+const demoClientInterne = {
+  id: "c-interne",
+  name: "Interne",
+  logoUrl: null,
+  website: "https://anthropic.com",
+};
+const demoClientWd = { id: "c-wd", name: "Webdentiste", logoUrl: null, website: null };
+
+// The project → folder pins a demo run has made so far. In memory only: the mock has no
+// database, and starting fresh on every reload is what makes the "asked once" behaviour
+// visible in a demo.
+const demoProjectRepos: TosseProjectRepo[] = [];
+
+const demoBriefing: TosseBriefing = {
+  projects: [
+    {
+      id: "p-tosse-code",
+      name: "Tosse Code",
+      status: "En cours",
+      client: demoClientInterne,
+      startDate: "2026-03-12T00:00:00.000Z",
+      dueDate: null,
+      taskCount: 58,
+      taskDone: 41,
+      tasks: [
+        demoTask("t-lot2", "Lot 2 — vue « Tâches TOSSE » + écriture", "En cours", {
+          priority: "Haute",
+          subtaskCount: 4,
+          subtaskDone: 1,
+        }),
+        demoTask("t-lot1", "Lot 1 — connexion (OAuth) + onglet Réglages", "Review", {
+          priority: "Haute",
+        }),
+        demoTask("t-bypass", "Réglage « autoriser le mode Bypass permissions »", "Review"),
+        demoTask("t-workflows", "Affichage live des workflows dans Flight Deck", "À faire", {
+          assignedTo: "Les deux",
+          subtaskCount: 4,
+          subtaskDone: 1,
+        }),
+        demoTask("t-lot3", "Lot 3 — association conversation ↔ tâche", "À faire", {
+          priority: "Haute",
+        }),
+        demoTask("t-readme", "Rédiger un README anglais", "À faire", {
+          priority: "Basse",
+          kind: "Rédaction",
+        }),
+      ],
+    },
+    {
+      id: "p-crm",
+      name: "TOSSE",
+      status: "En cours",
+      client: demoClientInterne,
+      startDate: null,
+      dueDate: "2026-08-15T00:00:00.000Z",
+      taskCount: 28,
+      taskDone: 16,
+      tasks: [
+        demoTask("t-bearer", "Bearer OAuth first-party sur /api/v1/*", "Review", {
+          priority: "Urgente",
+          // The CRM attributes actions taken through the MCP server this way, and it is how
+          // most tasks Claude files show up — so the demo has to exercise that mark too.
+          assignedTo: "MCP de Alexandre",
+        }),
+        demoTask("t-changelog", "Page changelog publique", "À faire", { assignedTo: "Armand" }),
+      ],
+    },
+    {
+      id: "p-santecall",
+      name: "SanteCall 3.0 — Refonte plateforme",
+      status: "En cours",
+      client: demoClientWd,
+      startDate: null,
+      // Deliberately in the past: exercises the overdue styling.
+      dueDate: "2026-07-28T00:00:00.000Z",
+      taskCount: 31,
+      taskDone: 9,
+      tasks: [
+        demoTask("t-volubile", "Migration Volubile → middleware provider", "En cours", {
+          priority: "Urgente",
+          assignedTo: "Armand",
+          dueDate: "2026-08-02T00:00:00.000Z",
+        }),
+        demoTask("t-blocked", "Refonte du flux d'identification patient", "À faire", {
+          priority: "Haute",
+          assignedTo: "Armand",
+        }),
+      ],
+    },
+  ],
+  pausedProjects: [
+    {
+      id: "p-mcp-santecall",
+      name: "Serveur MCP SanteCall",
+      status: "En pause",
+      client: demoClientWd,
+      startDate: null,
+      dueDate: null,
+      tasks: [],
+      taskCount: 12,
+      taskDone: 10,
+    },
+  ],
+  // A project-less task has no card to live in — the view gives it its own band.
+  generalTasks: [demoTask("t-admin", "Déclarer l'URSSAF du trimestre", "À faire", { kind: "Admin" })],
+};
+
+let demoNextId = 1;
+
+/** Every demo task with the project it belongs to, for the detail command. */
+function demoAllTasks(): { task: TosseTask; projectId: string | null; projectName: string | null }[] {
+  const rows = demoBriefing.projects.flatMap((p: TosseProject) =>
+    p.tasks.map((task) => ({ task, projectId: p.id, projectName: p.name })),
+  );
+  return [
+    ...rows,
+    ...demoBriefing.generalTasks.map((task) => ({ task, projectId: null, projectName: null })),
+  ];
+}
+
+/**
+ * Subtasks per parent task, created on first read and then KEPT — so ticking one in the
+ * demo actually sticks, and the panel that shows it can be seen to refresh (or not).
+ */
+const demoSubtasksByParent = new Map<string, TosseTask[]>();
+
+function demoSubtasks(parentId: string): TosseTask[] {
+  let rows = demoSubtasksByParent.get(parentId);
+  if (!rows) {
+    rows = [
+      demoTask(`${parentId}-st-1`, "Cadrage design", "Fait"),
+      demoTask(`${parentId}-st-2`, "Vue + navigation ⌘3", "À faire"),
+      demoTask(`${parentId}-st-3`, "Lecture briefing + groupement client", "À faire"),
+      demoTask(`${parentId}-st-4`, "Écriture : statut + création", "À faire"),
+    ];
+    demoSubtasksByParent.set(parentId, rows);
+  }
+  return rows;
+}
+
+/** Apply a status write to a subtask wherever it lives. Returns true if one matched. */
+function writeDemoSubtaskStatus(taskId: string, status: string): boolean {
+  for (const rows of demoSubtasksByParent.values()) {
+    const row = rows.find((r) => r.id === taskId);
+    if (row) {
+      row.status = status;
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---- Commands (same shape as the generated facade) -------------------------
 
@@ -240,7 +433,7 @@ export const mockCommands = {
         { name: "railway", scope: "user", transport: "stdio", command: "railway", url: null, source: null, enabled: false },
       ],
       plugins: [
-        { id: "browser@openai-bundled", name: "browser", marketplace: "openai-bundled", version: null, description: null, enabled: true, scope: "user", update_available: false, latest_version: null, skill_count: 0, agent_count: 0, command_count: 0, mcp_count: 0 },
+        { id: "browser@openai-bundled", name: "browser", marketplace: "openai-bundled", version: null, description: null, enabled: true, scope: "user", update_available: false, update_unproven: false, latest_version: null, skill_count: 0, agent_count: 0, command_count: 0, mcp_count: 0 },
       ],
       skills: [
         { name: "imagegen", description: "Generate an image", scope: "user", source: null, path: "/Users/x/.codex/skills/.system/imagegen/SKILL.md", enabled: true },
@@ -369,6 +562,232 @@ export const mockCommands = {
   async accountCodexLogout(): Promise<Result<null, string>> {
     return ok(null);
   },
+  // ---- TOSSE (the CRM) — demo connection ------------------------------------------
+  async tosseStatus(): Promise<Result<TosseAccountStatus, string>> {
+    return ok({
+      connected: true,
+      name: "Demo User",
+      email: "demo@example.com",
+      signedOutReason: null,
+      identityError: null,
+    });
+  },
+  async tosseLoginStart(): Promise<Result<string, string>> {
+    return ok("https://tosse.example/oauth/demo");
+  },
+  async tosseLoginCancel(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async tosseLogout(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  // The demo repo, matched to a CRM repository from its git remote — enough to exercise the
+  // badge's linked state and the whole card (url, linked project, Markdown context). Any
+  // OTHER folder has no entry here, so it renders the un-associated state (hollow mark on
+  // hover) and its picker lists the three repositories below.
+  async tosseRepoLinks(): Promise<Result<TosseRepoLinksPayload, string>> {
+    const repositories: TosseRepository[] = [
+      {
+        id: "crm-tosse-code",
+        name: "tosse-code",
+        url: "https://github.com/Alex375/tosse-code",
+        host: "github",
+        status: "Actif",
+        context:
+          "# tosse-code\n\nDesktop app to drive Claude Code.\n\n- **Stack**: Tauri 2, Rust, React\n- Ships as *Flight Deck*.",
+        projects: [{ id: "p-tosse-code", name: "Tosse Code", status: "En cours" }],
+      },
+      {
+        id: "crm-api",
+        name: "TOSSE",
+        url: "https://github.com/Alex375/CRM_max",
+        host: "github",
+        status: "Actif",
+        context: null,
+        projects: [{ id: "p-crm", name: "TOSSE", status: "En cours" }],
+      },
+      {
+        id: "crm-archived",
+        name: "old-prototype",
+        url: null,
+        host: "github",
+        status: "Archivé",
+        context: null,
+        projects: [],
+      },
+    ];
+    const links: TosseRepoLink[] = [
+      {
+        repoId: "repo-demo",
+        resolved: true,
+        notARepository: false,
+        remoteUrl: "git@github.com:Alex375/tosse-code.git",
+        repository: repositories[0],
+        source: "remote",
+        manualRepositoryId: null,
+        ambiguous: [],
+        remoteError: null,
+      },
+    ];
+    return ok({ connected: true, links, repositories, error: null });
+  },
+  async tosseLinkRepository(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  // Project → local folder pins. MUTABLE (like the briefing below), so a demo run
+  // exercises the real "asked once, then remembered" path: pick a folder for a project
+  // and the next Start goes straight there instead of asking again.
+  // Two clones "on disk" the demo repo does not know about, so the "found on this Mac"
+  // path is exercisable without touching a real filesystem.
+  async scanLocalGitRepos(urls: string[]): Promise<Result<LocalRepoScan, string>> {
+    const known: Record<string, { path: string; remoteUrl: string }[]> = {
+      "https://github.com/Alex375/CRM_max": [
+        { path: "/Users/dev/work/CRM_max", remoteUrl: "git@github.com:Alex375/CRM_max.git" },
+      ],
+      "https://github.com/Alex375/tosse-code": [
+        { path: "/Users/dev/demo-repo", remoteUrl: "git@github.com:Alex375/tosse-code.git" },
+      ],
+    };
+    const matches = urls.flatMap((u) =>
+      (known[u] ?? []).map((m) => ({ ...m, matchedUrl: u })),
+    );
+    return ok({ matches, truncated: false, unreadable: [], visited: 42, elapsedMs: 12 });
+  },
+  async tosseProjectRepos(): Promise<Result<TosseProjectRepo[], string>> {
+    return ok([...demoProjectRepos]);
+  },
+  async tosseLinkProjectRepo(
+    projectId: string,
+    repoId: string | null,
+  ): Promise<Result<null, string>> {
+    const at = demoProjectRepos.findIndex((p) => p.project_id === projectId);
+    if (at >= 0) demoProjectRepos.splice(at, 1);
+    if (repoId) demoProjectRepos.push({ project_id: projectId, repo_id: repoId });
+    return ok(null);
+  },
+  // ---- TOSSE tasks view -------------------------------------------------------------
+  // The demo briefing is MUTABLE: status changes and creations write into it, so the demo
+  // exercises the real optimistic-update path (row moves, counts follow) instead of
+  // snapping back on the next refetch.
+  async tosseBriefing(): Promise<Result<TosseBriefing, string>> {
+    return ok(demoBriefing);
+  },
+  // The real one is derived from the discovered `authorization_endpoint`; the demo answers
+  // the production frontend so "Open in TOSSE" is clickable in a mock run too.
+  async tosseWebUrl(): Promise<Result<string, string>> {
+    return ok("https://frontend-production-7e11.up.railway.app");
+  },
+  // Backlog comes from its own endpoint (the briefing excludes it). Spread across a project
+  // AND the project-less band, so a demo run exercises both places it can appear.
+  async tosseBacklog(): Promise<Result<TosseBacklogTask[], string>> {
+    return ok([
+      {
+        projectId: "p-tosse-code",
+        task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", {
+          priority: "Haute",
+        }),
+      },
+      {
+        projectId: "p-tosse-code",
+        task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
+          priority: "Basse",
+          assignedTo: "Armand",
+        }),
+      },
+      {
+        projectId: "p-santecall",
+        task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog"),
+      },
+      {
+        projectId: null,
+        task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
+      },
+    ]);
+  },
+  async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
+    const found = demoAllTasks().find((row) => row.task.id === taskId);
+    if (!found) return err(`no task with id ${taskId}`);
+    // `subtaskDone` is DERIVED, as the server derives it
+    // (`task.subtasks.filter(s => s.status === 'Fait').length`) — a frozen count would make
+    // the panel's own header disagree with the checkboxes right underneath it.
+    const subtasks = found.task.subtaskCount > 0 ? demoSubtasks(found.task.id) : [];
+    return ok({
+      task: {
+        ...found.task,
+        subtaskDone: subtasks.filter((st) => st.status === "Fait").length,
+      },
+      projectId: found.projectId,
+      projectName: found.projectName,
+      context:
+        "## Périmètre\n\nListe des projets **groupés par client**, tâches triées par statut.\n\n- Écriture : statut + création\n- États dégradés : hors-ligne, session expirée",
+      content: null,
+      // MUTABLE, like the briefing above: ticking a subtask has to be visible in the demo,
+      // otherwise a write that never reaches the open panel looks exactly like one that
+      // does — the very bug this band of the UI shipped with.
+      subtasks,
+      blockedBy:
+        found.task.id === "t-lot3"
+          ? [{ id: "t-lot2", title: "Lot 2 — vue « Tâches TOSSE »", status: "En cours", resolved: false }]
+          : [],
+      blocks: [],
+    });
+  },
+  async tosseSetTaskStatus(taskId: string, status: string): Promise<Result<null, string>> {
+    // One id always refuses, so the demo can show what a rejected write looks like.
+    if (taskId === "t-blocked") return err("Task is blocked by « Lot 1 » and cannot be started");
+    // A subtask ticked in the detail panel — its own list, not the board.
+    if (writeDemoSubtaskStatus(taskId, status)) return ok(null);
+    // Mirrors the server's briefing filter — a task moved to any of these leaves the board,
+    // not just « Fait » (briefing.service.ts: notIn ['Archivé','Fait','Backlog','En attente']).
+    const leavesTheBoard = ["Fait", "Backlog", "En attente", "Archivé"].includes(status);
+    for (const p of demoBriefing.projects) {
+      const t = p.tasks.find((x) => x.id === taskId);
+      if (!t) continue;
+      if (leavesTheBoard) p.tasks = p.tasks.filter((x) => x.id !== taskId);
+      else t.status = status;
+      return ok(null);
+    }
+    // Project-less tasks are a real band of the view, so the demo has to move them too:
+    // a mock that silently accepted the write without changing anything could not show the
+    // difference between an applied write and a swallowed one.
+    const g = demoBriefing.generalTasks.find((x) => x.id === taskId);
+    if (g) {
+      if (leavesTheBoard) {
+        demoBriefing.generalTasks = demoBriefing.generalTasks.filter((x) => x.id !== taskId);
+      } else {
+        g.status = status;
+      }
+    }
+    return ok(null);
+  },
+  async tosseSetProjectStatus(projectId: string, status: string): Promise<Result<null, string>> {
+    const p = demoBriefing.projects.find((x) => x.id === projectId);
+    if (p) p.status = status;
+    return ok(null);
+  },
+  async tosseCreateTask(
+    projectId: string,
+    title: string,
+    status: string,
+    kind: string | null,
+    priority: string | null,
+    assignedTo: string | null,
+  ): Promise<Result<TosseTask, string>> {
+    const created: TosseTask = {
+      id: `t-new-${demoNextId++}`,
+      title,
+      status,
+      priority: priority ?? "Moyenne",
+      kind: kind ?? "Code",
+      assignedTo: assignedTo ?? "Alexandre",
+      dueDate: null,
+      notes: null,
+      subtaskCount: 0,
+      subtaskDone: 0,
+    };
+    demoBriefing.projects.find((p) => p.id === projectId)?.tasks.push(created);
+    return ok(created);
+  },
 
   async spawnSession(
     _repoPath: string,
@@ -378,6 +797,7 @@ export const mockCommands = {
     permissionMode: string | null,
     ultracode: boolean,
     _backend: "claude" | "codex",
+    _allowBypassPermissions?: boolean,
   ): Promise<Result<string, string>> {
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
@@ -724,6 +1144,9 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
+          tosse_task_id: null,
+          tosse_task_title: null,
+          tosse_task_status: null,
           backend: "claude",
         },
         // A Codex conversation so the mixed-fleet identity (backend badge, neutral avatar,
@@ -745,6 +1168,9 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
+          tosse_task_id: null,
+          tosse_task_title: null,
+          tosse_task_status: null,
           backend: "codex",
         },
       ],

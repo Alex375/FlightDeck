@@ -66,9 +66,19 @@ pub struct SpawnConfig {
     pub effort: Option<String>,
     /// Initial permission mode (`--permission-mode`, e.g. "default", "plan"). `None`
     /// lets the CLI use its own default. NOTE: `bypassPermissions` is downgraded to
-    /// `default` server-side unless `--allow-dangerously-skip-permissions` is also
-    /// passed (which we deliberately do NOT — the UI keeps bypass disabled).
+    /// `default` server-side unless [`Self::allow_bypass_permissions`] is set.
     pub permission_mode: Option<String>,
+    /// Pass `--allow-dangerously-skip-permissions`, which UNLOCKS `bypassPermissions`
+    /// as a selectable mode without turning it on. Verified against the CLI's own help
+    /// (2.1.220): "Enable bypassing all permission checks *as an option, without it
+    /// being enabled by default*". Without it the CLI silently downgrades a
+    /// `bypassPermissions` request (spawn flag or runtime `set_permission_mode`) to
+    /// `default` — see `control::parse_set_permission_mode_ack`.
+    ///
+    /// ⚠️ NOT `--dangerously-skip-permissions` (no `--allow-` prefix): that one turns
+    /// the bypass ON outright, which is never what this flag is for. Off unless the
+    /// user opted in via Settings → General → Permissions.
+    pub allow_bypass_permissions: bool,
 }
 
 impl SpawnConfig {
@@ -85,6 +95,7 @@ impl SpawnConfig {
             model: None,
             effort: None,
             permission_mode: None,
+            allow_bypass_permissions: false,
         }
     }
 }
@@ -319,7 +330,17 @@ impl Transport {
             // same round-trip; (2) dogfooded against 2.1.187 — locally-typed messages
             // did NOT double. If a future build reassigns the uuid, the symptom is
             // loud & immediate (every local message doubles), not silent.
-            .arg("--replay-user-messages");
+            .arg("--replay-user-messages")
+            // Forward a sub-agent's OWN text and thinking, not just its tool calls.
+            // Without this the binary filters sub-agent messages before forwarding —
+            // `if (!forwardSubagentText && type !== "tool_use" && type !== "tool_result")
+            // continue;` — and that filter applies at depth 1 already, which is why a
+            // live sub-agent drill-in showed steps but no prose while the SAME
+            // conversation reloaded from disk showed both. It also carries nested
+            // (depth-2+) sub-agents, keyed by the Agent tool_use that spawned them.
+            //
+            // Flag verified present in 2.1.220 (the installed build) and 2.1.222.
+            .arg("--forward-subagent-text");
 
         if let Some(resume) = &cfg.resume {
             cmd.arg("--resume").arg(resume);
@@ -341,6 +362,11 @@ impl Transport {
         }
         if let Some(mode) = &cfg.permission_mode {
             cmd.arg("--permission-mode").arg(mode);
+        }
+        // Unlocks `bypassPermissions` as a choice (it does NOT enable it) — see the
+        // field doc. Opt-in, off by default.
+        if cfg.allow_bypass_permissions {
+            cmd.arg("--allow-dangerously-skip-permissions");
         }
 
         cmd.current_dir(&cfg.cwd)

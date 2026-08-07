@@ -357,9 +357,12 @@ function SubAgentCard({
   const subagentType = field(input, "subagent_type") ?? task?.subagent_type ?? null;
   const agentId = task?.agent_id ?? null;
   const model = task?.model ?? null;
-  // Sub-agents inherit the conversation's reasoning effort (not recorded per sub-agent
-  // anywhere), so the parent's effort is the best available signal.
-  const effort = state?.effort ?? null;
+  // NO effort chip here. A sub-agent can declare its OWN `effort:` in its agent
+  // definition, so the parent conversation's effort is not "the best available
+  // signal" — it is simply a different number, shown as if it were this agent's.
+  // The wire carries none (`task_started` has no effort field), and matching by
+  // `subagent_type` would miss every built-in type, so the honest render is nothing.
+  // (Claude Code 2.1.222 fixed the same mislabel on its own transcript view.)
 
   const running = status === "running" || (status === null && !result && (state?.busy ?? false));
   const failed = status === "failed" || (status === null && (result?.isError ?? false));
@@ -477,10 +480,9 @@ function SubAgentCard({
           </span>
         </span>
       </div>
-      {model || effort || (task && (task.tokens != null || task.duration_ms != null || task.tool_uses != null)) ? (
+      {model || (task && (task.tokens != null || task.duration_ms != null || task.tool_uses != null)) ? (
         <div className={styles.subStats + " wf-mono"}>
           {model ? <span title={model}>{shortModel(model)}</span> : null}
-          {effort ? <span>effort {effort}</span> : null}
           {task?.tokens != null ? <span>{fmtTokens(task.tokens)} tk</span> : null}
           {task?.tool_uses != null ? <span>{task.tool_uses} tools</span> : null}
           {task?.duration_ms != null ? <span>{fmtDuration(task.duration_ms)}</span> : null}
@@ -954,6 +956,10 @@ function AskTurn({ session, request }: { session: string; request: PermissionReq
             </div>
             <div className="wf-ask-t">{ask.text}</div>
             {ask.cmd ? <code className="wf-ask-cmd wf-mono">$ {ask.cmd}</code> : null}
+            {/* Why the CLI is asking (a blocked path / its stated reason), when it
+                says. Otherwise a restriction-driven prompt is indistinguishable
+                from an ordinary one. */}
+            {ask.reason ? <div className="wf-ask-why">{ask.reason}</div> : null}
           </div>
           <div className="wf-row" style={{ gap: 8, justifyContent: "flex-end" }}>
             <button className="wf-btn ghost sm" onClick={deny}>
@@ -1344,6 +1350,20 @@ function WorkingIndicator({ session }: { session: string }) {
   // terminal-style ("$ command…") rather than the generic "Running …" phrase — the
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
+  // The connection dropped and Claude Code is retrying on its own. It takes over the
+  // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
+  // usual "Running …" phrase would be a lie while nothing is actually running.
+  const retry = useSessionState(session)?.retry ?? null;
+  if (retry) {
+    const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
+    return (
+      <div className={styles.activity}>
+        <Ico name="refresh" className={"sm " + styles.retrySpin} />
+        <RollText text={`Connection lost — reconnecting${progress}`} />
+        <LiveElapsed session={session} />
+      </div>
+    );
+  }
   return (
     <div className={styles.activity}>
       <span className={styles.typing} aria-hidden="true">

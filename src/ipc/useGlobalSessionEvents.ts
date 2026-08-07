@@ -21,6 +21,7 @@ import type {
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
+  SessionPermissionResolvedEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -50,6 +51,7 @@ import { agentEventFor } from "../notifications/transition";
 import { syncReminderFromLive } from "../agent/reminderSync";
 import type { SessionStatePayload } from "./client";
 import { worktreesKey } from "./useWorktrees";
+import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
@@ -377,6 +379,15 @@ export function useGlobalSessionEvents(): void {
       useConversationStore.getState().enqueuePermission(session, payload.request);
     }
 
+    // The CLI withdrew a prompt (mode flipped mid-check, turn ended, …). Drop the
+    // card: the store otherwise prunes only when the user answers, so a dead prompt
+    // would sit there looking answerable.
+    function onPermissionResolved(payload: SessionPermissionResolvedEvent) {
+      const session = convIdForHandle(payload.session);
+      if (!session) return;
+      useConversationStore.getState().removePermission(session, payload.request_id);
+    }
+
     function onTitle(payload: SessionTitleEvent) {
       const convId = convIdForHandle(payload.session);
       if (!convId) return; // unknown / deleted conversation
@@ -450,6 +461,11 @@ export function useGlobalSessionEvents(): void {
         .getState()
         .recordOutcome(payload.backend, payload.success, payload.error);
       void queryClient.invalidateQueries({ queryKey: ["account-status"] });
+      // A TOSSE sign-in also changes what the repository marks can show. Their query lives
+      // under its own key, so the invalidation above does not reach it — without this, the
+      // marks stay absent for a full staleTime after connecting, and the feature looks
+      // broken exactly when it is first tried.
+      if (payload.backend === "tosse") invalidateTosseRepoLinks(queryClient);
     }
 
     function onCommands(payload: SessionCommandsEvent) {
@@ -506,6 +522,10 @@ export function useGlobalSessionEvents(): void {
       .catch((e) => onAttachError("state", e));
     events.sessionPermissionEvent
       .listen((e) => { if (!disposed) onPermission(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permissions", e));
+    events.sessionPermissionResolvedEvent
+      .listen((e) => { if (!disposed) onPermissionResolved(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("permissions", e));
     events.sessionCommandsEvent

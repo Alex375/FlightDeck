@@ -160,6 +160,7 @@ function baseState(busy: boolean) {
     ultracode: false,
     activity: null,
     awaiting_permission: false,
+    retry: null,
     ended: false,
     context_tokens: null,
     context_window: null,

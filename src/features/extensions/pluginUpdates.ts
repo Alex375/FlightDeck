@@ -13,9 +13,14 @@ export function cliScope(scope: ExtScope): "user" | "project" | "local" | null {
 }
 
 /**
- * The badge text for a plugin that has an update. A concrete "vX → vY" when both the
- * installed and target human versions are known and differ; otherwise a generic label
- * (a sha-only bump, or an unknown installed version) — never a misleading "vX → vX".
+ * The badge text for a plugin that has a PROVEN update. A concrete "vX → vY" when both
+ * the installed and target human versions are known and differ; otherwise a generic
+ * label — never a misleading "vX → vX".
+ *
+ * Note `update_available === true` now implies `latest_version !== null` (the core only
+ * claims an update it can prove from versions — a bare commit move reports
+ * `update_unproven` instead, which renders its own muted badge). The generic branch is
+ * therefore defensive only: it still guards an unknown INSTALLED version.
  */
 export function updateBadgeLabel(
   version: string | null,

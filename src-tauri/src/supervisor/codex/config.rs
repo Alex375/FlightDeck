@@ -215,6 +215,8 @@ fn read_config(path: &Path, snap: &mut ExtensionsSnapshot) -> Vec<(PathBuf, bool
             enabled: p.enabled,
             scope: ExtScope::User,
             update_available: false,
+            // Codex has no marketplace pin to compare against, so nothing is unproven.
+            update_unproven: false,
             latest_version: None,
             skill_count: 0,
             agent_count: 0,
