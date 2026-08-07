@@ -307,6 +307,35 @@ export function projectActions(status: string | null): ProjectAction[] {
   }
 }
 
+/**
+ * The one status move a task row offers as a BUTTON, or null when it offers none.
+ *
+ * Deliberately a single case — `Review` → `Fait` — and not the per-status ladder
+ * {@link projectActions} draws for a project. Closing a task you have just reviewed is the
+ * move that was worth a click of its own: everything else already has a natural home (the
+ * `/pickup` skill starts a task, and the CRM, not this app, is what writes « En cours »),
+ * and a button on every row would put three one-click writes to the CRM where the list
+ * previously had none.
+ *
+ * Every other move stays behind the row's status dot, which opens the full menu. This
+ * button is a shortcut through that menu, never the only way to reach a status.
+ *
+ * ⚠️ `Fait` is the one status the dot's menu isolates behind a separator, because it closes
+ * the task. A labelled button revealed on hover is a different gesture from a menu entry
+ * sitting under the pointer — deliberate, read before it is clicked — so it is NOT given a
+ * confirmation step (decided with Alexandre, 2026-08-07). A mis-click is recoverable from
+ * the same dot menu, which can put the task back.
+ */
+export interface TaskQuickAction {
+  label: string;
+  next: string;
+  tone: "done";
+}
+
+export function taskQuickAction(status: string): TaskQuickAction | null {
+  return status === "Review" ? { label: "Done", next: "Fait", tone: "done" } : null;
+}
+
 /** Every status a task can be moved to from the view, in menu order. `Fait` is last and
  *  rendered behind a separator: reachable (a human is clicking), never adjacent to the
  *  status right above it by accident. */

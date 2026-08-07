@@ -14,6 +14,7 @@ import {
   sortedBacklog,
   statusSections,
   STATUSES_OFF_THE_BOARD,
+  taskQuickAction,
   TASK_STATUS_CHOICES,
 } from "./tosseModel";
 
@@ -156,6 +157,37 @@ describe("projectActions", () => {
     expect(projectActions("Terminé")).toEqual([]);
     expect(projectActions("Archivé")).toEqual([]);
     expect(projectActions(null)).toEqual([]);
+  });
+});
+
+describe("taskQuickAction", () => {
+  it("closes a reviewed task in one click", () => {
+    expect(taskQuickAction("Review")).toEqual({ label: "Done", next: "Fait", tone: "done" });
+  });
+
+  // The scope is the point of the feature, not an oversight: a button on every row would
+  // put three one-click writes to the CRM where the list previously had none, and starting
+  // a task already has its own gesture (the Start button, which goes through /pickup).
+  // Every one of these statuses stays reachable through the row's dot menu.
+  it("offers nothing on any other status", () => {
+    for (const status of ["À faire", "En cours", "En attente", "Backlog", "Fait"]) {
+      expect(taskQuickAction(status)).toBeNull();
+    }
+    // An unknown status from a CRM that gained one must fall through, not throw.
+    expect(taskQuickAction("Something new")).toBeNull();
+  });
+
+  // The button writes a status the dot menu also offers; if the two ever disagreed, one of
+  // them would be writing a value the CRM does not have.
+  it("writes a status the menu itself offers", () => {
+    const quick = taskQuickAction("Review");
+    expect(TASK_STATUS_CHOICES).toContain(quick?.next);
+  });
+
+  // `Fait` is off the board, so the row must LEAVE the list rather than reappear under a
+  // "Fait" heading that the briefing never sends.
+  it("moves the task off the board", () => {
+    expect(STATUSES_OFF_THE_BOARD).toContain(taskQuickAction("Review")?.next);
   });
 });
 
