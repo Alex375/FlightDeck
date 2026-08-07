@@ -1031,22 +1031,56 @@ export const useTodoSummary = (session: string): TodoSummary =>
  * as `role:"user"` turns but are NOT something the user sent. Pure (no hook, no memo)
  * so it is unit-testable; the hook below memoises it. */
 export function selectUserMessageHistory(entry: SessionEntry | undefined): string[] {
-  if (!entry) return EMPTY_STRINGS;
+  const marks = selectUserMessageMarks(entry);
+  if (!marks.length) return EMPTY_STRINGS;
   const out: string[] = [];
+  for (const m of marks) {
+    if (!m.text.trim()) continue; // image-only turn: nothing to recall in the composer
+    if (out.length && out[out.length - 1] === m.text) continue; // collapse consecutive dups
+    out.push(m.text);
+  }
+  return out.length ? out : EMPTY_STRINGS;
+}
+
+/** One of the user's own messages, with the turn id that anchors it in the rendered
+ *  thread (`data-user-turn`). `text` is empty for an image-only send. */
+export interface UserMessageMark {
+  id: string;
+  text: string;
+}
+
+const EMPTY_MARKS: UserMessageMark[] = [];
+
+/**
+ * The same set of messages as {@link selectUserMessageHistory}, but carrying each turn's
+ * id and WITHOUT collapsing consecutive duplicates. Drives the message minimap, where
+ * every user bubble needs its own bar: two identical consecutive sends are two distinct
+ * places in the thread, and collapsing them would leave the second unreachable. (The
+ * collapse in the history above is shell-recall semantics — a different purpose.)
+ *
+ * An IMAGE-ONLY send is included too (empty text, joined images): it is a bubble in the
+ * thread, so it must be navigable. The history above drops it instead — there is nothing
+ * to recall into the composer. That also keeps parity with a reloaded conversation, where
+ * the transcript reader gives such a turn an `[image]` placeholder text.
+ *
+ * Pure (no hook, no memo) so it is unit-testable; the hook below memoises it.
+ */
+export function selectUserMessageMarks(entry: SessionEntry | undefined): UserMessageMark[] {
+  if (!entry) return EMPTY_MARKS;
+  const out: UserMessageMark[] = [];
   for (const t of entry.timeline) {
     if (t.kind !== "turn") continue;
     const turn = entry.turns[t.id];
     if (!turn || turn.role !== "user" || turn.parentToolUseId !== null) continue;
     const text = turn.streamingText;
-    if (!text.trim()) continue;
+    if (!text.trim() && !turn.images?.length) continue;
     // Skip CLI-injected markers (task-notification…): they're rendered as a dedicated
     // card, never a user bubble — so they must not count as "the user's last message"
     // in the preview/pin or the composer's recall history.
-    if (parseSpecialMessage(text)) continue;
-    if (out.length && out[out.length - 1] === text) continue; // collapse consecutive dups
-    out.push(text);
+    if (text.trim() && parseSpecialMessage(text)) continue;
+    out.push({ id: t.id, text });
   }
-  return out.length ? out : EMPTY_STRINGS;
+  return out.length ? out : EMPTY_MARKS;
 }
 
 // Memoised by `timeline` identity: the set of user root-turns (and their text, set
@@ -1074,3 +1108,27 @@ export const useUserMessageHistory = (session: string): string[] =>
   useConversationStore(
     useShallow((s) => memoizedUserMessageHistory(session, s.sessions[session])),
   );
+
+// Same memo discipline as the history above, and it must be a memo rather than a
+// `useShallow`: the marks are OBJECTS, so a fresh walk would hand back new identities on
+// every streamed token and re-render the minimap continuously. Caching on the `timeline`
+// reference means the array (and each mark in it) keeps its identity until a turn is
+// actually appended.
+const userMarksCache = new Map<string, { timeline: TimelineEntry[]; result: UserMessageMark[] }>();
+
+/** `selectUserMessageMarks` cached per session on the `timeline` reference. */
+export function memoizedUserMessageMarks(
+  session: string,
+  entry: SessionEntry | undefined,
+): UserMessageMark[] {
+  if (!entry) return EMPTY_MARKS;
+  const cached = userMarksCache.get(session);
+  if (cached && cached.timeline === entry.timeline) return cached.result;
+  const result = selectUserMessageMarks(entry);
+  userMarksCache.set(session, { timeline: entry.timeline, result });
+  return result;
+}
+
+/** The user's own messages (id + text) for the message minimap. */
+export const useUserMessageMarks = (session: string): UserMessageMark[] =>
+  useConversationStore((s) => memoizedUserMessageMarks(session, s.sessions[session]));

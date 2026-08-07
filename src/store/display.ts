@@ -16,6 +16,14 @@ const STORAGE_KEY = "tosse:display";
  *  A single GLOBAL setting (not per-conversation): one look across the whole app. */
 export type MarkdownMode = "classic" | "warm" | "minimal";
 
+/** What the message minimap shows when a bar is hovered.
+ *  - `summary`: one line — the summary saved for that message when it was sent, or a
+ *    truncation for the messages that were never summarized (short ones and slash
+ *    commands, where the truncation already IS the message).
+ *  - `full`   : the message as sent, in a scrollable preview.
+ *  See {@link MessageMinimap}. */
+export type MinimapHoverMode = "summary" | "full";
+
 export interface DisplayPrefs {
   /** The GLOBAL DEFAULT for "clean output" — folding an assistant response's intermediate
    *  work (tool runs, thinking, in-between narration, sub-agents) into ONE collapsible
@@ -67,6 +75,15 @@ export interface DisplayPrefs {
    *  its ≤6-word Haiku summary). Clicking it scrolls the thread to that message. On by
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
+
+  /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
+   *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
+   *  default. Read by {@link MessageMinimap}. */
+  messageMinimap: boolean;
+
+  /** What a minimap bar shows on hover — a one-line summary or the whole message.
+   *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
+  minimapHoverMode: MinimapHoverMode;
 
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
@@ -213,6 +230,12 @@ const DEFAULTS: DisplayPrefs = {
   fleetBannerConversation: true,
   showTaskNotifications: false,
   showLastMessagePreview: true,
+  // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
+  // two messages, so it costs nothing on the short conversations where it has nothing to
+  // map. Summary hover by default: one line reads at a glance; "full" is a click away in
+  // Settings for whoever prefers the message verbatim.
+  messageMinimap: true,
+  minimapHoverMode: "summary",
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
@@ -277,6 +300,8 @@ export const useDisplay = create<DisplayState>((set) => ({
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        messageMinimap: patch.messageMinimap ?? s.messageMinimap,
+        minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,

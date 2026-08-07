@@ -143,6 +143,7 @@ function MessageActions({
 
 export function MsgUser({
   text,
+  turnId,
   queued,
   images,
   onRewind,
@@ -150,6 +151,9 @@ export function MsgUser({
   forkBusy,
 }: {
   text: string;
+  /** Stamped as `data-user-turn` so the message minimap can scroll to this bubble.
+   *  Absent on surfaces that render a user message outside the live thread. */
+  turnId?: string;
   queued?: boolean;
   images?: UserTurnImage[];
   /** When set, show the rewind hover control on this message. */
@@ -164,7 +168,7 @@ export function MsgUser({
   const special = parseSpecialMessage(text);
   if (special) return <SpecialMessageCard data={special} />;
   return (
-    <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")}>
+    <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
       <div className="cv-bubble">
         {queued ? (
@@ -213,7 +217,9 @@ function InlineUserMarker({ session, turnId }: { session: string; turnId: string
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
   return (
-    <div className={styles.injectedMsg}>
+    // Same `data-user-turn` anchor as a full user bubble: in clean output this IS the
+    // message's place in the thread, so the minimap must be able to scroll to it.
+    <div className={styles.injectedMsg} data-user-turn={turnId}>
       <span
         className={styles.injectedMsgTag}
         title={
@@ -1425,6 +1431,7 @@ export function TurnRow({
     return (
       <MsgUser
         text={turn.streamingText}
+        turnId={turnId}
         queued={turn.queued}
         images={turn.images}
         onRewind={onRewind}

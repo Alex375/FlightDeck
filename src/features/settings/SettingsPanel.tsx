@@ -8,7 +8,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
-import { useDisplay } from "../../store/display";
+import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
@@ -227,6 +227,19 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   );
 }
 
+const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: string }> = [
+  {
+    id: "summary",
+    label: "Summary",
+    desc: "One line: the summary of that message, or its first line when it never needed one. Reads at a glance and never covers the conversation.",
+  },
+  {
+    id: "full",
+    label: "Whole message",
+    desc: "The message as you sent it, in a preview that can span several lines (long ones are clipped). Faithful, but it takes up more of the thread.",
+  },
+];
+
 /** Display prefs in the General tab. Today: the GLOBAL DEFAULT for "clean output" — fold
  *  each round's work behind a "Work" block so only the final message stays in
  *  clear. This is the default applied to conversations that haven't set their own choice;
@@ -236,6 +249,8 @@ function DisplayPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const messageMinimap = useDisplay((s) => s.messageMinimap);
+  const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
@@ -295,6 +310,38 @@ function DisplayPrefs() {
         onChange={(v) => set({ showLastMessagePreview: v })}
         label="Preview of the last sent message"
       />
+      <ToggleRow
+        title="Message minimap"
+        hint={
+          <>
+            Adds a compact block of thin marks at the <strong>right edge</strong> of the
+            conversation — one per message you sent. <strong>Hovering</strong> one previews that
+            message, <strong>clicking</strong> it scrolls to it, and the mark of the message
+            you're reading stays lit. The whole conversation always fits: on a long thread the
+            marks tighten instead of scrolling. <strong>On by default</strong>; hidden below two
+            messages.
+          </>
+        }
+        checked={messageMinimap}
+        onChange={(v) => set({ messageMinimap: v })}
+        label="Show the message minimap"
+      />
+      {messageMinimap ? (
+        <div className={styles.modeBlock}>
+          <div className={styles.ttitle}>Minimap hover</div>
+          <OptionCardRail
+            options={MINIMAP_HOVER_MODES}
+            selected={minimapHoverMode}
+            onSelect={(id) => set({ minimapHoverMode: id })}
+            ariaLabel="Message minimap hover preview"
+          />
+          <div className={styles.note}>
+            Summaries are the ones already generated when each message was sent, and are kept
+            from one run to the next. Messages that never got one — short messages and slash
+            commands, where the text is already its own summary — show their first line.
+          </div>
+        </div>
+      ) : null}
       <ToggleRow
         title="Message controls"
         hint={

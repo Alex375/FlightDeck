@@ -176,6 +176,117 @@
 .cv-lastpin .wf-ico { width:13px; height:13px; flex:0 0 auto; color:var(--wf-accent); }
 .cv-lastpin-txt { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx); }
 
+/* ---- message minimap: one bar per message you sent, floating over the right edge ----
+   Laid out as an OVERLAY (absolute, on top of the thread's right gutter) so the thread
+   keeps its full width and its centred max-width column stays centred.
+
+   Shape: a CONDENSED block of thin marks floating at mid-height — not a scale running down
+   the page. Each bar is placed by the component at an absolute `top` (markOffsetPx), the
+   block is centred on the column, and its pitch only tightens once it would outgrow ~45% of
+   the height. So a 300-message conversation keeps the same compact silhouette as a
+   5-message one, and the minimap never scrolls; past ~150 messages the marks touch and then
+   overlap, which is the accepted cost of that.
+
+   The column's `top`/`height` are set inline from the THREAD's box (not the pane's), so the
+   block centres on the conversation rather than on conversation-plus-composer.
+
+   The BUTTON is the hit area — exactly one pitch tall, also set inline, so the bands TILE
+   (no overlap stealing a neighbour's clicks). The ::before is the visible mark. */
+.cv-mmap {
+  position:absolute;
+  right:0;
+  width:28px;
+  z-index:5;
+  pointer-events:none; /* the column itself is inert; only the bars take the pointer */
+}
+.cv-mmap-bar {
+  position:absolute;
+  right:0;
+  transform:translateY(-50%);
+  width:100%;
+  padding:0;
+  border:0;
+  background:transparent;
+  cursor:pointer;
+  pointer-events:auto;
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+}
+/* 1px is the floor: the thinnest mark that still rasterises as a crisp hairline at any
+   scale factor. Since it has less ink than the 2px version it carried at first, it is given
+   a touch more opacity so the block stays legible at rest. */
+.cv-mmap-bar::before {
+  content:"";
+  width:17px;
+  height:1px;
+  margin-right:6px;
+  background:var(--wf-tx-xlo);
+  opacity:.55;
+  transition:opacity .12s ease, background-color .12s ease, width .12s ease, height .12s ease;
+}
+/* At rest the column is a whisper; hovering anywhere over it brings every bar up, so the
+   map reads as one object rather than as the single bar under the cursor. */
+.cv-mmap:hover .cv-mmap-bar::before { opacity:.78; }
+.cv-mmap-bar:hover::before,
+.cv-mmap-bar[data-hovered]::before,
+.cv-mmap-bar:focus-visible::before {
+  opacity:1;
+  width:22px;
+  height:2px;
+  background:var(--wf-accent);
+}
+.cv-mmap-bar:focus-visible { outline:none; }
+/* The message you are currently reading. Accent-coloured and doubled in thickness — at a
+   1px hairline, colour alone reads as a rendering artefact rather than as a position — but
+   NOT lengthened, so the indicator never competes with the mark under the cursor. */
+.cv-mmap-bar[data-active]::before { opacity:.95; height:2px; background:var(--wf-accent); }
+
+/* Hover preview, to the LEFT of the column. `right:100%` puts it outside the column's
+   width; its `top` is the bar's own offset, clamped by the component so it never hangs off
+   the pane's top/bottom edge.
+
+   ⚠️ `width:max-content` is load-bearing, not a nicety: this is absolutely positioned
+   inside the 22px-wide column, so its shrink-to-fit width resolves against THAT — with
+   only `right` set, the available width is ~0 and a wrapping preview collapses into a
+   one-character-per-line ribbon. Sizing to the content first, then clamping with
+   max-width, is what lets it wrap at a readable width. (`nowrap` masked this in summary
+   mode, so it only showed up in "whole message".) */
+.cv-mmap-tip {
+  position:absolute;
+  right:100%;
+  transform:translateY(-50%);
+  margin-right:4px;
+  width:max-content;
+  max-width:min(420px, calc(100vw - 80px));
+  padding:7px 11px;
+  border:1px solid var(--wf-line);
+  border-radius:9px;
+  background:color-mix(in srgb, var(--wf-panel) 92%, transparent);
+  -webkit-backdrop-filter:blur(9px);
+  backdrop-filter:blur(9px);
+  box-shadow:0 10px 26px -16px #000, 0 2px 8px -6px #0009;
+  color:var(--wf-tx);
+  font-size:12px;
+  line-height:1.45;
+  pointer-events:none; /* never steals the pointer from the bar underneath */
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
+/* Summary mode is a single line; full mode keeps the message's shape but is clamped so a
+   pasted wall of text can't cover the thread. */
+.cv-mmap-tip[data-mode="summary"] { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cv-mmap-tip[data-mode="full"] {
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:14;
+  overflow:hidden;
+}
+/* The thread's own right padding is 26px; the minimap sits in it. Give the thread a touch
+   more room on that side ONLY when the minimap is mounted, so a wide code block never
+   slides under the bars. */
+.cv-pane:has(.cv-mmap) .cv-thread { padding-right:38px; }
+
 /* Clickable http(s) link inside a message preview (LinkText): peek/pin/popover. */
 .cv-linktext { color:var(--wf-accent); text-decoration:underline; text-underline-offset:2px; cursor:pointer; overflow-wrap:anywhere; }
 .cv-linktext:hover { text-decoration:none; }
