@@ -22,6 +22,7 @@ import { StateActions } from "./StateActions";
 import { BackgroundTaskBadge } from "./BackgroundTaskBadge";
 import { LastMessagePeek } from "./LastMessagePeek";
 import { TodoPeek } from "./TodoPeek";
+import { WorkflowPeek } from "./WorkflowPeek";
 import { CardEffort } from "./CardEffort";
 import { CardContext } from "./CardContext";
 import { CardGoal } from "./CardGoal";
@@ -171,6 +172,10 @@ export function StreamCard({
       {lastMsg ? <LastMessagePeek convId={conv.id} summary={lastMsg} /> : null}
 
       <StateBlock convId={conv.id} status={status} />
+
+      {/* A running multi-agent workflow, read live from its journal — the one background task
+          the wire reports as a single opaque unit. Renders nothing without one. */}
+      <WorkflowPeek convId={conv.id} />
 
       <div className="ag-card-foot">
         {/* Active `/goal` — a clickable target opening the SAME goal popover as the composer

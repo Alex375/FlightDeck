@@ -85,6 +85,13 @@ export interface DisplayPrefs {
    *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
   minimapHoverMode: MinimapHoverMode;
 
+  /** Show a RUNNING workflow's live readout on its Flight Deck card — the current phase, how
+   *  many of its agents are in the air, and how far along the run is, read from the run's
+   *  on-disk journal. ON by default. Off → the card falls back to what it showed before: the
+   *  generic "⚙ N background tasks" chip, which counts tasks, not a workflow's inner agents.
+   *  Only ever visible while a workflow runs. Read by {@link WorkflowPeek}. */
+  workflowLiveCard: boolean;
+
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
    *  offered on both the user's and Claude's messages. ON by default. Off → messages have no
@@ -236,6 +243,7 @@ const DEFAULTS: DisplayPrefs = {
   // Settings for whoever prefers the message verbatim.
   messageMinimap: true,
   minimapHoverMode: "summary",
+  workflowLiveCard: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
@@ -302,6 +310,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
+        workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,

@@ -734,6 +734,31 @@ async loadWorkflowJournal(sessionId: string, runId: string) : Promise<Result<Wor
 }
 },
 /**
+ * Start (or join) a live watch on a RUNNING workflow's journal. Each change pushes a
+ * `WorkflowJournalEvent` carrying the run's fresh per-agent progress, so the pinned bar, the
+ * inline card and the Flight Deck card stay live WITHOUT any of them polling. Ref-counted:
+ * every call must be paired with [`unwatch_workflow_journal`].
+ */
+async watchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("watch_workflow_journal", { sessionId, runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop one reference to a run's journal watch (the last one stops it).
+ */
+async unwatchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("unwatch_workflow_journal", { sessionId, runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
  * the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
  * run. Empty if no script/phases. Lets the live overview show upcoming steps.
@@ -1739,7 +1764,8 @@ sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
-tickEvent: TickEvent
+tickEvent: TickEvent,
+workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
 fsChangeEvent: "fs-change-event",
@@ -1757,7 +1783,8 @@ sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
-tickEvent: "tick-event"
+tickEvent: "tick-event",
+workflowJournalEvent: "workflow-journal-event"
 })
 
 /** user-defined constants **/
@@ -3523,22 +3550,58 @@ export type UsageError =
  */
 export type UsageWindow = { used_percentage: number; resets_at: string | null }
 /**
- * Live progress counts for a RUNNING workflow, derived from its append-only
+ * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
  * only written when the run FINISHES, so during the run the journal is the sole on-disk
- * source of "how far along are we": one `{"type":"started",...}` per agent spawn and one
- * `{"type":"result",...}` per agent completion. This gives the overview the UI shows mid-run
- * — agents launched / done / still running — without needing the (absent) manifest.
+ * source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
+ * `{"type":"result",…}` per agent completion.
+ * 
+ * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
+ * than from raw line counts, so a re-emitted entry can never inflate the total past the
+ * number of agents that actually exist.
  */
 export type WorkflowJournal = { 
 /**
- * Agents spawned so far (count of `started` entries).
+ * Distinct agents the journal knows about (== `agents.len()`).
  */
 started: number; 
 /**
- * Agents finished so far (count of `result` entries).
+ * Agents whose `result` entry has landed.
  */
-done: number }
+done: number; 
+/**
+ * Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
+ * set — and drill into a running agent's incrementally-written transcript — instead
+ * of only a launched/done tally.
+ */
+agents: WorkflowJournalAgent[] }
+/**
+ * One agent of a running workflow, as the live journal knows it. The journal carries
+ * ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
+ * those exist solely in the end-of-run manifest. The id is what matters, because it is
+ * the key to that agent's transcript on disk
+ * (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
+ * INCREMENTALLY — so a still-running agent can be read live.
+ */
+export type WorkflowJournalAgent = { 
+/**
+ * Key for [`super::subagents::load_subagent_transcript`].
+ */
+agentId: string; 
+/**
+ * Whether a `result` entry closed this agent. `false` = still in flight.
+ */
+done: boolean }
+/**
+ * A RUNNING workflow's on-disk journal changed: the fresh per-agent progress of that run
+ * ([`crate::supervisor::workflow_watch`]). Keyed by `session_id` (Claude's durable id) +
+ * `run_id`, the pair every workflow surface already holds.
+ * 
+ * `journal: None` with no `error` is the NORMAL early state (the CLI creates the journal
+ * with the run's first agent). `error` is set when a journal that EXISTS could not be read —
+ * a real failure the UI must surface rather than render as a frozen readout.
+ */
+export type WorkflowJournalEvent = { session_id: string; run_id: string; journal: WorkflowJournal | null; error: string | null }
 /**
  * One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
  */

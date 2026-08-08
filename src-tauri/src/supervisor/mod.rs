@@ -13,6 +13,8 @@
 //!     transcript on resume (the CLI does not re-stream history).
 //!   - [`subagents`] — disk readers for background-task artifacts (sub-agent
 //!     transcripts, workflow manifests, background-task output files).
+//!   - [`workflow_watch`] — live watch on a running workflow's journal, so every
+//!     surface sees its real per-agent progress without polling.
 //!   - [`session`] — the actor that wires transport + control + assembler + an
 //!     event sink, exposed to the IPC layer (subtask 3).
 
@@ -25,6 +27,7 @@ pub mod protocol;
 pub mod session;
 pub mod subagents;
 pub mod transport;
+pub mod workflow_watch;
 
 pub use control::{PermissionDecision, PermissionMode};
 pub use model::{

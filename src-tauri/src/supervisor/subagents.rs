@@ -33,7 +33,9 @@
 use std::path::{Path, PathBuf};
 
 use super::history::{claude_config_dir, parse_transcript_str, project_dirs};
-use super::model::{ConversationItem, WorkflowJournal, WorkflowPhase, WorkflowRun};
+use super::model::{
+    ConversationItem, WorkflowJournal, WorkflowJournalAgent, WorkflowPhase, WorkflowRun,
+};
 
 /// Cap on how deep we recurse under `subagents/` looking for a transcript — enough
 /// for `subagents/workflows/wf_<id>/agent-<id>.jsonl` (depth 3) with margin, while
@@ -183,12 +185,26 @@ fn load_workflow_run_in(
         .map_err(|e| format!("unreadable manifest {}: {e}", path.display()))
 }
 
+/// The two fields of a journal entry we care about. Deliberately NOT `serde_json::Value`:
+/// a `result` entry embeds the agent's ENTIRE return value (real journals reach hundreds of
+/// KiB), and this file is re-read on every change of a running workflow. Deserializing into
+/// this struct lets serde SKIP `result` (and the cache `key`) without materializing them.
+#[derive(serde::Deserialize)]
+struct JournalLine {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
+}
+
 /// Read a RUNNING workflow's live progress from its append-only journal
 /// (`subagents/workflows/<run_id>/journal.jsonl`). The rich manifest is written only at the
 /// END of a run, so during the run this journal is the only on-disk "how far along" signal:
-/// we count `{"type":"started"}` (agents spawned) and `{"type":"result"}` (agents done). The
-/// run dir is named exactly `<run_id>` (the `wf_…` id). Probes every project slug holding the
-/// session (a cwd move splits artifacts across slugs).
+/// `{"type":"started",agentId}` (agent spawned) then `{"type":"result",agentId}` (agent done).
+/// We keep the AGENT IDS, not just tallies — they key each agent's incrementally-written
+/// transcript, so the UI can show (and drill into) what is running right now. The run dir is
+/// named exactly `<run_id>` (the `wf_…` id). Probes every project slug holding the session (a
+/// cwd move splits artifacts across slugs).
 ///
 /// `Ok(None)` = no journal yet (normal: the very first moments, or a resumed past run). `Err`
 /// = a real IO error reading an existing journal (surfaced, never silent). Individual malformed
@@ -198,6 +214,25 @@ pub fn load_workflow_journal(session_id: &str, run_id: &str) -> Result<Option<Wo
         Some(dir) => load_workflow_journal_in(&dir, session_id, run_id),
         None => Ok(None),
     }
+}
+
+/// The on-disk directory holding a run's live artifacts (`journal.jsonl` + one transcript
+/// per agent), or `None` while no slug holding this session has it yet — the normal state
+/// for the first moments of a run, since the CLI creates it with the first agent.
+///
+/// Exists for the live watcher ([`super::workflow_watch`]), which must watch the DIRECTORY:
+/// watching `journal.jsonl` itself would fail while it is still absent, and re-watching an
+/// atomically-replaced file is a class of bug we avoid entirely by watching its parent.
+pub fn workflow_run_dir(session_id: &str, run_id: &str) -> Option<PathBuf> {
+    let config_dir = claude_config_dir()?;
+    if !is_safe_id(session_id) || !is_safe_id(run_id) {
+        eprintln!("[subagents] refusing unsafe id (session={session_id:?}, run={run_id:?})");
+        return None;
+    }
+    session_dirs(&config_dir, session_id)
+        .into_iter()
+        .map(|dir| dir.join("subagents").join("workflows").join(run_id))
+        .find(|p| p.is_dir())
 }
 
 fn load_workflow_journal_in(
@@ -225,24 +260,47 @@ fn load_workflow_journal_in(
     let Some(content) = content else {
         return Ok(None);
     };
-    // Count by entry `type`. A malformed line (e.g. the final partial line of a live append)
-    // is skipped — that's expected, not an error.
-    let mut started = 0u64;
-    let mut done = 0u64;
-    for line in content.lines() {
+    Ok(Some(parse_workflow_journal(&content)))
+}
+
+/// Fold a journal's text into per-agent state. Agents are keyed by `agentId` and kept in
+/// FIRST-SEEN order, so a re-emitted `started` can't double-count and a `result` for an agent
+/// whose `started` we never saw (a resumed/cached run) still registers rather than vanishing.
+/// A malformed line (e.g. the final partial line of a live append) is skipped — expected, not
+/// an error. An entry without an `agentId` still moves the tallies via a positional key, so a
+/// shape change in the CLI degrades to "counts only" instead of to zero.
+fn parse_workflow_journal(content: &str) -> WorkflowJournal {
+    let mut agents: Vec<WorkflowJournalAgent> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (n, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            match v.get("type").and_then(|t| t.as_str()) {
-                Some("started") => started += 1,
-                Some("result") => done += 1,
-                _ => {}
+        let Ok(entry) = serde_json::from_str::<JournalLine>(line) else {
+            continue;
+        };
+        let done = match entry.kind.as_str() {
+            "started" => false,
+            "result" => true,
+            _ => continue,
+        };
+        // No id (unexpected shape): fall back to a per-line key so the agent is still counted.
+        let key = entry.agent_id.unwrap_or_else(|| format!("#line-{n}"));
+        match index.get(&key) {
+            Some(&i) => {
+                // `done` only ever moves false → true: a stray later `started` for an already
+                // finished agent must not resurrect it as in-flight.
+                agents[i].done |= done;
+            }
+            None => {
+                index.insert(key.clone(), agents.len());
+                agents.push(WorkflowJournalAgent { agent_id: key, done });
             }
         }
     }
-    Ok(Some(WorkflowJournal { started, done }))
+    let done = agents.iter().filter(|a| a.done).count() as u64;
+    WorkflowJournal { started: agents.len() as u64, done, agents }
 }
 
 /// The declared phases of a workflow, read from its SCRIPT's `meta.phases` — the only source
@@ -769,11 +827,58 @@ mod tests {
         let j = load_workflow_journal_in(&base, session_id, "wf_j").unwrap().expect("journal found");
         assert_eq!(j.started, 3);
         assert_eq!(j.done, 2);
+        // The agent IDS survive (they key each agent's live transcript) in spawn order, with
+        // `c` — started, no result yet — still in flight.
+        assert_eq!(
+            j.agents.iter().map(|a| (a.agent_id.as_str(), a.done)).collect::<Vec<_>>(),
+            [("a", true), ("b", true), ("c", false)],
+        );
 
         // Absent journal (no run dir) → Ok(None), not an error.
         assert!(load_workflow_journal_in(&base, session_id, "wf_absent").unwrap().is_none());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The journal fold: counts come from DISTINCT agent ids, a `result` never regresses to
+    /// in-flight, an id-less entry still counts, and a huge `result` payload is skipped by the
+    /// parser rather than materialized.
+    #[test]
+    fn journal_fold_dedups_agents_and_tolerates_shape_drift() {
+        // A re-emitted `started` for the same agent must not double-count, and a later stray
+        // `started` after the `result` must not resurrect it.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"agentId\":\"a\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a\"}\n\
+             {\"type\":\"result\",\"agentId\":\"a\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a\"}\n",
+        );
+        assert_eq!((j.started, j.done), (1, 1));
+        assert_eq!(j.agents.len(), 1);
+        assert!(j.agents[0].done);
+
+        // A `result` whose `started` we never saw (resumed/cached run) still registers.
+        let j = parse_workflow_journal("{\"type\":\"result\",\"agentId\":\"ghost\"}\n");
+        assert_eq!((j.started, j.done), (1, 1));
+
+        // An entry with no `agentId` (shape drift) still moves the tally — degrade to
+        // "counts only", never to zero. Unknown types and junk lines are ignored.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\"}\n\
+             {\"type\":\"started\"}\n\
+             {\"type\":\"heartbeat\",\"agentId\":\"z\"}\n\
+             not json at all\n",
+        );
+        assert_eq!((j.started, j.done), (2, 0));
+
+        // A fat `result` payload parses (and is skipped, not kept) — the shape real journals have.
+        let fat = format!(
+            "{{\"type\":\"result\",\"key\":\"v2:abc\",\"agentId\":\"a\",\"result\":{{\"findings\":\"{}\"}}}}\n",
+            "x".repeat(4096)
+        );
+        let j = parse_workflow_journal(&fat);
+        assert_eq!((j.started, j.done), (1, 1));
+        assert_eq!(j.agents[0].agent_id, "a");
     }
 
     /// Reality check against the developer's REAL `~/.claude` artifacts (ignored by default;
@@ -799,6 +904,43 @@ mod tests {
             Err(e) => eprintln!("[realworld] Err — {e}"),
         }
         assert!(matches!(got, Ok(Some(_))), "expected to resolve the real manifest");
+    }
+
+    /// Reality check of the journal reader against the developer's REAL `~/.claude` artifacts
+    /// (ignored by default; no CI dependency). Set `TOSSE_RW_SESSION` + `TOSSE_RW_RUN` and run
+    /// with `cargo test --lib realworld_load_workflow_journal -- --ignored --nocapture`.
+    ///
+    /// Prints the parse time as well as the counts: a real journal inlines every agent's full
+    /// return value (hundreds of KiB), and the live watcher re-reads it on every append — so
+    /// "does it parse" and "is it cheap enough to re-read" are the same question here.
+    #[test]
+    #[ignore]
+    fn realworld_load_workflow_journal() {
+        let session = std::env::var("TOSSE_RW_SESSION").expect("set TOSSE_RW_SESSION");
+        let run = std::env::var("TOSSE_RW_RUN").expect("set TOSSE_RW_RUN");
+        let t0 = std::time::Instant::now();
+        let got = super::load_workflow_journal(&session, &run);
+        let elapsed = t0.elapsed();
+        match &got {
+            Ok(Some(j)) => eprintln!(
+                "[realworld] OK started={} done={} in_flight={} agents[0..3]={:?} ({elapsed:?})",
+                j.started,
+                j.done,
+                j.started - j.done,
+                j.agents.iter().take(3).collect::<Vec<_>>(),
+            ),
+            Ok(None) => eprintln!("[realworld] None — no journal for session={session} run={run}"),
+            Err(e) => eprintln!("[realworld] Err — {e}"),
+        }
+        let j = got.expect("reader must not fail").expect("expected a real journal");
+        assert_eq!(j.started as usize, j.agents.len(), "counts derive from the agent list");
+        assert!(j.done <= j.started, "an agent cannot finish before it starts");
+
+        // Same resolution the live watcher does before it can watch anything: if this returns
+        // None on a real run, the watcher never attaches and the readout silently never moves.
+        let dir = super::workflow_run_dir(&session, &run).expect("watcher must resolve the run dir");
+        eprintln!("[realworld] run dir = {}", dir.display());
+        assert!(dir.join("journal.jsonl").is_file(), "the journal lives in the watched dir");
     }
 
     #[test]

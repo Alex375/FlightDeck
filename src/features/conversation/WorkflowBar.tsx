@@ -7,17 +7,23 @@
 //
 // Clicking a row opens the live overview (<WorkflowDetail>): current phase + per-phase agents
 // launched/done. The run id needed to read disk is parsed from the Workflow tool_result ack.
+//
+// Each row states the run's REAL progress — "N running · M done", counted from the journal the
+// watcher pushes — rather than only the wire's coarse "<phase>: <label>" string, which says
+// nothing about how much of the fleet is still in the air.
 
 import { useState } from "react";
 import { useBackgroundWorkflowTasks, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useToolResult } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
+import { useWorkflowJournal } from "../../store/workflowJournal";
 import { useStopTask } from "../../ipc/useCommands";
 import { runIdFromResult } from "../../agent/subagentMeta";
 import { Ico, RunDots } from "../../ui/kit";
 import { useIsCodex } from "./ConvMark";
 import { WorkflowDetail } from "./WorkflowDetail";
+import { WorkflowTally } from "./WorkflowTally";
 
 export function WorkflowBar({ session }: { session: string }) {
   // Bloc A (Phase 4.5): `Workflow` is a Claude-only background tool (no Codex equivalent
@@ -38,6 +44,7 @@ export function WorkflowBar({ session }: { session: string }) {
   const openedResult = useToolResult(session, opened?.tool_use_id ?? "");
   const openedRunId = opened ? runIdFromResult(openedResult?.content) : null;
   const liveActivity = useWorkflowLive(session, openedId ?? "");
+  const openedJournal = useWorkflowJournal(session, openedRunId);
 
   if (isCodex) return null;
   if (rows.length === 0 && !opened) return null;
@@ -56,6 +63,14 @@ export function WorkflowBar({ session }: { session: string }) {
             <Ico name="layers" className="sm cv-monrow-ico" />
             <span className="cv-bashrow-cmd">{t.label ?? "Workflow"}</span>
             {t.progress ? <span className="cv-bgagent-stats wf-mono">{t.progress}</span> : null}
+            {/* This bar lists RUNNING runs only, so `running` is always true here — passed
+                explicitly so the wording rule lives in one place, not in each caller's head. */}
+            <WorkflowTally
+              session={session}
+              toolUseId={t.tool_use_id}
+              running
+              className="cv-bgagent-stats wf-mono"
+            />
           </button>
           <button
             type="button"
@@ -77,6 +92,7 @@ export function WorkflowBar({ session }: { session: string }) {
         workflowName={opened?.label ?? null}
         currentProgress={opened?.progress ?? null}
         liveActivity={liveActivity}
+        journal={openedJournal}
         onClose={() => setOpenedId(null)}
       />
     </div>

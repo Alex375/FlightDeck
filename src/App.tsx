@@ -14,6 +14,7 @@ import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
 import { ZoomHost } from "./ui/ZoomHost";
+import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
@@ -409,6 +410,9 @@ export default function App() {
       {/* Idem (render-null): pushes the interface-zoom preference to the OS webview, on
           mount and on every change. */}
       <ZoomHost />
+      {/* Mounted once, globally (render-null): one live disk watch per RUNNING workflow, so
+          every surface sees its real per-agent progress even with the detail modal closed. */}
+      <WorkflowWatchHost />
     </Win>
   );
 }

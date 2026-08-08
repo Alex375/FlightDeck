@@ -85,6 +85,8 @@ export type {
   UsageError,
   UsageWindow,
   WorkflowJournal,
+  WorkflowJournalAgent,
+  WorkflowJournalEvent,
   WorkflowPhase,
   WorkflowRun,
   WorktreeInfo,

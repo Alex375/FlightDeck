@@ -16,6 +16,7 @@ import type {
   PermissionDecision,
   PermissionRequestPayload,
   SessionStatePayload,
+  WorkflowJournal,
   WorkflowRun,
 } from "../client";
 
@@ -160,6 +161,31 @@ export const DEMO_WORKFLOW_RUN: WorkflowRun = {
   ],
   result: null,
 };
+
+/** The demo run's live journal — what the Rust watcher pushes mid-run. Kept consistent with
+ *  the manifest above (same agent ids) so the live overview and the post-run report describe
+ *  the same three agents: r-correctness done, r-perf in flight, v-correctness queued (a queued
+ *  agent has NOT been spawned, so the journal — which only knows spawns — doesn't list it). */
+export function demoWorkflowJournal(): WorkflowJournal {
+  return isDemoWorkflowDone()
+    ? {
+        started: 3,
+        done: 3,
+        agents: [
+          { agentId: "demoagent_fg", done: true },
+          { agentId: "demoagent_bg", done: true },
+          { agentId: "demoagent_v", done: true },
+        ],
+      }
+    : {
+        started: 2,
+        done: 1,
+        agents: [
+          { agentId: "demoagent_fg", done: true },
+          { agentId: "demoagent_bg", done: false },
+        ],
+      };
+}
 
 // Demo-only flag: the dynamic workflow's manifest exists ONLY once the run is done (mirrors
 // reality — the CLI writes it at the end). While false, the mock's `load_workflow_run` returns

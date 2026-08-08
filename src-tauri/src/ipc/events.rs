@@ -4,7 +4,7 @@ use tauri_specta::Event;
 
 use crate::supervisor::model::{
     BackgroundTask, ConversationItem, PermissionRequestPayload, PermissionResolvedPayload,
-    RemoteControlState, SessionEmitter, SessionStatePayload, SlashCommand,
+    RemoteControlState, SessionEmitter, SessionStatePayload, SlashCommand, WorkflowJournal,
 };
 use crate::usage::PlanUsage;
 
@@ -142,6 +142,21 @@ pub struct AccountLoginEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct FsChangeEvent {
     pub paths: Vec<String>,
+}
+
+/// A RUNNING workflow's on-disk journal changed: the fresh per-agent progress of that run
+/// ([`crate::supervisor::workflow_watch`]). Keyed by `session_id` (Claude's durable id) +
+/// `run_id`, the pair every workflow surface already holds.
+///
+/// `journal: None` with no `error` is the NORMAL early state (the CLI creates the journal
+/// with the run's first agent). `error` is set when a journal that EXISTS could not be read —
+/// a real failure the UI must surface rather than render as a frozen readout.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct WorkflowJournalEvent {
+    pub session_id: String,
+    pub run_id: String,
+    pub journal: Option<WorkflowJournal>,
+    pub error: Option<String>,
 }
 
 /// The filesystem watcher backend hit an error and live updates may have stopped.

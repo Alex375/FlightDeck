@@ -27,6 +27,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
 import { isGenericThinking } from "../store/activity";
@@ -36,6 +37,8 @@ import {
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
 import { useWorkflowLiveStore } from "../store/workflowLive";
+import { useWorkflowJournalStore } from "../store/workflowJournal";
+import { useAppErrors } from "../store/appErrors";
 import { useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
@@ -565,10 +568,41 @@ export function useGlobalSessionEvents(): void {
         );
     }
 
+    // A running workflow's on-disk journal changed (the Rust watcher pushes its fresh
+    // per-agent progress). Keyed by Claude's DURABLE session id — not the live handle every
+    // other session event uses — because the journal is an on-disk artifact of that id.
+    function onWorkflowJournal(payload: WorkflowJournalEvent) {
+      const conv = useConversationsStore
+        .getState()
+        .conversations.find((c) => c.sessionId === payload.session_id);
+      if (!conv) {
+        // A watch whose conversation we can't resolve is a live watcher feeding nobody. Rare
+        // (the watch is owned by a mounted conversation), but dropping it in total silence
+        // would make it undiagnosable.
+        console.warn("[workflow journal] no conversation for session", payload.session_id);
+        return;
+      }
+      // A journal that EXISTS but can't be read is a real failure. Two things must happen, and
+      // the banner alone is NOT enough: the watcher only re-emits on CHANGE, so a persistent IO
+      // failure yields exactly one event — once the user dismisses the banner, nothing else
+      // says the numbers stopped being true. Flag the run itself so every surface stops
+      // presenting its last snapshot as live.
+      if (payload.error) {
+        useAppErrors.getState().pushError("Workflow journal unreadable", payload.error);
+        useWorkflowJournalStore.getState().markError(conv.id, payload.run_id, payload.error);
+        return;
+      }
+      useWorkflowJournalStore.getState().apply(conv.id, payload.run_id, payload.journal);
+    }
+
     events.sessionMessageEvent
       .listen((e) => { if (!disposed) onMessage(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("messages", e));
+    events.workflowJournalEvent
+      .listen((e) => { if (!disposed) onWorkflowJournal(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("workflow progress", e));
     events.sessionStateEvent
       .listen((e) => { if (!disposed) onState(e.payload); })
       .then((un) => unlisteners.push(un))

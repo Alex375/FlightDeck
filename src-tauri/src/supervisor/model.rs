@@ -462,19 +462,41 @@ pub struct WorkflowRun {
     pub result: Value,
 }
 
-/// Live progress counts for a RUNNING workflow, derived from its append-only
+/// One agent of a running workflow, as the live journal knows it. The journal carries
+/// ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
+/// those exist solely in the end-of-run manifest. The id is what matters, because it is
+/// the key to that agent's transcript on disk
+/// (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
+/// INCREMENTALLY — so a still-running agent can be read live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowJournalAgent {
+    /// Key for [`super::subagents::load_subagent_transcript`].
+    pub agent_id: String,
+    /// Whether a `result` entry closed this agent. `false` = still in flight.
+    pub done: bool,
+}
+
+/// Live progress of a RUNNING workflow, derived from its append-only
 /// `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
 /// only written when the run FINISHES, so during the run the journal is the sole on-disk
-/// source of "how far along are we": one `{"type":"started",...}` per agent spawn and one
-/// `{"type":"result",...}` per agent completion. This gives the overview the UI shows mid-run
-/// — agents launched / done / still running — without needing the (absent) manifest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+/// source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
+/// `{"type":"result",…}` per agent completion.
+///
+/// The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
+/// than from raw line counts, so a re-emitted entry can never inflate the total past the
+/// number of agents that actually exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowJournal {
-    /// Agents spawned so far (count of `started` entries).
+    /// Distinct agents the journal knows about (== `agents.len()`).
     pub started: u64,
-    /// Agents finished so far (count of `result` entries).
+    /// Agents whose `result` entry has landed.
     pub done: u64,
+    /// Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
+    /// set — and drill into a running agent's incrementally-written transcript — instead
+    /// of only a launched/done tally.
+    pub agents: Vec<WorkflowJournalAgent>,
 }
 
 /// Deserialize that maps an explicit JSON `null` to `T::default()`. `#[serde(default)]`
