@@ -22,8 +22,16 @@
      composited transform plays it back — so nothing here needs to know about the animation
      beyond pinning the origin the maths assumes. */
   transform-origin: center center;
-  width: min(1000px, 92vw);
-  height: min(820px, 90vh);
+  /* Sized to actually USE the display it is on. The old 1000×820 ceilings were the binding
+     constraint on anything bigger than a laptop screen, leaving a small card marooned in the
+     middle of a large monitor — the viewport terms never got a say. Now they almost always
+     do; the pixel ceilings only step in on very large displays, and the few percent of margin
+     left around it is deliberate: it has to keep reading as something laid OVER the deck
+     rather than a new window (there is a "Fullscreen" button for that). The thread keeps its
+     own centred reading column (--cv-max), exactly as the full conversation view does at any
+     window size. */
+  width: min(1500px, 94vw);
+  height: min(1400px, 94vh);
   display: flex;
   flex-direction: column;
   background: var(--wf-bg);
