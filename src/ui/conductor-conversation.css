@@ -384,6 +384,14 @@
 .cv-user.is-queued .cv-bubble { border-color:var(--wf-wait); border-style:dashed; }
 .cv-queued-tag { display:flex; align-items:center; gap:5px; width:fit-content; margin-bottom:8px; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; letter-spacing:.4px; text-transform:uppercase; color:var(--wf-wait); background:var(--wf-wait-bg); }
 .cv-queued-tag .wf-ico { width:11px; height:11px; color:var(--wf-wait); }
+/* Drop-this-pending-message control. Hidden until the bubble is hovered (like the
+   rewind/fork controls) so the tag stays a quiet status chip, and `display:none` →
+   `inline-flex` rather than opacity: an icon button never collapses to zero width, so
+   fading it alone would leave a permanent gap in the chip. */
+.cv-queued-del { display:none; margin-left:2px; padding:0; border:0; background:none; cursor:pointer; color:var(--wf-wait); opacity:.75; }
+.cv-queued-del .wf-ico { width:10px; height:10px; }
+.cv-msg.cv-user:hover .cv-queued-del { display:inline-flex; }
+.cv-queued-del:hover { opacity:1; }
 
 /* Injected "special message" card — e.g. a <task-notification> emitted when a
    background task/agent finishes. Rendered in PLACE of a user bubble (the CLI injects

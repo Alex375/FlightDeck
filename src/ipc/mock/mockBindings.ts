@@ -218,6 +218,8 @@ const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 let mockCounter = 0;
+/** Distinguishes the wire uuids the mock hands back for successive sends. */
+let mockSentCounter = 0;
 
 // ---- TOSSE briefing fixture ------------------------------------------------
 // Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
@@ -839,7 +841,7 @@ export const mockCommands = {
     _text: string,
     _images: ImageAttachment[],
     codexControls: CodexControls | null,
-  ): Promise<Result<null, string>> {
+  ): Promise<Result<string, string>> {
     // No actor to apply the per-turn Codex overrides to — log them so a dev/Playwright
     // run driving the demo Codex conversation can observe they were actually folded in.
     if (codexControls) console.info("[mock] sendMessage codexControls:", codexControls);
@@ -854,7 +856,15 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else driver.start();
-    return ok(null);
+    // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
+    // path as production (the demo has no queue, so cancelling it always reports false).
+    return ok(`mock-uuid-${session}-${mockSentCounter++}`);
+  },
+
+  async cancelQueuedMessage(_session: string, _messageUuid: string): Promise<Result<boolean, string>> {
+    // No command queue in the demo → nothing is ever removed, which is the same answer
+    // the binary gives for a message that already started running.
+    return ok(false);
   },
 
   async answerPermission(

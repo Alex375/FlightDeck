@@ -849,7 +849,7 @@ async getPlanUsage() : Promise<Result<PlanUsage, UsageError>> {
  * approval / sandbox / …) applied as per-turn overrides — `None`/ignored for Claude,
  * whose controls are pushed the moment they change.
  */
-async sendMessage(session: string, text: string, images: ImageAttachment[], codexControls: CodexControls | null) : Promise<Result<null, string>> {
+async sendMessage(session: string, text: string, images: ImageAttachment[], codexControls: CodexControls | null) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("send_message", { session, text, images, codexControls }) };
 } catch (e) {
@@ -1089,6 +1089,24 @@ async rewindFiles(session: string, userMessageId: string, dryRun: boolean) : Pro
 async cancelLastUserMessage(session: string) : Promise<Result<string | null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("cancel_last_user_message", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop ONE specific still-queued user message from the binary's command queue, by the
+ * uuid `send_message` returned for it. This is what backs "remove this pending message"
+ * on a message queued behind a running turn — distinct from
+ * [`cancel_last_user_message`], which targets whatever was sent last.
+ * 
+ * `false` = the binary did not remove it (already dequeued for execution, or never
+ * queued). The caller must NOT take the bubble away on `false`: the message is on its
+ * way to the model and will be answered.
+ */
+async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_queued_message", { session, messageUuid }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

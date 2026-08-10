@@ -1351,8 +1351,13 @@ pub async fn send_message(
     text: String,
     images: Vec<ImageAttachment>,
     codex_controls: Option<codex::CodexControls>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    // The returned uuid identifies THIS message on the wire. The UI keeps it on the
+    // turn so a message still sitting in the binary's queue can be dropped individually
+    // (`cancel_async_message`) — the only way to cancel one specific queued message
+    // rather than "the last thing sent". Codex sessions return one too; it is unused
+    // there, which keeps a single send path for both backends.
     handle
         .send_user(text, images, codex_controls)
         .await
@@ -1563,6 +1568,28 @@ pub async fn rewind_files(
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
     handle
         .rewind_files(user_message_id, dry_run)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Drop ONE specific still-queued user message from the binary's command queue, by the
+/// uuid `send_message` returned for it. This is what backs "remove this pending message"
+/// on a message queued behind a running turn — distinct from
+/// [`cancel_last_user_message`], which targets whatever was sent last.
+///
+/// `false` = the binary did not remove it (already dequeued for execution, or never
+/// queued). The caller must NOT take the bubble away on `false`: the message is on its
+/// way to the model and will be answered.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_queued_message(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    message_uuid: String,
+) -> Result<bool, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .cancel_async_message(message_uuid)
         .await
         .map_err(|e| e.to_string())
 }

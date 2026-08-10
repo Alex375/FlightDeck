@@ -38,6 +38,9 @@ pub enum SessionCommand {
         text: String,
         images: Vec<transport::ImageAttachment>,
         controls: Option<crate::supervisor::codex::CodexControls>,
+        /// Stamped by the caller (see [`SessionHandle::send_user`]) so it can be
+        /// returned with the send and used to cancel this exact message later.
+        uuid: String,
     },
     AnswerPermission {
         request_id: String,
@@ -247,16 +250,28 @@ impl SessionHandle {
     /// Send a user turn: text, any joined images, and (Codex only) the composer
     /// controls applied as per-turn overrides. `send_user_text` is the text-only
     /// convenience used by internal callers and tests.
+    /// Returns the uuid stamped on the turn. Minted HERE rather than inside the actor
+    /// so the caller gets it synchronously with the send: it is the handle the UI needs
+    /// to cancel THAT message later (`cancel_async_message`), and a message queued
+    /// behind a running turn can be dropped individually only if its own uuid is known.
     pub async fn send_user(
         &self,
         text: impl Into<String>,
         images: Vec<transport::ImageAttachment>,
         controls: Option<crate::supervisor::codex::CodexControls>,
-    ) -> Result<(), SessionError> {
-        self.send(SessionCommand::SendUser { text: text.into(), images, controls }).await
+    ) -> Result<String, SessionError> {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        self.send(SessionCommand::SendUser {
+            text: text.into(),
+            images,
+            controls,
+            uuid: uuid.clone(),
+        })
+        .await?;
+        Ok(uuid)
     }
 
-    pub async fn send_user_text(&self, text: impl Into<String>) -> Result<(), SessionError> {
+    pub async fn send_user_text(&self, text: impl Into<String>) -> Result<String, SessionError> {
         self.send_user(text, Vec::new(), None).await
     }
 
@@ -1076,11 +1091,12 @@ impl SessionCore {
         match cmd {
             // `controls` is Codex-only (per-turn overrides); the Claude backend pushes
             // each control the moment it changes, so it's ignored here.
-            SessionCommand::SendUser { text, images, .. } => {
-                // Stamp a uuid so `--replay-user-messages` echo of THIS turn can be
-                // recognised as our own and suppressed (the UI shows it optimistically);
-                // a remote turn carries a uuid we never recorded, so it surfaces live.
-                let uuid = uuid::Uuid::new_v4().to_string();
+            SessionCommand::SendUser { text, images, uuid, .. } => {
+                // The uuid was stamped by the caller. It serves two purposes: the
+                // `--replay-user-messages` echo of THIS turn is recognised as our own and
+                // suppressed (the UI shows it optimistically) — a remote turn carries a
+                // uuid we never recorded, so it surfaces live — and it is the handle the
+                // UI keeps to cancel this specific message while it is still queued.
                 if self.send(transport::user_message_with_images(
                     text.clone(),
                     &images,
@@ -1568,7 +1584,7 @@ mod tests {
     fn send_user_text_on_a_dead_session_surfaces_a_notice() {
         let (mut core, mut events, out) = test_core();
         drop(out); // the process is gone: the outbound channel is closed
-        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None });
+        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None, uuid: "u-test".to_string() });
         let notice = drain(&mut events).into_iter().find_map(|e| match e {
             SessionEvent::Item(ConversationItem::Notice { subtype, .. }) => Some(subtype),
             _ => None,
@@ -1784,7 +1800,7 @@ mod tests {
     #[test]
     fn send_user_text_writes_a_user_message() {
         let (mut core, _events, mut out) = test_core();
-        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None });
+        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None, uuid: "u-test".to_string() });
         let lines = drain(&mut out);
         assert_eq!(lines[0]["type"], json!("user"));
         assert_eq!(lines[0]["message"]["content"][0]["text"], json!("hello"));
@@ -1799,7 +1815,7 @@ mod tests {
     #[test]
     fn own_user_message_echo_suppressed_remote_surfaced() {
         let (mut core, mut events, mut out) = test_core();
-        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None });
+        core.on_command(SessionCommand::SendUser { text: "hello".to_string(), images: Vec::new(), controls: None, uuid: "u-test".to_string() });
         let uuid = drain(&mut out)[0]["uuid"].as_str().unwrap().to_string();
         let _ = drain(&mut events); // the busy state event from the send
 

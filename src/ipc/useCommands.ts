@@ -63,8 +63,9 @@ export async function sendConversationMessage(
   const driveTitle = goal === undefined;
   // The core does not echo user turns, so append optimistically (keyed by the
   // stable id) before sending — instant even while the session spawns.
+  let bubbleTurnId = "";
   if (showBubble) {
-    useConversationStore.getState().addUserTurn(convId, text, queued, images);
+    bubbleTurnId = useConversationStore.getState().addUserTurn(convId, text, queued, images);
     // Name a still-untitled conversation after its first message, and mark it eligible for
     // the model-generated title that replaces it.
     //
@@ -100,6 +101,11 @@ export async function sendConversationMessage(
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   const codexControls = conv?.kind === "codex" ? buildCodexControls(conv) : null;
   const res = await unwrap(commands.sendMessage(handle, text, wireImages, codexControls));
+  // Remember which message on the wire this bubble is, so it can be dropped from the
+  // binary's queue for as long as it has not started running.
+  if (bubbleTurnId && typeof res === "string") {
+    useConversationStore.getState().setTurnWireUuid(convId, bubbleTurnId, res);
+  }
   // A `/goal` command is not conversational content, so it must not drive the title or the
   // Flight Deck "last ask" peek either — otherwise a goal directive would leak into those.
   if (driveTitle) {
@@ -218,6 +224,41 @@ export function useAnswerPermission(convId: string) {
 // and a live change on one path, and lets the core's get_settings read-back be the
 // source of truth for what the indicator shows.
 
+/** Whether the most recent user bubble is one queued behind a running turn. */
+function lastUserTurnIsQueued(convId: string): boolean {
+  const entry = useConversationStore.getState().sessions[convId];
+  if (!entry) return false;
+  for (let i = entry.timeline.length - 1; i >= 0; i--) {
+    const item = entry.timeline[i];
+    if (item.kind !== "turn") continue;
+    const turn = entry.turns[item.id];
+    if (turn?.role === "user") return !!turn.queued;
+  }
+  return false;
+}
+
+/** Drop ONE message that is still waiting in the binary's queue, from the pending badge
+ *  on its own bubble. The bubble is removed ONLY on a confirmed cancellation: `false`
+ *  means the message already started running and WILL be answered, so taking the bubble
+ *  away would hide a message the agent is about to act on. */
+export function useCancelQueuedMessage(convId: string) {
+  const removeUserTurn = useConversationStore((s) => s.removeUserTurn);
+  const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
+  return useMutation({
+    mutationFn: async (args: { turnId: string; wireUuid: string }) => {
+      const handle = liveHandle(convId);
+      if (!handle) return false;
+      const cancelled = await unwrap(commands.cancelQueuedMessage(handle, args.wireUuid));
+      if (cancelled) removeUserTurn(convId, args.turnId);
+      return cancelled;
+    },
+    onError: (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      addErrorTurn(convId, `Could not remove the pending message: ${message}`);
+    },
+  });
+}
+
 /** Stop button behaviour: first try to UN-SEND the message the user just sent (it is
  *  still queued in the binary), and only fall back to interrupting the turn.
  *
@@ -237,6 +278,14 @@ export function useStopOrUnsend(convId: string) {
       const handle = liveHandle(convId);
       if (!handle) return;
       if (!useDisplay.getState().cancelRestoreOnStop) {
+        await interrupt.mutateAsync();
+        return;
+      }
+      // If the last thing sent was QUEUED behind a running turn, "stop" unambiguously
+      // means "stop the agent" — not "drop the message I lined up". Dropping that
+      // message is its own explicit action, on the pending bubble itself
+      // (`useCancelQueuedMessage`), so the two intentions never fight over one button.
+      if (lastUserTurnIsQueued(convId)) {
         await interrupt.mutateAsync();
         return;
       }
