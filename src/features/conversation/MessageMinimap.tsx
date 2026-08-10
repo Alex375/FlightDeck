@@ -23,6 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type RefObject } from "react";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
+import { verticalScaleOf, verticalScaleOfEl } from "../../ui/visualScale";
 import { useUserMessageMarks } from "../../store/conversationStore";
 import { summaryKey, summaryPreview, useMessageSummaries } from "../../store/lastMessageSummary";
 import { userMessagePreviewText } from "./userText";
@@ -154,28 +155,6 @@ export function isScrolledToBottom(
   return scrollHeight - scrollTop - clientHeight <= BOTTOM_EPSILON_PX;
 }
 
-/**
- * The vertical scale an ancestor `transform` is currently PAINTING an element at, from its
- * visual height (`getBoundingClientRect`) and its layout height (`offsetHeight`, which no
- * transform can touch). 1 when nothing is scaling it.
- *
- * ⚠️ Needed because `getBoundingClientRect` reports visual pixels. The Flight Deck's reply
- * modal opens by zooming the panel up from a card's box, so anything measuring itself in the
- * first frames of that animation reads a fraction of the real size. A measurement that is
- * then CACHED — like the minimap's column, whose ResizeObserver can never fire again, since a
- * transform changes no layout box — would stay wrong for as long as the modal is open. (That
- * is the bug this exists for: the block sat high and short until the window was resized.)
- *
- * Ratios within a hair of 1 snap to exactly 1: `offsetHeight` is integer-rounded, and the
- * untransformed case must divide by nothing at all rather than by 1.0004.
- */
-export function verticalScaleOf(visualHeight: number, layoutHeight: number): number {
-  if (!(layoutHeight > 0) || !Number.isFinite(visualHeight)) return 1;
-  const scale = visualHeight / layoutHeight;
-  if (!(scale > 0) || !Number.isFinite(scale)) return 1;
-  return Math.abs(scale - 1) < 0.01 ? 1 : scale;
-}
-
 export function MessageMinimap({
   session,
   paneRef,
@@ -224,8 +203,13 @@ export function MessageMinimap({
         setActiveId(nodes.length ? (nodes[nodes.length - 1].dataset.userTurn ?? null) : null);
         return;
       }
+      // ⚠️ Rect tops are VISUAL, `ACTIVE_LINE_PX` is a LAYOUT constant — so the constant is
+      // projected INTO visual space (multiplied, where a visual measurement would be
+      // divided). Under the reply modal's opening zoom the raw sum put the reading line ~480
+      // layout px down instead of 96, lighting a bar several messages too far; and since
+      // nothing necessarily scrolls or grows afterwards, that wrong bar just stayed lit.
       const threadTop = thread.getBoundingClientRect().top;
-      const line = threadTop + ACTIVE_LINE_PX;
+      const line = threadTop + ACTIVE_LINE_PX * verticalScaleOfEl(thread);
       const anchors: AnchorTop[] = [];
       for (const node of nodes) {
         const id = node.dataset.userTurn;
@@ -270,7 +254,7 @@ export function MessageMinimap({
       const p = pane.getBoundingClientRect();
       // These rects are VISUAL, while `top`/`height` below are written straight back into the
       // pane's OWN pixels. Divide out any ancestor scale so the two agree — see
-      // verticalScaleOf for the case that makes this load-bearing. The pane's layout is
+      // `visualScale.ts` for the case that makes this load-bearing. The pane's layout is
       // already final during such an animation, so this yields the settled numbers on the
       // first measurement rather than waiting the zoom out.
       const scale = verticalScaleOf(p.height, pane.offsetHeight);

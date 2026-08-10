@@ -61,16 +61,59 @@ export function boxOf(el: Element | null | undefined): Box | null {
   return { left: r.left, top: r.top, width: r.width, height: r.height };
 }
 
-/** Does this box overlap the window at all? A card scrolled out of its swimlane keeps a
- *  perfectly valid (but off-screen) box; zooming to it would throw the panel across the
+/** Does this box overlap `region` at all? A card scrolled out of its swimlane keeps a
+ *  perfectly valid (but invisible) box; zooming to it would throw the panel across the
  *  screen towards something the user cannot see. */
-export function isOnScreen(box: Box, viewport: { width: number; height: number }): boolean {
+export function isOnScreen(box: Box, region: Box): boolean {
   return (
-    box.left < viewport.width &&
-    box.top < viewport.height &&
-    box.left + box.width > 0 &&
-    box.top + box.height > 0
+    box.left < region.left + region.width &&
+    box.top < region.top + region.height &&
+    box.left + box.width > region.left &&
+    box.top + box.height > region.top
   );
+}
+
+/** The overlap of two boxes, or `null` when they do not meet. */
+export function intersectBox(a: Box, b: Box): Box | null {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.left + a.width, b.left + b.width);
+  const bottom = Math.min(a.top + a.height, b.top + b.height);
+  if (!(right > left) || !(bottom > top)) return null;
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+/** The window itself, as a box. */
+export function viewportBox(): Box {
+  return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+}
+
+/**
+ * The region `el` is actually VISIBLE within: the window, narrowed by every ancestor that
+ * clips its overflow.
+ *
+ * ⚠️ The window alone is not enough, and the gap is not theoretical: the deck scrolls inside
+ * a container whose top edge sits below the title bar and the fleet banner, so there is a
+ * ~86px band where a card is fully clipped yet still passes every window test. Closing into
+ * one shrank the panel to a point ABOVE the top of the screen, behind the banner — exactly
+ * the "lie about where it came from" these guards exist to prevent.
+ *
+ * Ancestors are matched on computed overflow rather than on a class name: the deck has two
+ * nested scrollers today, and a third would otherwise be a silent hole.
+ */
+export function visibleRegionOf(el: Element | null | undefined, viewport: Box): Box | null {
+  let region: Box | null = viewport;
+  let node = el?.parentElement ?? null;
+  while (node && node !== document.body && node !== document.documentElement) {
+    const s = getComputedStyle(node);
+    if (s.overflow !== "visible" || s.overflowX !== "visible" || s.overflowY !== "visible") {
+      const box = boxOf(node);
+      if (box) region = intersectBox(region, box);
+      if (!region) return null; // clipped away entirely — nothing of it is on screen
+    }
+    node = node.parentElement;
+  }
+  return region;
 }
 
 /**
@@ -78,16 +121,18 @@ export function isOnScreen(box: Box, viewport: { width: number; height: number }
  * the animation's *card* end. Animate to/from `"none"` for the *panel* end.
  *
  * Returns `null` when no honest zoom exists: no origin, a degenerate box, or a card that is
- * entirely off-screen. The scale is clamped to `≤ 1` so a card somehow larger than the panel
- * never plays the animation backwards (shrinking INTO the modal).
+ * not visible inside `region` — the area the card can actually be SEEN in, which is the
+ * window narrowed by whatever clips it (see {@link visibleRegionOf}); a `null` region means
+ * nothing of it is on screen at all. The scale is clamped to `≤ 1` so a card somehow larger
+ * than the panel never plays the animation backwards (shrinking INTO the modal).
  */
 export function zoomTransform(
   origin: Box | null | undefined,
   panel: Box | null | undefined,
-  viewport: { width: number; height: number },
+  region: Box | null,
 ): string | null {
   if (!finiteBox(origin) || !finiteBox(panel)) return null;
-  if (!isOnScreen(origin, viewport)) return null;
+  if (!region || !isOnScreen(origin, region)) return null;
   const sx = clamp(origin.width / panel.width, MIN_SCALE, 1);
   const sy = clamp(origin.height / panel.height, MIN_SCALE, 1);
   // Centre-to-centre, because the transform-origin is the panel's centre.

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { isOnScreen, zoomTransform, type Box } from "./modalZoom";
+import { intersectBox, isOnScreen, zoomTransform, type Box } from "./modalZoom";
 
-const VP = { width: 1440, height: 900 };
+// The visible region a card is tested against: the window unless something clips it.
+const VP: Box = { left: 0, top: 0, width: 1440, height: 900 };
 // A realistic pair: a Flight Deck card in the top-left swimlane, and the centred panel.
 const CARD: Box = { left: 40, top: 120, width: 348, height: 240 };
 const PANEL: Box = { left: 220, top: 40, width: 1000, height: 820 };
@@ -64,5 +65,37 @@ describe("isOnScreen", () => {
     expect(isOnScreen({ left: -10, top: -10, width: 40, height: 40 }, VP)).toBe(true);
     expect(isOnScreen({ left: -50, top: 10, width: 40, height: 40 }, VP)).toBe(false);
     expect(isOnScreen({ left: 10, top: VP.height + 1, width: 40, height: 40 }, VP)).toBe(false);
+  });
+
+  it("tests against the REGION, not the window — a clipped card is not visible", () => {
+    // The deck scrolls below the title bar + fleet banner: a card whose whole box sits in
+    // that band passes every window test yet is painted nowhere.
+    const deck: Box = { left: 0, top: 86, width: VP.width, height: VP.height - 86 };
+    const behindTheBanner: Box = { left: 40, top: -70, width: 348, height: 119 };
+    expect(isOnScreen(behindTheBanner, VP)).toBe(true); // …which is why the window alone lied
+    expect(isOnScreen(behindTheBanner, deck)).toBe(false);
+    // A card poking below the banner's edge is genuinely visible again.
+    expect(isOnScreen({ ...behindTheBanner, top: 40 }, deck)).toBe(true);
+  });
+});
+
+describe("intersectBox", () => {
+  it("narrows one box by another", () => {
+    expect(intersectBox(VP, { left: 0, top: 86, width: 1440, height: 814 })).toEqual({
+      left: 0,
+      top: 86,
+      width: 1440,
+      height: 814,
+    });
+  });
+
+  it("returns null for boxes that do not meet — including edge-touching ones", () => {
+    expect(intersectBox(VP, { left: 1440, top: 0, width: 100, height: 100 })).toBeNull();
+    expect(intersectBox(VP, { left: -100, top: 0, width: 100, height: 100 })).toBeNull();
+  });
+
+  it("is what makes a fully-clipped origin refuse a transform end to end", () => {
+    const deck = intersectBox(VP, { left: 0, top: 86, width: 1440, height: 814 });
+    expect(zoomTransform({ left: 40, top: -70, width: 348, height: 119 }, PANEL, deck)).toBeNull();
   });
 });

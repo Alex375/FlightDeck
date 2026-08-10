@@ -42,6 +42,8 @@ import {
   ZOOM_IN_MS,
   ZOOM_OUT_MS,
   boxOf,
+  viewportBox,
+  visibleRegionOf,
   zoomTransform,
 } from "./modalZoom";
 import styles from "./FlightDeckReplyModal.module.css";
@@ -94,6 +96,10 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
   // Escape / click while it plays must be ignored rather than restart it.
   const closingRef = useRef(false);
   const failsafeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The opening animations, kept so a dismissal that lands mid-flight can stop them before
+  // measuring anything — a running transform makes every rect inside the panel report visual,
+  // not layout, pixels.
+  const entryRef = useRef<Animation[]>([]);
 
   // Grow out of the card that was clicked. A LAYOUT effect so the very first painted frame
   // is already the card-sized state — starting after paint would flash the full-size panel.
@@ -109,11 +115,16 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
     // A freshly-opened panel always takes clicks again, whatever the last exit left behind
     // (React unmounts it between openings today — this keeps that from being load-bearing).
     if (panel) panel.style.pointerEvents = "";
+    entryRef.current = [];
     if (!convId || !scrim || !panel || !zoomAllowed()) return;
-    const from = zoomTransform(useFlightdeckModal.getState().origin, boxOf(panel), {
-      width: window.innerWidth,
-      height: window.innerHeight,
-    });
+    // The card is measured through whatever clips it, not just against the window — a lane
+    // hidden under the header/banner is not somewhere to fly from. See visibleRegionOf.
+    const card = liveCard(convId);
+    const from = zoomTransform(
+      useFlightdeckModal.getState().origin,
+      boxOf(panel),
+      visibleRegionOf(card, viewportBox()),
+    );
     const opts = { duration: ZOOM_IN_MS, easing: EASE_OPEN } as const;
     const anims = [
       scrim.animate([{ opacity: 0 }, { opacity: 1 }], opts),
@@ -131,11 +142,16 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
       ),
     ];
     panel.style.willChange = "transform, opacity";
+    // Kept so the exit can STOP them (see requestClose): while they run, the panel's box is
+    // an animated one, and every rect read inside it lies.
+    entryRef.current = anims;
     anims[1].onfinish = () => {
       panel.style.willChange = "";
+      entryRef.current = [];
     };
     return () => {
       for (const a of anims) a.cancel();
+      entryRef.current = [];
       panel.style.willChange = "";
     };
   }, [convId]);
@@ -152,14 +168,27 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
       return;
     }
     closingRef.current = true;
+    // ⚠️ Dismissing DURING the opening zoom (a double-click, a quick Escape) used to measure
+    // the panel through its own animation. `boxOf` is `getBoundingClientRect` — a VISUAL box —
+    // while the maths below needs the panel's final LAYOUT box, so the exit was computed
+    // against a half-grown panel: at ~27ms in, the measured box IS the card's, giving
+    // `scale(1)` and no shrink at all; further in, the panel flew to a point between the modal
+    // and the card, landing on nothing. So: read what is on screen right now, THEN stop the
+    // entry — after which the panel measures its true layout box again.
+    const shown = getComputedStyle(panel);
+    const fromTransform = shown.transform && shown.transform !== "none" ? shown.transform : "none";
+    const fromOpacity = Number.parseFloat(shown.opacity);
+    const opaque = Number.isFinite(fromOpacity) ? fromOpacity : 1;
+    const scrimOpacity = Number.parseFloat(getComputedStyle(scrim).opacity);
+    for (const a of entryRef.current) a.cancel();
+    entryRef.current = [];
     // Where the card is NOW — deliberately re-measured rather than reusing the box captured
     // at open time: the deck reorders itself as agents change state. When the card is gone
-    // (or has been pushed off-screen), the panel fades in place instead: shrinking into a
-    // remembered position would point at whatever sits there now.
-    const to = zoomTransform(boxOf(liveCard(id)), boxOf(panel), {
-      width: window.innerWidth,
-      height: window.innerHeight,
-    });
+    // (or is hidden behind the header/banner, or clipped out of its lane), the panel fades in
+    // place instead: shrinking into a remembered position would point at whatever sits there
+    // now, and shrinking into a clipped one at nothing the user can see.
+    const card = liveCard(id);
+    const to = zoomTransform(boxOf(card), boxOf(panel), visibleRegionOf(card, viewportBox()));
     // The panel stops taking clicks while it flies away; the scrim keeps swallowing them,
     // so a stray click cannot reach the deck underneath and open another card mid-exit.
     panel.style.pointerEvents = "none";
@@ -167,11 +196,20 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
     // `fill: forwards` holds the final frame until React unmounts us — without it the
     // animation's end reverts to the natural styles for a frame, flashing the panel back.
     const opts = { duration: ZOOM_OUT_MS, easing: EASE_CLOSE, fill: "forwards" } as const;
-    scrim.animate([{ opacity: 1 }, { opacity: 0 }], opts);
+    scrim.animate(
+      [{ opacity: Number.isFinite(scrimOpacity) ? scrimOpacity : 1 }, { opacity: 0 }],
+      opts,
+    );
     const flight = panel.animate(
       [
-        { transform: "none", opacity: 1, offset: 0 },
-        { opacity: 1, offset: 0.45 },
+        // Starting from what is ACTUALLY on screen, not from a hard-coded "none": a new
+        // animation wins composite order, so an exit that assumed the settled state would
+        // snap the panel to full size for one frame before shrinking — a visible pop,
+        // measured at 348 → 1353px, whenever the dismissal caught the entry mid-flight.
+        { transform: fromTransform, opacity: opaque, offset: 0 },
+        // Holds the opacity it STARTED at rather than jumping to a hard 1 — identical to the
+        // settled case (where that is 1), and no brightening pop when the entry was cut short.
+        { opacity: opaque, offset: 0.45 },
         { transform: to ?? "scale(0.97)", opacity: 0, offset: 1 },
       ],
       opts,
