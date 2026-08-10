@@ -1047,6 +1047,54 @@ async mcpAuthenticate(session: string, serverName: string) : Promise<Result<McpA
 }
 },
 /**
+ * The live model catalogue of a running session (`list_models`). Authoritative in a
+ * way our hard-coded table cannot be: the binary applies the provider, the settings
+ * cascade and the org enforcement policy, so this is exactly what the session may run.
+ * Errors with "unknown session" when nothing is live; the UI then keeps its static list.
+ */
+async listSessionModels(session: string) : Promise<Result<LiveModel[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_session_models", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Restore the files edited since a user message, from the binary's own checkpoints
+ * (`rewind_files`). Call with `dry_run: true` FIRST to preview which files and how
+ * many lines would change — the app never performs a destructive restore without
+ * showing that preview. A refusal (checkpointing disabled, no checkpoint for this
+ * message) comes back inside the result as `can_rewind: false` + `error`, never as a
+ * silent no-op.
+ */
+async rewindFiles(session: string, userMessageId: string, dryRun: boolean) : Promise<Result<RewindFilesResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rewind_files", { session, userMessageId, dryRun }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Un-send the message the user just sent, while the binary still has it QUEUED, and
+ * return its text so the composer can be refilled with it (`cancel_async_message`).
+ * `null` = nothing was cancelled — the turn had already started, or there was nothing
+ * to cancel — and the UI must then leave the conversation untouched rather than
+ * pretending the message is gone.
+ * 
+ * The uuid is minted core-side at send time and never crosses this boundary, so the
+ * target is "the last thing I sent" rather than an id the front would have to track.
+ */
+async cancelLastUserMessage(session: string) : Promise<Result<string | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_last_user_message", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Tear a session down and remove it from the registry.
  */
 async stopSession(session: string) : Promise<Result<null, string>> {
@@ -2687,6 +2735,40 @@ data_base64: string; too_large: boolean; size: number;
 mtime_ms: number | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * One selectable model, as the RUNNING session reports it via the `list_models`
+ * control request. Authoritative in a way a hard-coded table can never be: the
+ * binary resolves the provider, the settings cascade and the org enforcement
+ * policy, so this list is exactly what the session may actually run.
+ */
+export type LiveModel = { 
+/**
+ * The alias to send back in `set_model` (e.g. `default`, `sonnet`, `opus[1m]`).
+ */
+value: string; 
+/**
+ * The concrete model the alias resolves to (e.g. `claude-opus-5[1m]`). Carries the
+ * `[1m]` suffix when the session runs the 1M-context variant — the ONLY wire signal
+ * of the context window, which the model name alone does not give.
+ */
+resolved_model: string | null; 
+/**
+ * Human label for the picker (e.g. `Opus (1M context)`).
+ */
+display_name: string; 
+/**
+ * One-line description shown under the label.
+ */
+description: string | null; 
+/**
+ * Whether this model accepts an effort level at all.
+ */
+supports_effort: boolean; 
+/**
+ * The effort ladder this model accepts, in wire order (`low` … `max`). Data-driven:
+ * a binary that adds a rung exposes it here with no code change on our side.
+ */
+supported_effort_levels: string[] }
+/**
  * A clone found on this Mac that matches one of the urls asked about.
  */
 export type LocalRepoMatch = { path: string; 
@@ -3038,6 +3120,34 @@ max: number | null;
  * Short human reason ("Connection error."), when one is available.
  */
 reason: string | null }
+/**
+ * Outcome of a `rewind_files` request — the binary restoring the files it edited
+ * since a given user message, from its own checkpoints. Also the shape of a
+ * `dry_run` PREVIEW, which reports what *would* change without touching the disk.
+ */
+export type RewindFilesResult = { 
+/**
+ * Whether the rewind is possible (dry run) or was performed (real run). `false`
+ * with an `error` when file checkpointing is off or no checkpoint covers the message.
+ */
+can_rewind: boolean; 
+/**
+ * Absolute paths the rewind would restore / did restore.
+ */
+files_changed: string[]; 
+/**
+ * Lines that would be / were added back.
+ */
+insertions: number; 
+/**
+ * Lines that would be / were removed.
+ */
+deletions: number; 
+/**
+ * Why the rewind is unavailable. The binary answers a SUCCESS control_response even
+ * when it refuses, so this is the only signal — never swallow it.
+ */
+error: string | null }
 /**
  * What a rewind removed, returned to the UI.
  */

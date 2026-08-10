@@ -33,7 +33,9 @@ import type {
   ImageContent,
   MarketplaceInfo,
   McpAuthResult,
+  LiveModel,
   McpServerLive,
+  RewindFilesResult,
   PluginContents,
   PermissionDecision,
   PermissionMode,
@@ -953,6 +955,33 @@ export const mockCommands = {
   async interruptSession(session: string): Promise<Result<null, string>> {
     getRecord(session).driver.interrupt();
     return ok(null);
+  },
+
+  /** The demo has no command queue to drop a message from, so nothing is ever taken
+   *  back — `null` is the honest answer and makes the stop button fall through to the
+   *  interrupt, exactly as it does against a turn that has already started. */
+  async cancelLastUserMessage(_session: string): Promise<Result<string | null, string>> {
+    return ok(null);
+  },
+
+  async listSessionModels(_session: string): Promise<Result<LiveModel[], string>> {
+    return ok([]);
+  },
+
+  async rewindFiles(
+    _session: string,
+    _userMessageId: string,
+    _dryRun: boolean,
+  ): Promise<Result<RewindFilesResult, string>> {
+    // No file checkpoints in the demo: report the same refusal the binary gives when
+    // checkpointing is off, so the UI exercises its "cannot rewind" path.
+    return ok({
+      can_rewind: false,
+      files_changed: [],
+      insertions: 0,
+      deletions: 0,
+      error: "File rewinding is not enabled.",
+    });
   },
 
   async stopSession(session: string): Promise<Result<null, string>> {

@@ -67,6 +67,48 @@ pub struct SessionStatePayload {
     pub rate_limit: Option<RateLimitSnapshot>,
 }
 
+/// One selectable model, as the RUNNING session reports it via the `list_models`
+/// control request. Authoritative in a way a hard-coded table can never be: the
+/// binary resolves the provider, the settings cascade and the org enforcement
+/// policy, so this list is exactly what the session may actually run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct LiveModel {
+    /// The alias to send back in `set_model` (e.g. `default`, `sonnet`, `opus[1m]`).
+    pub value: String,
+    /// The concrete model the alias resolves to (e.g. `claude-opus-5[1m]`). Carries the
+    /// `[1m]` suffix when the session runs the 1M-context variant — the ONLY wire signal
+    /// of the context window, which the model name alone does not give.
+    pub resolved_model: Option<String>,
+    /// Human label for the picker (e.g. `Opus (1M context)`).
+    pub display_name: String,
+    /// One-line description shown under the label.
+    pub description: Option<String>,
+    /// Whether this model accepts an effort level at all.
+    pub supports_effort: bool,
+    /// The effort ladder this model accepts, in wire order (`low` … `max`). Data-driven:
+    /// a binary that adds a rung exposes it here with no code change on our side.
+    pub supported_effort_levels: Vec<String>,
+}
+
+/// Outcome of a `rewind_files` request — the binary restoring the files it edited
+/// since a given user message, from its own checkpoints. Also the shape of a
+/// `dry_run` PREVIEW, which reports what *would* change without touching the disk.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct RewindFilesResult {
+    /// Whether the rewind is possible (dry run) or was performed (real run). `false`
+    /// with an `error` when file checkpointing is off or no checkpoint covers the message.
+    pub can_rewind: bool,
+    /// Absolute paths the rewind would restore / did restore.
+    pub files_changed: Vec<String>,
+    /// Lines that would be / were added back.
+    pub insertions: u32,
+    /// Lines that would be / were removed.
+    pub deletions: u32,
+    /// Why the rewind is unavailable. The binary answers a SUCCESS control_response even
+    /// when it refuses, so this is the only signal — never swallow it.
+    pub error: Option<String>,
+}
+
 /// Live status of one MCP server, queried on demand from the running session via
 /// the `mcp_status` control request (NOT the `system/init` snapshot, which is
 /// point-in-time and shows servers stuck at `pending`). This is the authoritative

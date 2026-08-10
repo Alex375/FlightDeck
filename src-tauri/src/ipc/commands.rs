@@ -1266,7 +1266,25 @@ pub async fn read_task_output_file(path: String) -> Result<Option<String>, Strin
 /// Errors are typed ([`UsageError`]) so the UI can show a tailored next step.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_plan_usage() -> Result<PlanUsage, UsageError> {
+pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<PlanUsage, UsageError> {
+    // Prefer a LIVE session's `get_usage` control request: same numbers, but with no
+    // OAuth token and no Keychain read — which is precisely what makes it immune to the
+    // stale `~/.claude/.credentials.json` that shadows a fresh Keychain token and 401s
+    // the HTTP path. Only ONE session is tried: any of them reports the same
+    // account-wide plan, and walking a list of unresponsive handles would make the UI
+    // wait out a timeout per session.
+    //
+    // The HTTP path is deliberately KEPT rather than replaced: sessions spawn lazily, so
+    // with no conversation running there is nobody to ask — and the binary marks
+    // `get_usage` "Experimental — the response shape may change", so a drift there must
+    // degrade to the endpoint instead of blanking the meter.
+    if let Some(handle) = sessions.handles().into_iter().next() {
+        if let Ok(line) = handle.plan_usage_payload().await {
+            if let Some(usage) = crate::usage::plan_usage_from_control_response(&line) {
+                return Ok(usage);
+            }
+        }
+    }
     crate::usage::fetch_plan_usage().await
 }
 
@@ -1512,6 +1530,62 @@ pub async fn stop_task(
 ) -> Result<(), String> {
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
     handle.stop_task(task_id).await.map_err(|e| e.to_string())
+}
+
+/// The live model catalogue of a running session (`list_models`). Authoritative in a
+/// way our hard-coded table cannot be: the binary applies the provider, the settings
+/// cascade and the org enforcement policy, so this is exactly what the session may run.
+/// Errors with "unknown session" when nothing is live; the UI then keeps its static list.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_session_models(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+) -> Result<Vec<crate::supervisor::model::LiveModel>, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle.list_models().await.map_err(|e| e.to_string())
+}
+
+/// Restore the files edited since a user message, from the binary's own checkpoints
+/// (`rewind_files`). Call with `dry_run: true` FIRST to preview which files and how
+/// many lines would change — the app never performs a destructive restore without
+/// showing that preview. A refusal (checkpointing disabled, no checkpoint for this
+/// message) comes back inside the result as `can_rewind: false` + `error`, never as a
+/// silent no-op.
+#[tauri::command]
+#[specta::specta]
+pub async fn rewind_files(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    user_message_id: String,
+    dry_run: bool,
+) -> Result<crate::supervisor::model::RewindFilesResult, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .rewind_files(user_message_id, dry_run)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Un-send the message the user just sent, while the binary still has it QUEUED, and
+/// return its text so the composer can be refilled with it (`cancel_async_message`).
+/// `null` = nothing was cancelled — the turn had already started, or there was nothing
+/// to cancel — and the UI must then leave the conversation untouched rather than
+/// pretending the message is gone.
+///
+/// The uuid is minted core-side at send time and never crosses this boundary, so the
+/// target is "the last thing I sent" rather than an id the front would have to track.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_last_user_message(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+) -> Result<Option<String>, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .cancel_last_user_message()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Query a running session's LIVE MCP server status (real connection state +

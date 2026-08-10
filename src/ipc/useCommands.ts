@@ -13,6 +13,8 @@ import {
   useConversationsStore,
 } from "../store/conversationsStore";
 import { noteInterrupt } from "../notifications/notify";
+import { useComposerDrafts } from "../store/composerDrafts";
+import { useDisplay } from "../store/display";
 import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { triggerLastMessageSummary } from "../store/lastMessageSummary";
@@ -215,6 +217,50 @@ export function useAnswerPermission(convId: string) {
 // it to the live stream. That keeps a pre-spawn pick (persisted, applied at spawn)
 // and a live change on one path, and lets the core's get_settings read-back be the
 // source of truth for what the indicator shows.
+
+/** Stop button behaviour: first try to UN-SEND the message the user just sent (it is
+ *  still queued in the binary), and only fall back to interrupting the turn.
+ *
+ *  Cancelling is strictly better when it works — the message never reaches the model,
+ *  never lands in the on-disk transcript, and comes back in the composer to be edited.
+ *  When the turn is already running the binary answers "not cancelled" and we interrupt
+ *  exactly as before, so the button is never less capable than it used to be.
+ *
+ *  Gated by `cancelRestoreOnStop` (default on): it visibly changes what the stop button
+ *  does, so it can be turned off to get the plain interrupt back. */
+export function useStopOrUnsend(convId: string) {
+  const interrupt = useInterrupt(convId);
+  const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
+  const removeLastUserTurn = useConversationStore((s) => s.removeLastUserTurn);
+  return useMutation({
+    mutationFn: async () => {
+      const handle = liveHandle(convId);
+      if (!handle) return;
+      if (!useDisplay.getState().cancelRestoreOnStop) {
+        await interrupt.mutateAsync();
+        return;
+      }
+      let restored: string | null = null;
+      try {
+        restored = await unwrap(commands.cancelLastUserMessage(handle));
+      } catch (err) {
+        // Couldn't even ask — fall through to the interrupt rather than leaving the
+        // stop button doing nothing at all.
+        const message = err instanceof Error ? err.message : String(err);
+        addErrorTurn(convId, `Could not cancel the message: ${message}`);
+      }
+      if (restored === null) {
+        // Already running (or nothing to cancel): the honest fallback is an interrupt.
+        await interrupt.mutateAsync();
+        return;
+      }
+      // Confirmed dropped by the binary — only now is it safe to take the bubble back
+      // and hand the text to the composer.
+      removeLastUserTurn(convId);
+      useComposerDrafts.getState().setDraft(convId, restored);
+    },
+  });
+}
 
 export function useInterrupt(convId: string) {
   const addErrorTurn = useConversationStore((s) => s.addErrorTurn);

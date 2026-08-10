@@ -76,6 +76,13 @@ export interface DisplayPrefs {
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
 
+  /** Make the composer's stop button first try to UN-SEND the message you just sent —
+   *  dropping it from the binary's queue and putting its text back in the composer —
+   *  instead of only interrupting the turn. Falls back to a plain interrupt whenever the
+   *  turn has already started, so nothing is ever lost. ON by default. Turn it off to get
+   *  the plain interrupt back. Read by {@link useStopOrUnsend}. */
+  cancelRestoreOnStop: boolean;
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -237,6 +244,10 @@ const DEFAULTS: DisplayPrefs = {
   fleetBannerConversation: true,
   showTaskNotifications: false,
   showLastMessagePreview: true,
+  // On by default: this is what the CLI itself does on stop, and it can only ever do
+  // MORE than the old behaviour (it degrades to the same interrupt when the turn has
+  // already started).
+  cancelRestoreOnStop: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -308,6 +319,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        cancelRestoreOnStop: patch.cancelRestoreOnStop ?? s.cancelRestoreOnStop,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,

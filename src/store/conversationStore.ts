@@ -175,6 +175,9 @@ interface ConversationState {
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
    *  injects it before the loop ends) → drives the "en attente" badge. */
   addUserTurn: (session: string, text: string, queued?: boolean, images?: UserTurnImage[]) => void;
+  /** Remove the last optimistic user turn — ONLY after the binary confirmed the
+   *  message was dropped from its queue (see the action's note). */
+  removeLastUserTurn: (session: string) => void;
   /** Append a visible error bubble to the timeline (e.g. a send that failed to
    *  spawn the session). Makes an otherwise-silent command failure self-evident.
    *  `detail` (optional) is the raw technical payload, shown behind a disclosure. */
@@ -401,6 +404,31 @@ export const useConversationStore = create<ConversationState>((set) => {
           // Sending the next message consumes any pending review/question: the
           // user has clearly moved on from the previous result.
           turnSeen: true,
+        };
+      }),
+
+    // Take back the optimistic turn of a message the BINARY confirmed it dropped from
+    // its queue (`cancel_last_user_message`). Only ever called after that confirmation:
+    // the CLI persists a user message to its on-disk transcript as soon as it runs it,
+    // so removing the bubble on our own initiative would just make it reappear on the
+    // next history reload — the exact reason the first attempt at this feature was
+    // reverted. Undoes what `addUserTurn` did, including the replay anchor it moved.
+    removeLastUserTurn: (session) =>
+      withEntry(session, (entry) => {
+        const idx = [...entry.timeline]
+          .map((e, i) => [e, i] as const)
+          .reverse()
+          .find(([e]) => e.kind === "turn" && entry.turns[e.id]?.role === "user")?.[1];
+        if (idx === undefined) return entry;
+        const id = (entry.timeline[idx] as { kind: "turn"; id: string }).id;
+        const { [id]: _dropped, ...turns } = entry.turns;
+        return {
+          ...entry,
+          turns,
+          timeline: entry.timeline.filter((_, i) => i !== idx),
+          // Keep the anchor inside the shortened timeline, or a later remote echo would
+          // splice past its end.
+          replayAnchor: Math.min(entry.replayAnchor, entry.timeline.length - 1),
         };
       }),
 

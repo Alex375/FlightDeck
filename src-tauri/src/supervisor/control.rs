@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
 
-use super::model::{McpAuthResult, McpServerLive, RemoteControlState, SlashCommand};
+use super::model::{
+    LiveModel, McpAuthResult, McpServerLive, RemoteControlState, RewindFilesResult, SlashCommand,
+};
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
 /// The wire tokens are exactly these camelCase strings.
@@ -407,6 +409,163 @@ pub fn reload_plugins_request(request_id: &str) -> Value {
     control_request(request_id, json!({ "subtype": "reload_plugins" }))
 }
 
+/// `list_models` — the session's SELECTABLE model catalogue, straight from the
+/// binary (extension SDK: `sendControlRequest({subtype:"list_models"})`). The
+/// binary is the only authority here: the provider, the settings cascade and the
+/// org enforcement policy decide which models a session may actually run, so a
+/// hard-coded list drifts on every model launch AND can offer a model the account
+/// is not allowed to use. VERIFIED live (2.1.224): the payload is doubly nested
+/// (`response.response.models`), each entry carrying `value` (the alias to feed
+/// `set_model`), `resolvedModel`, `displayName`, `description` and the effort
+/// capability flags.
+pub fn list_models_request(request_id: &str) -> Value {
+    control_request(request_id, json!({ "subtype": "list_models" }))
+}
+
+/// Parse a `list_models` control response into the live catalogue. Entries with no
+/// `value` are skipped (an unselectable row would be a dead menu item). Missing
+/// capability flags default to "no effort support" rather than inventing a ladder —
+/// the picker then shows the model without an effort slider instead of offering
+/// levels the binary would reject.
+pub fn parse_list_models(line: &Value) -> Vec<LiveModel> {
+    let Some(arr) = line
+        .get("response")
+        .and_then(|r| r.get("response"))
+        .and_then(|r| r.get("models"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|m| {
+            let value = m.get("value").and_then(Value::as_str)?.to_string();
+            let str_field = |k: &str| m.get(k).and_then(Value::as_str).map(str::to_string);
+            Some(LiveModel {
+                // Fall back to the wire alias so a catalogue entry can never render blank.
+                display_name: str_field("displayName").unwrap_or_else(|| value.clone()),
+                value,
+                resolved_model: str_field("resolvedModel"),
+                description: str_field("description"),
+                supports_effort: m
+                    .get("supportsEffort")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                supported_effort_levels: m
+                    .get("supportedEffortLevels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|l| l.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// `get_usage` — the structured `/usage` data (session cost totals + the claude.ai
+/// plan rate-limit utilisation) from the RUNNING session, with no OAuth token and no
+/// Keychain read. Extension SDK: `{subtype:"get_usage"}`. VERIFIED live (2.1.224):
+/// `response.response` carries `{session:{…}, subscription_type, rate_limits_available,
+/// rate_limits:{five_hour, seven_day, limits[]}}` — the same shape
+/// [`crate::usage::plan_usage_from_payload`] already reads from the HTTP endpoint.
+///
+/// The binary marks this one "Experimental — the response shape may change", which is
+/// exactly why the caller keeps the HTTP path as a fallback rather than deleting it.
+pub fn get_usage_request(request_id: &str) -> Value {
+    control_request(request_id, json!({ "subtype": "get_usage" }))
+}
+
+/// `cancel_async_message` — drop a user message we already wrote to stdin from the
+/// binary's command QUEUE, by the `uuid` we stamped on it. Extension SDK:
+/// `cancelAsyncMessage(uuid) → {subtype:"cancel_async_message", message_uuid}`.
+///
+/// ⚠️ The wire field is `message_uuid`, NOT `uuid` (verified live: sending `uuid`
+/// silently answers `cancelled:false`, which is indistinguishable from "too late").
+/// `cancelled:false` means the message was never queued or has already been dequeued
+/// for execution — the caller MUST treat it as "could not cancel", never as success.
+pub fn cancel_async_message_request(request_id: &str, message_uuid: &str) -> Value {
+    control_request(
+        request_id,
+        json!({ "subtype": "cancel_async_message", "message_uuid": message_uuid }),
+    )
+}
+
+/// Parse a `cancel_async_message` ack: `response.response.cancelled`. Absent → `false`
+/// (fail-safe: we never claim a cancellation the binary did not confirm).
+pub fn parse_cancel_async_message(line: &Value) -> bool {
+    line.get("response")
+        .and_then(|r| r.get("response"))
+        .and_then(|r| r.get("cancelled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `rewind_files` — restore the files edited since a given user message, using the
+/// binary's own checkpoints. Extension SDK: `rewindFiles(id, {dryRun}) →
+/// {subtype:"rewind_files", user_message_id, dry_run}`.
+///
+/// ⚠️ TWO preconditions, both verified live (2.1.224):
+///   1. the session must be spawned with `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1`
+///      (in SDK/piloted mode the binary's `fileHistoryEnabled` gate reads that env var),
+///      otherwise every call answers `canRewind:false, "File rewinding is not enabled."`;
+///   2. a checkpoint must exist for that message — checkpoints live in the RUNNING
+///      session's state, so a conversation resumed from disk has none until it edits again.
+///
+/// `dry_run` asks for the preview (which files, how many lines) WITHOUT touching the
+/// disk — the only honest way to show a confirmation before a destructive restore.
+pub fn rewind_files_request(request_id: &str, user_message_id: &str, dry_run: bool) -> Value {
+    control_request(
+        request_id,
+        json!({
+            "subtype": "rewind_files",
+            "user_message_id": user_message_id,
+            "dry_run": dry_run,
+        }),
+    )
+}
+
+/// Parse a `rewind_files` response into [`RewindFilesResult`]. The binary answers a
+/// SUCCESS control_response even when it cannot rewind (`canRewind:false` + `error`),
+/// so the refusal reason is carried INSIDE the result — surfaced to the user rather
+/// than swallowed into a silent no-op.
+pub fn parse_rewind_files(line: &Value, err: Option<&str>) -> RewindFilesResult {
+    let payload = line.get("response").and_then(|r| r.get("response"));
+    let num = |k: &str| {
+        payload
+            .and_then(|p| p.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32
+    };
+    RewindFilesResult {
+        // A routed rejection means we never got a verdict — never report it as "can rewind".
+        can_rewind: err.is_none()
+            && payload
+                .and_then(|p| p.get("canRewind"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        files_changed: payload
+            .and_then(|p| p.get("filesChanged"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        insertions: num("insertions"),
+        deletions: num("deletions"),
+        error: err.map(str::to_string).or_else(|| {
+            payload
+                .and_then(|p| p.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
+    }
+}
+
 /// `mcp_status` — query the LIVE connection status of every MCP server the
 /// session knows. This is what the official extension's `Query.mcpServerStatus()`
 /// sends; the response carries the real per-server status (connected / needs-auth
@@ -646,6 +805,117 @@ pub fn control_error_response(request_id: &str, error: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A REAL `list_models` response, captured from claude 2.1.224 driven with the
+    /// production flags (trimmed to three entries). Re-capture on a binary upgrade.
+    fn captured_list_models() -> Value {
+        json!({
+            "response": { "subtype": "success", "request_id": "r", "response": { "models": [
+                {
+                    "value": "default", "resolvedModel": "claude-opus-5[1m]",
+                    "displayName": "Default (recommended)",
+                    "description": "Opus 5 with 1M context · Best for everyday, complex tasks",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                    "supportsAdaptiveThinking": true, "supportsFastMode": true
+                },
+                {
+                    "value": "sonnet", "resolvedModel": "claude-sonnet-5",
+                    "displayName": "Sonnet", "description": "Sonnet 5 · Efficient for routine tasks",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]
+                },
+                // Haiku really does come back with no effort fields at all.
+                { "value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001",
+                  "displayName": "Haiku", "description": "Haiku 4.5 · Fastest for quick answers" }
+            ]}}
+        })
+    }
+
+    #[test]
+    fn parses_the_live_model_catalogue() {
+        let models = parse_list_models(&captured_list_models());
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].value, "default");
+        assert_eq!(models[0].display_name, "Default (recommended)");
+        // The `[1m]` suffix is the only wire signal of the 1M context window.
+        assert_eq!(models[0].resolved_model.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(models[0].supported_effort_levels.len(), 5);
+        // A model with no effort fields must NOT be given an invented ladder.
+        assert!(!models[2].supports_effort);
+        assert!(models[2].supported_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn model_catalogue_skips_entries_with_no_selectable_value() {
+        // An entry with no `value` cannot be sent to `set_model` — a dead menu row.
+        let line = json!({ "response": { "response": { "models": [
+            { "displayName": "Ghost" }, { "value": "sonnet", "displayName": "Sonnet" }
+        ]}}});
+        let models = parse_list_models(&line);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].value, "sonnet");
+    }
+
+    #[test]
+    fn model_catalogue_of_a_shapeless_response_is_empty_not_a_panic() {
+        assert!(parse_list_models(&json!({ "response": { "response": {} } })).is_empty());
+        assert!(parse_list_models(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn cancel_ack_is_only_true_when_the_binary_confirms_it() {
+        let ok = json!({ "response": { "response": { "cancelled": true } } });
+        assert!(parse_cancel_async_message(&ok));
+        // Verified live: sending the wrong field name answers `cancelled:false`. Treating
+        // a missing/false flag as success would tell the user a message was cancelled
+        // while the binary goes on to answer it.
+        let late = json!({ "response": { "response": { "cancelled": false } } });
+        assert!(!parse_cancel_async_message(&late));
+        assert!(!parse_cancel_async_message(&json!({ "response": { "response": {} } })));
+    }
+
+    #[test]
+    fn cancel_request_uses_the_message_uuid_field() {
+        // ⚠️ `uuid` is silently ignored by the binary (answers cancelled:false).
+        let r = cancel_async_message_request("r-1", "u-42");
+        assert_eq!(r["request"]["subtype"], json!("cancel_async_message"));
+        assert_eq!(r["request"]["message_uuid"], json!("u-42"));
+        assert!(r["request"].get("uuid").is_none());
+    }
+
+    #[test]
+    fn parses_a_real_rewind_files_dry_run() {
+        // Captured from 2.1.224 with CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1.
+        let line = json!({ "response": { "subtype": "success", "response": {
+            "canRewind": true, "filesChanged": ["/tmp/probe/probe.txt"],
+            "insertions": 0, "deletions": 1
+        }}});
+        let r = parse_rewind_files(&line, None);
+        assert!(r.can_rewind);
+        assert_eq!(r.files_changed, vec!["/tmp/probe/probe.txt".to_string()]);
+        assert_eq!(r.deletions, 1);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn rewind_refusal_carries_its_reason_instead_of_being_swallowed() {
+        // The binary answers a SUCCESS control_response even when it refuses, so the
+        // reason lives in the payload. Losing it would show an unexplained no-op.
+        let line = json!({ "response": { "subtype": "success", "response": {
+            "canRewind": false, "error": "File rewinding is not enabled."
+        }}});
+        let r = parse_rewind_files(&line, None);
+        assert!(!r.can_rewind);
+        assert_eq!(r.error.as_deref(), Some("File rewinding is not enabled."));
+    }
+
+    #[test]
+    fn a_routed_rejection_never_reports_that_a_rewind_is_possible() {
+        let r = parse_rewind_files(&Value::Null, Some("session is shutting down"));
+        assert!(!r.can_rewind);
+        assert_eq!(r.error.as_deref(), Some("session is shutting down"));
+    }
 
     #[test]
     fn permission_mode_serializes_to_exact_wire_tokens() {

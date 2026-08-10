@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::assembler::Assembler;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
-    ConversationItem, McpAuthResult, McpServerLive, PermissionRequestPayload,
-    PermissionResolvedPayload, RemoteControlState, SessionEmitter, SessionEvent,
+    ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
+    PermissionResolvedPayload, RemoteControlState, RewindFilesResult, SessionEmitter, SessionEvent,
 };
 use super::protocol::CliMessage;
 use super::transport::{self, SpawnConfig, Transport, TransportError};
@@ -84,6 +84,25 @@ pub enum SessionCommand {
     McpAuthenticate {
         server_name: String,
         reply: oneshot::Sender<McpAuthResult>,
+    },
+    /// Read (without consuming) the uuid + text of the last user turn we wrote to
+    /// stdin, so it can be cancelled. The front never sees these uuids — they are
+    /// minted here, at send time — which is why "cancel what I just sent" is resolved
+    /// core-side rather than by the caller passing an id it cannot know.
+    LastUserMessage {
+        reply: oneshot::Sender<Option<(String, String)>>,
+    },
+    /// A control request whose answer we want back VERBATIM, as the raw
+    /// `control_response` line. One plumbing path for every query-shaped subtype the
+    /// binary exposes (`list_models`, `get_usage`, `rewind_files`,
+    /// `cancel_async_message`, …) instead of a bespoke `pending_*` map per subtype:
+    /// the parsing stays in [`control`], typed per feature, on the caller's side.
+    /// `Err` carries the binary's rejection message, so a refusal is never mistaken
+    /// for an empty success.
+    ControlQuery {
+        request_for: &'static str,
+        request: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
     },
     /// Enable/disable this session's Remote Control bridge (native `/remote-control`).
     /// The reply carries the resulting state — on enable, `connected` + the
@@ -297,6 +316,103 @@ impl SessionHandle {
         }
     }
 
+    /// Send a query-shaped control request and hand back the raw `control_response`
+    /// line. `request` is a FULL envelope built by a [`control`] builder; the actor
+    /// overwrites its `request_id` with the one it correlates on, so callers pass an
+    /// empty id. The wait is bounded — a non-answering CLI must never hang a caller.
+    async fn control_query(
+        &self,
+        request_for: &'static str,
+        request: Value,
+        timeout_secs: u64,
+    ) -> Result<Value, SessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(SessionCommand::ControlQuery { request_for, request, reply: tx })
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(Ok(line))) => Ok(line),
+            Ok(Ok(Err(msg))) => Err(SessionError::Rejected(msg)),
+            _ => Err(SessionError::Closed),
+        }
+    }
+
+    /// The session's live model catalogue (`list_models`). Authoritative — it reflects
+    /// the provider and the org policy, unlike a hard-coded table.
+    pub async fn list_models(&self) -> Result<Vec<LiveModel>, SessionError> {
+        let line = self
+            .control_query("list_models", control::list_models_request(""), 15)
+            .await?;
+        Ok(control::parse_list_models(&line))
+    }
+
+    /// The structured `/usage` payload from the running session (`get_usage`) — plan
+    /// rate limits with NO OAuth token and NO Keychain read. Returned raw: the sole
+    /// authority on interpreting a usage payload is [`crate::usage`].
+    pub async fn plan_usage_payload(&self) -> Result<Value, SessionError> {
+        self.control_query("get_usage", control::get_usage_request(""), 15)
+            .await
+    }
+
+    /// Restore the files edited since `user_message_id` from the binary's checkpoints.
+    /// With `dry_run`, reports what WOULD change without touching the disk. A refusal
+    /// (checkpointing off, no checkpoint) comes back inside the result, not as an error.
+    pub async fn rewind_files(
+        &self,
+        user_message_id: String,
+        dry_run: bool,
+    ) -> Result<RewindFilesResult, SessionError> {
+        match self
+            .control_query(
+                "rewind_files",
+                control::rewind_files_request("", &user_message_id, dry_run),
+                30,
+            )
+            .await
+        {
+            Ok(line) => Ok(control::parse_rewind_files(&line, None)),
+            // A routed rejection is a verdict too — surface its reason rather than a
+            // bare "closed", so the UI can say WHY nothing was restored.
+            Err(SessionError::Rejected(msg)) => Ok(control::parse_rewind_files(
+                &Value::Null,
+                Some(msg.as_str()),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Un-send the last user turn: drop it from the binary's command queue and give
+    /// back its text so the UI can put it back in the composer. `None` = nothing was
+    /// cancelled (already running, already answered, or nothing sent yet) — the caller
+    /// must then leave the conversation exactly as it is.
+    ///
+    /// This is the piece that makes "cancel + restore" honest. Removing only the
+    /// optimistic UI turn is NOT enough: the binary persists a user message to the
+    /// on-disk transcript as soon as it runs it, so a UI-only removal comes back on the
+    /// next history reload. VERIFIED (2.1.224): a message cancelled this way is never
+    /// written to the transcript at all.
+    pub async fn cancel_last_user_message(&self) -> Result<Option<String>, SessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(SessionCommand::LastUserMessage { reply: tx }).await?;
+        let Some((uuid, text)) = rx.await.map_err(|_| SessionError::Closed)? else {
+            return Ok(None);
+        };
+        Ok(self.cancel_async_message(uuid).await?.then_some(text))
+    }
+
+    /// Drop a queued user message from the binary's command queue by the uuid we
+    /// stamped on it. `false` = it was never queued or already started executing —
+    /// the caller must NOT present that as a successful cancellation.
+    pub async fn cancel_async_message(&self, message_uuid: String) -> Result<bool, SessionError> {
+        let line = self
+            .control_query(
+                "cancel_async_message",
+                control::cancel_async_message_request("", &message_uuid),
+                10,
+            )
+            .await?;
+        Ok(control::parse_cancel_async_message(&line))
+    }
+
     /// Enable/disable a live MCP server (fire-and-correlate; the UI re-polls
     /// `mcp_status` to reflect the change, a rejection surfaces as a control error).
     pub async fn mcp_toggle(&self, server_name: String, enabled: bool) -> Result<(), SessionError> {
@@ -483,6 +599,13 @@ struct SessionCore {
     /// In-flight `mcp_authenticate` requests, keyed by `request_id` — the reply
     /// (authUrl / requiresUserAction) is delivered back over the oneshot.
     pending_mcp_auth: HashMap<String, oneshot::Sender<McpAuthResult>>,
+    /// In-flight [`SessionCommand::ControlQuery`] requests, keyed by `request_id`. The
+    /// matching `control_response` is handed back whole, for the caller to parse.
+    pending_query: HashMap<String, oneshot::Sender<Result<Value, String>>>,
+    /// The `(uuid, text)` of the last user turn written to stdin — the handle for
+    /// "un-send what I just typed" (`cancel_async_message`). Kept here because the
+    /// uuid is minted at send time and never crosses the IPC boundary.
+    last_sent_user: Option<(String, String)>,
     /// In-flight `remote_control` requests, keyed by `request_id`. The stored `bool`
     /// is the direction we asked for (enable/disable), so the ack is parsed as a
     /// `session_url` grant or a plain disconnect; the reply carries the result state.
@@ -520,6 +643,8 @@ impl SessionCore {
             restore_ultracode: initial.ultracode,
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
+            pending_query: HashMap::new(),
+            last_sent_user: None,
             pending_remote_control: HashMap::new(),
             next_req: 0,
             outbound,
@@ -742,6 +867,22 @@ impl SessionCore {
             let _ = reply.send(result);
             return;
         }
+        // A generic query reply (`list_models`, `get_usage`, `rewind_files`, …): hand
+        // the WHOLE line back so the caller parses it with its own typed parser. A
+        // rejection becomes `Err(message)` — never an empty success, which would be
+        // indiscernible from a genuinely empty answer.
+        if let Some(reply) = self.pending_query.remove(&resp.request_id) {
+            let result = if resp.ok {
+                Ok(v.clone())
+            } else {
+                Err(resp
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "control request rejected".to_string()))
+            };
+            let _ = reply.send(result);
+            return;
+        }
         // An `mcp_authenticate` reply: fulfill with the parsed authUrl. A rejection
         // (resp.error) is carried INSIDE the result (surfaced in the UI), not as a
         // timeline control error — auth failures are expected and actionable there.
@@ -940,7 +1081,13 @@ impl SessionCore {
                 // recognised as our own and suppressed (the UI shows it optimistically);
                 // a remote turn carries a uuid we never recorded, so it surfaces live.
                 let uuid = uuid::Uuid::new_v4().to_string();
-                if self.send(transport::user_message_with_images(text, &images, &uuid)) {
+                if self.send(transport::user_message_with_images(
+                    text.clone(),
+                    &images,
+                    &uuid,
+                )) {
+                    // Remember it so the user can un-send it while it is still queued.
+                    self.last_sent_user = Some((uuid.clone(), text));
                     self.assembler.note_sent_user_message(&uuid);
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
@@ -1098,6 +1245,25 @@ impl SessionCore {
                 self.send_tracked(PendingControl::McpClearAuth, |rid| {
                     control::mcp_clear_auth_request(rid, &server_name)
                 });
+            }
+            SessionCommand::LastUserMessage { reply } => {
+                // Non-consuming on purpose: a failed cancellation must leave the handle
+                // in place, and a second attempt on an already-dequeued message simply
+                // comes back `cancelled:false`.
+                let _ = reply.send(self.last_sent_user.clone());
+            }
+            SessionCommand::ControlQuery { request_for, request, reply } => {
+                let rid = self.next_request_id();
+                // Same closed-channel guard as McpStatus: drop `reply` on a failed send so
+                // the caller returns at once instead of waiting out the full timeout on a
+                // request that can never be acked.
+                let mut line = request;
+                line["request_id"] = json!(rid.clone());
+                if self.send(line) {
+                    self.pending_query.insert(rid, reply);
+                } else {
+                    eprintln!("[session {}] {request_for} not sent (outbound closed)", self.id);
+                }
             }
             SessionCommand::McpAuthenticate { server_name, reply } => {
                 let rid = self.next_request_id();
