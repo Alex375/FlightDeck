@@ -108,6 +108,14 @@ export interface Turn {
    */
   injectedMidTurn?: boolean;
   /**
+   * User turn only, Claude only, LIVE only: the uuid stamped on the wire when WE sent
+   * this message (returned by `send_message`). It addresses the message in the binary's
+   * command queue, which is what lets a still-pending message be dropped individually
+   * (`cancel_queued_message`). Absent on turns restored from disk and on remote turns —
+   * neither can be cancelled, since the queue only holds what has not run yet.
+   */
+  wireUuid?: string;
+  /**
    * Codex only: the backend turn id this assistant turn belongs to (the app-server's
    * `turn/start` id, live; the rollout's `turn_context.turn_id`, cold). Lets the thread
    * target a Codex turn boundary by id for native rewind/fork (`thread/fork{lastTurnId}`)

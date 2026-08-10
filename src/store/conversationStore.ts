@@ -174,7 +174,21 @@ interface ConversationState {
   appendThinking: (session: string, messageId: string, text: string) => void;
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
    *  injects it before the loop ends) → drives the "en attente" badge. */
-  addUserTurn: (session: string, text: string, queued?: boolean, images?: UserTurnImage[]) => void;
+  /** Appends the optimistic user bubble and returns ITS id (to attach the wire uuid). */
+  addUserTurn: (
+    session: string,
+    text: string,
+    queued?: boolean,
+    images?: UserTurnImage[],
+  ) => string;
+  /** Record the wire uuid of a sent turn, so that message can be cancelled while queued. */
+  setTurnWireUuid: (session: string, turnId: string, uuid: string) => void;
+  /** Remove the last optimistic user turn — ONLY after the binary confirmed the
+   *  message was dropped from its queue (see the action's note). */
+  removeLastUserTurn: (session: string) => void;
+  /** Remove ONE user turn by id — ONLY after the binary confirmed that message was
+   *  dropped from its queue. */
+  removeUserTurn: (session: string, turnId: string) => void;
   /** Append a visible error bubble to the timeline (e.g. a send that failed to
    *  spawn the session). Makes an otherwise-silent command failure self-evident.
    *  `detail` (optional) is the raw technical payload, shown behind a disclosure. */
@@ -371,9 +385,14 @@ export const useConversationStore = create<ConversationState>((set) => {
     appendThinking: (session, messageId, text) =>
       appendBuffer(session, messageId, "streamingThinking", text),
 
-    addUserTurn: (session, text, queued, images) =>
+    // Returns the id of the turn it created, so the caller can attach the wire uuid to
+    // THIS turn once `send_message` answers — matching by "the last user turn" would
+    // pin the uuid on the wrong bubble when two sends overlap.
+    addUserTurn: (session, text, queued, images) => {
+      let createdId = "";
       withEntry(session, (entry) => {
         const id = `user_${entry.seq}`;
+        createdId = id;
         const turn: Turn = {
           id,
           role: "user",
@@ -401,6 +420,58 @@ export const useConversationStore = create<ConversationState>((set) => {
           // Sending the next message consumes any pending review/question: the
           // user has clearly moved on from the previous result.
           turnSeen: true,
+        };
+      });
+      return createdId;
+    },
+
+    // Attach the wire uuid `send_message` returned, so this exact message can later be
+    // dropped from the binary's queue. No-op if the turn is already gone (cancelled or
+    // rewound while the send was in flight).
+    setTurnWireUuid: (session, turnId, uuid) =>
+      withEntry(session, (entry) => {
+        const turn = entry.turns[turnId];
+        if (!turn) return entry;
+        return { ...entry, turns: { ...entry.turns, [turnId]: { ...turn, wireUuid: uuid } } };
+      }),
+
+    // Take back the optimistic turn of a message the BINARY confirmed it dropped from
+    // its queue (`cancel_last_user_message`). Only ever called after that confirmation:
+    // the CLI persists a user message to its on-disk transcript as soon as it runs it,
+    // so removing the bubble on our own initiative would just make it reappear on the
+    // next history reload — the exact reason the first attempt at this feature was
+    // reverted. Undoes what `addUserTurn` did, including the replay anchor it moved.
+    removeLastUserTurn: (session) =>
+      withEntry(session, (entry) => {
+        const idx = [...entry.timeline]
+          .map((e, i) => [e, i] as const)
+          .reverse()
+          .find(([e]) => e.kind === "turn" && entry.turns[e.id]?.role === "user")?.[1];
+        if (idx === undefined) return entry;
+        const id = (entry.timeline[idx] as { kind: "turn"; id: string }).id;
+        const { [id]: _dropped, ...turns } = entry.turns;
+        return {
+          ...entry,
+          turns,
+          timeline: entry.timeline.filter((_, i) => i !== idx),
+          // Keep the anchor inside the shortened timeline, or a later remote echo would
+          // splice past its end.
+          replayAnchor: Math.min(entry.replayAnchor, entry.timeline.length - 1),
+        };
+      }),
+
+    // Same contract as removeLastUserTurn, for a specific queued message the user chose
+    // to drop from the pending badge on its own bubble.
+    removeUserTurn: (session, turnId) =>
+      withEntry(session, (entry) => {
+        const idx = entry.timeline.findIndex((e) => e.kind === "turn" && e.id === turnId);
+        if (idx < 0) return entry;
+        const { [turnId]: _dropped, ...turns } = entry.turns;
+        return {
+          ...entry,
+          turns,
+          timeline: entry.timeline.filter((_, i) => i !== idx),
+          replayAnchor: Math.min(entry.replayAnchor, entry.timeline.length - 1),
         };
       }),
 

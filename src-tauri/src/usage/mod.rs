@@ -402,11 +402,30 @@ fn parse_access_token(blob: &str) -> Option<String> {
 /// cap isn't binding right now (see the module doc's "`limits` array & `is_active`").
 fn parse_usage(body: &str) -> Option<PlanUsage> {
     let v: Value = serde_json::from_str(body).ok()?;
+    plan_usage_from_value(&v)
+}
+
+/// Read a plan-usage snapshot out of a `get_usage` CONTROL RESPONSE — the same data as
+/// the HTTP endpoint, but obtained from a running session with no OAuth token and no
+/// Keychain read (which is what makes it immune to the stale-`.credentials.json` 401).
+/// The payload sits doubly nested (`response.response`) and nests its windows under
+/// `rate_limits`, a shape [`plan_usage_from_value`] already handles — so this is a
+/// different SOURCE for the same reading, never a second interpretation of it.
+///
+/// `None` when the line carries no usable window, so the caller falls back to HTTP
+/// instead of showing an empty meter as if the plan had no limits.
+pub fn plan_usage_from_control_response(line: &Value) -> Option<PlanUsage> {
+    plan_usage_from_value(line.get("response")?.get("response")?)
+}
+
+/// Shared core of both sources: the windows sit either under a `rate_limits` wrapper
+/// or at the root.
+fn plan_usage_from_value(v: &Value) -> Option<PlanUsage> {
     // Prefer a non-null `rate_limits` wrapper (old shape); otherwise read the root.
     let root = v
         .get("rate_limits")
         .filter(|r| !r.is_null())
-        .unwrap_or(&v);
+        .unwrap_or(v);
     let five_hour = parse_window(root.get("five_hour"));
     let seven_day = parse_window(root.get("seven_day"));
     // `limits[]` sits at the ROOT even under the legacy wrapper, so look there too.
@@ -520,6 +539,44 @@ mod tests {
     fn missing_token_is_none() {
         assert!(parse_access_token(r#"{"nope":true}"#).is_none());
         assert!(parse_access_token("not json").is_none());
+    }
+
+    #[test]
+    fn parses_a_real_get_usage_control_response() {
+        // Captured from claude 2.1.224 driven with the production flags: the SAME
+        // reading as the HTTP endpoint, but nested under `response.response.rate_limits`
+        // and obtained with no OAuth token and no Keychain read. Trimmed to the fields
+        // we read; the real payload also carries `session`, `subscription_type`, and a
+        // long tail of null windows.
+        let line: Value = serde_json::from_str(
+            r#"{"response":{"subtype":"success","request_id":"r","response":{
+                 "subscription_type":"max","rate_limits_available":true,
+                 "rate_limits":{
+                   "five_hour":{"utilization":11,"resets_at":"2026-08-10T19:10:00.782058+00:00"},
+                   "seven_day":{"utilization":3,"resets_at":"2026-08-17T10:00:00.782079+00:00"},
+                   "seven_day_opus":null,
+                   "limits":[
+                     {"kind":"session","group":"session","percent":11,"is_active":true},
+                     {"kind":"weekly_all","group":"weekly","percent":3,"is_active":false}]}}}}"#,
+        )
+        .unwrap();
+        let u = plan_usage_from_control_response(&line).expect("should parse");
+        assert_eq!(u.five_hour.as_ref().unwrap().used_percentage, 11.0);
+        assert_eq!(u.seven_day.as_ref().unwrap().used_percentage, 3.0);
+        // The two account-wide caps are rendered from their windows, never duplicated
+        // as scoped rows out of `limits[]`.
+        assert!(u.scoped.is_empty());
+    }
+
+    #[test]
+    fn a_get_usage_response_with_no_window_falls_back_rather_than_showing_an_empty_meter() {
+        // An account with no plan limits (or a drifted payload) must yield None so the
+        // caller tries HTTP, instead of rendering a meter that reads "no limits".
+        let line: Value =
+            serde_json::from_str(r#"{"response":{"response":{"rate_limits":{}}}}"#).unwrap();
+        assert!(plan_usage_from_control_response(&line).is_none());
+        // A response that isn't shaped like one at all must not panic either.
+        assert!(plan_usage_from_control_response(&Value::Null).is_none());
     }
 
     #[test]

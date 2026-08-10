@@ -33,7 +33,9 @@ import type {
   ImageContent,
   MarketplaceInfo,
   McpAuthResult,
+  LiveModel,
   McpServerLive,
+  RewindFilesResult,
   PluginContents,
   PermissionDecision,
   PermissionMode,
@@ -216,6 +218,8 @@ const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 let mockCounter = 0;
+/** Distinguishes the wire uuids the mock hands back for successive sends. */
+let mockSentCounter = 0;
 
 // ---- TOSSE briefing fixture ------------------------------------------------
 // Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
@@ -837,7 +841,7 @@ export const mockCommands = {
     _text: string,
     _images: ImageAttachment[],
     codexControls: CodexControls | null,
-  ): Promise<Result<null, string>> {
+  ): Promise<Result<string, string>> {
     // No actor to apply the per-turn Codex overrides to — log them so a dev/Playwright
     // run driving the demo Codex conversation can observe they were actually folded in.
     if (codexControls) console.info("[mock] sendMessage codexControls:", codexControls);
@@ -852,7 +856,15 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else driver.start();
-    return ok(null);
+    // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
+    // path as production (the demo has no queue, so cancelling it always reports false).
+    return ok(`mock-uuid-${session}-${mockSentCounter++}`);
+  },
+
+  async cancelQueuedMessage(_session: string, _messageUuid: string): Promise<Result<boolean, string>> {
+    // No command queue in the demo → nothing is ever removed, which is the same answer
+    // the binary gives for a message that already started running.
+    return ok(false);
   },
 
   async answerPermission(
@@ -953,6 +965,33 @@ export const mockCommands = {
   async interruptSession(session: string): Promise<Result<null, string>> {
     getRecord(session).driver.interrupt();
     return ok(null);
+  },
+
+  /** The demo has no command queue to drop a message from, so nothing is ever taken
+   *  back — `null` is the honest answer and makes the stop button fall through to the
+   *  interrupt, exactly as it does against a turn that has already started. */
+  async cancelLastUserMessage(_session: string): Promise<Result<string | null, string>> {
+    return ok(null);
+  },
+
+  async listSessionModels(_session: string): Promise<Result<LiveModel[], string>> {
+    return ok([]);
+  },
+
+  async rewindFiles(
+    _session: string,
+    _userMessageId: string,
+    _dryRun: boolean,
+  ): Promise<Result<RewindFilesResult, string>> {
+    // No file checkpoints in the demo: report the same refusal the binary gives when
+    // checkpointing is off, so the UI exercises its "cannot rewind" path.
+    return ok({
+      can_rewind: false,
+      files_changed: [],
+      insertions: 0,
+      deletions: 0,
+      error: "File rewinding is not enabled.",
+    });
   },
 
   async stopSession(session: string): Promise<Result<null, string>> {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ALL_MODELS,
+  CLAUDE_MODELS,
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
   backendOfModel,
@@ -87,6 +88,15 @@ describe("modelsForPicker (backend lock)", () => {
     const g = modelsForPicker("codex", { locked: true, codexAvailable: true });
     expect(g.map((x) => x.backend)).toEqual(["codex"]);
     expect(g[0].models).toBe(CODEX_MODELS);
+  });
+
+  it("offers the curated Claude catalogue, not the binary's own menu", () => {
+    // Deliberate: `list_models` reports a CLI-shaped menu (a "Default (recommended)" row,
+    // and the same model twice under its alias and its 1M variant). The picker shows our
+    // four curated rows instead.
+    const g = modelsForPicker("claude", { locked: true, codexAvailable: false });
+    expect(g[0].models).toBe(CLAUDE_MODELS);
+    expect(g[0].models.length).toBeGreaterThan(0);
   });
 
   it("locked Codex conv still shows its section even if Codex became unavailable (never empty)", () => {

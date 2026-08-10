@@ -124,6 +124,12 @@ export function modelsForPicker(
   // locked conversation always shows its own models, even if the other backend / a
   // now-missing Codex binary is unavailable — never an empty picker). The Codex list is
   // dynamic (`model/list`) when supplied, else the static fallback.
+  //
+  // The CLAUDE list stays deliberately STATIC, even though the binary can report its own
+  // catalogue (`list_models`, wired on the Rust side): what it returns is a menu meant
+  // for the CLI — a "Default (recommended)" entry, plus the same model listed twice under
+  // its alias and its 1M variant. Our four curated rows read better and are what we want
+  // to offer. Revisit only if a model launch makes the static list actually wrong.
   const wantClaude = !locked || convKind === "claude";
   const wantCodex = (!locked && codexAvailable) || convKind === "codex";
   if (wantClaude) groups.push({ backend: "claude", label: "Claude", models: CLAUDE_MODELS });
