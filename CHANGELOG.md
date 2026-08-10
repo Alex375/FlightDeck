@@ -14,7 +14,6 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 - New: zoom the whole interface — a Settings slider plus ⌘+ / ⌘− / ⌘0, working on French AZERTY keyboards too.
 - New: a minimap of your own messages down the side of a conversation — hover to preview, click to jump. It follows you into the History panel and the Flight Deck modal.
 - New: customize the composer bar — choose which controls it shows and in which order, so it carries what you actually use.
-- New: the model menu is now built from the CLI itself instead of a hardcoded list, so a newly released Claude shows up without waiting for an app update.
 - Improved: the Flight Deck reply modal now zooms out of its card and back into it, so you never lose track of which conversation you opened.
 - Improved: Stop is unambiguous again — it interrupts the turn, and a queued message can be deleted straight from its own bubble instead of being silently swept along.
 - Improved: in the TOSSE view, "Start" no longer throws you out of the task list, tasks in Review gained a one-click "Done", and running workflows now show their live progress.
