@@ -272,18 +272,38 @@
      the text is CLIPPED, not hidden behind a scrollbar nobody could reach. */
   overflow:hidden;
   padding:7px 11px;
-  border:1px solid var(--wf-line);
+  /* The card floats over the transcript, which is text on the same panel colour — at 92%
+     opacity with a neutral hairline it read as part of the conversation. It is now opaque,
+     outlined in a faded accent, and lifted by a soft accent halo + a deeper shadow, so it
+     reads as something laid ON the thread rather than a paragraph of it. */
+  border:1px solid color-mix(in srgb, var(--wf-accent) 38%, var(--wf-line));
   border-radius:9px;
-  background:color-mix(in srgb, var(--wf-panel) 92%, transparent);
-  -webkit-backdrop-filter:blur(9px);
-  backdrop-filter:blur(9px);
-  box-shadow:0 10px 26px -16px #000, 0 2px 8px -6px #0009;
+  background:var(--wf-panel-2);
+  -webkit-backdrop-filter:blur(10px);
+  backdrop-filter:blur(10px);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--wf-accent) 10%, transparent),
+    0 16px 34px -14px #000,
+    0 4px 12px -8px #000c;
   color:var(--wf-tx);
   font-size:12px;
   line-height:1.45;
   pointer-events:none; /* never steals the pointer from the bar underneath */
   white-space:pre-wrap;
   overflow-wrap:anywhere;
+  /* Moving between marks GLIDES instead of jumping (the card is one element that follows
+     the pointer down the column), and the first appearance fades in. Both are what keep a
+     sweep calm — together with the hover-intent delay that gates the content itself. */
+  transition:top .16s cubic-bezier(.22,.61,.36,1), max-height .16s ease;
+  animation:cv-mmap-tip-in .13s ease-out;
+}
+@keyframes cv-mmap-tip-in {
+  from { opacity:0; transform:translateX(4px); }
+  to   { opacity:1; transform:none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cv-mmap-tip { transition:none; animation:none; }
+  .cv-mmap-bar::before { transition:opacity .12s ease, background-color .12s ease; }
 }
 /* Summary mode is a single line; full mode keeps the message's shape but is clamped so a
    pasted wall of text can't cover the thread. */

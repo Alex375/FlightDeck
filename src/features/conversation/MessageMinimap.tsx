@@ -50,6 +50,17 @@ const TIP_BOTTOM_PAD_PX = 14;
  *  ⚠️ Keep in step with the CSS padding-top. */
 const TIP_TEXT_INSET_PX = 7;
 
+/**
+ * How long the pointer must settle on a mark before its message is previewed, in ms.
+ *
+ * Without it, sweeping the column fires a hover per mark crossed and the preview strobes
+ * through a dozen messages — unreadable, and it makes a deliberate hover feel twitchy. The
+ * delay is the difference between "passing over" and "asking about" a mark. It gates ONLY
+ * the preview card: the magnification stays instant, since that is the feedback that has to
+ * track the cursor for the column to feel alive.
+ */
+const HOVER_INTENT_MS = 120;
+
 /** How many neighbours on each side the dock magnification reaches. */
 const DOCK_RANGE = 3;
 
@@ -263,7 +274,11 @@ export function MessageMinimap({
 }) {
   const enabled = useDisplay((s) => s.messageMinimap);
   const hoverMode = useDisplay((s) => s.minimapHoverMode);
+  // Two hover states, on purpose: `hovered` is instant (it drives the magnification, which
+  // must track the cursor), `previewed` lags by HOVER_INTENT_MS (it drives the preview card,
+  // which must not strobe when the column is swept).
   const [hovered, setHovered] = useState<string | null>(null);
+  const [previewed, setPreviewed] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   // The column is sized and placed onto the SCROLL container's box, not the host's: in the
   // conversation the host also holds the floating bars and the composer, and centring on it
@@ -359,6 +374,19 @@ export function MessageMinimap({
     return () => ro.disconnect();
   }, [show, hostRef, scrollRef]);
 
+  // Hover intent: only a mark the pointer SETTLES on gets previewed. Leaving the column
+  // clears the card at once — an empty column should never keep a card floating over the
+  // conversation — while moving between marks keeps the previous one up until the new one
+  // settles, so a deliberate move reads as the card following rather than blinking.
+  useEffect(() => {
+    if (hovered === null) {
+      setPreviewed(null);
+      return;
+    }
+    const timer = setTimeout(() => setPreviewed(hovered), HOVER_INTENT_MS);
+    return () => clearTimeout(timer);
+  }, [hovered]);
+
   const scrollTo = useCallback(
     (id: string) => {
       // Match on the dataset rather than an attribute selector: turn ids are store keys, and
@@ -378,6 +406,7 @@ export function MessageMinimap({
   if (!show) return null;
 
   const hoveredIndex = hovered ? marks.findIndex((m) => m.id === hovered) : -1;
+  const previewedIndex = previewed ? marks.findIndex((m) => m.id === previewed) : -1;
   // The hit area is exactly one pitch tall, so the bands TILE: every pixel of the block
   // belongs to its nearest bar and none is stolen by an overlapping neighbour (which would
   // shift every target by half a slot).
@@ -417,7 +446,7 @@ export function MessageMinimap({
           }}
         />
       ))}
-      {hoveredIndex >= 0 ? (
+      {previewedIndex >= 0 ? (
         <div
           className="cv-mmap-tip"
           data-mode={hoverMode}
@@ -426,9 +455,9 @@ export function MessageMinimap({
           // back up for the first words. Instead of shifting the preview up when it would
           // run past the column (which would break that alignment, the whole point), its
           // height is capped to the room left below — see tipMaxHeightPx.
-          style={tipStyle(markOffsetPx(hoveredIndex, marks.length, column.height), column.height)}
+          style={tipStyle(markOffsetPx(previewedIndex, marks.length, column.height), column.height)}
         >
-          {labels[hoveredIndex]}
+          {labels[previewedIndex]}
         </div>
       ) : null}
     </div>
