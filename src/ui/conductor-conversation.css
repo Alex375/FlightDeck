@@ -195,7 +195,10 @@
 .cv-mmap {
   position:absolute;
   right:0;
-  width:28px;
+  /* Wide enough for the FULLY magnified mark plus its right margin (24 + 6). Too narrow and
+     the mark — a flex item — silently shrinks to fit instead of overflowing, so the top of
+     the dock swell is quietly clipped off. */
+  width:32px;
   z-index:5;
   pointer-events:none; /* the column itself is inert; only the bars take the pointer */
 }
@@ -215,27 +218,32 @@
 }
 /* 1px is the floor: the thinnest mark that still rasterises as a crisp hairline at any
    scale factor. Since it has less ink than the 2px version it carried at first, it is given
-   a touch more opacity so the block stays legible at rest. */
+   a touch more opacity so the block stays legible at rest.
+
+   DOCK MAGNIFICATION: every dimension is driven by --cv-mmap-mag (1 under the cursor,
+   easing to 0 three marks away) and --cv-mmap-push (how far this mark steps aside), both
+   set per bar by the component. The push is a transform on the MARK, never on the button —
+   moving the hit area out from under the cursor is what makes a dock effect flicker. */
 .cv-mmap-bar::before {
   content:"";
-  width:17px;
-  height:1px;
+  flex:none; /* never let the flex layout shrink the swell away — see the column's width */
+  width:calc(17px + var(--cv-mmap-mag, 0) * 7px);
+  height:calc(1px + var(--cv-mmap-mag, 0) * 1px);
   margin-right:6px;
   background:var(--wf-tx-xlo);
-  opacity:.55;
-  transition:opacity .12s ease, background-color .12s ease, width .12s ease, height .12s ease;
+  opacity:calc(.55 + var(--cv-mmap-mag, 0) * .45);
+  transform:translateY(var(--cv-mmap-push, 0px));
+  transition:opacity .12s ease, background-color .12s ease, width .12s ease, height .12s ease,
+             transform .12s ease;
 }
 /* At rest the column is a whisper; hovering anywhere over it brings every bar up, so the
    map reads as one object rather than as the single bar under the cursor. */
-.cv-mmap:hover .cv-mmap-bar::before { opacity:.78; }
-.cv-mmap-bar:hover::before,
+.cv-mmap:hover .cv-mmap-bar::before { opacity:calc(.68 + var(--cv-mmap-mag, 0) * .32); }
+/* Only the mark under the cursor takes the accent — its NEIGHBOURS swell and step aside but
+   stay neutral, so the target of a click is never ambiguous. Size comes from --cv-mmap-mag
+   above (1 here), so there is a single source for the magnified geometry. */
 .cv-mmap-bar[data-hovered]::before,
-.cv-mmap-bar:focus-visible::before {
-  opacity:1;
-  width:22px;
-  height:2px;
-  background:var(--wf-accent);
-}
+.cv-mmap-bar:focus-visible::before { opacity:1; background:var(--wf-accent); }
 .cv-mmap-bar:focus-visible { outline:none; }
 /* The message you are currently reading. Accent-coloured and doubled in thickness — at a
    1px hairline, colour alone reads as a rendering artefact rather than as a position — but
@@ -243,8 +251,10 @@
 .cv-mmap-bar[data-active]::before { opacity:.95; height:2px; background:var(--wf-accent); }
 
 /* Hover preview, to the LEFT of the column. `right:100%` puts it outside the column's
-   width; its `top` is the bar's own offset, clamped by the component so it never hangs off
-   the pane's top/bottom edge.
+   width; its `top` and `max-height` come from the component (tipStyle), which TOP-ALIGNS it
+   on the hovered mark — the first line of text lands on the mark, so the eye falls on the
+   start of the message instead of on its middle. ⚠️ `padding-top` here is mirrored by
+   TIP_TEXT_INSET_PX; changing one without the other shifts that alignment.
 
    ⚠️ `width:max-content` is load-bearing, not a nicety: this is absolutely positioned
    inside the 22px-wide column, so its shrink-to-fit width resolves against THAT — with
@@ -255,10 +265,12 @@
 .cv-mmap-tip {
   position:absolute;
   right:100%;
-  transform:translateY(-50%);
   margin-right:4px;
   width:max-content;
   max-width:min(420px, calc(100vw - 80px));
+  /* The preview takes no pointer events, so it can never be scrolled: past the height cap
+     the text is CLIPPED, not hidden behind a scrollbar nobody could reach. */
+  overflow:hidden;
   padding:7px 11px;
   border:1px solid var(--wf-line);
   border-radius:9px;
@@ -285,7 +297,7 @@
 /* The thread's own right padding is 26px; the minimap sits in it. Give the thread a touch
    more room on that side ONLY when the minimap is mounted, so a wide code block never
    slides under the bars. */
-.cv-pane:has(.cv-mmap) .cv-thread { padding-right:38px; }
+.cv-pane:has(.cv-mmap) .cv-thread { padding-right:42px; }
 
 /* Clickable http(s) link inside a message preview (LinkText): peek/pin/popover. */
 .cv-linktext { color:var(--wf-accent); text-decoration:underline; text-underline-offset:2px; cursor:pointer; overflow-wrap:anywhere; }

@@ -12,7 +12,8 @@ import type { ConversationItem, DiskConversation, SearchHit } from "../../ipc/cl
 import { Ico } from "../../ui/kit";
 import { repoName, reactivateDiskConversation, useConversationsStore } from "../../store/conversationsStore";
 import { BackendMark } from "../conversation/ConvMark";
-import { SubAgentTranscript } from "../conversation/SubAgentTranscript";
+import { SubAgentTranscript, userMarksFromItems } from "../conversation/SubAgentTranscript";
+import { MessageMinimap } from "../conversation/MessageMinimap";
 import { userMessagePreviewText } from "../conversation/userText";
 import { useHistoryUi } from "./historyUiStore";
 import {
@@ -23,6 +24,11 @@ import {
   type Period,
 } from "./historyView";
 import styles from "./HistoryPanel.module.css";
+
+/** No saved message summaries for a disk conversation — the cache is keyed by the app's
+ *  conversation id, which a conversation still only on disk does not have. Module-level so
+ *  the identity is stable across renders. */
+const NO_SUMMARIES: Record<string, string> = {};
 
 const PERIODS: { key: Period; label: string }[] = [
   { key: "all", label: "All" },
@@ -135,9 +141,14 @@ export function HistoryPanel() {
   }, [open]);
 
   // Preview: full transcript of the selected conversation (read-only render).
+  // `previewCol` is the positioned host for the message minimap and `previewBody` its scroll
+  // container — the same pairing the live conversation uses (pane + thread).
+  const previewColRef = useRef<HTMLDivElement>(null);
+  const previewBodyRef = useRef<HTMLDivElement>(null);
   const [preview, setPreview] = useState<ConversationItem[] | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewMarks = useMemo(() => (preview ? userMarksFromItems(preview) : []), [preview]);
   useEffect(() => {
     if (!selected) {
       setPreview(null);
@@ -300,7 +311,7 @@ export function HistoryPanel() {
           </div>
 
           {/* ---- Right: preview + reactivate ---- */}
-          <div className={styles.previewCol}>
+          <div className={styles.previewCol} ref={previewColRef}>
             {!selected ? (
               <div className={styles.previewEmpty}>
                 Select a conversation to preview it.
@@ -342,7 +353,7 @@ export function HistoryPanel() {
                     {existingIds.has(selected.session_id) ? "Open" : "Add conversation"}
                   </button>
                 </div>
-                <div className={styles.previewBody}>
+                <div className={styles.previewBody} ref={previewBodyRef}>
                   {previewLoading ? (
                     <div className={styles.previewEmpty}>Loading transcript…</div>
                   ) : previewError ? (
@@ -357,6 +368,18 @@ export function HistoryPanel() {
                     </div>
                   )}
                 </div>
+                {/* Same minimap as the live conversation, over the preview's right edge.
+                    No saved summaries to offer: those are keyed by the app's conversation
+                    id, and a conversation still on disk has none — the marks fall back to
+                    each message's first line, which is what the preview can honestly show. */}
+                {preview && preview.length > 0 ? (
+                  <MessageMinimap
+                    marks={previewMarks}
+                    summaries={NO_SUMMARIES}
+                    hostRef={previewColRef}
+                    scrollRef={previewBodyRef}
+                  />
+                ) : null}
               </>
             )}
           </div>

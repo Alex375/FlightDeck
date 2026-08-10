@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 import {
   clampRestoreTop,
   initialTarget,
@@ -23,6 +23,10 @@ const SETTLE_MAX_MS = 5000;
 export interface StickToBottom {
   /** Attach to the scroll container (the element with `overflow-y: auto`). */
   scrollRef: (node: HTMLDivElement | null) => void;
+  /** The attached scroll container, for siblings that need to measure or watch it (the
+   *  message minimap). Exposed rather than re-found by selector: the hook already holds it,
+   *  and a second lookup could resolve to another mounted thread. */
+  scrollEl: RefObject<HTMLDivElement | null>;
   /**
    * Call before paint on every thread render (see StreamFollow in ConductorThread).
    * While the open is still settling it applies the remembered/initial position;
@@ -265,5 +269,5 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     programmaticTop.current = el.scrollTop;
   }, [preserveKey]);
 
-  return { scrollRef, onRender, scrollToBottom };
+  return { scrollRef, scrollEl, onRender, scrollToBottom };
 }

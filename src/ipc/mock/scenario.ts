@@ -89,6 +89,60 @@ export const DEMO_SUBAGENT_TRANSCRIPT: ConversationItem[] = [
   },
 ];
 
+/** A finished MULTI-TURN conversation — what `load_session_history` returns for the History
+ *  panel's demo rows. Distinct from the sub-agent transcript above, which has a single
+ *  opening turn by design: a real conversation is a back-and-forth, and the preview has to
+ *  exercise that (several human messages in a row is what the message minimap maps). */
+export const DEMO_HISTORY_TRANSCRIPT: ConversationItem[] = [
+  ...DEMO_SUBAGENT_TRANSCRIPT,
+  {
+    kind: "user_message",
+    id: "hu2",
+    parent_tool_use_id: null,
+    text: "Good. Now walk me through how a background task reaches the UI — I want to know which layer decides a task is finished.",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha2",
+    parent_tool_use_id: null,
+    blocks: [
+      {
+        type: "text",
+        text: "The assembler owns that call. `task_notification` is the terminal event; the front never infers completion from a `tool_result` arriving, because the two can land out of order.",
+      },
+    ],
+  },
+  {
+    kind: "user_message",
+    id: "hu3",
+    parent_tool_use_id: null,
+    text: "/compact",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha3",
+    parent_tool_use_id: null,
+    blocks: [{ type: "text", text: "Conversation compacted." }],
+  },
+  {
+    kind: "user_message",
+    id: "hu4",
+    parent_tool_use_id: null,
+    text: "Last thing: add a regression test for the out-of-order case, then summarise what changed.",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha4",
+    parent_tool_use_id: null,
+    blocks: [
+      { type: "text", text: "Added — the test drives a `tool_result` BEFORE its notification and asserts the card stays live." },
+    ],
+  },
+];
+
 /** A canned workflow-run manifest — what `load_workflow_run` returns — so the
  *  <WorkflowDetail> 3-panel view (phases → agents → transcript) renders real-shaped content
  *  in dev. Mirrors the on-disk `workflows/wf_<id>.json` shape (camelCase, raw

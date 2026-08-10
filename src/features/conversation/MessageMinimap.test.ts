@@ -4,7 +4,10 @@
 import { describe, it, expect } from "vitest";
 import {
   activeAnchorId,
+  dockMagnification,
+  dockPushPx,
   isScrolledToBottom,
+  tipStyle,
   markOffsetPx,
   minimapBlockHeightPx,
   minimapPitchPx,
@@ -110,6 +113,65 @@ describe("markOffsetPx", () => {
       expect(markOffsetPx(0, count, 600)).toBeGreaterThan(0);
       expect(markOffsetPx(count - 1, count, 600)).toBeLessThan(600);
     }
+  });
+});
+
+describe("dockMagnification", () => {
+  it("is full under the cursor and fades to nothing out of reach", () => {
+    expect(dockMagnification(0)).toBe(1);
+    expect(dockMagnification(3)).toBe(0);
+    expect(dockMagnification(50)).toBe(0);
+  });
+
+  it("decreases with distance, symmetrically", () => {
+    expect(dockMagnification(1)).toBeGreaterThan(dockMagnification(2));
+    expect(dockMagnification(2)).toBeGreaterThan(dockMagnification(3));
+    expect(dockMagnification(-2)).toBe(dockMagnification(2));
+  });
+});
+
+describe("dockPushPx", () => {
+  it("leaves the hovered mark exactly where it was", () => {
+    expect(dockPushPx(4, 4)).toBe(0);
+  });
+
+  it("pushes neighbours APART — down below, up above", () => {
+    expect(dockPushPx(5, 4)).toBeGreaterThan(0);
+    expect(dockPushPx(3, 4)).toBeLessThan(0);
+    expect(dockPushPx(5, 4)).toBe(-dockPushPx(3, 4)); // symmetric
+  });
+
+  it("pushes further the further out you go, then settles", () => {
+    const push = [1, 2, 3, 4, 8, 40].map((d) => dockPushPx(4 + d, 4));
+    expect(push[1]).toBeGreaterThan(push[0]);
+    expect(push[2]).toBeGreaterThan(push[1]);
+    // Past the reach of the swell nothing more is added: distant marks all sit at the same
+    // small offset instead of drifting away without end.
+    expect(push[3]).toBe(push[2]);
+    expect(push[5]).toBe(push[2]);
+  });
+
+  it("does nothing at all when no mark is hovered", () => {
+    for (const i of [0, 3, 20]) expect(dockPushPx(i, -1)).toBe(0);
+  });
+});
+
+describe("tipStyle (top-aligned preview)", () => {
+  it("lands the first line of text ON the mark, not the preview's border", () => {
+    // 7px above the mark = the preview's own top padding.
+    expect(tipStyle(300, 600).top).toBe("293.00px");
+  });
+
+  it("never starts above the column", () => {
+    expect(tipStyle(2, 600).top).toBe("0.00px");
+  });
+
+  it("caps its height to the room left BELOW, rather than sliding up out of alignment", () => {
+    expect(tipStyle(300, 600).maxHeight).toBe("293.00px"); // 600 - 293 (top) - 14 (pad)
+    // Hovering the lowest possible mark still leaves a usable preview…
+    expect(parseFloat(tipStyle(0.725 * 600, 600).maxHeight)).toBeGreaterThan(140);
+    // …and the cap never goes negative on a column too short to hold anything.
+    expect(parseFloat(tipStyle(500, 100).maxHeight)).toBe(0);
   });
 });
 

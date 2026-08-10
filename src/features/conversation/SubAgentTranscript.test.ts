@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { ConversationItem } from "../../ipc/client";
-import { toRows } from "./SubAgentTranscript";
+import { toRows, userMarksFromItems } from "./SubAgentTranscript";
 
 // Regression guard for the "zero silent error" contract on the read-only transcript view
 // (history-panel preview + sub-agent drill-in): a `notice` item — e.g. `history_error` from
@@ -36,5 +36,39 @@ describe("SubAgentTranscript.toRows — notices are never dropped", () => {
     ]);
     // Two distinct assistant rows split by the notice → the notice is not merged/lost.
     expect(rows.map((r) => r.kind)).toEqual(["assistant", "notice", "assistant"]);
+  });
+
+  // The message minimap over the History preview maps THESE marks onto the rows above, by
+  // key. A mark that doesn't correspond to a rendered user bubble would scroll nowhere.
+  describe("userMarksFromItems", () => {
+    it("carries the row key, so a mark and its bubble always agree", () => {
+      const items = [user("u1", "first"), assistant("a1", "reply"), user("u2", "second")];
+      expect(userMarksFromItems(items)).toEqual([
+        { id: "u1", text: "first" },
+        { id: "u2", text: "second" },
+      ]);
+      // Same keys the renderer stamps as `data-user-turn`.
+      const keys = toRows(items).filter((r) => r.kind === "user").map((r) => r.key);
+      expect(userMarksFromItems(items).map((m) => m.id)).toEqual(keys);
+    });
+
+    it("skips a CLI-injected marker — it renders as a card, not a user bubble", () => {
+      const notif = "<task-notification>\n<status>completed</status>\n</task-notification>";
+      const items = [user("u1", "real ask"), user("tn", notif)];
+      expect(userMarksFromItems(items).map((m) => m.id)).toEqual(["u1"]);
+    });
+
+    it("skips blank messages", () => {
+      expect(userMarksFromItems([user("u1", "  "), user("u2", "ok")]).map((m) => m.id)).toEqual([
+        "u2",
+      ]);
+    });
+
+    it("skips a sub-agent transcript's opening turn — Claude wrote it, not the human", () => {
+      const items = [user("u1", "go audit this"), assistant("a1", "on it"), user("u2", "and now?")];
+      expect(userMarksFromItems(items, true).map((m) => m.id)).toEqual(["u2"]);
+      // The History preview has no such turn: its first message IS the human's.
+      expect(userMarksFromItems(items).map((m) => m.id)).toEqual(["u1", "u2"]);
+    });
   });
 });

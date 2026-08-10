@@ -82,7 +82,7 @@ import type {
   WorktreeInfo,
   WorktreeStatus,
 } from "../bindings";
-import { DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -994,7 +994,7 @@ export const mockCommands = {
     // return a representative transcript so the PREVIEW pane renders real-shaped content
     // in dev/Playwright; otherwise empty ("nothing to replay" → reload stays a no-op and
     // keeps whatever the live scenario already rendered).
-    if (HISTORY_DEMO_SESSION_IDS.has(sessionId)) return ok(DEMO_SUBAGENT_TRANSCRIPT);
+    if (HISTORY_DEMO_SESSION_IDS.has(sessionId)) return ok(DEMO_HISTORY_TRANSCRIPT);
     return ok([]);
   },
 

@@ -23,7 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type RefObject } from "react";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
-import { useUserMessageMarks } from "../../store/conversationStore";
+import { useUserMessageMarks, type UserMessageMark } from "../../store/conversationStore";
 import { summaryKey, summaryPreview, useMessageSummaries } from "../../store/lastMessageSummary";
 import { userMessagePreviewText } from "./userText";
 
@@ -41,8 +41,20 @@ const FULL_MAX = 1200;
  *  the current one once its top has scrolled past this line. */
 const ACTIVE_LINE_PX = 96;
 
-/** Keep the hover preview clear of the column's top/bottom edges, in px. */
-const TIP_CLAMP_PX = 14;
+/** Keep the hover preview clear of the column's bottom edge, in px. */
+const TIP_BOTTOM_PAD_PX = 14;
+
+/** The preview's own top padding (`.cv-mmap-tip` in CSS). The preview is lifted by this
+ *  much so its FIRST LINE OF TEXT — not its border — lands on the hovered mark: the point
+ *  of top-aligning it is that the eye falls straight on the start of the message.
+ *  ⚠️ Keep in step with the CSS padding-top. */
+const TIP_TEXT_INSET_PX = 7;
+
+/** How many neighbours on each side the dock magnification reaches. */
+const DOCK_RANGE = 3;
+
+/** How far a neighbour is pushed away, per unit of magnification, in px. */
+const DOCK_SPREAD_PX = 3;
 
 /** Fewer than this many messages and there is nothing to navigate — the column would be
  *  decoration. */
@@ -113,6 +125,54 @@ export function resolveMessageLabel(
   return summaries[summaryKey(text)] ?? summaryPreview(clean, LABEL_MAX);
 }
 
+/**
+ * Dock-style magnification: how much bar `distance` marks away from the cursor swells,
+ * from 1 (the one under the cursor) down to 0 (out of reach). A raised cosine, so the
+ * swell eases in and out instead of breaking into a visible cone.
+ */
+export function dockMagnification(distance: number): number {
+  const d = Math.abs(distance);
+  if (d >= DOCK_RANGE) return 0;
+  return (1 + Math.cos((Math.PI * d) / DOCK_RANGE)) / 2;
+}
+
+/**
+ * How far bar `index` is pushed away from the hovered one, in px (negative = upwards).
+ *
+ * This is the CUMULATIVE room the swollen bars between them take up — half of the hovered
+ * bar's own growth, plus all of each bar in between — which is what makes the block part
+ * around the cursor like the Dock, rather than every bar sliding by the same amount.
+ * Past `DOCK_RANGE` nothing more is added, so distant bars all settle at the same small
+ * offset instead of drifting further and further.
+ *
+ * Bounded by DOCK_RANGE, not by the conversation's length.
+ */
+export function dockPushPx(index: number, hoveredIndex: number): number {
+  if (hoveredIndex < 0 || index === hoveredIndex) return 0;
+  const direction = index > hoveredIndex ? 1 : -1;
+  const distance = Math.abs(index - hoveredIndex);
+  let room = dockMagnification(0) / 2; // the hovered bar pushes with half its own growth
+  for (let d = 1; d < distance && d < DOCK_RANGE; d++) room += dockMagnification(d);
+  return direction * room * DOCK_SPREAD_PX;
+}
+
+/**
+ * Where the hover preview sits and how tall it may get: its first line of text lands on the
+ * hovered mark, and it may use whatever room is left below.
+ *
+ * Capping the height (rather than sliding the preview up when it doesn't fit) is what keeps
+ * the top alignment unconditional. The block is centred and never taller than ~45% of the
+ * column, so the lowest mark still leaves ~a quarter of the height below it — enough for a
+ * useful preview, and summary mode is a single line that always fits.
+ */
+export function tipStyle(markTop: number, columnHeight: number): { top: string; maxHeight: string } {
+  const top = Math.max(0, markTop - TIP_TEXT_INSET_PX);
+  return {
+    top: `${top.toFixed(2)}px`,
+    maxHeight: `${Math.max(0, columnHeight - top - TIP_BOTTOM_PAD_PX).toFixed(2)}px`,
+  };
+}
+
 /** An anchor found in the thread: its message id and the distance of its top edge from the
  *  top of the scroll viewport. */
 export interface AnchorTop {
@@ -154,34 +214,71 @@ export function isScrolledToBottom(
   return scrollHeight - scrollTop - clientHeight <= BOTTOM_EPSILON_PX;
 }
 
-export function MessageMinimap({
+/**
+ * The live conversation's minimap: the store-backed wrapper around {@link MessageMinimap}.
+ * Kept separate so the column itself stays a pure function of its props and can serve the
+ * History panel, which has no conversation in the store to read from.
+ */
+export function ConversationMinimap({
   session,
-  paneRef,
+  hostRef,
+  scrollRef,
 }: {
   session: string;
-  /** The `.cv-pane` element. Every DOM lookup is scoped to it — see the header. */
-  paneRef: RefObject<HTMLDivElement | null>;
+  hostRef: RefObject<HTMLElement | null>;
+  scrollRef: RefObject<HTMLElement | null>;
+}) {
+  const marks = useUserMessageMarks(session);
+  const summaries = useMessageSummaries(session);
+  return (
+    <MessageMinimap
+      marks={marks}
+      summaries={summaries}
+      hostRef={hostRef}
+      scrollRef={scrollRef}
+    />
+  );
+}
+
+/**
+ * The minimap itself, as a function of the messages handed to it — no store reads, so the
+ * same column serves the live conversation and the History panel's cold preview (whose
+ * messages come off disk and have no conversation in the store at all).
+ */
+export function MessageMinimap({
+  marks,
+  summaries,
+  hostRef,
+  scrollRef,
+}: {
+  marks: UserMessageMark[];
+  /** Saved summaries by {@link summaryKey}; empty for a conversation we have none for. */
+  summaries: Record<string, string>;
+  /** The positioned, NON-scrolling element the column is laid over. It must not be the
+   *  scroll container itself, or the column would scroll away with the content. */
+  hostRef: RefObject<HTMLElement | null>;
+  /** The scroll container holding the anchored messages. Every DOM lookup is scoped to it,
+   *  since several transcripts can be mounted at once (see the header). */
+  scrollRef: RefObject<HTMLElement | null>;
 }) {
   const enabled = useDisplay((s) => s.messageMinimap);
   const hoverMode = useDisplay((s) => s.minimapHoverMode);
-  const marks = useUserMessageMarks(session);
-  const summaries = useMessageSummaries(session);
   const [hovered, setHovered] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
-  // The column is sized and placed onto the THREAD's box, not the pane's: the pane also
-  // holds the bars and the composer, and centring on it would sink the block below the
-  // conversation's actual middle by however tall the composer happens to be.
+  // The column is sized and placed onto the SCROLL container's box, not the host's: in the
+  // conversation the host also holds the floating bars and the composer, and centring on it
+  // would sink the block below the conversation's actual middle by however tall those are.
   const [column, setColumn] = useState({ top: 0, height: 0 });
 
   const show = enabled && marks.length >= MIN_MARKS;
 
-  /** All rendered anchors, in document order. Scoped to the pane (see header). */
+  /** All rendered anchors, in document order. Scoped to the scroll container (see header). */
   const anchorNodes = useCallback(
     (): HTMLElement[] =>
-      paneRef.current
-        ? Array.from(paneRef.current.querySelectorAll<HTMLElement>("[data-user-turn]"))
+      scrollRef.current
+        ? Array.from(scrollRef.current.querySelectorAll<HTMLElement>("[data-user-turn]"))
         : [],
-    [paneRef],
+    [scrollRef],
   );
 
   // Track the message currently under the reading line. Recomputed on scroll (throttled to
@@ -190,7 +287,7 @@ export function MessageMinimap({
   // a scroll event of its own.
   useEffect(() => {
     if (!show) return;
-    const thread = paneRef.current?.querySelector<HTMLElement>(".cv-thread");
+    const thread = scrollRef.current;
     if (!thread) return;
     let frame = 0;
     const measure = () => {
@@ -224,7 +321,10 @@ export function MessageMinimap({
     // Content can grow/shrink without a scroll (streaming, a fold opening) — observe the
     // thread's inner box so the indicator doesn't go stale while the user reads.
     const ro = new ResizeObserver(schedule);
-    const inner = thread.querySelector<HTMLElement>(".cv-thread-inner");
+    // Observe the scrolled CONTENT (the container's own box doesn't change as it grows).
+    // The first element child is that content wrapper in both hosts: `.cv-thread-inner`
+    // live, `.cv-subtranscript` in the History preview.
+    const inner = thread.firstElementChild;
     if (inner) ro.observe(inner);
     return () => {
       if (frame) cancelAnimationFrame(frame);
@@ -233,15 +333,15 @@ export function MessageMinimap({
     };
     // `marks` is a dep so a newly-sent message is measured immediately (its bar can become
     // the active one before any scroll happens).
-  }, [show, paneRef, anchorNodes, marks]);
+  }, [show, scrollRef, anchorNodes, marks]);
 
-  // Track the thread's box within the pane — it drives where the block sits and how tight
-  // its pitch is. Measured rather than assumed: the pane is resized by the side panel, the
-  // window, full screen, and by the floating bars appearing above the composer.
+  // Track the scroll container's box within the host — it drives where the block sits and
+  // how tight its pitch is. Measured rather than assumed: the box is resized by the side
+  // panel, the window, full screen, and by the floating bars appearing above the composer.
   useEffect(() => {
     if (!show) return;
-    const pane = paneRef.current;
-    const thread = pane?.querySelector<HTMLElement>(".cv-thread");
+    const pane = hostRef.current;
+    const thread = scrollRef.current;
     if (!pane || !thread) return;
     const measure = () => {
       const t = thread.getBoundingClientRect();
@@ -257,7 +357,7 @@ export function MessageMinimap({
     ro.observe(thread);
     ro.observe(pane);
     return () => ro.disconnect();
-  }, [show, paneRef]);
+  }, [show, hostRef, scrollRef]);
 
   const scrollTo = useCallback(
     (id: string) => {
@@ -295,9 +395,15 @@ export function MessageMinimap({
           key={mark.id}
           type="button"
           className="cv-mmap-bar"
+          // The BUTTON never moves — only the mark it draws does (the CSS applies the push
+          // to the ::before). A hit area that slid out from under the cursor would drop the
+          // hover, snap back, and oscillate: the classic dock-effect flicker.
           style={{
             top: `${markOffsetPx(i, marks.length, column.height).toFixed(2)}px`,
             height: `${Math.max(4, pitch).toFixed(2)}px`,
+            ["--cv-mmap-mag" as string]:
+              hoveredIndex < 0 ? "0" : dockMagnification(i - hoveredIndex).toFixed(3),
+            ["--cv-mmap-push" as string]: `${dockPushPx(i, hoveredIndex).toFixed(2)}px`,
           }}
           data-active={mark.id === activeId ? "" : undefined}
           data-hovered={mark.id === hovered ? "" : undefined}
@@ -315,12 +421,12 @@ export function MessageMinimap({
         <div
           className="cv-mmap-tip"
           data-mode={hoverMode}
-          style={{
-            top: `${Math.min(
-              Math.max(markOffsetPx(hoveredIndex, marks.length, column.height), TIP_CLAMP_PX),
-              Math.max(TIP_CLAMP_PX, column.height - TIP_CLAMP_PX),
-            ).toFixed(2)}px`,
-          }}
+          // TOP-aligned on the hovered mark, never centred on it: a multi-line preview
+          // centred on the mark puts its MIDDLE under the eye, so the reader has to hunt
+          // back up for the first words. Instead of shifting the preview up when it would
+          // run past the column (which would break that alignment, the whole point), its
+          // height is capped to the room left below — see tipMaxHeightPx.
+          style={tipStyle(markOffsetPx(hoveredIndex, marks.length, column.height), column.height)}
         >
           {labels[hoveredIndex]}
         </div>
