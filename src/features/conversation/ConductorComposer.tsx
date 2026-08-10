@@ -658,7 +658,11 @@ export const ConductorComposer = forwardRef<
     // A button's send never consumes the draft (see `keepDraft` in sendMessageNow).
     send: (t) => sendMessageNow(t.trim(), [], { keepDraft: true }),
     compact: () => usage.onCompact?.(),
-    interrupt: () => interrupt.mutate(),
+    // The SAME mutation the composer's own stop button fires (dev replaced plain
+    // `useInterrupt` with this in 8d1fd9c). Two buttons labelled "stop" that behaved
+    // differently — one honouring "cancel and restore the message", the other not —
+    // would be a trap.
+    interrupt: () => stopOrUnsend.mutate(),
   };
 
   /** Apply a saved configuration. Each field routes through the SAME setter the chip
