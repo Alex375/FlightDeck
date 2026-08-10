@@ -84,7 +84,12 @@ export function ConversationPane({
       <TodoBar session={session} />
       <ReviewBar session={session} />
       <AuthWarningBar session={session} />
-      <ConductorComposer ref={composerRef} session={session} onSent={scrollToBottom} />
+      <ConductorComposer
+          ref={composerRef}
+          session={session}
+          onSent={scrollToBottom}
+          hasPanels={!inertMentions}
+        />
     </div>
   );
 }

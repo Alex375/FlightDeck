@@ -20,6 +20,7 @@ import { ConversationSection } from "./ConversationSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
+import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -32,6 +33,9 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  // Its own tab rather than a group under General: arranging the bar is a task with a
+  // preview and a drag surface, not a row of switches.
+  { id: "composer", label: "Composer", icon: "wand" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   { id: "notifications", label: "Notifications", icon: "bell" },
@@ -154,6 +158,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
+
+            {section === "composer" && <ComposerSection />}
 
             {section === "reordering" && (
               <div>
