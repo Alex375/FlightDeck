@@ -90,20 +90,10 @@ describe("modelsForPicker (backend lock)", () => {
     expect(g[0].models).toBe(CODEX_MODELS);
   });
 
-  it("serves the LIVE Claude catalogue when one was supplied", () => {
-    // `list_models` is authoritative: it reflects the provider and the org policy, so a
-    // supplied catalogue must win over the static table.
-    const live = [{ label: "Opus (1M context)", value: "opus[1m]", backend: "claude" as const }];
-    const g = modelsForPicker("claude", {
-      locked: true,
-      codexAvailable: false,
-      claudeModels: live,
-    });
-    expect(g[0].models).toBe(live);
-  });
-
-  it("falls back to the static Claude catalogue when none was supplied (never empty)", () => {
-    // No live session has answered yet — the picker must still offer something.
+  it("offers the curated Claude catalogue, not the binary's own menu", () => {
+    // Deliberate: `list_models` reports a CLI-shaped menu (a "Default (recommended)" row,
+    // and the same model twice under its alias and its 1M variant). The picker shows our
+    // four curated rows instead.
     const g = modelsForPicker("claude", { locked: true, codexAvailable: false });
     expect(g[0].models).toBe(CLAUDE_MODELS);
     expect(g[0].models.length).toBeGreaterThan(0);

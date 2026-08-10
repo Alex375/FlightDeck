@@ -1537,10 +1537,17 @@ pub async fn stop_task(
     handle.stop_task(task_id).await.map_err(|e| e.to_string())
 }
 
-/// The live model catalogue of a running session (`list_models`). Authoritative in a
-/// way our hard-coded table cannot be: the binary applies the provider, the settings
-/// cascade and the org enforcement policy, so this is exactly what the session may run.
-/// Errors with "unknown session" when nothing is live; the UI then keeps its static list.
+/// The live model catalogue of a running session (`list_models`): what the binary will
+/// actually accept, after the provider, the settings cascade and the org enforcement
+/// policy. Errors with "unknown session" when nothing is live.
+///
+/// ⚠️ NOT wired to the model picker, on purpose. It was, and the result was rejected on
+/// sight: the binary returns a CLI-shaped menu — a "Default (recommended)" row, plus the
+/// same model listed twice under its alias and its `[1m]` variant — which reads worse
+/// than our four curated rows (see `modelsForPicker`). What stays valuable here is the
+/// per-model data no static table can hold: `supported_effort_levels` (the effort ladder
+/// is hard-coded today and drifts with each model launch) and `resolved_model`, whose
+/// `[1m]` suffix is the only wire signal of the 1M context window.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_session_models(

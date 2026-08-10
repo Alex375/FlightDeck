@@ -384,14 +384,19 @@
 .cv-user.is-queued .cv-bubble { border-color:var(--wf-wait); border-style:dashed; }
 .cv-queued-tag { display:flex; align-items:center; gap:5px; width:fit-content; margin-bottom:8px; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; letter-spacing:.4px; text-transform:uppercase; color:var(--wf-wait); background:var(--wf-wait-bg); }
 .cv-queued-tag .wf-ico { width:11px; height:11px; color:var(--wf-wait); }
-/* Drop-this-pending-message control. Hidden until the bubble is hovered (like the
-   rewind/fork controls) so the tag stays a quiet status chip, and `display:none` →
-   `inline-flex` rather than opacity: an icon button never collapses to zero width, so
-   fading it alone would leave a permanent gap in the chip. */
-.cv-queued-del { display:none; margin-left:2px; padding:0; border:0; background:none; cursor:pointer; color:var(--wf-wait); opacity:.75; }
-.cv-queued-del .wf-ico { width:10px; height:10px; }
-.cv-msg.cv-user:hover .cv-queued-del { display:inline-flex; }
-.cv-queued-del:hover { opacity:1; }
+/* Drop-this-pending-message control. ALWAYS visible (not hover-only): a pending message
+   is short-lived and the whole point is to catch it before the agent reads it — an
+   affordance you must first discover by hovering is one you miss in the seconds it
+   exists. Separated from the label by a divider so it reads as its own target rather
+   than part of the status text, and given a real button hit area. */
+.cv-queued-del { display:inline-flex; align-items:center; justify-content:center;
+  width:16px; height:16px; margin:-2px -4px -2px 3px; padding:0;
+  border:0; border-left:1px solid var(--wf-wait); border-radius:0 5px 5px 0;
+  background:none; cursor:pointer; color:var(--wf-wait); opacity:.7;
+  transition:opacity .12s ease, background-color .12s ease; }
+.cv-queued-del .wf-ico { width:11px; height:11px; }
+.cv-queued-del:hover { opacity:1; background:var(--wf-wait); color:var(--wf-panel); }
+.cv-queued-del:focus-visible { opacity:1; outline:2px solid var(--wf-wait); outline-offset:1px; }
 
 /* Injected "special message" card — e.g. a <task-notification> emitted when a
    background task/agent finishes. Rendered in PLACE of a user bubble (the CLI injects

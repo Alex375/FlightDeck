@@ -116,24 +116,23 @@ export function modelsForPicker(
     locked,
     codexAvailable,
     codexModels = CODEX_MODELS,
-    claudeModels = CLAUDE_MODELS,
-  }: {
-    locked: boolean;
-    codexAvailable: boolean;
-    codexModels?: ModelOption[];
-    claudeModels?: ModelOption[];
-  },
+  }: { locked: boolean; codexAvailable: boolean; codexModels?: ModelOption[] },
 ): { backend: BackendKind; label: string; models: ModelOption[] }[] {
   const groups: { backend: BackendKind; label: string; models: ModelOption[] }[] = [];
   // Show a backend's section when the conversation can still switch to it (fresh, and
   // — for Codex — the binary is installed) OR it is already ON that backend (so a
   // locked conversation always shows its own models, even if the other backend / a
-  // now-missing Codex binary is unavailable — never an empty picker). BOTH lists are
-  // dynamic when supplied (Codex `model/list`, Claude `list_models`), else the static
-  // fallback.
+  // now-missing Codex binary is unavailable — never an empty picker). The Codex list is
+  // dynamic (`model/list`) when supplied, else the static fallback.
+  //
+  // The CLAUDE list stays deliberately STATIC, even though the binary can report its own
+  // catalogue (`list_models`, wired on the Rust side): what it returns is a menu meant
+  // for the CLI — a "Default (recommended)" entry, plus the same model listed twice under
+  // its alias and its 1M variant. Our four curated rows read better and are what we want
+  // to offer. Revisit only if a model launch makes the static list actually wrong.
   const wantClaude = !locked || convKind === "claude";
   const wantCodex = (!locked && codexAvailable) || convKind === "codex";
-  if (wantClaude) groups.push({ backend: "claude", label: "Claude", models: claudeModels });
+  if (wantClaude) groups.push({ backend: "claude", label: "Claude", models: CLAUDE_MODELS });
   if (wantCodex) groups.push({ backend: "codex", label: "Codex", models: codexModels });
   return groups;
 }
