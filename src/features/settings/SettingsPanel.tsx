@@ -255,7 +255,6 @@ function DisplayPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
-  const cancelRestoreOnStop = useDisplay((s) => s.cancelRestoreOnStop);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
@@ -318,22 +317,6 @@ function DisplayPrefs() {
         checked={showLastMessagePreview}
         onChange={(v) => set({ showLastMessagePreview: v })}
         label="Preview of the last sent message"
-      />
-      <ToggleRow
-        title="Stop takes the message back"
-        hint={
-          <>
-            When you press <strong>stop</strong> just after sending, the message is{" "}
-            <strong>taken back</strong> — removed from the queue before the agent ever reads it —
-            and its text returns to the composer so you can fix it and send again. Nothing is left
-            behind: a message taken back this way never reaches the conversation history. If the
-            agent has <strong>already started</strong>, stop simply interrupts it as before.{" "}
-            <strong>On by default.</strong>
-          </>
-        }
-        checked={cancelRestoreOnStop}
-        onChange={(v) => set({ cancelRestoreOnStop: v })}
-        label="Stop takes the message back"
       />
       <ToggleRow
         title="Message minimap"

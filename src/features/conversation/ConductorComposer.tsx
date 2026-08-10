@@ -15,7 +15,7 @@ import type { BackendKind } from "../../store/conversationsStore";
 import type { UserTurnImage } from "../../store/types";
 import { isTauri } from "../../ipc/provider";
 import { useShallow } from "zustand/react/shallow";
-import { useSendMessage, useStopOrUnsend } from "../../ipc/useCommands";
+import { useInterrupt, useSendMessage } from "../../ipc/useCommands";
 import { useSessionState, useUserMessageHistory } from "../../store/conversationStore";
 import {
   DEFAULT_EFFORT,
@@ -173,7 +173,7 @@ export const ConductorComposer = forwardRef<
 >(function ConductorComposer({ session, onSent, hasPanels = true }, ref) {
   const state = useSessionState(session);
   const send = useSendMessage(session);
-  const stopOrUnsend = useStopOrUnsend(session);
+  const interrupt = useInterrupt(session);
   // The unsent draft is NOT component-local state: the conversation pane is keyed by
   // conv.id and remounts on every switch, which would wipe a useState("") and lose
   // what the user was typing. It lives in a per-conversation, localStorage-persisted
@@ -658,11 +658,9 @@ export const ConductorComposer = forwardRef<
     // A button's send never consumes the draft (see `keepDraft` in sendMessageNow).
     send: (t) => sendMessageNow(t.trim(), [], { keepDraft: true }),
     compact: () => usage.onCompact?.(),
-    // The SAME mutation the composer's own stop button fires (dev replaced plain
-    // `useInterrupt` with this in 8d1fd9c). Two buttons labelled "stop" that behaved
-    // differently — one honouring "cancel and restore the message", the other not —
-    // would be a trap.
-    interrupt: () => stopOrUnsend.mutate(),
+    // The SAME mutation the composer's own stop button fires. Two buttons labelled
+    // "stop" that behaved differently would be a trap.
+    interrupt: () => interrupt.mutate(),
   };
 
   /** Apply a saved configuration. Each field routes through the SAME setter the chip
@@ -1172,11 +1170,7 @@ export const ConductorComposer = forwardRef<
             busy or not — it's a send button: a message sent mid-turn is natively queued
             by the CLI and injected at the next loop boundary. */}
         {busy && !text.trim() && attachments.length === 0 && attaching === 0 ? (
-          <button
-            className="cv-send"
-            onClick={() => stopOrUnsend.mutate()}
-            title="Stop — takes the message back if it hasn't started yet"
-          >
+          <button className="cv-send" onClick={() => interrupt.mutate()} title="Interrupt">
             <Ico name="stop" className="sm" />
           </button>
         ) : (

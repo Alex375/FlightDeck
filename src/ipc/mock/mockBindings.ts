@@ -967,13 +967,6 @@ export const mockCommands = {
     return ok(null);
   },
 
-  /** The demo has no command queue to drop a message from, so nothing is ever taken
-   *  back — `null` is the honest answer and makes the stop button fall through to the
-   *  interrupt, exactly as it does against a turn that has already started. */
-  async cancelLastUserMessage(_session: string): Promise<Result<string | null, string>> {
-    return ok(null);
-  },
-
   async listSessionModels(_session: string): Promise<Result<LiveModel[], string>> {
     return ok([]);
   },

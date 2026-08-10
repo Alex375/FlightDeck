@@ -88,13 +88,6 @@ pub enum SessionCommand {
         server_name: String,
         reply: oneshot::Sender<McpAuthResult>,
     },
-    /// Read (without consuming) the uuid + text of the last user turn we wrote to
-    /// stdin, so it can be cancelled. The front never sees these uuids — they are
-    /// minted here, at send time — which is why "cancel what I just sent" is resolved
-    /// core-side rather than by the caller passing an id it cannot know.
-    LastUserMessage {
-        reply: oneshot::Sender<Option<(String, String)>>,
-    },
     /// A control request whose answer we want back VERBATIM, as the raw
     /// `control_response` line. One plumbing path for every query-shaped subtype the
     /// binary exposes (`list_models`, `get_usage`, `rewind_files`,
@@ -395,25 +388,6 @@ impl SessionHandle {
         }
     }
 
-    /// Un-send the last user turn: drop it from the binary's command queue and give
-    /// back its text so the UI can put it back in the composer. `None` = nothing was
-    /// cancelled (already running, already answered, or nothing sent yet) — the caller
-    /// must then leave the conversation exactly as it is.
-    ///
-    /// This is the piece that makes "cancel + restore" honest. Removing only the
-    /// optimistic UI turn is NOT enough: the binary persists a user message to the
-    /// on-disk transcript as soon as it runs it, so a UI-only removal comes back on the
-    /// next history reload. VERIFIED (2.1.224): a message cancelled this way is never
-    /// written to the transcript at all.
-    pub async fn cancel_last_user_message(&self) -> Result<Option<String>, SessionError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(SessionCommand::LastUserMessage { reply: tx }).await?;
-        let Some((uuid, text)) = rx.await.map_err(|_| SessionError::Closed)? else {
-            return Ok(None);
-        };
-        Ok(self.cancel_async_message(uuid).await?.then_some(text))
-    }
-
     /// Drop a queued user message from the binary's command queue by the uuid we
     /// stamped on it. `false` = it was never queued or already started executing —
     /// the caller must NOT present that as a successful cancellation.
@@ -617,10 +591,6 @@ struct SessionCore {
     /// In-flight [`SessionCommand::ControlQuery`] requests, keyed by `request_id`. The
     /// matching `control_response` is handed back whole, for the caller to parse.
     pending_query: HashMap<String, oneshot::Sender<Result<Value, String>>>,
-    /// The `(uuid, text)` of the last user turn written to stdin — the handle for
-    /// "un-send what I just typed" (`cancel_async_message`). Kept here because the
-    /// uuid is minted at send time and never crosses the IPC boundary.
-    last_sent_user: Option<(String, String)>,
     /// In-flight `remote_control` requests, keyed by `request_id`. The stored `bool`
     /// is the direction we asked for (enable/disable), so the ack is parsed as a
     /// `session_url` grant or a plain disconnect; the reply carries the result state.
@@ -659,7 +629,6 @@ impl SessionCore {
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
-            last_sent_user: None,
             pending_remote_control: HashMap::new(),
             next_req: 0,
             outbound,
@@ -1102,8 +1071,6 @@ impl SessionCore {
                     &images,
                     &uuid,
                 )) {
-                    // Remember it so the user can un-send it while it is still queued.
-                    self.last_sent_user = Some((uuid.clone(), text));
                     self.assembler.note_sent_user_message(&uuid);
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
@@ -1261,12 +1228,6 @@ impl SessionCore {
                 self.send_tracked(PendingControl::McpClearAuth, |rid| {
                     control::mcp_clear_auth_request(rid, &server_name)
                 });
-            }
-            SessionCommand::LastUserMessage { reply } => {
-                // Non-consuming on purpose: a failed cancellation must leave the handle
-                // in place, and a second attempt on an already-dequeued message simply
-                // comes back `cancelled:false`.
-                let _ = reply.send(self.last_sent_user.clone());
             }
             SessionCommand::ControlQuery { request_for, request, reply } => {
                 let rid = self.next_request_id();

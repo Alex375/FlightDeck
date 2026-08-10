@@ -13,8 +13,6 @@ import {
   useConversationsStore,
 } from "../store/conversationsStore";
 import { noteInterrupt } from "../notifications/notify";
-import { useComposerDrafts } from "../store/composerDrafts";
-import { useDisplay } from "../store/display";
 import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { triggerLastMessageSummary } from "../store/lastMessageSummary";
@@ -224,23 +222,18 @@ export function useAnswerPermission(convId: string) {
 // and a live change on one path, and lets the core's get_settings read-back be the
 // source of truth for what the indicator shows.
 
-/** Whether the most recent user bubble is one queued behind a running turn. */
-function lastUserTurnIsQueued(convId: string): boolean {
-  const entry = useConversationStore.getState().sessions[convId];
-  if (!entry) return false;
-  for (let i = entry.timeline.length - 1; i >= 0; i--) {
-    const item = entry.timeline[i];
-    if (item.kind !== "turn") continue;
-    const turn = entry.turns[item.id];
-    if (turn?.role === "user") return !!turn.queued;
-  }
-  return false;
-}
-
 /** Drop ONE message that is still waiting in the binary's queue, from the pending badge
  *  on its own bubble. The bubble is removed ONLY on a confirmed cancellation: `false`
  *  means the message already started running and WILL be answered, so taking the bubble
- *  away would hide a message the agent is about to act on. */
+ *  away would hide a message the agent is about to act on.
+ *
+ *  ⚠️ ONLY ever call this for a message that is genuinely still QUEUED — i.e. one sent
+ *  while ANOTHER turn was running (the `pending` badge). VERIFIED on the wire: cancelling
+ *  a message whose own turn has already STARTED answers `cancelled:false` and then WEDGES
+ *  the session — the turn stops producing and never emits its `result` (control run
+ *  without the cancel: same prompt completes normally). That is what made the stop button
+ *  look dead when it tried to un-send first, which is why stopping is now a plain
+ *  interrupt again and this call stays confined to the pending badge. */
 export function useCancelQueuedMessage(convId: string) {
   const removeUserTurn = useConversationStore((s) => s.removeUserTurn);
   const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
@@ -255,58 +248,6 @@ export function useCancelQueuedMessage(convId: string) {
     onError: (err) => {
       const message = err instanceof Error ? err.message : String(err);
       addErrorTurn(convId, `Could not remove the pending message: ${message}`);
-    },
-  });
-}
-
-/** Stop button behaviour: first try to UN-SEND the message the user just sent (it is
- *  still queued in the binary), and only fall back to interrupting the turn.
- *
- *  Cancelling is strictly better when it works — the message never reaches the model,
- *  never lands in the on-disk transcript, and comes back in the composer to be edited.
- *  When the turn is already running the binary answers "not cancelled" and we interrupt
- *  exactly as before, so the button is never less capable than it used to be.
- *
- *  Gated by `cancelRestoreOnStop` (default on): it visibly changes what the stop button
- *  does, so it can be turned off to get the plain interrupt back. */
-export function useStopOrUnsend(convId: string) {
-  const interrupt = useInterrupt(convId);
-  const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
-  const removeLastUserTurn = useConversationStore((s) => s.removeLastUserTurn);
-  return useMutation({
-    mutationFn: async () => {
-      const handle = liveHandle(convId);
-      if (!handle) return;
-      if (!useDisplay.getState().cancelRestoreOnStop) {
-        await interrupt.mutateAsync();
-        return;
-      }
-      // If the last thing sent was QUEUED behind a running turn, "stop" unambiguously
-      // means "stop the agent" — not "drop the message I lined up". Dropping that
-      // message is its own explicit action, on the pending bubble itself
-      // (`useCancelQueuedMessage`), so the two intentions never fight over one button.
-      if (lastUserTurnIsQueued(convId)) {
-        await interrupt.mutateAsync();
-        return;
-      }
-      let restored: string | null = null;
-      try {
-        restored = await unwrap(commands.cancelLastUserMessage(handle));
-      } catch (err) {
-        // Couldn't even ask — fall through to the interrupt rather than leaving the
-        // stop button doing nothing at all.
-        const message = err instanceof Error ? err.message : String(err);
-        addErrorTurn(convId, `Could not cancel the message: ${message}`);
-      }
-      if (restored === null) {
-        // Already running (or nothing to cancel): the honest fallback is an interrupt.
-        await interrupt.mutateAsync();
-        return;
-      }
-      // Confirmed dropped by the binary — only now is it safe to take the bubble back
-      // and hand the text to the composer.
-      removeLastUserTurn(convId);
-      useComposerDrafts.getState().setDraft(convId, restored);
     },
   });
 }

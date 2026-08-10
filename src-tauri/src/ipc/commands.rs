@@ -1581,8 +1581,11 @@ pub async fn rewind_files(
 
 /// Drop ONE specific still-queued user message from the binary's command queue, by the
 /// uuid `send_message` returned for it. This is what backs "remove this pending message"
-/// on a message queued behind a running turn — distinct from
-/// [`cancel_last_user_message`], which targets whatever was sent last.
+/// on a message queued behind a running turn.
+///
+/// ⚠️ ONLY for a message still WAITING behind another turn. Cancelling one whose own turn
+/// has already started answers `cancelled:false` and WEDGES the session (verified on the
+/// wire: the turn stops producing and never emits its `result`).
 ///
 /// `false` = the binary did not remove it (already dequeued for execution, or never
 /// queued). The caller must NOT take the bubble away on `false`: the message is on its
@@ -1597,27 +1600,6 @@ pub async fn cancel_queued_message(
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
     handle
         .cancel_async_message(message_uuid)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Un-send the message the user just sent, while the binary still has it QUEUED, and
-/// return its text so the composer can be refilled with it (`cancel_async_message`).
-/// `null` = nothing was cancelled — the turn had already started, or there was nothing
-/// to cancel — and the UI must then leave the conversation untouched rather than
-/// pretending the message is gone.
-///
-/// The uuid is minted core-side at send time and never crosses this boundary, so the
-/// target is "the last thing I sent" rather than an id the front would have to track.
-#[tauri::command]
-#[specta::specta]
-pub async fn cancel_last_user_message(
-    sessions: tauri::State<'_, Sessions>,
-    session: String,
-) -> Result<Option<String>, String> {
-    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
-    handle
-        .cancel_last_user_message()
         .await
         .map_err(|e| e.to_string())
 }
