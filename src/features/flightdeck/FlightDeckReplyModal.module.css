@@ -17,6 +17,11 @@
 }
 
 .panel {
+  /* The open/close zoom (see modalZoom.ts) transforms this element about its centre, from
+     the box of the card it was opened from. Its layout is always the FINAL one — only a
+     composited transform plays it back — so nothing here needs to know about the animation
+     beyond pinning the origin the maths assumes. */
+  transform-origin: center center;
   width: min(1000px, 92vw);
   height: min(820px, 90vh);
   display: flex;

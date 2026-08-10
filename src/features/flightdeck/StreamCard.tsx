@@ -27,6 +27,7 @@ import { CardEffort } from "./CardEffort";
 import { CardContext } from "./CardContext";
 import { CardGoal } from "./CardGoal";
 import { useFlightdeckModal } from "./flightdeckModalStore";
+import { boxOf } from "./modalZoom";
 
 /** Relative "last activity" stamp — "14 min ago" / "2 h ago". `now` comes from
  *  the grid's shared ticker so idle/off cards advance without a per-card timer. */
@@ -118,7 +119,9 @@ export function StreamCard({
     if (target.closest("button, a, input, textarea, select, label")) return;
     // A text selection isn't a click.
     if (!window.getSelection()?.isCollapsed) return;
-    openModal(conv.id);
+    // The card's box is the modal's zoom origin: the panel grows out of exactly what was
+    // clicked (and shrinks back into it on close).
+    openModal(conv.id, boxOf(e.currentTarget));
   };
 
   return (
@@ -127,6 +130,10 @@ export function StreamCard({
       style={dragStyle}
       className={cls + " cv-draggable"}
       data-rail={rail ?? undefined}
+      // How the reply modal finds this card again when it closes, to shrink back into it —
+      // by then the deck may have reordered or scrolled, so the box captured at open time
+      // is only the fallback.
+      data-conv-id={conv.id}
       onClick={onCardClick}
       onClickCapture={guardReorderClick}
       {...listeners}

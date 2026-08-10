@@ -8,7 +8,17 @@
 // Store-driven (useFlightdeckModal): the attention actions on the stream cards open
 // it; App mounts it once. `onPromote` is the only prop, since promoting needs the
 // app-level view switch (openConversation).
-import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
+//
+// It opens the way Finder's Quick Look does: the panel grows out of the card that was
+// clicked and shrinks back into it on close, so the modal is visibly THAT conversation
+// rather than a dialog appearing from nowhere. See `modalZoom.ts` for the geometry.
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { ConversationPane } from "../conversation/ConversationPane";
 import type { ComposerHandle } from "../conversation/ConductorComposer";
 import { StreamControl } from "../conversation/StreamControl";
@@ -23,15 +33,46 @@ import {
   useConversations,
   useConversationsStore,
 } from "../../store/conversationsStore";
-import { useEffectiveCleanOutput } from "../../store/display";
+import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { effectiveCwd } from "../git/worktree";
 import { useFlightdeckModal } from "./flightdeckModalStore";
+import {
+  EASE_CLOSE,
+  EASE_OPEN,
+  ZOOM_IN_MS,
+  ZOOM_OUT_MS,
+  boxOf,
+  zoomTransform,
+} from "./modalZoom";
 import styles from "./FlightDeckReplyModal.module.css";
 
 // Interactive elements whose clicks must NOT be hijacked to focus the composer —
 // same list the full Conversation view uses.
 const INTERACTIVE =
   'a, button, input, textarea, select, label, summary, [role="button"], [role="option"], [role="tab"], [contenteditable="true"]';
+
+/** Whether the zoom may play at all: the user's preference AND the OS "reduce motion"
+ *  setting, which always wins (an accessibility choice is not ours to override). Read
+ *  imperatively at each open/close so flipping the setting takes effect immediately,
+ *  without this component subscribing to it. */
+function zoomAllowed(): boolean {
+  if (!useDisplay.getState().flightdeckModalZoom) return false;
+  try {
+    return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return true; // no matchMedia (test env) — the preference alone decides
+  }
+}
+
+/** The card this conversation lives on RIGHT NOW, if it is still on the deck. Looked up by
+ *  data attribute rather than kept as a ref: between opening and closing, the card may have
+ *  been reordered, scrolled, or removed entirely. */
+function liveCard(convId: string): Element | null {
+  for (const el of document.querySelectorAll(".ag-card[data-conv-id]")) {
+    if ((el as HTMLElement).dataset.convId === convId) return el;
+  }
+  return null;
+}
 
 export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) => void }) {
   const convId = useFlightdeckModal((s) => s.convId);
@@ -47,6 +88,109 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
   // its own toggle in the header.
   const cleanOutput = useEffectiveCleanOutput(convId ?? "");
   const composerRef = useRef<ComposerHandle>(null);
+  const scrimRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // The exit animation runs BEFORE the store is cleared (that unmounts us), so a second
+  // Escape / click while it plays must be ignored rather than restart it.
+  const closingRef = useRef(false);
+  const failsafeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Grow out of the card that was clicked. A LAYOUT effect so the very first painted frame
+  // is already the card-sized state — starting after paint would flash the full-size panel.
+  // The panel keeps its final layout throughout; only a composited transform moves it.
+  useLayoutEffect(() => {
+    closingRef.current = false;
+    // Any fail-safe left over from the previous close is now moot — and must go, or it
+    // would slam shut a modal reopened within its delay.
+    if (failsafeRef.current) clearTimeout(failsafeRef.current);
+    failsafeRef.current = null;
+    const scrim = scrimRef.current;
+    const panel = panelRef.current;
+    // A freshly-opened panel always takes clicks again, whatever the last exit left behind
+    // (React unmounts it between openings today — this keeps that from being load-bearing).
+    if (panel) panel.style.pointerEvents = "";
+    if (!convId || !scrim || !panel || !zoomAllowed()) return;
+    const from = zoomTransform(useFlightdeckModal.getState().origin, boxOf(panel), {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    const opts = { duration: ZOOM_IN_MS, easing: EASE_OPEN } as const;
+    const anims = [
+      scrim.animate([{ opacity: 0 }, { opacity: 1 }], opts),
+      panel.animate(
+        [
+          // No usable origin (opened with no card to point at, or a card off-screen) →
+          // a plain fade with a hint of scale, instead of a lie about where it came from.
+          { transform: from ?? "scale(0.97)", opacity: 0, offset: 0 },
+          // Opaque well before the panel finishes travelling: the distorted early frames
+          // are the ones worth hiding, not the ones near full size.
+          { opacity: 1, offset: 0.45 },
+          { transform: "none", opacity: 1, offset: 1 },
+        ],
+        opts,
+      ),
+    ];
+    panel.style.willChange = "transform, opacity";
+    anims[1].onfinish = () => {
+      panel.style.willChange = "";
+    };
+    return () => {
+      for (const a of anims) a.cancel();
+      panel.style.willChange = "";
+    };
+  }, [convId]);
+
+  // Close by shrinking back into the card, THEN clearing the store (which unmounts us).
+  // Every dismissal goes through here — Escape, the × button, a backdrop click.
+  const requestClose = useCallback(() => {
+    if (closingRef.current) return;
+    const scrim = scrimRef.current;
+    const panel = panelRef.current;
+    const id = useFlightdeckModal.getState().convId;
+    if (!id || !scrim || !panel || !zoomAllowed()) {
+      close();
+      return;
+    }
+    closingRef.current = true;
+    // Where the card is NOW — deliberately re-measured rather than reusing the box captured
+    // at open time: the deck reorders itself as agents change state. When the card is gone
+    // (or has been pushed off-screen), the panel fades in place instead: shrinking into a
+    // remembered position would point at whatever sits there now.
+    const to = zoomTransform(boxOf(liveCard(id)), boxOf(panel), {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    // The panel stops taking clicks while it flies away; the scrim keeps swallowing them,
+    // so a stray click cannot reach the deck underneath and open another card mid-exit.
+    panel.style.pointerEvents = "none";
+    panel.style.willChange = "transform, opacity";
+    // `fill: forwards` holds the final frame until React unmounts us — without it the
+    // animation's end reverts to the natural styles for a frame, flashing the panel back.
+    const opts = { duration: ZOOM_OUT_MS, easing: EASE_CLOSE, fill: "forwards" } as const;
+    scrim.animate([{ opacity: 1 }, { opacity: 0 }], opts);
+    const flight = panel.animate(
+      [
+        { transform: "none", opacity: 1, offset: 0 },
+        { opacity: 1, offset: 0.45 },
+        { transform: to ?? "scale(0.97)", opacity: 0, offset: 1 },
+      ],
+      opts,
+    );
+    flight.onfinish = () => close();
+    // Fail-safe: a timeline that never fires `onfinish` (a hidden window pausing its
+    // animations) must not strand a modal the user asked to close.
+    failsafeRef.current = setTimeout(close, ZOOM_OUT_MS + 400);
+  }, [close]);
+
+  // Drop the fail-safe when we go away — including when something else (leaving the Flight
+  // Deck view) closes the modal out from under an exit already in flight.
+  useEffect(
+    () => () => {
+      if (failsafeRef.current) clearTimeout(failsafeRef.current);
+      failsafeRef.current = null;
+    },
+    [],
+  );
 
   // Replay the on-disk transcript into the message store (idempotent, at most once
   // per conversation) exactly as the full view does on selection — so the thread is
@@ -69,11 +213,11 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
   useEffect(() => {
     if (!convId) return;
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") requestClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [convId, close]);
+  }, [convId, requestClose]);
 
   if (!convId || !conv) return null;
 
@@ -89,16 +233,17 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
 
   return (
     <div
+      ref={scrimRef}
       className={styles.scrim}
       // Close on a genuine backdrop click only. We must NOT stopPropagation on the
       // panel (the old approach): that swallowed clicks before they reached the
       // window-level listener the opener plugin installs for `<a target="_blank">`,
       // so links in Claude's messages were dead in the modal but worked in the full view.
       onClick={(e) => {
-        if (e.target === e.currentTarget) close();
+        if (e.target === e.currentTarget) requestClose();
       }}
     >
-      <div className={styles.panel} role="dialog" aria-modal>
+      <div ref={panelRef} className={styles.panel} role="dialog" aria-modal>
         <div className={styles.head}>
           <Dot s={agentStatusToDot(status)} pulse />
           <span className={styles.title} title={conv.name}>
@@ -136,7 +281,7 @@ export function FlightDeckReplyModal({ onPromote }: { onPromote: (id: string) =>
           </button>
           <button
             className={styles.iconBtn}
-            onClick={close}
+            onClick={requestClose}
             title="Close (Esc)"
             aria-label="Close"
           >
