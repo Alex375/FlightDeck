@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ALL_MODELS,
+  CLAUDE_MODELS,
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
   backendOfModel,
@@ -87,6 +88,25 @@ describe("modelsForPicker (backend lock)", () => {
     const g = modelsForPicker("codex", { locked: true, codexAvailable: true });
     expect(g.map((x) => x.backend)).toEqual(["codex"]);
     expect(g[0].models).toBe(CODEX_MODELS);
+  });
+
+  it("serves the LIVE Claude catalogue when one was supplied", () => {
+    // `list_models` is authoritative: it reflects the provider and the org policy, so a
+    // supplied catalogue must win over the static table.
+    const live = [{ label: "Opus (1M context)", value: "opus[1m]", backend: "claude" as const }];
+    const g = modelsForPicker("claude", {
+      locked: true,
+      codexAvailable: false,
+      claudeModels: live,
+    });
+    expect(g[0].models).toBe(live);
+  });
+
+  it("falls back to the static Claude catalogue when none was supplied (never empty)", () => {
+    // No live session has answered yet — the picker must still offer something.
+    const g = modelsForPicker("claude", { locked: true, codexAvailable: false });
+    expect(g[0].models).toBe(CLAUDE_MODELS);
+    expect(g[0].models.length).toBeGreaterThan(0);
   });
 
   it("locked Codex conv still shows its section even if Codex became unavailable (never empty)", () => {

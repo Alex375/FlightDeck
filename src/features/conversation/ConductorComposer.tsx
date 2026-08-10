@@ -35,6 +35,7 @@ import { ChipBtn, ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuL
 import { useClaudeAvailable, useCodexAvailable } from "../../store/binaryAvailable";
 import { backendOfModel, modelFamily, modelLabel, modelsForPicker } from "./models";
 import { useCodexModels } from "./codexModels";
+import { useClaudeModels } from "./claudeModels";
 import { useAccountsLoggedOut } from "../../ipc/useAccounts";
 import { useCodexSkills } from "./codexSkills";
 import {
@@ -209,7 +210,15 @@ export const ConductorComposer = forwardRef<
     tiersById: codexTiers,
     defaultTierById: codexDefaultTier,
   } = useCodexModels(codexAvailable);
-  const pickerGroups = modelsForPicker(ctl.kind, { locked, codexAvailable, codexModels });
+  // Same idea on the Claude side: the live `list_models` catalogue when a session can
+  // answer, else the last one any session gave, else the static list.
+  const { models: claudeModels } = useClaudeModels(session);
+  const pickerGroups = modelsForPicker(ctl.kind, {
+    locked,
+    codexAvailable,
+    codexModels,
+    claudeModels,
+  });
   // Account state per backend, for the picker's "not connected" badges (definitive
   // logged-out only — cf. useAccountsLoggedOut). Shared cached queries, cost ~nil.
   const loggedOut = useAccountsLoggedOut(claudeAvailable, codexAvailable);

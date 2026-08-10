@@ -116,17 +116,24 @@ export function modelsForPicker(
     locked,
     codexAvailable,
     codexModels = CODEX_MODELS,
-  }: { locked: boolean; codexAvailable: boolean; codexModels?: ModelOption[] },
+    claudeModels = CLAUDE_MODELS,
+  }: {
+    locked: boolean;
+    codexAvailable: boolean;
+    codexModels?: ModelOption[];
+    claudeModels?: ModelOption[];
+  },
 ): { backend: BackendKind; label: string; models: ModelOption[] }[] {
   const groups: { backend: BackendKind; label: string; models: ModelOption[] }[] = [];
   // Show a backend's section when the conversation can still switch to it (fresh, and
   // — for Codex — the binary is installed) OR it is already ON that backend (so a
   // locked conversation always shows its own models, even if the other backend / a
-  // now-missing Codex binary is unavailable — never an empty picker). The Codex list is
-  // dynamic (`model/list`) when supplied, else the static fallback.
+  // now-missing Codex binary is unavailable — never an empty picker). BOTH lists are
+  // dynamic when supplied (Codex `model/list`, Claude `list_models`), else the static
+  // fallback.
   const wantClaude = !locked || convKind === "claude";
   const wantCodex = (!locked && codexAvailable) || convKind === "codex";
-  if (wantClaude) groups.push({ backend: "claude", label: "Claude", models: CLAUDE_MODELS });
+  if (wantClaude) groups.push({ backend: "claude", label: "Claude", models: claudeModels });
   if (wantCodex) groups.push({ backend: "codex", label: "Codex", models: codexModels });
   return groups;
 }
