@@ -843,7 +843,12 @@
 .cv-user-images { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
 .cv-user-image { max-width:220px; max-height:180px; border-radius:8px; border:1px solid var(--wf-line); object-fit:contain; background:var(--wf-panel-3); }
 /* Controls row sits at the bottom of the same card, just below the text row. */
-.cv-comp-foot { display:flex; align-items:center; gap:3px; padding:5px 6px 2px; font-size:11px; color:var(--wf-tx-lo); }
+/* `flex-wrap` is a LAST-RESORT net, not the regime: the slot budget (composerLayout.ts)
+   is sized so everything fits on one line at the 500px floor, and the window/splitter
+   minimums keep the composer at or above it. The one configuration those minimums can't
+   cover without forcing a ~1030px minimum window is "narrow window + side panel open" —
+   there, wrapping to a second line beats overflowing out of the card. */
+.cv-comp-foot { display:flex; flex-wrap:wrap; align-items:center; gap:3px; padding:5px 6px 2px; font-size:11px; color:var(--wf-tx-lo); }
 .cv-foot-sep { width:1px; height:16px; background:var(--wf-line); margin:0 5px; }
 .cv-wt-toggle { white-space:nowrap; }
 
@@ -858,6 +863,25 @@
   .cv-comp-foot .cv-wt-toggle { padding:5px; gap:0; }
   .cv-comp-foot .cv-foot-sep { margin:0 3px; }
 }
+
+/* Per-chip icon-only, the SAME four declarations as the width-driven rule above.
+   The wrapper draws no box (display:contents) so the chip stays a direct flex child of
+   the bar — identical layout and gaps — while still being a CSS ancestor, which is all
+   these selectors need. The user's choice is a floor, the container query a ceiling. */
+.cv-chipslot { display:contents; }
+.cv-comp-foot [data-compact] .wf-chip-t,
+.cv-comp-foot [data-compact] .wf-chip-chev,
+.cv-comp-foot [data-compact] .cv-wt-label { display:none; }
+.cv-comp-foot [data-compact] .wf-chip { padding:5px; gap:0; }
+.cv-comp-foot [data-compact] .cv-wt-toggle { padding:5px; gap:0; }
+
+/* A user-made button. Unavailable HERE (command missing from this repo, Codex-only
+   action on a Claude conversation…) is shown dimmed but still hoverable: `aria-disabled`
+   rather than `disabled`, because a disabled control takes no pointer events and its
+   `title` — the one place the reason is written — would never appear. */
+.cv-custom-btn { cursor:pointer; }
+.cv-custom-btn[aria-disabled] { opacity:.4; cursor:default; }
+.cv-custom-btn[aria-disabled]:hover { background:transparent; border-color:transparent; }
 
 .cv-ctx-h { display:flex; align-items:center; justify-content:space-between; padding:13px 14px; border-bottom:1px solid var(--wf-line); }
 .cv-ctx-top { padding:13px 14px; border-bottom:1px solid var(--wf-line); }

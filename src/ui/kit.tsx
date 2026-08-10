@@ -96,6 +96,10 @@ const WF_PATHS: Record<string, string> = {
   grip: "M8 6h.01M14 6h.01M8 11h.01M14 11h.01M8 16h.01M14 16h.01",
 };
 
+/** Every glyph the kit can draw, for the custom-button icon picker. Derived from the
+ *  path table rather than duplicated, so a glyph added above is offered immediately. */
+export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
+
 export function Ico({ name, className }: { name: string; className?: string }) {
   const d = WF_PATHS[name] || WF_PATHS.dots;
   return (

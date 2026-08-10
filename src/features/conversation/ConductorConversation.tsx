@@ -14,6 +14,7 @@ import { useSessionState } from "../../store/conversationStore";
 import { effectiveCwd } from "../git/worktree";
 import { Splitter } from "../editor/Splitter";
 import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
+import { MIN_CONVERSATION_PANE_PX } from "./composerLayout";
 import { SidePanel } from "./SidePanel";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { TaskDetail } from "../tosse/TosseView";
@@ -174,7 +175,10 @@ function MainArea({
           // fills that fraction of the row, leaving the rest blank. So full width
           // on close.
           flex: `${sideOpen ? 1 - editorFraction : 1} 1 0`,
-          minWidth: sideBySide ? 320 : 0,
+          // 552 = the composer's 500px floor + the 52px its card leaves on either side
+          // (see MIN_COMPOSER_PX). Below it the composer bar can no longer hold the
+          // slots the budget promised, so the splitter stops here instead.
+          minWidth: sideBySide ? MIN_CONVERSATION_PANE_PX : 0,
           minHeight: sideBySide ? 0 : 200,
           display: "flex",
         }}

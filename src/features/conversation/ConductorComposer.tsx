@@ -1,6 +1,7 @@
 import {
   forwardRef,
   Fragment,
+  type ReactNode,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -31,9 +32,9 @@ import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts"
 import { useEffectiveCleanOutput } from "../../store/display";
 import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
-import { ChipBtn, ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
+import { ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useClaudeAvailable, useCodexAvailable } from "../../store/binaryAvailable";
-import { backendOfModel, modelFamily, modelLabel, modelsForPicker } from "./models";
+import { backendOfModel, modelFamily, modelsForPicker } from "./models";
 import { useCodexModels } from "./codexModels";
 import { useAccountsLoggedOut } from "../../ipc/useAccounts";
 import { useCodexSkills } from "./codexSkills";
@@ -80,6 +81,31 @@ import {
   useConvAttachments,
   wireImageMimeForPath,
 } from "./composerAttachments";
+import {
+  appliesToBackend,
+  chipById,
+  leftGroups,
+  orderedRight,
+  type NativeChipId,
+} from "./composerLayout";
+import { useComposerBar } from "../../store/composerBar";
+import {
+  type ActionEnv,
+  type ActionHandlers,
+  type ConfigArg,
+} from "./composerActions";
+import { ChipSlot, CustomComposerButton } from "./composerBarParts";
+import {
+  CleanOutputFace,
+  CodexOptionsFace,
+  CodexSafetyFace,
+  CodexSpeedFace,
+  ExtensionsFace,
+  ModelFace,
+  PERMISSION_LABELS,
+  PermissionFace,
+  WorktreeFace,
+} from "./composerChipFaces";
 import styles from "./ConductorComposer.module.css";
 
 // Exact Claude Code permission modes (Shift+Tab selector), in the same order/labels.
@@ -94,14 +120,7 @@ const PERM_OPTS: [string, PermissionMode][] = [
   ["Plan mode", "plan"],
   ["Bypass permissions", "bypassPermissions"],
 ];
-const PERM_LABEL: Record<string, string> = {
-  auto: "Auto mode",
-  default: "Default",
-  acceptEdits: "Auto-accept edits",
-  plan: "Plan mode",
-  bypassPermissions: "Bypass permissions",
-  dontAsk: "Bypass permissions",
-};
+const PERM_LABEL = PERMISSION_LABELS;
 // Per-mode accent, like the Claude Code terminal: plan=blue, default=gray,
 // acceptEdits=purple, auto=yellow, bypass=red. Driven via CSS tokens.
 const PERM_TONE: Record<string, string> = {
@@ -140,8 +159,18 @@ export interface ComposerHandle {
 
 export const ConductorComposer = forwardRef<
   ComposerHandle,
-  { session: string; onSent?: () => void }
->(function ConductorComposer({ session, onSent }, ref) {
+  {
+    session: string;
+    onSent?: () => void;
+    /**
+     * Whether the host owns the side-panel region (editor / terminal / Git).
+     * False in the Flight Deck reply modal, which mounts a bare pane — a custom button
+     * bound to a panel action must refuse there instead of silently flipping the
+     * app-wide persisted layout flags with nothing to show for it.
+     */
+    hasPanels?: boolean;
+  }
+>(function ConductorComposer({ session, onSent, hasPanels = true }, ref) {
   const state = useSessionState(session);
   const send = useSendMessage(session);
   const stopOrUnsend = useStopOrUnsend(session);
@@ -548,7 +577,7 @@ export const ConductorComposer = forwardRef<
 
   // Core send: the typed text plus any joined images. Empty-empty is a no-op (the
   // send button is gated on it too), but text-empty-with-images IS a valid send.
-  const sendMessageNow = (t: string, images: UserTurnImage[]) => {
+  const sendMessageNow = (t: string, images: UserTurnImage[], opts?: { keepDraft?: boolean }) => {
     if (!t && images.length === 0) return;
     // NO busy gate: sending while the agent is working is supported and desirable.
     // The `claude` CLI natively queues a user message received mid-turn and injects
@@ -582,14 +611,20 @@ export const ConductorComposer = forwardRef<
     // `/` menu by re-fetching this cwd's catalogue (a fresh spawn reads disk
     // afresh), overwriting the once-per-session cache. Fire-and-forget.
     if (isReloadSkillsCommand(t)) void refetchSlashCommands(cwd);
-    setText("");
-    // Joined images were consumed by this send — drop them so they don't ride the
-    // next message.
-    useComposerAttachments.getState().clear(session);
-    setAttachErr(null);
-    histNav.current = IDLE_NAV;
-    setSlashToken(null);
-    requestAnimationFrame(autoGrow);
+    // `keepDraft` is for a send that did NOT come from the input — a custom composer
+    // button firing its own canned text. Clearing there would silently destroy whatever
+    // the user was in the middle of typing, and nothing they did asked for that. Such a
+    // send carries no images either, so the joined ones must survive too.
+    if (!opts?.keepDraft) {
+      setText("");
+      // Joined images were consumed by this send — drop them so they don't ride the
+      // next message.
+      useComposerAttachments.getState().clear(session);
+      setAttachErr(null);
+      histNav.current = IDLE_NAV;
+      setSlashToken(null);
+      requestAnimationFrame(autoGrow);
+    }
     // Sending always snaps the thread to the bottom, even if the user had scrolled
     // up — this re-engages stick-to-bottom so the incoming reply stays in view.
     onSent?.();
@@ -597,6 +632,65 @@ export const ConductorComposer = forwardRef<
 
   // Text-only send (slash-command run, `/compact`) — never carries attachments.
   const sendText = (raw: string) => sendMessageNow(raw.trim(), []);
+
+  // ---- What a custom composer button is allowed to do -------------------------------
+
+  /** Drop text in at the caret, leaving the draft (and the rest of the line) alone. */
+  const insertAtCaret = (t: string, caretOffset: number | null) => {
+    const ta = taRef.current;
+    const from = ta ? ta.selectionStart : text.length;
+    const to = ta ? ta.selectionEnd : text.length;
+    const next = text.slice(0, from) + t + text.slice(to);
+    const caret = from + (caretOffset ?? t.length);
+    setText(next);
+    setSlashDismissed(false);
+    requestAnimationFrame(() => {
+      const el = taRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+      autoGrow();
+    });
+  };
+
+  const buttonHandlers: ActionHandlers = {
+    insert: insertAtCaret,
+    // A button's send never consumes the draft (see `keepDraft` in sendMessageNow).
+    send: (t) => sendMessageNow(t.trim(), [], { keepDraft: true }),
+    compact: () => usage.onCompact?.(),
+    interrupt: () => interrupt.mutate(),
+  };
+
+  /** Apply a saved configuration. Each field routes through the SAME setter the chip
+   *  uses, so a button and the menu can't diverge (and a model change still decides the
+   *  backend exactly as picking it by hand would). */
+  const applyConfig = (cfg: ConfigArg) => {
+    if (cfg.model) chooseModel(cfg.model, backendOfModel(cfg.model));
+    if (cfg.effort) chooseEffort(cfg.effort as EffortLevel);
+    if (cfg.permission) choosePerm(cfg.permission);
+  };
+
+  // Everything the availability rules read, as data. `commands` stays null until the
+  // catalogue for this cwd is known — "not looked yet" must not read as "missing".
+  const actionEnv: ActionEnv = {
+    backend,
+    locked,
+    live: ctl.live,
+    // ⚠️ An EMPTY catalogue means "not loaded yet", not "this repo has no commands": a
+    // loaded one always carries the built-ins. Mapping empty → null keeps a button from
+    // being refused during the cold-start window before the catalogue arrives.
+    commands: commands.length ? commands.map((c) => c.name) : null,
+    effortsFor: (model) =>
+      backendOfModel(model) === "codex"
+        ? (codexEfforts[model] ?? effortLevelsForModel(model))
+        : effortLevelsForModel(model),
+    currentModel: modelId,
+    bypassBlocked,
+    // The reply modal mounts a bare pane with no side-panel region (same reason it
+    // makes file mentions inert), so panel actions must refuse there rather than flip
+    // the persisted layout flags invisibly.
+    hostHasPanels: hasPanels,
+  };
 
   // The composer's primary send (button / Enter): text + this conversation's
   // joined images, stripped of their local ids for the wire + optimistic bubble.
@@ -730,6 +824,281 @@ export const ConductorComposer = forwardRef<
     }
   };
 
+
+  // ---- The bar, as data -------------------------------------------------------------
+  // Every control keyed by id, so ONE table decides what renders, in which order and in
+  // which display mode — and so Settings can mount THIS bar as its editable preview
+  // instead of a mock-up that would drift from it.
+  const compactLeft = useComposerBar((s) => s.compactLeft);
+  const hiddenIds = useComposerBar(useShallow((s) => s.hidden));
+  const rightOrder = useComposerBar(useShallow((s) => s.rightOrder));
+  const customButtons = useComposerBar(useShallow((s) => s.customs));
+  const [leftRun, leftRights] = leftGroups(backend);
+  const rightIds = useMemo(
+    () =>
+      orderedRight(rightOrder, new Set(hiddenIds), customButtons).filter((id) => {
+        const chip = chipById(id);
+        return !chip || appliesToBackend(chip, backend);
+      }),
+    [rightOrder, hiddenIds, customButtons, backend],
+  );
+  const customById = useMemo(
+    () => new Map(customButtons.map((c) => [c.id, c] as const)),
+    [customButtons],
+  );
+  const chipNodes: Partial<Record<NativeChipId, ReactNode>> = {
+    // Model picker — UNIFIED across backends: choosing a model IS how the backend
+    // is chosen (a Codex model ⇒ a Codex conversation). Sections per backend
+    // (Claude / Codex), the chip wears the matching brand mark. While fresh, both
+    // backends are offered so the pick sets the backend; once a message is sent the
+    // backend is frozen and the picker locks to it (see modelsForPicker).
+    model: (
+      <Menu
+        up
+        trigger={
+          <ModelFace backend={backend} modelId={modelId} />
+        }
+      >
+        {pickerGroups.map((g) => (
+          <Fragment key={g.backend}>
+            <MenuLabel>
+              <span className="wf-mi-lbl-brand">
+                {g.backend === "codex" ? <CodexMark /> : <ClaudeMark />}
+                {g.label}
+                {/* Definitive logged-out flag only (a failed probe shows nothing) —
+                    picking a model of a disconnected backend WILL fail on send. */}
+                {(g.backend === "codex" ? loggedOut.codex : loggedOut.claude) ? (
+                  <span className="wf-mi-lbl-warn">not connected</span>
+                ) : null}
+              </span>
+            </MenuLabel>
+            {g.models.map((m) => (
+              <MenuItem
+                key={m.value}
+                on={modelFamily(modelId) === m.value}
+                onClick={() => chooseModel(m.value, m.backend)}
+              >
+                {m.label}
+              </MenuItem>
+            ))}
+          </Fragment>
+        ))}
+        {/* Once locked, the other backend is gone from the list — say why, so a user
+            who saw both sections before the first message understands. */}
+        {locked && codexAvailable ? (
+          <MenuItem disabled>Backend locked after the first message</MenuItem>
+        ) : null}
+      </Menu>
+
+    ),
+    // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
+    // code, Codex is low→xhigh, gpt-5.6 adds max+ultra; renders nothing when the model
+    // has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
+    // turn's override.
+    effort: (
+      <EffortGauge
+        model={modelId}
+        value={gaugeValue}
+        onChange={chooseEffort}
+        efforts={
+          backend === "codex"
+            ? // Data-driven from the selected model; fall back to the per-model static
+              // ladder (gpt-5.6 → max+ultra, older gpt-5.x → low→xhigh) so a Codex conv
+              // shows the right rungs even if its persisted model id isn't in the dynamic
+              // list — and never Claude-only tiers.
+              (codexEfforts[modelId] ?? effortLevelsForModel(modelId))
+            : undefined
+        }
+      />
+
+    ),
+    permission: (
+      /* Claude permission mode (set_permission_mode). ⇧Tab cycles modes. Colour-coded. */
+      <Menu
+        up
+        trigger={
+          <PermissionFace mode={permMode} label={permLabel} title="Permission mode — ⇧Tab to change" />
+        }
+      >
+        <MenuLabel>Permission mode · ⇧Tab</MenuLabel>
+        {PERM_OPTS.map(([label, value]) => {
+          const blocked = value === "bypassPermissions" && bypassBlocked;
+          return (
+            <MenuItem
+              key={value}
+              on={permMode === value}
+              disabled={!!blocked}
+              onClick={blocked ? undefined : () => choosePerm(value)}
+            >
+              <span className="cv-perm-dot" style={{ background: PERM_TONE[value] }} />
+              {label}
+            </MenuItem>
+          );
+        })}
+        {/* The reason lives OUTSIDE the disabled row on purpose: a disabled button
+            takes no pointer events (a `title` would never show) and is dimmed to
+            .36 opacity, which would bury the one sentence that explains the refusal. */}
+        {bypassBlocked ? <div className="cv-perm-note">{bypassBlocked}</div> : null}
+      </Menu>
+    ),
+    // Safety PRESET = sandbox × approval, like OpenAI's VS Code dropdown. The
+    // chip is colour-coded per preset (like Claude's permission mode), ⇧Tab
+    // cycles (same muscle-memory).
+    codexSafety: (
+      <Menu
+        up
+        trigger={
+          <CodexSafetyFace preset={codexCtl.preset} title="Codex safety (sandbox × approval) — ⇧Tab to change" />
+        }
+      >
+        <MenuLabel>Codex safety · ⇧Tab</MenuLabel>
+        {PRESET_ORDER.map((p) => (
+          <MenuItem
+            key={p}
+            on={codexCtl.preset === p}
+            hint={CODEX_PRESETS[p].hint}
+            onClick={() => useCodexControls.getState().set(session, { preset: p })}
+          >
+            <span className="cv-perm-dot" style={{ background: CODEX_PRESETS[p].tone }} />
+            {CODEX_PRESETS[p].label}
+          </MenuItem>
+        ))}
+      </Menu>
+    ),
+    // Service tier ("Fast") — a per-turn speed/priority override, shown ONLY when the
+    // selected model advertises a real choice (≥2 tiers). Parity with the Codex-native
+    // Fast tier; the chip lights up when a non-default (faster) tier is active.
+    codexSpeed: (() => {
+        const tiers = codexTiers[modelId] ?? [];
+        if (tiers.length < 2) return null;
+        const defaultTier = codexDefaultTier[modelId] ?? null;
+        const currentId = codexCtl.serviceTier ?? defaultTier;
+        const current = tiers.find((t) => t.id === currentId) ?? null;
+        const boosted = currentId != null && currentId !== defaultTier;
+        return (
+          <Menu
+            up
+            trigger={
+              <CodexSpeedFace name={current?.name || "Speed"} boosted={boosted} title="Codex speed (service tier) — per-turn override" />
+            }
+          >
+            <MenuLabel>Codex speed</MenuLabel>
+            {tiers.map((t) => (
+              <MenuItem
+                key={t.id}
+                on={currentId === t.id}
+                hint={t.description || undefined}
+                onClick={() =>
+                  useCodexControls.getState().set(session, {
+                    // Default tier → clear (follow the model default); else store the id.
+                    serviceTier: t.id === defaultTier ? undefined : t.id,
+                  })
+                }
+              >
+                {t.name || t.id}
+              </MenuItem>
+            ))}
+          </Menu>
+        );
+    })(),
+    // The remaining Codex-only settings folded into ONE menu to keep the composer
+    // tidy: network access (sandbox), reasoning-summary verbosity, personality.
+    codexOptions: (
+      <Menu
+        up
+        trigger={
+          <CodexOptionsFace title="Codex options — network access, reasoning summary, personality" />
+        }
+      >
+        <MenuLabel>Sandbox network</MenuLabel>
+        <MenuItem
+          on={codexCtl.network}
+          icon="globe"
+          onClick={() =>
+            useCodexControls.getState().set(session, { network: !codexCtl.network })
+          }
+        >
+          Network access
+        </MenuItem>
+        <MenuLabel>Reasoning summary</MenuLabel>
+        {CODEX_SUMMARY_OPTS.map(([label, value]) => (
+          <MenuItem
+            key={value}
+            on={codexCtl.summary === value}
+            onClick={() => useCodexControls.getState().set(session, { summary: value })}
+          >
+            {label}
+          </MenuItem>
+        ))}
+        <MenuLabel>Personality</MenuLabel>
+        {CODEX_PERSONALITY_OPTS.map(([label, value]) => (
+          <MenuItem
+            key={value}
+            on={codexCtl.personality === value}
+            onClick={() => useCodexControls.getState().set(session, { personality: value })}
+          >
+            {label}
+          </MenuItem>
+        ))}
+      </Menu>
+    ),
+    // Artifacts index — every artifact Claude published in THIS conversation, with its
+    // versions. Renders only when there is ≥1 (Codex conversations never yield any).
+    // Read-only toward claude.ai (surfaces the transcript; never republishes).
+    artifacts: (
+      <ArtifactsChip session={session} />
+    ),
+    // Extensions panel — what this conversation's Claude sees (MCP + live
+    // status, plugins, skills, sub-agents), like /mcp. Scans the session's
+    // current cwd so a worktree shows its own config.
+    extensions: (
+      <ExtensionsFace
+        onClick={() =>
+          openExtensions({
+            kind: "conversation",
+            backend,
+            path: state?.cwd ?? cwd ?? ".",
+            title: convName,
+            session,
+          })
+        }
+        title="This conversation's extensions — MCP (live status), plugins, skills, sub-agents"
+      />
+    ),
+    // Clean-output toggle — fold each round's work behind a "Claude's work"
+    // block so only the final message stays in clear. PER-CONVERSATION: the toggle
+    // writes THIS conversation's explicit override (the global default lives in
+    // Settings → General). On-state borrows the accent like the worktree checkbox.
+    cleanOutput: (
+      <CleanOutputFace
+        on={cleanOutput}
+        onClick={() =>
+          useConversationsStore.getState().setConvCleanOutput(session, !cleanOutput)
+        }
+        title="Clean output (this conversation) — show only the final message of each response; fold the intermediate work (tools, thinking, steps)"
+      />
+    ),
+    // Remote control — bridge this conversation to a phone/web. Backend-aware:
+    // Claude rides its control channel (→ a claude.ai/code URL); Codex uses its native
+    // `remoteControl/enable` (→ a device-pairing code). The chip adapts its active menu
+    // to the backend.
+    remoteControl: (
+      <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh} />
+    ),
+    // Active `/goal` — a target button; click opens a popover with the condition + a clear
+    // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
+    goal: !isCodex ? <GoalChip convId={session} /> : null,
+    // Worktree checkbox — only before the session spawns (first message).
+    // Explicit empty/checked box so the on/off state is unambiguous.
+    worktree: isFresh ? (
+      <WorktreeFace
+        checked={useWorktree}
+        onClick={() => setUseWorktree((v) => !v)}
+        title="Start this conversation in a new git worktree"
+      />
+    ) : null,
+  };
+
   return (
     <div className="cv-composer">
       {slashOpen ? (
@@ -819,317 +1188,33 @@ export const ConductorComposer = forwardRef<
       </div>
 
       <div className="cv-comp-foot">
-        {/* Model picker — UNIFIED across backends: choosing a model IS how the backend
-            is chosen (a Codex model ⇒ a Codex conversation). Sections per backend
-            (Claude / Codex), the chip wears the matching brand mark. While fresh, both
-            backends are offered so the pick sets the backend; once a message is sent the
-            backend is frozen and the picker locks to it (see modelsForPicker). */}
-        <Menu
-          up
-          trigger={
-            <ChipBtn iconNode={backend === "codex" ? <CodexMark /> : <ClaudeMark />}>
-              {modelLabel(modelId)}
-            </ChipBtn>
-          }
-        >
-          {pickerGroups.map((g) => (
-            <Fragment key={g.backend}>
-              <MenuLabel>
-                <span className="wf-mi-lbl-brand">
-                  {g.backend === "codex" ? <CodexMark /> : <ClaudeMark />}
-                  {g.label}
-                  {/* Definitive logged-out flag only (a failed probe shows nothing) —
-                      picking a model of a disconnected backend WILL fail on send. */}
-                  {(g.backend === "codex" ? loggedOut.codex : loggedOut.claude) ? (
-                    <span className="wf-mi-lbl-warn">not connected</span>
-                  ) : null}
-                </span>
-              </MenuLabel>
-              {g.models.map((m) => (
-                <MenuItem
-                  key={m.value}
-                  on={modelFamily(modelId) === m.value}
-                  onClick={() => chooseModel(m.value, m.backend)}
-                >
-                  {m.label}
-                </MenuItem>
-              ))}
-            </Fragment>
-          ))}
-          {/* Once locked, the other backend is gone from the list — say why, so a user
-              who saw both sections before the first message understands. */}
-          {locked && codexAvailable ? (
-            <MenuItem disabled>Backend locked after the first message</MenuItem>
-          ) : null}
-        </Menu>
-        {/* Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
-            code, Codex is low→xhigh, gpt-5.6 adds max+ultra; renders nothing when the model
-            has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
-            turn's override. */}
-        <EffortGauge
-          model={modelId}
-          value={gaugeValue}
-          onChange={chooseEffort}
-          efforts={
-            backend === "codex"
-              ? // Data-driven from the selected model; fall back to the per-model static
-                // ladder (gpt-5.6 → max+ultra, older gpt-5.x → low→xhigh) so a Codex conv
-                // shows the right rungs even if its persisted model id isn't in the dynamic
-                // list — and never Claude-only tiers.
-                (codexEfforts[modelId] ?? effortLevelsForModel(modelId))
-              : undefined
-          }
-        />
+        {leftRun.map((c) => (
+          <ChipSlot key={c.id} compact={compactLeft[c.id] === true}>
+            {chipNodes[c.id as NativeChipId]}
+          </ChipSlot>
+        ))}
         <span className="cv-foot-sep" />
-        {backend === "claude" ? (
-          /* Claude permission mode (set_permission_mode). ⇧Tab cycles modes. Colour-coded. */
-          <Menu
-            up
-            trigger={
-              <ChipBtn icon="shield" data-perm={permMode} title="Permission mode — ⇧Tab to change">
-                {permLabel}
-              </ChipBtn>
-            }
-          >
-            <MenuLabel>Permission mode · ⇧Tab</MenuLabel>
-            {PERM_OPTS.map(([label, value]) => {
-              const blocked = value === "bypassPermissions" && bypassBlocked;
-              return (
-                <MenuItem
-                  key={value}
-                  on={permMode === value}
-                  disabled={!!blocked}
-                  onClick={blocked ? undefined : () => choosePerm(value)}
-                >
-                  <span className="cv-perm-dot" style={{ background: PERM_TONE[value] }} />
-                  {label}
-                </MenuItem>
-              );
-            })}
-            {/* The reason lives OUTSIDE the disabled row on purpose: a disabled button
-                takes no pointer events (a `title` would never show) and is dimmed to
-                .36 opacity, which would bury the one sentence that explains the refusal. */}
-            {bypassBlocked ? <div className="cv-perm-note">{bypassBlocked}</div> : null}
-          </Menu>
-        ) : (
-          /* Codex controls — all applied as per-turn overrides (see codexControls). */
-          <>
-            {/* Safety PRESET = sandbox × approval, like OpenAI's VS Code dropdown. The
-                chip is colour-coded per preset (like Claude's permission mode), ⇧Tab
-                cycles (same muscle-memory). */}
-            <Menu
-              up
-              trigger={
-                <ChipBtn
-                  icon="shield"
-                  data-codex-preset={codexCtl.preset}
-                  title="Codex safety (sandbox × approval) — ⇧Tab to change"
-                >
-                  {CODEX_PRESETS[codexCtl.preset].label}
-                </ChipBtn>
-              }
-            >
-              <MenuLabel>Codex safety · ⇧Tab</MenuLabel>
-              {PRESET_ORDER.map((p) => (
-                <MenuItem
-                  key={p}
-                  on={codexCtl.preset === p}
-                  hint={CODEX_PRESETS[p].hint}
-                  onClick={() => useCodexControls.getState().set(session, { preset: p })}
-                >
-                  <span className="cv-perm-dot" style={{ background: CODEX_PRESETS[p].tone }} />
-                  {CODEX_PRESETS[p].label}
-                </MenuItem>
-              ))}
-            </Menu>
-            {/* Service tier ("Fast") — a per-turn speed/priority override, shown ONLY when the
-                selected model advertises a real choice (≥2 tiers). Parity with the Codex-native
-                Fast tier; the chip lights up when a non-default (faster) tier is active. */}
-            {(() => {
-              const tiers = codexTiers[modelId] ?? [];
-              if (tiers.length < 2) return null;
-              const defaultTier = codexDefaultTier[modelId] ?? null;
-              const currentId = codexCtl.serviceTier ?? defaultTier;
-              const current = tiers.find((t) => t.id === currentId) ?? null;
-              const boosted = currentId != null && currentId !== defaultTier;
-              return (
-                <Menu
-                  up
-                  trigger={
-                    <ChipBtn
-                      icon="bolt"
-                      data-codex-fast={boosted ? "on" : undefined}
-                      title="Codex speed (service tier) — per-turn override"
-                    >
-                      {current?.name || "Speed"}
-                    </ChipBtn>
-                  }
-                >
-                  <MenuLabel>Codex speed</MenuLabel>
-                  {tiers.map((t) => (
-                    <MenuItem
-                      key={t.id}
-                      on={currentId === t.id}
-                      hint={t.description || undefined}
-                      onClick={() =>
-                        useCodexControls.getState().set(session, {
-                          // Default tier → clear (follow the model default); else store the id.
-                          serviceTier: t.id === defaultTier ? undefined : t.id,
-                        })
-                      }
-                    >
-                      {t.name || t.id}
-                    </MenuItem>
-                  ))}
-                </Menu>
-              );
-            })()}
-            {/* The remaining Codex-only settings folded into ONE menu to keep the composer
-                tidy: network access (sandbox), reasoning-summary verbosity, personality. */}
-            <Menu
-              up
-              trigger={
-                <ChipBtn
-                  icon="cog"
-                  title="Codex options — network access, reasoning summary, personality"
-                  aria-label="Codex options"
-                />
-              }
-            >
-              <MenuLabel>Sandbox network</MenuLabel>
-              <MenuItem
-                on={codexCtl.network}
-                icon="globe"
-                onClick={() =>
-                  useCodexControls.getState().set(session, { network: !codexCtl.network })
-                }
-              >
-                Network access
-              </MenuItem>
-              <MenuLabel>Reasoning summary</MenuLabel>
-              {CODEX_SUMMARY_OPTS.map(([label, value]) => (
-                <MenuItem
-                  key={value}
-                  on={codexCtl.summary === value}
-                  onClick={() => useCodexControls.getState().set(session, { summary: value })}
-                >
-                  {label}
-                </MenuItem>
-              ))}
-              <MenuLabel>Personality</MenuLabel>
-              {CODEX_PERSONALITY_OPTS.map(([label, value]) => (
-                <MenuItem
-                  key={value}
-                  on={codexCtl.personality === value}
-                  onClick={() => useCodexControls.getState().set(session, { personality: value })}
-                >
-                  {label}
-                </MenuItem>
-              ))}
-            </Menu>
-          </>
-        )}
+        {leftRights.map((c) => (
+          <ChipSlot key={c.id} compact={compactLeft[c.id] === true}>
+            {chipNodes[c.id as NativeChipId]}
+          </ChipSlot>
+        ))}
         <span style={{ marginLeft: "auto" }} />
-        {/* Artifacts index — every artifact Claude published in THIS conversation, with its
-            versions. Renders only when there is ≥1 (Codex conversations never yield any).
-            Read-only toward claude.ai (surfaces the transcript; never republishes). */}
-        <ArtifactsChip session={session} />
-        {/* Extensions panel — what this conversation's Claude sees (MCP + live
-            status, plugins, skills, sub-agents), like /mcp. Scans the session's
-            current cwd so a worktree shows its own config. */}
-        <button
-          type="button"
-          className="wf-chip"
-          onClick={() =>
-            openExtensions({
-              kind: "conversation",
-              backend,
-              path: state?.cwd ?? cwd ?? ".",
-              title: convName,
-              session,
-            })
-          }
-          title="This conversation's extensions — MCP (live status), plugins, skills, sub-agents"
-          aria-label="Extensions"
-        >
-          <Ico name="layers" className="sm" />
-        </button>
-        {/* Clean-output toggle — fold each round's work behind a "Claude's work"
-            block so only the final message stays in clear. PER-CONVERSATION: the toggle
-            writes THIS conversation's explicit override (the global default lives in
-            Settings → General). On-state borrows the accent like the worktree checkbox. */}
-        <button
-          type="button"
-          role="switch"
-          aria-checked={cleanOutput}
-          className="wf-chip"
-          onClick={() =>
-            useConversationsStore.getState().setConvCleanOutput(session, !cleanOutput)
-          }
-          title="Clean output (this conversation) — show only the final message of each response; fold the intermediate work (tools, thinking, steps)"
-          aria-label="Clean output"
-          style={
-            cleanOutput
-              ? { borderColor: "var(--wf-accent)", color: "var(--wf-accent)" }
-              : undefined
-          }
-        >
-          <Ico name="list" className="sm" />
-        </button>
-        {/* Remote control — bridge this conversation to a phone/web. Backend-aware:
-            Claude rides its control channel (→ a claude.ai/code URL); Codex uses its native
-            `remoteControl/enable` (→ a device-pairing code). The chip adapts its active menu
-            to the backend. */}
-        <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh} />
-        {/* Active `/goal` — a target button; click opens a popover with the condition + a clear
-            button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`). */}
-        {!isCodex ? <GoalChip convId={session} /> : null}
-        {/* Worktree checkbox — only before the session spawns (first message).
-            Explicit empty/checked box so the on/off state is unambiguous. */}
-        {isFresh ? (
-          <button
-            type="button"
-            role="checkbox"
-            aria-checked={useWorktree}
-            className="cv-wt-toggle"
-            onClick={() => setUseWorktree((v) => !v)}
-            title="Start this conversation in a new git worktree"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              font: "inherit",
-              fontSize: 11,
-              cursor: "pointer",
-              padding: "4px 9px",
-              borderRadius: 7,
-              border: `1px solid ${useWorktree ? "var(--wf-accent)" : "var(--wf-line)"}`,
-              background: "transparent",
-              color: useWorktree ? "var(--wf-accent)" : "var(--wf-tx-lo)",
-            }}
-          >
-            <span
-              style={{
-                width: 13,
-                height: 13,
-                flex: "0 0 auto",
-                borderRadius: 3,
-                border: `1.5px solid ${useWorktree ? "var(--wf-accent)" : "var(--wf-line-2)"}`,
-                background: useWorktree ? "var(--wf-accent)" : "transparent",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "#1a0f0a",
-                fontSize: 10,
-                lineHeight: 1,
-              }}
-            >
-              {useWorktree ? "✓" : ""}
-            </span>
-            <Ico name="branch" className="sm" />
-            <span className="cv-wt-label">Worktree</span>
-          </button>
-        ) : null}
+        {rightIds.map((id) => {
+          const custom = customById.get(id);
+          return custom ? (
+            <CustomComposerButton
+              key={id}
+              button={custom}
+              convId={session}
+              env={actionEnv}
+              handlers={buttonHandlers}
+              applyConfig={applyConfig}
+            />
+          ) : (
+            <Fragment key={id}>{chipNodes[id as NativeChipId]}</Fragment>
+          );
+        })}
         <ContextRing
           ctx={ctxData}
           plan={isCodex ? null : planData}
