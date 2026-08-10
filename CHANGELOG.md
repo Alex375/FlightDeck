@@ -9,6 +9,18 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.6.0
+
+- New: zoom the whole interface — a Settings slider plus ⌘+ / ⌘− / ⌘0, working on French AZERTY keyboards too.
+- New: a minimap of your own messages down the side of a conversation — hover to preview, click to jump. It follows you into the History panel and the Flight Deck modal.
+- New: customize the composer bar — choose which controls it shows and in which order, so it carries what you actually use.
+- New: the model menu is now built from the CLI itself instead of a hardcoded list, so a newly released Claude shows up without waiting for an app update.
+- Improved: the Flight Deck reply modal now zooms out of its card and back into it, so you never lose track of which conversation you opened.
+- Improved: Stop is unambiguous again — it interrupts the turn, and a queued message can be deleted straight from its own bubble instead of being silently swept along.
+- Improved: in the TOSSE view, "Start" no longer throws you out of the task list, tasks in Review gained a one-click "Done", and running workflows now show their live progress.
+- Changed: client logos fetched from the web are now ON by default. Clients with no logo in the CRM are marked with their website's favicon, which means asking Google for that domain — switch it off in Settings → TOSSE to stay fully local.
+- Fixed: no more "done" chime when the conversation picks straight back up on its own.
+
 ## v1.5.0
 
 - New: connect the app to your TOSSE CRM — sign in from Settings → TOSSE, and link each local folder to its TOSSE repository.
