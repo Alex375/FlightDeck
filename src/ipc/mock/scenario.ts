@@ -16,6 +16,7 @@ import type {
   PermissionDecision,
   PermissionRequestPayload,
   SessionStatePayload,
+  WorkflowJournal,
   WorkflowRun,
 } from "../client";
 
@@ -84,6 +85,60 @@ export const DEMO_SUBAGENT_TRANSCRIPT: ConversationItem[] = [
         type: "text",
         text: "Here's the module map:\n\n- **protocol.rs** — serde types for the stream-json wire\n- **assembler.rs** — normalization + background-task registry\n- **session.rs** — tokio actor per session\n- **subagents.rs** — disk readers (sub-agent transcript, workflow manifest)\n\nBackground-task flow: `task_started → task_progress → task_updated → task_notification`, each event re-emitted as a full `BackgroundTask`.",
       },
+    ],
+  },
+];
+
+/** A finished MULTI-TURN conversation — what `load_session_history` returns for the History
+ *  panel's demo rows. Distinct from the sub-agent transcript above, which has a single
+ *  opening turn by design: a real conversation is a back-and-forth, and the preview has to
+ *  exercise that (several human messages in a row is what the message minimap maps). */
+export const DEMO_HISTORY_TRANSCRIPT: ConversationItem[] = [
+  ...DEMO_SUBAGENT_TRANSCRIPT,
+  {
+    kind: "user_message",
+    id: "hu2",
+    parent_tool_use_id: null,
+    text: "Good. Now walk me through how a background task reaches the UI — I want to know which layer decides a task is finished.",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha2",
+    parent_tool_use_id: null,
+    blocks: [
+      {
+        type: "text",
+        text: "The assembler owns that call. `task_notification` is the terminal event; the front never infers completion from a `tool_result` arriving, because the two can land out of order.",
+      },
+    ],
+  },
+  {
+    kind: "user_message",
+    id: "hu3",
+    parent_tool_use_id: null,
+    text: "/compact",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha3",
+    parent_tool_use_id: null,
+    blocks: [{ type: "text", text: "Conversation compacted." }],
+  },
+  {
+    kind: "user_message",
+    id: "hu4",
+    parent_tool_use_id: null,
+    text: "Last thing: add a regression test for the out-of-order case, then summarise what changed.",
+    replay: false,
+  },
+  {
+    kind: "assistant_message",
+    id: "ha4",
+    parent_tool_use_id: null,
+    blocks: [
+      { type: "text", text: "Added — the test drives a `tool_result` BEFORE its notification and asserts the card stays live." },
     ],
   },
 ];
@@ -160,6 +215,31 @@ export const DEMO_WORKFLOW_RUN: WorkflowRun = {
   ],
   result: null,
 };
+
+/** The demo run's live journal — what the Rust watcher pushes mid-run. Kept consistent with
+ *  the manifest above (same agent ids) so the live overview and the post-run report describe
+ *  the same three agents: r-correctness done, r-perf in flight, v-correctness queued (a queued
+ *  agent has NOT been spawned, so the journal — which only knows spawns — doesn't list it). */
+export function demoWorkflowJournal(): WorkflowJournal {
+  return isDemoWorkflowDone()
+    ? {
+        started: 3,
+        done: 3,
+        agents: [
+          { agentId: "demoagent_fg", done: true },
+          { agentId: "demoagent_bg", done: true },
+          { agentId: "demoagent_v", done: true },
+        ],
+      }
+    : {
+        started: 2,
+        done: 1,
+        agents: [
+          { agentId: "demoagent_fg", done: true },
+          { agentId: "demoagent_bg", done: false },
+        ],
+      };
+}
 
 // Demo-only flag: the dynamic workflow's manifest exists ONLY once the run is done (mirrors
 // reality — the CLI writes it at the end). While false, the mock's `load_workflow_run` returns

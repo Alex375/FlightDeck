@@ -158,23 +158,37 @@ export interface ChordEvent {
  * the same AZERTY reasoning as the dedicated helpers above (letters are layout-stable
  * under `key`, whereas a letter's `code` names its QWERTY position). `shift`/`alt`
  * default to false and must match EXACTLY, so ⌘L never fires on ⌘⇧L or ⌥⌘L.
+ *
+ * The plural `codes`/`keys` and `shift: "any"` exist for the ZOOM chords, which are the
+ * first ones that genuinely live on several keys at once: "+" needs Shift while "=" does
+ * not, and every layout also has the numeric keypad's own +/−/0. Matching one spelling
+ * only would leave the shortcut dead on half the keyboards.
  */
 export interface ChordSpec {
   key?: string;
   code?: string;
-  shift?: boolean;
+  /** Physical keys, any of which matches (superset form of {@link ChordSpec.code}). */
+  codes?: readonly string[];
+  /** Produced characters, any of which matches (superset form of {@link ChordSpec.key}). */
+  keys?: readonly string[];
+  /** `false` (default) / `true`: Shift must match exactly. `"any"`: Shift is ignored —
+   *  only for a chord whose key REQUIRES Shift on some layouts and not on others. */
+  shift?: boolean | "any";
   alt?: boolean;
 }
 
-/** Whether `e` matches `spec` — ⌘/Ctrl required, Shift/Alt matched exactly, and the
- *  key compared via `code` (physical) or `key` (produced char, case-insensitive). */
+/** Whether `e` matches `spec` — ⌘/Ctrl required, Alt matched exactly, Shift matched exactly
+ *  unless `"any"`, and the key compared via `code`/`codes` (physical) then `key`/`keys`
+ *  (produced char, case-insensitive). A spec may carry both: the two are OR'd, which is how
+ *  one zoom binding covers the main row, the keypad and the layouts that shift the symbol. */
 export function matchChord(e: ChordEvent, spec: ChordSpec): boolean {
   if (!(e.metaKey || e.ctrlKey)) return false;
   if (e.altKey !== (spec.alt ?? false)) return false;
-  if (e.shiftKey !== (spec.shift ?? false)) return false;
-  if (spec.code) return e.code === spec.code;
-  if (spec.key) return e.key.toLowerCase() === spec.key.toLowerCase();
-  return false;
+  if (spec.shift !== "any" && e.shiftKey !== (spec.shift ?? false)) return false;
+  const codes = spec.codes ?? (spec.code ? [spec.code] : []);
+  if (codes.includes(e.code)) return true;
+  const keys = spec.keys ?? (spec.key ? [spec.key] : []);
+  return keys.some((k) => k.toLowerCase() === e.key.toLowerCase());
 }
 
 /** The extra actions dispatched by the global handler (beyond the historical
@@ -188,7 +202,10 @@ export type ShortcutAction =
   | "new-conversation"
   | "prev-conversation"
   | "next-conversation"
-  | "open-history";
+  | "open-history"
+  | "zoom-in"
+  | "zoom-out"
+  | "zoom-reset";
 
 /** `global` fires anywhere; `conversation` only in the conversation view with an
  *  active conversation (so ⌘B/⌘J/… are inert on the Flight Deck). */
@@ -217,6 +234,28 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "prev-conversation", spec: { code: "ArrowUp", alt: true }, scope: "global" },
   { action: "next-conversation", spec: { code: "ArrowDown", alt: true }, scope: "global" },
   { action: "open-history", spec: { key: "o", shift: true }, scope: "global" },
+  // Interface zoom — the browser chords, and global on purpose: making the app readable
+  // must work from wherever focus happens to be, editor and terminal included (neither
+  // binds these).
+  //
+  // ⚠️ These match the PRODUCED CHARACTER, never the main row's physical `code`. A
+  // punctuation `code` names its QWERTY POSITION, and on the French Apple layout those
+  // positions carry something else entirely: `Equal` is the key printed "-", `Minus` is
+  // the one printed ")", and "=" lives on `Slash`. Binding `Equal`/`Minus` therefore made
+  // ⌘- ZOOM IN on an AZERTY Mac (its "-" key IS `Equal`, and zoom-in is tested first),
+  // leaving no way to zoom out at all — while ⌘= matched nothing. The characters are the
+  // same on every layout; only their positions move. Same reasoning as the letter chords
+  // (⌘Z reads `key`); the ⌘1/⌘2 DIGITS are the exception, not the rule.
+  //
+  // `shift: "any"` because "+" needs Shift and "=" does not — one chord, both states. Only
+  // the KEYPAD codes are matched positionally: those keys carry their symbol everywhere.
+  //   in    — "+" and "=", the two the browser answers to
+  //   out   — "-", plus "_" (Shift+"-" on both layouts)
+  //   reset — the key PRINTED 0: `Digit0` is stable there (same reasoning as ⌘1/⌘2, and
+  //           AZERTY's shifted "0" is covered by the character)
+  { action: "zoom-in", spec: { codes: ["NumpadAdd"], keys: ["+", "="], shift: "any" }, scope: "global" },
+  { action: "zoom-out", spec: { codes: ["NumpadSubtract"], keys: ["-", "_"], shift: "any" }, scope: "global" },
+  { action: "zoom-reset", spec: { codes: ["Digit0", "Numpad0"], keys: ["0"], shift: "any" }, scope: "global" },
 ];
 
 // ---- Display catalogue (Settings → Shortcuts) ------------------------------
@@ -249,6 +288,8 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘⇧ M", label: "Mute / unmute notification sound" },
       { keys: "⌘ ,", label: "Open Settings" },
       { keys: "⌘ Z", label: "Restore the last deleted conversation" },
+      { keys: "⌘ + / ⌘ −", label: "Zoom the interface in / out" },
+      { keys: "⌘ 0", label: "Reset the zoom to 100%" },
     ],
   },
   {

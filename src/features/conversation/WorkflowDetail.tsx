@@ -1,27 +1,36 @@
 // The /workflows-style detail modal. Two faces, because of how the CLI persists a run:
 //
 //  - WHILE RUNNING → a LIVE OVERVIEW. The rich per-phase/per-agent data does NOT exist on
-//    disk yet (the manifest is written only when the run ENDS). The only live signals are the
+//    disk yet (the manifest is written only when the run ENDS). The live signals are the
 //    wire's coarse `task_progress` ("<phase>: <label>", passed in as `currentProgress`) and
-//    the append-only `journal.jsonl` (agents launched vs done). So mid-run we show the
-//    overview the user asked for: current phase + agents launched / done / running.
+//    the append-only `journal.jsonl` — pushed in as `journal` by the app-wide watcher. So
+//    mid-run we show: current phase, agents launched / running / done, and the EXACT set of
+//    agents in flight, each drillable into its (incrementally written) transcript.
 //  - ONCE FINISHED → the rich 3-panel view (phases → agents w/ metrics → transcript), read
 //    from the manifest (`load_workflow_run`) + per-agent transcripts (`load_subagent_transcript`).
 //
-// Portal + scrim (same family as <TranscriptPopover>). While running we poll both readers; the
-// moment the run ends we re-fetch (the manifest lands just after the status flips), upgrading
-// the live overview in place to the rich report. The shared read-only <SubAgentTranscript>
-// renders each agent's transcript, so the off-thread view never drifts from the live one.
+// Portal + scrim (same family as <TranscriptPopover>). The journal is NOT polled here anymore:
+// it arrives pushed, so the readout is identical whether this modal is open or closed. The
+// moment the run ends we re-fetch the manifest (it lands just after the status flips),
+// upgrading the live overview in place to the rich report. The shared read-only
+// <SubAgentTranscript> renders every transcript, live or cold, so the two never drift.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { ConversationItem, WorkflowJournal, WorkflowPhase, WorkflowRun } from "../../ipc/client";
+import type { ConversationItem, WorkflowPhase, WorkflowRun } from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import { Dot, Ico, RunDots } from "../../ui/kit";
 import { fmtDuration, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { useAppErrors } from "../../store/appErrors";
 import type { WfLive } from "../../store/workflowLive";
+import {
+  inFlightAgents,
+  JOURNAL_UNAVAILABLE,
+  pickJournal,
+  toJournalView,
+  type WfJournalView,
+} from "../../store/workflowJournal";
 import { SubAgentTranscript } from "./SubAgentTranscript";
 import {
   parseWorkflow,
@@ -62,6 +71,7 @@ export function WorkflowDetail({
   workflowName,
   currentProgress,
   liveActivity,
+  journal,
   onClose,
 }: {
   open: boolean;
@@ -77,16 +87,24 @@ export function WorkflowDetail({
   currentProgress?: string | null;
   /** Accumulated per-phase agent activity from the wire (live per-phase started counts). */
   liveActivity?: WfLive;
+  /** The run's live per-agent progress, pushed from disk by the app-wide watcher. */
+  journal?: WfJournalView;
   onClose: () => void;
 }) {
   const [run, setRun] = useState<WorkflowRun | null>(null);
-  const [journal, setJournal] = useState<WorkflowJournal | null>(null);
+  // One-shot read of the journal, as a FALLBACK for a run nothing is watching: a finished run
+  // reopened from history whose manifest never landed would otherwise show "report not found"
+  // even though its journal is right there on disk. The live push always wins when present.
+  const [diskJournal, setDiskJournal] = useState<WfJournalView | null>(null);
   const [livePhases, setLivePhases] = useState<WorkflowPhase[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [tick, setTick] = useState(0); // bumped on each poll → refetches the transcript too
   const [selPhaseKey, setSelPhaseKey] = useState<string | null>(null);
   const [selAgentKey, setSelAgentKey] = useState<string | null>(null);
+  // The in-flight agent being read mid-run (live overview only; the rich view has its own
+  // phase/agent selection). Cleared when the modal reopens.
+  const [selLiveAgent, setSelLiveAgent] = useState<string | null>(null);
   // The script is written once at t=0 — fetch its phases until loaded, then stop re-parsing it
   // on every poll (the manifest + journal are the only things that change during the run).
   const phasesLoadedRef = useRef(false);
@@ -105,8 +123,15 @@ export function WorkflowDetail({
       // non-blocking but must NOT be silent → surface it in the app-level error banner.
       if (r.status === "ok") setRun(r.data);
       setErr(r.status === "error" ? r.error : null);
-      if (j.status === "ok") setJournal(j.data);
-      else useAppErrors.getState().pushError("Workflow journal unreadable", j.error);
+      if (j.status === "ok") setDiskJournal(toJournalView(j.data));
+      // A failed read must DROP the previous disk snapshot, not keep it: leaving it in place
+      // would let `pickJournal` serve unflagged stale numbers as this run's final truth, with
+      // only a dismissible banner to say otherwise. Cleared → the pushed view (which carries
+      // the watcher's own error flag) takes over.
+      else {
+        setDiskJournal(null);
+        useAppErrors.getState().pushError("Workflow journal unreadable", j.error);
+      }
       if (p) {
         if (p.status === "ok") {
           if (p.data.length > 0) {
@@ -129,21 +154,25 @@ export function WorkflowDetail({
   useEffect(() => {
     if (!open) return;
     setRun(null);
-    setJournal(null);
+    setDiskJournal(null);
     setLivePhases([]);
     setErr(null);
     setSelPhaseKey(null);
     setSelAgentKey(null);
+    setSelLiveAgent(null);
     phasesLoadedRef.current = false;
     void fetchData();
   }, [open, fetchData]);
 
-  // Poll while the run is going (the session dir isn't fs-watched).
+  // Tick while the run is going — but for far less than before. The journal is PUSHED now
+  // (the run dir is fs-watched app-wide), and the manifest does not exist until the run ends,
+  // so the only reasons left to tick are: re-reading an OPEN agent transcript, and retrying
+  // the script's phases when they hadn't been written yet at open time.
   useEffect(() => {
     if (!open || !running) return;
     const id = setInterval(() => {
       setTick((t) => t + 1);
-      void fetchData();
+      if (!phasesLoadedRef.current) void fetchData();
     }, POLL_MS);
     return () => clearInterval(id);
   }, [open, running, fetchData]);
@@ -205,8 +234,16 @@ export function WorkflowDetail({
 
   if (!open) return null;
 
+  // Which snapshot to believe — see `pickJournal`: neither the push nor the one-shot disk read
+  // is reliably the fresher one, so the choice depends on the run's state, not on the source.
+  const live: WfJournalView = pickJournal(running, journal, diskJournal);
+  const hasJournal = live.started > 0 && !live.error;
+
   const total = runProgress(model);
   // Header subtitle: rich stats once the manifest is in, else the live count from the journal.
+  // ⚠️ The error case must be stated HERE too, not only in the body: a header reading
+  // "running · 4/9 agents" beside a body saying "progress unavailable" is the same stale-shown-
+  // as-live failure, just in the one line the user reads first.
   const subParts = run
     ? [
         run.status ? run.status : null,
@@ -217,7 +254,7 @@ export function WorkflowDetail({
       ].filter(Boolean)
     : [
         running ? "running" : "completed",
-        journal ? `${journal.done}/${journal.started} agents` : null,
+        live.error ? JOURNAL_UNAVAILABLE : hasJournal ? `${live.done}/${live.started} agents` : null,
       ].filter(Boolean);
 
   let bodyInner: ReactNode;
@@ -282,14 +319,29 @@ export function WorkflowDetail({
     );
   } else if (err) {
     bodyInner = <div className={styles.note}>Manifest unreadable: {err}</div>;
-  } else if (running || journal) {
+  } else if (selLiveAgent) {
+    // ---- Drill-in: ONE in-flight agent's transcript, mid-run ----
+    // The CLI writes each agent's transcript incrementally, so a running agent can be read
+    // live — this is the only way to see inside a workflow before it ends.
+    bodyInner = (
+      <LiveAgentTranscript
+        sessionId={sessionId}
+        agentId={selLiveAgent}
+        running={running}
+        refreshTick={tick}
+        onBack={() => setSelLiveAgent(null)}
+      />
+    );
+  } else if (running || hasJournal) {
     // ---- Live overview (manifest not written yet) ----
     bodyInner = (
       <LiveOverview
         phases={livePhases}
         liveActivity={liveActivity ?? { phases: [] }}
         currentProgress={currentProgress}
-        journal={journal}
+        journal={live}
+        running={running}
+        onOpenAgent={setSelLiveAgent}
       />
     );
   } else if (loading) {
@@ -423,26 +475,50 @@ function buildLiveRows(
   });
 }
 
-/** The mid-run overview: 3 colour-coded count boxes + the full step list with a per-phase
- *  "done/total" badge. Phases come from the script's `meta` (available at t=0 → upcoming steps
- *  show); per-phase started from the accumulated wire; done from the journal — the only live
- *  signals (the rich per-agent manifest is written only at the end). */
+/** The mid-run overview: 3 colour-coded count boxes, the in-flight agents (drillable), and the
+ *  full step list with a per-phase "done/total" badge. Phases come from the script's `meta`
+ *  (available at t=0 → upcoming steps show); per-phase started from the accumulated wire; the
+ *  counts and the agent set from the journal — the only live signals (the rich per-agent
+ *  manifest is written only at the end). */
 function LiveOverview({
   phases,
   liveActivity,
   currentProgress,
   journal,
+  running,
+  onOpenAgent,
 }: {
   phases: WorkflowPhase[];
   liveActivity: WfLive;
   currentProgress: string | null | undefined;
-  journal: WorkflowJournal | null;
+  journal: WfJournalView;
+  /** Whether the RUN is still going. Gates everything that claims present-tense activity. */
+  running: boolean;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const cur = splitProgress(currentProgress);
-  const started = journal?.started ?? 0;
-  const done = journal?.done ?? 0;
-  const inflight = Math.max(0, started - done);
+  const { started, done } = journal;
+  // "In flight" is only true while the run is going: an agent with no `result` line in a
+  // SETTLED run was never closed by the CLI (real runs do this), not still working. Showing
+  // spinners for it would state something false about a finished run.
+  const inflight = running ? journal.running : 0;
   const rows = buildLiveRows(phases, liveActivity, done, cur?.phase ?? null);
+  const flying = running ? inFlightAgents(journal) : [];
+
+  // The numbers can no longer be read: say so instead of animating the last ones we had.
+  if (journal.error) {
+    return (
+      <div className={styles.live}>
+        <div className={styles.note}>
+          {JOURNAL_UNAVAILABLE} — {journal.error}
+        </div>
+        <div className={styles.liveNote}>
+          The run's journal could not be read, so the counts below its last known state are not
+          being refreshed. The run itself is unaffected.
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={styles.live}>
@@ -461,10 +537,43 @@ function LiveOverview({
         </div>
       </div>
 
+      {flying.length > 0 ? (
+        <div className={styles.liveAgents}>
+          {/* Same rows either way — only the CLAIM changes. While the run lives these agents are
+              working. Once it has settled they are agents the CLI never wrote a result for,
+              which is not the same statement and must not spin. They stay clickable in both
+              cases: on a settled run whose manifest never landed, this is the only way into
+              their transcripts, which are still on disk. */}
+          <div className={styles.liveAgentsHdr}>
+            {running ? "In flight" : "No result recorded"}
+          </div>
+          {flying.map((a) => (
+            <button
+              key={a.agentId}
+              type="button"
+              className={styles.liveAgentRow}
+              onClick={() => onOpenAgent(a.agentId)}
+              title={
+                running
+                  ? "Read this agent's transcript as it writes it"
+                  : "Read this agent's transcript"
+              }
+            >
+              {running ? <RunDots /> : <Dot s="off" />}
+              <span className={styles.liveAgentId + " wf-mono"}>{shortAgentId(a.agentId)}</span>
+              <Ico name="arrow" className={"sm " + styles.liveAgentChevron} />
+            </button>
+          ))}
+        </div>
+      ) : null}
+
       {rows.length > 0 ? (
         <div className={styles.livePhases}>
           {rows.map((r, i) => {
-            const isActive = r.state === "cur";
+            // "cur" comes from the WIRE's last progress tick, which survives the run's end —
+            // so gate the spinner on the run too, or a finished run keeps animating a step as
+            // if it were in progress (the same false present tense as the counts).
+            const isActive = r.state === "cur" && running;
             const isCurPhase = cur != null && norm(r.title) === norm(cur.phase);
             return (
               <div key={`${r.title}-${i}`} className={styles.livePhaseRow} data-state={r.state}>
@@ -495,9 +604,51 @@ function LiveOverview({
       )}
 
       <div className={styles.liveNote}>
-        Live overview. Per-step counts refine as the run progresses; per-agent detail (metrics,
-        transcripts) appears at the end, once the full report is written.
+        Live overview. Launched / running / done are exact; the per-STEP split is approximate
+        while the run lasts (the wire doesn't say which step an agent belongs to). Labels,
+        metrics and models per agent appear at the end, with the full report.
       </div>
+    </div>
+  );
+}
+
+/** A workflow agent id is a long opaque hash; mid-run there is no label for it anywhere on
+ *  disk (labels live only in the end-of-run manifest), so the id itself has to identify the
+ *  row — shortened, since only its head is needed to tell rows apart. */
+function shortAgentId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+}
+
+/** One in-flight agent's transcript, read mid-run. Same read-only renderer as everywhere else;
+ *  the back link returns to the overview (the live face has no room for a persistent list). */
+function LiveAgentTranscript({
+  sessionId,
+  agentId,
+  running,
+  refreshTick,
+  onBack,
+}: {
+  sessionId: string | null;
+  agentId: string;
+  running: boolean;
+  refreshTick: number;
+  onBack: () => void;
+}) {
+  return (
+    <div>
+      <div className={styles.txHead}>
+        <button type="button" className={styles.backBtn} onClick={onBack}>
+          <Ico name="arrow" className={"sm " + styles.backIco} />
+          Back to overview
+        </button>
+        <div className={styles.txTitle + " wf-mono"}>{shortAgentId(agentId)}</div>
+      </div>
+      <TranscriptBody
+        sessionId={sessionId}
+        agentId={agentId}
+        running={running}
+        refreshTick={refreshTick}
+      />
     </div>
   );
 }
@@ -549,10 +700,50 @@ function AgentTranscriptPane({
   running: boolean;
   refreshTick: number;
 }) {
+  return (
+    <div>
+      <div className={styles.txHead}>
+        <div className={styles.txTitle}>{agent.label}</div>
+        {agent.promptPreview ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>Prompt</span>
+            {truncate(agent.promptPreview, 320)}
+          </div>
+        ) : null}
+        {agent.resultPreview ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>Result</span>
+            {truncate(agent.resultPreview, 320)}
+          </div>
+        ) : null}
+      </div>
+      <TranscriptBody
+        sessionId={sessionId}
+        agentId={agent.agentId}
+        running={running}
+        refreshTick={refreshTick}
+      />
+    </div>
+  );
+}
+
+/** Loads and renders one agent's on-disk transcript. Shared by the rich post-run pane and the
+ *  mid-run drill-in, so a running agent and a finished one read exactly the same. `agentId`
+ *  null = the manifest carried no id (a queued agent) — a normal state, stated as such. */
+function TranscriptBody({
+  sessionId,
+  agentId,
+  running,
+  refreshTick,
+}: {
+  sessionId: string | null;
+  agentId: string | null;
+  running: boolean;
+  refreshTick: number;
+}) {
   const [items, setItems] = useState<ConversationItem[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const agentId = agent.agentId;
 
   useEffect(() => {
     let alive = true;
@@ -601,26 +792,7 @@ function AgentTranscriptPane({
     body = <SubAgentTranscript items={items} agentPrompt />;
   }
 
-  return (
-    <div>
-      <div className={styles.txHead}>
-        <div className={styles.txTitle}>{agent.label}</div>
-        {agent.promptPreview ? (
-          <div className={styles.txPreview}>
-            <span className={styles.txPreviewLbl}>Prompt</span>
-            {truncate(agent.promptPreview, 320)}
-          </div>
-        ) : null}
-        {agent.resultPreview ? (
-          <div className={styles.txPreview}>
-            <span className={styles.txPreviewLbl}>Result</span>
-            {truncate(agent.resultPreview, 320)}
-          </div>
-        ) : null}
-      </div>
-      {body}
-    </div>
-  );
+  return body;
 }
 
 function truncate(s: string, n: number): string {

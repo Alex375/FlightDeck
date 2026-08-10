@@ -3,6 +3,7 @@ import { TodoBar } from "../todos/TodoBar";
 import { ConductorComposer, type ComposerHandle } from "./ConductorComposer";
 import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
+import { ConversationMinimap } from "./MessageMinimap";
 import { FileMentionProvider } from "./FileMention";
 import { ReviewBar } from "./ReviewBar";
 import { AuthWarningBar } from "./AuthWarningBar";
@@ -49,7 +50,7 @@ export function ConversationPane({
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
   // of jumping when the user flips it (via the chip or the global default).
   const cleanOutput = useEffectiveCleanOutput(session);
-  const { scrollRef, onRender, scrollToBottom } = useStickToBottom(session, cleanOutput);
+  const { scrollRef, scrollEl, onRender, scrollToBottom } = useStickToBottom(session, cleanOutput);
   // The pane is the positioning context (position:relative in CSS) AND the scope for the
   // pin's "scroll to my last message" lookup — see LastMessagePin.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -62,6 +63,11 @@ export function ConversationPane({
     >
       {/* Floating "last message you sent" pin, pinned over the top of the thread. */}
       <LastMessagePin session={session} paneRef={paneRef} />
+      {/* Floating column of marks over the thread's right edge — one per message sent.
+          Mounted on EVERY surface that shows the thread (including the Flight Deck reply
+          modal): one navigation affordance, everywhere. The pane is the positioned host;
+          the thread is the scroll container the column measures and watches. */}
+      <ConversationMinimap session={session} hostRef={paneRef} scrollRef={scrollEl} />
       {/* Provide the conversation id + live cwd so file mentions in the thread
           resolve + open in this conversation's editor. */}
       <FileMentionProvider convId={session} cwd={cwd} inert={inertMentions}>
@@ -79,7 +85,12 @@ export function ConversationPane({
       <TodoBar session={session} />
       <ReviewBar session={session} />
       <AuthWarningBar session={session} />
-      <ConductorComposer ref={composerRef} session={session} onSent={scrollToBottom} />
+      <ConductorComposer
+          ref={composerRef}
+          session={session}
+          onSent={scrollToBottom}
+          hasPanels={!inertMentions}
+        />
     </div>
   );
 }

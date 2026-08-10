@@ -1200,6 +1200,34 @@ pub async fn load_workflow_journal(
     .map_err(|e| e.to_string())?
 }
 
+/// Start (or join) a live watch on a RUNNING workflow's journal. Each change pushes a
+/// `WorkflowJournalEvent` carrying the run's fresh per-agent progress, so the pinned bar, the
+/// inline card and the Flight Deck card stay live WITHOUT any of them polling. Ref-counted:
+/// every call must be paired with [`unwatch_workflow_journal`].
+#[tauri::command]
+#[specta::specta]
+pub fn watch_workflow_journal(
+    app: tauri::AppHandle,
+    watchers: tauri::State<'_, crate::supervisor::workflow_watch::WorkflowWatchers>,
+    session_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    watchers.watch(app, session_id, run_id);
+    Ok(())
+}
+
+/// Drop one reference to a run's journal watch (the last one stops it).
+#[tauri::command]
+#[specta::specta]
+pub fn unwatch_workflow_journal(
+    watchers: tauri::State<'_, crate::supervisor::workflow_watch::WorkflowWatchers>,
+    session_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    watchers.unwatch(&session_id, &run_id);
+    Ok(())
+}
+
 /// The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
 /// the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
 /// run. Empty if no script/phases. Lets the live overview show upcoming steps.
@@ -1238,7 +1266,25 @@ pub async fn read_task_output_file(path: String) -> Result<Option<String>, Strin
 /// Errors are typed ([`UsageError`]) so the UI can show a tailored next step.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_plan_usage() -> Result<PlanUsage, UsageError> {
+pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<PlanUsage, UsageError> {
+    // Prefer a LIVE session's `get_usage` control request: same numbers, but with no
+    // OAuth token and no Keychain read — which is precisely what makes it immune to the
+    // stale `~/.claude/.credentials.json` that shadows a fresh Keychain token and 401s
+    // the HTTP path. Only ONE session is tried: any of them reports the same
+    // account-wide plan, and walking a list of unresponsive handles would make the UI
+    // wait out a timeout per session.
+    //
+    // The HTTP path is deliberately KEPT rather than replaced: sessions spawn lazily, so
+    // with no conversation running there is nobody to ask — and the binary marks
+    // `get_usage` "Experimental — the response shape may change", so a drift there must
+    // degrade to the endpoint instead of blanking the meter.
+    if let Some(handle) = sessions.handles().into_iter().next() {
+        if let Ok(line) = handle.plan_usage_payload().await {
+            if let Some(usage) = crate::usage::plan_usage_from_control_response(&line) {
+                return Ok(usage);
+            }
+        }
+    }
     crate::usage::fetch_plan_usage().await
 }
 
@@ -1305,8 +1351,13 @@ pub async fn send_message(
     text: String,
     images: Vec<ImageAttachment>,
     codex_controls: Option<codex::CodexControls>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    // The returned uuid identifies THIS message on the wire. The UI keeps it on the
+    // turn so a message still sitting in the binary's queue can be dropped individually
+    // (`cancel_async_message`) — the only way to cancel one specific queued message
+    // rather than "the last thing sent". Codex sessions return one too; it is unused
+    // there, which keeps a single send path for both backends.
     handle
         .send_user(text, images, codex_controls)
         .await
@@ -1484,6 +1535,73 @@ pub async fn stop_task(
 ) -> Result<(), String> {
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
     handle.stop_task(task_id).await.map_err(|e| e.to_string())
+}
+
+/// The live model catalogue of a running session (`list_models`): what the binary will
+/// actually accept, after the provider, the settings cascade and the org enforcement
+/// policy. Errors with "unknown session" when nothing is live.
+///
+/// ⚠️ NOT wired to the model picker, on purpose. It was, and the result was rejected on
+/// sight: the binary returns a CLI-shaped menu — a "Default (recommended)" row, plus the
+/// same model listed twice under its alias and its `[1m]` variant — which reads worse
+/// than our four curated rows (see `modelsForPicker`). What stays valuable here is the
+/// per-model data no static table can hold: `supported_effort_levels` (the effort ladder
+/// is hard-coded today and drifts with each model launch) and `resolved_model`, whose
+/// `[1m]` suffix is the only wire signal of the 1M context window.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_session_models(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+) -> Result<Vec<crate::supervisor::model::LiveModel>, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle.list_models().await.map_err(|e| e.to_string())
+}
+
+/// Restore the files edited since a user message, from the binary's own checkpoints
+/// (`rewind_files`). Call with `dry_run: true` FIRST to preview which files and how
+/// many lines would change — the app never performs a destructive restore without
+/// showing that preview. A refusal (checkpointing disabled, no checkpoint for this
+/// message) comes back inside the result as `can_rewind: false` + `error`, never as a
+/// silent no-op.
+#[tauri::command]
+#[specta::specta]
+pub async fn rewind_files(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    user_message_id: String,
+    dry_run: bool,
+) -> Result<crate::supervisor::model::RewindFilesResult, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .rewind_files(user_message_id, dry_run)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Drop ONE specific still-queued user message from the binary's command queue, by the
+/// uuid `send_message` returned for it. This is what backs "remove this pending message"
+/// on a message queued behind a running turn.
+///
+/// ⚠️ ONLY for a message still WAITING behind another turn. Cancelling one whose own turn
+/// has already started answers `cancelled:false` and WEDGES the session (verified on the
+/// wire: the turn stops producing and never emits its `result`).
+///
+/// `false` = the binary did not remove it (already dequeued for execution, or never
+/// queued). The caller must NOT take the bubble away on `false`: the message is on its
+/// way to the model and will be answered.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_queued_message(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    message_uuid: String,
+) -> Result<bool, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .cancel_async_message(message_uuid)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Query a running session's LIVE MCP server status (real connection state +
@@ -1702,6 +1820,32 @@ pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(
     window
         .request_user_attention(Some(kind))
         .map_err(|e| e.to_string())
+}
+
+/// The widest zoom factor the webview will be asked for — the front's ladder
+/// (`src/ui/zoom.ts`) stays well inside this. These are a BACKSTOP, not the product
+/// range: `setPageZoom(0)` (or a NaN) would leave the window unreadable with no way
+/// back through the UI, so a nonsense factor is refused here rather than applied.
+const MIN_UI_ZOOM: f64 = 0.25;
+const MAX_UI_ZOOM: f64 = 4.0;
+
+/// Scale the whole interface by `factor` (1.0 = 100 %), the way a browser's ⌘+ does:
+/// this drives the OS webview's own page zoom (WKWebView `pageZoom` on macOS), so
+/// every pixel of the UI — thread, Flight Deck, Monaco, xterm, PDF viewer, popovers —
+/// scales together and each surface re-layouts from its own size observer.
+///
+/// The zoom is NOT persisted by the webview: the front holds it in its display prefs
+/// and re-applies it on mount (see `ZoomHost`). A no-op if the main window is gone.
+#[tauri::command]
+#[specta::specta]
+pub fn set_ui_zoom(app: tauri::AppHandle, factor: f64) -> Result<(), String> {
+    if !factor.is_finite() || !(MIN_UI_ZOOM..=MAX_UI_ZOOM).contains(&factor) {
+        return Err(format!("zoom factor out of range: {factor}"));
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(()); // window already closed — nothing to scale
+    };
+    window.set_zoom(factor).map_err(|e| e.to_string())
 }
 
 // ---- Git worktrees --------------------------------------------------------

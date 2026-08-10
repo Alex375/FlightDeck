@@ -7,7 +7,7 @@ import type {
   PermissionRequestPayload,
 } from "../../ipc/client";
 import { commands } from "../../ipc/client";
-import { useAnswerPermission } from "../../ipc/useCommands";
+import { useAnswerPermission, useCancelQueuedMessage } from "../../ipc/useCommands";
 import { classifyAsk, field } from "../../agent/ask";
 import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
@@ -143,14 +143,23 @@ function MessageActions({
 
 export function MsgUser({
   text,
+  turnId,
   queued,
+  onCancelQueued,
   images,
   onRewind,
   onFork,
   forkBusy,
 }: {
   text: string;
+  /** Stamped as `data-user-turn` so the message minimap can scroll to this bubble.
+   *  Absent on surfaces that render a user message outside the live thread. */
+  turnId?: string;
   queued?: boolean;
+  /** When set, offer to drop this still-pending message from the binary's queue. Only
+   *  passed for a message we sent in THIS session (a restored or remote turn carries no
+   *  wire uuid, and nothing that already ran can be taken out of the queue). */
+  onCancelQueued?: () => void;
   images?: UserTurnImage[];
   /** When set, show the rewind hover control on this message. */
   onRewind?: () => void;
@@ -164,13 +173,27 @@ export function MsgUser({
   const special = parseSpecialMessage(text);
   if (special) return <SpecialMessageCard data={special} />;
   return (
-    <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")}>
+    <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
       <div className="cv-bubble">
         {queued ? (
           <span className="cv-queued-tag" title="Sent while the agent is working — will be handled along the way">
             <Ico name="clock" />
             pending
+            {/* Only offered while the message is genuinely still droppable: it needs the
+                wire uuid that addresses it in the binary's queue (see `onCancelQueued`).
+                Removing it here is the EXPLICIT counterpart to the stop button, which
+                deliberately leaves queued messages alone and stops the agent instead. */}
+            {onCancelQueued ? (
+              <button
+                className="cv-queued-del"
+                title="Remove this pending message — it hasn't been read yet"
+                aria-label="Remove this pending message"
+                onClick={onCancelQueued}
+              >
+                <Ico name="x" />
+              </button>
+            ) : null}
           </span>
         ) : null}
         {images && images.length ? (
@@ -213,7 +236,9 @@ function InlineUserMarker({ session, turnId }: { session: string; turnId: string
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
   return (
-    <div className={styles.injectedMsg}>
+    // Same `data-user-turn` anchor as a full user bubble: in clean output this IS the
+    // message's place in the thread, so the minimap must be able to scroll to it.
+    <div className={styles.injectedMsg} data-user-turn={turnId}>
       <span
         className={styles.injectedMsgTag}
         title={
@@ -1420,17 +1445,27 @@ export function TurnRow({
   forkBusy?: boolean;
 }) {
   const turn = useTurn(session, turnId);
+  const cancelQueued = useCancelQueuedMessage(session);
   if (!turn) return null;
-  if (turn.role === "user")
+  if (turn.role === "user") {
+    // Droppable only while it is BOTH still pending and addressable on the wire — a turn
+    // restored from disk or typed remotely has no uuid of ours, and nothing already
+    // running can be pulled back out of the queue.
+    const wireUuid = turn.queued ? turn.wireUuid : undefined;
     return (
       <MsgUser
         text={turn.streamingText}
+        turnId={turnId}
         queued={turn.queued}
+        onCancelQueued={
+          wireUuid ? () => cancelQueued.mutate({ turnId, wireUuid }) : undefined
+        }
         images={turn.images}
         onRewind={onRewind}
         onFork={onFork}
         forkBusy={forkBusy}
       />
     );
+  }
   return <MsgAI session={session} turnId={turnId} busy={busy} awaiting={awaiting} />;
 }

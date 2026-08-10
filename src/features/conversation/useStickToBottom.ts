@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 import {
   clampRestoreTop,
   initialTarget,
@@ -6,6 +6,7 @@ import {
   readScrollMemo,
   writeScrollMemo,
 } from "./scrollMemory";
+import { verticalScaleOfEl } from "../../ui/visualScale";
 
 // After a send, follow new content smoothly for this long (the user message + the
 // "thinking" indicator land in this window), then snap instantly so fast token
@@ -23,6 +24,10 @@ const SETTLE_MAX_MS = 5000;
 export interface StickToBottom {
   /** Attach to the scroll container (the element with `overflow-y: auto`). */
   scrollRef: (node: HTMLDivElement | null) => void;
+  /** The attached scroll container, for siblings that need to measure or watch it (the
+   *  message minimap). Exposed rather than re-found by selector: the hook already holds it,
+   *  and a second lookup could resolve to another mounted thread. */
+  scrollEl: RefObject<HTMLDivElement | null>;
   /**
    * Call before paint on every thread render (see StreamFollow in ConductorThread).
    * While the open is still settling it applies the remembered/initial position;
@@ -63,11 +68,22 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     const inner = el.querySelector(".cv-thread-inner");
     if (!inner) return;
     const top = el.getBoundingClientRect().top;
+    // ⚠️ The SELECTION below compares rects, which are VISUAL — so the 8px threshold, a
+    // layout figure, is projected into that space. Under the Flight Deck modal's opening
+    // zoom (an ancestor transform) a raw 8 would mean ~40 layout px and could latch onto a
+    // different row than at rest.
+    const minVisible = 8 * verticalScaleOfEl(el);
     for (const child of Array.from(inner.children) as HTMLElement[]) {
       const r = child.getBoundingClientRect();
       // First element whose bottom is below the viewport top = the topmost visible row.
-      if (r.bottom - top > 8) {
-        anchor.current = { node: child, gap: r.top - top };
+      if (r.bottom - top > minVisible) {
+        // ⚠️ …and the GAP itself is taken in LAYOUT space (`offsetTop` − `scrollTop`), never
+        // from rects. It is cached here and spent much later against `scrollTop`, which is
+        // always layout pixels; a visual gap captured under the modal's zoom would be off by
+        // that scale and send the thread hundreds of pixels away from what the user was
+        // reading — the very jump this anchor exists to prevent. Layout metrics cannot be
+        // scaled by a transform, so this needs no correction rather than the right one.
+        anchor.current = { node: child, gap: child.offsetTop - el.scrollTop };
         break;
       }
     }
@@ -252,10 +268,11 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     } else {
       const a = anchor.current;
       if (a && a.node.isConnected) {
-        // Restore so the anchored row keeps the same offset from the viewport top.
-        const top = el.getBoundingClientRect().top;
-        const currentGap = a.node.getBoundingClientRect().top - top;
-        el.scrollTop += currentGap - a.gap;
+        // Restore so the anchored row keeps the same offset from the viewport top. Layout
+        // space at both ends (see captureAnchor): `offsetTop` is where the row sits in the
+        // scrolled content, so putting `scrollTop` that same distance behind it reproduces
+        // the offset exactly — whatever transform happened to be painting either end.
+        el.scrollTop = a.node.offsetTop - a.gap;
       } else {
         // No usable anchor → keep the same distance from the bottom.
         el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - distFromBottom.current);
@@ -265,5 +282,5 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     programmaticTop.current = el.scrollTop;
   }, [preserveKey]);
 
-  return { scrollRef, onRender, scrollToBottom };
+  return { scrollRef, scrollEl, onRender, scrollToBottom };
 }

@@ -33,7 +33,9 @@ import type {
   ImageContent,
   MarketplaceInfo,
   McpAuthResult,
+  LiveModel,
   McpServerLive,
+  RewindFilesResult,
   PluginContents,
   PermissionDecision,
   PermissionMode,
@@ -52,6 +54,7 @@ import type {
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
+  SessionPermissionResolvedEvent,
   SessionRemoteControlEvent,
   SessionStatePayload,
   SessionStateEvent,
@@ -75,12 +78,13 @@ import type {
   TickEvent,
   UsageError,
   WorkflowJournal,
+  WorkflowJournalEvent,
   WorkflowPhase,
   WorkflowRun,
   WorktreeInfo,
   WorktreeStatus,
 } from "../bindings";
-import { DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -130,6 +134,11 @@ class MockEmitter<T> {
 
 const sessionMessageEvent = new MockEmitter<SessionMessageEvent>();
 const sessionPermissionEvent = new MockEmitter<SessionPermissionEvent>();
+// Never emitted by a scenario (nothing withdraws a mock permission), but it MUST exist:
+// `useGlobalSessionEvents` attaches every listener at App mount, so a missing emitter is
+// `undefined.listen()` — which takes the whole app down in the browser mock, not just the
+// events it carries. Any event added to `bindings.ts` has to be mirrored here.
+const sessionPermissionResolvedEvent = new MockEmitter<SessionPermissionResolvedEvent>();
 const sessionStateEvent = new MockEmitter<SessionStateEvent>();
 const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
@@ -148,6 +157,8 @@ const tickEvent = new MockEmitter<TickEvent>();
 // No real filesystem in the browser mock — these never fire, but must exist so
 // the editor's `useFsWatch` can subscribe without crashing.
 const fsChangeEvent = new MockEmitter<FsChangeEvent>();
+// Pushed by `watchWorkflowJournal` below, so the workflow demo exercises the live readout.
+const workflowJournalEvent = new MockEmitter<WorkflowJournalEvent>();
 const fsWatchErrorEvent = new MockEmitter<FsWatchErrorEvent>();
 // No real PTY in the browser mock — these never fire, but must exist so the
 // integrated terminal can subscribe without crashing.
@@ -157,6 +168,7 @@ const terminalExitEvent = new MockEmitter<TerminalExitEvent>();
 export const mockEvents = {
   sessionMessageEvent,
   sessionPermissionEvent,
+  sessionPermissionResolvedEvent,
   sessionStateEvent,
   sessionCommandsEvent,
   sessionTaskEvent,
@@ -169,6 +181,7 @@ export const mockEvents = {
   tickEvent,
   fsChangeEvent,
   fsWatchErrorEvent,
+  workflowJournalEvent,
   terminalOutputEvent,
   terminalExitEvent,
 };
@@ -205,6 +218,8 @@ const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 let mockCounter = 0;
+/** Distinguishes the wire uuids the mock hands back for successive sends. */
+let mockSentCounter = 0;
 
 // ---- TOSSE briefing fixture ------------------------------------------------
 // Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
@@ -826,7 +841,7 @@ export const mockCommands = {
     _text: string,
     _images: ImageAttachment[],
     codexControls: CodexControls | null,
-  ): Promise<Result<null, string>> {
+  ): Promise<Result<string, string>> {
     // No actor to apply the per-turn Codex overrides to — log them so a dev/Playwright
     // run driving the demo Codex conversation can observe they were actually folded in.
     if (codexControls) console.info("[mock] sendMessage codexControls:", codexControls);
@@ -841,7 +856,15 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else driver.start();
-    return ok(null);
+    // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
+    // path as production (the demo has no queue, so cancelling it always reports false).
+    return ok(`mock-uuid-${session}-${mockSentCounter++}`);
+  },
+
+  async cancelQueuedMessage(_session: string, _messageUuid: string): Promise<Result<boolean, string>> {
+    // No command queue in the demo → nothing is ever removed, which is the same answer
+    // the binary gives for a message that already started running.
+    return ok(false);
   },
 
   async answerPermission(
@@ -944,6 +967,26 @@ export const mockCommands = {
     return ok(null);
   },
 
+  async listSessionModels(_session: string): Promise<Result<LiveModel[], string>> {
+    return ok([]);
+  },
+
+  async rewindFiles(
+    _session: string,
+    _userMessageId: string,
+    _dryRun: boolean,
+  ): Promise<Result<RewindFilesResult, string>> {
+    // No file checkpoints in the demo: report the same refusal the binary gives when
+    // checkpointing is off, so the UI exercises its "cannot rewind" path.
+    return ok({
+      can_rewind: false,
+      files_changed: [],
+      insertions: 0,
+      deletions: 0,
+      error: "File rewinding is not enabled.",
+    });
+  },
+
   async stopSession(session: string): Promise<Result<null, string>> {
     const rec = getRecord(session);
     rec.driver.reset();
@@ -983,7 +1026,7 @@ export const mockCommands = {
     // return a representative transcript so the PREVIEW pane renders real-shaped content
     // in dev/Playwright; otherwise empty ("nothing to replay" → reload stays a no-op and
     // keeps whatever the live scenario already rendered).
-    if (HISTORY_DEMO_SESSION_IDS.has(sessionId)) return ok(DEMO_SUBAGENT_TRANSCRIPT);
+    if (HISTORY_DEMO_SESSION_IDS.has(sessionId)) return ok(DEMO_HISTORY_TRANSCRIPT);
     return ok([]);
   },
 
@@ -1017,9 +1060,29 @@ export const mockCommands = {
     _sessionId: string,
     _runId: string,
   ): Promise<Result<WorkflowJournal | null, string>> {
-    // Live progress counts (the mid-run signal), kept consistent with the demo's 2 wire ticks
+    // Live per-agent progress (the mid-run signal), consistent with the demo's 2 wire ticks
     // (r-correctness done, r-perf running). Grows to "all done" once the run finishes.
-    return ok(isDemoWorkflowDone() ? { started: 3, done: 3 } : { started: 2, done: 1 });
+    return ok(demoWorkflowJournal());
+  },
+
+  async watchWorkflowJournal(sessionId: string, runId: string): Promise<Result<null, string>> {
+    // The real watcher pushes a snapshot as soon as it attaches; mirror that, or the mock's
+    // card and detail modal would sit at "starting…" forever (no filesystem in the browser).
+    setTimeout(
+      () =>
+        workflowJournalEvent.emit({
+          session_id: sessionId,
+          run_id: runId,
+          journal: demoWorkflowJournal(),
+          error: null,
+        }),
+      0,
+    );
+    return ok(null);
+  },
+
+  async unwatchWorkflowJournal(_sessionId: string, _runId: string): Promise<Result<null, string>> {
+    return ok(null);
   },
 
   async loadWorkflowPhases(
@@ -1204,6 +1267,18 @@ export const mockCommands = {
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {
     // No real power assertion in the browser/dev mock — the toggle is inert here.
+    return ok(null);
+  },
+
+  async setUiZoom(factor: number): Promise<Result<null, string>> {
+    // There is no OS webview to ask in the browser/dev mock, so approximate its page zoom
+    // with the CSS one — enough to see the stepper and ⌘+/⌘−/⌘0 actually do something while
+    // developing. ⚠️ It is an APPROXIMATION, not the shipped mechanism: CSS zoom scales the
+    // coordinate space that `position: fixed` popovers measure themselves against, so a
+    // portalled menu can land slightly off HERE and be perfectly placed in the real app
+    // (which scales the whole page at the webview level). Judge popover placement under
+    // `/build-app`, not in the browser.
+    document.documentElement.style.zoom = factor === 1 ? "" : String(factor);
     return ok(null);
   },
 

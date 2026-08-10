@@ -256,6 +256,80 @@
   color: var(--wf-tx-lo);
 }
 
+/* The in-flight agents: the only per-agent handle that exists mid-run (an opaque id, which
+   keys a transcript the CLI writes as the agent works). One row per running agent, drillable. */
+.liveAgents {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--wf-line-2, var(--wf-line));
+  border-radius: 10px;
+  overflow: hidden;
+}
+.liveAgentsHdr {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--wf-tx-xlo);
+  padding: 8px 12px 6px;
+}
+.liveAgentRow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-top: 1px solid var(--wf-line-2, var(--wf-line));
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+.liveAgentRow:hover {
+  background: color-mix(in srgb, var(--wf-panel-3) 50%, transparent);
+}
+.liveAgentId {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.liveAgentChevron {
+  flex: 0 0 auto;
+  color: var(--wf-tx-xlo);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.liveAgentRow:hover .liveAgentChevron {
+  opacity: 1;
+}
+
+/* Back link out of a mid-run agent transcript, into the overview. */
+.backBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 3px 8px 3px 5px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.backBtn:hover {
+  background: var(--bg-hover, #ffffff10);
+  color: var(--wf-tx);
+}
+.backIco {
+  transform: rotate(180deg);
+}
+
 /* ---- columns -------------------------------------------------------------- */
 
 .colPhases {

@@ -373,6 +373,13 @@ impl Transport {
             .env("CLAUDE_CODE_ENTRYPOINT", "tosse-code")
             .env("MCP_CONNECTION_NONBLOCKING", "true")
             .env("CLAUDE_CODE_ENABLE_TASKS", "0")
+            // Turn on the binary's file checkpointing so `rewind_files` can restore what
+            // a turn edited. In interactive mode the CLI enables this itself, but in
+            // SDK/piloted mode (our case) its `fileHistoryEnabled` gate reads ONLY this
+            // env var — without it every rewind answers "File rewinding is not enabled."
+            // (verified live against 2.1.224). Costs nothing when unused: the binary just
+            // snapshots the files IT edits, and rewinding stays an explicit user action.
+            .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
             .env_remove("NODE_OPTIONS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

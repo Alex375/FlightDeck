@@ -1,9 +1,10 @@
 // "Start" and "Discuss" — turning a TOSSE task into a conversation.
 //
 // One provider owns the whole gesture (resolve the folder, ask what has to be asked,
-// send, navigate) and every task row / detail panel reaches it through context, rather
-// than each row carrying its own copy of the queries and the rules. That is what keeps
-// the two buttons meaning the same thing wherever they are pressed.
+// send, and decide whether to navigate) and every task row / detail panel reaches it
+// through context, rather than each row carrying its own copy of the queries and the
+// rules. That is what keeps the two buttons meaning the same thing wherever they are
+// pressed — including the last step, which is NOT the same for both: see `handOff`.
 //
 // The dialog is deliberately NOT always shown. A project whose folder is already known
 // and whose repo has the `/pickup` skill starts in one click — "ask once, then remember"
@@ -13,12 +14,13 @@
 //   - the folder has no `/pickup` skill, so written instructions go instead — a
 //     substitution the user is TOLD about rather than left to discover.
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { repoName, useConversationsStore, useRepos } from "../../store/conversationsStore";
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
-import { launchTaskConversation, type LaunchMode } from "./taskConversation";
+import { launchFocusesConversation, launchTaskConversation, type LaunchMode } from "./taskConversation";
+import { useDisplay } from "../../store/display";
 import { resolveTaskFolder } from "./taskFolder";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
@@ -52,6 +54,15 @@ const useLaunchDialog = create<LaunchDialogState>((set) => ({
   close: () => set({ pending: null }),
 }));
 
+/** How long a task wears its "Started" mark. Long enough to be caught by an eye that was
+ *  on the button and has already moved on, short enough that it never reads as the row's
+ *  permanent state — after it, the conversation chip alone says the task is taken. */
+const STARTED_MS = 2600;
+
+/** The resting value of `startedTaskIds` — one shared empty set, so a provider that has
+ *  never started anything hands out the same reference on every render. */
+const NO_TASKS: ReadonlySet<string> = new Set();
+
 interface TaskLaunchApi {
   /** Press "Start" or "Discuss" on a task — ALWAYS opens a NEW conversation. A task can
    *  legitimately carry several (a retry, a second opinion, a discussion alongside the
@@ -61,6 +72,18 @@ interface TaskLaunchApi {
   open: (convId: string) => void;
   /** The task whose launch is in flight (its buttons show it), or null. */
   busyTaskId: string | null;
+  /** The tasks that JUST started and stayed on this view, each for a few seconds
+   *  ({@link STARTED_MS}). Only filled when the window did NOT move: a launch that navigates
+   *  announces itself by landing you in the thread, so there is nothing left to confirm.
+   *  Read by the task row, which flashes and shows "Started" — otherwise the only thing a
+   *  successful click changes is a small chip appearing, easy to miss on the row you were
+   *  already looking at.
+   *
+   *  A SET, not one id: staying put is what makes firing off several tasks in a row the
+   *  normal way to work, and one slot would yank the mark off the previous row the moment
+   *  the next one started — turning the confirmation into a flicker exactly when it is
+   *  being used most. */
+  startedTaskIds: ReadonlySet<string>;
 }
 
 const Ctx = createContext<TaskLaunchApi | null>(null);
@@ -74,7 +97,8 @@ export function TaskLaunchProvider({
   onOpenConversation,
   children,
 }: {
-  /** Focus the conversation once it is open — the tasks view hands over to the thread. */
+  /** Focus a conversation — the tasks view hands over to the thread. Called for "Open",
+   *  and after a launch only when that launch focuses (see `handOff`). */
   onOpenConversation: (convId: string) => void;
   children: React.ReactNode;
 }) {
@@ -86,6 +110,47 @@ export function TaskLaunchProvider({
   const { data: pins } = useTosseProjectRepos();
   const { data: links } = useTosseRepoLinks();
   const repos = useRepos();
+  const startStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
+  const [startedTaskIds, setStartedTaskIds] = useState<ReadonlySet<string>>(NO_TASKS);
+  // One timer PER task, so each mark lives out its own few seconds — see `startedTaskIds`.
+  const startedTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // The marks fade on a timer, so they MUST be cancellable: leaving this view mid-flash
+  // would otherwise land a state update on an unmounted component.
+  useEffect(() => {
+    const timers = startedTimers.current;
+    return () => {
+      timers.forEach(clearTimeout);
+      timers.clear();
+    };
+  }, []);
+
+  // Every successful launch ends here — the one-click path AND the dialog's — so the
+  // "does the window move" decision is taken in ONE place, whichever route got there.
+  const handOff = useCallback(
+    (mode: LaunchMode, taskId: string, convId: string) => {
+      if (launchFocusesConversation(mode, startStaysOnTasks)) {
+        onOpenConversation(convId);
+        return;
+      }
+      // Staying put. The window moving IS the confirmation everywhere else, so with it
+      // gone the row has to say it itself.
+      const running = startedTimers.current.get(taskId);
+      if (running) clearTimeout(running);
+      setStartedTaskIds((prev) => new Set(prev).add(taskId));
+      startedTimers.current.set(
+        taskId,
+        setTimeout(() => {
+          startedTimers.current.delete(taskId);
+          setStartedTaskIds((prev) => {
+            const next = new Set(prev);
+            next.delete(taskId);
+            return next;
+          });
+        }, STARTED_MS),
+      );
+    },
+    [onOpenConversation, startStaysOnTasks],
+  );
 
   const launch = useCallback(
     (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => {
@@ -110,11 +175,11 @@ export function TaskLaunchProvider({
       }
       setBusyTaskId(task.id);
       void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
-        .then((out) => onOpenConversation(out.convId))
+        .then((out) => handOff(mode, task.id, out.convId))
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
-    [links, onOpenConversation, openDialog, pins, repos],
+    [handOff, links, openDialog, pins, repos],
   );
 
   const open = useCallback(
@@ -126,8 +191,8 @@ export function TaskLaunchProvider({
   );
 
   const api = useMemo<TaskLaunchApi>(
-    () => ({ launch, open, busyTaskId }),
-    [launch, open, busyTaskId],
+    () => ({ launch, open, busyTaskId, startedTaskIds }),
+    [launch, open, busyTaskId, startedTaskIds],
   );
 
   return (
@@ -156,7 +221,7 @@ export function TaskLaunchProvider({
           key={`${pending.task.id}:${pending.mode}`}
           pending={pending}
           onClose={closeDialog}
-          onOpenConversation={onOpenConversation}
+          onLaunched={(convId) => handOff(pending.mode, pending.task.id, convId)}
         />
       ) : null}
     </Ctx.Provider>
@@ -167,11 +232,13 @@ export function TaskLaunchProvider({
 function TaskLaunchDialog({
   pending,
   onClose,
-  onOpenConversation,
+  onLaunched,
 }: {
   pending: Pending;
   onClose: () => void;
-  onOpenConversation: (id: string) => void;
+  /** The launch went through. Whether that also focuses the conversation is the
+   *  provider's call (see `handOff`) — the dialog only reports the outcome. */
+  onLaunched: (convId: string) => void;
 }) {
   const repos = useRepos();
   const { data: pins } = useTosseProjectRepos();
@@ -289,7 +356,7 @@ function TaskLaunchDialog({
         return;
       }
       onClose();
-      onOpenConversation(out.convId);
+      onLaunched(out.convId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSending(false);

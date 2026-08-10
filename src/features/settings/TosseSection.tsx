@@ -55,6 +55,7 @@ export function TosseSection() {
 function TosseDisplayPrefs() {
   const tosseRepoBadge = useDisplay((d) => d.tosseRepoBadge);
   const tosseTasksView = useDisplay((d) => d.tosseTasksView);
+  const tosseStartStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
   const tosseClientFavicons = useDisplay((d) => d.tosseClientFavicons);
   const set = useDisplay((d) => d.set);
@@ -89,6 +90,22 @@ function TosseDisplayPrefs() {
         label="Show the TOSSE tasks view"
       />
       <ToggleRow
+        title="Stay on the tasks view when you press Start"
+        hint={
+          <>
+            <strong>Start</strong> opens a conversation on the task and hands it to the
+            pickup skill. <strong>On by default</strong> — the window stays here, so you can
+            keep reading and start the next one; the task row gains an{" "}
+            <strong>« Open »</strong> button to go to it whenever you want. Off → the window
+            switches to the new conversation. <strong>Discuss</strong> always switches, either
+            way: you asked it something, so the answer is what you want to see.
+          </>
+        }
+        checked={tosseStartStaysOnTasks}
+        onChange={(v) => set({ tosseStartStaysOnTasks: v })}
+        label="Stay on the tasks view after Start"
+      />
+      <ToggleRow
         title="Warn before deleting a linked conversation"
         hint={
           <>
@@ -109,12 +126,12 @@ function TosseDisplayPrefs() {
         hint={
           <>
             When a client has no logo uploaded in the CRM, fetch its website's favicon from
-            Google to use as its mark. <strong>Off by default</strong>, because of what it
-            sends: each such client's <strong>domain</strong>, plus your IP, go to{" "}
-            <code>google.com</code> — one request per client shown, which is a slice of who
-            you work for. The CRM's own page does this too, so turning it on only matches what
-            your browser already does. Off → clients show their uploaded logo, or their
-            initials.
+            Google to use as its mark. <strong>On by default</strong> — the CRM's own page
+            does exactly this, so the app shows you the same marks your browser already
+            does. Worth knowing what it sends: each such client's <strong>domain</strong>,
+            plus your IP, go to <code>google.com</code>, one request per client shown, which
+            is a slice of who you work for. Off → clients show their uploaded logo, or their
+            initials, and nothing leaves this Mac.
           </>
         }
         checked={tosseClientFavicons}

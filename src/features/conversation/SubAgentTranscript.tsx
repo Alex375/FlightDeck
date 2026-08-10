@@ -12,6 +12,7 @@
 
 import { useMemo, type ReactNode } from "react";
 import type { ConversationItem, JsonValue, NormalizedBlock } from "../../ipc/client";
+import type { UserMessageMark } from "../../store/conversationStore";
 import { Avatar, ClaudeMark, Ico, UserMark } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
@@ -145,6 +146,31 @@ export function toRows(items: ConversationItem[]): Row[] {
 }
 
 /**
+ * The human's own messages in a settled transcript, with the row key that anchors each in
+ * the render (`data-user-turn`) — what the message minimap needs to map a cold conversation
+ * (History preview) exactly as it maps a live one.
+ *
+ * Mirrors the renderer's own exclusions, so a mark can never point at something that isn't
+ * drawn as a user bubble: CLI-injected markers (`<task-notification>` &c.) render as their
+ * own card, and a sub-agent transcript's opening turn is Claude's instruction, not a human
+ * message. Pure, and built on the same `toRows` the renderer uses, so the keys always agree.
+ */
+export function userMarksFromItems(
+  items: ConversationItem[],
+  agentPrompt?: boolean,
+): UserMessageMark[] {
+  const rows = toRows(items);
+  const promptKey = agentPrompt ? rows.find((r) => r.kind === "user")?.key : undefined;
+  const marks: UserMessageMark[] = [];
+  for (const r of rows) {
+    if (r.kind !== "user" || r.key === promptKey) continue;
+    if (!r.text.trim() || parseSpecialMessage(r.text)) continue;
+    marks.push({ id: r.key, text: r.text });
+  }
+  return marks;
+}
+
+/**
  * The instruction Claude wrote to open a sub-agent's run — rendered with its OWN
  * attribution, never the human avatar.
  *
@@ -209,7 +235,9 @@ export function SubAgentTranscript({
         if (special) return <SpecialMessageCard key={r.key} data={special} />;
         if (r.key === promptKey) return <AgentInstruction key={r.key} text={r.text} />;
         return (
-          <div className="cv-msg cv-user" key={r.key}>
+          // `data-user-turn` anchors this bubble for the message minimap — same attribute
+          // and same key as `userMarksFromItems` produces, so a click lands on this row.
+          <div className="cv-msg cv-user" key={r.key} data-user-turn={r.key}>
             <Avatar user>
               <UserMark />
             </Avatar>

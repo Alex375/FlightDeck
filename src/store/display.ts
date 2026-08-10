@@ -4,6 +4,7 @@
 // metadata store.
 import { create } from "zustand";
 import { useConversationsStore } from "./conversationsStore";
+import { DEFAULT_ZOOM, sanitizeZoom } from "../ui/zoom";
 
 const STORAGE_KEY = "tosse:display";
 
@@ -14,6 +15,14 @@ const STORAGE_KEY = "tosse:display";
  *  - `minimal`: neutral/typographic — airy, hairline chrome, uppercase section heads.
  *  A single GLOBAL setting (not per-conversation): one look across the whole app. */
 export type MarkdownMode = "classic" | "warm" | "minimal";
+
+/** What the message minimap shows when a bar is hovered.
+ *  - `summary`: one line — the summary saved for that message when it was sent, or a
+ *    truncation for the messages that were never summarized (short ones and slash
+ *    commands, where the truncation already IS the message).
+ *  - `full`   : the message as sent, in a scrollable preview.
+ *  See {@link MessageMinimap}. */
+export type MinimapHoverMode = "summary" | "full";
 
 export interface DisplayPrefs {
   /** The GLOBAL DEFAULT for "clean output" — folding an assistant response's intermediate
@@ -33,6 +42,16 @@ export interface DisplayPrefs {
   /** The Markdown rendering look, applied globally to every surface that renders
    *  Markdown. See {@link MarkdownMode}. Set from Settings → Conversation. */
   markdownMode: MarkdownMode;
+
+  /** How much the WHOLE interface is scaled — conversation, Flight Deck, editor, terminal,
+   *  popovers, everything — as a factor on the {@link ZOOM_STEPS} ladder (1 = 100 %, the
+   *  default). Set from Settings → General → Display, or from anywhere with ⌘+ / ⌘− / ⌘0.
+   *
+   *  Applied by the OS webview rather than by CSS (see `ui/zoom.ts` for why), so this value
+   *  is pushed to the Rust side by {@link ZoomHost} — nothing reads it to render with. It is
+   *  {@link sanitizeZoom}d on load AND on write: a corrupted entry that reached the webview
+   *  could leave the window unreadable with no way back through the UI. */
+  uiZoom: number;
 
   /** Show the "Fleet readout" banner (the adaptive "N Running · N Review · …" stage
    *  counts across the whole fleet) at the TOP of the FlightDeck. On by default. Set
@@ -56,6 +75,30 @@ export interface DisplayPrefs {
    *  its ≤6-word Haiku summary). Clicking it scrolls the thread to that message. On by
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
+
+  /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
+   *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
+   *  default. Read by {@link MessageMinimap}. */
+  messageMinimap: boolean;
+
+  /** What a minimap bar shows on hover — a one-line summary or the whole message.
+   *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
+  minimapHoverMode: MinimapHoverMode;
+
+  /** Show a RUNNING workflow's live readout on its Flight Deck card — the current phase, how
+   *  many of its agents are in the air, and how far along the run is, read from the run's
+   *  on-disk journal. ON by default. Off → the card falls back to what it showed before: the
+   *  generic "⚙ N background tasks" chip, which counts tasks, not a workflow's inner agents.
+   *  Only ever visible while a workflow runs. Read by {@link WorkflowPeek}. */
+  workflowLiveCard: boolean;
+
+  /** Animate the Flight Deck's reply modal open and closed: the panel GROWS out of the card
+   *  that was clicked and SHRINKS back into it, the way Finder's Quick Look previews a file —
+   *  so the modal reads as that card enlarged rather than as a dialog from nowhere. ON by
+   *  default; ~0.2 s to open, ~0.15 s to close. Off → it appears and disappears instantly, as
+   *  it did before. The OS "reduce motion" setting overrides this whichever way it is set.
+   *  Read by {@link FlightDeckReplyModal}. */
+  flightdeckModalZoom: boolean;
 
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
@@ -95,23 +138,38 @@ export interface DisplayPrefs {
    *  worse than no tab, per the feature's spec). Read by {@link App}. */
   tosseTasksView: boolean;
 
+  /** Keep the window on the TASKS view after pressing « Start » on a task — the conversation
+   *  opens and its first message goes out, but the app does not follow it. ON by default:
+   *  starting is a HAND-OFF (the agent picks the task up on its own), so being thrown into a
+   *  thread that has nothing to show yet only costs the place in the list one was reading.
+   *  Off → the window switches to the new conversation, as it did before.
+   *
+   *  Deliberately « Start » only. « Discuss » always hands over whatever this says: that
+   *  button exists to ASK something, and the answer is the point of pressing it.
+   *
+   *  Nothing is lost either way — the task row gains its « Open » button as soon as the
+   *  conversation is linked. Read via {@link launchFocusesConversation}. */
+  tosseStartStaysOnTasks: boolean;
+
   /** Fetch a client's mark from Google's favicon service when the CRM holds no uploaded
    *  logo for it.
    *
-   *  ⚠️ **OFF by default, and that default is the point.** Turning it on sends every such
-   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP to
+   *  ⚠️ **ON by default since 2026-08-07, reversing the default it shipped with.** What it
+   *  sends has not changed and is still the reason this is a SWITCH at all: every such
+   *  client's DOMAIN — i.e. a slice of Tosse's client list — plus this machine's IP go to
    *  `google.com/s2/favicons`, one request per client shown.
    *
    *  It is not the app's only call to that service ({@link webResultFaviconUrl} resolves
-   *  one per web-search result chip, and always has). What is different here is the
-   *  DATA, which is why only this one is a choice: a search result is a public site the
-   *  model just visited, whereas these domains are who Tosse works for. The CRM's own web
-   *  page resolves them the same way, so switching this on only matches what the browser
-   *  already does — but a desktop app that sits open all day should not make that call on
-   *  the strength of a default nobody chose.
+   *  one per web-search result chip, and always has). What is different here is the DATA:
+   *  a search result is a public site the model just visited, whereas these domains are
+   *  who Tosse works for. The CRM's own web page resolves them the same way, so the app is
+   *  matching a call the browser already makes for the same person looking at the same
+   *  list — which is what settled the default: shipped off, the marks looked broken (they
+   *  read as "the logos don't work"), and the privacy question stays answerable by one
+   *  visible toggle in Settings → TOSSE.
    *
    *  Off → the cascade stops at the CRM's uploaded logo, then the client's initials on a
-   *  colour derived from its name (no network, and already what most clients show).
+   *  colour derived from its name (no network at all).
    *  Read by {@link ClientAvatar}. */
   tosseClientFavicons: boolean;
 
@@ -182,17 +240,29 @@ export interface DisplayPrefs {
 const DEFAULTS: DisplayPrefs = {
   cleanOutput: false,
   markdownMode: "warm",
+  uiZoom: DEFAULT_ZOOM,
   fleetBannerFlightDeck: true,
   fleetBannerConversation: true,
   showTaskNotifications: false,
   showLastMessagePreview: true,
+  // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
+  // two messages, so it costs nothing on the short conversations where it has nothing to
+  // map. Summary hover by default: one line reads at a glance; "full" is a click away in
+  // Settings for whoever prefers the message verbatim.
+  messageMinimap: true,
+  minimapHoverMode: "summary",
+  workflowLiveCard: true,
+  flightdeckModalZoom: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
+  tosseStartStaysOnTasks: true,
   tosseTaskDeleteWarning: true,
-  // OFF: the only preference here that sends CRM data to a third party (see its doc).
-  tosseClientFavicons: false,
+  // ON, though it is the only preference here that sends CRM data to a third party: the
+  // CRM's own page makes the same call for the same person, and off, the marks read as
+  // broken rather than as a choice. Switchable in Settings → TOSSE (see its doc).
+  tosseClientFavicons: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -212,8 +282,11 @@ function load(): DisplayPrefs {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULTS;
     // Merge over defaults so a newly-added pref defaults sanely for users who already
-    // have a stored (older, smaller) prefs object.
-    return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<DisplayPrefs>) };
+    // have a stored (older, smaller) prefs object. The zoom is the one pref a bad stored
+    // value could make the app unusable with (see `sanitizeZoom`), so it is re-checked
+    // here rather than trusted from storage.
+    const stored = JSON.parse(raw) as Partial<DisplayPrefs>;
+    return { ...DEFAULTS, ...stored, uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM) };
   } catch {
     return DEFAULTS;
   }
@@ -239,14 +312,20 @@ export const useDisplay = create<DisplayState>((set) => ({
       const next: DisplayPrefs = {
         cleanOutput: patch.cleanOutput ?? s.cleanOutput,
         markdownMode: patch.markdownMode ?? s.markdownMode,
+        uiZoom: sanitizeZoom(patch.uiZoom ?? s.uiZoom),
         fleetBannerFlightDeck: patch.fleetBannerFlightDeck ?? s.fleetBannerFlightDeck,
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        messageMinimap: patch.messageMinimap ?? s.messageMinimap,
+        minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
+        workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
+        flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,

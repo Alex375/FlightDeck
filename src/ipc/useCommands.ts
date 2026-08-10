@@ -61,8 +61,9 @@ export async function sendConversationMessage(
   const driveTitle = goal === undefined;
   // The core does not echo user turns, so append optimistically (keyed by the
   // stable id) before sending — instant even while the session spawns.
+  let bubbleTurnId = "";
   if (showBubble) {
-    useConversationStore.getState().addUserTurn(convId, text, queued, images);
+    bubbleTurnId = useConversationStore.getState().addUserTurn(convId, text, queued, images);
     // Name a still-untitled conversation after its first message, and mark it eligible for
     // the model-generated title that replaces it.
     //
@@ -98,6 +99,11 @@ export async function sendConversationMessage(
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   const codexControls = conv?.kind === "codex" ? buildCodexControls(conv) : null;
   const res = await unwrap(commands.sendMessage(handle, text, wireImages, codexControls));
+  // Remember which message on the wire this bubble is, so it can be dropped from the
+  // binary's queue for as long as it has not started running.
+  if (bubbleTurnId && typeof res === "string") {
+    useConversationStore.getState().setTurnWireUuid(convId, bubbleTurnId, res);
+  }
   // A `/goal` command is not conversational content, so it must not drive the title or the
   // Flight Deck "last ask" peek either — otherwise a goal directive would leak into those.
   if (driveTitle) {
@@ -215,6 +221,36 @@ export function useAnswerPermission(convId: string) {
 // it to the live stream. That keeps a pre-spawn pick (persisted, applied at spawn)
 // and a live change on one path, and lets the core's get_settings read-back be the
 // source of truth for what the indicator shows.
+
+/** Drop ONE message that is still waiting in the binary's queue, from the pending badge
+ *  on its own bubble. The bubble is removed ONLY on a confirmed cancellation: `false`
+ *  means the message already started running and WILL be answered, so taking the bubble
+ *  away would hide a message the agent is about to act on.
+ *
+ *  ⚠️ ONLY ever call this for a message that is genuinely still QUEUED — i.e. one sent
+ *  while ANOTHER turn was running (the `pending` badge). VERIFIED on the wire: cancelling
+ *  a message whose own turn has already STARTED answers `cancelled:false` and then WEDGES
+ *  the session — the turn stops producing and never emits its `result` (control run
+ *  without the cancel: same prompt completes normally). That is what made the stop button
+ *  look dead when it tried to un-send first, which is why stopping is now a plain
+ *  interrupt again and this call stays confined to the pending badge. */
+export function useCancelQueuedMessage(convId: string) {
+  const removeUserTurn = useConversationStore((s) => s.removeUserTurn);
+  const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
+  return useMutation({
+    mutationFn: async (args: { turnId: string; wireUuid: string }) => {
+      const handle = liveHandle(convId);
+      if (!handle) return false;
+      const cancelled = await unwrap(commands.cancelQueuedMessage(handle, args.wireUuid));
+      if (cancelled) removeUserTurn(convId, args.turnId);
+      return cancelled;
+    },
+    onError: (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      addErrorTurn(convId, `Could not remove the pending message: ${message}`);
+    },
+  });
+}
 
 export function useInterrupt(convId: string) {
   const addErrorTurn = useConversationStore((s) => s.addErrorTurn);

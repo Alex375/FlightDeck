@@ -51,6 +51,7 @@ import {
   shortDate,
   statusSections,
   STATUS_TONE,
+  taskQuickAction,
   TASK_STATUS_CHOICES,
   type ProjectAction,
   type StatusSection,
@@ -226,6 +227,7 @@ function TaskActions({
   projectName,
   detail,
   className,
+  onStatus,
 }: {
   task: TosseTask;
   projectId: string | null;
@@ -234,22 +236,29 @@ function TaskActions({
    *  long-form fields ride along in the "Discuss" prompt instead of being re-fetched. */
   detail?: TosseTaskDetail | null;
   className?: string;
+  /** Write this task's status. Given by the LIST, where the shortcut earns its place; the
+   *  detail panel leaves it out, because the status chip at its head already IS a
+   *  one-click status control, and two of them would only disagree about which is the
+   *  one to use. Absent → no quick-action button, exactly as before. */
+  onStatus?: (status: string) => void;
 }) {
   const api = useTaskLaunch();
   const linked = useConversationsForTask(task.id);
-  if (!api) return null;
-  const busy = api.busyTaskId === task.id;
+  const quick = taskQuickAction(task.status);
+  const busy = api?.busyTaskId === task.id;
   const built = () => launchTask(task, projectName, detail);
   const go = (mode: LaunchMode) => (e: React.MouseEvent) => {
     e.stopPropagation();
-    api.launch(built(), projectId, mode);
+    api?.launch(built(), projectId, mode);
   };
+  // Nothing to show at all — no launch context AND no status move to offer.
+  if (!api && !(quick && onStatus)) return null;
   return (
     <span className={className}>
       {/* One conversation: a plain button. Several: the same button plus a menu to pick
           which — the count is on it, so the row says how many agents this task carries
           without being hovered for a tooltip. */}
-      {linked.length === 1 ? (
+      {api == null ? null : linked.length === 1 ? (
         <button
           className={`${s.act} ${s.act_go}`}
           title={`Open « ${linked[0].name} »`}
@@ -282,51 +291,71 @@ function TaskActions({
           ))}
         </Menu>
       ) : null}
-      <button
-        className={s.act}
-        disabled={busy}
-        title={
-          linked.length > 0
-            ? "Open ANOTHER conversation that thinks this task through, without starting it"
-            : "Open a conversation that thinks this task through, without starting it"
-        }
-        onClick={go("discuss")}
-      >
-        Discuss
-      </button>
-      {/* A split button: "Start" runs it, the caret adds a word about HOW this particular
-          run should go. Always "Start", whether or not the task already has a conversation
-          — what the button does never changes, so its label should not either. */}
-      <span className={s.split}>
+      {api == null ? null : (
         <button
-          className={`${s.act} ${s.act_go} ${s.splitMain}`}
+          className={s.act}
           disabled={busy}
           title={
             linked.length > 0
-              ? "Start another conversation on this task and hand it to the pickup skill"
-              : "Open a conversation on this task and hand it to the pickup skill"
+              ? "Open ANOTHER conversation that thinks this task through, without starting it"
+              : "Open a conversation that thinks this task through, without starting it"
           }
-          onClick={go("pickup")}
+          onClick={go("discuss")}
         >
-          {busy ? "Opening…" : "Start"}
+          Discuss
         </button>
-        <Menu
-          portal
-          align="right"
-          trigger={
-            <button
-              className={`${s.act} ${s.act_go} ${s.splitCaret}`}
-              disabled={busy}
-              title="Start with an extra instruction"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <Ico name="chevron" className="sm" />
-            </button>
-          }
+      )}
+      {/* A split button: "Start" runs it, the caret adds a word about HOW this particular
+          run should go. Always "Start", whether or not the task already has a conversation
+          — what the button does never changes, so its label should not either. */}
+      {api == null ? null : (
+        <span className={s.split}>
+          <button
+            className={`${s.act} ${s.act_go} ${s.splitMain}`}
+            disabled={busy}
+            title={
+              linked.length > 0
+                ? "Start another conversation on this task and hand it to the pickup skill"
+                : "Open a conversation on this task and hand it to the pickup skill"
+            }
+            onClick={go("pickup")}
+          >
+            {busy ? "Opening…" : "Start"}
+          </button>
+          <Menu
+            portal
+            align="right"
+            trigger={
+              <button
+                className={`${s.act} ${s.act_go} ${s.splitCaret}`}
+                disabled={busy}
+                title="Start with an extra instruction"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <Ico name="chevron" className="sm" />
+              </button>
+            }
+          >
+            <StartWithNote onStart={(note) => api.launch(built(), projectId, "pickup", note)} />
+          </Menu>
+        </span>
+      )}
+      {/* Last, and the only green one: this is where a reviewed task gets closed. Placed
+          after the launch buttons on purpose — it ENDS the work the others start, and the
+          rightmost slot is the one the eye reaches after reading the row. */}
+      {quick && onStatus ? (
+        <button
+          className={`${s.act} ${s[`act_${quick.tone}`]}`}
+          title={`Close this task — moves it to « ${quick.next} »`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onStatus(quick.next);
+          }}
         >
-          <StartWithNote onStart={(note) => api.launch(built(), projectId, "pickup", note)} />
-        </Menu>
-      </span>
+          <Ico name="check" className="sm" />
+          {quick.label}
+        </button>
+      ) : null}
     </span>
   );
 }
@@ -420,9 +449,25 @@ function ConvStateDot({ convId }: { convId: string }) {
  * Deliberately just the glyph (and a count past one): the AGENT's state belongs to the
  * conversation surfaces, and a second coloured dot on a row that already carries the CRM's
  * own status would read as a contradiction. Everything else is in the tooltip.
+ *
+ * For a few seconds after a "Start" that stayed on this view, the SAME chip says « Started »
+ * in words instead. The mark that this task is taken is exactly what the click produced, so
+ * it is the honest thing to announce with — and reusing the chip means the confirmation
+ * fades back into the row's resting state rather than being a second thing to dismiss.
  */
-function LinkedMark({ convs }: { convs: Conversation[] }) {
+function LinkedMark({ convs, justStarted }: { convs: Conversation[]; justStarted?: boolean }) {
   if (convs.length === 0) return null;
+  if (justStarted) {
+    return (
+      <span
+        className={`${s.linked} ${s.linkedStarted}`}
+        title={`« ${convs[convs.length - 1].name} » was just started on this task`}
+      >
+        <Ico name="check" className="sm" />
+        Started
+      </span>
+    );
+  }
   return (
     <span
       className={s.linked}
@@ -462,10 +507,15 @@ function TaskRow({
   const due = shortDate(task.dueDate);
   const late = isOverdue(task.dueDate, Date.now());
   const linked = useConversationsForTask(task.id);
+  // Set for a few seconds after a "Start" that stayed on this view — see `startedTaskIds`.
+  const justStarted = useTaskLaunch()?.startedTaskIds.has(task.id) === true;
   return (
     <div
       className={`${s.row} ${selected ? s.rowSel : ""}`}
       data-tone={tone}
+      // Drives the one-shot flash. An ATTRIBUTE rather than a class so the animation is
+      // restarted by React swapping it, and so it costs nothing at rest.
+      data-started={justStarted ? "" : undefined}
       // ⚠️ Both handlers ignore anything that did not happen INSIDE this row's DOM.
       // React bubbles events through the COMPONENT tree, so a popover this row opens in a
       // portal (the Start button's instruction field) sends its clicks and keystrokes
@@ -523,16 +573,19 @@ function TaskRow({
           {task.subtaskDone}/{task.subtaskCount}
         </span>
       ) : null}
-      <LinkedMark convs={linked} />
+      <LinkedMark convs={linked} justStarted={justStarted} />
       {task.assignedTo ? <AssigneeAvatar name={task.assignedTo} /> : null}
       {due ? <span className={`${s.due} ${late ? s.dueLate : ""}`}>{due}</span> : null}
       {/* Revealed on hover, at the end of the row — the row's own click still opens the
-          task, so these must not sit in the way of it. */}
+          task, so these must not sit in the way of it. `onStatus` is the SAME writer the
+          dot's menu uses, so the shortcut inherits its optimistic update, its rollback and
+          its under-the-row error line for free. */}
       <TaskActions
         task={task}
         projectId={projectId}
         projectName={projectName}
         className={s.rowActs}
+        onStatus={onStatus}
       />
     </div>
   );

@@ -6,16 +6,23 @@
 // id — the modal reads everything else by that id, independent of the app's single
 // "active conversation" selection.
 import { create } from "zustand";
+import type { Box } from "./modalZoom";
 
 interface FlightdeckModalState {
   /** Stable id of the conversation shown in the modal, or null when closed. */
   convId: string | null;
-  open: (convId: string) => void;
+  /** Screen box of the card the modal was opened FROM, captured at click time — the start
+   *  point of the zoom (see {@link zoomTransform}). Null when the opener had no card to point
+   *  at, in which case the modal just fades in. Only the ENTRY reads it: the exit re-measures
+   *  the card live, since the deck reorders itself while the modal is open. */
+  origin: Box | null;
+  open: (convId: string, origin?: Box | null) => void;
   close: () => void;
 }
 
 export const useFlightdeckModal = create<FlightdeckModalState>((set) => ({
   convId: null,
-  open: (convId) => set({ convId }),
-  close: () => set({ convId: null }),
+  origin: null,
+  open: (convId, origin) => set({ convId, origin: origin ?? null }),
+  close: () => set({ convId: null, origin: null }),
 }));

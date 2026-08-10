@@ -26,6 +26,7 @@ import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
 import { useWorkflowLiveStore } from "./workflowLive";
+import { useWorkflowJournalStore } from "./workflowJournal";
 import { useRemoteControlStore } from "./remoteControl";
 import { refreshActiveGoal, useGoalStore } from "./goalStore";
 import { useCodexPlanUsageStore } from "./codexPlanUsage";
@@ -505,6 +506,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       useConversationStore.getState().dropSession(c.id);
       useBackgroundTasksStore.getState().dropSession(c.id);
       useWorkflowLiveStore.getState().drop(c.id);
+      useWorkflowJournalStore.getState().drop(c.id);
       clearCachedWindow(c.id);
       disposeTerminal(c.id);
       clearTodoBarOpen(c.id);
@@ -579,6 +581,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     useConversationStore.getState().dropSession(id);
     useBackgroundTasksStore.getState().dropSession(id);
     useWorkflowLiveStore.getState().drop(id);
+    useWorkflowJournalStore.getState().drop(id);
     clearCachedWindow(id);
     clearTodoBarOpen(id);
     clearComposerDraft(id);
@@ -1726,6 +1729,7 @@ export async function wipeAllData(): Promise<void> {
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.getState().clear();
   useWorkflowLiveStore.getState().clear();
+  useWorkflowJournalStore.getState().clear();
   useGitViewStore.getState().clearAll();
   useRemoteControlStore.getState().clearAll();
   useGoalStore.getState().clearAll();

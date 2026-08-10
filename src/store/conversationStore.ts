@@ -174,7 +174,18 @@ interface ConversationState {
   appendThinking: (session: string, messageId: string, text: string) => void;
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
    *  injects it before the loop ends) → drives the "en attente" badge. */
-  addUserTurn: (session: string, text: string, queued?: boolean, images?: UserTurnImage[]) => void;
+  /** Appends the optimistic user bubble and returns ITS id (to attach the wire uuid). */
+  addUserTurn: (
+    session: string,
+    text: string,
+    queued?: boolean,
+    images?: UserTurnImage[],
+  ) => string;
+  /** Record the wire uuid of a sent turn, so that message can be cancelled while queued. */
+  setTurnWireUuid: (session: string, turnId: string, uuid: string) => void;
+  /** Remove ONE user turn by id — ONLY after the binary confirmed that message was
+   *  dropped from its queue. */
+  removeUserTurn: (session: string, turnId: string) => void;
   /** Append a visible error bubble to the timeline (e.g. a send that failed to
    *  spawn the session). Makes an otherwise-silent command failure self-evident.
    *  `detail` (optional) is the raw technical payload, shown behind a disclosure. */
@@ -371,9 +382,14 @@ export const useConversationStore = create<ConversationState>((set) => {
     appendThinking: (session, messageId, text) =>
       appendBuffer(session, messageId, "streamingThinking", text),
 
-    addUserTurn: (session, text, queued, images) =>
+    // Returns the id of the turn it created, so the caller can attach the wire uuid to
+    // THIS turn once `send_message` answers — matching by "the last user turn" would
+    // pin the uuid on the wrong bubble when two sends overlap.
+    addUserTurn: (session, text, queued, images) => {
+      let createdId = "";
       withEntry(session, (entry) => {
         const id = `user_${entry.seq}`;
+        createdId = id;
         const turn: Turn = {
           id,
           role: "user",
@@ -401,6 +417,35 @@ export const useConversationStore = create<ConversationState>((set) => {
           // Sending the next message consumes any pending review/question: the
           // user has clearly moved on from the previous result.
           turnSeen: true,
+        };
+      });
+      return createdId;
+    },
+
+    // Attach the wire uuid `send_message` returned, so this exact message can later be
+    // dropped from the binary's queue. No-op if the turn is already gone (cancelled or
+    // rewound while the send was in flight).
+    setTurnWireUuid: (session, turnId, uuid) =>
+      withEntry(session, (entry) => {
+        const turn = entry.turns[turnId];
+        if (!turn) return entry;
+        return { ...entry, turns: { ...entry.turns, [turnId]: { ...turn, wireUuid: uuid } } };
+      }),
+
+    // Take back the optimistic bubble of a message the BINARY confirmed it dropped from
+    // its queue. Called ONLY after that confirmation: the CLI persists a user message to
+    // its on-disk transcript as soon as it RUNS it, so removing a bubble on our own
+    // initiative would just bring it back on the next history reload.
+    removeUserTurn: (session, turnId) =>
+      withEntry(session, (entry) => {
+        const idx = entry.timeline.findIndex((e) => e.kind === "turn" && e.id === turnId);
+        if (idx < 0) return entry;
+        const { [turnId]: _dropped, ...turns } = entry.turns;
+        return {
+          ...entry,
+          turns,
+          timeline: entry.timeline.filter((_, i) => i !== idx),
+          replayAnchor: Math.min(entry.replayAnchor, entry.timeline.length - 1),
         };
       }),
 
@@ -1031,22 +1076,56 @@ export const useTodoSummary = (session: string): TodoSummary =>
  * as `role:"user"` turns but are NOT something the user sent. Pure (no hook, no memo)
  * so it is unit-testable; the hook below memoises it. */
 export function selectUserMessageHistory(entry: SessionEntry | undefined): string[] {
-  if (!entry) return EMPTY_STRINGS;
+  const marks = selectUserMessageMarks(entry);
+  if (!marks.length) return EMPTY_STRINGS;
   const out: string[] = [];
+  for (const m of marks) {
+    if (!m.text.trim()) continue; // image-only turn: nothing to recall in the composer
+    if (out.length && out[out.length - 1] === m.text) continue; // collapse consecutive dups
+    out.push(m.text);
+  }
+  return out.length ? out : EMPTY_STRINGS;
+}
+
+/** One of the user's own messages, with the turn id that anchors it in the rendered
+ *  thread (`data-user-turn`). `text` is empty for an image-only send. */
+export interface UserMessageMark {
+  id: string;
+  text: string;
+}
+
+const EMPTY_MARKS: UserMessageMark[] = [];
+
+/**
+ * The same set of messages as {@link selectUserMessageHistory}, but carrying each turn's
+ * id and WITHOUT collapsing consecutive duplicates. Drives the message minimap, where
+ * every user bubble needs its own bar: two identical consecutive sends are two distinct
+ * places in the thread, and collapsing them would leave the second unreachable. (The
+ * collapse in the history above is shell-recall semantics — a different purpose.)
+ *
+ * An IMAGE-ONLY send is included too (empty text, joined images): it is a bubble in the
+ * thread, so it must be navigable. The history above drops it instead — there is nothing
+ * to recall into the composer. That also keeps parity with a reloaded conversation, where
+ * the transcript reader gives such a turn an `[image]` placeholder text.
+ *
+ * Pure (no hook, no memo) so it is unit-testable; the hook below memoises it.
+ */
+export function selectUserMessageMarks(entry: SessionEntry | undefined): UserMessageMark[] {
+  if (!entry) return EMPTY_MARKS;
+  const out: UserMessageMark[] = [];
   for (const t of entry.timeline) {
     if (t.kind !== "turn") continue;
     const turn = entry.turns[t.id];
     if (!turn || turn.role !== "user" || turn.parentToolUseId !== null) continue;
     const text = turn.streamingText;
-    if (!text.trim()) continue;
+    if (!text.trim() && !turn.images?.length) continue;
     // Skip CLI-injected markers (task-notification…): they're rendered as a dedicated
     // card, never a user bubble — so they must not count as "the user's last message"
     // in the preview/pin or the composer's recall history.
-    if (parseSpecialMessage(text)) continue;
-    if (out.length && out[out.length - 1] === text) continue; // collapse consecutive dups
-    out.push(text);
+    if (text.trim() && parseSpecialMessage(text)) continue;
+    out.push({ id: t.id, text });
   }
-  return out.length ? out : EMPTY_STRINGS;
+  return out.length ? out : EMPTY_MARKS;
 }
 
 // Memoised by `timeline` identity: the set of user root-turns (and their text, set
@@ -1074,3 +1153,27 @@ export const useUserMessageHistory = (session: string): string[] =>
   useConversationStore(
     useShallow((s) => memoizedUserMessageHistory(session, s.sessions[session])),
   );
+
+// Same memo discipline as the history above, and it must be a memo rather than a
+// `useShallow`: the marks are OBJECTS, so a fresh walk would hand back new identities on
+// every streamed token and re-render the minimap continuously. Caching on the `timeline`
+// reference means the array (and each mark in it) keeps its identity until a turn is
+// actually appended.
+const userMarksCache = new Map<string, { timeline: TimelineEntry[]; result: UserMessageMark[] }>();
+
+/** `selectUserMessageMarks` cached per session on the `timeline` reference. */
+export function memoizedUserMessageMarks(
+  session: string,
+  entry: SessionEntry | undefined,
+): UserMessageMark[] {
+  if (!entry) return EMPTY_MARKS;
+  const cached = userMarksCache.get(session);
+  if (cached && cached.timeline === entry.timeline) return cached.result;
+  const result = selectUserMessageMarks(entry);
+  userMarksCache.set(session, { timeline: entry.timeline, result });
+  return result;
+}
+
+/** The user's own messages (id + text) for the message minimap. */
+export const useUserMessageMarks = (session: string): UserMessageMark[] =>
+  useConversationStore((s) => memoizedUserMessageMarks(session, s.sessions[session]));

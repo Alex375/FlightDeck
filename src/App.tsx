@@ -13,15 +13,15 @@ import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { ZoomHost } from "./ui/ZoomHost";
+import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
 import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
 import { useTosseConnection } from "./ipc/useTosse";
-import { useExtensionsUi } from "./features/extensions/extensionsUiStore";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
-import { useHistoryUi } from "./features/history/historyUiStore";
 import { useEditorStore } from "./features/editor/editorStore";
 import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
 import { UpdateBanner } from "./features/settings/UpdateBanner";
@@ -34,17 +34,16 @@ import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
   bootConversations,
-  createConversationInRepo,
-  groupConversationsByRepo,
   useActiveConversationId,
   useConversationRepo,
   useConversations,
   useConversationsStore,
 } from "./store/conversationsStore";
-import { useDisplay, resolveCleanOutput } from "./store/display";
+import { useDisplay } from "./store/display";
 import { useNotifications } from "./store/notifications";
 import { useSettingsUi } from "./store/settingsUi";
 import { NavBtn, TosseCrmMark, Win } from "./ui/kit";
+import { runAppAction } from "./ui/appActions";
 import {
   ACTION_BINDINGS,
   isEditableTarget,
@@ -53,7 +52,6 @@ import {
   isUndoChord,
   matchChord,
   viewForShortcut,
-  type ShortcutAction,
   type View,
 } from "./ui/shortcuts";
 
@@ -184,76 +182,11 @@ export default function App() {
       for (const b of ACTION_BINDINGS) {
         if (!matchChord(e, b.spec)) continue;
         if (b.scope === "conversation" && viewRef.current !== "conversation") return;
-        if (dispatchAction(b.action)) e.preventDefault();
+        if (runAppAction(b.action, { changeView })) e.preventDefault();
         return;
       }
     }
 
-    /** Run one app-action shortcut; returns whether it did something (so the caller
-     *  only swallows the key when it actually acted). Reads live store state at event
-     *  time — no stale closures. */
-    function dispatchAction(action: ShortcutAction): boolean {
-      const store = useConversationsStore.getState();
-      const conv = store.conversations.find((c) => c.id === store.activeId) ?? null;
-      const editor = useEditorStore.getState();
-      switch (action) {
-        case "toggle-editor":
-          if (!conv) return false;
-          editor.toggleOpen();
-          return true;
-        case "toggle-terminal":
-          if (!conv) return false;
-          editor.toggleTerminal();
-          return true;
-        case "toggle-git":
-          if (!conv) return false;
-          editor.toggleGit();
-          return true;
-        case "toggle-clean-output": {
-          if (!conv) return false;
-          const eff = resolveCleanOutput(conv.cleanOutput ?? null, useDisplay.getState().cleanOutput);
-          store.setConvCleanOutput(conv.id, !eff);
-          return true;
-        }
-        case "open-extensions":
-          if (!conv) return false;
-          useExtensionsUi.getState().openManager({
-            kind: "conversation",
-            backend: conv.kind,
-            path: conv.liveCwd ?? conv.cwd ?? ".",
-            title: conv.name,
-            session: conv.id,
-          });
-          return true;
-        case "new-conversation": {
-          const repoPath =
-            (conv && store.repos.find((r) => r.id === conv.repoId)?.path) ??
-            store.repos[0]?.path ??
-            null;
-          if (!repoPath) return false;
-          createConversationInRepo(repoPath);
-          changeView("conversation");
-          return true;
-        }
-        case "prev-conversation":
-        case "next-conversation": {
-          const ordered = groupConversationsByRepo(store.repos, store.conversations).flatMap(
-            (g) => g.conversations,
-          );
-          if (ordered.length < 2) return false;
-          const idx = ordered.findIndex((c) => c.id === store.activeId);
-          if (idx < 0) return false;
-          const nextIdx = action === "prev-conversation" ? idx - 1 : idx + 1;
-          if (nextIdx < 0 || nextIdx >= ordered.length) return false; // clamp at the ends
-          store.selectConversation(ordered[nextIdx].id);
-          changeView("conversation");
-          return true;
-        }
-        case "open-history":
-          useHistoryUi.getState().openPanel();
-          return true;
-      }
-    }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [changeView]);
@@ -386,6 +319,12 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): pushes the interface-zoom preference to the OS webview, on
+          mount and on every change. */}
+      <ZoomHost />
+      {/* Mounted once, globally (render-null): one live disk watch per RUNNING workflow, so
+          every surface sees its real per-agent progress even with the detail modal closed. */}
+      <WorkflowWatchHost />
     </Win>
   );
 }

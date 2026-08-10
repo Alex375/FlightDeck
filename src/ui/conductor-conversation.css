@@ -176,6 +176,149 @@
 .cv-lastpin .wf-ico { width:13px; height:13px; flex:0 0 auto; color:var(--wf-accent); }
 .cv-lastpin-txt { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx); }
 
+/* ---- message minimap: one bar per message you sent, floating over the right edge ----
+   Laid out as an OVERLAY (absolute, on top of the thread's right gutter) so the thread
+   keeps its full width and its centred max-width column stays centred.
+
+   Shape: a CONDENSED block of thin marks floating at mid-height — not a scale running down
+   the page. Each bar is placed by the component at an absolute `top` (markOffsetPx), the
+   block is centred on the column, and its pitch only tightens once it would outgrow ~45% of
+   the height. So a 300-message conversation keeps the same compact silhouette as a
+   5-message one, and the minimap never scrolls; past ~150 messages the marks touch and then
+   overlap, which is the accepted cost of that.
+
+   The column's `top`/`height` are set inline from the THREAD's box (not the pane's), so the
+   block centres on the conversation rather than on conversation-plus-composer.
+
+   The BUTTON is the hit area — exactly one pitch tall, also set inline, so the bands TILE
+   (no overlap stealing a neighbour's clicks). The ::before is the visible mark. */
+.cv-mmap {
+  position:absolute;
+  right:0;
+  /* Wide enough for the FULLY magnified mark plus its right margin (24 + 6). Too narrow and
+     the mark — a flex item — silently shrinks to fit instead of overflowing, so the top of
+     the dock swell is quietly clipped off. */
+  width:32px;
+  z-index:5;
+  pointer-events:none; /* the column itself is inert; only the bars take the pointer */
+}
+.cv-mmap-bar {
+  position:absolute;
+  right:0;
+  transform:translateY(-50%);
+  width:100%;
+  padding:0;
+  border:0;
+  background:transparent;
+  cursor:pointer;
+  pointer-events:auto;
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+}
+/* 1px is the floor: the thinnest mark that still rasterises as a crisp hairline at any
+   scale factor. Since it has less ink than the 2px version it carried at first, it is given
+   a touch more opacity so the block stays legible at rest.
+
+   DOCK MAGNIFICATION: every dimension is driven by --cv-mmap-mag (1 under the cursor,
+   easing to 0 three marks away) and --cv-mmap-push (how far this mark steps aside), both
+   set per bar by the component. The push is a transform on the MARK, never on the button —
+   moving the hit area out from under the cursor is what makes a dock effect flicker. */
+.cv-mmap-bar::before {
+  content:"";
+  flex:none; /* never let the flex layout shrink the swell away — see the column's width */
+  width:calc(17px + var(--cv-mmap-mag, 0) * 7px);
+  height:calc(1px + var(--cv-mmap-mag, 0) * 1px);
+  margin-right:6px;
+  background:var(--wf-tx-xlo);
+  opacity:calc(.55 + var(--cv-mmap-mag, 0) * .45);
+  transform:translateY(var(--cv-mmap-push, 0px));
+  transition:opacity .12s ease, background-color .12s ease, width .12s ease, height .12s ease,
+             transform .12s ease;
+}
+/* At rest the column is a whisper; hovering anywhere over it brings every bar up, so the
+   map reads as one object rather than as the single bar under the cursor. */
+.cv-mmap:hover .cv-mmap-bar::before { opacity:calc(.68 + var(--cv-mmap-mag, 0) * .32); }
+/* Only the mark under the cursor takes the accent — its NEIGHBOURS swell and step aside but
+   stay neutral, so the target of a click is never ambiguous. Size comes from --cv-mmap-mag
+   above (1 here), so there is a single source for the magnified geometry. */
+.cv-mmap-bar[data-hovered]::before,
+.cv-mmap-bar:focus-visible::before { opacity:1; background:var(--wf-accent); }
+.cv-mmap-bar:focus-visible { outline:none; }
+/* The message you are currently reading. Accent-coloured and doubled in thickness — at a
+   1px hairline, colour alone reads as a rendering artefact rather than as a position — but
+   NOT lengthened, so the indicator never competes with the mark under the cursor. */
+.cv-mmap-bar[data-active]::before { opacity:.95; height:2px; background:var(--wf-accent); }
+
+/* Hover preview, to the LEFT of the column. `right:100%` puts it outside the column's
+   width; its `top` and `max-height` come from the component (tipStyle), which TOP-ALIGNS it
+   on the hovered mark — the first line of text lands on the mark, so the eye falls on the
+   start of the message instead of on its middle. ⚠️ `padding-top` here is mirrored by
+   TIP_TEXT_INSET_PX; changing one without the other shifts that alignment.
+
+   ⚠️ `width:max-content` is load-bearing, not a nicety: this is absolutely positioned
+   inside the 22px-wide column, so its shrink-to-fit width resolves against THAT — with
+   only `right` set, the available width is ~0 and a wrapping preview collapses into a
+   one-character-per-line ribbon. Sizing to the content first, then clamping with
+   max-width, is what lets it wrap at a readable width. (`nowrap` masked this in summary
+   mode, so it only showed up in "whole message".) */
+.cv-mmap-tip {
+  position:absolute;
+  right:100%;
+  margin-right:4px;
+  width:max-content;
+  max-width:min(420px, calc(100vw - 80px));
+  /* The preview takes no pointer events, so it can never be scrolled: past the height cap
+     the text is CLIPPED, not hidden behind a scrollbar nobody could reach. */
+  overflow:hidden;
+  padding:7px 11px;
+  /* The card floats over the transcript, which is text on the same panel colour — at 92%
+     opacity with a neutral hairline it read as part of the conversation. It is now opaque,
+     outlined in a faded accent, and lifted by a soft accent halo + a deeper shadow, so it
+     reads as something laid ON the thread rather than a paragraph of it. */
+  border:1px solid color-mix(in srgb, var(--wf-accent) 38%, var(--wf-line));
+  border-radius:9px;
+  background:var(--wf-panel-2);
+  -webkit-backdrop-filter:blur(10px);
+  backdrop-filter:blur(10px);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--wf-accent) 10%, transparent),
+    0 16px 34px -14px #000,
+    0 4px 12px -8px #000c;
+  color:var(--wf-tx);
+  font-size:12px;
+  line-height:1.45;
+  pointer-events:none; /* never steals the pointer from the bar underneath */
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  /* Moving between marks GLIDES instead of jumping (the card is one element that follows
+     the pointer down the column), and the first appearance fades in. Both are what keep a
+     sweep calm — together with the hover-intent delay that gates the content itself. */
+  transition:top .16s cubic-bezier(.22,.61,.36,1), max-height .16s ease;
+  animation:cv-mmap-tip-in .13s ease-out;
+}
+@keyframes cv-mmap-tip-in {
+  from { opacity:0; transform:translateX(4px); }
+  to   { opacity:1; transform:none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cv-mmap-tip { transition:none; animation:none; }
+  .cv-mmap-bar::before { transition:opacity .12s ease, background-color .12s ease; }
+}
+/* Summary mode is a single line; full mode keeps the message's shape but is clamped so a
+   pasted wall of text can't cover the thread. */
+.cv-mmap-tip[data-mode="summary"] { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cv-mmap-tip[data-mode="full"] {
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:14;
+  overflow:hidden;
+}
+/* The thread's own right padding is 26px; the minimap sits in it. Give the thread a touch
+   more room on that side ONLY when the minimap is mounted, so a wide code block never
+   slides under the bars. */
+.cv-pane:has(.cv-mmap) .cv-thread { padding-right:42px; }
+
 /* Clickable http(s) link inside a message preview (LinkText): peek/pin/popover. */
 .cv-linktext { color:var(--wf-accent); text-decoration:underline; text-underline-offset:2px; cursor:pointer; overflow-wrap:anywhere; }
 .cv-linktext:hover { text-decoration:none; }
@@ -273,6 +416,19 @@
 .cv-user.is-queued .cv-bubble { border-color:var(--wf-wait); border-style:dashed; }
 .cv-queued-tag { display:flex; align-items:center; gap:5px; width:fit-content; margin-bottom:8px; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; letter-spacing:.4px; text-transform:uppercase; color:var(--wf-wait); background:var(--wf-wait-bg); }
 .cv-queued-tag .wf-ico { width:11px; height:11px; color:var(--wf-wait); }
+/* Drop-this-pending-message control. ALWAYS visible (not hover-only): a pending message
+   is short-lived and the whole point is to catch it before the agent reads it — an
+   affordance you must first discover by hovering is one you miss in the seconds it
+   exists. Separated from the label by a divider so it reads as its own target rather
+   than part of the status text, and given a real button hit area. */
+.cv-queued-del { display:inline-flex; align-items:center; justify-content:center;
+  width:16px; height:16px; margin:-2px -4px -2px 3px; padding:0;
+  border:0; border-left:1px solid var(--wf-wait); border-radius:0 5px 5px 0;
+  background:none; cursor:pointer; color:var(--wf-wait); opacity:.7;
+  transition:opacity .12s ease, background-color .12s ease; }
+.cv-queued-del .wf-ico { width:11px; height:11px; }
+.cv-queued-del:hover { opacity:1; background:var(--wf-wait); color:var(--wf-panel); }
+.cv-queued-del:focus-visible { opacity:1; outline:2px solid var(--wf-wait); outline-offset:1px; }
 
 /* Injected "special message" card — e.g. a <task-notification> emitted when a
    background task/agent finishes. Rendered in PLACE of a user bubble (the CLI injects
@@ -687,7 +843,12 @@
 .cv-user-images { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
 .cv-user-image { max-width:220px; max-height:180px; border-radius:8px; border:1px solid var(--wf-line); object-fit:contain; background:var(--wf-panel-3); }
 /* Controls row sits at the bottom of the same card, just below the text row. */
-.cv-comp-foot { display:flex; align-items:center; gap:3px; padding:5px 6px 2px; font-size:11px; color:var(--wf-tx-lo); }
+/* `flex-wrap` is a LAST-RESORT net, not the regime: the slot budget (composerLayout.ts)
+   is sized so everything fits on one line at the 500px floor, and the window/splitter
+   minimums keep the composer at or above it. The one configuration those minimums can't
+   cover without forcing a ~1030px minimum window is "narrow window + side panel open" —
+   there, wrapping to a second line beats overflowing out of the card. */
+.cv-comp-foot { display:flex; flex-wrap:wrap; align-items:center; gap:3px; padding:5px 6px 2px; font-size:11px; color:var(--wf-tx-lo); }
 .cv-foot-sep { width:1px; height:16px; background:var(--wf-line); margin:0 5px; }
 .cv-wt-toggle { white-space:nowrap; }
 
@@ -702,6 +863,25 @@
   .cv-comp-foot .cv-wt-toggle { padding:5px; gap:0; }
   .cv-comp-foot .cv-foot-sep { margin:0 3px; }
 }
+
+/* Per-chip icon-only, the SAME four declarations as the width-driven rule above.
+   The wrapper draws no box (display:contents) so the chip stays a direct flex child of
+   the bar — identical layout and gaps — while still being a CSS ancestor, which is all
+   these selectors need. The user's choice is a floor, the container query a ceiling. */
+.cv-chipslot { display:contents; }
+.cv-comp-foot [data-compact] .wf-chip-t,
+.cv-comp-foot [data-compact] .wf-chip-chev,
+.cv-comp-foot [data-compact] .cv-wt-label { display:none; }
+.cv-comp-foot [data-compact] .wf-chip { padding:5px; gap:0; }
+.cv-comp-foot [data-compact] .cv-wt-toggle { padding:5px; gap:0; }
+
+/* A user-made button. Unavailable HERE (command missing from this repo, Codex-only
+   action on a Claude conversation…) is shown dimmed but still hoverable: `aria-disabled`
+   rather than `disabled`, because a disabled control takes no pointer events and its
+   `title` — the one place the reason is written — would never appear. */
+.cv-custom-btn { cursor:pointer; }
+.cv-custom-btn[aria-disabled] { opacity:.4; cursor:default; }
+.cv-custom-btn[aria-disabled]:hover { background:transparent; border-color:transparent; }
 
 .cv-ctx-h { display:flex; align-items:center; justify-content:space-between; padding:13px 14px; border-bottom:1px solid var(--wf-line); }
 .cv-ctx-top { padding:13px 14px; border-bottom:1px solid var(--wf-line); }

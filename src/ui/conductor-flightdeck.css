@@ -157,6 +157,23 @@
 .ag-bgpop-label { flex:1; min-width:0; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ag-bgpop-meta { flex:0 0 auto; font-size:10px; color:var(--wf-tx-lo); }
 
+/* --- live workflow readout on a card (phase + in-flight agents + progress) --- */
+/* A workflow is one aggregated task on the wire, so without this the card cannot say how big
+   the run is; the numbers come from the run's journal, watched on disk. */
+.ag-wfpeek-list { display:flex; flex-direction:column; gap:6px; }
+.ag-wfpeek { display:flex; flex-direction:column; gap:5px; width:100%; padding:8px 10px; border:1px solid color-mix(in srgb, var(--wf-run) 26%, transparent); border-radius:10px; background:color-mix(in srgb, var(--wf-run) 8%, transparent); color:var(--wf-tx); font:inherit; text-align:left; cursor:pointer; transition:background .12s ease, border-color .12s ease; }
+.ag-wfpeek:hover { background:color-mix(in srgb, var(--wf-run) 14%, transparent); border-color:color-mix(in srgb, var(--wf-run) 40%, transparent); }
+.ag-wfpeek-top { display:flex; align-items:center; gap:7px; min-width:0; }
+.ag-wfpeek-name { flex:1 1 auto; min-width:0; font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ag-wfpeek-count { flex:0 0 auto; font-size:11px; font-variant-numeric:tabular-nums; color:var(--wf-run); }
+.ag-wfpeek-chev { flex:0 0 auto; color:var(--wf-tx-xlo); opacity:0; transition:opacity .12s ease; }
+.ag-wfpeek:hover .ag-wfpeek-chev { opacity:1; }
+/* No progress bar here on purpose: `done/started` is not run completion (a multi-phase run is
+   momentarily balanced at every phase boundary, which would read as "finished"). */
+.ag-wfpeek-sub { display:flex; align-items:center; gap:6px; min-width:0; font-size:10.5px; color:var(--wf-tx-lo); }
+.ag-wfpeek-phase { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ag-wfpeek-agents { flex:0 0 auto; margin-left:auto; color:var(--wf-tx-xlo); }
+
 /* --- clickable to-do pips on the card footer (→ popover with the full plan) --- */
 /* Hit-area enlarged ~10% (padding up from 2/5 → 3/7); the matching negative margin
    cancels it so the visual position is unchanged and neighbours don't shift. */

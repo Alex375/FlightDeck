@@ -538,7 +538,9 @@ impl CodexCore {
 
     async fn on_command(&mut self, cmd: SessionCommand, thread_id: &str, server: &Arc<CodexServer>) {
         match cmd {
-            SessionCommand::SendUser { text, images, controls } => {
+            // `uuid` is Claude-only: it tags our own turn on the stream-json replay and
+            // addresses `cancel_async_message`. Codex has neither, so it is ignored here.
+            SessionCommand::SendUser { text, images, controls, .. } => {
                 // Refresh the live controls from this send (they ride each user message,
                 // the wire being per-turn). Images become `localImage` inputs pointing at
                 // temp files the app-server reads from disk (Codex takes a path, not base64).
@@ -3475,7 +3477,7 @@ mod tests {
 
     /// A plain-text SendUser command, for the on_command error-path tests.
     fn send_user(text: &str) -> SessionCommand {
-        SessionCommand::SendUser { text: text.into(), images: vec![], controls: None }
+        SessionCommand::SendUser { text: text.into(), images: vec![], controls: None, uuid: "u-test".into() }
     }
 
     // Mirror of the Claude backend's `send_user_text_on_a_dead_session_surfaces_a_notice`:
@@ -3519,7 +3521,7 @@ mod tests {
         let server = Arc::new(CodexServer::new());
         let bad = ImageAttachment { media_type: "image/png".into(), data: "!!!".into() };
         c.on_command(
-            SessionCommand::SendUser { text: "  ".into(), images: vec![bad], controls: None },
+            SessionCommand::SendUser { text: "  ".into(), images: vec![bad], controls: None, uuid: "u-test".into() },
             "t1",
             &server,
         )

@@ -45,6 +45,48 @@ function consumeInterrupt(convId: string): boolean {
   return Date.now() - ts < INTERRUPT_WINDOW_MS;
 }
 
+// Notifications armed but not yet delivered, at most one per conversation: a state
+// edge arms one, and the conversation has a short window to prove the edge meant what
+// it looked like before it reaches the user (see `SETTLE_MS` in transition.ts). The
+// caller owns the policy — this only holds the timers, so nothing here needs the
+// conversation stores.
+const armedNotifications = new Map<
+  string,
+  { kind: ChimeKind; timer: ReturnType<typeof setTimeout> }
+>();
+
+/**
+ * Arm `fire` for `convId` after `delayMs`, replacing anything already armed for it —
+ * the newest edge is always the one that describes the conversation. `fire` runs with
+ * the entry already dropped, so it is free to arm again.
+ */
+export function armAgentNotification(
+  convId: string,
+  kind: ChimeKind,
+  delayMs: number,
+  fire: () => void,
+): void {
+  cancelAgentNotification(convId);
+  const timer = setTimeout(() => {
+    armedNotifications.delete(convId);
+    fire();
+  }, delayMs);
+  armedNotifications.set(convId, { kind, timer });
+}
+
+/** What is armed for `convId` right now, or null — so the caller can re-check it. */
+export function armedAgentNotificationKind(convId: string): ChimeKind | null {
+  return armedNotifications.get(convId)?.kind ?? null;
+}
+
+/** Drop `convId`'s armed notification, if any. Idempotent. */
+export function cancelAgentNotification(convId: string): void {
+  const armed = armedNotifications.get(convId);
+  if (!armed) return;
+  clearTimeout(armed.timer);
+  armedNotifications.delete(convId);
+}
+
 /**
  * Ask the OS for notification permission once at launch, so the first real
  * notification doesn't race a permission prompt. Best-effort: a denial just

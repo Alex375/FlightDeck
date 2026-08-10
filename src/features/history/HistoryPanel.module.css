@@ -98,6 +98,10 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* Positioned host for the message minimap, which floats over the preview's right edge.
+     It must anchor HERE and not on .previewBody: that one scrolls, and the column would
+     scroll away with the transcript instead of staying put. */
+  position: relative;
   /* Same: without this, a wide transcript line (table/pre/long path) widens the 1fr
      track and overflows the modal to the right. */
   min-width: 0;
@@ -385,6 +389,12 @@
   min-width: 0;
   overflow-y: auto;
   padding: 14px 22px 24px;
+}
+/* Give the transcript room on the right ONLY when the minimap is actually mounted, so a
+   wide line never slides under the marks. Mirrors what the conversation does to its thread.
+   `:global` because .cv-mmap is a plain global class, not a module-scoped one. */
+.previewCol:has(:global(.cv-mmap)) .previewBody {
+  padding-right: 44px;
 }
 .previewEmpty {
   display: flex;

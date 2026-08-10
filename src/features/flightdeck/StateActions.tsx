@@ -6,12 +6,14 @@
 // on the card. When the status says "blocked" but no request is actually queued yet
 // (the awaiting vs queue race), there's nothing to answer → no action row (the card
 // body still opens it).
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { Ico } from "../../ui/kit";
 import type { AgentStatus } from "../../agent/status";
 import { usePendingPermissions } from "../../store/conversationStore";
 import { acknowledgeConversation } from "../../store/conversationsStore";
 import { questionCount } from "../conversation/QuestionnaireAsk";
 import { useFlightdeckModal } from "./flightdeckModalStore";
+import { boxOf } from "./modalZoom";
 
 export function StateActions({
   convId,
@@ -22,7 +24,11 @@ export function StateActions({
 }) {
   const pending = usePendingPermissions(convId);
   const openModal = useFlightdeckModal((s) => s.open);
-  const reply = () => openModal(convId); // open the conversation in the reply modal
+  // Open the conversation in the reply modal, zooming out of the CARD this button sits in
+  // (not the button) — the same origin a click on the card body gives, so both gestures
+  // animate identically.
+  const reply = (e: ReactMouseEvent<HTMLButtonElement>) =>
+    openModal(convId, boxOf(e.currentTarget.closest(".ag-card")));
 
   if (status.kind === "needIntervention") {
     const req = pending[0];

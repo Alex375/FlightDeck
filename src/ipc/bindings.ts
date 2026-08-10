@@ -734,6 +734,31 @@ async loadWorkflowJournal(sessionId: string, runId: string) : Promise<Result<Wor
 }
 },
 /**
+ * Start (or join) a live watch on a RUNNING workflow's journal. Each change pushes a
+ * `WorkflowJournalEvent` carrying the run's fresh per-agent progress, so the pinned bar, the
+ * inline card and the Flight Deck card stay live WITHOUT any of them polling. Ref-counted:
+ * every call must be paired with [`unwatch_workflow_journal`].
+ */
+async watchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("watch_workflow_journal", { sessionId, runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop one reference to a run's journal watch (the last one stops it).
+ */
+async unwatchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("unwatch_workflow_journal", { sessionId, runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
  * the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
  * run. Empty if no script/phases. Lets the live overview show upcoming steps.
@@ -824,7 +849,7 @@ async getPlanUsage() : Promise<Result<PlanUsage, UsageError>> {
  * approval / sandbox / …) applied as per-turn overrides — `None`/ignored for Claude,
  * whose controls are pushed the moment they change.
  */
-async sendMessage(session: string, text: string, images: ImageAttachment[], codexControls: CodexControls | null) : Promise<Result<null, string>> {
+async sendMessage(session: string, text: string, images: ImageAttachment[], codexControls: CodexControls | null) : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("send_message", { session, text, images, codexControls }) };
 } catch (e) {
@@ -1016,6 +1041,64 @@ async mcpClearAuth(session: string, serverName: string) : Promise<Result<null, s
 async mcpAuthenticate(session: string, serverName: string) : Promise<Result<McpAuthResult, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("mcp_authenticate", { session, serverName }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The live model catalogue of a running session (`list_models`): what the binary will
+ * actually accept, after the provider, the settings cascade and the org enforcement
+ * policy. Errors with "unknown session" when nothing is live.
+ * 
+ * ⚠️ NOT wired to the model picker, on purpose. It was, and the result was rejected on
+ * sight: the binary returns a CLI-shaped menu — a "Default (recommended)" row, plus the
+ * same model listed twice under its alias and its `[1m]` variant — which reads worse
+ * than our four curated rows (see `modelsForPicker`). What stays valuable here is the
+ * per-model data no static table can hold: `supported_effort_levels` (the effort ladder
+ * is hard-coded today and drifts with each model launch) and `resolved_model`, whose
+ * `[1m]` suffix is the only wire signal of the 1M context window.
+ */
+async listSessionModels(session: string) : Promise<Result<LiveModel[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_session_models", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Restore the files edited since a user message, from the binary's own checkpoints
+ * (`rewind_files`). Call with `dry_run: true` FIRST to preview which files and how
+ * many lines would change — the app never performs a destructive restore without
+ * showing that preview. A refusal (checkpointing disabled, no checkpoint for this
+ * message) comes back inside the result as `can_rewind: false` + `error`, never as a
+ * silent no-op.
+ */
+async rewindFiles(session: string, userMessageId: string, dryRun: boolean) : Promise<Result<RewindFilesResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rewind_files", { session, userMessageId, dryRun }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop ONE specific still-queued user message from the binary's command queue, by the
+ * uuid `send_message` returned for it. This is what backs "remove this pending message"
+ * on a message queued behind a running turn.
+ * 
+ * ⚠️ ONLY for a message still WAITING behind another turn. Cancelling one whose own turn
+ * has already started answers `cancelled:false` and WEDGES the session (verified on the
+ * wire: the turn stops producing and never emits its `result`).
+ * 
+ * `false` = the binary did not remove it (already dequeued for execution, or never
+ * queued). The caller must NOT take the bubble away on `false`: the message is on its
+ * way to the model and will be answered.
+ */
+async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_queued_message", { session, messageUuid }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1662,6 +1745,23 @@ async setAwake(awake: boolean) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Scale the whole interface by `factor` (1.0 = 100 %), the way a browser's ⌘+ does:
+ * this drives the OS webview's own page zoom (WKWebView `pageZoom` on macOS), so
+ * every pixel of the UI — thread, Flight Deck, Monaco, xterm, PDF viewer, popovers —
+ * scales together and each surface re-layouts from its own size observer.
+ * 
+ * The zoom is NOT persisted by the webview: the front holds it in its display prefs
+ * and re-applies it on mount (see `ZoomHost`). A no-op if the main window is gone.
+ */
+async setUiZoom(factor: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_ui_zoom", { factor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read the Claude CLI (`claude` binary) update status: installed + latest published version,
  * whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
  * missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel
@@ -1722,7 +1822,8 @@ sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
-tickEvent: TickEvent
+tickEvent: TickEvent,
+workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
 fsChangeEvent: "fs-change-event",
@@ -1740,7 +1841,8 @@ sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
-tickEvent: "tick-event"
+tickEvent: "tick-event",
+workflowJournalEvent: "workflow-journal-event"
 })
 
 /** user-defined constants **/
@@ -2643,6 +2745,40 @@ data_base64: string; too_large: boolean; size: number;
 mtime_ms: number | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * One selectable model, as the RUNNING session reports it via the `list_models`
+ * control request. Authoritative in a way a hard-coded table can never be: the
+ * binary resolves the provider, the settings cascade and the org enforcement
+ * policy, so this list is exactly what the session may actually run.
+ */
+export type LiveModel = { 
+/**
+ * The alias to send back in `set_model` (e.g. `default`, `sonnet`, `opus[1m]`).
+ */
+value: string; 
+/**
+ * The concrete model the alias resolves to (e.g. `claude-opus-5[1m]`). Carries the
+ * `[1m]` suffix when the session runs the 1M-context variant — the ONLY wire signal
+ * of the context window, which the model name alone does not give.
+ */
+resolved_model: string | null; 
+/**
+ * Human label for the picker (e.g. `Opus (1M context)`).
+ */
+display_name: string; 
+/**
+ * One-line description shown under the label.
+ */
+description: string | null; 
+/**
+ * Whether this model accepts an effort level at all.
+ */
+supports_effort: boolean; 
+/**
+ * The effort ladder this model accepts, in wire order (`low` … `max`). Data-driven:
+ * a binary that adds a rung exposes it here with no code change on our side.
+ */
+supported_effort_levels: string[] }
+/**
  * A clone found on this Mac that matches one of the urls asked about.
  */
 export type LocalRepoMatch = { path: string; 
@@ -2994,6 +3130,34 @@ max: number | null;
  * Short human reason ("Connection error."), when one is available.
  */
 reason: string | null }
+/**
+ * Outcome of a `rewind_files` request — the binary restoring the files it edited
+ * since a given user message, from its own checkpoints. Also the shape of a
+ * `dry_run` PREVIEW, which reports what *would* change without touching the disk.
+ */
+export type RewindFilesResult = { 
+/**
+ * Whether the rewind is possible (dry run) or was performed (real run). `false`
+ * with an `error` when file checkpointing is off or no checkpoint covers the message.
+ */
+can_rewind: boolean; 
+/**
+ * Absolute paths the rewind would restore / did restore.
+ */
+files_changed: string[]; 
+/**
+ * Lines that would be / were added back.
+ */
+insertions: number; 
+/**
+ * Lines that would be / were removed.
+ */
+deletions: number; 
+/**
+ * Why the rewind is unavailable. The binary answers a SUCCESS control_response even
+ * when it refuses, so this is the only signal — never swallow it.
+ */
+error: string | null }
 /**
  * What a rewind removed, returned to the UI.
  */
@@ -3506,22 +3670,58 @@ export type UsageError =
  */
 export type UsageWindow = { used_percentage: number; resets_at: string | null }
 /**
- * Live progress counts for a RUNNING workflow, derived from its append-only
+ * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
  * only written when the run FINISHES, so during the run the journal is the sole on-disk
- * source of "how far along are we": one `{"type":"started",...}` per agent spawn and one
- * `{"type":"result",...}` per agent completion. This gives the overview the UI shows mid-run
- * — agents launched / done / still running — without needing the (absent) manifest.
+ * source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
+ * `{"type":"result",…}` per agent completion.
+ * 
+ * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
+ * than from raw line counts, so a re-emitted entry can never inflate the total past the
+ * number of agents that actually exist.
  */
 export type WorkflowJournal = { 
 /**
- * Agents spawned so far (count of `started` entries).
+ * Distinct agents the journal knows about (== `agents.len()`).
  */
 started: number; 
 /**
- * Agents finished so far (count of `result` entries).
+ * Agents whose `result` entry has landed.
  */
-done: number }
+done: number; 
+/**
+ * Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
+ * set — and drill into a running agent's incrementally-written transcript — instead
+ * of only a launched/done tally.
+ */
+agents: WorkflowJournalAgent[] }
+/**
+ * One agent of a running workflow, as the live journal knows it. The journal carries
+ * ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
+ * those exist solely in the end-of-run manifest. The id is what matters, because it is
+ * the key to that agent's transcript on disk
+ * (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
+ * INCREMENTALLY — so a still-running agent can be read live.
+ */
+export type WorkflowJournalAgent = { 
+/**
+ * Key for [`super::subagents::load_subagent_transcript`].
+ */
+agentId: string; 
+/**
+ * Whether a `result` entry closed this agent. `false` = still in flight.
+ */
+done: boolean }
+/**
+ * A RUNNING workflow's on-disk journal changed: the fresh per-agent progress of that run
+ * ([`crate::supervisor::workflow_watch`]). Keyed by `session_id` (Claude's durable id) +
+ * `run_id`, the pair every workflow surface already holds.
+ * 
+ * `journal: None` with no `error` is the NORMAL early state (the CLI creates the journal
+ * with the run's first agent). `error` is set when a journal that EXISTS could not be read —
+ * a real failure the UI must surface rather than render as a frozen readout.
+ */
+export type WorkflowJournalEvent = { session_id: string; run_id: string; journal: WorkflowJournal | null; error: string | null }
 /**
  * One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
  */

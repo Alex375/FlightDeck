@@ -27,6 +27,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
 import { isGenericThinking } from "../store/activity";
@@ -36,18 +37,31 @@ import {
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
 import { useWorkflowLiveStore } from "../store/workflowLive";
+import { useWorkflowJournalStore } from "../store/workflowJournal";
+import { useAppErrors } from "../store/appErrors";
 import { useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
-import { agentStatusForEntry } from "../agent/useAgentStatus";
+import { agentStatusForEntry, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
 import { useLastMessageSummaryStore } from "../store/lastMessageSummary";
 import { setCachedWindow } from "../store/contextWindowCache";
 import { useAccountLoginStore } from "../store/accountLogin";
-import { dispatchAgentNotification } from "../notifications/notify";
-import { agentEventFor } from "../notifications/transition";
+import {
+  armAgentNotification,
+  armedAgentNotificationKind,
+  cancelAgentNotification,
+  dispatchAgentNotification,
+} from "../notifications/notify";
+import {
+  SETTLE_MS,
+  agentEventFor,
+  isNoOpTurn,
+  stillWarranted,
+  type AgentEventKind,
+} from "../notifications/transition";
 import { syncReminderFromLive } from "../agent/reminderSync";
 import type { SessionStatePayload } from "./client";
 import { worktreesKey } from "./useWorktrees";
@@ -74,47 +88,89 @@ function convIdForHandle(handle: string): string | null {
 }
 
 /**
- * Fire a notification on the meaningful session-state transitions:
+ * Route the meaningful session-state transitions to a notification:
  *  - awaiting_permission false→true → "attention" (a permission/question is up).
  *  - busy true→false while still alive and not waiting → "done" (turn finished).
- * Compared against the PREVIOUS state so we notify on the edge, not continuously.
+ * Compared against the PREVIOUS state so we act on the edge, not continuously.
  * `prev` is the entry's state before this event (the neutral connecting state on
  * the very first one, whose busy/awaiting_permission are false → no false fire).
  * Reading `prev` from the already-applied store also dedupes Tauri's at-least-once
  * delivery: a duplicated state event finds `prev` already equal to `next`, so no
  * edge is seen and nothing re-fires.
- * The dispatcher suppresses notifications when the user is already watching this
- * conversation, and swallows the "done" that follows a user-initiated interrupt.
+ *
+ * ⚠️ The edge only ARMS the notification — it does not send it. A `result` (the sole
+ * thing that clears `busy`) means "the CLI is handing control back", not "the
+ * conversation is over": it takes control straight back whenever something is queued
+ * (a message sent mid-turn, a `<task-notification>`, a cron / `/loop` wake-up, an
+ * unmet `/goal`, a Stop hook). Firing on the raw edge chimed "finished" while the
+ * thread visibly kept going. So every state event re-checks what is armed against the
+ * new state and cancels it the moment it stops being true — see `stillWarranted`,
+ * which catches a resumed turn on `activity` within ~50 ms.
  */
 function notifyTransition(
   convId: string,
   prev: SessionStatePayload,
   next: SessionStatePayload,
 ): void {
+  // Re-check whatever is already armed BEFORE arming anything new: this event may be
+  // the very one that disproves it (the turn resumed, the prompt was withdrawn, the
+  // process died).
+  const armed = armedAgentNotificationKind(convId);
+  if (armed && !stillWarranted(armed, next)) cancelAgentNotification(convId);
+
   const kind = agentEventFor(prev, next);
   if (!kind) return;
+  // The delivery runs on a timer, i.e. OUTSIDE the caller's try/catch — it carries its
+  // own, so a notification failure can never surface as an unhandled rejection.
+  armAgentNotification(convId, kind, SETTLE_MS[kind], () => {
+    try {
+      fireAgentNotification(convId, kind);
+    } catch (e) {
+      console.error("notification dispatch failed:", e);
+    }
+  });
+}
 
+/**
+ * Deliver an armed notification, once its settle window has elapsed without the
+ * conversation disproving it. Everything is re-read here rather than captured at arm
+ * time, so the decision is made against the state the user is actually looking at.
+ * The dispatcher then suppresses the banner/dock when the user is already watching
+ * this conversation, and swallows the "done" that follows a user-initiated interrupt.
+ */
+function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   const convs = useConversationsStore.getState();
   const conv = convs.conversations.find((c) => c.id === convId);
-  if (!conv) return;
+  // Gone, or switched off in the meantime (stopped / exited / deleted): a conversation
+  // with no live process has nothing to announce.
+  if (!conv || !conv.handle) return;
 
-  // Suppress the "done" ping when the finish lands the agent in `backgrounding` — it
-  // finished cleanly but a background task is still running, so there is nothing to alert
-  // about yet (the work continues and the agent resumes on its own). deriveAgentStatus
-  // encodes that rule, so we just check the resulting status: no extra branching here keeps
-  // the visual and the notification in lock-step. An open question / error while a background
-  // task runs does NOT derive to `backgrounding` (it genuinely wants the user), so those
-  // still ping. The Bash-only re-alert setting (below) makes a lone background Bash command
-  // derive to `review` instead of `backgrounding` → the ping is NOT suppressed → it fires,
-  // exactly the pre-`backgrounding` behaviour the setting restores. Feeding the same signals
-  // to `agentStatusForEntry` keeps the ping and the visual in lock-step.
+  const entry = useConversationStore.getState().sessions[convId];
+  // Belt and braces: the cancel path above covers every state event, but a window that
+  // elapses between two of them must still see the truth.
+  if (!entry || !stillWarranted(kind, entry.state)) return;
+
   if (kind === "done") {
+    // A turn that never queried the model (a local slash command the CLI answered by
+    // itself) finished nothing — staying silent is the whole point of the check.
+    if (isNoOpTurn(lastTurnResultMeta(entry))) return;
+
+    // Suppress the "done" ping when the finish lands the agent in `backgrounding` — it
+    // finished cleanly but a background task is still running, so there is nothing to alert
+    // about yet (the work continues and the agent resumes on its own). deriveAgentStatus
+    // encodes that rule, so we just check the resulting status: no extra branching here keeps
+    // the visual and the notification in lock-step. An open question / error while a background
+    // task runs does NOT derive to `backgrounding` (it genuinely wants the user), so those
+    // still ping. The Bash-only re-alert setting makes a lone background Bash command
+    // derive to `review` instead of `backgrounding` → the ping is NOT suppressed → it fires,
+    // exactly the pre-`backgrounding` behaviour the setting restores. Feeding the same signals
+    // to `agentStatusForEntry` keeps the ping and the visual in lock-step.
     const tasks = useBackgroundTasksStore.getState().sessions;
     const bg = runningCountsByConv(tasks)[convId] ?? 0;
     if (bg > 0) {
       const status = agentStatusForEntry(
         conv.handle,
-        useConversationStore.getState().sessions[convId],
+        entry,
         conv.pendingReminder,
         bg,
         runningBashCountsByConv(tasks)[convId] ?? 0,
@@ -512,10 +568,41 @@ export function useGlobalSessionEvents(): void {
         );
     }
 
+    // A running workflow's on-disk journal changed (the Rust watcher pushes its fresh
+    // per-agent progress). Keyed by Claude's DURABLE session id — not the live handle every
+    // other session event uses — because the journal is an on-disk artifact of that id.
+    function onWorkflowJournal(payload: WorkflowJournalEvent) {
+      const conv = useConversationsStore
+        .getState()
+        .conversations.find((c) => c.sessionId === payload.session_id);
+      if (!conv) {
+        // A watch whose conversation we can't resolve is a live watcher feeding nobody. Rare
+        // (the watch is owned by a mounted conversation), but dropping it in total silence
+        // would make it undiagnosable.
+        console.warn("[workflow journal] no conversation for session", payload.session_id);
+        return;
+      }
+      // A journal that EXISTS but can't be read is a real failure. Two things must happen, and
+      // the banner alone is NOT enough: the watcher only re-emits on CHANGE, so a persistent IO
+      // failure yields exactly one event — once the user dismisses the banner, nothing else
+      // says the numbers stopped being true. Flag the run itself so every surface stops
+      // presenting its last snapshot as live.
+      if (payload.error) {
+        useAppErrors.getState().pushError("Workflow journal unreadable", payload.error);
+        useWorkflowJournalStore.getState().markError(conv.id, payload.run_id, payload.error);
+        return;
+      }
+      useWorkflowJournalStore.getState().apply(conv.id, payload.run_id, payload.journal);
+    }
+
     events.sessionMessageEvent
       .listen((e) => { if (!disposed) onMessage(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("messages", e));
+    events.workflowJournalEvent
+      .listen((e) => { if (!disposed) onWorkflowJournal(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("workflow progress", e));
     events.sessionStateEvent
       .listen((e) => { if (!disposed) onState(e.payload); })
       .then((un) => unlisteners.push(un))

@@ -23,7 +23,9 @@ use ipc::commands::{
     list_worktrees, load_persisted_state, load_session_context, load_session_goal,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
+    unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
+    cancel_queued_message, list_session_models, rewind_files,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
     account_claude_logout, account_claude_status, account_codex_login_cancel,
     account_codex_login_start, account_codex_logout, account_codex_status,
@@ -41,7 +43,8 @@ use ipc::commands::{
     check_rewind_target, rewind_conversation, search_conversations,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
-    set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ultracode,
+    set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
+    set_ultracode,
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
     tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
@@ -55,6 +58,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
@@ -118,6 +122,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_subagent_transcript,
             load_workflow_run,
             load_workflow_journal,
+            watch_workflow_journal,
+            unwatch_workflow_journal,
             load_workflow_phases,
             list_disk_conversations,
             prime_history_index,
@@ -139,6 +145,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             mcp_reconnect,
             mcp_clear_auth,
             mcp_authenticate,
+            list_session_models,
+            rewind_files,
+            cancel_queued_message,
             stop_session,
             stop_task,
             open_in_terminal,
@@ -192,6 +201,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_active_conversation,
             wipe_all_data,
             set_awake,
+            set_ui_zoom,
             claude_cli_status,
             claude_cli_update,
             set_claude_cli_auto_update,
@@ -212,6 +222,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             AccountLoginEvent,
             FsChangeEvent,
             FsWatchErrorEvent,
+            WorkflowJournalEvent,
             TerminalOutputEvent,
             TerminalExitEvent,
         ])
@@ -450,6 +461,8 @@ pub fn run() {
         .manage(HistoryIndex::new())
         // The editor's single active filesystem watch (live file/tree refresh).
         .manage(fs::FsWatcher::new())
+        // Live watches on running workflows' journals (per-agent progress from disk).
+        .manage(supervisor::workflow_watch::WorkflowWatchers::new())
         // The live integrated terminals (one PTY-backed shell per conversation).
         .manage(terminal::Terminals::new())
         // The single app-wide macOS keep-awake assertion (managed `caffeinate` child).

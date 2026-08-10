@@ -1179,3 +1179,55 @@
   font-variant-numeric: tabular-nums;
   color: var(--wf-tx-xlo);
 }
+
+/* Once the row's actions come out, the "Open" button IS this mark — same chat glyph, same
+   count past one — so keeping the resting mark beside it says the same thing twice. It
+   steps aside for the button and comes straight back at rest. Mirrors the two conditions
+   that reveal `.rowActs`, so the mark and the button are never both out.
+   ⚠️ `:not(.linkedStarted)`: the « Started » receipt appears exactly where the pointer
+   already is (you have just clicked "Start"), so hiding it on hover would delete the only
+   confirmation there is, precisely when it is meant to be read. */
+.row:hover .linked:not(.linkedStarted),
+.row:has(.rowActs:focus-within) .linked:not(.linkedStarted) {
+  display: none;
+}
+
+/* ---- "it's started" — the few seconds after a Start that stayed here ---- */
+/* The one moment this mark IS allowed a colour of its own (see `.linked` above): it is not
+   a second verdict on the task, it is the receipt for a click that just happened, and it
+   goes away. Blue — « En cours » in this view's palette, which is exactly where the pickup
+   skill is taking the task — so it never gets read as the emerald « Fait ». */
+.linkedStarted {
+  gap: 4px;
+  padding: 1px 6px 1px 4px;
+  border-radius: 999px;
+  color: var(--ts-run-tx);
+  background: var(--ts-run-bg);
+  border: 1px solid var(--ts-run-line);
+  animation: startedPop 0.22s cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+@keyframes startedPop {
+  from { opacity: 0; transform: scale(0.82); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* And a single sweep across the row, so the confirmation is caught even by an eye that has
+   already left the button. One shot, no loop: a row that kept pulsing would become the
+   list's loudest thing while meaning the least. It animates the SAME two properties hover
+   uses, and wins over them while it runs — after which the row is its ordinary self. */
+.row[data-started] {
+  animation: rowStarted 1.5s ease-out;
+}
+@keyframes rowStarted {
+  0%   { background: var(--ts-run-bg); border-left-color: var(--ts-run); }
+  55%  { background: var(--ts-run-bg); border-left-color: var(--ts-run); }
+  100% { background: transparent; border-left-color: transparent; }
+}
+
+/* Reduced motion: keep every bit of the MESSAGE, drop the movement. The chip still says
+   « Started » in words and still carries its colour — it is the only confirmation there
+   is, so it must never be what gets switched off. */
+@media (prefers-reduced-motion: reduce) {
+  .linkedStarted { animation: none; }
+  .row[data-started] { animation: none; background: var(--ts-run-bg); }
+}

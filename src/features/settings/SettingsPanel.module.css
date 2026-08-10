@@ -241,6 +241,76 @@
   color: var(--text-secondary);
 }
 
+/* ---- Interface zoom stepper (a .trow control) ---------------------------- */
+
+/* − 100% + | Reset. Sits where a toggle normally sits, so it keeps the toggle's
+   flex: none and never squeezes the row's text. */
+.zoomCtl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.zoomBtn {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  /* The glyphs are −/+ typed as text, so give them a size of their own rather than
+     inheriting the row's 13px, which renders them noticeably small. */
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition-hover), color var(--transition-hover),
+    border-color var(--transition-hover);
+}
+.zoomBtn:not(:disabled):hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.zoomBtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* Tabular figures + a fixed minimum so stepping 90% → 100% → 110% doesn't nudge the
+   buttons sideways. */
+.zoomVal {
+  min-width: 46px;
+  text-align: center;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.zoomReset {
+  height: 26px;
+  padding: 0 10px;
+  margin-left: 2px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background var(--transition-hover), color var(--transition-hover),
+    border-color var(--transition-hover);
+}
+.zoomReset:not(:disabled):hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.zoomReset:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* ---- Shared section primitives ------------------------------------------ */
 
 .desc {
