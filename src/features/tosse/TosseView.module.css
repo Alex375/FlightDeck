@@ -1180,6 +1180,18 @@
   color: var(--wf-tx-xlo);
 }
 
+/* Once the row's actions come out, the "Open" button IS this mark — same chat glyph, same
+   count past one — so keeping the resting mark beside it says the same thing twice. It
+   steps aside for the button and comes straight back at rest. Mirrors the two conditions
+   that reveal `.rowActs`, so the mark and the button are never both out.
+   ⚠️ `:not(.linkedStarted)`: the « Started » receipt appears exactly where the pointer
+   already is (you have just clicked "Start"), so hiding it on hover would delete the only
+   confirmation there is, precisely when it is meant to be read. */
+.row:hover .linked:not(.linkedStarted),
+.row:has(.rowActs:focus-within) .linked:not(.linkedStarted) {
+  display: none;
+}
+
 /* ---- "it's started" — the few seconds after a Start that stayed here ---- */
 /* The one moment this mark IS allowed a colour of its own (see `.linked` above): it is not
    a second verdict on the task, it is the receipt for a click that just happened, and it
