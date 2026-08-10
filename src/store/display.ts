@@ -99,6 +99,14 @@ export interface DisplayPrefs {
    *  Only ever visible while a workflow runs. Read by {@link WorkflowPeek}. */
   workflowLiveCard: boolean;
 
+  /** Animate the Flight Deck's reply modal open and closed: the panel GROWS out of the card
+   *  that was clicked and SHRINKS back into it, the way Finder's Quick Look previews a file —
+   *  so the modal reads as that card enlarged rather than as a dialog from nowhere. ON by
+   *  default; ~0.2 s to open, ~0.15 s to close. Off → it appears and disappears instantly, as
+   *  it did before. The OS "reduce motion" setting overrides this whichever way it is set.
+   *  Read by {@link FlightDeckReplyModal}. */
+  flightdeckModalZoom: boolean;
+
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
    *  offered on both the user's and Claude's messages. ON by default. Off → messages have no
@@ -255,6 +263,7 @@ const DEFAULTS: DisplayPrefs = {
   messageMinimap: true,
   minimapHoverMode: "summary",
   workflowLiveCard: true,
+  flightdeckModalZoom: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
@@ -323,6 +332,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
+        flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,

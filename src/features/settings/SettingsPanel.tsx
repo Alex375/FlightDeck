@@ -253,6 +253,7 @@ function DisplayPrefs() {
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
+  const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
@@ -374,6 +375,21 @@ function DisplayPrefs() {
         checked={workflowLiveCard}
         onChange={(v) => set({ workflowLiveCard: v })}
         label="Show live workflow progress on cards"
+      />
+      <ToggleRow
+        title="Zoom when opening a card"
+        hint={
+          <>
+            On the Flight Deck, opening a card makes the conversation{" "}
+            <strong>grow out of that card</strong> and shrink back into it when closed — like
+            Finder's Quick Look. <strong>On by default</strong> (about a fifth of a second).
+            Off → the conversation appears and disappears instantly. Your system's{" "}
+            <strong>"reduce motion"</strong> setting always wins over this.
+          </>
+        }
+        checked={flightdeckModalZoom}
+        onChange={(v) => set({ flightdeckModalZoom: v })}
+        label="Zoom the conversation out of its card"
       />
       <ToggleRow
         title="Message controls"
