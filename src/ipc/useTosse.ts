@@ -292,13 +292,39 @@ export function useTosseBacklog(enabled = true) {
   });
 }
 
+/**
+ * The ONE way a single task is fetched — shared by the detail panel and by the linked-task
+ * reconcile, so a query key can never end up with two different `queryFn`s (whichever
+ * observer happens to trigger the fetch would then decide what the other one gets).
+ *
+ * Re-stamps the linked conversation's denormalised copy, for the same reason the briefing
+ * does: the answer belongs to the FETCH, not to whichever view is mounted. This is the path
+ * that reaches a task the briefing structurally cannot carry — a finished one — and it is
+ * what stops the delete dialog from asking about work that is already done.
+ *
+ * A failure re-stamps nothing, so the copy stays at its last known value: the documented
+ * offline behaviour, and the conservative direction (the guard keeps asking rather than
+ * quietly giving up on a task that may well still be live).
+ */
+export function taskDetailQuery(taskId: string) {
+  return {
+    queryKey: tosseTaskKey(taskId),
+    queryFn: async (): Promise<TosseTaskDetail> => {
+      const detail = await unwrap(commands.tosseTaskDetail(taskId));
+      refreshLinkedTaskMeta([
+        { id: detail.task.id, title: detail.task.title, status: detail.task.status },
+      ]);
+      return detail;
+    },
+    staleTime: 30_000,
+  };
+}
+
 /** One task in full — fetched only when a row is opened (the briefing omits the Markdown). */
 export function useTosseTaskDetail(taskId: string | null) {
   return useQuery<TosseTaskDetail>({
-    queryKey: tosseTaskKey(taskId ?? ""),
+    ...taskDetailQuery(taskId ?? ""),
     enabled: taskId != null,
-    queryFn: () => unwrap(commands.tosseTaskDetail(taskId as string)),
-    staleTime: 30_000,
   });
 }
 

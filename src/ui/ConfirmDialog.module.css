@@ -18,10 +18,19 @@
   padding: 18px;
 }
 
+/* Roomier variant, for a body that carries more than a sentence (see the `size` prop). */
+.lg {
+  width: 468px;
+  padding: 24px 24px 20px;
+}
+
 .title {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+}
+.lg .title {
+  font-size: 15px;
 }
 
 .body {
@@ -30,12 +39,22 @@
   color: var(--text-secondary);
   line-height: var(--lh-body);
 }
+.lg .body {
+  margin-top: 14px;
+}
 
 .actions {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-3);
   margin-top: 18px;
+}
+.lg .actions {
+  margin-top: 22px;
+}
+.lg .btn {
+  height: 34px;
+  padding: 0 var(--space-5);
 }
 
 .btn {

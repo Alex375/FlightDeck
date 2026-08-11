@@ -209,6 +209,9 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         <DeleteConversationDialog
           conv={conv}
           reason={deleteAsk}
+          // Already in the conversation view: selecting the row is all it takes for the
+          // task panel the dialog then opens to be on screen.
+          onShowConversation={select}
           onCancel={() => setConfirmingDelete(false)}
           onConfirm={() => {
             setConfirmingDelete(false);

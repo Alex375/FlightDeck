@@ -1,0 +1,99 @@
+/* The delete confirmation's body: at most one short line and one task snippet. */
+
+.line {
+  color: var(--text-secondary);
+}
+
+/* The linked task, as a row. Boxed so it reads as a quoted object rather than as more
+   sentence — the title is the CRM's words, not ours.
+
+   Same element whether or not it is clickable (a `button` when it opens the task), so the
+   two states can't drift apart visually: `font: inherit` / `text-align: left` undo the
+   button defaults rather than a second rule set doing it. */
+.task {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: var(--radius-sm);
+  background: var(--wf-panel-2);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  min-width: 0;
+}
+.task:first-child {
+  margin-top: 0;
+}
+
+.clickable {
+  cursor: pointer;
+  transition: background var(--transition-hover), border-color var(--transition-hover);
+}
+.clickable:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* The "opens elsewhere" hint. Always laid out (never display:none) so revealing it on hover
+   can't shift the title's available width — the row would visibly reflow under the pointer. */
+.go {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity var(--transition-hover);
+}
+.clickable:hover .go {
+  opacity: 0.7;
+}
+
+.mark {
+  color: var(--wf-tosse-accent);
+  flex: 0 0 auto;
+}
+
+/* Wraps to two lines rather than truncating on one: the title is the whole reason the row
+   is there, and a 380px dialog cuts most CRM titles mid-word. Past two lines it does
+   ellipsise — a snippet that grows into a paragraph is the thing this dialog was slimmed
+   down to avoid. */
+.title {
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* The status, in the CRM's own colours — same language as the tasks view and the task chip,
+   because this describes a CRM value, not an agent state. */
+.badge {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.01em;
+}
+.b_run {
+  color: #3b82f6;
+}
+.b_wait {
+  color: #f59e0b;
+}
+.b_hold {
+  color: #8b5cf6;
+}
+.b_done {
+  color: #34d399;
+}
+.b_todo {
+  color: var(--wf-tx-lo);
+}

@@ -19,6 +19,7 @@ import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
 import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
+import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
 import { useTosseConnection } from "./ipc/useTosse";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
@@ -319,6 +320,9 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): keeps each linked conversation's copy of its TOSSE task in step
+          with the CRM, so the delete warning stops asking about tasks that are already done. */}
+      <LinkedTaskSync />
       {/* Idem (render-null): pushes the interface-zoom preference to the OS webview, on
           mount and on every change. */}
       <ZoomHost />
