@@ -1,11 +1,13 @@
 // Shared "open this artifact" action, used by every artifact surface (the inline card, the
 // composer chip rows, and the prose link card). It routes to the IN-APP viewer when a local
-// file is available to render, and falls back to opening the hosted claude.ai page in the
-// browser otherwise (e.g. a link to an artifact from another conversation, or after a reload
-// once the ephemeral temp file is gone and we only have the URL).
+// file is available to render AND the host has a side region to render it in, and falls back
+// to opening the hosted claude.ai page in the browser otherwise (e.g. a link to an artifact
+// from another conversation, an inert host, or after a reload once the ephemeral temp file is
+// gone and we only have the URL).
 
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEditorStore } from "../editor/editorStore";
+import { useAppErrors } from "../../store/appErrors";
+import { useEditorStore, type ArtifactView } from "../editor/editorStore";
 import { ARTIFACT_URL_RE } from "./artifacts";
 
 /**
@@ -47,23 +49,80 @@ export interface ArtifactOpenMeta {
   url: string | null;
   /** Local temp file to render in the viewer, or null. */
   filePath: string | null;
+  /**
+   * True when the host mounts NO side region (the Flight Deck reply modal). Mirrors
+   * FileMentionProvider's `inert`, the same gate every other click-to-reveal surface honours.
+   */
+  inert?: boolean;
+}
+
+/** Where a click on an artifact must go. Pure, so the routing rule is testable on its own. */
+export type ArtifactRoute =
+  | { kind: "viewer"; view: ArtifactView }
+  | { kind: "browser"; url: string }
+  | { kind: "none" };
+
+/**
+ * Decide where an artifact opens: the in-app viewer when there is a local file to render AND a
+ * side region to render it in, else the hosted page, else nowhere.
+ *
+ * ⚠️ The `inert` branch is load-bearing, not defensive. An inert host (the reply modal mounts a
+ * bare pane, no MainArea) has no side region, so routing there was a DEAD CLICK — and worse, it
+ * still set the global `artifactView`, which then popped the viewer open the next time that
+ * conversation was opened full-screen.
+ */
+export function routeArtifactOpen(meta: ArtifactOpenMeta): ArtifactRoute {
+  if (meta.filePath && !meta.inert) {
+    return {
+      kind: "viewer",
+      view: {
+        convId: meta.convId,
+        title: meta.title,
+        favicon: meta.favicon,
+        url: meta.url,
+        filePath: meta.filePath,
+        kind: artifactKind(meta.filePath),
+      },
+    };
+  }
+  if (meta.url) return { kind: "browser", url: meta.url };
+  return { kind: "none" };
 }
 
 /**
- * Open an artifact: render it in the side-region viewer when we have a local file, else open the
- * hosted page in the browser. When neither is available it is a no-op (nothing to show).
+ * Open an artifact: render it in the side-region viewer, else open the hosted page in the
+ * browser. When neither route exists the click is surfaced as an app error — never swallowed
+ * (a click that does nothing at all reads as a broken app).
  */
 export function openArtifactView(meta: ArtifactOpenMeta): void {
-  if (meta.filePath) {
-    useEditorStore.getState().openArtifact({
-      convId: meta.convId,
-      title: meta.title,
-      favicon: meta.favicon,
-      url: meta.url,
-      filePath: meta.filePath,
-      kind: artifactKind(meta.filePath),
-    });
-  } else if (meta.url) {
-    void openUrl(meta.url);
+  const route = routeArtifactOpen(meta);
+  if (route.kind === "viewer") {
+    useEditorStore.getState().openArtifact(route.view);
+    return;
   }
+  if (route.kind === "browser") {
+    // Every click from an inert host now lands here, so a failed hand-off to the browser is
+    // the ONE reachable failure of this action — dropping the rejection would leave the user
+    // with a click that did nothing and nothing to read.
+    openUrl(route.url).catch((e: unknown) => {
+      useAppErrors
+        .getState()
+        .pushError(
+          `Couldn't open the artifact "${meta.title}".`,
+          e instanceof Error ? e.message : String(e),
+        );
+    });
+    return;
+  }
+  // BACKSTOP, not a designed state: `routeArtifactOpen` is total, but every caller already
+  // refuses to invoke this without a url (the card is unclickable, the popover row disabled,
+  // the prose card only exists for a matched artifact URL). Kept because the pure function's
+  // contract covers the case; deliberately ONE wording, since no user path reaches it and a
+  // second one tuned per host would be dead prose maintained as though it were live.
+  useAppErrors
+    .getState()
+    .pushError(
+      `Couldn't open the artifact "${meta.title}".`,
+      "It has no local file to render and no published link.",
+    );
 }

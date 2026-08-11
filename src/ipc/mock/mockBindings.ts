@@ -64,6 +64,8 @@ import type {
   TosseAccountStatus,
   TosseBacklogTask,
   TosseBriefing,
+  TosseCrmEvent,
+  TosseLiveStateEvent,
   TosseProject,
   LocalRepoScan,
   TosseProjectRepo,
@@ -85,6 +87,7 @@ import type {
   WorktreeStatus,
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -153,6 +156,11 @@ const sessionCodexPlanUsageEvent = new MockEmitter<SessionCodexPlanUsageEvent>()
 // Extensions v2 + accounts: never fire in the mock, but the global router subscribes.
 const sessionExtensionsChangedEvent = new MockEmitter<SessionExtensionsChangedEvent>();
 const accountLoginEvent = new MockEmitter<AccountLoginEvent>();
+// The TOSSE live channel. No socket in the browser mock, so no CRM change ever arrives —
+// but the STATE event is emitted by `tosseLiveStart`/`Stop` below, so the indicator and the
+// host's reconnection handling run for real here.
+const tosseCrmEvent = new MockEmitter<TosseCrmEvent>();
+const tosseLiveStateEvent = new MockEmitter<TosseLiveStateEvent>();
 const tickEvent = new MockEmitter<TickEvent>();
 // No real filesystem in the browser mock — these never fire, but must exist so
 // the editor's `useFsWatch` can subscribe without crashing.
@@ -178,6 +186,8 @@ export const mockEvents = {
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
   accountLoginEvent,
+  tosseCrmEvent,
+  tosseLiveStateEvent,
   tickEvent,
   fsChangeEvent,
   fsWatchErrorEvent,
@@ -359,14 +369,49 @@ const demoBriefing: TosseBriefing = {
 
 let demoNextId = 1;
 
+/**
+ * The Backlog rows, hoisted out of the `tosseBacklog` command so `tosseTaskDetail` can answer
+ * for them too. The real `GET /tasks/:id` knows every task whatever its status — and a task
+ * the BRIEFING does not carry is precisely the one the app has to be able to ask about
+ * (see `linkedTaskReconcile`), so a mock that 404s on it would hide that path.
+ *
+ * Spread across a project AND the project-less band, so a demo run exercises both places a
+ * backlog row can appear.
+ */
+const demoBacklog: TosseBacklogTask[] = [
+  {
+    projectId: "p-tosse-code",
+    task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", { priority: "Haute" }),
+  },
+  {
+    projectId: "p-tosse-code",
+    task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
+      priority: "Basse",
+      assignedTo: "Armand",
+    }),
+  },
+  { projectId: "p-santecall", task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog") },
+  {
+    projectId: null,
+    task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
+  },
+];
+
 /** Every demo task with the project it belongs to, for the detail command. */
 function demoAllTasks(): { task: TosseTask; projectId: string | null; projectName: string | null }[] {
   const rows = demoBriefing.projects.flatMap((p: TosseProject) =>
     p.tasks.map((task) => ({ task, projectId: p.id, projectName: p.name })),
   );
+  const projectName = (id: string | null) =>
+    demoBriefing.projects.find((p: TosseProject) => p.id === id)?.name ?? null;
   return [
     ...rows,
     ...demoBriefing.generalTasks.map((task) => ({ task, projectId: null, projectName: null })),
+    ...demoBacklog.map((row) => ({
+      task: row.task,
+      projectId: row.projectId,
+      projectName: projectName(row.projectId),
+    })),
   ];
 }
 
@@ -596,6 +641,23 @@ export const mockCommands = {
   async tosseLogout(): Promise<Result<null, string>> {
     return ok(null);
   },
+  // The live channel: there is no socket in the browser mock, so no CRM change ever
+  // arrives — but the state is announced through the SAME event the core uses, so the
+  // indicator and the host's reconnection handling are exercised rather than stubbed.
+  // Reported as `live` (not `off`) so the toolbar shows its normal state instead of a
+  // permanent warning about a connection this build was never going to make.
+  async tosseLiveStart(): Promise<Result<null, string>> {
+    tosseLiveStateEvent.emit({
+      status: { state: "live", detail: null, attempts: 0, connections: 1 },
+    });
+    return ok(null);
+  },
+  async tosseLiveStop(): Promise<Result<null, string>> {
+    tosseLiveStateEvent.emit({
+      status: { state: "off", detail: null, attempts: 0, connections: 0 },
+    });
+    return ok(null);
+  },
   // The demo repo, matched to a CRM repository from its git remote — enough to exercise the
   // badge's linked state and the whole card (url, linked project, Markdown context). Any
   // OTHER folder has no entry here, so it renders the un-associated state (hollow mark on
@@ -692,32 +754,9 @@ export const mockCommands = {
   async tosseWebUrl(): Promise<Result<string, string>> {
     return ok("https://frontend-production-7e11.up.railway.app");
   },
-  // Backlog comes from its own endpoint (the briefing excludes it). Spread across a project
-  // AND the project-less band, so a demo run exercises both places it can appear.
+  // Backlog comes from its own endpoint (the briefing excludes it) — see `demoBacklog`.
   async tosseBacklog(): Promise<Result<TosseBacklogTask[], string>> {
-    return ok([
-      {
-        projectId: "p-tosse-code",
-        task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", {
-          priority: "Haute",
-        }),
-      },
-      {
-        projectId: "p-tosse-code",
-        task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
-          priority: "Basse",
-          assignedTo: "Armand",
-        }),
-      },
-      {
-        projectId: "p-santecall",
-        task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog"),
-      },
-      {
-        projectId: null,
-        task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
-      },
-    ]);
+    return ok(demoBacklog);
   },
   async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
     const found = demoAllTasks().find((row) => row.task.id === taskId);
@@ -1207,9 +1246,12 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
-          tosse_task_id: null,
-          tosse_task_title: null,
-          tosse_task_status: null,
+          // Linked to a task the demo briefing carries, so the conversation↔task band is
+          // exercisable in dev: the header chip, and the delete confirmation's task snippet.
+          // « En cours » here and « Review » on the Codex row below, to cover both badges.
+          tosse_task_id: "t-lot2",
+          tosse_task_title: "Lot 2 — vue « Tâches TOSSE » + écriture",
+          tosse_task_status: "En cours",
           backend: "claude",
         },
         // A Codex conversation so the mixed-fleet identity (backend badge, neutral avatar,
@@ -1231,9 +1273,9 @@ export const mockCommands = {
           permission_mode: "auto",
           pending_reminder: null,
           clean_output: null,
-          tosse_task_id: null,
-          tosse_task_title: null,
-          tosse_task_status: null,
+          tosse_task_id: "t-lot1",
+          tosse_task_title: "Lot 1 — connexion (OAuth) + onglet Réglages",
+          tosse_task_status: "Review",
           backend: "codex",
         },
       ],

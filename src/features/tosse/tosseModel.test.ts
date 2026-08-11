@@ -193,11 +193,60 @@ describe("taskQuickAction", () => {
 
 describe("dates", () => {
   const now = Date.parse("2026-08-03T12:00:00.000Z");
+  const DAY_MS = 86_400_000;
+
+  /** The `yyyy-mm-dd` the VIEWER's clock is on at `t`. Derived rather than hard-coded so the
+   *  assertions below hold on a machine in any timezone, not only the one that wrote them. */
+  function viewerDay(t: number): string {
+    const d = new Date(t);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  /** Run `fn` with the process in `tz`, restoring the ambient zone afterwards.
+   *
+   *  ⚠️ The runner's own zone decides whether this bug is even REACHABLE: at a non-negative
+   *  UTC offset, a UTC-midnight value read back with the local getters lands on the same
+   *  calendar day, so the buggy code was accidentally right and a green suite in UTC (what
+   *  CI runs — vitest.config.ts pins no TZ) would prove nothing. Assertions that need a
+   *  negative offset to discriminate pin one here rather than trusting the machine. */
+  function inZone<T>(tz: string, fn: () => T): T {
+    // Reached through `globalThis` (the repo has no @types/node): assigning `process.env.TZ`
+    // is what actually moves `Date`'s zone at runtime under the vitest runner.
+    const env = (globalThis as { process?: { env: Record<string, string | undefined> } }).process
+      ?.env;
+    if (!env) return fn(); // no process to pin (non-node runner) — run in the ambient zone
+    const prev = env.TZ;
+    env.TZ = tz;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) delete env.TZ;
+      else env.TZ = prev;
+    }
+  }
 
   it("flags a past due date and only a past one", () => {
     expect(isOverdue("2026-07-28T00:00:00.000Z", now)).toBe(true);
     expect(isOverdue("2026-08-15T00:00:00.000Z", now)).toBe(false);
     expect(isOverdue(null, now)).toBe(false);
+  });
+
+  // A CRM due date is a calendar DAY stamped at UTC midnight, so comparing it as an instant
+  // called a task late from the first minute of the very day it was due — and, west of
+  // Greenwich, from the evening before.
+  it("does not flag a task due on the day the viewer is living in", () => {
+    expect(isOverdue(`${viewerDay(now)}T00:00:00.000Z`, now)).toBe(false);
+    // `now` must sit EARLY in the UTC day for this to discriminate everywhere: at 12:00Z a
+    // viewer at UTC+12 or beyond is already on the next calendar day, whose UTC midnight is
+    // still in the future — so the old instant compare answered `false` too and the
+    // assertion passed against the very bug it exists to catch.
+    const earlyNow = Date.parse("2026-08-03T01:00:00.000Z");
+    expect(isOverdue(`${viewerDay(earlyNow)}T00:00:00.000Z`, earlyNow)).toBe(false);
+  });
+
+  it("flags a task once its day has passed for the viewer", () => {
+    expect(isOverdue(`${viewerDay(now - DAY_MS)}T00:00:00.000Z`, now)).toBe(true);
   });
 
   it("renders nothing rather than NaN for an unparseable date", () => {
@@ -207,6 +256,27 @@ describe("dates", () => {
 
   it("renders dd/mm, zero-padded", () => {
     expect(shortDate("2026-03-07T00:00:00.000Z")).toBe("07/03");
+  });
+
+  // The regression: the local-zone getters read a UTC-midnight day one day early anywhere
+  // west of Greenwich (that value is 2026-03-06 19:00 in New York), so a deadline silently
+  // rendered as the day before — indistinguishable from a correct one.
+  //
+  // ⚠️ Only a NEGATIVE offset discriminates: east of Greenwich (and in UTC itself) the old
+  // getters happened to read the right day, so the ambient run is a guard, not the proof.
+  // The pinned run is the one that goes red against the buggy code in CI.
+  it("renders the calendar day the CRM minted, whatever the viewer's timezone", () => {
+    const days = ["2026-01-01", "2026-03-07", "2026-06-30", "2026-12-31"];
+    const check = () => {
+      for (const day of days) {
+        const [, month, date] = day.split("-");
+        expect(shortDate(`${day}T00:00:00.000Z`), day).toBe(`${date}/${month}`);
+        // The bare date-only form the CRM could equally send: ES parses it as UTC too.
+        expect(shortDate(day), day).toBe(`${date}/${month}`);
+      }
+    };
+    check(); // whatever zone the machine running the suite happens to be in
+    inZone("America/New_York", check); // and one where the bug is actually reachable
   });
 });
 

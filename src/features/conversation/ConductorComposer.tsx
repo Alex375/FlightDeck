@@ -594,7 +594,12 @@ export const ConductorComposer = forwardRef<
     // silent, matching the reloaded thread which drops those). `markGoalSeen` arms the turn-edge
     // refetch so the target chip picks up a freshly set goal without every goalless conversation
     // paying a per-turn transcript read.
-    const goalCmd = isGoalCommand(t);
+    // ⚠️ CLAUDE ONLY. `/goal` is a Claude-native local command: only there is its echo
+    // masked (live and on reload) and only there does a goal chip stand in for it. On
+    // Codex the very same text is an ordinary prompt the model answers, so the plumbing
+    // must stay off — otherwise the silent path would swallow the bubble and leave an
+    // assistant reply hanging under no visible question.
+    const goalCmd = !isCodex && isGoalCommand(t);
     if (goalCmd) markGoalSeen(session);
     const goalKind = goalCmd
       ? parseGoalCommand(t)?.action === "set"
@@ -1048,7 +1053,9 @@ export const ConductorComposer = forwardRef<
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
     artifacts: (
-      <ArtifactsChip session={session} />
+      // `hasPanels` IS the "does this host have a side region?" signal the pane already
+      // threads down (it is `!inertMentions`), so the chip is told rather than made to guess.
+      <ArtifactsChip session={session} inert={!hasPanels} />
     ),
     // Extensions panel — what this conversation's Claude sees (MCP + live
     // status, plugins, skills, sub-agents), like /mcp. Scans the session's

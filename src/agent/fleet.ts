@@ -150,7 +150,7 @@ export type FleetLane = RepoGroup;
  * idle → off, recency as tiebreak), then order the repos by their most urgent
  * conversation (recency as tiebreak; empty repos last). `rank` is injected so the
  * status source stays out of this pure function. Shares the grouping skeleton with
- * the sidebar's `groupConversationsByRepo` (`groupByRepo`); only the comparators
+ * the sidebar's `groupConversationsByRepoOrdered` (`groupByRepo`); only the comparators
  * differ (status-first here vs recency there).
  */
 export function orderLanes(

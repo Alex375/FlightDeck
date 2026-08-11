@@ -16,6 +16,7 @@ import { useToolResult } from "../../store/conversationStore";
 import { Dot, Ico } from "../../ui/kit";
 import { artifactUrlFromResult } from "./artifacts";
 import { openArtifactView } from "./artifactOpen";
+import { useHostInert } from "./FileMention";
 import { basename } from "./toolMeta";
 
 export function ArtifactCard({
@@ -28,6 +29,9 @@ export function ArtifactCard({
   input: JsonValue;
 }) {
   const result = useToolResult(session, toolUseId);
+  // No side region on this host (the Flight Deck reply modal) → the in-app viewer can't render,
+  // so the click opens the hosted page instead of dying silently. See routeArtifactOpen.
+  const inert = useHostInert();
   // NO backend guard on purpose. `Artifact` is a Claude-only tool today, but the card is
   // backend-agnostic and DEGRADES instead of vanishing: the segment is only ever produced for a
   // tool literally named `Artifact` carrying a `file_path` (see toolGroup.ts), and with no
@@ -58,6 +62,7 @@ export function ArtifactCard({
       favicon: favicon ?? null,
       url,
       filePath: filePath || null,
+      inert,
     });
   const detail = errored
     ? reason
@@ -76,7 +81,15 @@ export function ArtifactCard({
       data-state={errored ? "error" : undefined}
       onClick={clickable ? open : undefined}
       role={clickable ? "button" : undefined}
-      title={errored ? reason ?? undefined : clickable ? "Open artifact in Flight Deck" : undefined}
+      title={
+        errored
+          ? reason ?? undefined
+          : clickable
+            ? inert
+              ? "Open artifact on claude.ai"
+              : "Open artifact in Flight Deck"
+            : undefined
+      }
     >
       <span className="cv-art-tile" aria-hidden="true">
         {favicon || "🎨"}

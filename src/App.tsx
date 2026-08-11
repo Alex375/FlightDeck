@@ -18,7 +18,9 @@ import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
+import { TosseLiveHost } from "./features/tosse/TosseLiveHost";
 import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
+import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
 import { useTosseConnection } from "./ipc/useTosse";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
@@ -319,12 +321,20 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): keeps each linked conversation's copy of its TOSSE task in step
+          with the CRM, so the delete warning stops asking about tasks that are already done. */}
+      <LinkedTaskSync />
       {/* Idem (render-null): pushes the interface-zoom preference to the OS webview, on
           mount and on every change. */}
       <ZoomHost />
       {/* Mounted once, globally (render-null): one live disk watch per RUNNING workflow, so
           every surface sees its real per-agent progress even with the detail modal closed. */}
       <WorkflowWatchHost />
+      {/* Idem (render-null): the ONE live connection to the CRM's change feed, so the tasks
+          view follows a task edited in the browser instead of waiting out a cache delay.
+          App-global on purpose — a per-view subscription would open and close the socket
+          with the tab. Off unless connected AND the preference is on. */}
+      <TosseLiveHost />
     </Win>
   );
 }

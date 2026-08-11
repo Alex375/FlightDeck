@@ -9,6 +9,12 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.7.0
+
+- New: the TOSSE Tasks view is now live — tasks, statuses and projects update by themselves as the CRM changes, without a refresh.
+- New: projects fold and unfold like clients do, and the app remembers what you left open.
+- Fixed: the deletion warning now only appears for a TOSSE task that is genuinely running, and its pop-up is lighter.
+
 ## v1.6.0
 
 - New: zoom the whole interface — a Settings slider plus ⌘+ / ⌘− / ⌘0, working on French AZERTY keyboards too.

@@ -274,7 +274,9 @@ pub fn remote_url(repo_path: &str) -> Result<RemoteLookup, GitError> {
 ///   (`https://github.com/Alex375/CRM_max`) — the local clones use both;
 /// - a trailing `.git`, present on clone URLs and absent from the CRM's;
 /// - case: GitHub treats owner/repo case-insensitively, so `CRM_max` and
-///   `crm_max` are one repository.
+///   `crm_max` are one repository;
+/// - an explicit port (`ssh://git@github.com:22/o/r`, seen behind a bastion or a
+///   proxy) — the same repository as the portless `git@github.com:o/r`.
 pub fn normalize_remote_url(url: &str) -> Option<String> {
     let mut s = url.trim();
     if s.is_empty() {
@@ -282,9 +284,12 @@ pub fn normalize_remote_url(url: &str) -> Option<String> {
     }
 
     // Drop the scheme (`https://`, `ssh://`, `git://`, `file://`…). What remains
-    // is `[user@]host/path` for a URL, or the scp-style form handled just below.
+    // is `[user@]host[:port]/path` for a URL, or the scp-style form handled just
+    // below.
+    let mut had_scheme = false;
     if let Some(rest) = s.split_once("://") {
         s = rest.1;
+        had_scheme = true;
     } else if let Some((head, tail)) = s.split_once(':') {
         // scp-style `git@host:owner/repo` — but NOT a Windows drive or a port-ish
         // oddity: require the colon to come before any slash, as git itself does.
@@ -298,6 +303,13 @@ pub fn normalize_remote_url(url: &str) -> Option<String> {
         s = host_and_path;
     }
 
+    // Neither is an explicit port. ONLY on a scheme URL: in the scp-style form the
+    // part after the colon is the PATH, so `git@host:12345/repo` owns `12345` and
+    // stripping a "port" there would eat the owner. That form was rewritten into
+    // `host/12345/repo` above and re-entered here without a scheme.
+    let portless = if had_scheme { strip_host_port(s) } else { None };
+    let s = portless.as_deref().unwrap_or(s);
+
     let s = s.trim_end_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/');
 
@@ -307,6 +319,23 @@ pub fn normalize_remote_url(url: &str) -> Option<String> {
         return None;
     }
     Some(s.to_lowercase())
+}
+
+/// Drop an explicit `:port` from the `host[:port]/path` left by a scheme URL.
+/// `None` when there is nothing to drop, so the caller keeps the original string.
+///
+/// Only a purely numeric segment between the host and the next `/` is a port —
+/// anything else (an IPv6 literal, a colon further down the path) is identity and
+/// stays. Callers must never hand it an scp-style remote, where that segment is
+/// the first path component.
+fn strip_host_port(host_and_path: &str) -> Option<String> {
+    let (authority, path) = host_and_path.split_once('/')?;
+    // `rsplit` so an IPv6 literal (`[::1]:22`) keeps its own colons.
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{host}/{path}"))
 }
 
 /// List every worktree of the repository that `repo_path` lives in. The main
@@ -935,6 +964,44 @@ mod tests {
         );
     }
 
+    /// An explicit port is notation, not identity: a clone made through a bastion
+    /// or a proxy (`ssh://git@host:22/…`) is the same repository as the CRM's
+    /// portless url. Without this the folder is reported as having no associated
+    /// TOSSE repository and the user is asked to pick a folder for a project
+    /// already cloned in front of them.
+    #[test]
+    fn an_explicit_port_is_not_part_of_the_identity() {
+        // The pair from the field: explicit-port ssh URL vs the CRM's scp-style.
+        let with_port = normalize_remote_url("ssh://git@github.com:22/acme/site.git");
+        let scp = normalize_remote_url("git@github.com:acme/site.git");
+        assert_eq!(with_port.as_deref(), Some("github.com/acme/site"));
+        assert_eq!(with_port, scp);
+
+        // Same for HTTPS on a non-default port.
+        assert_eq!(
+            normalize_remote_url("https://github.com:8443/acme/site.git"),
+            normalize_remote_url("https://github.com/acme/site")
+        );
+
+        // THE TRAP: in scp-style the part after the colon is the PATH, so a purely
+        // numeric owner is an owner — stripping it as a "port" would silently point
+        // the folder at `github.com/repo`.
+        assert_eq!(
+            normalize_remote_url("git@github.com:12345/repo.git").as_deref(),
+            Some("github.com/12345/repo")
+        );
+
+        // Only a purely numeric segment is a port; an IPv6 literal keeps its colons.
+        assert_eq!(
+            normalize_remote_url("ssh://git@[::1]/acme/site.git").as_deref(),
+            Some("[::1]/acme/site")
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@[::1]:22/acme/site.git").as_deref(),
+            Some("[::1]/acme/site")
+        );
+    }
+
     /// Distinct repositories must NOT collapse together — the failure mode that
     /// would silently link a local folder to the wrong CRM entry.
     #[test]
@@ -964,6 +1031,10 @@ mod tests {
         assert_eq!(normalize_remote_url("   "), None);
         assert_eq!(normalize_remote_url("https://github.com"), None);
         assert_eq!(normalize_remote_url("https://github.com/"), None);
+        // A host reached on an explicit port still names no repository: dropping
+        // the port must not manufacture a key that other portless hosts match.
+        assert_eq!(normalize_remote_url("ssh://git@github.com:22"), None);
+        assert_eq!(normalize_remote_url("ssh://git@github.com:22/"), None);
     }
 
     /// The three outcomes, against real `git` — the classification depends on exit codes

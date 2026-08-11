@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { parseSkillInvocation, parseSlashCommand, userMessagePreviewText } from "./userText";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  UserText,
+  parseSkillInvocation,
+  parseSlashCommand,
+  userMessagePreviewText,
+} from "./userText";
 
 describe("parseSlashCommand", () => {
   it("extracts a bare command (with and without args)", () => {
@@ -71,6 +78,33 @@ describe("parseSlashCommand", () => {
         "<command-name>/goal</command-name>\n<command-args>ship the site</command-args>",
       ),
     ).toBe("Goal: ship the site");
+  });
+});
+
+// `UserText` reads no store, so a static render observes it faithfully (unlike a
+// zustand-backed component, whose SSR path would freeze the initial state).
+describe("UserText and the /goal card", () => {
+  const render = (text: string, goalAware?: boolean) =>
+    renderToStaticMarkup(createElement(UserText, { text, goalAware }));
+
+  it("shows the Goal set card on the backend that has the command", () => {
+    expect(render("/goal ship the site")).toContain("Goal set");
+  });
+
+  // The regression: Codex has no `/goal`, so that text is an ordinary prompt the model
+  // answers — a "Goal set" card would claim a state change that never happened (no goal, no
+  // chip). It must degrade to the plain slash-command chip instead.
+  it("never claims a goal was set on a backend without the command", () => {
+    const html = render("/goal ship the site", false);
+    expect(html).not.toContain("Goal set");
+    expect(html).toContain("cv-cmd");
+    expect(html).toContain("/goal");
+    expect(html).toContain("ship the site");
+  });
+
+  it("leaves a plain prompt alone either way", () => {
+    expect(render("fix the typo", false)).toContain("fix the typo");
+    expect(render("fix the typo", false)).not.toContain("cv-cmd");
   });
 });
 

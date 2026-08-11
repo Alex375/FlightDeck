@@ -1033,6 +1033,36 @@ function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string): Repo {
 }
 
 /**
+ * The per-conversation controls a BRANCH inherits from the conversation it was forked
+ * from. A fork continues the very same work, so it must run on the same model / effort /
+ * permission mode: seeding it with the product defaults instead would silently move the
+ * branch to another model (and another plan burn) with nothing on screen saying so.
+ *
+ * Optional everywhere it is accepted: re-activating a conversation picked from the
+ * History panel has NO source conversation to copy from, and keeps the defaults.
+ */
+export interface InheritedControls {
+  model: string | null;
+  effort: string | null;
+  ultracode: boolean;
+  permissionMode: string | null;
+  cleanOutput: boolean | null;
+}
+
+/** Snapshot the controls a fork must carry over from its source conversation. Single
+ *  definition shared by BOTH fork paths (Claude transcript copy + native Codex branch)
+ *  so the two can't drift apart on what a branch inherits. */
+export function inheritedControls(source: Conversation): InheritedControls {
+  return {
+    model: source.model,
+    effort: source.effort,
+    ultracode: source.ultracode,
+    permissionMode: source.permissionMode,
+    cleanOutput: source.cleanOutput,
+  };
+}
+
+/**
  * Bring a conversation discovered on disk (the history panel) back into the app.
  *
  * Reuses the existing repo whose path is the longest prefix of its cwd, else
@@ -1045,8 +1075,15 @@ function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string): Repo {
  *
  * Lazy as ever: NO `claude` process is spawned here; selection + the first message
  * drive the (re)spawn, and the thread fills from the on-disk transcript.
+ *
+ * `inherit` is for the Claude FORK path, which reuses this inserter to materialize a
+ * branch: it carries the source conversation's controls over instead of the product
+ * defaults. Omitted for the History panel, where there is no source to copy from.
  */
-export function reactivateDiskConversation(d: DiskConversation): string {
+export function reactivateDiskConversation(
+  d: DiskConversation,
+  inherit?: InheritedControls,
+): string {
   const store = useConversationsStore.getState();
   const existing = store.conversations.find((c) => c.sessionId === d.session_id);
   if (existing) {
@@ -1068,6 +1105,15 @@ export function reactivateDiskConversation(d: DiskConversation): string {
   // the backend's own default model/effort so a Codex conversation never carries a Claude
   // alias its binary would reject at thread/start.
   const kind: BackendKind = d.backend === "codex" ? "codex" : "claude";
+  const controls: InheritedControls = inherit ?? {
+    model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
+    effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
+    ultracode: false,
+    permissionMode: DEFAULT_PERMISSION_MODE,
+    // null = inherit the global "clean output" default; the composer chip sets an
+    // explicit per-conversation override.
+    cleanOutput: null,
+  };
   useConversationsStore.getState().addConversation({
     id,
     // An untitled conversation falls back to its first prompt — cleaned up first, or a
@@ -1084,14 +1130,12 @@ export function reactivateDiskConversation(d: DiskConversation): string {
     handle: null, // no live process until the first message (lazy)
     liveCwd: null,
     bypassAllowed: false,
-    model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
-    effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
-    ultracode: false,
-    permissionMode: DEFAULT_PERMISSION_MODE,
+    model: controls.model,
+    effort: controls.effort,
+    ultracode: controls.ultracode,
+    permissionMode: controls.permissionMode,
     pendingReminder: null,
-    // null = inherit the global "clean output" default; the composer chip sets an
-    // explicit per-conversation override.
-    cleanOutput: null,
+    cleanOutput: controls.cleanOutput,
     kind,
     // A conversation brought back from disk gets a FRESH stable id — the row that
     // carried any TOSSE link was forgotten with the old one, and the transcript holds
@@ -1119,6 +1163,9 @@ export function materializeCodexBranch(
 ): string {
   const id = uid();
   const now = Date.now();
+  // Same rule as the Claude fork: the branch runs on the controls of the conversation it
+  // came from, never on the product defaults.
+  const inherit = inheritedControls(source);
   useConversationsStore.getState().addConversation({
     id,
     name,
@@ -1132,12 +1179,14 @@ export function materializeCodexBranch(
     liveCwd: null,
     bypassAllowed: false,
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
-    model: forkModel ?? source.model ?? DEFAULT_CODEX_MODEL,
-    effort: source.effort ?? DEFAULT_CODEX_EFFORT,
+    model: forkModel ?? inherit.model ?? DEFAULT_CODEX_MODEL,
+    effort: inherit.effort ?? DEFAULT_CODEX_EFFORT,
+    // "Ultra code" is a Claude-only app tier — a Codex branch never carries it, whatever
+    // the source says (its own top rung is the `ultra` EFFORT, covered by `effort` above).
     ultracode: false,
-    permissionMode: DEFAULT_PERMISSION_MODE,
+    permissionMode: inherit.permissionMode,
     pendingReminder: null,
-    cleanOutput: null,
+    cleanOutput: inherit.cleanOutput,
     kind: "codex",
     // A fork deliberately does NOT inherit the source's TOSSE link: one task keeps one
     // conversation, so two rows claiming the same task would make "reopen the linked
@@ -1684,7 +1733,10 @@ export async function forkConversation(
     ...outcome.conversation,
     title: `${conv.name} (fork)`,
   };
-  const newId = reactivateDiskConversation(branch);
+  // Carry the source's controls over: that import path defaults them (it normally serves the
+  // History panel, which has no source), and a branch that silently jumped to the default
+  // model/effort would burn the plan on a model the user never picked for this work.
+  const newId = reactivateDiskConversation(branch, inheritedControls(conv));
   if (outcome.removed_prompt) {
     useComposerDrafts.getState().setDraft(newId, outcome.removed_prompt);
   }
@@ -1813,26 +1865,11 @@ export function groupByRepo(
     .sort(sortRepos);
 }
 
-/**
- * Group conversations under their repo and order by recency: within a repo the
- * most recently active conversation comes first, and repos are ordered by their
- * most recent conversation (an empty repo falls back to when it was added). The
- * recency-ordered grouping the sidebar shows — the FlightDeck reuses the same
- * skeleton (`groupByRepo`) but orders status-first instead (see `orderLanes`).
- */
-export function groupConversationsByRepo(
-  repos: Repo[],
-  conversations: Conversation[],
-): RepoGroup[] {
-  // After the recency sort, a group's first conversation is its most recent one.
-  const recency = (g: RepoGroup) => g.conversations[0]?.lastActivityAt ?? g.repo.addedAt;
-  return groupByRepo(
-    repos,
-    conversations,
-    (a, b) => b.lastActivityAt - a.lastActivityAt,
-    (a, b) => recency(b) - recency(a),
-  );
-}
+// NOTE: there is no separate recency-only `groupConversationsByRepo`. It became a second,
+// unrendered spelling of the same order the day the sidebar and ⌘⌥↑/↓ both moved to
+// `groupConversationsByRepoOrdered` — a function only its own test still called, where the
+// recency comparator could be changed "safely green" against a code path nothing renders.
+// Recency is that function with both `auto*` flags on.
 
 /**
  * Group conversations by repo honouring the sidebar's MANUAL drag order per level. Each

@@ -804,6 +804,17 @@ impl CodexCore {
                     }
                 });
             }
+            // A query-shaped control request (`get_usage`, `list_models`, `rewind_files`,
+            // `cancel_async_message`, …) is a CLAUDE control-channel subtype; the app-server
+            // exposes no equivalent. REFUSE it explicitly instead of dropping the oneshot: a
+            // dropped sender comes back as `SessionError::Closed` → "session is closed", which
+            // tells the user their perfectly live conversation has died and hides the real
+            // reason. `Rejected` carries this message straight to the caller.
+            SessionCommand::ControlQuery { request_for, reply, .. } => {
+                let _ = reply.send(Err(format!(
+                    "{request_for} is not supported on the Codex backend"
+                )));
+            }
             // Everything else has no base-layer equivalent on Codex → a clean no-op. (Summary /
             // remaining MCP mutations / plugins / stop-task land across phases 4.4-4.5.)
             // ⚠️ Any FUTURE `SessionCommand` variant carrying a `oneshot` reply MUST be matched
@@ -3553,6 +3564,34 @@ mod tests {
         let (mut c3, sink3) = core();
         c3.on_command(SessionCommand::Interrupt, "t1", &server).await;
         assert_eq!(notice_count(&items(&sink3), "error"), 0);
+    }
+
+    // A Claude control-channel query (`cancel_async_message` from the pending badge,
+    // `get_usage` from the plan ring, …) reaching the Codex actor MUST come back as an
+    // explicit refusal. Dropping its oneshot instead would surface as
+    // `SessionError::Closed` — "session is closed" — on a conversation that is very much
+    // alive, sending the user hunting for a dead process that never died.
+    #[tokio::test]
+    async fn a_control_query_is_refused_explicitly_never_dropped() {
+        let (mut c, _sink) = core();
+        let server = Arc::new(CodexServer::new());
+        let (tx, rx) = oneshot::channel();
+        c.on_command(
+            SessionCommand::ControlQuery {
+                request_for: "cancel_async_message",
+                request: json!({}),
+                reply: tx,
+            },
+            "t1",
+            &server,
+        )
+        .await;
+        let answer = rx.await.expect("the reply channel must be answered, never dropped");
+        let msg = answer.expect_err("Codex has no control channel — this must be a refusal");
+        assert!(
+            msg.contains("cancel_async_message") && msg.contains("Codex"),
+            "the refusal names the query and the backend: {msg}"
+        );
     }
 
     #[test]

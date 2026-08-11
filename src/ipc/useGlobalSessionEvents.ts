@@ -550,6 +550,13 @@ export function useGlobalSessionEvents(): void {
       // (1b) workflow: accumulate the per-phase agent activity from the wire's progress ticks
       // (the snapshot keeps only the latest; the live overview needs the running totals).
       useWorkflowLiveStore.getState().record(session, task);
+      // (1c) a task LEAVING the running set is a settling edge too: a turn that finished
+      // cleanly while background work ran shows the calm green `backgrounding` (nothing to
+      // review, so nothing is persisted), and only becomes a blue `review` once the last
+      // background task ends. Re-derive here so that review survives the process dying —
+      // the turn_result / busy edges have long passed by then. Cheap: gated to a terminal
+      // snapshot (rare) and `setReminder` is idempotent.
+      if (task.status !== "running") syncReminderFromLive(session);
       // (2) failure surfacing (de-duped per task — re-emitted on each transition).
       if (task.status !== "failed") return;
       if (seenFailedTasks.has(task.task_id)) return; // re-emitted per transition

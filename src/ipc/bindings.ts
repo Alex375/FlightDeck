@@ -414,6 +414,34 @@ async tosseLogout() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Open the CRM's live change feed, so the Tasks view updates itself instead of waiting out
+ * a `staleTime`. Idempotent: a second call re-publishes the current state rather than
+ * opening a second socket (one connection for the whole app — see `crate::tosse::sse`).
+ * 
+ * Driven by the front on the ONE condition that gates it: a held TOSSE session. There is no
+ * preference — live updates are how the Tasks view works, not a mode of it.
+ */
+async tosseLiveStart() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_live_start") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Close the live channel (idempotent). Called on sign-out — "off" must mean no socket at
+ * all, not a hidden one nobody reads.
+ */
+async tosseLiveStop() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_live_stop") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pair every Flight Deck folder with the TOSSE repository it belongs to.
  * 
  * A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's
@@ -1823,6 +1851,8 @@ sessionTitleEvent: SessionTitleEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
 tickEvent: TickEvent,
+tosseCrmEvent: TosseCrmEvent,
+tosseLiveStateEvent: TosseLiveStateEvent,
 workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
@@ -1842,6 +1872,8 @@ sessionTitleEvent: "session-title-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
 tickEvent: "tick-event",
+tosseCrmEvent: "tosse-crm-event",
+tosseLiveStateEvent: "tosse-live-state-event",
 workflowJournalEvent: "workflow-journal-event"
 })
 
@@ -2779,6 +2811,30 @@ supports_effort: boolean;
  */
 supported_effort_levels: string[] }
 /**
+ * The live channel's health, as the Tasks view shows it.
+ * 
+ * `Off` is a real state, not the absence of one: with no TOSSE session there is nothing to
+ * connect with, and the view must read as "nothing to show" rather than claim a broken
+ * connection.
+ */
+export type LiveState = 
+/**
+ * Not running (never started, or stopped).
+ */
+"off" | 
+/**
+ * Opening, or retrying after a failure we still consider transient.
+ */
+"connecting" | 
+/**
+ * Connected and receiving.
+ */
+"live" | 
+/**
+ * Repeated failures, or a dead session: the view is NOT live and says so.
+ */
+"error"
+/**
  * A clone found on this Mac that matches one of the urls asked about.
  */
 export type LocalRepoMatch = { path: string; 
@@ -3454,6 +3510,17 @@ export type TosseClientRef = { id: string; name: string; logoUrl: string | null;
  */
 website: string | null }
 /**
+ * Something changed in the TOSSE CRM, per its live SSE feed (`crate::tosse::sse`).
+ * 
+ * Carries the event KIND only (`"task:updated"`, `"project:archived"`, …) — never the
+ * server's payload. The board is aggregated and sorted server-side, so the front treats
+ * this as a pure invalidation signal and refetches through the normal read commands; the
+ * alternative (patching the cache from here) would duplicate that aggregation in the UI.
+ * Already filtered to the domains this app reads — the CRM's broadcast is global and also
+ * carries finance / cron / settings traffic that must never reach the webview.
+ */
+export type TosseCrmEvent = { kind: string }
+/**
  * How a local folder came to be linked to a CRM repository.
  */
 export type TosseLinkSource = 
@@ -3465,6 +3532,32 @@ export type TosseLinkSource =
  * Derived from the folder's `origin` remote.
  */
 "remote"
+/**
+ * The TOSSE live channel's health. Two jobs, and both are load-bearing: the view shows a
+ * discreet indicator (a frozen board that claims to be live is the worst outcome), and the
+ * transition INTO `live` is the front's cue to refetch wholesale — the server implements no
+ * replay, so whatever changed while we were disconnected is only knowable by re-reading.
+ */
+export type TosseLiveStateEvent = { status: TosseLiveStatus }
+/**
+ * The live channel's state as published to the UI. `detail` carries the reason whenever
+ * there is one — a state that degrades without saying why is a silent error.
+ */
+export type TosseLiveStatus = { state: LiveState; detail: string | null; 
+/**
+ * Consecutive failed attempts. Lets the UI distinguish "reconnecting" from "wedged"
+ * without parsing prose.
+ */
+attempts: number; 
+/**
+ * Connections established since the channel started.
+ * 
+ * The front's cue to refetch wholesale — and the reason it is a COUNTER rather than a
+ * state transition: the server recycles an idle stream every ~12 s, and those recycles
+ * deliberately leave the state on `Live` (no flicker), so `live → live` with a bumped
+ * counter is exactly the case a transition-based signal would miss.
+ */
+connections: number }
 /**
  * A project with the tasks the briefing kept for it.
  * 

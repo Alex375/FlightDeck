@@ -20,10 +20,15 @@ function childrenText(children: ReactNode): string {
 export function ArtifactRefCard({
   url,
   convId,
+  inert = false,
   children,
 }: {
   url: string;
   convId: string | null;
+  /** Host with no side region (the Flight Deck reply modal) — the in-app viewer can't render
+   *  there, so the click must open the hosted page. Passed down from the same MentionCtx that
+   *  gives us `convId` (a prop, not a `useContext`, because FileMention imports THIS module). */
+  inert?: boolean;
   children?: ReactNode;
 }) {
   // Enrich from the conversation's artifact registry when the link points at one of its own
@@ -42,7 +47,7 @@ export function ArtifactRefCard({
     if (e.type === "click" && !window.getSelection()?.isCollapsed) return;
     e.preventDefault();
     if (convId && (filePath || url)) {
-      openArtifactView({ convId, title, favicon, url, filePath });
+      openArtifactView({ convId, title, favicon, url, filePath, inert });
     } else {
       void openUrl(url);
     }
