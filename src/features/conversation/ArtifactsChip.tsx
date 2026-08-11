@@ -1,7 +1,8 @@
 // The composer's "Artifacts (N)" chip: the always-reachable, per-conversation index of every
 // artifact Claude published in this conversation, grouped by artifact with its version history.
 // Click the chip → a portal popover (fixed-positioned under it, opening upward from the composer)
-// listing each artifact newest-first; click a row → open the hosted page on claude.ai.
+// listing each artifact newest-first; click a row → open it (in-app viewer, or the hosted page on
+// claude.ai when this host has no side region to render it in — see routeArtifactOpen).
 //
 // Rendered ONLY when the conversation has ≥1 artifact (Codex conversations never do — the
 // Artifact tool is Claude-only). READ-ONLY toward claude.ai — it only surfaces what was already
@@ -11,6 +12,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dot, Ico } from "../../ui/kit";
+import { useFlightdeckModal } from "../flightdeck/flightdeckModalStore";
 import { useArtifacts, type Artifact } from "./artifacts";
 import { openArtifactView } from "./artifactOpen";
 
@@ -47,9 +49,20 @@ function artifactPopPlacement(r: DOMRect): ArtifactPopPos {
 }
 
 /** One artifact in the popover: its favicon + title + description + version count, opening the
- *  artifact in the in-app viewer; its versions expand inline (informational — the wire exposes one
- *  canonical URL, not a per-version link, so we never fabricate one). */
-function ArtifactRow({ art, session, onOpened }: { art: Artifact; session: string; onOpened: () => void }) {
+ *  artifact in the in-app viewer (or the hosted page on an `inert` host); its versions expand
+ *  inline (informational — the wire exposes one canonical URL, not a per-version link, so we
+ *  never fabricate one). */
+function ArtifactRow({
+  art,
+  session,
+  inert,
+  onOpened,
+}: {
+  art: Artifact;
+  session: string;
+  inert: boolean;
+  onOpened: () => void;
+}) {
   const [showVersions, setShowVersions] = useState(false);
   const url = art.url;
   const vcount = art.versions.length;
@@ -60,6 +73,7 @@ function ArtifactRow({ art, session, onOpened }: { art: Artifact; session: strin
       favicon: art.favicon,
       url,
       filePath: art.latestFilePath,
+      inert,
     });
     onOpened();
   };
@@ -71,7 +85,7 @@ function ArtifactRow({ art, session, onOpened }: { art: Artifact; session: strin
           className="cv-artpop-open"
           disabled={!url}
           onClick={open}
-          title={url ? "Open in Flight Deck" : "Not published yet"}
+          title={url ? (inert ? "Open on claude.ai" : "Open in Flight Deck") : "Not published yet"}
         >
           <span className="cv-artpop-fav" aria-hidden="true">
             {art.favicon || "🎨"}
@@ -121,6 +135,14 @@ function ArtifactRow({ art, session, onOpened }: { art: Artifact; session: strin
 // inside it non-dismissing; only a row click (which navigates away) closes it.
 export function ArtifactsChip({ session }: { session: string }) {
   const artifacts = useArtifacts(session);
+  // Is this conversation's composer mounted on a host WITHOUT a side region? Every other
+  // click-to-reveal surface reads FileMentionProvider's `inert` for that, but the composer sits
+  // OUTSIDE that provider (it only wraps the thread), so the reachable signal is the reply modal
+  // itself: it is the one inert host, it mounts a bare pane, and its store holds the conversation
+  // it shows — exactly how notify.ts asks "is this conversation being watched in the modal?".
+  // Without this, a row click set a viewer state the modal cannot render (dead click) that then
+  // popped open the next time the conversation was opened full-screen.
+  const inert = useFlightdeckModal((s) => s.convId) === session;
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<ArtifactPopPos | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -209,6 +231,7 @@ export function ArtifactsChip({ session }: { session: string }) {
                       key={a.url ?? a.latestFilePath}
                       art={a}
                       session={session}
+                      inert={inert}
                       onOpened={() => setOpen(false)}
                     />
                   ))}

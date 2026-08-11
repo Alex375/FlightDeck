@@ -101,7 +101,14 @@ export async function sendConversationMessage(
   const res = await unwrap(commands.sendMessage(handle, text, wireImages, codexControls));
   // Remember which message on the wire this bubble is, so it can be dropped from the
   // binary's queue for as long as it has not started running.
-  if (bubbleTurnId && typeof res === "string") {
+  //
+  // ⚠️ CLAUDE ONLY (see `Turn.wireUuid`). Codex has NO command queue — a message sent
+  // mid-turn is steered into the live turn (or starts a new one) — and no
+  // `cancel_async_message` on the app-server. Keeping the uuid here would put the
+  // "remove this pending message" cross on a Codex bubble whose only possible outcome is
+  // an error bubble ("session is closed"), while the message is answered anyway. The
+  // uuid `send_message` returns for a Codex send is deliberately unused.
+  if (bubbleTurnId && typeof res === "string" && conv?.kind !== "codex") {
     useConversationStore.getState().setTurnWireUuid(convId, bubbleTurnId, res);
   }
   // A `/goal` command is not conversational content, so it must not drive the title or the
@@ -240,10 +247,30 @@ export function useCancelQueuedMessage(convId: string) {
   return useMutation({
     mutationFn: async (args: { turnId: string; wireUuid: string }) => {
       const handle = liveHandle(convId);
-      if (!handle) return false;
+      // No live session: the process died / was stopped while the pending bubble was
+      // still on screen. Returning quietly would leave the badge and its cross exactly
+      // as they were with nothing said — the user clicks again and concludes the button
+      // is broken, never learning the message will not be delivered. Fail loudly so
+      // `onError` puts it in the thread, like every sibling command here.
+      if (!handle) {
+        throw new Error("the session is no longer running, so it can no longer be withdrawn");
+      }
       const cancelled = await unwrap(commands.cancelQueuedMessage(handle, args.wireUuid));
       if (cancelled) removeUserTurn(convId, args.turnId);
       return cancelled;
+    },
+    // A REFUSED cancellation (`false`) used to change nothing on screen: bubble, badge and
+    // cross all stayed put with no word said, so the only reading left was "the button is
+    // broken" — and clicking again is exactly the wedging call the doc above warns about.
+    // Say what happened; `addErrorTurn` also retires the now-meaningless pending badge, so
+    // the cross goes with it.
+    onSuccess: (cancelled) => {
+      if (!cancelled) {
+        addErrorTurn(
+          convId,
+          "Could not remove the pending message: it has already started running and will be answered.",
+        );
+      }
     },
     onError: (err) => {
       const message = err instanceof Error ? err.message : String(err);

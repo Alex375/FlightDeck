@@ -120,6 +120,38 @@ describe("conflict policy on external change", () => {
     expect(b.diskChanged).toBe(true); // surfaced via the "modified on disk" banner instead
   });
 
+  it("clears a stale too-large flag when the file shrinks back under the limit", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, FILE);
+    // What a tab looks like after the file was read while it was >MAX_FILE_BYTES:
+    // the "File too large to display" placeholder over an empty buffer. The agent
+    // then truncates the file, so the read below returns real text again — the flag
+    // describes the OLD read and must not outlive it (only closing the tab did).
+    patch(FILE, { tooLarge: true, content: "", saved: "", dirty: false });
+
+    await s.onExternalChange(CONV, [FILE]);
+
+    const b = buffer();
+    expect(b.tooLarge).toBe(false);
+    expect(b.content.length).toBeGreaterThan(0);
+    expect(b.content).toBe(b.saved);
+  });
+
+  it("clears a stale read error when the file reappears with the same bytes", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, FILE);
+    // The file vanished (reloadTab flagged the buffer), then came back byte-for-byte
+    // → the "no real change" branch. The error belongs to the failed read; leaving it
+    // would keep the tab showing "File unavailable on disk." over live content.
+    patch(FILE, { error: "File unavailable on disk." });
+
+    await s.onExternalChange(CONV, [FILE]);
+
+    expect(buffer().error).toBeNull();
+  });
+
   it("reloadFromDisk applies the pending disk content and clears the flag", async () => {
     const s = useEditorStore.getState();
     s.ensureConv(CONV, ROOT);

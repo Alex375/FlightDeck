@@ -203,9 +203,14 @@ export function AgentInstruction({ text }: { text: string }) {
 export function SubAgentTranscript({
   items,
   agentPrompt,
+  goalAware = true,
 }: {
   items: ConversationItem[];
   agentPrompt?: boolean;
+  /** False when the transcript comes from a backend with no `/goal` command (a Codex
+   *  rollout in the history preview): there that text is an ordinary prompt, so it must not
+   *  render as a "Goal set" card. See `UserText`. Defaults to true (Claude). */
+  goalAware?: boolean;
 }) {
   const results = useMemo(() => {
     const map = new Map<string, JoinedResult>();
@@ -242,7 +247,7 @@ export function SubAgentTranscript({
               <UserMark />
             </Avatar>
             <div className="cv-bubble">
-              <UserText text={r.text} />
+              <UserText text={r.text} goalAware={goalAware} />
             </div>
           </div>
         );

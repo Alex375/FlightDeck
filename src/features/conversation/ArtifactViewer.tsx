@@ -112,7 +112,9 @@ export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose:
   const [load, setLoad] = useState<Load>({ status: "loading" });
   /** Bumped when the file changed underneath us, to re-run the load effect. */
   const [rev, setRev] = useState(0);
-  /** The file state the currently shown content came from (see `statKey`). */
+  /** The file state the panel has already ACTED on (see `statKey`): stamped by a successful
+   *  read, and by the poll each time it triggers a reload. `null` means "nothing acted on
+   *  yet" — first open, or a read that failed before it could stamp anything. */
   const seenKey = useRef<string | null>(null);
   /** Which artifact is currently on screen, to tell "a different one" from "the
    *  same one, rewritten". */
@@ -197,7 +199,14 @@ export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose:
       }
       if (stopped || !stat) return;
       const key = statKey(stat);
-      if (seenKey.current === null || key === seenKey.current) return;
+      // A null stamp means the panel has acted on NOTHING yet — the read failed (temp file
+      // swept, or the viewer was opened before the file landed). That has to mean "try this
+      // observation", never "stop polling": bailing on null left a viewer whose first read
+      // failed stuck on the error panel forever, even after Claude re-published seconds later
+      // to the very same path. Claiming the key BEFORE reloading is what keeps that honest AND
+      // cheap: a doomed retry costs one read per DISTINCT file state, so a file that stays
+      // gone (or stays unreadable at the same size+mtime) is a non-event from the next tick on.
+      if (key === seenKey.current) return;
       seenKey.current = key;
       setRev((r) => r + 1);
     };

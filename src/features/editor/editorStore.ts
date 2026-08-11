@@ -644,21 +644,30 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       // like — including the "no real change" one, whose whole point is that the
       // content matches even though the stamp (an autosave's own echo, a rewrite
       // with identical bytes) moved.
-      const stamped = { ...b, diskStamp: stampOf(f) };
+      //
+      // `binary` / `tooLarge` / `error` all DESCRIBE A READ, so they are re-derived
+      // from THIS one instead of being inherited from the previous one: a file that
+      // shrinks back under MAX_FILE_BYTES, stops being binary, or simply reappears
+      // after a failed read would otherwise keep rendering its old placeholder
+      // ("File too large to display", "File unavailable on disk.") over content that
+      // is sitting right there in the buffer — and only closing the tab cleared it.
+      // The one buffer that keeps its own flags is a DIRTY one: what it shows is the
+      // user's text, not the disk's (see the dirty branch below).
+      const stamped: FileBuffer = b.dirty
+        ? { ...b, diskStamp: stampOf(f) }
+        : { ...b, diskStamp: stampOf(f), binary: f.binary, tooLarge: f.too_large, error: null };
       // No real change vs what we already have on disk → ignore (this also
       // absorbs the echo of our own save).
       if (f.content === b.saved) return { ...stamped, diskChanged: false, diskContent: null };
       // Unsaved local edits: never clobber — surface the on-disk version via the
-      // banner. This MUST be checked before the binary/too-large branch below:
-      // if the on-disk file turned binary or >MAX_FILE_BYTES, that branch would
-      // otherwise overwrite the buffer with the (empty) disk content and drop the
-      // user's edits with no banner and no error — a silent data loss.
+      // banner. This MUST be checked before the reload below: if the on-disk file
+      // turned binary or >MAX_FILE_BYTES, reloading would overwrite the buffer with
+      // the (empty) disk content and drop the user's edits with no banner and no
+      // error — a silent data loss.
       if (b.dirty) return { ...stamped, diskChanged: true, diskContent: f.content };
-      if (b.binary || f.binary || f.too_large) {
-        return { ...stamped, binary: f.binary, tooLarge: f.too_large, saved: f.content, content: f.content };
-      }
-      // Clean buffer: live-reload in place.
-      return { ...stamped, content: f.content, saved: f.content, dirty: false, error: null };
+      // Clean buffer: live-reload in place. A binary / too-large read lands here too
+      // — its content is empty, which is exactly what its placeholder shows.
+      return { ...stamped, content: f.content, saved: f.content, dirty: false };
     });
   }
 

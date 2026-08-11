@@ -60,13 +60,18 @@ export function userMessagePreviewText(text: string): string {
 }
 
 /** A user message's text: a slash-command shows as a clean chip (the `<command-*>` wrapper
- *  is dropped), everything else renders as-is. */
-export function UserText({ text }: { text: string }) {
+ *  is dropped), everything else renders as-is.
+ *
+ *  `goalAware` must be false on a backend where `/goal` is NOT a command (Codex): there the
+ *  same text is an ordinary prompt the model answers, so a "Goal set" card would assert a
+ *  state change that never happened — no goal exists, no chip appears. Falling through to the
+ *  plain slash-command chip is the honest rendering. Defaults to true (Claude). */
+export function UserText({ text, goalAware = true }: { text: string; goalAware?: boolean }) {
   // A `/goal <condition>` SET is surfaced as its own card — the user asked to SEE the goal they
   // set, not to have it hidden as plumbing. Clear / bare-status fall through to the normal
   // slash-command chip (the Rust normalizer keeps those out of the thread anyway).
   const goal = parseGoalCommand(text);
-  if (goal?.action === "set") return <GoalCommandCard condition={goal.condition} />;
+  if (goalAware && goal?.action === "set") return <GoalCommandCard condition={goal.condition} />;
   const cmd = parseSlashCommand(text);
   // A plain prompt keeps its line breaks: the raw text carries `\n`, but HTML collapses
   // whitespace by default, so we render it in a `white-space: pre-wrap` span (the fix for

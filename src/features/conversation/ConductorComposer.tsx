@@ -594,7 +594,12 @@ export const ConductorComposer = forwardRef<
     // silent, matching the reloaded thread which drops those). `markGoalSeen` arms the turn-edge
     // refetch so the target chip picks up a freshly set goal without every goalless conversation
     // paying a per-turn transcript read.
-    const goalCmd = isGoalCommand(t);
+    // ⚠️ CLAUDE ONLY. `/goal` is a Claude-native local command: only there is its echo
+    // masked (live and on reload) and only there does a goal chip stand in for it. On
+    // Codex the very same text is an ordinary prompt the model answers, so the plumbing
+    // must stay off — otherwise the silent path would swallow the bubble and leave an
+    // assistant reply hanging under no visible question.
+    const goalCmd = !isCodex && isGoalCommand(t);
     if (goalCmd) markGoalSeen(session);
     const goalKind = goalCmd
       ? parseGoalCommand(t)?.action === "set"

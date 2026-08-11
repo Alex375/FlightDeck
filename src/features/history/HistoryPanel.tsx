@@ -361,7 +361,10 @@ export function HistoryPanel() {
                       Unable to load transcript: {previewError}
                     </div>
                   ) : preview && preview.length > 0 ? (
-                    <SubAgentTranscript items={preview} />
+                    <SubAgentTranscript
+                      items={preview}
+                      goalAware={selected.backend !== "codex"}
+                    />
                   ) : (
                     <div className={styles.previewEmpty}>
                       This conversation has no readable messages.

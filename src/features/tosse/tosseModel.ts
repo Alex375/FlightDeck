@@ -258,21 +258,52 @@ export function groupByClient(projects: TosseProject[], paused: TosseProject[] =
   return [...bands.values()].sort((a, b) => Number(a.key === "none") - Number(b.key === "none"));
 }
 
-/** Whether a due date is in the past — the one date styling that has to be loud. `now` is
- *  injected so this stays pure (and testable) rather than reading the clock. */
+/**
+ * The calendar day a CRM date denotes, as `yyyy-mm-dd`, or null when it isn't a date.
+ *
+ * ⚠️ The CRM's `dueDate`/`startDate` are date-only values, minted at UTC midnight
+ * (`2026-03-07T00:00:00.000Z`) — a DAY, not an instant. Read back with the local-zone
+ * getters, that day lands on the 6th at 19:00 in New York, so every deadline rendered one
+ * day early for any viewer west of Greenwich — and a day-early date is indistinguishable
+ * from a correct one. So the day is read in the zone it was minted in.
+ *
+ * This is ONLY for those date-only fields. A real timestamp (an activity time, the "Synced
+ * at" of the toolbar) is an instant and must keep the local getters — none goes through here.
+ */
+function crmDay(value: string | null): string | null {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+/** The day the VIEWER is living in, as `yyyy-mm-dd` — the other side of an overdue check. */
+function localDay(now: number): string {
+  const d = new Date(now);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/**
+ * Whether a due date is in the past — the one date styling that has to be loud. `now` is
+ * injected so this stays pure (and testable) rather than reading the clock.
+ *
+ * Compares CALENDAR DAYS, not instants: the due value is the start of its day in UTC, so an
+ * instant comparison called a task late from the very first minute of the day it is due
+ * (and, west of Greenwich, from the evening BEFORE). A task is late once the day it was due
+ * has passed for the person looking at it. `yyyy-mm-dd` strings order lexicographically.
+ */
 export function isOverdue(dueDate: string | null, now: number): boolean {
-  if (!dueDate) return false;
-  const t = Date.parse(dueDate);
-  return Number.isFinite(t) && t < now;
+  const due = crmDay(dueDate);
+  return due !== null && due < localDay(now);
 }
 
 /** `dd/mm` — the compact form the CRM uses on its own cards. Invalid input renders nothing
  *  rather than "NaN/NaN". */
 export function shortDate(value: string | null): string | null {
-  if (!value) return null;
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+  const day = crmDay(value);
+  if (!day) return null;
+  return `${day.slice(8, 10)}/${day.slice(5, 7)}`;
 }
 
 /**

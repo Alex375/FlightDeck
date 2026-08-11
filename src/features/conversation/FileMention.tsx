@@ -82,6 +82,22 @@ function useFileMentionCtx(): MentionCtx | null {
   return useContext(Ctx);
 }
 
+/**
+ * True when the surrounding host has NO side region to reveal into (today: the Flight Deck reply
+ * modal, which mounts a bare pane with no editor/viewer area). Read by the artifact card so a
+ * click falls back to the hosted page instead of setting a viewer state nothing there can render.
+ *
+ * ⚠️ `inert` ONLY, never `stepRowInert`: the "clickable file paths" pref governs one tool-row
+ * filename and must never disable opening an artifact.
+ *
+ * Off a provider the answer is `false` (assume a normal host): a sub-agent transcript popover
+ * floats over a full conversation view, which does have the side region. Only an explicitly
+ * inert provider degrades.
+ */
+export function useHostInert(): boolean {
+  return useFileMentionCtx()?.inert ?? false;
+}
+
 // ---- Hook: a token → a clickable target, or null ----------------------------
 
 interface MentionTarget {
@@ -321,10 +337,12 @@ export function MentionLink({
   );
   // A hosted-artifact URL renders as a compact artifact card (opens the in-app viewer / browser),
   // not a plain anchor — regardless of host, so it's recognisable everywhere Claude links one.
+  // An inert host keeps the card but loses the viewer route (no side region to render it in), so
+  // `inert` rides along: there the click opens the hosted page instead of doing nothing at all.
   // Checked AFTER the hook above so hook order stays stable if a streaming href flips.
   if (isArtifactUrl(href)) {
     return (
-      <ArtifactRefCard url={href!} convId={ctx?.convId ?? null}>
+      <ArtifactRefCard url={href!} convId={ctx?.convId ?? null} inert={ctx?.inert ?? true}>
         {children}
       </ArtifactRefCard>
     );

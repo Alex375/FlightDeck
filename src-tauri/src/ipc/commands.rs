@@ -28,10 +28,19 @@ pub struct Pong {
     pub at_ms: u64,
 }
 
+/// One registered session: its handle plus the backend it runs on. The handle itself is
+/// backend-neutral by design (both actors are driven through the same command channel),
+/// so the registry is the one place that still remembers WHICH backend answers — needed
+/// by the rare capability that only one of them has (e.g. Claude's `get_usage`).
+struct LiveSession {
+    backend: Backend,
+    handle: SessionHandle,
+}
+
 /// Tauri managed state: the registry of live sessions, keyed by our own id.
 #[derive(Default)]
 pub struct Sessions {
-    inner: Mutex<HashMap<String, SessionHandle>>,
+    inner: Mutex<HashMap<String, LiveSession>>,
     next: AtomicU64,
 }
 
@@ -46,15 +55,15 @@ impl Sessions {
 
     /// Clone out a handle (never holds the lock across an `.await`).
     fn get(&self, id: &str) -> Option<SessionHandle> {
-        self.inner.lock().unwrap().get(id).cloned()
+        self.inner.lock().unwrap().get(id).map(|s| s.handle.clone())
     }
 
-    fn insert(&self, id: String, handle: SessionHandle) {
-        self.inner.lock().unwrap().insert(id, handle);
+    fn insert(&self, id: String, backend: Backend, handle: SessionHandle) {
+        self.inner.lock().unwrap().insert(id, LiveSession { backend, handle });
     }
 
     fn remove(&self, id: &str) -> Option<SessionHandle> {
-        self.inner.lock().unwrap().remove(id)
+        self.inner.lock().unwrap().remove(id).map(|s| s.handle)
     }
 
     /// Snapshot every live handle WITHOUT evicting them. Each session's actor
@@ -62,7 +71,26 @@ impl Sessions {
     /// can request shutdown on this snapshot and then watch [`Sessions::is_empty`]
     /// to know when every process is actually reaped.
     pub fn handles(&self) -> Vec<SessionHandle> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner.lock().unwrap().values().map(|s| s.handle.clone()).collect()
+    }
+
+    /// Snapshot the live CLAUDE handles, in a DETERMINISTIC (session-id) order. A
+    /// control request only the Claude CLI answers must never be aimed at whatever
+    /// handle the `HashMap` happens to yield first: with a Codex conversation open too,
+    /// the pick — and therefore the outcome — would change from one app run to the next.
+    /// The order is for reproducibility, not ranking: every Claude session reports the
+    /// same account-wide answer.
+    fn claude_handles(&self) -> Vec<SessionHandle> {
+        let mut claude: Vec<SessionHandle> = self
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| matches!(s.backend, Backend::Claude))
+            .map(|s| s.handle.clone())
+            .collect();
+        claude.sort_by(|a, b| a.id.cmp(&b.id));
+        claude
     }
 
     /// Whether any session is still registered (still tearing down or live).
@@ -168,7 +196,7 @@ pub async fn spawn_session(
         Backend::Claude => session::spawn_session(id.clone(), cfg, initial, emitter, on_exit),
     }
     .map_err(|e| e.to_string())?;
-    sessions.insert(id.clone(), handle);
+    sessions.insert(id.clone(), backend, handle);
     Ok(id)
 }
 
@@ -1257,6 +1285,11 @@ pub async fn read_task_output_file(path: String) -> Result<Option<String>, Strin
         .map_err(|e| e.to_string())
 }
 
+/// Total time the live-session fast path of [`get_plan_usage`] may spend across ALL the
+/// Claude sessions it asks — the same budget a single `get_usage` query already has, so
+/// walking several handles never costs the UI more than asking one did.
+const LIVE_USAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Fetch the real subscription usage percentages (5h + weekly windows). The stream
 /// only carries a coarse rate-limit status, so this replicates the CLI's internal
 /// `GET /api/oauth/usage` (OAuth token read from `~/.claude/.credentials.json` then
@@ -1270,16 +1303,27 @@ pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<Plan
     // Prefer a LIVE session's `get_usage` control request: same numbers, but with no
     // OAuth token and no Keychain read — which is precisely what makes it immune to the
     // stale `~/.claude/.credentials.json` that shadows a fresh Keychain token and 401s
-    // the HTTP path. Only ONE session is tried: any of them reports the same
-    // account-wide plan, and walking a list of unresponsive handles would make the UI
-    // wait out a timeout per session.
+    // the HTTP path.
+    //
+    // Only CLAUDE sessions are asked: `get_usage` is a Claude control request that the
+    // Codex actor cannot serve. Picking whatever handle the registry yielded first meant
+    // that, with one Claude and one Codex conversation open, the Codex handle could win
+    // the draw — the fast path failed and the stale-credentials account silently fell
+    // through to the very HTTP 401 this path exists to avoid, differently on each run.
+    // The whole fast path shares ONE deadline (matching a single query's own timeout):
+    // trying the next Claude session costs nothing when a handle is dead, and an
+    // unresponsive CLI still can't make the UI wait out a timeout per session.
     //
     // The HTTP path is deliberately KEPT rather than replaced: sessions spawn lazily, so
     // with no conversation running there is nobody to ask — and the binary marks
     // `get_usage` "Experimental — the response shape may change", so a drift there must
     // degrade to the endpoint instead of blanking the meter.
-    if let Some(handle) = sessions.handles().into_iter().next() {
-        if let Ok(line) = handle.plan_usage_payload().await {
+    let deadline = tokio::time::Instant::now() + LIVE_USAGE_BUDGET;
+    for handle in sessions.claude_handles() {
+        // Err = the budget ran out, the session is gone, or the CLI refused/garbled the
+        // query. None = a payload we can't read (the documented "experimental shape may
+        // drift" case). Either way another live Claude session may still answer.
+        if let Ok(Ok(line)) = tokio::time::timeout_at(deadline, handle.plan_usage_payload()).await {
             if let Some(usage) = crate::usage::plan_usage_from_control_response(&line) {
                 return Ok(usage);
             }
@@ -2481,6 +2525,38 @@ mod tests {
         assert!(pong.ok);
         assert_eq!(pong.echo, "hello");
         assert!(pong.at_ms > 0, "timestamp should be populated");
+    }
+
+    /// `get_usage` is a CLAUDE control request, so the live fast path of
+    /// [`get_plan_usage`] must aim at a Claude session — never at whatever handle the
+    /// registry's `HashMap` yields first. With a Codex conversation open too, that
+    /// arbitrary pick asked an actor that cannot answer and dropped the account onto the
+    /// HTTP/Keychain path the fast path exists to avoid, nondeterministically per run.
+    #[test]
+    fn claude_handles_skips_codex_and_is_deterministic() {
+        fn handle(id: &str) -> SessionHandle {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            SessionHandle::from_channel(id.to_string(), tx)
+        }
+        let sessions = Sessions::new();
+        sessions.insert("session-2".into(), Backend::Codex, handle("session-2"));
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"));
+        sessions.insert("session-3".into(), Backend::Claude, handle("session-3"));
+
+        let ids: Vec<String> = sessions.claude_handles().into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, ["session-1", "session-3"], "Claude sessions only, in a stable order");
+        assert_eq!(sessions.handles().len(), 3, "the neutral snapshot still sees every session");
+        assert!(sessions.get("session-2").is_some(), "lookup by id stays backend-blind");
+
+        assert_eq!(sessions.remove("session-1").map(|h| h.id).as_deref(), Some("session-1"));
+        let left: Vec<String> = sessions.claude_handles().into_iter().map(|h| h.id).collect();
+        assert_eq!(left, ["session-3"], "an evicted session is no longer offered");
+
+        sessions.remove("session-3");
+        assert!(
+            sessions.claude_handles().is_empty(),
+            "a Codex-only fleet has nobody to ask — the HTTP fallback must stay reachable"
+        );
     }
 
     /// The resume invocation is BACKEND-AWARE: Claude uses `--resume`, Codex uses the

@@ -7,8 +7,13 @@
 // "what ⌘B does" and "what a button labelled ⌘B does" from drifting apart.
 //
 // Live store state is read at call time — no stale closures, whichever surface calls.
-import { createConversationInRepo, groupConversationsByRepo, useConversationsStore } from "../store/conversationsStore";
+import {
+  createConversationInRepo,
+  groupConversationsByRepoOrdered,
+  useConversationsStore,
+} from "../store/conversationsStore";
 import { useDisplay, resolveCleanOutput } from "../store/display";
+import { slotFor, useManualOrder } from "../store/manualOrder";
 import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
@@ -83,9 +88,19 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
     }
     case "prev-conversation":
     case "next-conversation": {
-      const ordered = groupConversationsByRepo(store.repos, store.conversations).flatMap(
-        (g) => g.conversations,
-      );
+      // Walk EXACTLY the order the sidebar shows: same ordered grouping, same order
+      // prefs, same manual-order slot as `useConversationsByRepo`. Ordering by recency
+      // here instead would send ⌘⌥↑/↓ to a conversation that is nowhere near the one
+      // above/below on screen as soon as the user has arranged the list by hand.
+      const display = useDisplay.getState();
+      const order = useManualOrder.getState()[slotFor("sidebar", display.sharedManualOrder)];
+      const ordered = groupConversationsByRepoOrdered(
+        store.repos,
+        store.conversations,
+        order,
+        display.autoOrderSidebarConvs,
+        display.autoOrderSidebarRepos,
+      ).flatMap((g) => g.conversations);
       if (ordered.length < 2) return false;
       const idx = ordered.findIndex((c) => c.id === store.activeId);
       if (idx < 0) return false;

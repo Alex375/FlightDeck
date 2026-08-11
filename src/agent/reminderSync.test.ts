@@ -7,10 +7,12 @@ vi.mock("../ipc/client", () => {
   return { commands: { upsertConversation: vi.fn(() => ok()) } };
 });
 
-import { commands } from "../ipc/client";
+import { commands, type BackgroundTask } from "../ipc/client";
 import { syncReminderFromLive } from "./reminderSync";
 import { useConversationsStore, type Conversation } from "../store/conversationsStore";
 import { useConversationStore } from "../store/conversationStore";
+import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
+import { useDisplay } from "../store/display";
 import type { SessionEntry, Turn } from "../store/types";
 import type { ReminderKind } from "./status";
 
@@ -98,10 +100,38 @@ function seed(c: Conversation, e: SessionEntry | undefined) {
   useConversationStore.setState({ sessions: e ? { c1: e } : {} });
 }
 
+/** A background task of the conversation (running by default). */
+function bgTask(over: Partial<BackgroundTask> = {}): BackgroundTask {
+  return {
+    task_id: "tk1",
+    kind: "agent",
+    tool_use_id: "toolu_1",
+    label: "do the thing",
+    command: null,
+    subagent_type: "Explore",
+    model: null,
+    agent_id: null,
+    status: "running",
+    progress: null,
+    tokens: null,
+    tool_uses: null,
+    duration_ms: null,
+    summary: null,
+    output_file: null,
+    ...over,
+  };
+}
+
 const persisted = (): ReminderKind | null =>
   useConversationsStore.getState().conversations[0].pendingReminder;
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  // The background-task registry and the "re-alert on background Bash" setting are
+  // inputs of the derivation now — reset both so each case states its own situation.
+  useBackgroundTasksStore.getState().clear();
+  useDisplay.getState().set({ alertOnBackgroundBash: false });
+});
 
 describe("syncReminderFromLive — arming the persisted reminder from the live status", () => {
   it("arms 'review' for a clean finished turn", () => {
@@ -164,6 +194,46 @@ describe("syncReminderFromLive — arming the persisted reminder from the live s
     expect(persisted()).toBeNull();
     // Edge 2: the turn_result message now lands (entry settles) → reminder armed.
     useConversationStore.setState({ sessions: { c1: entry({ turnSeen: false }) } });
+    syncReminderFromLive("c1");
+    expect(persisted()).toBe("review");
+  });
+
+  it("does NOT arm 'review' for a clean finish made while background work runs", () => {
+    // The visible status of a clean finish with a workflow / sub-agent still running is the
+    // green `backgrounding` — nothing to review. Persisting 'review' here would re-surface a
+    // blue "needs review" badge after a restart for a turn the user was never asked to look at.
+    seed(conv(), entry({ turnSeen: false, text: "C'est fait ✅" }));
+    useBackgroundTasksStore.getState().applyTask("c1", bgTask());
+    syncReminderFromLive("c1");
+    expect(persisted()).toBeNull();
+  });
+
+  it("arms 'review' once the last background task ends (the settling edge moves)", () => {
+    seed(conv(), entry({ turnSeen: false, text: "C'est fait ✅" }));
+    useBackgroundTasksStore.getState().applyTask("c1", bgTask());
+    syncReminderFromLive("c1");
+    expect(persisted()).toBeNull();
+    // The sub-agent finishes: the conversation now genuinely shows the blue review, so the
+    // reminder must be armed (this is the edge the task event re-syncs on).
+    useBackgroundTasksStore.getState().applyTask("c1", bgTask({ status: "completed" }));
+    syncReminderFromLive("c1");
+    expect(persisted()).toBe("review");
+  });
+
+  it("still arms an ALERT (error / open question) raised while background work runs", () => {
+    // An error genuinely wants the user, background work or not — it must survive a restart.
+    seed(conv(), entry({ turnSeen: false, isError: true }));
+    useBackgroundTasksStore.getState().applyTask("c1", bgTask());
+    syncReminderFromLive("c1");
+    expect(persisted()).toBe("error");
+  });
+
+  it("honours the Bash-only re-alert setting (arms 'review' like the visible status)", () => {
+    // With the setting ON and the sole background task a Bash command, deriveAgentStatus
+    // routes the finish to `review` — the persisted reminder must follow, not diverge.
+    useDisplay.getState().set({ alertOnBackgroundBash: true });
+    seed(conv(), entry({ turnSeen: false, text: "C'est fait ✅" }));
+    useBackgroundTasksStore.getState().applyTask("c1", bgTask({ kind: "bash" }));
     syncReminderFromLive("c1");
     expect(persisted()).toBe("review");
   });

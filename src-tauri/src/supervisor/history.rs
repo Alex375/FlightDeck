@@ -784,9 +784,10 @@ fn clean_prompt_for_composer(text: &str) -> Option<String> {
 ///   never appears on disk, so we FALL BACK to matching by [`prompt_match_key`] over
 ///   `target_text` (tolerant of slash/image shapes). `occurrence` (the front's index among
 ///   identical-key prompts) disambiguates repeats — critical since short prompts ("ok",
-///   "continue") recur; without it the fallback would silently cut at the LAST repeat. The
-///   cut lands ON the prompt (it and everything after are dropped). Refused on the first
-///   prompt (would leave an unresumable, turn-less file).
+///   "continue") recur; without it the fallback would silently cut at the LAST repeat. An
+///   occurrence the disk does NOT have is REFUSED, never re-pointed at another repeat (see
+///   the note at the match below). The cut lands ON the prompt (it and everything after are
+///   dropped). Refused on the first prompt (would leave an unresumable, turn-less file).
 /// - ASSISTANT target: located by `message.id` (stable both live and on disk). The cut lands
 ///   at the NEXT genuine human prompt, keeping the whole response + its tool_results intact.
 fn resolve_cut(
@@ -811,9 +812,30 @@ fn resolve_cut(
                 let matches: Vec<usize> = (0..raw.len())
                     .filter(|&i| human_prompt_at(parsed, i).map(|t| prompt_match_key(&t)) == Some(key.clone()))
                     .collect();
-                ti = occurrence
-                    .and_then(|o| matches.get(o).copied())
-                    .or_else(|| matches.last().copied());
+                ti = match occurrence {
+                    // ⚠️ An occurrence the transcript does NOT have means the front and the
+                    // disk disagree about WHICH of the identical prompts this is (a turn the
+                    // file never persisted, a live-only synthetic turn shifting the count).
+                    // NEVER slide to another repeat: the rewind truncates IN PLACE, so cutting
+                    // at the LAST "ok" when the user clicked the FIRST destroys every turn in
+                    // between and still reports success. Refuse and say so. The fork shares
+                    // this locator and refuses too: it is non-destructive, but branching at a
+                    // prompt the user did not click is just as silently wrong, and the remedy
+                    // is the same one line of advice (reload → real on-disk uuids, path 1).
+                    Some(o) if !matches.is_empty() => Some(*matches.get(o).ok_or_else(|| {
+                        format!(
+                            "This message no longer lines up with the transcript: the app is \
+                             targeting repeat #{} of an identical prompt, but only {} of them \
+                             are on disk. Reload the conversation and try again.",
+                            o + 1,
+                            matches.len()
+                        )
+                    })?),
+                    // No line matches the key at all → the generic "not found" below.
+                    Some(_) => None,
+                    // No disambiguation asked for: the LAST match, as before.
+                    None => matches.last().copied(),
+                };
             }
         }
         let ti = ti.ok_or_else(|| "target message not found in the transcript".to_string())?;
@@ -2350,6 +2372,49 @@ mod tests {
         let earlier = rewind_transcript_in(&base, sid, "user_x", true, Some("ok"), Some(0)).unwrap();
         std::fs::remove_dir_all(&base).ok();
         assert_eq!(earlier.removed_lines, 4, "occurrence 0 targets the earlier duplicate");
+    }
+
+    /// An `occurrence` the transcript does NOT hold means the front and the disk disagree
+    /// about WHICH identical prompt is targeted (a turn the file never persisted, a live-only
+    /// synthetic turn shifting the count). The cut must be REFUSED — sliding onto another
+    /// repeat would truncate IN PLACE at the wrong boundary and still report success. The
+    /// fork shares the locator and refuses identically (no stray branch written).
+    #[test]
+    fn rewind_out_of_range_occurrence_is_refused_and_leaves_the_file_intact() {
+        let base = std::env::temp_dir().join(format!("tosse-rw-occ-oob-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        write_transcript(
+            &base,
+            "-p",
+            sid,
+            &[
+                r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"start"}}"#,
+                r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"r1"}]}}"#,
+                r#"{"type":"user","uuid":"u2","message":{"role":"user","content":"ok"}}"#,
+                r#"{"type":"assistant","uuid":"a2","message":{"id":"m2","content":[{"type":"text","text":"r2"}]}}"#,
+                r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"ok"}}"#,
+                r#"{"type":"assistant","uuid":"a3","message":{"id":"m3","content":[{"type":"text","text":"r3"}]}}"#,
+            ],
+        );
+        let dir = base.join("projects").join("-p");
+        let path = dir.join(format!("{sid}.jsonl"));
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // The front sees THREE "ok" turns but only two reached the disk: clicking the FIRST
+        // one sends occurrence=2, which used to land on the LAST "ok" and wipe what lay
+        // between. Both the destructive rewind and the non-destructive fork must refuse.
+        let err = rewind_transcript_in(&base, sid, "user_x", true, Some("ok"), Some(2)).unwrap_err();
+        let fork_err =
+            fork_transcript_in(&base, sid, "user_x", true, Some("ok"), Some(2)).unwrap_err();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(err.contains("Reload the conversation"), "the refusal must say what to do; got: {err}");
+        assert!(fork_err.contains("Reload the conversation"), "the fork shares the locator; got: {fork_err}");
+        assert_eq!(before, after, "a refused rewind must not touch the transcript");
+        assert_eq!(files, 1, "a refused fork must not write a branch");
     }
 
     /// A live slash-command turn (front sends "/done"; disk holds the <command-name> header)

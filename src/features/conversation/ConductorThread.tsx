@@ -37,7 +37,7 @@ import { useBackgroundTasksStore, useTaskByToolUse, useRunningTaskCount } from "
 import { fmtDuration, isBackgroundAgentInput, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
-import { AiAvatar } from "./ConvMark";
+import { AiAvatar, useIsCodex } from "./ConvMark";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
 import { PlanCard } from "./PlanCard";
@@ -150,6 +150,7 @@ export function MsgUser({
   onRewind,
   onFork,
   forkBusy,
+  goalAware,
 }: {
   text: string;
   /** Stamped as `data-user-turn` so the message minimap can scroll to this bubble.
@@ -167,6 +168,8 @@ export function MsgUser({
   onFork?: () => void;
   /** The fork on this message is in flight (spin its icon). */
   forkBusy?: boolean;
+  /** False on a backend that has no `/goal` command (Codex) — see `UserText`. */
+  goalAware?: boolean;
 }) {
   // A `<task-notification>` (and other CLI-injected markers) reaches us AS a user turn,
   // but the human didn't type it — render the clean card instead of a raw user bubble.
@@ -209,7 +212,7 @@ export function MsgUser({
             ))}
           </div>
         ) : null}
-        {text.trim() ? <UserText text={text} /> : null}
+        {text.trim() ? <UserText text={text} goalAware={goalAware} /> : null}
         <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
       </div>
     </div>
@@ -223,6 +226,8 @@ export function MsgUser({
  */
 function InlineUserMarker({ session, turnId }: { session: string; turnId: string }) {
   const turn = useTurn(session, turnId);
+  // Read BEFORE the early returns below, so the hook order stays stable.
+  const isCodex = useIsCodex(session);
   const text = turn?.streamingText ?? "";
   const images = turn?.images;
   const hasImages = !!(images && images.length);
@@ -264,7 +269,7 @@ function InlineUserMarker({ session, turnId }: { session: string; turnId: string
             ))}
           </div>
         ) : null}
-        {text.trim() ? <UserText text={text} /> : null}
+        {text.trim() ? <UserText text={text} goalAware={!isCodex} /> : null}
       </div>
     </div>
   );
@@ -1446,11 +1451,16 @@ export function TurnRow({
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
+  // `/goal` is Claude-native: on Codex the same text is an ordinary prompt, so its bubble
+  // must not render the "Goal set" card (see `UserText`). Read before the early return.
+  const isCodex = useIsCodex(session);
   if (!turn) return null;
   if (turn.role === "user") {
     // Droppable only while it is BOTH still pending and addressable on the wire — a turn
     // restored from disk or typed remotely has no uuid of ours, and nothing already
-    // running can be pulled back out of the queue.
+    // running can be pulled back out of the queue. A CODEX turn carries no uuid either
+    // (the send path stamps it for Claude only): that backend has no queue to pull a
+    // message back out of, so the cross is never offered there.
     const wireUuid = turn.queued ? turn.wireUuid : undefined;
     return (
       <MsgUser
@@ -1464,6 +1474,7 @@ export function TurnRow({
         onRewind={onRewind}
         onFork={onFork}
         forkBusy={forkBusy}
+        goalAware={!isCodex}
       />
     );
   }
