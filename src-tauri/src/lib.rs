@@ -48,7 +48,8 @@ use ipc::commands::{
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
     tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
-    tosse_link_project_repo, tosse_login_start, tosse_logout, tosse_project_repos,
+    tosse_link_project_repo, tosse_live_start, tosse_live_status, tosse_live_stop,
+    tosse_login_start, tosse_logout, tosse_project_repos,
     tosse_repo_links, tosse_set_project_status,
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_backlog,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -58,7 +59,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
-    WorkflowJournalEvent,
+    TosseCrmEvent, TosseLiveStateEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
@@ -100,6 +101,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_login_start,
             tosse_login_cancel,
             tosse_logout,
+            tosse_live_start,
+            tosse_live_stop,
+            tosse_live_status,
             tosse_repo_links,
             tosse_link_repository,
             tosse_project_repos,
@@ -220,6 +224,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionCodexPlanUsageEvent,
             SessionExtensionsChangedEvent,
             AccountLoginEvent,
+            TosseCrmEvent,
+            TosseLiveStateEvent,
             FsChangeEvent,
             FsWatchErrorEvent,
             WorkflowJournalEvent,

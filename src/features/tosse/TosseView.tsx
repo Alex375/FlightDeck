@@ -37,6 +37,9 @@ import { launchTask } from "./taskPrompts";
 import type { LaunchMode } from "./taskConversation";
 import { useConversationsForTask, type Conversation } from "../../store/conversationsStore";
 import { useTosseFold } from "../../store/tosseFold";
+import { useTosseLive } from "../../store/tosseLive";
+import { liveIndicatorView } from "./liveIndicator";
+import { commands } from "../../ipc/client";
 
 import type { TosseProject, TosseTask, TosseTaskDetail } from "../../ipc/client";
 import {
@@ -1216,6 +1219,41 @@ export function TosseView({
   );
 }
 
+/**
+ * Whether this board is following the CRM live, and — the part that earns its place — when
+ * it is NOT.
+ *
+ * The failure this guards against is specific: the socket dies, nothing on screen changes,
+ * and the view keeps showing a board it has stopped updating. The state itself comes from
+ * the core (see `tosse/sse.rs`); what to say about it is a pure function
+ * ({@link liveIndicatorView}) so the wording is pinned by tests.
+ */
+function LiveIndicator() {
+  const status = useTosseLive((l) => l.status);
+  const view = liveIndicatorView(status);
+  if (!view) return null;
+  const tone = view.tone === "on" ? s.liveOn : view.tone === "wait" ? s.liveWait : s.liveErr;
+  return (
+    <span className={`${s.live} ${tone}`} title={view.title}>
+      <span className={s.liveDot} />
+      {view.label}
+      {/* Only once retrying has given up: while the core is still cycling through its
+          backoff, a button that "reconnects" would just be a slower version of what is
+          already happening. */}
+      {view.retry ? (
+        <button
+          className={s.liveRetry}
+          onClick={() => {
+            void commands.tosseLiveStart();
+          }}
+        >
+          Reconnect
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
 function TosseBoard() {
   const { data, isLoading, isFetching, error, refetch, dataUpdatedAt } = useTosseBriefing();
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
@@ -1263,6 +1301,7 @@ function TosseBoard() {
           ) : null}
         </span>
         <span className={s.spacer} />
+        <LiveIndicator />
         <span className={s.sync}>
           {isFetching
             ? "Syncing…"

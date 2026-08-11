@@ -64,6 +64,9 @@ import type {
   TosseAccountStatus,
   TosseBacklogTask,
   TosseBriefing,
+  TosseCrmEvent,
+  TosseLiveStateEvent,
+  TosseLiveStatus,
   TosseProject,
   LocalRepoScan,
   TosseProjectRepo,
@@ -85,6 +88,9 @@ import type {
   WorktreeStatus,
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+
+/** The live channel's state in the browser mock (no socket — see `tosseLiveStart`). */
+let mockLiveStatus: TosseLiveStatus = { state: "off", detail: null, attempts: 0, connections: 0 };
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -153,6 +159,11 @@ const sessionCodexPlanUsageEvent = new MockEmitter<SessionCodexPlanUsageEvent>()
 // Extensions v2 + accounts: never fire in the mock, but the global router subscribes.
 const sessionExtensionsChangedEvent = new MockEmitter<SessionExtensionsChangedEvent>();
 const accountLoginEvent = new MockEmitter<AccountLoginEvent>();
+// The TOSSE live channel. No socket in the browser mock, so no CRM change ever arrives —
+// but the STATE event is emitted by `tosseLiveStart`/`Stop` below, so the indicator and the
+// host's reconnection handling run for real here.
+const tosseCrmEvent = new MockEmitter<TosseCrmEvent>();
+const tosseLiveStateEvent = new MockEmitter<TosseLiveStateEvent>();
 const tickEvent = new MockEmitter<TickEvent>();
 // No real filesystem in the browser mock — these never fire, but must exist so
 // the editor's `useFsWatch` can subscribe without crashing.
@@ -178,6 +189,8 @@ export const mockEvents = {
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
   accountLoginEvent,
+  tosseCrmEvent,
+  tosseLiveStateEvent,
   tickEvent,
   fsChangeEvent,
   fsWatchErrorEvent,
@@ -595,6 +608,24 @@ export const mockCommands = {
   },
   async tosseLogout(): Promise<Result<null, string>> {
     return ok(null);
+  },
+  // The live channel: there is no socket in the browser mock, so no CRM change ever
+  // arrives — but the state is announced through the SAME event the core uses, so the
+  // indicator and the host's reconnection handling are exercised rather than stubbed.
+  // Reported as `live` (not `off`) so the toolbar shows its normal state instead of a
+  // permanent warning about a connection this build was never going to make.
+  async tosseLiveStart(): Promise<Result<null, string>> {
+    mockLiveStatus = { state: "live", detail: null, attempts: 0, connections: 1 };
+    tosseLiveStateEvent.emit({ status: mockLiveStatus });
+    return ok(null);
+  },
+  async tosseLiveStop(): Promise<Result<null, string>> {
+    mockLiveStatus = { state: "off", detail: null, attempts: 0, connections: 0 };
+    tosseLiveStateEvent.emit({ status: mockLiveStatus });
+    return ok(null);
+  },
+  async tosseLiveStatus(): Promise<Result<TosseLiveStatus, string>> {
+    return ok(mockLiveStatus);
   },
   // The demo repo, matched to a CRM repository from its git remote — enough to exercise the
   // badge's linked state and the whole card (url, linked project, Markdown context). Any

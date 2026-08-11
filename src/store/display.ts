@@ -173,6 +173,19 @@ export interface DisplayPrefs {
    *  Read by {@link ClientAvatar}. */
   tosseClientFavicons: boolean;
 
+  /** Keep the TOSSE views up to date from the CRM's live feed instead of waiting out a
+   *  cache delay. ON by default.
+   *
+   *  On → the core holds ONE server-sent-events connection to the CRM while you are signed
+   *  in, and a change made in the browser (or by an agent through the MCP) refreshes the
+   *  board within a second. It is cheaper than polling: an idle socket plus a keepalive
+   *  every 15 s, and a refetch only when something actually changed.
+   *
+   *  Off → the exact behaviour that predates the feature (refresh on window focus, on a
+   *  write, and on the Refresh button), and NO connection is opened at all. Read by
+   *  {@link TosseLiveHost}; the live indicator in the tasks toolbar disappears with it. */
+  tosseLiveUpdates: boolean;
+
   /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
    *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
    *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
@@ -263,6 +276,9 @@ const DEFAULTS: DisplayPrefs = {
   // CRM's own page makes the same call for the same person, and off, the marks read as
   // broken rather than as a choice. Switchable in Settings → TOSSE (see its doc).
   tosseClientFavicons: true,
+  // ON: the whole point of the tasks view is that it agrees with the CRM, and a socket the
+  // core already authenticates costs less than the polling it replaces.
+  tosseLiveUpdates: true,
   showTurnDuration: true,
   showModelTime: true,
   showThinkingTime: true,
@@ -328,6 +344,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
+        tosseLiveUpdates: patch.tosseLiveUpdates ?? s.tosseLiveUpdates,
         showTurnDuration: patch.showTurnDuration ?? s.showTurnDuration,
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,

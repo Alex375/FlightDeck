@@ -135,6 +135,44 @@ pub struct AccountLoginEvent {
     pub error: Option<String>,
 }
 
+/// Something changed in the TOSSE CRM, per its live SSE feed (`crate::tosse::sse`).
+///
+/// Carries the event KIND only (`"task:updated"`, `"project:archived"`, …) — never the
+/// server's payload. The board is aggregated and sorted server-side, so the front treats
+/// this as a pure invalidation signal and refetches through the normal read commands; the
+/// alternative (patching the cache from here) would duplicate that aggregation in the UI.
+/// Already filtered to the domains this app reads — the CRM's broadcast is global and also
+/// carries finance / cron / settings traffic that must never reach the webview.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct TosseCrmEvent {
+    pub kind: String,
+}
+
+/// The TOSSE live channel's health. Two jobs, and both are load-bearing: the view shows a
+/// discreet indicator (a frozen board that claims to be live is the worst outcome), and the
+/// transition INTO `live` is the front's cue to refetch wholesale — the server implements no
+/// replay, so whatever changed while we were disconnected is only knowable by re-reading.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct TosseLiveStateEvent {
+    pub status: crate::tosse::sse::TosseLiveStatus,
+}
+
+/// Bridges the TOSSE live channel onto the Tauri event bus (`crate::tosse::sse::LiveSink`),
+/// so that module stays free of any Tauri dependency — same shape as [`TauriEmitter`].
+pub struct TosseLiveEmitter {
+    pub app: tauri::AppHandle,
+}
+
+impl crate::tosse::sse::LiveSink for TosseLiveEmitter {
+    fn crm_event(&self, kind: &str) {
+        emit_logged(&self.app, "tosse_crm", TosseCrmEvent { kind: kind.to_string() });
+    }
+
+    fn state(&self, status: &crate::tosse::sse::TosseLiveStatus) {
+        emit_logged(&self.app, "tosse_live_state", TosseLiveStateEvent { status: status.clone() });
+    }
+}
+
 /// Coalesced filesystem change notification for the editor panel: the (de-noised,
 /// debounced) set of paths that changed under the watched working directory. The
 /// UI reloads any open file in this set and refreshes any expanded tree dirs it

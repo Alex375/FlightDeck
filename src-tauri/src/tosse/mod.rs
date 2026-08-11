@@ -49,6 +49,11 @@ use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+/// The CRM's live change feed (`GET /api/v1/sse`), so the Tasks view stops waiting out a
+/// `staleTime` to notice a task edited elsewhere. Lives here rather than beside the IPC
+/// layer because it needs the Bearer token, which never leaves this module.
+pub mod sse;
+
 /// The TOSSE backend, hard-coded on purpose (decision: no configurable field — we always
 /// test against production, and a moved deployment is a one-line change here). It is the
 /// ONLY hard-coded URL: every OAuth endpoint is discovered from its metadata document, so
@@ -1223,6 +1228,23 @@ async fn clear_tokens(reason: Option<String>) -> R<()> {
         a.refresh_token = None;
         a.expires_at_ms = None;
         a.signed_out_reason = reason;
+        Ok((a, ()))
+    })
+    .await
+}
+
+/// Drop the ACCESS token only, keeping the refresh token (and the session) intact, so the
+/// next [`access_token`] mints a fresh one.
+///
+/// For the case the recorded expiry cannot describe: a token we still believe fresh that
+/// the server rejects anyway (a revocation on their side, a clock skew). The live channel
+/// uses it on a 401/403 — which is emphatically NOT a refused grant, so nothing here may
+/// touch `refresh_token` or `signed_out_reason`: signing the user out over a transient 403
+/// would cost them the whole browser sign-in.
+pub(crate) async fn invalidate_access_token() -> R<()> {
+    with_stored(move |mut a| {
+        a.access_token = None;
+        a.expires_at_ms = None;
         Ok((a, ()))
     })
     .await

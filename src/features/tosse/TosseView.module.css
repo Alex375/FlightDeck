@@ -83,6 +83,40 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- live-channel indicator -------------------------------------------- */
+/* Deliberately quiet: while the feed works it is a dot and a word, because "it is up to
+   date" is the state the view is in nearly always. It grows a colour and a reason only when
+   the channel is DOWN — a board that silently stops following the CRM while looking exactly
+   like one that follows it is the failure this feature must never produce. */
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--wf-tx-xlo);
+}
+.liveDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+.liveOn { color: var(--wf-run); }
+/* Reconnecting: amber, and NOT alarming — a single blip is ordinary (a closed lid, a
+   redeploy), so this state stays a note rather than a warning. */
+.liveWait { color: var(--wf-att); }
+.liveErr { color: var(--wf-err); }
+.liveRetry {
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 /* ---- error banner ----------------------------------------------------- */
 .banner {
   display: flex;
