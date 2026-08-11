@@ -176,14 +176,37 @@ export const useBackgroundWorkflowTasks = (session: string): BackgroundTask[] =>
 /** How many background tasks are currently RUNNING for a conversation. Drives the
  *  "backgrounding" agent status (idle main loop + live background work). A plain
  *  number → referentially stable, re-renders only when the count changes. */
+/** Running background tasks for ONE conversation, off a raw `sessions` snapshot.
+ *
+ *  The plain counterpart of {@link useRunningTaskCount}, for callers that already hold the
+ *  snapshot and want a single conversation's number — building a whole-fleet map (and its
+ *  object) to read one key out of it is the shape this exists to avoid. */
+export function runningCountFor(
+  sessions: Record<string, Record<string, BackgroundTask>>,
+  convId: string,
+): number {
+  const tasks = sessions[convId];
+  if (!tasks) return 0;
+  let n = 0;
+  for (const t of Object.values(tasks)) if (t.status === "running") n++;
+  return n;
+}
+
+/** The Bash-only subset of {@link runningCountFor}. Read from the SAME snapshot as the total
+ *  so the two stay consistent. */
+export function runningBashCountFor(
+  sessions: Record<string, Record<string, BackgroundTask>>,
+  convId: string,
+): number {
+  const tasks = sessions[convId];
+  if (!tasks) return 0;
+  let n = 0;
+  for (const t of Object.values(tasks)) if (t.kind === "bash" && t.status === "running") n++;
+  return n;
+}
+
 export const useRunningTaskCount = (session: string): number =>
-  useBackgroundTasksStore((s) => {
-    const tasks = s.sessions[session];
-    if (!tasks) return 0;
-    let n = 0;
-    for (const t of Object.values(tasks)) if (t.status === "running") n++;
-    return n;
-  });
+  useBackgroundTasksStore((s) => runningCountFor(s.sessions, session));
 
 /** How many background *Bash commands* (`kind: "bash"`) are currently RUNNING for a
  *  conversation. A SUBSET of {@link useRunningTaskCount}; when the two are equal (and
@@ -191,13 +214,7 @@ export const useRunningTaskCount = (session: string): number =>
  *  Bash" setting acts on (see {@link deriveAgentStatus}). A plain number → referentially
  *  stable, re-renders only when the bash count changes. */
 export const useRunningBashTaskCount = (session: string): number =>
-  useBackgroundTasksStore((s) => {
-    const tasks = s.sessions[session];
-    if (!tasks) return 0;
-    let n = 0;
-    for (const t of Object.values(tasks)) if (t.kind === "bash" && t.status === "running") n++;
-    return n;
-  });
+  useBackgroundTasksStore((s) => runningBashCountFor(s.sessions, session));
 
 /** Running background-task count for EVERY conversation at once, `{ convId → n }`,
  *  omitting the zeros so the object stays small and shallow-stable — re-renders only

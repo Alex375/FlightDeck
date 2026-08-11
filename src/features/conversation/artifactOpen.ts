@@ -114,12 +114,15 @@ export function openArtifactView(meta: ArtifactOpenMeta): void {
     });
     return;
   }
+  // BACKSTOP, not a designed state: `routeArtifactOpen` is total, but every caller already
+  // refuses to invoke this without a url (the card is unclickable, the popover row disabled,
+  // the prose card only exists for a matched artifact URL). Kept because the pure function's
+  // contract covers the case; deliberately ONE wording, since no user path reaches it and a
+  // second one tuned per host would be dead prose maintained as though it were live.
   useAppErrors
     .getState()
     .pushError(
       `Couldn't open the artifact "${meta.title}".`,
-      meta.inert
-        ? "This view has no side panel to render its local file, and the artifact has no published link yet."
-        : "It has no local file to render and no published link.",
+      "It has no local file to render and no published link.",
     );
 }

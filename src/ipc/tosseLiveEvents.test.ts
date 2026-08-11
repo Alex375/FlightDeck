@@ -4,6 +4,7 @@ import {
   connectionRefetch,
   crmEventQueryKeys,
   mergeInvalidationKeys,
+  recycleRefetchKeys,
 } from "./tosseLiveEvents";
 import {
   tosseBacklogKey,
@@ -146,6 +147,33 @@ describe("allTosseQueryKeys", () => {
       for (const key of crmEventQueryKeys(kind)) {
         expect(all, `${kind} → ${JSON.stringify(key)}`).toContain(JSON.stringify(key));
       }
+    }
+  });
+});
+
+describe("recycleRefetchKeys", () => {
+  // The server ends an idle stream every ~12 s, so this sweep is the one that repeats. It
+  // must stay a SUBSET of the outage sweep — anything it drops is covered the moment the
+  // channel actually goes down.
+  it("is a subset of the full reconnection sweep", () => {
+    const all = asSet(allTosseQueryKeys());
+    for (const key of recycleRefetchKeys()) {
+      expect(all).toContain(JSON.stringify(key));
+    }
+  });
+
+  // ⚠️ The whole point: refetching the repo links costs an HTTPS round trip PLUS one
+  // `git remote get-url` per Flight Deck folder, and the badge keeps that query mounted
+  // app-wide. Paying it on a repeating timer is the polling this feature removed.
+  it("leaves out the repo links, which a ~200 ms gap cannot plausibly have changed", () => {
+    expect(asSet(recycleRefetchKeys())).not.toContain(JSON.stringify(tosseRepoLinksKey));
+  });
+
+  // The board itself is the thing a missed event would leave stale, so it must be there.
+  it("still covers everything a task event invalidates", () => {
+    const recycle = asSet(recycleRefetchKeys());
+    for (const key of crmEventQueryKeys("task:updated")) {
+      expect(recycle).toContain(JSON.stringify(key));
     }
   });
 });

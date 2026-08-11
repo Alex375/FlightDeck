@@ -23,14 +23,7 @@ export const useTosseLive = create<TosseLiveState>((set) => ({
   set: (status) => set({ status }),
 }));
 
-/**
- * Whether the channel is failing in a way the user should SEE.
- *
- * Deliberately not "anything other than live": a single reconnection is normal (a lid
- * closed, a Railway redeploy) and flashing a warning at every blip would train the eye to
- * ignore the one that matters. The core only reports `error` once the failures have piled
- * up — see `FAILURES_BEFORE_ERROR` in `tosse/sse.rs`.
- */
-export function isLiveChannelBroken(status: TosseLiveStatus): boolean {
-  return status.state === "error";
-}
+// NOTE: "is the channel broken?" deliberately has no helper here. The one surface that asks
+// is the Tasks-view indicator, and it asks a richer question (what to SAY, and whether to
+// offer a reconnect) answered in one pure place — `features/tosse/liveIndicator.ts`. A second
+// predicate spelling the same rule differently is how the two drift.

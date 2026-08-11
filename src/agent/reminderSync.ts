@@ -6,8 +6,8 @@ import { useConversationStore } from "../store/conversationStore";
 import { useConversationsStore } from "../store/conversationsStore";
 import {
   useBackgroundTasksStore,
-  runningCountsByConv,
-  runningBashCountsByConv,
+  runningCountFor,
+  runningBashCountFor,
 } from "../store/backgroundTasksStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry } from "./useAgentStatus";
@@ -34,14 +34,17 @@ export function syncReminderFromLive(convId: string): void {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.handle) return; // off: preserve the persisted reminder as-is
   const entry = useConversationStore.getState().sessions[convId];
-  // Both counts off ONE snapshot, so the total and its Bash subset stay consistent.
+  // Both counts off ONE snapshot, so the total and its Bash subset stay consistent — and
+  // scoped to THIS conversation: this runs on every settling edge and every terminal
+  // background-task snapshot, so building two whole-fleet maps to read one key out of each
+  // was allocation for nothing.
   const tasks = useBackgroundTasksStore.getState().sessions;
   const status = agentStatusForEntry(
     conv.handle,
     entry,
     conv.pendingReminder,
-    runningCountsByConv(tasks)[convId] ?? 0,
-    runningBashCountsByConv(tasks)[convId] ?? 0,
+    runningCountFor(tasks, convId),
+    runningBashCountFor(tasks, convId),
     useDisplay.getState().alertOnBackgroundBash,
   );
   useConversationsStore.getState().setReminder(convId, statusReminderKind(status));

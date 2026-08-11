@@ -442,18 +442,6 @@ async tosseLiveStop() : Promise<Result<null, string>> {
 }
 },
 /**
- * The live channel's current health, for a surface that mounts after the last state event
- * (the events themselves carry every change — this is the initial read).
- */
-async tosseLiveStatus() : Promise<Result<TosseLiveStatus, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("tosse_live_status") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Pair every Flight Deck folder with the TOSSE repository it belongs to.
  * 
  * A manual pin wins; otherwise the folder's `origin` remote is matched against the CRM's

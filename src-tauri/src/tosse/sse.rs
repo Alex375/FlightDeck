@@ -37,8 +37,10 @@
 //! gets the chance to fire and the connection it exists to hold open is dropped first.
 //!
 //! Two consequences the loop is built around:
-//! - A clean end after a connection that RAN ([`ESTABLISHED_AFTER`]) is not a failure. It is
-//!   recycled silently: no backoff, no state change, no indicator flicker every 12 s.
+//! - A clean end after a connection that RAN ([`ESTABLISHED_AFTER`]) **and delivered** is not
+//!   a failure. It is recycled silently: no backoff, no state change, no indicator flicker
+//!   every 12 s. An idle timeout never qualifies, however long the socket stayed open — see
+//!   [`ended`], which is what keeps `Error` reachable for a stream that goes quiet.
 //! - The refetch owed per connection is throttled ON THE FRONT, or a recycle every 12 s
 //!   would become the very polling this feature exists to remove.
 //!
@@ -67,6 +69,9 @@ const SSE_PATH: &str = "/api/v1/sse";
 /// minutes after the peer is gone, and a frozen view that claims to be live is the worst
 /// outcome this feature can produce.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// How long to wait for the socket itself.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// First reconnection delay; doubles per consecutive failure up to [`MAX_BACKOFF`].
 const BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
@@ -98,6 +103,20 @@ const FAILURES_BEFORE_ERROR: u32 = 3;
 /// Event kinds this app cares about, by prefix. Everything else on the global broadcast is
 /// dropped before it reaches the webview — see the module doc.
 const INTERESTING_PREFIXES: [&str; 5] = ["task:", "project:", "mission:", "repository:", "client:"];
+
+/// Largest single framing line the parser will buffer before declaring the stream malformed.
+///
+/// A line is only complete at a `\n`, so without a ceiling a body that arrives with no
+/// newline at all — a compressed or binary payload a proxy served under a 200, a JSON blob
+/// on one line — grows the buffer for as long as bytes keep coming, and the idle timeout
+/// cannot save it because every chunk resets that clock. Far above any real CRM event.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Largest total `data:` payload accumulated for ONE event before the same verdict.
+///
+/// The other unbounded path: a server that emits `data:` lines and never the blank line that
+/// dispatches them.
+const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 // ── What the front is told ───────────────────────────────────────────────────────────
 
@@ -178,6 +197,12 @@ pub struct SseParser {
     /// Fields accumulated for the event currently being built.
     event: Option<String>,
     data: Vec<String>,
+    /// Bytes accumulated in [`Self::data`], tracked so the cap costs no re-summing.
+    data_bytes: usize,
+    /// Set once a cap is blown: the framing is not what we asked for, so the parser stops
+    /// buffering and the read loop turns this into a visible failure rather than growing
+    /// memory in silence.
+    overflow: Option<String>,
 }
 
 impl SseParser {
@@ -185,8 +210,20 @@ impl SseParser {
         Self::default()
     }
 
+    /// Why the framing was rejected, once it has been — see [`MAX_LINE_BYTES`].
+    ///
+    /// Checked by the read loop after every [`Self::feed`]: this is a fault about the stream
+    /// itself, so it must reach the user as a failed connection, never as a quietly emptied
+    /// buffer under a green indicator.
+    pub fn overflow(&self) -> Option<&str> {
+        self.overflow.as_deref()
+    }
+
     /// Feed a chunk, returning every event it completed (possibly none, possibly several).
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseMessage> {
+        if self.overflow.is_some() {
+            return Vec::new(); // already condemned: buffer nothing more
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         // Take complete lines only; whatever follows the last newline stays buffered.
@@ -199,8 +236,29 @@ impl SseParser {
             if let Some(msg) = self.line(&String::from_utf8_lossy(&line)) {
                 out.push(msg);
             }
+            if self.overflow.is_some() {
+                break;
+            }
+        }
+        // Whatever is left is an UNTERMINATED line. Bounded here, because nothing else
+        // bounds it: no newline means no drain, and every arriving chunk resets the idle
+        // timeout, so a body with no line breaks would grow this buffer indefinitely.
+        if self.overflow.is_none() && self.buf.len() > MAX_LINE_BYTES {
+            self.condemn(format!("a single line exceeded {MAX_LINE_BYTES} bytes"));
+        }
+        if self.overflow.is_some() {
+            out.clear();
         }
         out
+    }
+
+    /// Give up on this stream's framing and release everything buffered.
+    fn condemn(&mut self, why: String) {
+        self.buf = Vec::new();
+        self.data = Vec::new();
+        self.data_bytes = 0;
+        self.event = None;
+        self.overflow = Some(why);
     }
 
     /// Handle one complete line, returning an event when the line dispatches one.
@@ -209,6 +267,7 @@ impl SseParser {
         if line.is_empty() {
             let event = self.event.take();
             let data = std::mem::take(&mut self.data);
+            self.data_bytes = 0;
             // Per the spec a dispatch with no data buffer is a no-op — that is exactly the
             // shape of a lone `event:` line, and turning it into an empty event would have
             // the front refetch for nothing.
@@ -233,7 +292,14 @@ impl SseParser {
         };
         match field {
             "event" => self.event = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                self.data_bytes = self.data_bytes.saturating_add(value.len());
+                if self.data_bytes > MAX_EVENT_BYTES {
+                    self.condemn(format!("one event's data exceeded {MAX_EVENT_BYTES} bytes"));
+                    return None;
+                }
+                self.data.push(value.to_string());
+            }
             // `id` / `retry` / anything unknown: ignored. We do not resume by id (the server
             // implements no replay), and the reconnection delay is ours to decide.
             _ => {}
@@ -250,6 +316,20 @@ impl SseParser {
 /// costs a stale board.
 pub fn is_interesting(kind: &str) -> bool {
     INTERESTING_PREFIXES.iter().any(|p| kind.starts_with(p))
+}
+
+/// Whether a `Content-Type` header announces an event stream.
+///
+/// A 2xx is NOT proof that what follows is one: a captive portal, an authenticating proxy or
+/// a route regression answers `200 text/html`, and reading that as a live channel paints the
+/// board green while [`SseParser`] chews lines that never dispatch anything. The media type
+/// is the cheap discriminant, and the diagnostic probe prints it precisely because it matters.
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(|m| m.trim().eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
 }
 
 /// The reconnection delay after `attempts` consecutive failures (1-based), with jitter.
@@ -281,35 +361,89 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// an already-running channel) can be told where things stand instead of guessing.
 static STATUS: std::sync::Mutex<Option<TosseLiveStatus>> = std::sync::Mutex::new(None);
 
-/// The current published status (`Off` before the first start).
-pub fn status() -> TosseLiveStatus {
-    STATUS
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(TosseLiveStatus::off)
+/// The one HTTP client the channel uses, built at most once.
+///
+/// A DEDICATED client (not the shared one in `mod.rs`): that one carries a 15 s request
+/// timeout, which would guillotine a healthy stream every 15 seconds. Liveness is enforced
+/// by the idle timeout on reads instead — bounded per chunk, not per request.
+///
+/// ⚠️ Built ONCE, not per attempt. The server recycles an idle stream every ~12 s, so a
+/// per-attempt client would rebuild the TLS config, the resolver AND the connection pool
+/// about five times a minute for the app's whole life — throwing away the pool it is there
+/// to keep, and paying a full TCP+TLS handshake every cycle.
+static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// The shared streaming client, building it on first use.
+///
+/// A build failure is NOT cached: it is a transient (the crypto provider not yet installed,
+/// resources exhausted), and freezing it into the `OnceLock` would make one bad moment
+/// permanent for the process.
+fn stream_client() -> Result<&'static reqwest::Client, LoopExit> {
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    ensure_crypto_provider();
+    let built = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| LoopExit::Transient(format!("HTTP client build failed: {e}")))?;
+    Ok(CLIENT.get_or_init(|| built))
 }
 
+/// Take the status lock, recovering from poisoning.
+///
+/// The guarded value is a plain status struct with no invariant a panic could have broken —
+/// and a permanently unlockable mutex would mean the channel silently stops reporting for the
+/// rest of the process, which is precisely the failure mode this module refuses everywhere
+/// else. (It matters now that [`publish`] emits under the lock; see its note.)
+fn status_lock() -> std::sync::MutexGuard<'static, Option<TosseLiveStatus>> {
+    STATUS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The current published status (`Off` before the first start).
+pub fn status() -> TosseLiveStatus {
+    status_lock().clone().unwrap_or_else(TosseLiveStatus::off)
+}
+
+/// Publish a status, unless this task has been superseded.
+///
+/// ⚠️ The generation is read WHILE HOLDING the status lock, and the event goes out under it
+/// too. A check-then-act would let a task that is being aborted pass the check, get preempted
+/// by [`stop`] (which bumps the generation and publishes `off`), and only then write its
+/// `Live` over it — with its own loop already dead, nothing would ever correct that, and the
+/// UI would report a live connection to a session the user just ended. Holding one lock
+/// across both makes "am I still current?" and "here is the new status" a single step, and
+/// serialises the emitted events in the same order as the stored ones.
 fn publish(sink: &dyn LiveSink, generation: u64, status: TosseLiveStatus) {
+    let mut g = status_lock();
     if GENERATION.load(Ordering::SeqCst) != generation {
         return; // superseded task: stay silent rather than contradict the live one
     }
-    if let Ok(mut g) = STATUS.lock() {
-        *g = Some(status.clone());
-    }
+    *g = Some(status.clone());
     sink.state(&status);
 }
 
-/// Open the live channel (idempotent).
+/// Open the live channel (idempotent), or CUT SHORT a retry loop the UI shows as down.
 ///
 /// Re-publishes the current status even when already running, so the caller always learns
 /// where the channel stands — a `start` that answered nothing would leave a freshly mounted
 /// view with no state at all.
+///
+/// ⚠️ The `Error` case is not merely idempotent, and that is the point. `Error` is published
+/// after [`FAILURES_BEFORE_ERROR`] failures while the loop is still ALIVE, sleeping out a
+/// backoff of up to [`MAX_BACKOFF`] — which is exactly when the view offers its "Reconnect"
+/// button. Answering that with "here is the same error" made the button a lie: nothing
+/// reconnected, nothing on screen changed, and the user waited out the same backoff. So a
+/// wedged channel is aborted and reopened at once, which is what the button says it does.
 pub async fn start<S: LiveSink>(sink: std::sync::Arc<S>) {
     let mut guard = TASK.lock().await;
-    if guard.as_ref().is_some_and(|t| !t.is_finished()) {
+    let wedged = matches!(status().state, LiveState::Error);
+    if guard.as_ref().is_some_and(|t| !t.is_finished()) && !wedged {
         sink.state(&status());
         return;
+    }
+    if let Some(task) = guard.take() {
+        task.abort();
     }
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     *guard = Some(tokio::spawn(async move { run(sink, generation).await }));
@@ -445,14 +579,7 @@ async fn connect_and_read(
         Err(e) => return Err(LoopExit::Transient(e.to_string())),
     };
 
-    ensure_crypto_provider();
-    // A DEDICATED client: the shared one in `mod.rs` carries a 15 s request timeout, which
-    // would guillotine a healthy stream every 15 seconds. Liveness is enforced by the idle
-    // timeout on reads instead — bounded per chunk, not per request.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| LoopExit::Transient(format!("HTTP client build failed: {e}")))?;
+    let client = stream_client()?;
 
     let url = format!("{BASE_URL}{SSE_PATH}");
     let mut resp = client
@@ -486,6 +613,22 @@ async fn connect_and_read(
         return Err(LoopExit::Transient(detail));
     }
 
+    // A 2xx is not enough: the body has to actually BE an event stream. Without this check a
+    // captive portal's `200 text/html` was published as `Live`, its `connections` counter
+    // drove a wholesale refetch, and the board read "Live" while following nothing.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !is_event_stream(&content_type) {
+        return Err(LoopExit::Transient(format!(
+            "the live channel answered {http_status} as `{}`, not an event stream",
+            if content_type.is_empty() { "(no content type)" } else { content_type.as_str() }
+        )));
+    }
+
     // Connected. `connections` is what tells the front to refetch wholesale — the server
     // offers no replay, so anything that changed while we were away is only knowable by
     // re-reading. Published on EVERY connection, recycles included, because a recycle leaves
@@ -505,6 +648,9 @@ async fn connect_and_read(
         },
     );
     let connected_at = std::time::Instant::now();
+    // Whether this connection ever DELIVERED. Part of what separates the server's recycle
+    // from a socket that was merely accepted — see [`ended`].
+    let mut saw_bytes = false;
 
     let mut parser = SseParser::new();
     loop {
@@ -513,43 +659,76 @@ async fn connect_and_read(
         }
         match tokio::time::timeout(IDLE_TIMEOUT, resp.chunk()).await {
             Ok(Ok(Some(bytes))) => {
+                saw_bytes = true;
                 for msg in parser.feed(&bytes) {
                     if is_interesting(&msg.event) {
                         sink.crm_event(&msg.event);
                     }
                 }
+                // Framing we refused to keep buffering: a fault about the stream itself, so
+                // it fails the connection instead of quietly emptying a buffer under a green
+                // indicator. Never a recycle, however long the socket had been up.
+                if let Some(why) = parser.overflow() {
+                    return Err(LoopExit::Transient(format!(
+                        "the live channel is not sending events ({why})"
+                    )));
+                }
             }
             // Clean end of stream. On production this is the ORDINARY case (~12 s of
             // silence, measured) — see the module doc — so an established connection ending
             // this way is recycled rather than counted as a failure.
-            Ok(Ok(None)) => return Err(ended(connected_at, "the live channel closed")),
+            Ok(Ok(None)) => return Err(ended(connected_at, saw_bytes, EndCause::Closed)),
             Ok(Err(e)) => {
-                return Err(ended(connected_at, &format!("the live channel dropped: {e}")))
+                let why = e.to_string();
+                return Err(ended(connected_at, saw_bytes, EndCause::Dropped(&why)));
             }
-            Err(_) => {
-                return Err(ended(
-                    connected_at,
-                    &format!(
-                        "no keepalive from TOSSE for {}s — reconnecting",
-                        IDLE_TIMEOUT.as_secs()
-                    ),
-                ))
-            }
+            Err(_) => return Err(ended(connected_at, saw_bytes, EndCause::Idle)),
         }
     }
 }
 
-/// Classify the end of a connection by how long it lasted.
+/// How one connection came to an end — the input [`ended`] classifies.
+#[derive(Debug, Clone, Copy)]
+enum EndCause<'a> {
+    /// The body finished: a clean EOF.
+    Closed,
+    /// The transport failed mid-stream.
+    Dropped(&'a str),
+    /// Nothing arrived for [`IDLE_TIMEOUT`].
+    Idle,
+}
+
+/// Classify the end of a connection: the server's ordinary recycle, or a failure.
 ///
-/// One that RAN is the server's recycle: reopen at once, silently. One that died young is a
-/// failure and keeps its place in the backoff — which is what stops an accept-then-drop
-/// server (or a proxy refusing us in a loop) from being hammered.
-fn ended(connected_at: std::time::Instant, detail: &str) -> LoopExit {
-    if connected_at.elapsed() >= ESTABLISHED_AFTER {
-        LoopExit::Recycle
-    } else {
-        LoopExit::Transient(detail.to_string())
+/// A recycle is reopened at once and silently; a failure keeps its place in the backoff,
+/// which is what stops an accept-then-drop server (or a proxy refusing us in a loop) from
+/// being hammered — and what eventually turns the indicator red.
+///
+/// ⚠️ Two conditions, and BOTH are load-bearing:
+/// - the connection RAN ([`ESTABLISHED_AFTER`]), and
+/// - it DELIVERED at least one byte. Production sends `connected` immediately, so a stream
+///   that produced nothing at all never was one.
+///
+/// And the idle timeout is never a recycle, whatever the clock says. The recycle ENDS the
+/// body; it does not hold a socket open in silence. Classifying it by elapsed time alone made
+/// `Error` unreachable for the case that needs it most: a buffering proxy answering 200 and
+/// then saying nothing would time out at [`IDLE_TIMEOUT`] — necessarily past
+/// [`ESTABLISHED_AFTER`] — be filed as a recycle, and loop forever under a green "Live" with
+/// `attempts` stuck at 0.
+fn ended(connected_at: std::time::Instant, saw_bytes: bool, cause: EndCause<'_>) -> LoopExit {
+    if let EndCause::Idle = cause {
+        return LoopExit::Transient(format!(
+            "nothing arrived on the live channel for {}s",
+            IDLE_TIMEOUT.as_secs()
+        ));
     }
+    if saw_bytes && connected_at.elapsed() >= ESTABLISHED_AFTER {
+        return LoopExit::Recycle;
+    }
+    LoopExit::Transient(match cause {
+        EndCause::Dropped(e) => format!("the live channel dropped: {e}"),
+        _ => "the live channel closed".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -684,7 +863,7 @@ mod tests {
     #[test]
     fn a_stream_that_ran_is_recycled_not_failed() {
         let ran = std::time::Instant::now() - (ESTABLISHED_AFTER + std::time::Duration::from_secs(1));
-        assert!(matches!(ended(ran, "closed"), LoopExit::Recycle));
+        assert!(matches!(ended(ran, true, EndCause::Closed), LoopExit::Recycle));
     }
 
     /// The opposite guard: a server that accepts and drops us at once must NOT be reopened
@@ -692,7 +871,73 @@ mod tests {
     #[test]
     fn a_stream_that_dies_young_is_a_failure() {
         let young = std::time::Instant::now() - std::time::Duration::from_millis(200);
-        assert!(matches!(ended(young, "closed"), LoopExit::Transient(_)));
+        assert!(matches!(ended(young, true, EndCause::Closed), LoopExit::Transient(_)));
+    }
+
+    /// ⚠️ The regression that made `Error` unreachable: a buffering proxy answers 200, sends
+    /// nothing, and the read times out — necessarily LATER than `ESTABLISHED_AFTER`. Judged
+    /// on elapsed time alone that was a "recycle", so the loop reopened forever under a green
+    /// "Live" with `attempts` stuck at 0 and the reason string dead text.
+    #[test]
+    fn a_silent_stream_is_a_failure_however_long_it_stayed_open() {
+        let long = std::time::Instant::now() - (IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        let exit = ended(long, false, EndCause::Idle);
+        match exit {
+            LoopExit::Transient(d) => assert!(d.contains("nothing arrived"), "{d}"),
+            _ => panic!("an idle timeout is never the server's recycle"),
+        }
+        // Even a stream that HAD delivered before going quiet: the recycle ends the body, it
+        // never holds the socket open saying nothing.
+        assert!(matches!(ended(long, true, EndCause::Idle), LoopExit::Transient(_)));
+    }
+
+    /// A connection that delivered NOTHING never was the recycle either: production sends
+    /// `connected` at once, so an empty stream is a socket that was merely accepted.
+    #[test]
+    fn a_stream_that_delivered_nothing_is_a_failure() {
+        let long = std::time::Instant::now() - (ESTABLISHED_AFTER + std::time::Duration::from_secs(9));
+        assert!(matches!(ended(long, false, EndCause::Closed), LoopExit::Transient(_)));
+    }
+
+    /// A 2xx says nothing about the framing: a portal's `text/html` must not be read as a
+    /// live channel.
+    #[test]
+    fn only_an_event_stream_content_type_is_accepted() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("text/event-stream; charset=utf-8"));
+        assert!(is_event_stream("Text/Event-Stream"), "the media type is case-insensitive");
+        for bad in ["", "text/html", "text/html; charset=utf-8", "application/json"] {
+            assert!(!is_event_stream(bad), "{bad} is not an event stream");
+        }
+    }
+
+    /// The unbounded-memory guard: a body with no newline at all (a compressed payload a
+    /// proxy served under a 200) must stop being buffered, and must SAY so — the idle
+    /// timeout cannot save it, since every arriving chunk resets that clock.
+    #[test]
+    fn a_line_that_never_ends_is_bounded_and_reported() {
+        let mut p = SseParser::new();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut fed = 0usize;
+        while p.overflow().is_none() && fed < MAX_LINE_BYTES * 4 {
+            p.feed(&chunk);
+            fed += chunk.len();
+        }
+        assert!(p.overflow().is_some(), "an endless line must condemn the stream");
+        assert!(p.buf.is_empty(), "the buffer must be released, not kept");
+        // Condemned means condemned: nothing more is buffered, nothing more is emitted.
+        assert!(p.feed(b"event: task:updated\ndata: x\n\n").is_empty());
+    }
+
+    /// The other unbounded path: `data:` lines that are never dispatched by a blank line.
+    #[test]
+    fn undispatched_data_is_bounded_and_reported() {
+        let mut p = SseParser::new();
+        let line = format!("data: {}\n", "y".repeat(64 * 1024));
+        while p.overflow().is_none() {
+            p.feed(line.as_bytes());
+        }
+        assert!(p.data.is_empty(), "the accumulated data must be released");
     }
 
     /// A blip stays quiet; a streak becomes visible. The reason is carried either way, so a

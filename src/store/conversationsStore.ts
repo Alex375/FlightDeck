@@ -1865,26 +1865,11 @@ export function groupByRepo(
     .sort(sortRepos);
 }
 
-/**
- * Group conversations under their repo and order by recency: within a repo the
- * most recently active conversation comes first, and repos are ordered by their
- * most recent conversation (an empty repo falls back to when it was added). The
- * recency-ordered grouping the sidebar shows — the FlightDeck reuses the same
- * skeleton (`groupByRepo`) but orders status-first instead (see `orderLanes`).
- */
-export function groupConversationsByRepo(
-  repos: Repo[],
-  conversations: Conversation[],
-): RepoGroup[] {
-  // After the recency sort, a group's first conversation is its most recent one.
-  const recency = (g: RepoGroup) => g.conversations[0]?.lastActivityAt ?? g.repo.addedAt;
-  return groupByRepo(
-    repos,
-    conversations,
-    (a, b) => b.lastActivityAt - a.lastActivityAt,
-    (a, b) => recency(b) - recency(a),
-  );
-}
+// NOTE: there is no separate recency-only `groupConversationsByRepo`. It became a second,
+// unrendered spelling of the same order the day the sidebar and ⌘⌥↑/↓ both moved to
+// `groupConversationsByRepoOrdered` — a function only its own test still called, where the
+// recency comparator could be changed "safely green" against a code path nothing renders.
+// Recency is that function with both `auto*` flags on.
 
 /**
  * Group conversations by repo honouring the sidebar's MANUAL drag order per level. Each

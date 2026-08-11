@@ -12,7 +12,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dot, Ico } from "../../ui/kit";
-import { useFlightdeckModal } from "../flightdeck/flightdeckModalStore";
 import { useArtifacts, type Artifact } from "./artifacts";
 import { openArtifactView } from "./artifactOpen";
 
@@ -133,16 +132,25 @@ function ArtifactRow({
 // popover root), which would make the per-artifact "vN" version-expand button close the popover
 // instead of expanding it. This one owns its own portal + placement precisely to keep clicks
 // inside it non-dismissing; only a row click (which navigates away) closes it.
-export function ArtifactsChip({ session }: { session: string }) {
+export function ArtifactsChip({
+  session,
+  inert = false,
+}: {
+  session: string;
+  /**
+   * True when the host mounts NO side region to reveal an artifact into (the Flight Deck
+   * reply modal). Same question `FileMentionProvider`'s `inert` answers for the thread — but
+   * the composer sits OUTSIDE that provider, so the host passes it down instead.
+   *
+   * ⚠️ It used to be re-derived here by asking the reply-modal store whether IT was showing
+   * this conversation. That hard-coded one host into a shared question: a second host without
+   * a side region, or a differently keyed modal store, and clicks would silently route back
+   * into a viewer that cannot render — the dead click (plus the leaked `artifactView` that
+   * popped open later) this gate exists to prevent.
+   */
+  inert?: boolean;
+}) {
   const artifacts = useArtifacts(session);
-  // Is this conversation's composer mounted on a host WITHOUT a side region? Every other
-  // click-to-reveal surface reads FileMentionProvider's `inert` for that, but the composer sits
-  // OUTSIDE that provider (it only wraps the thread), so the reachable signal is the reply modal
-  // itself: it is the one inert host, it mounts a bare pane, and its store holds the conversation
-  // it shows — exactly how notify.ts asks "is this conversation being watched in the modal?".
-  // Without this, a row click set a viewer state the modal cannot render (dead click) that then
-  // popped open the next time the conversation was opened full-screen.
-  const inert = useFlightdeckModal((s) => s.convId) === session;
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<ArtifactPopPos | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);

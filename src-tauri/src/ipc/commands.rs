@@ -571,13 +571,12 @@ pub async fn tosse_live_stop(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// The live channel's current health, for a surface that mounts after the last state event
-/// (the events themselves carry every change — this is the initial read).
-#[tauri::command]
-#[specta::specta]
-pub fn tosse_live_status() -> Result<crate::tosse::sse::TosseLiveStatus, String> {
-    Ok(crate::tosse::sse::status())
-}
+// NOTE: there is deliberately NO `tosse_live_status` command. The health of the channel
+// reaches the front entirely through `TosseLiveStateEvent`: `TosseLiveHost` mounts once at
+// the app root BEFORE the channel is started and receives every state event, including the
+// one `tosse_live_start` re-publishes for an already-running channel. A pull-based initial
+// read had no caller — it was an IPC command, a generated binding and a mock implementation
+// kept compiling for nobody.
 
 /// How each of Flight Deck's folders relates to TOSSE, in one call.
 ///

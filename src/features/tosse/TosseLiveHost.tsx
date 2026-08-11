@@ -22,6 +22,7 @@ import {
   allTosseQueryKeys,
   connectionRefetch,
   mergeInvalidationKeys,
+  recycleRefetchKeys,
 } from "../../ipc/tosseLiveEvents";
 import { useTosseConnection } from "../../ipc/useTosse";
 import { useTosseLive } from "../../store/tosseLive";
@@ -37,20 +38,23 @@ import { useAppErrors } from "../../store/appErrors";
 const BURST_MS = 400;
 
 /**
- * Shortest interval between two whole-board refetches caused by a (re)connection.
+ * Shortest interval between two refetches caused by the server RECYCLING an idle stream.
  *
  * ⚠️ This exists because of a MEASURED server behaviour: an idle stream is ended by the
  * proxy roughly every 12 s (see `tosse/sse.rs`), so the core reopens one about that often.
- * Each connection owes a full refetch — there is no replay, so the gap could have hidden a
+ * Each connection owes a refetch — there is no replay, so the gap could have hidden a
  * change — and honouring every one of them literally would be a refetch every 12 s: the
  * polling this feature exists to remove, wearing a different hat.
  *
- * So they are throttled, with the pending one kept (never dropped): the worst case is that a
- * change landing inside a ~200 ms reconnection gap is shown up to this long after the fact,
- * instead of the board being re-downloaded five times a minute. Fixing the keepalive on the
- * CRM side would make both the recycles and this throttle unnecessary.
+ * Set to the briefing's own `staleTime`, so at its very worst this costs no more than the
+ * query would have refetched by itself. Two further guards keep it from becoming a permanent
+ * poll (which is exactly what it was): the sweep is narrowed to what a ~200 ms gap can
+ * plausibly have hidden ({@link recycleRefetchKeys}, which excludes the expensive repo-link
+ * matching), and it does not run at all while the window is hidden — it is held, then flushed
+ * when the user comes back. Fixing the keepalive on the CRM side would make both the recycles
+ * and this throttle unnecessary.
  */
-const RECONNECT_REFETCH_MS = 30_000;
+const RECYCLE_REFETCH_MS = 60_000;
 
 export function TosseLiveHost() {
   const queryClient = useQueryClient();
@@ -72,9 +76,16 @@ export function TosseLiveHost() {
   // a bumped counter is precisely the case a transition test would miss.
   const refetchedFor = useRef(0);
   // Throttle bookkeeping for those refetches: when the last one ran, and the timer that will
-  // run the one we held back. Held back, never dropped — see RECONNECT_REFETCH_MS.
+  // run the one we held back. Held back, never dropped — see RECYCLE_REFETCH_MS.
   const lastRefetchAt = useRef(0);
   const pendingRefetch = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Was the channel ever NOT live since the connection we last refetched for? That is what
+  // separates the server's ~200 ms recycle from a real outage (a lid closed, a redeploy),
+  // whose gap can be minutes long. The two owe very different refetches — see onState.
+  const sawOutage = useRef(false);
+  // What the last (re)connection still owes, if anything. "full" outranks "recycle": once an
+  // outage is in the mix, the narrow sweep is no longer enough to cover the gap.
+  const owed = useRef<null | "recycle" | "full">(null);
 
   // Listeners are attached ONCE, independently of whether the channel is currently open:
   // re-attaching them on every sign-in would race the events themselves (a state event
@@ -82,6 +93,11 @@ export function TosseLiveHost() {
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
+    // ⚠️ `listen()` is async, so an unmount can land BEFORE it resolves — which StrictMode
+    // makes happen on every dev mount. Pushing into the array from the `.then` would then
+    // register a listener nobody ever removes: it stays on the Tauri bus for the life of the
+    // app, delivering every event to a handler the `disposed` flag has already muted.
+    const track = (un: () => void) => (disposed ? un() : unlisteners.push(un));
 
     const flush = () => {
       timer.current = null;
@@ -97,34 +113,73 @@ export function TosseLiveHost() {
       if (timer.current == null) timer.current = setTimeout(flush, BURST_MS);
     };
 
-    const refetchEverything = () => {
+    /**
+     * Run the refetch a (re)connection owes — unless the window is hidden, in which case it
+     * stays owed and is flushed on the way back. A backgrounded app must do NO periodic work:
+     * that was the polling this feature exists to remove.
+     */
+    const runOwed = () => {
       pendingRefetch.current = null;
+      const what = owed.current;
+      if (what == null || document.hidden) return;
+      owed.current = null;
       lastRefetchAt.current = Date.now();
-      for (const key of allTosseQueryKeys()) {
+      for (const key of what === "full" ? allTosseQueryKeys() : recycleRefetchKeys()) {
         void queryClient.invalidateQueries({ queryKey: key });
       }
     };
 
+    /** Owe it now if the throttle allows, else park it on a timer. */
+    const scheduleOwed = () => {
+      if (pendingRefetch.current != null || document.hidden) return;
+      const since = Date.now() - lastRefetchAt.current;
+      if (since >= RECYCLE_REFETCH_MS) runOwed();
+      else pendingRefetch.current = setTimeout(runOwed, RECYCLE_REFETCH_MS - since);
+    };
+
     const onState = (status: TosseLiveStatus) => {
       useTosseLive.getState().set(status);
-      // ⚠️ Every connection owes a full refetch: the server implements no replay, so
-      // whatever it emitted while the socket was down is gone. Without it, a reconnection
-      // leaves the view showing — confidently, under a green indicator — a board that
-      // changed in the meantime. The rule itself is pure and tested.
+      // Sign-out clears the slate: there is no gap to cover for a channel nobody asked for.
+      if (status.state === "off") {
+        sawOutage.current = false;
+        owed.current = null;
+      } else if (status.state !== "live") {
+        sawOutage.current = true;
+      }
+      // ⚠️ Every connection owes a refetch: the server implements no replay, so whatever it
+      // emitted while the socket was down is gone. Without it, a reconnection leaves the view
+      // showing — confidently, under a green indicator — a board that changed in the
+      // meantime. The rule itself is pure and tested.
       const { refetch, nextHandled } = connectionRefetch(status, refetchedFor.current);
       refetchedFor.current = nextHandled;
       if (!refetch) return;
-      if (pendingRefetch.current != null) return; // already owed; the timer will cover this one
-      const since = Date.now() - lastRefetchAt.current;
-      if (since >= RECONNECT_REFETCH_MS) refetchEverything();
-      else pendingRefetch.current = setTimeout(refetchEverything, RECONNECT_REFETCH_MS - since);
+      // How MUCH is owed depends on what the gap was. A real outage (the channel dropped to
+      // connecting/error first) can have hidden minutes of changes and is rare → the full
+      // sweep, right now, no throttle. The server's idle recycle hides ~200 ms and happens
+      // five times a minute → the narrow sweep, on the throttle. Treating both as "refetch
+      // everything" is what turned this into a permanent 30-second poll of the whole board.
+      const outage = sawOutage.current;
+      sawOutage.current = false;
+      owed.current = outage || owed.current === "full" ? "full" : "recycle"; // "full" wins
+      if (!outage) {
+        scheduleOwed();
+        return;
+      }
+      if (pendingRefetch.current != null) clearTimeout(pendingRefetch.current);
+      runOwed();
     };
+
+    // Coming back to the window is when a held-back refetch is finally worth paying for.
+    const onVisibility = () => {
+      if (!document.hidden && owed.current != null) scheduleOwed();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
 
     events.tosseCrmEvent
       .listen((e) => {
         if (!disposed) onCrmEvent(e.payload.kind);
       })
-      .then((un) => unlisteners.push(un))
+      .then(track)
       .catch((e) =>
         // Attaching is the one failure that would make the whole feature silently absent:
         // the socket runs, the indicator says "live", and nothing ever refreshes.
@@ -136,7 +191,7 @@ export function TosseLiveHost() {
       .listen((e) => {
         if (!disposed) onState(e.payload.status);
       })
-      .then((un) => unlisteners.push(un))
+      .then(track)
       .catch((e) =>
         useAppErrors
           .getState()
@@ -149,6 +204,7 @@ export function TosseLiveHost() {
       timer.current = null;
       if (pendingRefetch.current != null) clearTimeout(pendingRefetch.current);
       pendingRefetch.current = null;
+      document.removeEventListener("visibilitychange", onVisibility);
       unlisteners.forEach((un) => un());
     };
   }, [queryClient]);

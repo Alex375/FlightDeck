@@ -37,7 +37,7 @@ import { useBackgroundTasksStore, useTaskByToolUse, useRunningTaskCount } from "
 import { fmtDuration, isBackgroundAgentInput, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
-import { AiAvatar, useIsCodex } from "./ConvMark";
+import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
 import { PlanCard } from "./PlanCard";
@@ -226,8 +226,9 @@ export function MsgUser({
  */
 function InlineUserMarker({ session, turnId }: { session: string; turnId: string }) {
   const turn = useTurn(session, turnId);
-  // Read BEFORE the early returns below, so the hook order stays stable.
-  const isCodex = useIsCodex(session);
+  // Read BEFORE the early returns below, so the hook order stays stable. Row-scoped reader:
+  // one marker per injected message, and the answer is the same for the whole thread.
+  const isCodex = useRowIsCodex(session);
   const text = turn?.streamingText ?? "";
   const images = turn?.images;
   const hasImages = !!(images && images.length);
@@ -1060,9 +1061,7 @@ export function ConductorThread({
   // Codex has no in-place truncation, so it FORKS the thread through the chosen turn
   // (thread/fork{lastTurnId}) and swaps onto the branch — targeting by Codex turn id, not text.
   // ⚠️ Neither reverts on-disk file changes — history only (spelled out in the confirm dialog).
-  const isCodex = useConversationsStore(
-    (s) => s.conversations.find((c) => c.id === session)?.kind === "codex",
-  );
+  const isCodex = useIsCodex(session);
   const messageControls = useDisplay((s) => s.messageControls);
   const runningBgTasks = useRunningTaskCount(session);
   const showControls = messageControls && !busy && !awaiting && !disableControls;
@@ -1202,6 +1201,8 @@ export function ConductorThread({
   }, [busy, awaiting, rewindTarget]);
 
   return (
+    // Answered once here, for every row in the thread: see ConvKindProvider.
+    <ConvKindProvider session={session}>
     <div className="cv-thread" ref={scrollRef}>
       <StreamFollow session={session} onRender={onRender} />
       <div className="cv-thread-inner">
@@ -1339,6 +1340,7 @@ export function ConductorThread({
         ) : null}
       </ConfirmDialog>
     </div>
+    </ConvKindProvider>
   );
 }
 
@@ -1452,8 +1454,9 @@ export function TurnRow({
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
   // `/goal` is Claude-native: on Codex the same text is an ordinary prompt, so its bubble
-  // must not render the "Goal set" card (see `UserText`). Read before the early return.
-  const isCodex = useIsCodex(session);
+  // must not render the "Goal set" card (see `UserText`). Read before the early return, and
+  // through the row-scoped reader: this component is one instance PER TURN.
+  const isCodex = useRowIsCodex(session);
   if (!turn) return null;
   if (turn.role === "user") {
     // Droppable only while it is BOTH still pending and addressable on the wire — a turn

@@ -331,9 +331,15 @@ export function MentionLink({
   // Gated by `inert` alone: a file link the model wrote in its conversation is clickable
   // regardless of the "clickable file paths (Read/Write tools)" pref — only a host with no
   // editor to reveal into (the reply modal) forces plain text.
+  //
+  // ⚠️ Through {@link useHostInert}, not an inline `?? true`: off a provider the two spellings
+  // used to disagree (`false` there, `true` here) about the very same question. It was masked
+  // only because a provider-less render also has no convId, so nothing consulted the value —
+  // exactly the kind of contradiction that surfaces the day one branch starts reading it.
+  const hostInert = useHostInert();
   const route = useMemo(
-    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: ctx?.inert ?? true }),
-    [href, ctx?.cwd, ctx?.inert],
+    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: hostInert }),
+    [href, ctx?.cwd, hostInert],
   );
   // A hosted-artifact URL renders as a compact artifact card (opens the in-app viewer / browser),
   // not a plain anchor — regardless of host, so it's recognisable everywhere Claude links one.
@@ -342,7 +348,7 @@ export function MentionLink({
   // Checked AFTER the hook above so hook order stays stable if a streaming href flips.
   if (isArtifactUrl(href)) {
     return (
-      <ArtifactRefCard url={href!} convId={ctx?.convId ?? null} inert={ctx?.inert ?? true}>
+      <ArtifactRefCard url={href!} convId={ctx?.convId ?? null} inert={hostInert}>
         {children}
       </ArtifactRefCard>
     );

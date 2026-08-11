@@ -1265,9 +1265,11 @@ function LiveIndicator() {
     <span className={`${s.live} ${tone}`} title={view.title}>
       <span className={s.liveDot} />
       {view.label}
-      {/* Only once retrying has given up: while the core is still cycling through its
-          backoff, a button that "reconnects" would just be a slower version of what is
-          already happening. */}
+      {/* Offered only once the channel reads as DOWN — while it is still cycling quietly
+          through its backoff, a button would just be a slower version of what is already
+          happening. And it really does reconnect: `tosse_live_start` CUTS a wedged retry
+          loop short and reopens at once, rather than answering with the error the user is
+          already looking at (see `start` in tosse/sse.rs). */}
       {view.retry ? (
         <button
           className={s.liveRetry}

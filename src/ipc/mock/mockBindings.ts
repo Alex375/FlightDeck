@@ -66,7 +66,6 @@ import type {
   TosseBriefing,
   TosseCrmEvent,
   TosseLiveStateEvent,
-  TosseLiveStatus,
   TosseProject,
   LocalRepoScan,
   TosseProjectRepo,
@@ -89,8 +88,6 @@ import type {
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
-/** The live channel's state in the browser mock (no socket — see `tosseLiveStart`). */
-let mockLiveStatus: TosseLiveStatus = { state: "off", detail: null, attempts: 0, connections: 0 };
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -650,17 +647,16 @@ export const mockCommands = {
   // Reported as `live` (not `off`) so the toolbar shows its normal state instead of a
   // permanent warning about a connection this build was never going to make.
   async tosseLiveStart(): Promise<Result<null, string>> {
-    mockLiveStatus = { state: "live", detail: null, attempts: 0, connections: 1 };
-    tosseLiveStateEvent.emit({ status: mockLiveStatus });
+    tosseLiveStateEvent.emit({
+      status: { state: "live", detail: null, attempts: 0, connections: 1 },
+    });
     return ok(null);
   },
   async tosseLiveStop(): Promise<Result<null, string>> {
-    mockLiveStatus = { state: "off", detail: null, attempts: 0, connections: 0 };
-    tosseLiveStateEvent.emit({ status: mockLiveStatus });
+    tosseLiveStateEvent.emit({
+      status: { state: "off", detail: null, attempts: 0, connections: 0 },
+    });
     return ok(null);
-  },
-  async tosseLiveStatus(): Promise<Result<TosseLiveStatus, string>> {
-    return ok(mockLiveStatus);
   },
   // The demo repo, matched to a CRM repository from its git remote — enough to exercise the
   // badge's linked state and the whole card (url, linked project, Markdown context). Any

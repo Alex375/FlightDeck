@@ -1053,7 +1053,9 @@ export const ConductorComposer = forwardRef<
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
     artifacts: (
-      <ArtifactsChip session={session} />
+      // `hasPanels` IS the "does this host have a side region?" signal the pane already
+      // threads down (it is `!inertMentions`), so the chip is told rather than made to guess.
+      <ArtifactsChip session={session} inert={!hasPanels} />
     ),
     // Extensions panel — what this conversation's Claude sees (MCP + live
     // status, plugins, skills, sub-agents), like /mcp. Scans the session's

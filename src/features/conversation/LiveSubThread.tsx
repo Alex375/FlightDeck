@@ -10,6 +10,7 @@
 // bindings resolve it safely.
 
 import { TurnRow } from "./ConductorThread";
+import { ConvKindProvider } from "./ConvMark";
 import { AgentInstruction } from "./SubAgentTranscript";
 
 export function LiveSubThread({
@@ -25,14 +26,18 @@ export function LiveSubThread({
   promptText?: string | null;
 }) {
   return (
-    <div className="cv-subtranscript">
-      {/* Claude's instruction to the sub-agent — attributed to Claude, not to the user
-          (it used to carry the human avatar, as if they had written it). Same component as
-          the cold drill-in, so live and settled views match. */}
-      {promptText ? <AgentInstruction text={promptText} /> : null}
-      {ids.map((id) => (
-        <TurnRow key={id} session={session} turnId={id} />
-      ))}
-    </div>
+    // The drill-in popovers mount this OUTSIDE the thread, so it answers the backend question
+    // for its own rows rather than leaving each one to ask the store.
+    <ConvKindProvider session={session}>
+      <div className="cv-subtranscript">
+        {/* Claude's instruction to the sub-agent — attributed to Claude, not to the user
+            (it used to carry the human avatar, as if they had written it). Same component as
+            the cold drill-in, so live and settled views match. */}
+        {promptText ? <AgentInstruction text={promptText} /> : null}
+        {ids.map((id) => (
+          <TurnRow key={id} session={session} turnId={id} />
+        ))}
+      </div>
+    </ConvKindProvider>
   );
 }

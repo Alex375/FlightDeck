@@ -117,3 +117,21 @@ export function allTosseQueryKeys(): InvalidationKey[] {
     tosseRepoLinksKey,
   ];
 }
+
+/**
+ * The narrower sweep owed by the server RECYCLING an idle stream (a ~200 ms gap, five times
+ * a minute) rather than by a real outage.
+ *
+ * ⚠️ The difference is cost, and it is not marginal. `tosseRepoLinks` is mounted app-wide by
+ * the sidebar's repo badge, and refetching it costs an HTTPS round trip to the CRM PLUS a
+ * `git remote get-url` spawned per Flight Deck folder — paying that on a repeating timer, for
+ * a gap that could only ever have hidden a fifth of a second, is strictly more background
+ * work than the `staleTime` behaviour the live channel replaced.
+ *
+ * What it drops is bounded: repository and client changes are the rare ones, they already
+ * invalidate this key the moment their event arrives, and a real outage (whose gap is
+ * unbounded) still gets {@link allTosseQueryKeys}.
+ */
+export function recycleRefetchKeys(): InvalidationKey[] {
+  return [tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix, tosseProjectReposKey];
+}
