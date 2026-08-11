@@ -36,7 +36,12 @@ import { TaskLaunchProvider, useTaskLaunch } from "./TaskLaunch";
 import { launchTask } from "./taskPrompts";
 import type { LaunchMode } from "./taskConversation";
 import { useConversationsForTask, type Conversation } from "../../store/conversationsStore";
-import { useTosseFold } from "../../store/tosseFold";
+import {
+  backlogFoldKey,
+  GENERAL_FOLD_KEY,
+  projectFoldKey,
+  useTosseFold,
+} from "../../store/tosseFold";
 
 import type { TosseProject, TosseTask, TosseTaskDetail } from "../../ipc/client";
 import {
@@ -57,18 +62,6 @@ import {
   type StatusSection,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
-
-/** Fold key for the project-less band. Prefixed so it can never collide with a client id. */
-const GENERAL_FOLD_KEY = "band:general";
-
-/**
- * Fold key for a card's Backlog section.
- *
- * ⚠️ Read INVERTED. `tosseFold` stores what is CLOSED, because every other band defaults to
- * open. The backlog defaults to CLOSED — it is what you are not working on — so here the
- * presence of the key means OPEN. Same store, same persistence, opposite default.
- */
-const backlogKey = (projectId: string) => `backlog:${projectId}`;
 
 /** The progress ring on a project card (done / total across ALL its tasks). Pure SVG —
  *  the same shape the CRM draws, so the two read as one number. */
@@ -171,7 +164,7 @@ function BacklogSection({
   onStatus: (task: TosseTask, status: string) => void;
   writeErrors?: Record<string, string>;
 }) {
-  // Inverted read — see `backlogKey`.
+  // Inverted read — see `backlogFoldKey`.
   const open = useTosseFold((f) => f.folded[foldKey] === true);
   const toggle = useTosseFold((f) => f.toggle);
   if (tasks.length === 0) return null;
@@ -764,6 +757,9 @@ function ProjectCard({
   const taskErrors = useTaskWriteErrors();
   const [confirming, setConfirming] = useState<ProjectAction | null>(null);
   const sections = useMemo(() => statusSections(project.tasks), [project.tasks]);
+  const foldKey = projectFoldKey(project.id);
+  const folded = useTosseFold((f) => f.folded[foldKey] === true);
+  const toggle = useTosseFold((f) => f.toggle);
   const actions = projectActions(project.status);
   const start = shortDate(project.startDate);
   const due = shortDate(project.dueDate);
@@ -776,21 +772,49 @@ function ProjectCard({
 
   return (
     <div
-      className={`${s.card} ${paused ? s.cardPaused : ""}`}
+      className={`${s.card} ${paused ? s.cardPaused : ""} ${folded ? s.cardFolded : ""}`}
       style={{ "--i": index ?? 0 } as React.CSSProperties}
     >
       <div className={s.cardHead}>
-        <div className={s.cardIdent}>
-          <div className={s.cardName}>{project.name}</div>
-          <div className={s.cardMeta}>
-            {start ? <span>Started {start}</span> : null}
-            {due ? <span className={late ? s.dueLate : ""}>Due {due}</span> : null}
-            <span>
-              {project.tasks.length} open
-              {paused ? " · paused" : ""}
+        {/* The card's own disclosure, wearing the client band's chevron because it does the
+            same thing one level down. It covers the identity block ONLY: the tools beside it
+            are buttons of their own, and a button cannot live inside a button. */}
+        <button
+          className={s.cardIdent}
+          onClick={() => toggle(foldKey)}
+          aria-expanded={!folded}
+          title={folded ? `Show « ${project.name} »'s tasks` : `Hide « ${project.name} »'s tasks`}
+        >
+          <span className={`${s.cardChevron} ${folded ? s.cardChevronClosed : ""}`}>
+            <Ico name="chevron" className="sm" />
+          </span>
+          <span className={s.cardIdentText}>
+            <span className={s.cardName}>{project.name}</span>
+            <span className={s.cardMeta}>
+              {start ? <span>Started {start}</span> : null}
+              {due ? <span className={late ? s.dueLate : ""}>Due {due}</span> : null}
+              <span>
+                {project.tasks.length} open
+                {paused ? " · paused" : ""}
+              </span>
+              {/* Folded, the head takes over what the sections below were saying — a closed
+                  card still has to tell you whether anything in it is running or waiting,
+                  the same way a folded client band keeps its counts. Open, they would only
+                  repeat the section headings a few pixels lower. */}
+              {folded
+                ? sections.map((sec) => (
+                    <span
+                      key={sec.status}
+                      className={s.cardCount}
+                      data-tone={STATUS_TONE[sec.status] ?? "todo"}
+                    >
+                      {sec.tasks.length} {sectionLabel(sec.status).toLowerCase()}
+                    </span>
+                  ))
+                : null}
             </span>
-          </div>
-        </div>
+          </span>
+        </button>
         <div className={s.cardTools}>
           {/* Where this project's work happens on this Mac — stated, and re-pickable.
               An association decided once inside a dialog would otherwise be invisible. */}
@@ -821,12 +845,16 @@ function ProjectCard({
 
       {/* A refused write is shown where it happened, not swallowed by the next refetch.
           Task-level refusals are rendered under their own row (see `writeErrors`); this one
-          is the PROJECT's own state change, which has no row to sit under. */}
+          is the PROJECT's own state change, which has no row to sit under.
+
+          ⚠️ OUTSIDE the fold, unlike everything below: the buttons that produce this error
+          live in the head, which stays on screen when the card is closed. Folding it away
+          would leave a click that visibly did nothing and no reason anywhere. */}
       {setProjectStatus.error ? (
         <div className={s.rowError}>{String(setProjectStatus.error.message)}</div>
       ) : null}
 
-      {paused ? (
+      {folded ? null : paused ? (
         <div className={s.pausedNote}>Paused — its tasks are hidden. Resume to work on it.</div>
       ) : (
         <>
@@ -849,7 +877,7 @@ function ProjectCard({
             }
           />
           <BacklogSection
-            foldKey={backlogKey(project.id)}
+            foldKey={backlogFoldKey(project.id)}
             tasks={backlog}
             projectId={project.id}
             projectName={project.name}
@@ -1423,7 +1451,7 @@ function GeneralTaskBand({
             }
           />
           <BacklogSection
-            foldKey={backlogKey(GENERAL_FOLD_KEY)}
+            foldKey={backlogFoldKey(GENERAL_FOLD_KEY)}
             tasks={backlog}
             projectId={null}
             projectName={null}

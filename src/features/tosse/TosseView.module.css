@@ -318,10 +318,65 @@
    project NAME down to a few pixels — the one thing on the card you must be able to read.
    Now the controls drop to their own line instead. */
 .cardHead { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+/* Folded: only the head is left, so the bottom padding grows back to meet the top's — the
+   card was drawn to breathe under a rule that is no longer there. */
+.cardFolded { padding-bottom: 18px; }
 /* `1 1 180px`: the name keeps a usable width, and it is the basis running out that triggers
-   the wrap above. */
-.cardIdent { min-width: 0; flex: 1 1 180px; }
+   the wrap above.
+   It is a BUTTON — the card's disclosure — reset to look exactly like the block it replaced:
+   name and meta are the hit area, because a 20px chevron alone is a poor target on a card
+   this wide. It covers the identity block ONLY, never the tools beside it: those are buttons
+   of their own, and a button cannot be nested in a button. */
+.cardIdent {
+  min-width: 0;
+  flex: 1 1 180px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cardIdentText { min-width: 0; flex: 1 1 auto; }
+.cardIdent:hover .cardChevron { color: var(--wf-tx-hi); border-color: var(--wf-tx-xlo); }
+/* The client band's chevron, one level down: its own bordered hit area, rotating -90° when
+   folded so the state is legible from the shape alone. `margin-top` sits it on the name's
+   first line rather than on the block's top edge. */
+.cardChevron {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  border-radius: var(--wf-r);
+  border: 1px solid var(--wf-line-2);
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-lo);
+  flex: 0 0 20px;
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1), color 0.15s, border-color 0.15s;
+}
+.cardChevronClosed { transform: rotate(-90deg); }
+/* What a FOLDED card reports in place of its sections. Coloured by the same status tones the
+   section headings wear, so the closed card and the open one speak one language. */
+.cardCount {
+  font-family: var(--wf-mono);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cardCount[data-tone="run"] { color: var(--ts-run-tx); }
+.cardCount[data-tone="wait"] { color: var(--ts-wait-tx); }
+.cardCount[data-tone="todo"] { color: var(--ts-todo); }
+.cardCount[data-tone="hold"] { color: var(--ts-hold-tx); }
+.cardCount[data-tone="done"] { color: var(--ts-done); }
 .cardName {
+  /* Explicit: it is a <span> inside the disclosure button, and an inline box would ignore
+     the ellipsis below entirely. */
+  display: block;
   font-size: 16px;
   font-weight: 600;
   color: var(--wf-tx-hi);
@@ -335,6 +390,10 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  /* Wraps: folded, this line also carries the status counts, and on a narrow card they
+     would otherwise push the dates off the edge. */
+  flex-wrap: wrap;
+  row-gap: 4px;
   margin-top: 5px;
   font-size: 11px;
   color: var(--wf-tx-xlo);
