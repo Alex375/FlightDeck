@@ -18,6 +18,7 @@ import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
+import { TosseLiveHost } from "./features/tosse/TosseLiveHost";
 import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
 import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
 import { useTosseConnection } from "./ipc/useTosse";
@@ -329,6 +330,11 @@ export default function App() {
       {/* Mounted once, globally (render-null): one live disk watch per RUNNING workflow, so
           every surface sees its real per-agent progress even with the detail modal closed. */}
       <WorkflowWatchHost />
+      {/* Idem (render-null): the ONE live connection to the CRM's change feed, so the tasks
+          view follows a task edited in the browser instead of waiting out a cache delay.
+          App-global on purpose — a per-view subscription would open and close the socket
+          with the tab. Off unless connected AND the preference is on. */}
+      <TosseLiveHost />
     </Win>
   );
 }

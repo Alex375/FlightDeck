@@ -541,8 +541,42 @@ pub async fn tosse_login_cancel() -> Result<(), String> {
 /// tokens. Errs only when revocation failed — the local sign-out has happened either way.
 #[tauri::command]
 #[specta::specta]
-pub async fn tosse_logout() -> Result<(), String> {
+pub async fn tosse_logout(app: tauri::AppHandle) -> Result<(), String> {
+    // Close the live channel FIRST, and here rather than only in the front's reaction to the
+    // status change: a stream left open on revoked credentials would spend its retry budget
+    // collecting 401s from a session the user just ended.
+    crate::tosse::sse::stop(&crate::ipc::events::TosseLiveEmitter { app }).await;
     crate::tosse::logout().await.map_err(|e| e.to_string())
+}
+
+/// Open the CRM's live change feed, so the Tasks view updates itself instead of waiting out
+/// a `staleTime`. Idempotent: a second call re-publishes the current state rather than
+/// opening a second socket (one connection for the whole app — see `crate::tosse::sse`).
+///
+/// Driven by the front on the ONE condition that gates it: a held TOSSE session. There is no
+/// preference — live updates are how the Tasks view works, not a mode of it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_live_start(app: tauri::AppHandle) -> Result<(), String> {
+    crate::tosse::sse::start(std::sync::Arc::new(crate::ipc::events::TosseLiveEmitter { app })).await;
+    Ok(())
+}
+
+/// Close the live channel (idempotent). Called on sign-out — "off" must mean no socket at
+/// all, not a hidden one nobody reads.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_live_stop(app: tauri::AppHandle) -> Result<(), String> {
+    crate::tosse::sse::stop(&crate::ipc::events::TosseLiveEmitter { app }).await;
+    Ok(())
+}
+
+/// The live channel's current health, for a surface that mounts after the last state event
+/// (the events themselves carry every change — this is the initial read).
+#[tauri::command]
+#[specta::specta]
+pub fn tosse_live_status() -> Result<crate::tosse::sse::TosseLiveStatus, String> {
+    Ok(crate::tosse::sse::status())
 }
 
 /// How each of Flight Deck's folders relates to TOSSE, in one call.
