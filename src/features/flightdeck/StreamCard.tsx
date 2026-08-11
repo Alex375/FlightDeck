@@ -207,6 +207,9 @@ export function StreamCard({
         <DeleteConversationDialog
           conv={conv}
           reason={deleteAsk}
+          // The card's own "open" — focus the conversation and leave the deck for it, which
+          // is where the side panel the dialog then opens the task in actually lives.
+          onShowConversation={onOpen}
           onCancel={() => setConfirmingDelete(false)}
           onConfirm={() => {
             setConfirmingDelete(false);

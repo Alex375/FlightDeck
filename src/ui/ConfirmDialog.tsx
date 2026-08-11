@@ -21,6 +21,7 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   danger,
   busy,
+  size = "default",
   onConfirm,
   onCancel,
 }: {
@@ -31,6 +32,11 @@ export function ConfirmDialog({
   cancelLabel?: string;
   /** Style the confirm button as destructive (red). */
   danger?: boolean;
+  /**
+   * `"lg"` for a body that is more than a sentence — a wider, airier panel. Opt-in so the
+   * many one-line confirmations across the app keep the compact panel they were written for.
+   */
+  size?: "default" | "lg";
   /** Disable the buttons while the action is in flight. */
   busy?: boolean;
   onConfirm: () => void;
@@ -59,7 +65,7 @@ export function ConfirmDialog({
   return createPortal(
     <div className={styles.scrim} onClick={onCancel}>
       <div
-        className={styles.panel}
+        className={`${styles.panel} ${size === "lg" ? styles.lg : ""}`}
         onClick={(e) => e.stopPropagation()}
         role="alertdialog"
         aria-modal
