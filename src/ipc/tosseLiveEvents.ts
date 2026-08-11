@@ -92,8 +92,8 @@ export function connectionRefetch(
   status: { state: string; connections: number },
   lastHandled: number,
 ): { refetch: boolean; nextHandled: number } {
-  // A stopped channel resets the core's counter, so ours must reset too: otherwise switching
-  // the preference off and on lands on `connections: 1`, matches the 1 remembered from the
+  // A stopped channel resets the core's counter, so ours must reset too: otherwise a
+  // sign-out then sign-in lands on `connections: 1`, matches the 1 remembered from the
   // previous run, and skips the refetch that a restart most needs.
   if (status.state === "off") return { refetch: false, nextHandled: 0 };
   if (status.state !== "live") return { refetch: false, nextHandled: lastHandled };

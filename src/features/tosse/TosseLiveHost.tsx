@@ -1,6 +1,9 @@
 // Owns the TOSSE live channel from the UI side: when it runs, what a CRM change
 // invalidates, and where a failure shows up. Renders nothing.
 //
+// There is no preference gating any of it — signed in, the channel runs. Live updates are
+// how the tasks view works rather than a mode of it, so the only "off" is being signed out.
+//
 // Mounted once at the app root, next to the other always-on hosts, because the channel is
 // app-global — one socket, whatever view is on screen. A per-view subscription would open
 // and close the connection with the tab, which is exactly the churn the CRM's rate limiter
@@ -21,7 +24,6 @@ import {
   mergeInvalidationKeys,
 } from "../../ipc/tosseLiveEvents";
 import { useTosseConnection } from "../../ipc/useTosse";
-import { useDisplay } from "../../store/display";
 import { useTosseLive } from "../../store/tosseLive";
 import { useAppErrors } from "../../store/appErrors";
 
@@ -52,12 +54,14 @@ const RECONNECT_REFETCH_MS = 30_000;
 
 export function TosseLiveHost() {
   const queryClient = useQueryClient();
-  const enabledPref = useDisplay((d) => d.tosseLiveUpdates);
+  // Being signed in is the ONE condition. There is no preference: live updates are how the
+  // tasks view works, not a mode of it — a board that silently disagrees with the CRM is
+  // not a behaviour worth keeping a switch for.
+  //
   // The connection query is already mounted app-wide; TanStack dedupes, so reading it here
   // costs nothing and keeps this host from needing its own notion of "signed in".
   const { data: connection } = useTosseConnection(true);
   const connected = connection?.connected === true;
-  const wanted = enabledPref && connected;
 
   // Pending event kinds and the timer that will flush them. Refs, not state: a burst must
   // not re-render anything — it only decides which queries to refetch.
@@ -72,9 +76,9 @@ export function TosseLiveHost() {
   const lastRefetchAt = useRef(0);
   const pendingRefetch = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Listeners are attached ONCE, independently of whether the channel is currently wanted:
-  // re-attaching them on every preference flip would race the events themselves (a state
-  // event emitted by `start` can arrive before a listener registered right after it).
+  // Listeners are attached ONCE, independently of whether the channel is currently open:
+  // re-attaching them on every sign-in would race the events themselves (a state event
+  // emitted by `start` can arrive before a listener registered right after it).
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
@@ -149,19 +153,20 @@ export function TosseLiveHost() {
     };
   }, [queryClient]);
 
-  // Start / stop follows the two conditions. Off means NO socket — not a hidden one nobody
-  // reads — which is what makes the preference a true revert to the previous behaviour.
+  // The channel follows the session: open while signed in, closed otherwise. Closed means NO
+  // socket — not a hidden one nobody reads — so a signed-out app talks to the CRM exactly as
+  // little as it did before any of this existed.
   useEffect(() => {
     let disposed = false;
     const run = async () => {
-      const res = wanted ? await commands.tosseLiveStart() : await commands.tosseLiveStop();
+      const res = connected ? await commands.tosseLiveStart() : await commands.tosseLiveStop();
       if (disposed || res.status !== "error") return;
-      // A channel that could not be opened must say so: the tasks view would otherwise
-      // stay on its old refresh behaviour while the indicator claimed nothing at all.
+      // A channel that could not be opened must say so: the tasks view would otherwise fall
+      // back to its focus/refresh behaviour while the indicator claimed nothing at all.
       useAppErrors
         .getState()
         .pushError(
-          wanted ? "TOSSE live updates could not start" : "TOSSE live updates could not stop",
+          connected ? "TOSSE live updates could not start" : "TOSSE live updates could not stop",
           res.error,
         );
     };
@@ -169,7 +174,7 @@ export function TosseLiveHost() {
     return () => {
       disposed = true;
     };
-  }, [wanted]);
+  }, [connected]);
 
   return null;
 }

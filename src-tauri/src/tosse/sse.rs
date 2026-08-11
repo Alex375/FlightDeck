@@ -103,9 +103,9 @@ const INTERESTING_PREFIXES: [&str; 5] = ["task:", "project:", "mission:", "repos
 
 /// The live channel's health, as the Tasks view shows it.
 ///
-/// `Off` is a real state, not the absence of one: the feature can be switched off in
-/// Settings, and the view must then look exactly as it did before this existed rather than
-/// claim a broken connection.
+/// `Off` is a real state, not the absence of one: with no TOSSE session there is nothing to
+/// connect with, and the view must read as "nothing to show" rather than claim a broken
+/// connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveState {
@@ -315,8 +315,7 @@ pub async fn start<S: LiveSink>(sink: std::sync::Arc<S>) {
     *guard = Some(tokio::spawn(async move { run(sink, generation).await }));
 }
 
-/// Close the live channel (idempotent). Called on sign-out, on switching the preference
-/// off, and at quit.
+/// Close the live channel (idempotent). Called on sign-out — the only "off" there is.
 ///
 /// `abort()` is safe here in a way it would not be for a file writer: the task owns nothing
 /// but a socket, and dropping it closes the connection — the server's zombie sweep collects

@@ -21,9 +21,9 @@ export interface LiveIndicatorView {
 /**
  * The indicator for a channel state, or `null` when nothing should be shown.
  *
- * `off` renders NOTHING on purpose: it is the state of a user who switched the feature off
- * (or is signed out), and for them the view must look exactly as it did before the feature
- * existed — a grey "not live" chip would be a permanent complaint about a choice they made.
+ * `off` renders NOTHING on purpose: the channel only stops when there is no TOSSE session,
+ * and the tasks view is already withdrawn in that case — a grey "not live" chip would be a
+ * complaint about a connection nobody asked for.
  */
 export function liveIndicatorView(status: TosseLiveStatus): LiveIndicatorView | null {
   switch (status.state) {

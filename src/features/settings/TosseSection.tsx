@@ -58,7 +58,6 @@ function TosseDisplayPrefs() {
   const tosseStartStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
   const tosseClientFavicons = useDisplay((d) => d.tosseClientFavicons);
-  const tosseLiveUpdates = useDisplay((d) => d.tosseLiveUpdates);
   const set = useDisplay((d) => d.set);
   return (
     <SettingsGroup title="In the app" icon="list">
@@ -121,23 +120,6 @@ function TosseDisplayPrefs() {
         checked={tosseTaskDeleteWarning}
         onChange={(v) => set({ tosseTaskDeleteWarning: v })}
         label="Warn when deleting a conversation linked to an active task"
-      />
-      <ToggleRow
-        title="Live updates from the CRM"
-        hint={
-          <>
-            Keeps the tasks view in step with TOSSE as changes happen — a task you edit in
-            the browser, or one an agent moves, shows up here within a second.{" "}
-            <strong>On by default.</strong> It replaces polling rather than adding to it:
-            the app holds one connection to the CRM while you are signed in and only
-            refetches when something actually changed. Off → no connection is opened, and
-            the board refreshes as it did before (when you focus the window, after a write,
-            and on <strong>Refresh</strong>).
-          </>
-        }
-        checked={tosseLiveUpdates}
-        onChange={(v) => set({ tosseLiveUpdates: v })}
-        label="Follow TOSSE changes live"
       />
       <ToggleRow
         title="Client logos from the web"

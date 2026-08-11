@@ -120,9 +120,9 @@ describe("connectionRefetch", () => {
     expect(connectionRefetch({ state: "error", connections: 3 }, 3).refetch).toBe(false);
   });
 
-  // Switching the preference off and on restarts the core's counter at 1. Without the reset,
-  // that 1 matches the 1 we remembered and the restart — the moment a refetch matters most —
-  // would silently skip it.
+  // Signing out and back in restarts the core's counter at 1. Without the reset, that 1
+  // matches the 1 we remembered and the restart — the moment a refetch matters most — would
+  // silently skip it.
   it("resets on stop so the next start refetches again", () => {
     const stopped = connectionRefetch({ state: "off", connections: 0 }, 1);
     expect(stopped).toEqual({ refetch: false, nextHandled: 0 });

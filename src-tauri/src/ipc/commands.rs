@@ -525,8 +525,8 @@ pub async fn tosse_logout(app: tauri::AppHandle) -> Result<(), String> {
 /// a `staleTime`. Idempotent: a second call re-publishes the current state rather than
 /// opening a second socket (one connection for the whole app — see `crate::tosse::sse`).
 ///
-/// Driven by the front, which owns the two conditions: a held TOSSE session, and the
-/// `tosseLiveUpdates` preference. Switched off, nothing here ever runs.
+/// Driven by the front on the ONE condition that gates it: a held TOSSE session. There is no
+/// preference — live updates are how the Tasks view works, not a mode of it.
 #[tauri::command]
 #[specta::specta]
 pub async fn tosse_live_start(app: tauri::AppHandle) -> Result<(), String> {
@@ -534,8 +534,8 @@ pub async fn tosse_live_start(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Close the live channel (idempotent). Called on sign-out and when the preference is
-/// switched off — "off" must mean no socket at all, not a hidden one nobody reads.
+/// Close the live channel (idempotent). Called on sign-out — "off" must mean no socket at
+/// all, not a hidden one nobody reads.
 #[tauri::command]
 #[specta::specta]
 pub async fn tosse_live_stop(app: tauri::AppHandle) -> Result<(), String> {

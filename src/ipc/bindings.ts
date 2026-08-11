@@ -418,8 +418,8 @@ async tosseLogout() : Promise<Result<null, string>> {
  * a `staleTime`. Idempotent: a second call re-publishes the current state rather than
  * opening a second socket (one connection for the whole app — see `crate::tosse::sse`).
  * 
- * Driven by the front, which owns the two conditions: a held TOSSE session, and the
- * `tosseLiveUpdates` preference. Switched off, nothing here ever runs.
+ * Driven by the front on the ONE condition that gates it: a held TOSSE session. There is no
+ * preference — live updates are how the Tasks view works, not a mode of it.
  */
 async tosseLiveStart() : Promise<Result<null, string>> {
     try {
@@ -430,8 +430,8 @@ async tosseLiveStart() : Promise<Result<null, string>> {
 }
 },
 /**
- * Close the live channel (idempotent). Called on sign-out and when the preference is
- * switched off — "off" must mean no socket at all, not a hidden one nobody reads.
+ * Close the live channel (idempotent). Called on sign-out — "off" must mean no socket at
+ * all, not a hidden one nobody reads.
  */
 async tosseLiveStop() : Promise<Result<null, string>> {
     try {
@@ -2825,9 +2825,9 @@ supported_effort_levels: string[] }
 /**
  * The live channel's health, as the Tasks view shows it.
  * 
- * `Off` is a real state, not the absence of one: the feature can be switched off in
- * Settings, and the view must then look exactly as it did before this existed rather than
- * claim a broken connection.
+ * `Off` is a real state, not the absence of one: with no TOSSE session there is nothing to
+ * connect with, and the view must read as "nothing to show" rather than claim a broken
+ * connection.
  */
 export type LiveState = 
 /**

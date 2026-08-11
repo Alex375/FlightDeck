@@ -11,8 +11,8 @@ const status = (p: Partial<TosseLiveStatus>): TosseLiveStatus => ({
 });
 
 describe("liveIndicatorView", () => {
-  // The preference is a true revert: switched off, the toolbar must look like it did before
-  // the feature existed rather than complain about a state the user chose.
+  // The channel is only off when there is no session — and the view is already withdrawn
+  // then, so the toolbar must not complain about a connection nobody asked for.
   it("shows nothing when the channel is off", () => {
     expect(liveIndicatorView(status({ state: "off" }))).toBeNull();
   });
