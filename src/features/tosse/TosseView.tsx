@@ -15,6 +15,7 @@ import { agentStatusToDot } from "../../agent/status";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { Splitter } from "../editor/Splitter";
+import { useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 import { useSettingsUi } from "../../store/settingsUi";
 import { useTosseDetail } from "../../store/tosseDetail";
 import { useHistoryUi } from "../history/historyUiStore";
@@ -1308,6 +1309,19 @@ function TosseBoard() {
     [backlogRows],
   );
 
+  // The panel pushes the list aside as it arrives, and folds back into the edge on close.
+  // `flex: 0 1 auto` at rest, exactly as the panel itself sizes: the slot measures whatever
+  // the CSS settles on (the stored width, clamped by the panel's own floor and viewport cap),
+  // so the animation lands on the layout instead of on a number we guessed.
+  const detailSlide = usePanelSlide({
+    open: openTaskId !== null,
+    axis: "x",
+    restStyle: { flex: "0 1 auto", minWidth: 0, display: "flex", flexDirection: "row" },
+  });
+  // Held while the panel folds away: `openTaskId` is already null by then, and re-reading it
+  // would empty the panel before it finished leaving.
+  const shownTaskId = useFrozenWhile(openTaskId !== null, openTaskId);
+
   return (
     <div className={s.page}>
       <div className={s.toolbar}>
@@ -1399,28 +1413,32 @@ function TosseBoard() {
           </div>
         </div>
 
-        {openTaskId ? (
-          <>
-            {/* The panel's width is the user's call and it persists — same treatment as the
-                conversations sidebar. */}
-            <Splitter
-              axis="x"
-              onMove={(x) => {
-                const box = bodyRef.current?.getBoundingClientRect();
-                // The row's width goes with it, so the clamp knows the same cap the CSS
-                // applies — otherwise part of the drag stores a width nothing honours.
-                if (box) setDetailWidth(box.right - x, box.width);
-              }}
-            />
-            {/* Keyed by task id so switching tasks REPLAYS the section cascade — otherwise
-                one task is swapped for another with nothing to mark the change. */}
-            <TaskDetail
-              key={openTaskId}
-              taskId={openTaskId}
-              width={detailWidth}
-              onClose={() => setOpenTaskId(null)}
-            />
-          </>
+        {detailSlide.mounted && shownTaskId ? (
+          // The slot holds the splitter AND the panel, and animates its size so the list
+          // gives way as the panel arrives instead of jumping aside in one frame.
+          <div ref={detailSlide.slotRef} style={detailSlide.slotStyle}>
+            <div style={detailSlide.paneStyle}>
+              {/* The panel's width is the user's call and it persists — same treatment as the
+                  conversations sidebar. */}
+              <Splitter
+                axis="x"
+                onMove={(x) => {
+                  const box = bodyRef.current?.getBoundingClientRect();
+                  // The row's width goes with it, so the clamp knows the same cap the CSS
+                  // applies — otherwise part of the drag stores a width nothing honours.
+                  if (box) setDetailWidth(box.right - x, box.width);
+                }}
+              />
+              {/* Keyed by task id so switching tasks REPLAYS the section cascade — otherwise
+                  one task is swapped for another with nothing to mark the change. */}
+              <TaskDetail
+                key={shownTaskId}
+                taskId={shownTaskId}
+                width={detailWidth}
+                onClose={() => setOpenTaskId(null)}
+              />
+            </div>
+          </div>
         ) : null}
       </div>
     </div>

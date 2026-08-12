@@ -21,12 +21,18 @@ import { TaskDetail } from "../tosse/TosseView";
 import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
+import { useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 
 // Lazy: the Git workspace pulls in Monaco's diff editor + ribbon overlay — its
 // own chunk, off the startup bundle, fetched only when Git mode is opened.
 const GitWorkspace = lazy(() =>
   import("../git/GitWorkspace").then((m) => ({ default: m.GitWorkspace })),
 );
+
+// Narrowest the side region may be dragged to: the 280px the panel itself needs, plus the
+// 6px splitter — which now lives INSIDE the animated slot (so the divider slides in with the
+// panel), and therefore counts against the same minimum.
+const SIDE_REGION_MIN_PX = 286;
 
 // Interactive elements whose clicks must NOT be hijacked to focus the composer
 // (buttons, links, other fields, expandable tool-card headers via role=button…).
@@ -129,6 +135,33 @@ function MainArea({
   const showTosseTask = !!tosseTaskView && tosseTaskView.convId === conv.id;
   const sideOpen = open || terminalOpen || showArtifact || showTosseTask;
 
+  // The side region slides in and out rather than appearing in one frame: the slot below
+  // (splitter + panel) animates its size while the conversation gives way over the same
+  // fraction of a second. `animating` is why the conversation's grow factor is read from it
+  // — see PanelSlide.animating.
+  const slide = usePanelSlide({
+    open: sideOpen,
+    axis: sideBySide ? "x" : "y",
+    restStyle: {
+      flex: `${editorFraction} 1 0`,
+      minWidth: sideBySide ? SIDE_REGION_MIN_PX : 0,
+      minHeight: sideBySide ? 0 : 160,
+      display: "flex",
+      flexDirection: sideBySide ? "row" : "column",
+    },
+  });
+
+  // What the side region shows, HELD for the length of a closing animation: every input
+  // below comes from the state that just went false, so re-reading it while the panel folds
+  // away would empty the panel first and fold an empty box (see useFrozenWhile).
+  const shown = useFrozenWhile(sideOpen, {
+    kind: showTosseTask ? "tosse" : showArtifact ? "artifact" : "panes",
+    taskId: tosseTaskView?.taskId ?? null,
+    artifact: artifactView,
+    editorOpen: open,
+    terminalOpen,
+  });
+
   // Git mode takes over the whole area with its own 2x2 workspace (conversation
   // minimized top-left, diff top-right, history + files strip at the bottom),
   // independent of the editor/terminal region.
@@ -173,8 +206,9 @@ function MainArea({
           // When the side region is CLOSED the grow factor must be 1 (not
           // 1-fraction): a single flex child whose grow factors sum to < 1 only
           // fills that fraction of the row, leaving the rest blank. So full width
-          // on close.
-          flex: `${sideOpen ? 1 - editorFraction : 1} 1 0`,
+          // on close — and equally while the panel SLIDES, where the slot holds a
+          // pixel size of its own and this pane takes whatever it hasn't claimed yet.
+          flex: `${slide.mounted && !slide.animating ? 1 - editorFraction : 1} 1 0`,
           // 552 = the composer's 500px floor + the 52px its card leaves on either side
           // (see MIN_COMPOSER_PX). Below it the composer bar can no longer hold the
           // slots the budget promised, so the splitter stops here instead.
@@ -193,33 +227,36 @@ function MainArea({
           onBackgroundClick={onBackgroundClick}
         />
       </div>
-      {sideOpen ? (
-        <>
-          <Splitter axis={sideBySide ? "x" : "y"} onMove={onSplitDrag} />
-          <div
-            style={{
-              flex: `${editorFraction} 1 0`,
-              minWidth: sideBySide ? 280 : 0,
-              minHeight: sideBySide ? 0 : 160,
-              display: "flex",
-            }}
-          >
-            {showTosseTask && tosseTaskView ? (
-              // Keyed by task id so switching tasks remounts the panel (it replays its
-              // section cascade), as the board's own panel does.
-              <TaskDetail
-                key={tosseTaskView.taskId}
-                taskId={tosseTaskView.taskId}
-                onClose={closeTosseTask}
-                embedded
-              />
-            ) : showArtifact && artifactView ? (
-              <ArtifactViewer view={artifactView} onClose={closeArtifact} />
-            ) : (
-              <SidePanel convId={conv.id} cwd={cwd} sideBySide={sideBySide} />
-            )}
+      {slide.mounted ? (
+        // The animated slot holds the splitter AND the panel, so the divider travels with
+        // the panel instead of blinking into place 6px early.
+        <div ref={slide.slotRef} style={slide.slotStyle}>
+          <div style={slide.paneStyle}>
+            <Splitter axis={sideBySide ? "x" : "y"} onMove={onSplitDrag} />
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex" }}>
+              {shown.kind === "tosse" && shown.taskId ? (
+                // Keyed by task id so switching tasks remounts the panel (it replays its
+                // section cascade), as the board's own panel does.
+                <TaskDetail
+                  key={shown.taskId}
+                  taskId={shown.taskId}
+                  onClose={closeTosseTask}
+                  embedded
+                />
+              ) : shown.kind === "artifact" && shown.artifact ? (
+                <ArtifactViewer view={shown.artifact} onClose={closeArtifact} />
+              ) : (
+                <SidePanel
+                  convId={conv.id}
+                  cwd={cwd}
+                  sideBySide={sideBySide}
+                  editorOpen={shown.editorOpen}
+                  terminalOpen={shown.terminalOpen}
+                />
+              )}
+            </div>
           </div>
-        </>
+        </div>
       ) : null}
     </div>
   );

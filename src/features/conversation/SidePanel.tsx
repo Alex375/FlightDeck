@@ -1,7 +1,8 @@
 import { lazy, Suspense, useRef } from "react";
 import { EditorPanel } from "../editor/EditorPanel";
 import { Splitter } from "../editor/Splitter";
-import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
+import { clamp, useEditorStore } from "../editor/editorStore";
+import { usePanelSlide } from "../../ui/usePanelSlide";
 
 // Lazy: xterm.js + its WebGL/fit addons stay out of the startup bundle (mirrors
 // Monaco) — fetched only when the integrated terminal is first opened.
@@ -22,20 +23,29 @@ const TerminalView = lazy(() => import("../terminal/TerminalView"));
  * With only one pane open it fills the region (terminal alone = the whole right
  * side). `terminalFraction` (draggable) sizes the terminal when both are open, so
  * the terminal resizes in both height and width depending on the layout.
+ *
+ * Which panes are open comes in as PROPS rather than being read from the layout
+ * store: while the whole region folds away, MainArea holds these at their last
+ * values so the exit animation shows the panel being closed instead of an empty box
+ * (see useFrozenWhile).
  */
 export function SidePanel({
   convId,
   cwd,
   sideBySide,
+  editorOpen,
+  terminalOpen,
 }: {
   convId: string;
   cwd: string;
   sideBySide: boolean;
+  editorOpen: boolean;
+  terminalOpen: boolean;
 }) {
-  const { open, terminalOpen, terminalFraction } = useEditorLayout();
+  const terminalFraction = useEditorStore((s) => s.terminalFraction);
   const setTerminalFraction = useEditorStore((s) => s.setTerminalFraction);
   const ref = useRef<HTMLDivElement>(null);
-  const both = open && terminalOpen;
+  const both = editorOpen && terminalOpen;
 
   // Inner direction is perpendicular to the region's placement: region-on-right
   // (sideBySide) stacks vertically (column); region-below stacks horizontally (row).
@@ -43,6 +53,7 @@ export function SidePanel({
   // Both panes carry the same conversation-separator border as the editor would
   // (left when the region is on the right, top when it's below).
   const stacked = !sideBySide;
+  const innerAxis = innerColumn ? "y" : "x";
 
   const onInnerDrag = (clientX: number, clientY: number) => {
     const rect = ref.current?.getBoundingClientRect();
@@ -53,6 +64,42 @@ export function SidePanel({
       : 1 - (clientX - rect.left) / rect.width;
     setTerminalFraction(clamp(frac, 0.15, 0.85));
   };
+
+  // Each pane slides in and out against the OTHER one, on the same mechanics the whole
+  // region uses — but ONLY while its neighbour is there to be pushed. A pane arriving on
+  // its own IS the region arriving, which MainArea already animates; playing both would
+  // slide a panel inside a sliding panel. Hence `enabled` on the neighbour's state.
+  //
+  // The editor is pinned to the START edge (left / top) and the terminal to the END, so
+  // each emerges from its own side rather than unrolling out of the middle.
+  const editorSlide = usePanelSlide({
+    open: editorOpen,
+    axis: innerAxis,
+    edge: "start",
+    enabled: terminalOpen,
+    restStyle: {
+      flex: `${both ? 1 - terminalFraction : 1} 1 0`,
+      minWidth: 0,
+      minHeight: 0,
+      display: "flex",
+      flexDirection: innerColumn ? "column" : "row",
+    },
+  });
+  const termSlide = usePanelSlide({
+    open: terminalOpen,
+    axis: innerAxis,
+    enabled: editorOpen,
+    restStyle: {
+      flex: `${both ? terminalFraction : 1} 1 0`,
+      minWidth: 0,
+      minHeight: 0,
+      display: "flex",
+      flexDirection: innerColumn ? "column" : "row",
+    },
+  });
+  // While one pane travels on a pixel size of its own, the other takes everything it has
+  // not claimed yet (grow 1) — the same reason the conversation does in MainArea.
+  const sliding = editorSlide.animating || termSlide.animating;
 
   return (
     <div
@@ -65,31 +112,41 @@ export function SidePanel({
         flexDirection: innerColumn ? "column" : "row",
       }}
     >
-      {open ? (
+      {editorSlide.mounted ? (
         <div
-          style={{
-            flex: `${both ? 1 - terminalFraction : 1} 1 0`,
-            minWidth: 0,
-            minHeight: 0,
-            display: "flex",
-          }}
+          ref={editorSlide.slotRef}
+          style={
+            sliding && !editorSlide.animating
+              ? { ...editorSlide.slotStyle, flex: "1 1 0" }
+              : editorSlide.slotStyle
+          }
         >
-          <EditorPanel convId={convId} cwd={cwd} stacked={stacked} />
+          <div style={editorSlide.paneStyle}>
+            <EditorPanel convId={convId} cwd={cwd} stacked={stacked} />
+          </div>
         </div>
       ) : null}
-      {both ? <Splitter axis={innerColumn ? "y" : "x"} onMove={onInnerDrag} /> : null}
-      {terminalOpen ? (
+      {termSlide.mounted ? (
         <div
-          style={{
-            flex: `${both ? terminalFraction : 1} 1 0`,
-            minWidth: 0,
-            minHeight: 0,
-            display: "flex",
-          }}
+          ref={termSlide.slotRef}
+          style={
+            sliding && !termSlide.animating
+              ? { ...termSlide.slotStyle, flex: "1 1 0" }
+              : termSlide.slotStyle
+          }
         >
-          <Suspense fallback={<div style={{ flex: 1, background: "var(--wf-bg)" }} />}>
-            <TerminalView convId={convId} cwd={cwd} stacked={stacked} />
-          </Suspense>
+          <div style={termSlide.paneStyle}>
+            {/* The divider exists only while both panes do, and it rides INSIDE the
+                terminal's slot: a terminal folding away takes the divider with it instead
+                of leaving an orphaned 6px line behind, and the measured slot size is the
+                one the layout really settles at. */}
+            {editorSlide.mounted ? <Splitter axis={innerAxis} onMove={onInnerDrag} /> : null}
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex" }}>
+              <Suspense fallback={<div style={{ flex: 1, background: "var(--wf-bg)" }} />}>
+                <TerminalView convId={convId} cwd={cwd} stacked={stacked} />
+              </Suspense>
+            </div>
+          </div>
         </div>
       ) : null}
     </div>
