@@ -3,32 +3,16 @@
    `CRM_max/apps/frontend/app/briefing/page.tsx`, scaled by ~0.85: the CRM is drawn at a
    16px base, this app at 13px, so its raw values would inflate the view by a third.
 
-   ⚠️ STATUS COLOURS ARE THE CRM'S, NOT THE APP'S — blue « En cours », amber « En revue »,
-   violet « En attente ». That contradicts Flight Deck's own language one tab away (green =
+   ⚠️ STATUS COLOURS ARE THE CRM'S, NOT THE APP'S — blue « En cours », VIOLET « En revue »,
+   YELLOW « En attente ». That contradicts Flight Deck's own language one tab away (green =
    running, blue = waiting for you); Alexandre reversed his 2026-08-01 decision on
    2026-08-04 knowing that, because this screen IS the CRM's board. The hues live in the
-   `--ts-*` variables below, scoped to `.page`, so nothing outside this view is affected.
+   `--ts-*` variables of `src/ui/tosse-status.css` — one definition, shared with the two
+   other surfaces that paint a task status (the conversation's task chip, the delete
+   dialog), which each used to carry their own copy and had already drifted apart.
    Everything else (surfaces, text, errors) still comes from the app's own tokens. */
 
 .page {
-  /* CRM status palette (Tailwind 500/400 pairs, as `briefing/page.tsx` uses them). */
-  --ts-run: #3b82f6;          /* blue-500  — En cours */
-  --ts-run-tx: #60a5fa;       /* blue-400 */
-  --ts-run-bg: rgba(59, 130, 246, 0.12);
-  --ts-run-line: rgba(59, 130, 246, 0.3);
-  --ts-wait: #f59e0b;         /* amber-500 — En revue */
-  --ts-wait-tx: #fbbf24;      /* amber-400 */
-  --ts-wait-bg: rgba(245, 158, 11, 0.12);
-  --ts-wait-line: rgba(245, 158, 11, 0.3);
-  --ts-todo: #9ca3af;         /* gray-400  — À faire */
-  --ts-todo-line: rgba(156, 163, 175, 0.25);
-  --ts-hold: #8b5cf6;         /* violet-500 — En attente */
-  --ts-hold-tx: #a78bfa;      /* violet-400 */
-  --ts-hold-bg: rgba(139, 92, 246, 0.12);
-  --ts-hold-line: rgba(139, 92, 246, 0.3);
-  --ts-done: #34d399;         /* emerald-400 — Fait */
-  --ts-done-bg: rgba(52, 211, 153, 0.12);
-
   flex: 1;
   min-height: 0;
   /* ⚠️ Load-bearing. A flex item defaults to `min-width: auto` = min-content, so without
@@ -72,7 +56,7 @@
   margin-right: 4px;
 }
 .cRun { color: var(--ts-run-tx); }
-.cRev { color: var(--ts-wait-tx); }
+.cRev { color: var(--ts-review-tx); }
 /* Neutral, like its section heading. It was the BRIGHTEST figure in the toolbar, which put
    "À faire" above "En cours" in the visual hierarchy — the opposite of what the board says. */
 .cTodo { color: var(--ts-todo); }
@@ -403,10 +387,12 @@
   white-space: nowrap;
 }
 .cardCount[data-tone="run"] { color: var(--ts-run-tx); }
-.cardCount[data-tone="wait"] { color: var(--ts-wait-tx); }
+.cardCount[data-tone="review"] { color: var(--ts-review-tx); }
 .cardCount[data-tone="todo"] { color: var(--ts-todo); }
+.cardCount[data-tone="backlog"] { color: var(--ts-backlog); }
 .cardCount[data-tone="hold"] { color: var(--ts-hold-tx); }
 .cardCount[data-tone="done"] { color: var(--ts-done); }
+.cardCount[data-tone="archived"] { color: var(--ts-archived); }
 .cardName {
   /* Explicit: it is a <span> inside the disclosure button, and an inline box would ignore
      the ellipsis below entirely. */
@@ -487,18 +473,16 @@
   color: var(--wf-tx-lo);
   white-space: nowrap;
 }
-/* Chips share the board's palette so a status reads the same wherever it appears. */
+/* Chips share the board's palette so a status reads the same wherever it appears. ONE class
+   per tone, worn by both vocabularies — a project state (`projectStatusTone`) and a task
+   status (`STATUS_TONE`) resolve to the same seven tones. */
 .state_run {
   color: var(--ts-run-tx);
   border-color: var(--ts-run-line);
   background: var(--ts-run-bg);
 }
-.state_pause {
-  color: var(--ts-wait-tx);
-  border-color: var(--ts-wait-line);
-  background: var(--ts-wait-bg);
-}
 .state_todo { color: var(--wf-tx-lo); }
+.state_backlog { color: var(--ts-backlog); border-color: var(--ts-backlog-line); }
 /* The chip as a control (detail panel): same pill, plus a caret and a hover. */
 .stateBtn {
   gap: 4px;
@@ -507,10 +491,10 @@
 }
 .stateBtn:hover { filter: brightness(1.25); }
 .stateBtn svg { width: 11px; height: 11px; opacity: 0.75; }
-.state_wait {
-  color: var(--ts-wait-tx);
-  border-color: var(--ts-wait-line);
-  background: var(--ts-wait-bg);
+.state_review {
+  color: var(--ts-review-tx);
+  border-color: var(--ts-review-line);
+  background: var(--ts-review-bg);
 }
 .state_hold {
   color: var(--ts-hold-tx);
@@ -519,8 +503,14 @@
 }
 .state_done {
   color: var(--ts-done);
-  border-color: rgba(52, 211, 153, 0.3);
+  border-color: var(--ts-done-line);
   background: var(--ts-done-bg);
+}
+/* Spent, not coloured — the CRM dims an archived badge rather than giving it a hue. */
+.state_archived {
+  color: var(--ts-archived);
+  border-color: var(--ts-archived-line);
+  opacity: 0.8;
 }
 .act {
   display: inline-flex;
@@ -603,19 +593,29 @@
 .section[data-tone="run"] .sectionIco,
 .section[data-tone="run"] .sectionLabel { color: var(--ts-run-tx); }
 .section[data-tone="run"] .sectionRule { background: var(--ts-run-line); }
-.section[data-tone="wait"] .sectionDot { background: var(--ts-wait); }
-.section[data-tone="wait"] .sectionIco,
-.section[data-tone="wait"] .sectionLabel { color: var(--ts-wait-tx); }
-.section[data-tone="wait"] .sectionRule { background: var(--ts-wait-line); }
+.section[data-tone="review"] .sectionDot { background: var(--ts-review); }
+.section[data-tone="review"] .sectionIco,
+.section[data-tone="review"] .sectionLabel { color: var(--ts-review-tx); }
+.section[data-tone="review"] .sectionRule { background: var(--ts-review-line); }
 /* « À faire » is toned too — its dot and icon already were, so leaving the label grey made
    the heading read as half-lit rather than as a deliberate neutral. */
 .section[data-tone="todo"] .sectionIco,
 .section[data-tone="todo"] .sectionLabel { color: var(--ts-todo); }
 .section[data-tone="todo"] .sectionRule { background: var(--ts-todo-line); }
+/* Backlog: the lighter of the CRM's two greys, so a card carrying both parked and to-do
+   work does not show one grey heading twice. */
+.section[data-tone="backlog"] .sectionDot { background: var(--ts-backlog); }
+.section[data-tone="backlog"] .sectionIco,
+.section[data-tone="backlog"] .sectionLabel { color: var(--ts-backlog); }
+.section[data-tone="backlog"] .sectionRule { background: var(--ts-backlog-line); }
 .section[data-tone="hold"] .sectionDot { background: var(--ts-hold); }
 .section[data-tone="hold"] .sectionIco,
 .section[data-tone="hold"] .sectionLabel { color: var(--ts-hold-tx); }
 .section[data-tone="hold"] .sectionRule { background: var(--ts-hold-line); }
+.section[data-tone="archived"] .sectionDot { background: var(--ts-archived); }
+.section[data-tone="archived"] .sectionIco,
+.section[data-tone="archived"] .sectionLabel { color: var(--ts-archived); }
+.section[data-tone="archived"] .sectionRule { background: var(--ts-archived-line); }
 
 /* ---- task row --------------------------------------------------------- */
 .row {
@@ -650,10 +650,14 @@
   transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 .dot_run { background: var(--ts-run); border-color: var(--ts-run); }
-.dot_wait { background: var(--ts-wait); border-color: var(--ts-wait); }
+.dot_review { background: var(--ts-review); border-color: var(--ts-review); }
 .dot_hold { background: var(--ts-hold); border-color: var(--ts-hold); }
 .dot_done { background: var(--ts-done); border-color: var(--ts-done); }
+/* The two neutrals stay HOLLOW — an unstarted task is an outline, whichever list it sits
+   in — and separate only by the ring's grey, as the CRM's two badges do. */
 .dot_todo { background: transparent; border-color: var(--ts-todo); }
+.dot_backlog { background: transparent; border-color: var(--ts-backlog); }
+.dot_archived { background: transparent; border-color: var(--ts-archived); }
 .menuSep { height: 1px; background: var(--wf-line); margin: 3px 4px; }
 
 /* The CRM's priority pill: sentence case with a leading dot, not a shouty micro-caps tag.
@@ -1084,9 +1088,11 @@
   flex: 0 0 6px;
 }
 .blockDot[data-tone="run"] { background: var(--ts-run); }
-.blockDot[data-tone="wait"] { background: var(--ts-wait); }
+.blockDot[data-tone="review"] { background: var(--ts-review); }
 .blockDot[data-tone="hold"] { background: var(--ts-hold); }
 .blockDot[data-tone="done"] { background: var(--ts-done); }
+.blockDot[data-tone="backlog"] { background: var(--ts-backlog); }
+.blockDot[data-tone="archived"] { background: var(--ts-archived); }
 .blockRow .muted { margin-left: auto; }
 
 /* Full-width hover rows with the same -8px bleed as the task rows, so a subtask reads as

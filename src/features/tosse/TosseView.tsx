@@ -3,12 +3,14 @@
 //
 // Structure is lifted from the CRM's own Briefing page (project card: client, progress
 // ring, tasks in status sections), because that page is the one Alexandre already reads
-// every morning — but the COLOURS are Flight Deck's, not the CRM's: here blue means "needs
-// your eyes" and green means "running", and two views of one app must not disagree.
+// every morning — and so are the COLOURS: violet « En revue », yellow « En attente », the
+// CRM's two greys. This screen is the CRM's board, so it reads like the CRM even though
+// Flight Deck one tab away speaks a different colour language (see `tosse-status.css`).
 //
-// One request feeds all of it (`tosse_briefing`); the detail panel fetches a task in full
-// only when a row is opened. Writes are optimistic with a whole-board rollback, and a
-// refused write says why — see `useTosse`.
+// The briefing feeds most of it (`tosse_briefing`), plus one request per status the
+// briefing structurally omits — Backlog and « En attente » (see `useTosseOffBoard`). The
+// detail panel fetches a task in full only when a row is opened. Writes are optimistic with
+// a whole-board rollback, and a refused write says why — see `useTosse`.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Dot, Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
 import { agentStatusToDot } from "../../agent/status";
@@ -25,7 +27,7 @@ import {
   useCreateTosseTask,
   useSetTosseProjectStatus,
   useSetTosseTaskStatus,
-  useTosseBacklog,
+  useTosseOffBoard,
   useTosseBriefing,
   useTosseTaskDetail,
   useTosseWebUrl,
@@ -38,8 +40,8 @@ import { launchTask } from "./taskPrompts";
 import type { LaunchMode } from "./taskConversation";
 import { useConversationsForTask, type Conversation } from "../../store/conversationsStore";
 import {
-  backlogFoldKey,
   GENERAL_FOLD_KEY,
+  offBoardFold,
   projectFoldKey,
   useTosseFold,
 } from "../../store/tosseFold";
@@ -47,13 +49,23 @@ import { useTosseLive } from "../../store/tosseLive";
 import { liveIndicatorView } from "./liveIndicator";
 import { commands } from "../../ipc/client";
 
-import type { TosseProject, TosseTask, TosseTaskDetail } from "../../ipc/client";
+import type {
+  TosseOffBoardTask,
+  TosseProject,
+  TosseTask,
+  TosseTaskDetail,
+} from "../../ipc/client";
 import {
   briefingTotals,
-  groupBacklogByProject,
   groupByClient,
+  groupOffBoardByProject,
   isOverdue,
+  offBoardForScope,
+  offBoardProjectCards,
+  offBoardWithoutProject,
+  OFF_BOARD_SECTIONS,
   projectActions,
+  projectStatusTone,
   sectionIcon,
   sectionLabel,
   sortedBacklog,
@@ -142,14 +154,21 @@ function MiniRing({ done, total }: { done: number; total: number }) {
 }
 
 /**
- * A card's Backlog: everything parked, behind a fold that starts CLOSED.
+ * A card's off-board section — « En attente » or Backlog — behind a fold of its own.
  *
- * It is a section like the others — same head, same rows — but it does not belong in the
- * status order: the briefing is "what am I working on", and the backlog is the answer to a
- * different question. Hence its own fold, its own default, and a heading you have to open.
+ * These are sections like the others (same head, same rows) but they do not belong in the
+ * status order: the briefing answers "what am I working on", and these two answer different
+ * questions, from a request of their own. Hence their own fold and their own default.
+ *
+ * ⚠️ The two defaults are OPPOSITE, and the store only records what is CLOSED — so the
+ * reading of `folded[key]` has to flip with `defaultOpen`. Getting that backwards does not
+ * fail loudly: it just hides a section that should be open, which reads as "there is
+ * nothing there".
  */
-function BacklogSection({
+function OffBoardSection({
+  status,
   foldKey,
+  defaultOpen,
   tasks,
   projectId,
   projectName,
@@ -158,7 +177,10 @@ function BacklogSection({
   onStatus,
   writeErrors,
 }: {
+  /** The CRM status this section holds — also what it is titled and toned by. */
+  status: string;
   foldKey: string;
+  defaultOpen: boolean;
   tasks: TosseTask[];
   /** The card's project — what a launch from one of these rows resolves its folder from. */
   projectId: string | null;
@@ -168,22 +190,27 @@ function BacklogSection({
   onStatus: (task: TosseTask, status: string) => void;
   writeErrors?: Record<string, string>;
 }) {
-  // Inverted read — see `backlogFoldKey`.
-  const open = useTosseFold((f) => f.folded[foldKey] === true);
+  const marked = useTosseFold((f) => f.folded[foldKey] === true);
   const toggle = useTosseFold((f) => f.toggle);
+  const open = defaultOpen ? !marked : marked;
+  const label = sectionLabel(status);
   if (tasks.length === 0) return null;
   return (
-    <div className={s.section} data-tone="todo">
+    <div className={s.section} data-tone={STATUS_TONE[status] ?? "todo"}>
       <button
         className={`${s.sectionHead} ${s.sectionToggle}`}
         onClick={() => toggle(foldKey)}
         aria-expanded={open}
-        title={open ? "Hide the backlog" : "Show the backlog"}
+        title={open ? `Hide « ${label} »` : `Show « ${label} »`}
       >
         <span className={`${s.sectionChevron} ${open ? "" : s.sectionChevronClosed}`}>
           <Ico name="chevron" className="sm" />
         </span>
-        <span className={s.sectionLabel}>Backlog</span>
+        {/* Dot and icon as on every other section head — the fold is the only difference,
+            and a heading that lost its mark would read as a different KIND of thing. */}
+        <span className={s.sectionDot} />
+        <Ico name={sectionIcon(status)} className={`sm ${s.sectionIco}`} />
+        <span className={s.sectionLabel}>{label}</span>
         <span className={s.sectionCount}>{tasks.length}</span>
         <span className={s.sectionRule} />
       </button>
@@ -205,6 +232,57 @@ function BacklogSection({
           ))
         : null}
     </div>
+  );
+}
+
+/**
+ * Every off-board section of one card, in order — « En attente » first, then the Backlog.
+ *
+ * Waiting work is live (its ball is in someone else's court) while a backlog item is work
+ * deliberately not started, so the one you might act on today sits closer to the tasks
+ * above it. Rendered by the same component for both the project cards and the "no project"
+ * band: `scopeId` is only what namespaces the fold keys.
+ */
+function OffBoardSections({
+  scopeId,
+  offBoard,
+  projectId,
+  projectName,
+  selectedTaskId,
+  onOpenTask,
+  onStatus,
+  writeErrors,
+}: {
+  scopeId: string;
+  offBoard: Record<string, TosseTask[]>;
+  projectId: string | null;
+  projectName: string | null;
+  selectedTaskId: string | null;
+  onOpenTask: (id: string) => void;
+  onStatus: (task: TosseTask, status: string) => void;
+  writeErrors?: Record<string, string>;
+}) {
+  return (
+    <>
+      {OFF_BOARD_SECTIONS.map((status) => {
+        const fold = offBoardFold(status);
+        return (
+          <OffBoardSection
+            key={status}
+            status={status}
+            foldKey={fold.key(scopeId)}
+            defaultOpen={fold.defaultOpen}
+            tasks={offBoard[status] ?? []}
+            projectId={projectId}
+            projectName={projectName}
+            selectedTaskId={selectedTaskId}
+            onOpenTask={onOpenTask}
+            writeErrors={writeErrors}
+            onStatus={onStatus}
+          />
+        );
+      })}
+    </>
   );
 }
 
@@ -743,7 +821,7 @@ function ProjectCard({
   project,
   paused,
   index,
-  backlog,
+  offBoard,
   selectedTaskId,
   onOpenTask,
 }: {
@@ -751,8 +829,9 @@ function ProjectCard({
   paused?: boolean;
   /** Position in its band — drives the entry cascade (capped in CSS at 6 steps). */
   index?: number;
-  /** This project's parked tasks — they come from a separate request, see `useTosseBacklog`. */
-  backlog: TosseTask[];
+  /** This project's off-board tasks by status — from their own requests, see
+   *  `useTosseOffBoard`. */
+  offBoard: Record<string, TosseTask[]>;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -761,6 +840,9 @@ function ProjectCard({
   const taskErrors = useTaskWriteErrors();
   const [confirming, setConfirming] = useState<ProjectAction | null>(null);
   const sections = useMemo(() => statusSections(project.tasks), [project.tasks]);
+  // Whether the card has anything at all — "No open task" must not appear above a list of
+  // parked ones, which is exactly what counting only the briefing's sections would do.
+  const offBoardCount = Object.values(offBoard).reduce((n, tasks) => n + tasks.length, 0);
   const foldKey = projectFoldKey(project.id);
   const folded = useTosseFold((f) => f.folded[foldKey] === true);
   const toggle = useTosseFold((f) => f.toggle);
@@ -804,7 +886,11 @@ function ProjectCard({
               {/* Folded, the head takes over what the sections below were saying — a closed
                   card still has to tell you whether anything in it is running or waiting,
                   the same way a folded client band keeps its counts. Open, they would only
-                  repeat the section headings a few pixels lower. */}
+                  repeat the section headings a few pixels lower.
+
+                  ⚠️ The off-board counts are here too, and they have to be: a project whose
+                  whole queue is parked has NO briefing section, so a folded card reported
+                  "0 open" and nothing else — a card that looks empty and is not. */}
               {folded
                 ? sections.map((sec) => (
                     <span
@@ -816,6 +902,20 @@ function ProjectCard({
                     </span>
                   ))
                 : null}
+              {/* After the live ones, in the order the sections themselves appear. */}
+              {folded
+                ? OFF_BOARD_SECTIONS.filter((status) => (offBoard[status]?.length ?? 0) > 0).map(
+                    (status) => (
+                      <span
+                        key={status}
+                        className={s.cardCount}
+                        data-tone={STATUS_TONE[status] ?? "todo"}
+                      >
+                        {offBoard[status]?.length} {sectionLabel(status).toLowerCase()}
+                      </span>
+                    ),
+                  )
+                : null}
             </span>
           </span>
         </button>
@@ -826,7 +926,7 @@ function ProjectCard({
           {project.taskCount > 0 ? (
             <ProgressRing done={project.taskDone} total={project.taskCount} />
           ) : null}
-          <span className={`${s.state} ${s[`state_${stateClass(project.status)}`]}`}>
+          <span className={`${s.state} ${s[`state_${projectStatusTone(project.status)}`]}`}>
             {project.status ?? "—"}
           </span>
           <OpenInTosse
@@ -880,9 +980,9 @@ function ProjectCard({
               )
             }
           />
-          <BacklogSection
-            foldKey={backlogFoldKey(project.id)}
-            tasks={backlog}
+          <OffBoardSections
+            scopeId={project.id}
+            offBoard={offBoard}
             projectId={project.id}
             projectName={project.name}
             selectedTaskId={selectedTaskId}
@@ -898,7 +998,7 @@ function ProjectCard({
               )
             }
           />
-          {sections.length === 0 && backlog.length === 0 ? (
+          {sections.length === 0 && offBoardCount === 0 ? (
             <div className={s.cardEmpty}>No open task</div>
           ) : null}
           {/* ONE creation line per card, not one per section: a row under every status was
@@ -926,17 +1026,6 @@ function ProjectCard({
       </ConfirmDialog>
     </div>
   );
-}
-
-function stateClass(status: string | null): string {
-  switch (status) {
-    case "En cours":
-      return "run";
-    case "En pause":
-      return "pause";
-    default:
-      return "todo";
-  }
 }
 
 /**
@@ -1000,10 +1089,10 @@ export function TaskDetail({
         <div className={s.detailTitle}>{data?.task.title ?? "…"}</div>
         {data ? (
           <div className={s.detailChips}>
-            {/* A TASK's status, so it uses the task colour language — `stateClass` maps
-                PROJECT states, and sent everything it didn't know to "todo": a task in
-                « Review » came out grey here while the board painted it blue, in the one
-                place meant to tell you what the task is. */}
+            {/* A TASK's status, so it uses the task colour language — `projectStatusTone`
+                maps PROJECT states, and sends everything it doesn't know to "todo": a task
+                in « Review » came out grey here while the board painted it violet, in the
+                one place meant to tell you what the task is. */}
             {/* The status is a CONTROL here too, not a label: the panel is where you read a
                 task in full, so it is also where you move it on. Same menu as the row's
                 dot — one way to change a status, wherever you are. */}
@@ -1173,13 +1262,13 @@ export function TaskDetail({
 /** A client band: a fold whose header keeps reporting what's inside when closed. */
 function ClientBand({
   band,
-  backlogByProject,
+  offBoardByProject,
   selectedTaskId,
   onOpenTask,
 }: {
   band: ReturnType<typeof groupByClient>[number];
-  /** projectId → its parked tasks, from the separate backlog request. */
-  backlogByProject: Record<string, TosseTask[]>;
+  /** status → projectId → that project's off-board tasks, from their own requests. */
+  offBoardByProject: Record<string, Record<string, TosseTask[]>>;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -1224,7 +1313,7 @@ function ClientBand({
               project={p}
               index={i}
               paused={p.status === "En pause"}
-              backlog={backlogByProject[p.id] ?? []}
+              offBoard={offBoardForScope(offBoardByProject, p.id)}
               selectedTaskId={selectedTaskId}
               onOpenTask={onOpenTask}
             />
@@ -1292,22 +1381,45 @@ function TosseBoard() {
   const bodyRef = useRef<HTMLDivElement>(null);
   const detailWidth = useTosseDetail((d) => d.width);
   const setDetailWidth = useTosseDetail((d) => d.setWidth);
-  const bands = useMemo(
-    () => groupByClient(data?.projects ?? [], data?.pausedProjects ?? []),
-    [data],
-  );
   const totals = useMemo(
     () => briefingTotals(data?.projects ?? [], data?.generalTasks ?? []),
     [data],
   );
-  // The backlog comes from its own request (the briefing excludes it), so it is filed under
-  // the right card here rather than by every card asking for its own.
-  const { data: backlogRows } = useTosseBacklog();
-  const backlogByProject = useMemo(() => groupBacklogByProject(backlogRows ?? []), [backlogRows]);
-  const generalBacklog = useMemo(
-    () => (backlogRows ?? []).filter((r) => !r.projectId).map((r) => r.task),
-    [backlogRows],
+  // Each off-board status comes from its own request (the briefing excludes them all
+  // server-side), so they are filed under the right card HERE rather than by every card
+  // asking for its own.
+  //
+  // ⚠️ Fixed number of hooks, from a constant list — never a `.map` over data, which would
+  // change the hook count between renders the moment a status appeared or vanished.
+  const pending = useTosseOffBoard("En attente");
+  const backlog = useTosseOffBoard("Backlog");
+  const offBoardRows = useMemo<Record<string, TosseOffBoardTask[]>>(
+    () => ({ "En attente": pending.data ?? [], Backlog: backlog.data ?? [] }),
+    [pending.data, backlog.data],
   );
+  const offBoardByProject = useMemo(() => {
+    const out: Record<string, Record<string, TosseTask[]>> = {};
+    for (const [status, rows] of Object.entries(offBoardRows)) {
+      out[status] = groupOffBoardByProject(rows);
+    }
+    return out;
+  }, [offBoardRows]);
+  const generalOffBoard = useMemo(() => {
+    const out: Record<string, TosseTask[]> = {};
+    for (const [status, rows] of Object.entries(offBoardRows)) {
+      const tasks = offBoardWithoutProject(rows);
+      if (tasks.length) out[status] = tasks;
+    }
+    return out;
+  }, [offBoardRows]);
+  // A project whose whole queue is parked is absent from the briefing, so its card has to be
+  // BUILT — otherwise its tasks are fetched and then rendered nowhere. See
+  // `offBoardProjectCards`.
+  const bands = useMemo(() => {
+    const extra = offBoardProjectCards(data ?? null, Object.values(offBoardRows));
+    return groupByClient([...(data?.projects ?? []), ...extra], data?.pausedProjects ?? []);
+  }, [data, offBoardRows]);
+  const hasGeneralOffBoard = Object.keys(generalOffBoard).length > 0;
 
   // The panel pushes the list aside as it arrives, and folds back into the edge on close.
   // `flex: 0 1 auto` at rest, exactly as the panel itself sizes: the slot measures whatever
@@ -1385,10 +1497,14 @@ function TosseBoard() {
                 "Nothing open in TOSSE" directly above a list of open tasks — while the
                 toolbar, which does count them, announced how many there were. The view
                 contradicted itself on the only question it exists to answer. */}
-            {!isLoading && bands.length === 0 && (data?.generalTasks.length ?? 0) === 0 && !error ? (
+            {!isLoading &&
+            bands.length === 0 &&
+            (data?.generalTasks.length ?? 0) === 0 &&
+            !hasGeneralOffBoard &&
+            !error ? (
               <div className={s.empty}>
                 <div className={s.emptyBig}>Nothing open in TOSSE</div>
-                <div>Every active project is clear. Backlog and done tasks live in the CRM.</div>
+                <div>Every active project is clear. Done tasks live in the CRM.</div>
               </div>
             ) : null}
 
@@ -1396,16 +1512,16 @@ function TosseBoard() {
               <ClientBand
                 key={band.key}
                 band={band}
-                backlogByProject={backlogByProject}
+                offBoardByProject={offBoardByProject}
                 selectedTaskId={openTaskId}
                 onOpenTask={setOpenTaskId}
               />
             ))}
 
-            {(data?.generalTasks.length ?? 0) > 0 || generalBacklog.length > 0 ? (
+            {(data?.generalTasks.length ?? 0) > 0 || hasGeneralOffBoard ? (
               <GeneralTaskBand
                 tasks={data?.generalTasks ?? []}
-                backlog={generalBacklog}
+                offBoard={generalOffBoard}
                 selectedTaskId={openTaskId}
                 onOpenTask={setOpenTaskId}
               />
@@ -1456,13 +1572,13 @@ function TosseBoard() {
  */
 function GeneralTaskBand({
   tasks,
-  backlog,
+  offBoard,
   selectedTaskId,
   onOpenTask,
 }: {
   tasks: TosseTask[];
-  /** Parked tasks that belong to no project either. */
-  backlog: TosseTask[];
+  /** Off-board tasks that belong to no project either, by status. */
+  offBoard: Record<string, TosseTask[]>;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
@@ -1471,6 +1587,11 @@ function GeneralTaskBand({
   const sections = useMemo(() => statusSections(tasks), [tasks]);
   const folded = useTosseFold((f) => f.folded[GENERAL_FOLD_KEY] === true);
   const toggle = useTosseFold((f) => f.toggle);
+  // EVERY row the band holds, off-board ones included — unlike a project card's "N open",
+  // which counts live work by definition, this heading claims to count the band's tasks. It
+  // read "1 task" above three of them.
+  const total =
+    tasks.length + Object.values(offBoard).reduce((n, rows) => n + rows.length, 0);
   return (
     <>
       {/* Folds like a client band — it wears the same chevron, so it has to behave the same
@@ -1487,7 +1608,7 @@ function GeneralTaskBand({
         <span className={s.bandName}>No project</span>
         <span className={s.bandRule} />
         <span className={s.bandProjects}>
-          {tasks.length} task{tasks.length > 1 ? "s" : ""}
+          {total} task{total > 1 ? "s" : ""}
         </span>
       </button>
       {folded ? null : (
@@ -1509,9 +1630,9 @@ function GeneralTaskBand({
               )
             }
           />
-          <BacklogSection
-            foldKey={backlogFoldKey(GENERAL_FOLD_KEY)}
-            tasks={backlog}
+          <OffBoardSections
+            scopeId={GENERAL_FOLD_KEY}
+            offBoard={offBoard}
             projectId={null}
             projectName={null}
             selectedTaskId={selectedTaskId}

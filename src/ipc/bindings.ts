@@ -534,12 +534,15 @@ async tosseBriefing() : Promise<Result<TosseBriefing, string>> {
 }
 },
 /**
- * The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
- * the view can offer them as a section of their own — see `tosse::backlog`.
+ * The tasks of ONE status the briefing deliberately leaves out (`Backlog`, `En attente`).
+ * 
+ * One command for both rather than one per status: they differ only by the value in the
+ * query, and the view renders them the same way — as a section of its own on the card of
+ * the project that owns them. See `tosse::tasks_by_status`.
  */
-async tosseBacklog() : Promise<Result<TosseBacklogTask[], string>> {
+async tosseTasksByStatus(status: string) : Promise<Result<TosseOffBoardTask[], string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("tosse_backlog") };
+    return { status: "ok", data: await TAURI_INVOKE("tosse_tasks_by_status", { status }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3473,11 +3476,6 @@ signedOutReason: string | null;
  */
 identityError: string | null }
 /**
- * A backlog task, plus the project it belongs to so the view can file it under the right
- * card. `project_id` is `None` for a task that has no project at all.
- */
-export type TosseBacklogTask = { projectId: string | null; task: TosseTask }
-/**
  * `GET /api/v1/briefing/morning`, normalised.
  * 
  * ⚠️ What this endpoint deliberately LEAVES OUT: tasks in `Backlog`, `En attente` or
@@ -3558,6 +3556,14 @@ attempts: number;
  * counter is exactly the case a transition-based signal would miss.
  */
 connections: number }
+/**
+ * A task the briefing structurally leaves out, plus the project that owns it.
+ */
+export type TosseOffBoardTask = { 
+/**
+ * `None` for a task attached to no project at all — the view has a band for those.
+ */
+project: TosseTaskProject | null; task: TosseTask }
 /**
  * A project with the tasks the briefing kept for it.
  * 
@@ -3722,6 +3728,26 @@ export type TosseTaskLink = { id: string; title: string; status: string | null;
  * dimmed, so "why was this stuck" stays answerable after the fact.
  */
 resolved: boolean }
+/**
+ * The project a `/api/v1/tasks` row names.
+ * 
+ * ⚠️ NOT the briefing's [`TosseProject`], and deliberately so: this is all the tasks
+ * endpoint knows (no dates, no progress counts, and the client reached through the
+ * mission), yet it is enough to BUILD a card for a project the briefing never sends —
+ * which is the whole point. A project whose only tasks are off the board has no card in
+ * the briefing, so without this its tasks would have nowhere to be rendered and would
+ * simply not appear.
+ */
+export type TosseTaskProject = { id: string; name: string; status: string | null; 
+/**
+ * ⚠️ Reached through `mission.client` here, where the briefing sends a flat `client`.
+ * 
+ * The endpoint selects only the client's `id` and `name` (see the CRM's
+ * `routes/tasks.ts`), so `logo_url`/`website` are normally absent and the view falls
+ * back to initials. Read anyway — if the CRM ever widens that select, the mark appears
+ * with no change here.
+ */
+client: TosseClientRef | null }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

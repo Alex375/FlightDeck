@@ -881,12 +881,19 @@ pub async fn tosse_briefing() -> Result<crate::tosse::TosseBriefing, String> {
     crate::tosse::briefing().await.map_err(|e| e.to_string())
 }
 
-/// The `Backlog` tasks, which the briefing deliberately leaves out. Fetched separately so
-/// the view can offer them as a section of their own — see `tosse::backlog`.
+/// The tasks of ONE status the briefing deliberately leaves out (`Backlog`, `En attente`).
+///
+/// One command for both rather than one per status: they differ only by the value in the
+/// query, and the view renders them the same way — as a section of its own on the card of
+/// the project that owns them. See `tosse::tasks_by_status`.
 #[tauri::command]
 #[specta::specta]
-pub async fn tosse_backlog() -> Result<Vec<crate::tosse::TosseBacklogTask>, String> {
-    crate::tosse::backlog().await.map_err(|e| e.to_string())
+pub async fn tosse_tasks_by_status(
+    status: String,
+) -> Result<Vec<crate::tosse::TosseOffBoardTask>, String> {
+    crate::tosse::tasks_by_status(&status)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Where TOSSE lives in a browser, so the tasks view can hand a task or a project over to

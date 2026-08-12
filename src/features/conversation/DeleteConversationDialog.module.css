@@ -82,18 +82,27 @@
   line-height: 16px;
   letter-spacing: 0.01em;
 }
+/* ⚠️ From the shared `--ts-*` tokens (`src/ui/tosse-status.css`), never local hexes: this
+   badge, the board and the header chip all name the same CRM value, and three private
+   copies is how they came to disagree. */
 .b_run {
-  color: #3b82f6;
+  color: var(--ts-run-tx);
 }
-.b_wait {
-  color: #f59e0b;
+.b_review {
+  color: var(--ts-review-tx);
 }
 .b_hold {
-  color: #8b5cf6;
+  color: var(--ts-hold-tx);
 }
 .b_done {
-  color: #34d399;
+  color: var(--ts-done);
 }
 .b_todo {
   color: var(--wf-tx-lo);
+}
+.b_backlog {
+  color: var(--ts-backlog);
+}
+.b_archived {
+  color: var(--ts-archived);
 }

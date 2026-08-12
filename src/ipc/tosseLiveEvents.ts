@@ -12,7 +12,7 @@
 // test that pins what it must NOT touch.
 
 import {
-  tosseBacklogKey,
+  tosseOffBoardKeyPrefix,
   tosseBriefingKey,
   tosseProjectReposKey,
   tosseRepoLinksKey,
@@ -36,12 +36,12 @@ export function crmEventQueryKeys(kind: string): InvalidationKey[] {
   // `task:created` / `:updated` / `:archived`, plus the relation events (a blocking link
   // changes what the detail panel shows and whether a task can be started).
   if (kind.startsWith("task:")) {
-    return [tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix];
+    return [tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix];
   }
   // A project can move between the active and paused sections — and it takes its tasks with
   // it, which is why the briefing (not just a project list) is refetched.
   if (kind.startsWith("project:")) {
-    return [tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix, tosseProjectReposKey];
+    return [tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix, tosseProjectReposKey];
   }
   // A mission is above the project in the cascade: the board groups by client through it,
   // so a renamed or archived mission changes what the cards say.
@@ -111,7 +111,7 @@ export function connectionRefetch(
 export function allTosseQueryKeys(): InvalidationKey[] {
   return [
     tosseBriefingKey,
-    tosseBacklogKey,
+    tosseOffBoardKeyPrefix,
     tosseTaskKeyPrefix,
     tosseProjectReposKey,
     tosseRepoLinksKey,
@@ -133,5 +133,5 @@ export function allTosseQueryKeys(): InvalidationKey[] {
  * unbounded) still gets {@link allTosseQueryKeys}.
  */
 export function recycleRefetchKeys(): InvalidationKey[] {
-  return [tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix, tosseProjectReposKey];
+  return [tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix, tosseProjectReposKey];
 }

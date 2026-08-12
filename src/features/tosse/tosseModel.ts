@@ -4,7 +4,13 @@
 // Kept out of the component so the ordering rules — the part that has to stay stable while
 // rows move under optimistic writes — is unit-testable without a DOM.
 
-import type { TosseBriefing, TosseProject, TosseTask } from "../../ipc/client";
+import type {
+  TosseBriefing,
+  TosseOffBoardTask,
+  TosseProject,
+  TosseTask,
+  TosseTaskProject,
+} from "../../ipc/client";
 
 /**
  * The statuses that make a task LEAVE the briefing.
@@ -21,6 +27,16 @@ export const STATUSES_OFF_THE_BOARD = new Set([
 ]);
 
 /**
+ * The off-board statuses the view FETCHES for itself, in the order their sections appear.
+ *
+ * ⚠️ Mirror of `OFF_BOARD_STATUSES` in `src-tauri/src/tosse/mod.rs`, which refuses anything
+ * else: asking here for a status the core does not fetch would surface as a raw error about
+ * a request the user never made. `Fait` and `Archivé` are deliberately absent — they are off
+ * the board too, but they are history, and this screen is about live work.
+ */
+export const OFF_BOARD_SECTIONS = ["En attente", "Backlog"] as const;
+
+/**
  * The board as it looks the instant a task is moved to `status` — the optimistic patch.
  *
  * Covers `generalTasks` as well as the projects, because the project-less band is rendered
@@ -29,8 +45,8 @@ export const STATUSES_OFF_THE_BOARD = new Set([
  * produced the identical screen.
  *
  * A task whose new status is off the board is removed rather than moved: the briefing does
- * not carry those, so keeping the row would show something the next refetch deletes on its
- * own, which reads as a glitch instead of as the move that was asked for.
+ * not carry those. Where it GOES instead is {@link routeTaskStatus}'s business — this
+ * function only ever describes the briefing.
  */
 export function applyStatusToBoard(
   briefing: TosseBriefing,
@@ -49,6 +65,155 @@ export function applyStatusToBoard(
 }
 
 /**
+ * The three caches the view reads, as one value — the briefing plus one list per off-board
+ * status. `null` means "not fetched / not in cache", which is NOT the same as an empty list
+ * and must not be turned into one: writing back an empty array would tell the query cache
+ * the answer is "nothing", and the section would go silent instead of loading.
+ */
+export interface BoardCaches {
+  briefing: TosseBriefing | null;
+  /** status → its rows, or null when that query holds nothing yet. */
+  offBoard: Record<string, TosseOffBoardTask[] | null>;
+}
+
+/** The task a row carries, plus where it lives — what a move needs in order to re-file it. */
+interface FoundTask {
+  task: TosseTask;
+  project: TosseTaskProject | null;
+}
+
+/**
+ * Every cache, the instant a task is moved to `status`.
+ *
+ * ⚠️ This exists because the sections a task can move BETWEEN are no longer all in one
+ * payload. With only the briefing patched, a task sent to « En attente » vanished (the
+ * briefing drops it) and did not reappear in the section right below it, while a task
+ * pulled OUT of « En attente » vanished the other way — both until a refetch landed. The
+ * move looked like a deletion, which is the one reading a status change must never have.
+ *
+ * The task is looked up across ALL caches first, so a row can be moved from wherever it is
+ * displayed; then removed everywhere; then filed into its destination:
+ *   - an off-board status we fetch → that list, carrying its project so the card survives;
+ *   - a board status → the briefing, under its project (fabricating that project's entry
+ *     when the briefing has never carried it — see {@link offBoardProjectCards}, which is
+ *     what put the row on screen in the first place);
+ *   - `Fait` / `Archivé` → nowhere. They leave the screen, which is what closing a task
+ *     means here.
+ *
+ * Returns the caches unchanged when the task is nowhere to be found: patching by id alone
+ * would silently create a half-filled row out of a task we never had.
+ */
+export function routeTaskStatus(
+  caches: BoardCaches,
+  taskId: string,
+  status: string,
+): BoardCaches {
+  const found = findTask(caches, taskId);
+  if (!found) return caches;
+
+  const moved: TosseTask = { ...found.task, status };
+  const briefing = caches.briefing
+    ? stripTaskFromBriefing(caches.briefing, taskId)
+    : null;
+  const offBoard: Record<string, TosseOffBoardTask[] | null> = {};
+  for (const [key, rows] of Object.entries(caches.offBoard)) {
+    offBoard[key] = rows ? rows.filter((r) => r.task.id !== taskId) : rows;
+  }
+
+  // Destination 1 — another off-board list. Only one we actually hold: a status whose query
+  // has never run has nothing to patch, and the section will fetch it when it mounts.
+  if (status in offBoard) {
+    const rows = offBoard[status];
+    if (rows) offBoard[status] = [...rows, { project: found.project, task: moved }];
+    return { briefing, offBoard };
+  }
+
+  // Destination 2 — back onto the board.
+  if (!STATUSES_OFF_THE_BOARD.has(status) && briefing) {
+    return { briefing: insertIntoBriefing(briefing, moved, found.project), offBoard };
+  }
+
+  // Destination 3 — `Fait` / `Archivé`: gone from every list, on purpose.
+  return { briefing, offBoard };
+}
+
+function findTask(caches: BoardCaches, taskId: string): FoundTask | null {
+  for (const rows of Object.values(caches.offBoard)) {
+    const row = rows?.find((r) => r.task.id === taskId);
+    if (row) return { task: row.task, project: row.project };
+  }
+  const b = caches.briefing;
+  if (!b) return null;
+  for (const project of b.projects) {
+    const task = project.tasks.find((t) => t.id === taskId);
+    if (task) {
+      return {
+        task,
+        project: {
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          client: project.client,
+        },
+      };
+    }
+  }
+  const general = b.generalTasks.find((t) => t.id === taskId);
+  return general ? { task: general, project: null } : null;
+}
+
+function stripTaskFromBriefing(briefing: TosseBriefing, taskId: string): TosseBriefing {
+  return {
+    ...briefing,
+    projects: briefing.projects.map((p) => ({
+      ...p,
+      tasks: p.tasks.filter((t) => t.id !== taskId),
+    })),
+    generalTasks: briefing.generalTasks.filter((t) => t.id !== taskId),
+  };
+}
+
+/**
+ * Put a task back on the board, under its project.
+ *
+ * A project the briefing has never carried gets an entry built on the spot — the same
+ * fabrication {@link offBoardProjectCards} does for display. Without it, pulling the last
+ * parked task of such a project onto the board would delete its card (nothing off-board
+ * left to build one from) and the task would be nowhere until the refetch landed.
+ */
+function insertIntoBriefing(
+  briefing: TosseBriefing,
+  task: TosseTask,
+  project: TosseTaskProject | null,
+): TosseBriefing {
+  if (!project) return { ...briefing, generalTasks: [...briefing.generalTasks, task] };
+  let placed = false;
+  const projects = briefing.projects.map((p) => {
+    if (p.id !== project.id) return p;
+    placed = true;
+    return { ...p, tasks: [...p.tasks, task] };
+  });
+  if (placed) return { ...briefing, projects };
+  return { ...briefing, projects: [...projects, projectCard(project, [task])] };
+}
+
+/** A briefing-shaped project from what a task row knows — no dates, no progress counts,
+ *  because the tasks endpoint does not send them (see `TosseTaskProject`). */
+function projectCard(project: TosseTaskProject, tasks: TosseTask[]): TosseProject {
+  return {
+    id: project.id,
+    name: project.name,
+    status: project.status,
+    client: project.client,
+    startDate: null,
+    dueDate: null,
+    tasks,
+    taskCount: 0,
+    taskDone: 0,
+  };
+}
+
+/**
  * The status sections a project card shows, in order.
  *
  * This is the CRM Briefing page's order (running first), NOT the alphabetical or lifecycle
@@ -61,23 +226,60 @@ export const STATUS_ORDER = ["En cours", "Review", "À faire", "En attente", "Ba
 /**
  * Semantic tone per status.
  *
- * ⚠️ These tones are painted with the CRM's OWN colours in this view — blue for « En cours »,
- * amber for « En revue » — and NOT with Flight Deck's language (where green means running
- * and blue means waiting for you). Alexandre reversed the 2026-08-01 decision on
- * 2026-08-04, having been told the two views would then disagree: this screen is the CRM's
- * board, and the point is that it reads like the CRM.
+ * ⚠️ These tones are painted with the CRM's OWN colours — blue « En cours », VIOLET
+ * « En revue », YELLOW « En attente » — and NOT with Flight Deck's language (where green
+ * means running and blue means waiting for you). Alexandre reversed the 2026-08-01 decision
+ * on 2026-08-04, having been told the two views would then disagree: this screen is the
+ * CRM's board, and the point is that it reads like the CRM.
  *
- * The colours live in `TosseView.module.css` as `--ts-*` variables scoped to `.page`, so the
- * Flight Deck's own dots and rails are untouched.
+ * ⚠️ The two greys are NOT interchangeable. `Backlog` and `À faire` shared one tone, so the
+ * only two statuses a card can show side by side looked identical; the CRM separates them
+ * (gray-700/200 against gray-800/300) and so do we — `backlog` is the lighter of the pair.
+ *
+ * The hues live in `src/ui/tosse-status.css` as `--ts-*` variables on `:root`, because the
+ * board is not the only surface that paints a task status (the conversation's task chip and
+ * the delete dialog do too, and each used to carry its own copy of the hexes). Nothing
+ * outside those surfaces consumes them.
  */
-export const STATUS_TONE: Record<string, "run" | "wait" | "todo" | "hold" | "done"> = {
+export type StatusTone = "run" | "review" | "todo" | "backlog" | "hold" | "done" | "archived";
+
+export const STATUS_TONE: Record<string, StatusTone> = {
   "En cours": "run",
-  Review: "wait",
+  Review: "review",
   "À faire": "todo",
   "En attente": "hold",
-  Backlog: "todo",
+  Backlog: "backlog",
   Fait: "done",
+  Archivé: "archived",
 };
+
+/**
+ * Semantic tone per PROJECT status — a different vocabulary from a task's, painted with the
+ * same tokens because the CRM paints both with one badge.
+ *
+ * ⚠️ Kept beside {@link STATUS_TONE} and NOT merged with it: the two enums share no value
+ * except « En cours », and a single map would let a project state silently pick up a task
+ * colour (or the reverse) the day either list grows. The CRM's badge does the same — one
+ * palette, one lookup table per meaning.
+ *
+ * `En pause` is the yellow that « En attente » wears (parked, in both languages), `Terminé`
+ * the green of `Fait`, `Archivé` the spent grey. `À démarrer` is the CRM's darker neutral,
+ * exactly like `À faire`. Anything unknown — `Annulé` today — stays neutral rather than
+ * borrowing a meaning.
+ */
+export const PROJECT_STATUS_TONE: Record<string, StatusTone> = {
+  "En cours": "run",
+  "En pause": "hold",
+  "À démarrer": "todo",
+  Terminé: "done",
+  Actif: "done",
+  Archivé: "archived",
+};
+
+export function projectStatusTone(status: string | null): StatusTone {
+  if (!status) return "todo";
+  return PROJECT_STATUS_TONE[status] ?? "todo";
+}
 
 /**
  * What a status section is CALLED on a project card.
@@ -148,23 +350,75 @@ export function statusSections(tasks: TosseTask[]): StatusSection[] {
   return sections;
 }
 
-/** Backlog rows, in the same order as any other section. Exported because the backlog is
- *  rendered on its own, outside `statusSections`. */
+/** Off-board rows, in the same order as any other section. Exported because those sections
+ *  are rendered on their own, outside `statusSections`. */
 export function sortedBacklog(tasks: TosseTask[]): TosseTask[] {
   return sortTasks(tasks);
 }
 
-/** File the flat backlog response under each project id. Tasks with no project are left
+/** File a flat off-board response under each project id. Tasks with no project are left
  *  out — the caller renders those in the project-less band. */
-export function groupBacklogByProject(
-  rows: Array<{ projectId: string | null; task: TosseTask }>,
+export function groupOffBoardByProject(
+  rows: TosseOffBoardTask[],
 ): Record<string, TosseTask[]> {
   const by: Record<string, TosseTask[]> = {};
   for (const row of rows) {
-    if (!row.projectId) continue;
-    (by[row.projectId] ??= []).push(row.task);
+    if (!row.project) continue;
+    (by[row.project.id] ??= []).push(row.task);
   }
   return by;
+}
+
+/** The rows of an off-board response that belong to no project at all. */
+export function offBoardWithoutProject(rows: TosseOffBoardTask[]): TosseTask[] {
+  return rows.filter((r) => !r.project).map((r) => r.task);
+}
+
+/** One card's slice of the off-board grouping: status → its tasks for that project. Empty
+ *  statuses are kept out, so a card asks only about what it has. */
+export function offBoardForScope(
+  byStatus: Record<string, Record<string, TosseTask[]>>,
+  scopeId: string,
+): Record<string, TosseTask[]> {
+  const out: Record<string, TosseTask[]> = {};
+  for (const [status, byProject] of Object.entries(byStatus)) {
+    const tasks = byProject[scopeId];
+    if (tasks?.length) out[status] = tasks;
+  }
+  return out;
+}
+
+/**
+ * Cards for the projects that ONLY have off-board work.
+ *
+ * ⚠️ Load-bearing, not a nicety. The briefing lists a project because it has a live task;
+ * a project whose whole queue is parked is therefore absent from it, and its tasks had
+ * nowhere to be drawn — 17 « En attente » tasks across 6 projects at the time this was
+ * written, several of which existed on no card at all. The row was fetched, grouped by a
+ * project id nothing matched, and silently dropped: the count in the toolbar and the rows
+ * on screen disagreed, with nothing to explain it.
+ *
+ * The cards are DEGRADED by construction — no dates, no progress ring, and the client mark
+ * falls back to initials — because the tasks endpoint sends none of that (see
+ * `TosseTaskProject`). A degraded card that shows the work beats a perfect one that doesn't
+ * exist. `paused`/`Terminé` projects can't appear here: the request already asks for active
+ * projects only, exactly as the briefing does.
+ */
+export function offBoardProjectCards(
+  briefing: TosseBriefing | null,
+  rows: TosseOffBoardTask[][],
+): TosseProject[] {
+  const known = new Set<string>();
+  for (const p of briefing?.projects ?? []) known.add(p.id);
+  for (const p of briefing?.pausedProjects ?? []) known.add(p.id);
+
+  const cards = new Map<string, TosseProject>();
+  for (const row of rows.flat()) {
+    const project = row.project;
+    if (!project || known.has(project.id) || cards.has(project.id)) continue;
+    cards.set(project.id, projectCard(project, []));
+  }
+  return [...cards.values()];
 }
 
 /** Priority first, then title — a total order, so a re-render after an optimistic write

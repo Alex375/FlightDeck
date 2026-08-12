@@ -1768,31 +1768,72 @@ pub async fn briefing() -> R<TosseBriefing> {
     parse_briefing(data)
 }
 
-/// A backlog task, plus the project it belongs to so the view can file it under the right
-/// card. `project_id` is `None` for a task that has no project at all.
+/// The project a `/api/v1/tasks` row names.
+///
+/// ⚠️ NOT the briefing's [`TosseProject`], and deliberately so: this is all the tasks
+/// endpoint knows (no dates, no progress counts, and the client reached through the
+/// mission), yet it is enough to BUILD a card for a project the briefing never sends —
+/// which is the whole point. A project whose only tasks are off the board has no card in
+/// the briefing, so without this its tasks would have nowhere to be rendered and would
+/// simply not appear.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct TosseBacklogTask {
-    pub project_id: Option<String>,
+pub struct TosseTaskProject {
+    pub id: String,
+    pub name: String,
+    pub status: Option<String>,
+    /// ⚠️ Reached through `mission.client` here, where the briefing sends a flat `client`.
+    ///
+    /// The endpoint selects only the client's `id` and `name` (see the CRM's
+    /// `routes/tasks.ts`), so `logo_url`/`website` are normally absent and the view falls
+    /// back to initials. Read anyway — if the CRM ever widens that select, the mark appears
+    /// with no change here.
+    pub client: Option<TosseClientRef>,
+}
+
+/// A task the briefing structurally leaves out, plus the project that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseOffBoardTask {
+    /// `None` for a task attached to no project at all — the view has a band for those.
+    pub project: Option<TosseTaskProject>,
     pub task: TosseTask,
 }
 
-/// Every task sitting in `Backlog`.
+/// The statuses this app is willing to ask the tasks endpoint for.
 ///
-/// ⚠️ A SEPARATE request on purpose: the briefing deliberately excludes Backlog (along with
-/// `Fait`, `En attente` and `Archivé`) because it answers "what am I working on", and the
-/// server is the one who decides that. Rather than fight it, we ask the tasks endpoint for
-/// exactly the status the briefing left out.
+/// ⚠️ A whitelist, not defensiveness: the CRM validates `status` against an enum and answers
+/// 400 for anything else, so an unknown value would reach the user as a raw HTTP error about
+/// a request they never consciously made. These are exactly the statuses the briefing
+/// excludes and the view renders in a section of its own.
+const OFF_BOARD_STATUSES: [&str; 2] = ["Backlog", "En attente"];
+
+/// Every task sitting in one status the briefing does not carry.
 ///
-/// `active_projects_only` mirrors the briefing's own view of the world, so a backlog task
+/// ⚠️ A SEPARATE request on purpose: the briefing excludes `Backlog`, `En attente`, `Fait`
+/// and `Archivé` server-side (`briefing.service.ts`) because it answers "what am I working
+/// on", and the server is the one who decides that. Rather than fight it, we ask the tasks
+/// endpoint for exactly the status it left out.
+///
+/// `active_projects_only` mirrors the briefing's own view of the world, so a parked task
 /// belonging to a paused or finished project does not reappear under a card the briefing
 /// itself would not show.
-pub async fn backlog() -> R<Vec<TosseBacklogTask>> {
-    let v = api_get("/api/v1/tasks?status=Backlog&active_projects_only=true").await?;
-    let rows = v
-        .pointer("/data")
-        .or_else(|| v.get("data"))
-        .unwrap_or(&v);
+pub async fn tasks_by_status(status: &str) -> R<Vec<TosseOffBoardTask>> {
+    if !OFF_BOARD_STATUSES.contains(&status) {
+        return Err(TosseError::Protocol(format!(
+            "« {status} » is not a status this view fetches separately",
+        )));
+    }
+    // ⚠️ Percent-encoded: « En attente » carries a space, and an unescaped one makes the
+    // request line malformed. `%20` rather than `+` — the plus form only means a space by
+    // the form-encoding convention, which is a property of whoever parses the query, not of
+    // URLs.
+    let path = format!(
+        "/api/v1/tasks?status={}&active_projects_only=true",
+        percent_encode(status)
+    );
+    let v = api_get(&path).await?;
+    let rows = v.pointer("/data").or_else(|| v.get("data")).unwrap_or(&v);
     let Value::Array(rows) = rows else {
         return Err(TosseError::Protocol(format!(
             "the task list was not an array: {}",
@@ -1801,16 +1842,64 @@ pub async fn backlog() -> R<Vec<TosseBacklogTask>> {
     };
     rows.iter()
         .map(|row| {
-            Ok(TosseBacklogTask {
-                project_id: row
-                    .pointer("/project/id")
-                    .and_then(Value::as_str)
-                    .or_else(|| row.get("projectId").and_then(Value::as_str))
-                    .map(str::to_string),
+            Ok(TosseOffBoardTask {
+                project: parse_task_project(row.get("project")),
                 task: parse_task(row)?,
             })
         })
         .collect()
+}
+
+/// The `project` object of a task row, when there is one.
+///
+/// A project without an `id` is dropped rather than invented: the id is what files the task
+/// under a card, and a card keyed by nothing would collect every project-less row into one
+/// bogus project. The task itself still renders — in the "no project" band.
+fn parse_task_project(v: Option<&Value>) -> Option<TosseTaskProject> {
+    let v = v.filter(|p| !p.is_null())?;
+    let id = v.get("id").and_then(Value::as_str)?.to_string();
+    let client = v
+        .pointer("/mission/client")
+        .filter(|c| !c.is_null())
+        .and_then(|c| {
+            Some(TosseClientRef {
+                id: c.get("id").and_then(Value::as_str)?.to_string(),
+                name: c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled client")
+                    .to_string(),
+                logo_url: c.get("logoUrl").and_then(Value::as_str).map(str::to_string),
+                website: c.get("website").and_then(Value::as_str).map(str::to_string),
+            })
+        });
+    Some(TosseTaskProject {
+        id,
+        name: v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled project")
+            .to_string(),
+        status: v.get("status").and_then(Value::as_str).map(str::to_string),
+        client,
+    })
+}
+
+/// Percent-encode one query-string VALUE — everything outside the unreserved set goes to
+/// `%XX`. Small and local on purpose: the one value we ever interpolate is a status from
+/// {@link OFF_BOARD_STATUSES}, and reaching for a dependency to escape a space would be a
+/// bigger commitment than the problem.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Shape the briefing payload. Split from the request so the mapping is testable without a
@@ -2243,6 +2332,65 @@ mod tests {
         assert_eq!(parsed.projects.len(), 1);
         assert_eq!(parsed.projects[0].name, "IA de formulation");
         assert_eq!(parsed.projects[0].status.as_deref(), Some("En cours"));
+    }
+
+    /// A `/api/v1/tasks` row carries its project under a DIFFERENT shape from the briefing's:
+    /// the client hangs off `mission`, not off the project directly. Getting that wrong
+    /// costs the client band — the card would land under "No client".
+    #[test]
+    fn an_off_board_row_reaches_its_client_through_the_mission() {
+        let row = serde_json::json!({
+            "id": "task-1",
+            "title": "Relancer le client",
+            "status": "En attente",
+            "project": {
+                "id": "proj-1",
+                "name": "Refonte site",
+                "status": "En cours",
+                "mission": { "client": { "id": "cli-1", "name": "Fiabila" } }
+            }
+        });
+        let project = parse_task_project(row.get("project")).expect("the row names a project");
+        assert_eq!(project.id, "proj-1");
+        assert_eq!(project.name, "Refonte site");
+        let client = project.client.expect("the client is reachable through the mission");
+        assert_eq!(client.name, "Fiabila");
+        // The endpoint selects id + name only; the mark falls back to initials rather than
+        // fetching anything of its own.
+        assert_eq!(client.logo_url, None);
+        assert_eq!(client.website, None);
+    }
+
+    /// A task with no project — or with a project the endpoint sent without an id — must not
+    /// invent a card. It still renders, in the "no project" band.
+    #[test]
+    fn an_off_board_row_without_a_usable_project_files_under_none() {
+        assert!(parse_task_project(None).is_none());
+        assert!(parse_task_project(Some(&serde_json::Value::Null)).is_none());
+        assert!(parse_task_project(Some(&serde_json::json!({ "name": "id-less" }))).is_none());
+        // A project with no mission is ordinary in the CRM (the client link can be missing at
+        // either hop) — it keeps its card, it just has no client.
+        let bare = parse_task_project(Some(&serde_json::json!({ "id": "p", "name": "Bare" })))
+            .expect("an id is all a card needs");
+        assert_eq!(bare.client, None);
+    }
+
+    /// The space in « En attente » is the whole reason this exists: sent raw it makes the
+    /// request line malformed, and `+` only means a space to a form-encoding parser.
+    #[test]
+    fn a_status_with_a_space_is_percent_encoded() {
+        assert_eq!(percent_encode("En attente"), "En%20attente");
+        assert_eq!(percent_encode("Backlog"), "Backlog");
+        // Non-ASCII goes out byte by byte, as UTF-8 — « Archivé » is the status next door.
+        assert_eq!(percent_encode("Archivé"), "Archiv%C3%A9");
+    }
+
+    /// A status the CRM's enum does not know would come back as a bare 400 about a request
+    /// the user never made. Refused here, with a sentence that names the cause.
+    #[tokio::test]
+    async fn an_unlisted_status_is_refused_before_any_request() {
+        let err = tasks_by_status("Fait").await.expect_err("not an off-board status we fetch");
+        assert!(matches!(err, TosseError::Protocol(_)), "got {err:?}");
     }
 
     /// A row missing its id fails loudly: dropping it would render a short list that looks
