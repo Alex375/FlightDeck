@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import type {
   BackgroundTaskStatus,
   ConversationItem,
@@ -60,6 +68,8 @@ import {
   type ToolStep,
 } from "./toolGroup";
 import { useEffectiveCleanOutput, useDisplay } from "../../store/display";
+import { useWorkFold } from "../../store/workFold";
+import { NO_SLOTS, exitDelayMs, useWorkExit } from "./cleanExit";
 import { ClaudeWorkBlock, LiveToolStep, ToolSection } from "./ToolSection";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
@@ -536,12 +546,16 @@ function LiveRunSection({
   steps,
   active,
   live,
+  motion,
 }: {
   session: string;
   steps: ToolStep[];
   active: boolean;
   /** True while this run is the live trailing run → section stays expanded, collapses on settle. */
   live: boolean;
+  /** Clean-output live regions only: wraps each row in its motion shell and animates the rows
+   *  listed here (the run itself stays — a run moving whole is wrapped by its caller). */
+  motion?: WorkMotion;
 }) {
   const errored = useRunErrored(
     session,
@@ -549,9 +563,15 @@ function LiveRunSection({
   );
   return (
     <ToolSection title={runHeader(steps)} errored={errored} live={live}>
-      {steps.map((step) => (
-        <LiveToolStep key={step.id} session={session} step={step} active={active} />
-      ))}
+      {steps.map((step) =>
+        motion ? (
+          <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>
+            <LiveToolStep session={session} step={step} active={active} />
+          </MotionWrap>
+        ) : (
+          <LiveToolStep key={step.id} session={session} step={step} active={active} />
+        ),
+      )}
     </ToolSection>
   );
 }
@@ -576,98 +596,187 @@ function LiveThinkingBlock({ session, text }: { session: string; text: string })
   return <ThinkingBlock text={text} finalized={false} durationMs={durationMs} />;
 }
 
+/** One half of the travel choreography: an item shrinking OUT of the clear zone, or the same
+ *  item growing IN inside an open fold. See {@link WorkMotion}. */
+type MotionMode = "exit" | "enter";
+
+/** Which items of a rendered region are moving, and in which direction. The map is atom render
+ *  id → stagger slot; an item absent from it is standing still. */
+interface WorkMotion {
+  mode: MotionMode;
+  slots: ReadonlyMap<string, number>;
+}
+
+/**
+ * The animated shell of one item of a region in motion. Present on EVERY item of that region,
+ * not just the moving ones: the exit is a TRANSITION, which needs a node the browser already
+ * painted in its open state, so the wrapper must pre-exist and merely gain `data-motion`.
+ * `slot` (null = standing still) also carries the batch stagger to CSS.
+ */
+function MotionWrap({
+  mode,
+  slot,
+  children,
+}: {
+  mode: MotionMode;
+  slot: number | null;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className="cv-motion"
+      data-motion={slot == null ? undefined : mode}
+      style={slot == null ? undefined : ({ "--cv-exit-delay": `${exitDelayMs(slot)}ms` } as CSSProperties)}
+    >
+      <div className="cv-motion-in">{children}</div>
+    </div>
+  );
+}
+
 /** Render a list of segments as the grouped transcript nodes. `active` marks segments
  *  belonging to the live turn (gates the running spinner); `liveIdx` is the index of the
  *  one run that should render EXPANDED & live (its steps appear as they stream), or -1.
- *  Shared by the normal flow and the inside of a folded <ClaudeWorkBlock>. */
+ *  Shared by the normal flow and the inside of a folded <ClaudeWorkBlock>.
+ *
+ *  `motion` is set for the clean-output regions: every item is then wrapped in <MotionWrap>,
+ *  and the ones in its map are travelling across the fold boundary (see cleanExit). A run whose
+ *  steps are ALL moving animates as one block (header included) instead of dissolving row by
+ *  row under a header that would then vanish on its own.
+ *
+ *  ⚠️ A call site must be CONSISTENT about passing it: React reconciles on (key, TYPE), so a
+ *  wrapper that comes and goes at a stable key tears down and rebuilds the whole subtree. Pass
+ *  a motion with the empty {@link NO_SLOTS} map to mean "nothing is moving", never `undefined`
+ *  — otherwise every `ToolSection`, step row and `SubAgentCard` under it resets to collapsed
+ *  (and a loaded sub-agent transcript is thrown away) the instant the round settles. */
 function renderSegments(
   session: string,
   segs: Segment[],
   active: boolean,
   liveIdx: number,
+  motion?: WorkMotion,
 ): ReactNode[] {
-  return segs.map((seg, i) => {
-    if (seg.kind === "text") return <StreamMarkdown key={seg.key} text={seg.text} />;
-    if (seg.kind === "thinking")
-      return <FrozenThinkingBlock key={seg.key} session={session} text={seg.text} />;
-    if (seg.kind === "marker")
-      // An in-band marker absorbed into this round: a control-change bar (NoticeRow) or a
-      // message injected mid-work (InlineUserMarker), rendered in place — never cuts the work.
-      return seg.markerKind === "notice" ? (
-        <NoticeRow key={seg.key} session={session} noticeId={seg.id} />
-      ) : (
-        <InlineUserMarker key={seg.key} session={session} turnId={seg.id} />
-      );
-    if (seg.kind === "agent")
-      // A sub-agent always renders inline (live lifecycle + drill-in transcript),
-      // never grouped nor hidden by the live-trailing suppression.
+  if (motion) {
+    const { mode, slots } = motion;
+    return segs.map((seg, i) => {
+      // A `run` is keyed by its steps, not by its own (reconstructed) key: it moves as one
+      // block only when EVERY step is moving, else it stays put and hands `motion` down so
+      // the individual rows animate inside it.
+      const slot =
+        seg.kind === "run"
+          ? seg.steps.length > 0 && seg.steps.every((s) => slots.has(s.id))
+            ? Math.min(...seg.steps.map((s) => slots.get(s.id) ?? 0))
+            : null
+          : (slots.get(seg.key) ?? null);
       return (
-        <SubAgentCard
-          key={seg.key}
-          session={session}
-          toolUseId={seg.step.id}
-          input={seg.step.input}
-        />
+        <MotionWrap key={seg.key} mode={mode} slot={slot}>
+          {/* A run moving whole animates from HERE, so its rows must not animate again —
+              but they still get a (neutral) motion, so their wrapper never disappears. */}
+          {renderSegment(
+            session,
+            seg,
+            i,
+            active,
+            liveIdx,
+            slot == null ? motion : { mode, slots: NO_SLOTS },
+          )}
+        </MotionWrap>
       );
-    if (seg.kind === "workflow")
-      // A Workflow renders as a persistent inline card (opens the live overview / report).
-      return (
-        <WorkflowCard
-          key={seg.key}
-          session={session}
-          toolUseId={seg.step.id}
-          input={seg.step.input}
-        />
-      );
-    if (seg.kind === "skill")
-      // A model-invoked slash-command renders as a dedicated command chip (never a raw tool row).
-      return <SkillChip key={seg.key} input={seg.step.input} />;
-    if (seg.kind === "plan")
-      // A proposed plan (ExitPlanMode) renders as its own prominent card: the plan markdown,
-      // its accept/reject decision (hosted here, not in the bottom AskTurn), and annotations.
-      return (
-        <PlanCard
-          key={seg.key}
-          session={session}
-          toolUseId={seg.step.id}
-          input={seg.step.input}
-        />
-      );
-    if (seg.kind === "artifact")
-      // An `Artifact` publish renders as its own inline card, opening the hosted claude.ai page.
-      return (
-        <ArtifactCard
-          key={seg.key}
-          session={session}
-          toolUseId={seg.step.id}
-          input={seg.step.input}
-        />
-      );
-    if (seg.kind === "question")
-      // A question to the user renders as its own inline card (question + chosen answer)
-      // anchoring the exchange in the flow; the interactive ask stays in the bottom AskTurn.
-      return (
-        <QuestionCard
-          key={seg.key}
-          session={session}
-          toolUseId={seg.step.id}
-          input={seg.step.input}
-        />
-      );
-    // A `run` of regular tools. The trailing run of the live turn renders EXPANDED so its
-    // steps appear live (spinner → result), then collapses to its header on settle. Past
-    // / non-trailing runs render collapsed. `active` gates the spinner so a resultless
-    // step in a PAST turn never spins when the session is busy later.
+    });
+  }
+  return segs.map((seg, i) => renderSegment(session, seg, i, active, liveIdx));
+}
+
+/** One segment's node. Extracted from {@link renderSegments} so the clean-output clear zone can
+ *  wrap each item in its exit shell without duplicating the per-kind dispatch. */
+function renderSegment(
+  session: string,
+  seg: Segment,
+  i: number,
+  active: boolean,
+  liveIdx: number,
+  motion?: WorkMotion,
+): ReactNode {
+  if (seg.kind === "text") return <StreamMarkdown key={seg.key} text={seg.text} />;
+  if (seg.kind === "thinking")
+    return <FrozenThinkingBlock key={seg.key} session={session} text={seg.text} />;
+  if (seg.kind === "marker")
+    // An in-band marker absorbed into this round: a control-change bar (NoticeRow) or a
+    // message injected mid-work (InlineUserMarker), rendered in place — never cuts the work.
+    return seg.markerKind === "notice" ? (
+      <NoticeRow key={seg.key} session={session} noticeId={seg.id} />
+    ) : (
+      <InlineUserMarker key={seg.key} session={session} turnId={seg.id} />
+    );
+  if (seg.kind === "agent")
+    // A sub-agent always renders inline (live lifecycle + drill-in transcript),
+    // never grouped nor hidden by the live-trailing suppression.
     return (
-      <LiveRunSection
+      <SubAgentCard
         key={seg.key}
         session={session}
-        steps={seg.steps}
-        active={active}
-        live={i === liveIdx}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
       />
     );
-  });
+  if (seg.kind === "workflow")
+    // A Workflow renders as a persistent inline card (opens the live overview / report).
+    return (
+      <WorkflowCard
+        key={seg.key}
+        session={session}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+      />
+    );
+  if (seg.kind === "skill")
+    // A model-invoked slash-command renders as a dedicated command chip (never a raw tool row).
+    return <SkillChip key={seg.key} input={seg.step.input} />;
+  if (seg.kind === "plan")
+    // A proposed plan (ExitPlanMode) renders as its own prominent card: the plan markdown,
+    // its accept/reject decision (hosted here, not in the bottom AskTurn), and annotations.
+    return (
+      <PlanCard
+        key={seg.key}
+        session={session}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+      />
+    );
+  if (seg.kind === "artifact")
+    // An `Artifact` publish renders as its own inline card, opening the hosted claude.ai page.
+    return (
+      <ArtifactCard
+        key={seg.key}
+        session={session}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+      />
+    );
+  if (seg.kind === "question")
+    // A question to the user renders as its own inline card (question + chosen answer)
+    // anchoring the exchange in the flow; the interactive ask stays in the bottom AskTurn.
+    return (
+      <QuestionCard
+        key={seg.key}
+        session={session}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+      />
+    );
+  // A `run` of regular tools. The trailing run of the live turn renders EXPANDED so its
+  // steps appear live (spinner → result), then collapses to its header on settle. Past
+  // / non-trailing runs render collapsed. `active` gates the spinner so a resultless
+  // step in a PAST turn never spins when the session is busy later.
+  return (
+    <LiveRunSection
+      key={seg.key}
+      session={session}
+      steps={seg.steps}
+      active={active}
+      live={i === liveIdx}
+      motion={motion}
+    />
+  );
 }
 
 /** The live sliding window: how many trailing steps stay visible (current activity) before
@@ -681,7 +790,15 @@ const LIVE_WINDOW = 3;
  *  plan, split it at each plan: every contiguous work run folds into its own block and each plan
  *  renders in clear between them, preserving chronology. The common (no-plan) case is byte-for-byte
  *  unchanged and keeps the round's single foldKey, so its remembered open/collapsed state stands. */
-function renderFoldedWork(session: string, folded: Segment[], roundKey: string): ReactNode {
+function renderFoldedWork(
+  session: string,
+  folded: Segment[],
+  roundKey: string,
+  /** The landing half of the travel choreography, for the work rendered INSIDE the block.
+   *  Always passed (its slot map is empty when the fold is closed, since a closed block renders
+   *  nothing to animate into) — see the reconciliation warning on {@link renderSegments}. */
+  motion: WorkMotion,
+): ReactNode {
   // A `plan`, an `artifact` or a `question` is a decision/deliverable that must never hide
   // inside the fold, even when buried mid-round (e.g. an answered AskUserQuestion followed by
   // more work in the same group): split the fold at each so it renders in clear between runs.
@@ -690,7 +807,7 @@ function renderFoldedWork(session: string, folded: Segment[], roundKey: string):
   if (!folded.some(cuts)) {
     return (
       <ClaudeWorkBlock count={countWorkSteps(folded)} foldConv={session} foldKey={roundKey}>
-        {renderSegments(session, folded, false, -1)}
+        {renderSegments(session, folded, false, -1, motion)}
       </ClaudeWorkBlock>
     );
   }
@@ -708,7 +825,7 @@ function renderFoldedWork(session: string, folded: Segment[], roundKey: string):
         foldConv={session}
         foldKey={`${roundKey}#${idx}`}
       >
-        {renderSegments(session, c, false, -1)}
+        {renderSegments(session, c, false, -1, motion)}
       </ClaudeWorkBlock>,
     );
     chunk = [];
@@ -716,6 +833,9 @@ function renderFoldedWork(session: string, folded: Segment[], roundKey: string):
   for (const seg of folded) {
     if (cuts(seg)) {
       flush();
+      // Rendered in CLEAR, outside the block — and never held in the clear zone either (the
+      // `holdable` veto in CleanBlocks), so from the user's side this card simply stays put.
+      // No motion, in every render, which is also what keeps its element type stable.
       out.push(...renderSegments(session, [seg], false, -1));
     } else {
       chunk.push(seg);
@@ -781,11 +901,48 @@ function CleanBlocks({
       });
     }),
   );
+  // Is this round's fold OPEN? Then the arriving work is actually VISIBLE inside the block, so
+  // it gets the landing half of the travel — growing in exactly as its outgoing copy shrinks
+  // away, which is what keeps the thread's total height constant. Closed, the block renders
+  // nothing and only the exit half plays.
+  // A round holding a plan / artifact / question splits into several blocks keyed
+  // `${roundKey}#N` (see renderFoldedWork); scanning for those is gated on the round actually
+  // containing one, so the common case stays a single map lookup per round.
+  const splitFold = work.some(
+    (s) => s.kind === "plan" || s.kind === "artifact" || s.kind === "question",
+  );
+  const foldOpen = useWorkFold((s) => {
+    const m = s.open[session];
+    if (!m) return false;
+    if (m[roundKey]) return true;
+    if (!splitFold) return false;
+    for (const k in m) if (m[k] && k.startsWith(`${roundKey}#`)) return true;
+    return false;
+  });
+
   const runningById = new Map<string, boolean>();
   ids.forEach((id, i) =>
     runningById.set(id, atomStillRunning({ hasResult: hasResult[i] ?? false, taskStatus: taskStatus[i] ?? null })),
   );
   const isRunning = (id: string) => runningById.get(id) ?? false;
+
+  const atoms = flattenWork(work);
+  // The atom's RENDER id: a step is addressed by its tool_use id (that's what the row is keyed
+  // by inside a run), everything else by its own segment key. Distinct namespaces, so one map
+  // addresses both.
+  const atomIds = atoms.map((a) => (a.kind === "step" ? a.step.id : a.key));
+  // Decision/deliverable atoms are pulled back out of the block and rendered in clear whatever
+  // the fold does (renderFoldedWork), so crossing the cut does not remove them from view —
+  // holding one would put the SAME card on screen twice, at full height, for the whole flight.
+  const stayingInClear = new Set(
+    atoms
+      .filter((a) => a.kind === "plan" || a.kind === "artifact" || a.kind === "question")
+      .map((a) => a.key),
+  );
+  const split = live ? liveVisibleStart(atoms, isRunning, LIVE_WINDOW) : atoms.length;
+  // Purely cosmetic: hold the atoms that just crossed the cut so they can animate towards the
+  // block instead of being cut out. `split` — WHAT folds and WHEN — is untouched.
+  const exit = useWorkExit(atomIds, split, live, (key) => !stayingInClear.has(key));
 
   // Settled response ending on tools (no closing prose): render unfolded — folding everything
   // would leave nothing in clear.
@@ -793,20 +950,29 @@ function CleanBlocks({
     return <>{renderSegments(session, work, false, -1)}</>;
   }
 
-  const atoms = flattenWork(work);
-  const split = live ? liveVisibleStart(atoms, isRunning, LIVE_WINDOW) : atoms.length;
   const folded = atomsToSegments(atoms.slice(0, split), "fold");
-  const visible = live ? atomsToSegments(atoms.slice(split), "vis") : [];
+  const visible = live ? atomsToSegments(atoms.slice(exit.visStart), "vis") : [];
   // Expand the trailing run of the visible region so its steps show live (spinner → result).
   let liveIdx = -1;
   visible.forEach((s, i) => {
     if (s.kind === "run") liveIdx = i;
   });
 
+  // The same atoms drive both halves: leaving the clear zone, arriving inside the block. Both
+  // are ALWAYS objects — an empty slot map says "nothing is moving". Dropping the prop instead
+  // would make the wrapper vanish at a stable key, remounting everything under it (a settling
+  // round would snap every expanded section and step row shut, and discard any sub-agent
+  // transcript already fetched). See renderSegments.
+  const leaving: WorkMotion = { mode: "exit", slots: live ? exit.slots : NO_SLOTS };
+  const arriving: WorkMotion = {
+    mode: "enter",
+    slots: live && foldOpen ? exit.slots : NO_SLOTS,
+  };
+
   return (
     <>
-      {folded.length > 0 ? renderFoldedWork(session, folded, roundKey) : null}
-      {visible.length > 0 ? renderSegments(session, visible, true, liveIdx) : null}
+      {folded.length > 0 ? renderFoldedWork(session, folded, roundKey, arriving) : null}
+      {visible.length > 0 ? renderSegments(session, visible, true, liveIdx, leaving) : null}
       {final.length > 0 ? renderSegments(session, final, false, -1) : null}
     </>
   );

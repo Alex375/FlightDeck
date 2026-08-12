@@ -537,8 +537,22 @@ describe("flattenWork / atomsToSegments", () => {
     const atoms = flattenWork(segs([tool("a", "Read"), tool("b", "Edit")]));
     const a = atomsToSegments(atoms, "vis");
     const b = atomsToSegments(atoms.slice(1), "vis");
-    expect(a[0].key).toBe("vis-run-0");
-    expect(b[0].key).toBe("vis-run-0"); // same key though it now holds only the 2nd step
+    expect(a[0].key).toBe("vis-run-a");
+    // Losing the run's first step does re-key it — that run genuinely changed identity.
+    expect(b[0].key).toBe("vis-run-b");
+  });
+
+  it("does not re-key a run when an EARLIER one folds away", () => {
+    // The regression an ordinal-based key produced: the fold boundary advancing past the first
+    // run renumbered the second one, so React remounted a live, untouched tool section (and
+    // every step row the user had expanded inside it snapped shut).
+    const atoms = flattenWork(
+      segs([tool("a", "Read"), text("narration"), tool("b", "Edit"), tool("c", "Bash")]),
+    );
+    const wide = atomsToSegments(atoms, "vis").filter((s) => s.kind === "run");
+    const narrow = atomsToSegments(atoms.slice(2), "vis").filter((s) => s.kind === "run");
+    expect(wide.map((s) => s.key)).toEqual(["vis-run-a", "vis-run-b"]);
+    expect(narrow.map((s) => s.key)).toEqual(["vis-run-b"]); // same run, same key
   });
 
   it("keeps a Skill as a non-step atom that breaks a run and round-trips", () => {
