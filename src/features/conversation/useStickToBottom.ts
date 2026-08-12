@@ -252,6 +252,47 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     return () => ro.disconnect();
   }, []);
 
+  // Track CONTENT height changes frame by frame. The clean-output choreography (an item
+  // flying into the fold, a block opening/closing) shrinks or grows the thread over ~180ms
+  // WITHOUT re-rendering it, so neither `onRender` (render-driven) nor the viewport observer
+  // above (clientHeight-driven) fires during the animation. Both regimes need it:
+  //  - pinned to the bottom: without a per-frame re-pin, a smoothed contraction reads as a
+  //    slow drift AWAY from the bottom — strictly worse than the abrupt jump it replaced;
+  //  - scrolled back to read: content contracting ABOVE the viewport otherwise pushes the
+  //    very text the user is reading (WebKit has no scroll anchoring to do it for us), so we
+  //    hold their anchored row in place.
+  useEffect(() => {
+    const el = scrollEl.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const inner = el.querySelector(".cv-thread-inner");
+    if (!inner) return;
+    const ro = new ResizeObserver(() => {
+      const node = scrollEl.current;
+      if (!node || restoring.current) return; // never fight the initial-position restore
+      if (following.current) {
+        // Go through the ONE pin decision point rather than assigning scrollTop here: right
+        // after a send the hook is deliberately in its smooth window, and a raw `scrollTop =`
+        // performs an instant scroll, which per CSSOM-View ABORTS the smooth animation already
+        // in flight. The content grows on the very next frame after a send, so this observer
+        // would cancel that scroll every single time.
+        followIfPinned();
+        return;
+      }
+      // A scroll the user just made has not been captured yet (the capture is coalesced to
+      // one per frame): re-applying the STALE anchor would undo their scrolling.
+      if (captureQueued.current) return;
+      const a = anchor.current;
+      if (!a || !a.node.isConnected) return;
+      const top = Math.max(0, a.node.offsetTop - a.gap);
+      if (Math.abs(top - node.scrollTop) < 1) return;
+      node.scrollTop = top;
+      lastTop.current = node.scrollTop;
+      programmaticTop.current = node.scrollTop;
+    });
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [followIfPinned]);
+
   // Re-anchor when `preserveKey` flips (a toggle that changes the thread height a lot).
   // Runs as a layout effect AFTER the new layout is committed but before paint, so the
   // jump is never visible. Skips the initial mount (no toggle yet).

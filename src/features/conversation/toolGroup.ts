@@ -340,16 +340,21 @@ export function flattenWork(segs: Segment[]): WorkAtom[] {
 
 /** Reconstruct segments from atoms, re-coalescing consecutive steps into runs. `keyPrefix`
  *  keeps reconstructed run keys stable per call-site (the visible vs the folded side), so a
- *  run section isn't remounted as the fold boundary slides. */
+ *  run section isn't remounted as the fold boundary slides.
+ *
+ *  ⚠️ The key is derived from the run's FIRST step, never from its ordinal in the slice. The
+ *  slice's START moves every time the fold boundary advances, so an ordinal would renumber
+ *  every following run (`vis-run-1` → `vis-run-0`) as soon as an earlier one folded away —
+ *  remounting a live, untouched tool section and slamming shut whatever the user had expanded
+ *  inside it. A step's tool_use id is unique, so the key stays put for the run's whole life. */
 export function atomsToSegments(atoms: WorkAtom[], keyPrefix: string): Segment[] {
   const out: Segment[] = [];
   let run: ToolStep[] | null = null;
-  let runOrd = 0;
   for (const a of atoms) {
     if (a.kind === "step") {
       if (!run) {
         run = [];
-        out.push({ kind: "run", key: `${keyPrefix}-run-${runOrd++}`, steps: run });
+        out.push({ kind: "run", key: `${keyPrefix}-run-${a.step.id}`, steps: run });
       }
       run.push(a.step);
       continue;
