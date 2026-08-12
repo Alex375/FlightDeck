@@ -7,7 +7,7 @@ import {
   recycleRefetchKeys,
 } from "./tosseLiveEvents";
 import {
-  tosseBacklogKey,
+  tosseOffBoardKeyPrefix,
   tosseBriefingKey,
   tosseProjectReposKey,
   tosseRepoLinksKey,
@@ -22,7 +22,7 @@ describe("crmEventQueryKeys", () => {
   it("refreshes the board for every task change", () => {
     for (const kind of ["task:created", "task:updated", "task:archived"]) {
       expect(asSet(crmEventQueryKeys(kind))).toEqual(
-        asSet([tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix]),
+        asSet([tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix]),
       );
     }
   });
@@ -44,7 +44,7 @@ describe("crmEventQueryKeys", () => {
   // not merely a project list — is what goes stale.
   it("refreshes the board and the folder pins for a project change", () => {
     expect(asSet(crmEventQueryKeys("project:archived"))).toEqual(
-      asSet([tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix, tosseProjectReposKey]),
+      asSet([tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix, tosseProjectReposKey]),
     );
   });
 
@@ -85,7 +85,7 @@ describe("mergeInvalidationKeys", () => {
     ]);
     expect(merged).toHaveLength(3);
     expect(asSet(merged)).toEqual(
-      asSet([tosseBriefingKey, tosseBacklogKey, tosseTaskKeyPrefix]),
+      asSet([tosseBriefingKey, tosseOffBoardKeyPrefix, tosseTaskKeyPrefix]),
     );
   });
 

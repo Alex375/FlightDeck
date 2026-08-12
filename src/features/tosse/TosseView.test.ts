@@ -15,7 +15,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import type { TosseBriefing, TosseTask } from "../../ipc/client";
+import type { TosseBriefing, TosseOffBoardTask, TosseTask } from "../../ipc/client";
 
 const REFUSAL = "Task is blocked by « Lot 1 » and cannot be started";
 
@@ -24,6 +24,7 @@ const REFUSAL = "Task is blocked by « Lot 1 » and cannot be started";
 // than a pre-set error field.
 const state = {
   briefing: undefined as TosseBriefing | undefined,
+  offBoard: {} as Record<string, TosseOffBoardTask[]>,
   refuseWrites: false,
 };
 
@@ -56,8 +57,12 @@ vi.mock("../../ipc/useTosse", () => ({
     dataUpdatedAt: 0,
   }),
   useTosseTaskDetail: () => ({ data: undefined, isLoading: false, error: null }),
-  // The backlog is a separate request; these tests are about the board itself.
-  useTosseBacklog: () => ({ data: [], isLoading: false, error: null }),
+  // Backlog and « En attente » each come from their own request, keyed by status.
+  useTosseOffBoard: (status: string) => ({
+    data: state.offBoard[status] ?? [],
+    isLoading: false,
+    error: null,
+  }),
   useSetTosseTaskStatus: () => taskStatusMutation(),
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),
@@ -73,6 +78,7 @@ vi.mock("../../ipc/useTosse", () => ({
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 import { TosseView } from "./TosseView";
+import { useTosseFold } from "../../store/tosseFold";
 
 function task(id: string, status: string, over: Partial<TosseTask> = {}): TosseTask {
   return {
@@ -108,7 +114,13 @@ beforeEach(() => {
   document.body.appendChild(container);
   root = createRoot(container);
   state.briefing = boardWithOnlyAGeneralTask();
+  state.offBoard = {};
   state.refuseWrites = false;
+  // The fold store persists to localStorage, and it is shared by every test in this file:
+  // a section left closed by one would silently make the next one's assertion about a
+  // default meaningless.
+  localStorage.clear();
+  useTosseFold.setState({ folded: {} });
 });
 
 afterEach(() => {
@@ -169,6 +181,70 @@ describe("the « No project » band", () => {
     render();
     clickStatus("En cours");
     expect(container.textContent).not.toContain(REFUSAL);
+  });
+});
+
+/** A project as a `/api/v1/tasks` row names it — less than the briefing's shape. */
+function offBoardRow(id: string, title: string, status: string, projectId: string | null) {
+  return {
+    project: projectId
+      ? {
+          id: projectId,
+          name: "Refonte site",
+          status: "En cours",
+          client: { id: "c-wd", name: "Webdentiste", logoUrl: null, website: null },
+        }
+      : null,
+    task: task(id, status, { title }),
+  };
+}
+
+describe("the off-board sections", () => {
+  // The whole point of the feature: « En attente » was fetched by nobody and rendered
+  // nowhere, so 17 waiting tasks existed only in the CRM's browser tab.
+  it("shows waiting tasks, open without being asked", () => {
+    state.briefing = {
+      projects: [],
+      pausedProjects: [],
+      generalTasks: [task("g-urssaf", "À faire", { title: "Déclarer l'URSSAF" })],
+    };
+    state.offBoard = { "En attente": [offBoardRow("w1", "Retour du client", "En attente", null)] };
+    render();
+    expect(container.textContent).toContain("En attente");
+    // OPEN by default (Alexandre, 2026-08-11) — waiting work is live work, so the rows are
+    // there without a click. The backlog's opposite default is asserted right below.
+    expect(container.textContent).toContain("Retour du client");
+  });
+
+  it("keeps the backlog closed by default, heading and all", () => {
+    state.offBoard = { Backlog: [offBoardRow("b1", "Audit annuel", "Backlog", null)] };
+    render();
+    expect(container.textContent).toContain("Backlog");
+    expect(container.textContent).not.toContain("Audit annuel");
+  });
+
+  // The gap that made this more than a rendering change: a project whose whole queue is
+  // parked is ABSENT from the briefing, so its rows had no card to be drawn on and simply
+  // never appeared.
+  it("builds a card for a project the briefing does not carry", () => {
+    state.briefing = { projects: [], pausedProjects: [], generalTasks: [] };
+    state.offBoard = {
+      "En attente": [offBoardRow("w1", "Validation des maquettes", "En attente", "p-ghost")],
+    };
+    render();
+    expect(container.textContent).toContain("Refonte site");
+    expect(container.textContent).toContain("Validation des maquettes");
+    // …and it lands in its client's band rather than under "No client".
+    expect(container.textContent).toContain("Webdentiste");
+  });
+
+  // The empty state is a claim about the user's workload. It counted the briefing only, so a
+  // board whose only work is parked said "Nothing open in TOSSE" above a list of tasks.
+  it("does not claim the board is empty while listing off-board tasks", () => {
+    state.briefing = { projects: [], pausedProjects: [], generalTasks: [] };
+    state.offBoard = { "En attente": [offBoardRow("w1", "Retour du client", "En attente", null)] };
+    render();
+    expect(container.textContent).not.toContain("Nothing open in TOSSE");
   });
 });
 

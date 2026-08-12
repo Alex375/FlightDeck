@@ -1,0 +1,66 @@
+/* The CRM's status palette — the ONE definition of what a TOSSE status looks like.
+
+   ⚠️ These are the CRM's colours, not Flight Deck's, and they deliberately contradict the
+   app's own language one tab away (there green means running and blue means waiting for
+   you). A status shown here describes a CRM value, so it reads like the CRM.
+
+   Authoritative source: `CRM_max/apps/frontend/components/shared/status-badge.tsx`, dark
+   variants — the badge every CRM page paints a status with. Its pairing is `bg-…-900/30`
+   with `text-…-400`; we take the 400 as the text/label hue and the 500 as the saturated
+   fill a dot or a section rule uses.
+
+   | Status     | CRM (dark)                        | token   |
+   |------------|-----------------------------------|---------|
+   | Backlog    | bg gray-700  / text gray-200      | backlog |
+   | À faire    | bg gray-800  / text gray-300      | todo    |
+   | En cours   | blue-400                          | run     |
+   | Review     | purple-400                        | review  |
+   | En attente | yellow-400  (also « En pause »)   | hold    |
+   | Fait       | green-400   (also Terminé/Actif)  | done    |
+   | Archivé    | gray-500, dimmed                  | archived|
+
+   Defined on `:root` rather than scoped to the tasks view because THREE surfaces paint a
+   task status — the board, the conversation's task chip, and the delete-conversation
+   dialog — and they each carried their own copy of the hexes. That is exactly how the app
+   ended up showing « Review » in amber on one screen and violet on another. Nothing else
+   consumes `--ts-*`, so a global definition changes no other view. */
+
+:root {
+  /* En cours — blue */
+  --ts-run: #3b82f6;          /* blue-500 */
+  --ts-run-tx: #60a5fa;       /* blue-400 */
+  --ts-run-bg: rgba(59, 130, 246, 0.12);
+  --ts-run-line: rgba(59, 130, 246, 0.3);
+
+  /* Review — violet (the CRM's purple, NOT the amber this app used to paint it) */
+  --ts-review: #a855f7;       /* purple-500 */
+  --ts-review-tx: #c084fc;    /* purple-400 */
+  --ts-review-bg: rgba(168, 85, 247, 0.12);
+  --ts-review-line: rgba(168, 85, 247, 0.3);
+
+  /* À faire — the darker grey of the CRM's two neutrals */
+  --ts-todo: #9ca3af;         /* gray-400 */
+  --ts-todo-line: rgba(156, 163, 175, 0.25);
+
+  /* Backlog — the LIGHTER neutral. The CRM puts backlog above « à faire » in contrast
+     (gray-200 on gray-700 vs gray-300 on gray-800), so the two greys stay distinguishable;
+     we stop one step short of its gray-200, which on this app's much darker surface reads
+     as white and would outshine « En cours ». */
+  --ts-backlog: #d1d5db;      /* gray-300 */
+  --ts-backlog-line: rgba(209, 213, 219, 0.25);
+
+  /* En attente — yellow (also the project state « En pause », as in the CRM) */
+  --ts-hold: #eab308;         /* yellow-500 */
+  --ts-hold-tx: #facc15;      /* yellow-400 */
+  --ts-hold-bg: rgba(234, 179, 8, 0.12);
+  --ts-hold-line: rgba(234, 179, 8, 0.3);
+
+  /* Fait — green (the CRM's `green-400`, where this app used emerald) */
+  --ts-done: #4ade80;         /* green-400 */
+  --ts-done-bg: rgba(74, 222, 128, 0.12);
+  --ts-done-line: rgba(74, 222, 128, 0.3);
+
+  /* Archivé — present but spent. The CRM dims it rather than colouring it. */
+  --ts-archived: #6b7280;     /* gray-500 */
+  --ts-archived-line: rgba(107, 114, 128, 0.25);
+}

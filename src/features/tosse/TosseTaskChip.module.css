@@ -43,7 +43,12 @@
 }
 
 /* The TASK's status, in the CRM's own colours — the same language the tasks view speaks,
-   since this dot describes a CRM value, not an agent state. */
+   since this dot describes a CRM value, not an agent state.
+
+   ⚠️ Read from the shared `--ts-*` tokens (`src/ui/tosse-status.css`), NOT from hexes of
+   its own: this file used to carry a private copy, and when the board's palette was
+   corrected the chip kept painting « Review » amber — one status, two colours, depending on
+   which part of the app you were looking at. */
 .dot {
   width: 7px;
   height: 7px;
@@ -53,24 +58,32 @@
   background: transparent;
 }
 .dot_run {
-  background: #3b82f6;
-  border-color: #3b82f6;
+  background: var(--ts-run);
+  border-color: var(--ts-run);
 }
-.dot_wait {
-  background: #f59e0b;
-  border-color: #f59e0b;
+.dot_review {
+  background: var(--ts-review);
+  border-color: var(--ts-review);
 }
 .dot_hold {
-  background: #8b5cf6;
-  border-color: #8b5cf6;
+  background: var(--ts-hold);
+  border-color: var(--ts-hold);
 }
 .dot_done {
-  background: #34d399;
-  border-color: #34d399;
+  background: var(--ts-done);
+  border-color: var(--ts-done);
 }
 .dot_todo {
   background: transparent;
-  border-color: #9ca3af;
+  border-color: var(--ts-todo);
+}
+.dot_backlog {
+  background: transparent;
+  border-color: var(--ts-backlog);
+}
+.dot_archived {
+  background: transparent;
+  border-color: var(--ts-archived);
 }
 
 .title {
