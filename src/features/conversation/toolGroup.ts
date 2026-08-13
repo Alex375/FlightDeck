@@ -267,16 +267,14 @@ export function splitFinalMessage(segments: Segment[]): {
   // A trailing `question` (AskUserQuestion) is peeled like a plan: a response that closes on a
   // question — typically prose explaining the situation, then the ask — must keep BOTH the
   // question card and its preceding explanation in clear, not fold them as "work".
+  // A trailing `artifact` is peeled like a plan: a just-published artifact is a deliverable,
+  // not intermediate work — hence `isDecisionKind` for the three of them.
   let i = segments.length;
   while (
     i > 0 &&
     (segments[i - 1].kind === "text" ||
       segments[i - 1].kind === "marker" ||
-      segments[i - 1].kind === "plan" ||
-      // A trailing `artifact` is peeled too: a just-published artifact is a deliverable, not
-      // intermediate work — it stays in clear under clean output (like a plan).
-      segments[i - 1].kind === "artifact" ||
-      segments[i - 1].kind === "question")
+      isDecisionKind(segments[i - 1]))
   )
     i--;
   return { work: segments.slice(0, i), final: segments.slice(i) };
@@ -289,7 +287,9 @@ export function splitFinalMessage(segments: Segment[]): {
 // into segments for rendering.
 
 export type WorkAtom =
-  | { kind: "step"; key: string; step: ToolStep }
+  // `runKey` is the key of the run this step came FROM, carried down so the run can be
+  // rebuilt with the same identity from any slice — see {@link atomsToSegments}.
+  | { kind: "step"; key: string; step: ToolStep; runKey: string }
   | { kind: "agent"; key: string; step: ToolStep }
   | { kind: "workflow"; key: string; step: ToolStep }
   // A skill chip: a non-step atom (like text/thinking) — it folds with the surrounding work
@@ -309,12 +309,33 @@ export type WorkAtom =
   // work but never counts as a step nor forces the fold open.
   | { kind: "marker"; key: string; markerKind: "notice" | "user"; id: string };
 
+/**
+ * Is this a DECISION or a DELIVERABLE rather than intermediate work?
+ *
+ * A proposed plan, a published artifact and a pending question are the three things the agent
+ * produces that the user has to see whatever the fold says — so they are peeled out of the work
+ * block, they cut a run in two, and they are never held back to animate (they never actually
+ * leave the clear flow).
+ *
+ * ⚠️ ONE predicate, deliberately: the same test used to be spelled out four times across two
+ * files, and the copies fail in OPPOSITE directions when a fifth kind is added. Miss it in the
+ * exit veto and the card is held in the clear zone while also being rendered there — the same
+ * full-height card twice for the whole flight; miss it in the fold split and an open fold plays
+ * no arrival at all. Both are visual-only, so no test falls over.
+ *
+ * Typed on the shared `kind` field so it reads a {@link Segment} and a {@link WorkAtom} alike.
+ */
+export function isDecisionKind(item: { kind: Segment["kind"] | WorkAtom["kind"] }): boolean {
+  return item.kind === "plan" || item.kind === "artifact" || item.kind === "question";
+}
+
 /** Flatten work segments into per-item atoms (a run → one atom per step). */
 export function flattenWork(segs: Segment[]): WorkAtom[] {
   const out: WorkAtom[] = [];
   for (const seg of segs) {
     if (seg.kind === "run") {
-      for (const step of seg.steps) out.push({ kind: "step", key: `${seg.key}-${step.id}`, step });
+      for (const step of seg.steps)
+        out.push({ kind: "step", key: `${seg.key}-${step.id}`, step, runKey: seg.key });
     } else if (seg.kind === "agent") {
       out.push({ kind: "agent", key: seg.key, step: seg.step });
     } else if (seg.kind === "workflow") {
@@ -340,16 +361,24 @@ export function flattenWork(segs: Segment[]): WorkAtom[] {
 
 /** Reconstruct segments from atoms, re-coalescing consecutive steps into runs. `keyPrefix`
  *  keeps reconstructed run keys stable per call-site (the visible vs the folded side), so a
- *  run section isn't remounted as the fold boundary slides. */
+ *  run section isn't remounted as the fold boundary slides.
+ *
+ *  ⚠️ The key comes from the atom's `runKey` — the identity of the run it was FLATTENED FROM,
+ *  which is absolute (`run-<block index>`) and therefore the same whatever slice we are handed.
+ *  Deriving it from the slice instead re-keys a live, untouched tool section, which React
+ *  remounts: every step row the user had expanded snaps shut and a fetched sub-agent transcript
+ *  is thrown away. Both slice-local schemes have been tried and both broke, in opposite cases:
+ *  an ORDINAL renumbers every following run as soon as an earlier one folds away entirely
+ *  (`vis-run-1` → `vis-run-0`), and the FIRST STEP's id re-keys on the far more common case of
+ *  the boundary advancing THROUGH a run, once per tool call for the whole turn. */
 export function atomsToSegments(atoms: WorkAtom[], keyPrefix: string): Segment[] {
   const out: Segment[] = [];
   let run: ToolStep[] | null = null;
-  let runOrd = 0;
   for (const a of atoms) {
     if (a.kind === "step") {
       if (!run) {
         run = [];
-        out.push({ kind: "run", key: `${keyPrefix}-run-${runOrd++}`, steps: run });
+        out.push({ kind: "run", key: `${keyPrefix}-${a.runKey}`, steps: run });
       }
       run.push(a.step);
       continue;

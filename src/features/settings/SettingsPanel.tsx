@@ -259,6 +259,8 @@ function DisplayPrefs() {
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
+  const panelAnimations = useDisplay((s) => s.panelAnimations);
+  const conversationAnimations = useDisplay((s) => s.conversationAnimations);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
@@ -379,6 +381,41 @@ function DisplayPrefs() {
         checked={flightdeckModalZoom}
         onChange={(v) => set({ flightdeckModalZoom: v })}
         label="Zoom the conversation out of its card"
+      />
+      <ToggleRow
+        title="Slide side panels open"
+        hint={
+          <>
+            A side panel <strong>pushes its way in</strong> from the edge and the view beside
+            it gives way over the same fraction of a second, instead of the layout jumping in
+            one frame. Covers the conversation's <strong>editor, terminal, artifact viewer</strong>{" "}
+            and task panel, and the <strong>Tasks</strong> view's panel.{" "}
+            <strong>On by default</strong> (about a fifth of a second). The panel's contents
+            are held at their final size while it travels, so nothing inside re-lays-out on the
+            way. Off → panels appear and disappear instantly. Your system's{" "}
+            <strong>"reduce motion"</strong> setting always wins over this.
+          </>
+        }
+        checked={panelAnimations}
+        onChange={(v) => set({ panelAnimations: v })}
+        label="Animate side panels opening and closing"
+      />
+      <ToggleRow
+        title="Animate the conversation"
+        hint={
+          <>
+            A tool section or work block <strong>opens and closes as a movement</strong> rather
+            than a cut, and in <strong>clean output</strong> a finished step{" "}
+            <strong>slides up into the work block</strong> instead of being swapped between the
+            two in one frame. <strong>On by default</strong> (about a tenth of a second).
+            Unlike the side panels, this one plays on <strong>every turn</strong>, right where
+            you are reading. Off → the thread jumps between states as it did before. Your
+            system's <strong>"reduce motion"</strong> setting always wins over this.
+          </>
+        }
+        checked={conversationAnimations}
+        onChange={(v) => set({ conversationAnimations: v })}
+        label="Animate work folding and unfolding"
       />
       <ToggleRow
         title="Message controls"

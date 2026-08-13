@@ -7,7 +7,7 @@
 // (result handed in). Collapsed by default; an error is flagged ONLY by a small alert glyph
 // on the row / section — no auto-expand, no red text (the user opens it on purpose).
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
 import {
@@ -21,6 +21,7 @@ import { fmtDuration } from "../../agent/subagentMeta";
 import { useNow } from "../../ui/useNow";
 import { useWorkFold } from "../../store/workFold";
 import { Ico } from "../../ui/kit";
+import { useCollapseAnim } from "../../ui/useCollapseAnim";
 import { DiffView } from "./DiffView";
 import { applyPatchChanges, parseUnifiedDiff } from "./unifiedDiff";
 import { MentionPathChip } from "./FileMention";
@@ -342,6 +343,9 @@ export function ToolSection({
   useEffect(() => {
     setOpen(Boolean(live));
   }, [live]);
+  // Open/close as a movement rather than a cut — including the automatic collapse on settle,
+  // which used to make the run's rows vanish under a chevron that merely rotated.
+  const { mounted, expanded, settling } = useCollapseAnim(open);
 
   return (
     <div className="cv-steps">
@@ -358,7 +362,15 @@ export function ToolSection({
           <Ico name="chev" className="sm" />
         </span>
       </button>
-      {open ? <div className="cv-steps-b">{children}</div> : null}
+      {mounted ? (
+        <div
+          className="cv-collapse"
+          data-open={expanded ? "1" : undefined}
+          data-settling={settling ? "1" : undefined}
+        >
+          <div className="cv-steps-b">{children}</div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -396,19 +408,46 @@ export function ClaudeWorkBlock({
   const onToggle = persisted
     ? () => toggleStore(foldConv!, foldKey!)
     : () => setLocalOpen((o) => !o);
+  const { mounted, expanded, settling } = useCollapseAnim(open);
+  // Landing signal. In clean output the work flies UP into this block, so the block
+  // acknowledges the arrival — otherwise you see an item leave and never learn where it went.
+  // The count itself still increments at take-off (when the fold rule moves); only the pulse
+  // is delayed by the flight time, in CSS. `land` is a sequence, not a flag: re-keying the
+  // glyph is what REPLAYS the animation when several items land in a row (a CSS animation
+  // does not restart just because an attribute's value changed).
+  const [land, setLand] = useState(0);
+  const prevCount = useRef(count);
+  useEffect(() => {
+    if (count > prevCount.current) setLand((n) => n + 1);
+    prevCount.current = count;
+  }, [count]);
   // Backend-neutral label (the fold serves both Claude and Codex conversations),
   // matching the neighbouring labels ("Executed N steps").
   const label = count > 0 ? `Work · ${count} step${count > 1 ? "s" : ""}` : "Work";
   return (
     <div className="cv-work">
-      <button type="button" className="cv-work-h" onClick={onToggle} aria-expanded={open}>
-        <Ico name="spark" className="sm cv-work-ico" />
+      <button
+        type="button"
+        className="cv-work-h"
+        onClick={onToggle}
+        aria-expanded={open}
+        data-land={land > 0 ? land : undefined}
+      >
+        <Ico key={land} name="spark" className="sm cv-work-ico" />
         <span className="cv-work-t">{label}</span>
         <span className="cv-work-chev" data-open={open ? "1" : undefined}>
           <Ico name="chev" className="sm" />
         </span>
       </button>
-      {open ? <div className="cv-work-b">{children}</div> : null}
+      {mounted ? (
+        <div
+          className="cv-collapse"
+          data-open={expanded ? "1" : undefined}
+          data-settling={settling ? "1" : undefined}
+        >
+          <div className="cv-work-b">{children}</div>
+        </div>
+      ) : null}
     </div>
   );
 }

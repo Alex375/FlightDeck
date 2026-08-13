@@ -10,6 +10,8 @@
 // falls back to a plain fade, which is honest: it says "this appeared" without lying about
 // where from.
 
+import { EASE_ENTER, EASE_EXIT } from "../../ui/motion";
+
 /** A screen-space box, in CSS pixels (the subset of DOMRect this module needs). */
 export interface Box {
   left: number;
@@ -27,10 +29,11 @@ export const ZOOM_OUT_MS = 150;
 /** Decelerating, but not violently so. A sharper curve (easeOutExpo & friends) covers half
  *  the distance in the first tenth of the duration, which reads as the panel BLINKING to
  *  full size rather than leaving the card — the take-off is the part that carries the
- *  meaning here, so it gets frames spent on it. */
-export const EASE_OPEN = "cubic-bezier(0.32, 0.72, 0, 1)";
+ *  meaning here, so it gets frames spent on it. Shared with every other animated surface
+ *  (see `src/ui/motion.ts`): retuning the app's feel is one edit, not a hunt for copies. */
+export const EASE_OPEN = EASE_ENTER;
 /** Accelerating: peels away slowly, then drops into the card. */
-export const EASE_CLOSE = "cubic-bezier(0.4, 0, 0.9, 0.5)";
+export const EASE_CLOSE = EASE_EXIT;
 
 /** The scale a degenerate origin is never allowed to go below — a 0-height card would
  *  otherwise collapse the panel to an invisible line and "unfold" out of nothing. */

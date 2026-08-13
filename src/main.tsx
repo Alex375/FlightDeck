@@ -9,6 +9,8 @@ import "./ui/conductor-flightdeck.css";
 import "./ui/conductor-aliases.css";
 import "./ui/conductor-markdown-modes.css";
 import "./ui/conductor-fleet.css";
+// The CRM's status palette — one definition for every surface that paints a TOSSE status.
+import "./ui/tosse-status.css";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false }, mutations: { retry: false } },

@@ -21,6 +21,7 @@ import { type Conversation } from "../../store/conversationsStore";
 import { type ComposerHandle } from "../conversation/ConductorComposer";
 import { ConversationPane } from "../conversation/ConversationPane";
 import { Splitter } from "../editor/Splitter";
+import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
 import { useGitAutoRefresh, useGitStatus } from "../../ipc/useGit";
 import { useConvGitView, useGitViewStore } from "./gitViewStore";
@@ -65,6 +66,27 @@ export function GitWorkspace({
   const diffOpen = isHistory ? !!selectedHistoryFile : !!selectedChangePath;
   const filesOpen = isHistory && !!selectedOid; // commit's files pane (history tab)
   const vertical = gitOrientation === "row"; // 3-column layout
+
+  // The diff pushes the conversation aside as it arrives and folds back into the edge when
+  // the selection is cleared, on the same mechanics as the conversation view's side region.
+  const diffSlide = usePanelSlide({
+    open: diffOpen,
+    axis: "x",
+    restStyle: {
+      flex: `${1 - gitConvFraction} 1 0`,
+      minWidth: 0,
+      display: "flex",
+      flexDirection: "row",
+    },
+  });
+  // Held while the diff folds away: the selection it renders is what just went null, and
+  // re-reading it would blink the pane to "Select a file" on its way out.
+  const shownSelection = useFrozenWhile(diffOpen, {
+    tab,
+    selectedOid,
+    selectedHistoryFile,
+    selectedChangePath,
+  });
 
   const outerRef = useRef<HTMLDivElement>(null);
   const convDiffRef = useRef<HTMLDivElement>(null);
@@ -113,7 +135,13 @@ export function GitWorkspace({
 
   const diff = (
     <div className={styles.wsDiff} style={{ minWidth: 0, minHeight: 0 }}>
-      <DiffPane cwd={cwd} convId={convId} />
+      <DiffPane
+        cwd={cwd}
+        tab={shownSelection.tab}
+        selectedOid={shownSelection.selectedOid}
+        selectedHistoryFile={shownSelection.selectedHistoryFile}
+        selectedChangePath={shownSelection.selectedChangePath}
+      />
     </div>
   );
 
@@ -124,17 +152,22 @@ export function GitWorkspace({
     <>
       <div
         className={styles.wsConv}
-        style={{ flex: `${diffOpen ? gitConvFraction : 1} 1 0`, minWidth: 220 }}
+        style={{
+          // Grow 1 while the diff travels: the slot holds a pixel size of its own then, and
+          // the conversation takes whatever it has not claimed yet (see neighborFlex).
+          flex: neighborFlex(diffSlide, gitConvFraction),
+          minWidth: 220,
+        }}
       >
         {conversation}
       </div>
-      {diffOpen ? (
-        <>
-          <Splitter axis="x" onMove={(x) => onConvDrag(x)} />
-          <div style={{ flex: `${1 - gitConvFraction} 1 0`, minWidth: 0, display: "flex" }}>
-            {diff}
+      {diffSlide.mounted ? (
+        <div ref={diffSlide.slotRef} style={diffSlide.slotStyle}>
+          <div style={diffSlide.paneStyle}>
+            <Splitter axis="x" onMove={(x) => onConvDrag(x)} />
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex" }}>{diff}</div>
           </div>
-        </>
+        </div>
       ) : null}
     </>
   );

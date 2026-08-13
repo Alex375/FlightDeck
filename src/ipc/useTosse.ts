@@ -12,8 +12,8 @@ import type {
   LocalRepoScan,
   Result,
   TosseAccountStatus,
-  TosseBacklogTask,
   TosseBriefing,
+  TosseOffBoardTask,
   TosseProjectRepo,
   TosseRepoLink,
   TosseRepoLinksPayload,
@@ -24,7 +24,11 @@ import { accountStatusKey } from "./useAccounts";
 // "The session is gone" vs "one request failed" — a wording CONTRACT with the Rust side,
 // so it lives in its own tested module rather than as a local predicate here.
 import { isSessionGone } from "./tosseErrors";
-import { applyStatusToBoard } from "../features/tosse/tosseModel";
+import {
+  OFF_BOARD_SECTIONS,
+  routeTaskStatus,
+  type BoardCaches,
+} from "../features/tosse/tosseModel";
 import { refreshLinkedTaskMeta, useConversationsStore } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
@@ -274,20 +278,26 @@ export function useTosseWebUrl(enabled = true) {
   });
 }
 
-export const tosseBacklogKey = ["tosse-backlog"] as const;
+/**
+ * The prefix every off-board list shares, so one invalidation covers them all — a status
+ * write can move a task between ANY two of them and we would otherwise have to remember to
+ * name each list at every call site.
+ */
+export const tosseOffBoardKeyPrefix = ["tosse-offboard"] as const;
+export const tosseOffBoardKey = (status: string) => ["tosse-offboard", status] as const;
 
 /**
- * The Backlog tasks, which the briefing deliberately omits.
+ * The tasks of one status the briefing structurally omits — `Backlog` and `En attente`.
  *
- * A second request, and a deliberately cold one: a backlog is what you are NOT working on,
- * so it does not need to track the board minute by minute. It is still invalidated by the
- * writes below, so moving a task into or out of Backlog is reflected.
+ * One extra request per status, and deliberately cold ones: these are what you are NOT
+ * working on, so they do not need to track the board minute by minute. They are still
+ * invalidated by the writes below, so moving a task into or out of either is reflected.
  */
-export function useTosseBacklog(enabled = true) {
-  return useQuery<TosseBacklogTask[]>({
-    queryKey: tosseBacklogKey,
+export function useTosseOffBoard(status: string, enabled = true) {
+  return useQuery<TosseOffBoardTask[]>({
+    queryKey: tosseOffBoardKey(status),
     enabled,
-    queryFn: () => unwrap(commands.tosseBacklog()),
+    queryFn: () => unwrap(commands.tosseTasksByStatus(status)),
     staleTime: 5 * 60_000,
   });
 }
@@ -339,18 +349,51 @@ function patchBriefing(
   return previous;
 }
 
+/** Every board cache as one value, and the way back. `null` means "nothing cached" and is
+ *  carried as such — see {@link BoardCaches}. */
+function readBoardCaches(qc: ReturnType<typeof useQueryClient>): BoardCaches {
+  const offBoard: Record<string, TosseOffBoardTask[] | null> = {};
+  for (const status of OFF_BOARD_SECTIONS) {
+    offBoard[status] = qc.getQueryData<TosseOffBoardTask[]>(tosseOffBoardKey(status)) ?? null;
+  }
+  return {
+    briefing: qc.getQueryData<TosseBriefing>(tosseBriefingKey) ?? null,
+    offBoard,
+  };
+}
+
+/** The off-board list a task is currently sitting in, if any — what a status write is about to
+ *  take it OUT of, and therefore half of what the refetch has to cover. */
+function findOffBoardStatus(caches: BoardCaches, taskId: string): string | null {
+  for (const [status, rows] of Object.entries(caches.offBoard)) {
+    if (rows?.some((r) => r.task.id === taskId)) return status;
+  }
+  return null;
+}
+
+/** Write the caches back — the same call restores a snapshot on rollback and installs the
+ *  optimistic patch, so the two can never diverge in shape. */
+function writeBoardCaches(qc: ReturnType<typeof useQueryClient>, caches: BoardCaches): void {
+  if (caches.briefing) qc.setQueryData(tosseBriefingKey, caches.briefing);
+  for (const [status, rows] of Object.entries(caches.offBoard)) {
+    if (rows) qc.setQueryData(tosseOffBoardKey(status), rows);
+  }
+}
 
 /**
  * Move a task to another status.
  *
  * Optimistic: the row jumps to its new section immediately, because the whole point of
  * doing this here rather than in the browser is that it feels local. If the server refuses
- * (a blocked task, an expired session), the previous board is restored WHOLE and the
- * caller shows the reason — a silent revert on the next refetch would look like a bug.
+ * (a blocked task, an expired session), the previous state is restored WHOLE and the caller
+ * shows the reason — a silent revert on the next refetch would look like a bug.
  *
- * A task moved off the board (see {@link STATUSES_OFF_THE_BOARD}) is removed rather than
- * moved: the briefing does not list those, so keeping the row would show something that
- * vanishes on the next refresh anyway.
+ * ⚠️ The patch spans EVERY cache the board draws from, not just the briefing
+ * ({@link routeTaskStatus}). Two of the six statuses live in separate lists, and patching
+ * only the briefing made a move to « En attente » look like a deletion: the row left the
+ * briefing (which excludes that status) and did not appear in the section right below it,
+ * where the user had just sent it, until a refetch landed. The rollback snapshot is taken
+ * across all of them for the same reason.
  */
 export function useSetTosseTaskStatus() {
   const qc = useQueryClient();
@@ -358,22 +401,36 @@ export function useSetTosseTaskStatus() {
     mutationFn: (v: { taskId: string; status: string; title?: string }): Promise<null> =>
       unwrap(commands.tosseSetTaskStatus(v.taskId, v.status)),
     onMutate: async ({ taskId, status }) => {
-      // Stop any briefing refetch already in flight FIRST. Without this, a response that
-      // left before our patch can land after it and overwrite the optimistic board with
-      // pre-write data — and, if the write then fails, our rollback would "restore" that
-      // stale answer as if it were the state the user had.
-      await qc.cancelQueries({ queryKey: tosseBriefingKey });
-      return {
-        previous: patchBriefing(qc, (b) => applyStatusToBoard(b, taskId, status)),
-      };
+      // Stop any refetch already in flight FIRST — briefing AND off-board lists. Without
+      // this, a response that left before our patch can land after it and overwrite the
+      // optimistic board with pre-write data — and, if the write then fails, our rollback
+      // would "restore" that stale answer as if it were the state the user had.
+      await Promise.all([
+        qc.cancelQueries({ queryKey: tosseBriefingKey }),
+        qc.cancelQueries({ queryKey: tosseOffBoardKeyPrefix }),
+      ]);
+      const previous = readBoardCaches(qc);
+      // Which off-board list the task is LEAVING, read before the patch moves it. Together
+      // with the destination this is the whole set of lists a refetch can change.
+      const from = findOffBoardStatus(previous, taskId);
+      writeBoardCaches(qc, routeTaskStatus(previous, taskId, status));
+      return { previous, from };
     },
     onError: (_e, _v, ctx) => {
-      if (ctx?.previous) qc.setQueryData(tosseBriefingKey, ctx.previous);
+      if (ctx?.previous) writeBoardCaches(qc, ctx.previous);
     },
-    onSettled: () => {
+    onSettled: (_d, _e, { status }, ctx) => {
       void qc.invalidateQueries({ queryKey: tosseBriefingKey });
-      // A status write can move a task INTO or OUT OF Backlog, so that list is stale too.
-      void qc.invalidateQueries({ queryKey: tosseBacklogKey });
+      // ⚠️ Only the lists this write can actually have changed — the one it left and the one
+      // it arrived in. Invalidating the whole prefix refetched BOTH off-board lists on every
+      // move, including « À faire » → « En cours », which cannot touch either: three CRM round
+      // trips for a checkbox tick, and again after the SSE burst maps the same event to the
+      // same keys.
+      for (const s of new Set([ctx?.from, status].filter(Boolean) as string[])) {
+        if (OFF_BOARD_SECTIONS.includes(s as (typeof OFF_BOARD_SECTIONS)[number])) {
+          void qc.invalidateQueries({ queryKey: tosseOffBoardKey(s) });
+        }
+      }
       // The WHOLE `tosse-task` prefix, not just the task we wrote. Ticking a SUBTASK writes
       // the subtask's id, while the panel on screen is keyed by its PARENT — invalidating
       // only the written id refreshed a query nobody was looking at, so the checkbox never
@@ -409,7 +466,16 @@ export function useSetTosseProjectStatus() {
     },
     // Always refetch: a project that changed state moves BETWEEN `projects` and
     // `pausedProjects` (and takes its tasks with it), which is the server's call to make.
-    onSettled: () => void qc.invalidateQueries({ queryKey: tosseBriefingKey }),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      // …and the off-board lists with it. They carry a `project` on every row, and the board
+      // BUILDS a card out of those rows for any project the briefing does not name (see
+      // `offBoardProjectCards`). So finishing a project whose queue is parked makes it drop
+      // out of the briefing while its parked rows stay in this 5-minute cache — and the card
+      // the user just closed is fabricated straight back onto the board. The task mutation
+      // already invalidates the same prefix; this one was missed.
+      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
+    },
   });
 }
 

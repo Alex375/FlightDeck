@@ -1,21 +1,33 @@
 import { describe, expect, it } from "vitest";
-import type { TosseProject, TosseTask } from "../../ipc/client";
+import type {
+  TosseOffBoardTask,
+  TosseProject,
+  TosseTask,
+  TosseTaskProject,
+} from "../../ipc/client";
 import type { TosseBriefing } from "../../ipc/client";
 import {
-  applyStatusToBoard,
   briefingTotals,
-  groupBacklogByProject,
   groupByClient,
+  offBoardByScope,
   isOverdue,
+  NO_OFF_BOARD,
+  offBoardProjectCards,
+  offBoardWithoutProject,
+  OFF_BOARD_SECTIONS,
   projectActions,
+  projectStatusTone,
+  routeTaskStatus,
   sectionIcon,
   sectionLabel,
   shortDate,
   sortedBacklog,
   statusSections,
+  STATUS_TONE,
   STATUSES_OFF_THE_BOARD,
   taskQuickAction,
   TASK_STATUS_CHOICES,
+  type BoardCaches,
 } from "./tosseModel";
 
 function task(id: string, status: string, extra: Partial<TosseTask> = {}): TosseTask {
@@ -53,6 +65,31 @@ function project(
     taskCount: tasks.length,
     taskDone: 0,
     ...extra,
+  };
+}
+
+function taskProject(id: string, clientId: string | null = null): TosseTaskProject {
+  return {
+    id,
+    name: id,
+    status: "En cours",
+    client: clientId
+      ? { id: clientId, name: clientId.toUpperCase(), logoUrl: null, website: null }
+      : null,
+  };
+}
+
+/** One row of an off-board response. `projectId` null = a task attached to no project. */
+function row(
+  id: string,
+  status: string,
+  projectId: string | null,
+  extra: Partial<TosseTask> = {},
+  clientId: string | null = null,
+): TosseOffBoardTask {
+  return {
+    project: projectId ? taskProject(projectId, clientId) : null,
+    task: task(id, status, extra),
   };
 }
 
@@ -328,27 +365,47 @@ describe("section headings", () => {
   });
 });
 
-describe("backlog grouping", () => {
+describe("off-board grouping", () => {
   it("files each parked task under its project", () => {
-    const rows = [
-      { projectId: "p1", task: task("b1", "Backlog") },
-      { projectId: "p2", task: task("b2", "Backlog") },
-      { projectId: "p1", task: task("b3", "Backlog") },
-    ];
-    const by = groupBacklogByProject(rows);
-    expect(by.p1.map((t) => t.id)).toEqual(["b1", "b3"]);
-    expect(by.p2.map((t) => t.id)).toEqual(["b2"]);
+    const by = offBoardByScope({
+      Backlog: [row("b1", "Backlog", "p1"), row("b2", "Backlog", "p2"), row("b3", "Backlog", "p1")],
+    });
+    expect(by.p1.Backlog.map((t) => t.id)).toEqual(["b1", "b3"]);
+    expect(by.p2.Backlog.map((t) => t.id)).toEqual(["b2"]);
   });
 
-  // Project-less backlog tasks belong to the "No project" band, which reads them from the
+  // Project-less off-board tasks belong to the "No project" band, which reads them from the
   // raw list — grouping them under a project id would file them nowhere and lose them.
   it("leaves project-less tasks out rather than inventing a bucket", () => {
-    const by = groupBacklogByProject([{ projectId: null, task: task("b-solo", "Backlog") }]);
-    expect(by).toEqual({});
+    const rows = [row("b-solo", "Backlog", null)];
+    expect(offBoardByScope({ Backlog: rows })).toEqual({});
+    expect(offBoardWithoutProject(rows).map((t) => t.id)).toEqual(["b-solo"]);
   });
 
   it("is empty, not undefined, for a project with nothing parked", () => {
-    expect(groupBacklogByProject([])).toEqual({});
+    expect(offBoardByScope({ Backlog: [] })).toEqual({});
+    expect(NO_OFF_BOARD).toEqual({});
+  });
+
+  it("hands a card only the statuses it actually has rows for", () => {
+    const byScope = offBoardByScope({
+      "En attente": [row("w1", "En attente", "p1")],
+      Backlog: [row("b1", "Backlog", "p2")],
+    });
+    expect(Object.keys(byScope.p1)).toEqual(["En attente"]);
+    expect(Object.keys(byScope.p2)).toEqual(["Backlog"]);
+    expect(byScope["p-none"]).toBeUndefined();
+  });
+
+  it("sorts each card's slice once, so no render has to", () => {
+    const byScope = offBoardByScope({
+      Backlog: [
+        row("z", "Backlog", "p1", { priority: "Basse", title: "z" }),
+        row("a", "Backlog", "p1", { priority: "Urgente", title: "a" }),
+        row("m", "Backlog", "p1", { priority: "Moyenne", title: "m" }),
+      ],
+    });
+    expect(byScope.p1.Backlog.map((t) => t.title)).toEqual(["a", "m", "z"]);
   });
 
   it("orders the backlog like every other section (priority, then title)", () => {
@@ -361,66 +418,218 @@ describe("backlog grouping", () => {
   });
 });
 
-describe("optimistic status patch", () => {
-  const board = (): TosseBriefing => ({
-    projects: [project("p1", "c1", [task("t1", "À faire"), task("t2", "En cours")])],
-    pausedProjects: [],
-    generalTasks: [task("g1", "À faire")],
+describe("cards for projects the briefing omits", () => {
+  const briefing = (): TosseBriefing => ({
+    projects: [project("p1", "c1", [task("t1", "En cours")])],
+    pausedProjects: [project("p-paused", "c1", [], { status: "En pause" })],
+    generalTasks: [],
   });
 
-  it("moves a task inside a project", () => {
-    const next = applyStatusToBoard(board(), "t1", "En cours");
-    expect(next.projects[0].tasks.find((t) => t.id === "t1")?.status).toBe("En cours");
-    // Its neighbours are untouched.
-    expect(next.projects[0].tasks.find((t) => t.id === "t2")?.status).toBe("En cours");
+  // The bug this exists for: a project whose whole queue is parked is absent from the
+  // briefing, so its rows were fetched, grouped under an id no card had, and dropped.
+  it("builds a card for a project that only has off-board work", () => {
+    const cards = offBoardProjectCards(briefing(), [
+      [row("w1", "En attente", "p-waiting", {}, "c2")],
+      [row("b1", "Backlog", "p-waiting", {}, "c2")],
+    ]);
+    expect(cards.map((p) => p.id)).toEqual(["p-waiting"]);
+    // Degraded by construction — the tasks endpoint sends no dates and no progress counts,
+    // and the ring is hidden on a zero count rather than drawn as 0/0.
+    expect(cards[0]).toMatchObject({ tasks: [], taskCount: 0, taskDone: 0, startDate: null });
+    // The client comes through, so the card lands in the right band instead of "No client".
+    expect(cards[0].client?.id).toBe("c2");
   });
 
-  // The regression: `generalTasks` was skipped, so a project-less row never moved. That is
-  // what made a REFUSED write invisible — there was no optimistic change to roll back, so
-  // failure looked exactly like success.
-  it("moves a PROJECT-LESS task too", () => {
-    const next = applyStatusToBoard(board(), "g1", "En cours");
-    expect(next.generalTasks[0].status).toBe("En cours");
+  it("never duplicates a project the briefing already carries, paused ones included", () => {
+    const cards = offBoardProjectCards(briefing(), [
+      [row("b1", "Backlog", "p1"), row("b2", "Backlog", "p-paused")],
+    ]);
+    expect(cards).toEqual([]);
   });
 
-  it("drops a project-less task that leaves the board", () => {
-    expect(applyStatusToBoard(board(), "g1", "Fait").generalTasks).toEqual([]);
+  it("builds ONE card for a project with rows in several statuses", () => {
+    const cards = offBoardProjectCards(briefing(), [
+      [row("w1", "En attente", "p-new")],
+      [row("b1", "Backlog", "p-new")],
+    ]);
+    expect(cards).toHaveLength(1);
   });
 
-  // The server's briefing filter excludes four statuses, not one. Keeping a row the next
-  // refetch deletes makes it linger a second and then vanish on its own — a glitch, not the
-  // move the user asked for.
-  it("drops a task for EVERY status that leaves the briefing, not just « Fait »", () => {
-    for (const status of ["Fait", "Backlog", "En attente", "Archivé"]) {
-      const next = applyStatusToBoard(board(), "t1", status);
-      expect(next.projects[0].tasks.map((t) => t.id), `status ${status}`).toEqual(["t2"]);
+  // No briefing yet (first load, or a failed read) is not the same as "the briefing has no
+  // such project": with nothing to compare against, every off-board project needs a card, or
+  // its rows would be invisible for as long as the briefing takes.
+  it("still builds cards when there is no briefing at all", () => {
+    expect(offBoardProjectCards(null, [[row("b1", "Backlog", "p-x")]]).map((p) => p.id)).toEqual([
+      "p-x",
+    ]);
+  });
+
+  it("ignores project-less rows — they have their own band", () => {
+    expect(offBoardProjectCards(briefing(), [[row("b1", "Backlog", null)]])).toEqual([]);
+  });
+});
+
+describe("routing a status change across every cache", () => {
+  const caches = (): BoardCaches => ({
+    briefing: {
+      projects: [project("p1", "c1", [task("t1", "À faire"), task("t2", "En cours")])],
+      pausedProjects: [],
+      generalTasks: [task("g1", "À faire")],
+    },
+    offBoard: {
+      "En attente": [row("w1", "En attente", "p1")],
+      Backlog: [row("b1", "Backlog", "p1")],
+    },
+  });
+
+  // THE regression this function exists for: with only the briefing patched, sending a task
+  // to « En attente » made it disappear — off the briefing, and not into the section right
+  // below it where the user had just put it.
+  it("moves a board task INTO the off-board section it was sent to", () => {
+    const next = routeTaskStatus(caches(), "t1", "En attente");
+    expect(next.briefing?.projects[0].tasks.map((t) => t.id)).toEqual(["t2"]);
+    const waiting = next.offBoard["En attente"] ?? [];
+    expect(waiting.map((r) => r.task.id)).toEqual(["w1", "t1"]);
+    // It carries its project, so the card it lands on is the one it came from.
+    expect(waiting[waiting.length - 1]?.project?.id).toBe("p1");
+    expect(waiting[waiting.length - 1]?.task.status).toBe("En attente");
+  });
+
+  it("moves an off-board task back ONTO the board, under its project", () => {
+    const next = routeTaskStatus(caches(), "w1", "En cours");
+    expect(next.offBoard["En attente"]).toEqual([]);
+    const tasks = next.briefing?.projects[0].tasks ?? [];
+    expect(tasks.map((t) => t.id)).toEqual(["t1", "t2", "w1"]);
+    expect(tasks.find((t) => t.id === "w1")?.status).toBe("En cours");
+  });
+
+  it("moves a task straight between two off-board sections", () => {
+    const next = routeTaskStatus(caches(), "b1", "En attente");
+    expect(next.offBoard.Backlog).toEqual([]);
+    expect(next.offBoard["En attente"]?.map((r) => r.task.id)).toEqual(["w1", "b1"]);
+  });
+
+  // Pulling the last parked task of a briefing-less project onto the board would delete the
+  // card it was standing on (nothing off-board left to build one from), so the row would be
+  // nowhere at all until the refetch landed.
+  it("fabricates the project entry when the briefing has never carried it", () => {
+    const c = caches();
+    c.offBoard["En attente"] = [row("w-x", "En attente", "p-ghost", {}, "c9")];
+    const next = routeTaskStatus(c, "w-x", "En cours");
+    const built = next.briefing?.projects.find((p) => p.id === "p-ghost");
+    expect(built?.tasks.map((t) => t.id)).toEqual(["w-x"]);
+    expect(built?.client?.id).toBe("c9");
+  });
+
+  it("sends a project-less task back to the project-less band", () => {
+    const c = caches();
+    c.offBoard.Backlog = [row("b-solo", "Backlog", null)];
+    const next = routeTaskStatus(c, "b-solo", "À faire");
+    expect(next.briefing?.generalTasks.map((t) => t.id)).toEqual(["g1", "b-solo"]);
+  });
+
+  // `Fait` and `Archivé` have no list of their own here: closing a task means it leaves the
+  // screen. Keeping it in some cache would make it come back on the next render.
+  it("drops a task closed or archived, from wherever it was", () => {
+    for (const status of ["Fait", "Archivé"]) {
+      const fromBoard = routeTaskStatus(caches(), "t1", status);
+      expect(fromBoard.briefing?.projects[0].tasks.map((t) => t.id), status).toEqual(["t2"]);
+      const fromParked = routeTaskStatus(caches(), "b1", status);
+      expect(fromParked.offBoard.Backlog, status).toEqual([]);
     }
   });
 
-  it("keeps a task that stays on the board", () => {
-    for (const status of ["À faire", "En cours", "Review"]) {
-      const next = applyStatusToBoard(board(), "t1", status);
-      expect(next.projects[0].tasks.map((t) => t.id), `status ${status}`).toEqual(["t1", "t2"]);
-    }
+  // A list that was never fetched is `null`, and must STAY null: writing an empty array back
+  // would tell the query cache the answer is "nothing", and the section would go silent
+  // instead of loading.
+  it("never turns an unfetched list into an empty one", () => {
+    const c = caches();
+    c.offBoard["En attente"] = null;
+    const next = routeTaskStatus(c, "t1", "En attente");
+    expect(next.offBoard["En attente"]).toBeNull();
+    // The task still leaves the briefing — the server will not send it back there.
+    expect(next.briefing?.projects[0].tasks.map((t) => t.id)).toEqual(["t2"]);
   });
 
-  it("mirrors the server's own exclusion list", () => {
-    // briefing.service.ts: status: { notIn: ['Archivé', 'Fait', 'Backlog', 'En attente'] }
-    expect([...STATUSES_OFF_THE_BOARD].sort()).toEqual(
-      ["Archivé", "Backlog", "En attente", "Fait"].sort(),
-    );
+  it("works with no briefing cached at all", () => {
+    const c = caches();
+    c.briefing = null;
+    const next = routeTaskStatus(c, "b1", "En attente");
+    expect(next.briefing).toBeNull();
+    expect(next.offBoard["En attente"]?.map((r) => r.task.id)).toEqual(["w1", "b1"]);
   });
 
-  it("does not mutate the board it was given (the rollback copy must stay intact)", () => {
-    const before = board();
+  // …but a task coming back ONTO the board has nowhere to land without one, and taking it out
+  // of its off-board list anyway made the row vanish from the screen entirely — the "looks
+  // like a deletion" reading a status change must never produce. Patch nothing instead; the
+  // refetch is what fills the gap.
+  it("patches NOTHING rather than losing a task moved back onto a board it cannot see", () => {
+    const c = caches();
+    c.briefing = null;
+    const snapshot = JSON.stringify(c);
+    const next = routeTaskStatus(c, "w1", "En cours");
+    expect(JSON.stringify(next)).toBe(snapshot);
+    expect(next.offBoard["En attente"]?.map((r) => r.task.id)).toEqual(["w1"]);
+  });
+
+  it("leaves everything alone when the id matches nothing", () => {
+    const before = caches();
     const snapshot = JSON.stringify(before);
-    applyStatusToBoard(before, "t1", "Fait");
+    const next = routeTaskStatus(before, "nope", "Fait");
+    expect(JSON.stringify(next)).toBe(snapshot);
     expect(JSON.stringify(before)).toBe(snapshot);
   });
 
-  it("leaves the board alone when the id matches nothing", () => {
-    const next = applyStatusToBoard(board(), "nope", "Fait");
-    expect(next.projects[0].tasks).toHaveLength(2);
-    expect(next.generalTasks).toHaveLength(1);
+  it("does not mutate the caches it was given (the rollback snapshot must stay intact)", () => {
+    const before = caches();
+    const snapshot = JSON.stringify(before);
+    routeTaskStatus(before, "t1", "En attente");
+    expect(JSON.stringify(before)).toBe(snapshot);
+  });
+
+  // The sections the view fetches are exactly the ones the core will answer for
+  // (`OFF_BOARD_STATUSES` in `src-tauri/src/tosse/mod.rs`). Asking for anything else surfaces
+  // as an error about a request the user never made.
+  it("fetches exactly the statuses the core allows, waiting work first", () => {
+    expect([...OFF_BOARD_SECTIONS]).toEqual(["En attente", "Backlog"]);
+    for (const status of OFF_BOARD_SECTIONS) {
+      expect(STATUSES_OFF_THE_BOARD.has(status), status).toBe(true);
+    }
+  });
+});
+
+describe("status colours", () => {
+  // The CRM's own badge (`status-badge.tsx`, dark variants) is the authority. The app used
+  // to invert two of them — amber where the CRM is violet, violet where it is yellow — so a
+  // task read in the browser and the same task read here were different colours.
+  it("matches the CRM's badge, tone for tone", () => {
+    expect(STATUS_TONE["En cours"]).toBe("run");
+    expect(STATUS_TONE["Review"]).toBe("review");
+    expect(STATUS_TONE["En attente"]).toBe("hold");
+    expect(STATUS_TONE["Fait"]).toBe("done");
+    expect(STATUS_TONE["Archivé"]).toBe("archived");
+  });
+
+  // They shared one tone, so the two statuses a card is most likely to show together were
+  // indistinguishable.
+  it("tells Backlog and « À faire » apart", () => {
+    expect(STATUS_TONE["Backlog"]).not.toBe(STATUS_TONE["À faire"]);
+  });
+
+  // A project state is a different vocabulary painted with the same tokens: « En pause » is
+  // the yellow of « En attente », « Terminé » the green of « Fait ».
+  it("maps project states with their own table", () => {
+    expect(projectStatusTone("En cours")).toBe("run");
+    expect(projectStatusTone("En pause")).toBe("hold");
+    expect(projectStatusTone("Terminé")).toBe("done");
+    expect(projectStatusTone("Archivé")).toBe("archived");
+    expect(projectStatusTone("À démarrer")).toBe("todo");
+    // Unknown (« Annulé » today) and absent stay neutral rather than borrowing a meaning.
+    expect(projectStatusTone("Annulé")).toBe("todo");
+    expect(projectStatusTone(null)).toBe("todo");
+    // ⚠️ `Actif` is a REPOSITORY status, not a project one, and it used to sit in this table
+    // mapped to the finished green — so an "active" value would have worn the same badge as a
+    // closed project. Its own vocabulary, or neutral.
+    expect(projectStatusTone("Actif")).toBe("todo");
   });
 });

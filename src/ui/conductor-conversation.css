@@ -1,4 +1,19 @@
 /* view-conversation.css */
+
+/* Motion budget for the clean-output choreography (see the .cv-motion / .cv-collapse blocks
+   further down). ⚠️ --cv-exit-dur MUST stay in step with EXIT_MS in cleanExit.ts: that is
+   how long the leaving item is kept mounted, and a CSS transition outliving the mount would
+   be cut off mid-flight. Kept short on purpose — at a sustained live cadence a longer
+   animation overlaps the next one and the thread turns to syrup. */
+:root {
+  --cv-exit-dur: 180ms;
+  --cv-land-dur: 420ms;
+  /* Opening/closing a disclosure the user just clicked: snappier than the app's generic
+     --transition-expand. Stay in step with COLLAPSE_MS in useCollapseAnim.ts (a touch
+     higher there, so the unmount lands after the transition instead of clipping it). */
+  --cv-collapse-dur: 110ms;
+}
+
 .cv-side-h { display:flex; align-items:center; justify-content:space-between; padding:12px 12px 10px; }
 /* Brand mark (the plane + engine-thrust app logo) — standalone, no tile: it carries
    its own coral/cyan identity. Sized to sit level with the "Flight Deck" wordmark. */
@@ -605,6 +620,105 @@
 /* The fold header carries NO error indicator: a failed tool inside is folded like the rest,
    flagged only by the small alert glyph on the command section / step row inside. */
 
+/* ---- Disclosure body (shared by the run section and the work fold) -------------------
+   An auto-height body cannot be transitioned directly, so the row is animated as a grid
+   track (1fr ↔ 0fr) — the one clean way to reach `height: auto`. The body keeps its own
+   margins INSIDE the track, so they contract with it instead of leaving a residual gap.
+   The body is mounted only while visible (see useCollapseAnim) — a clean-output thread
+   holds one fold per response and we don't render collapsed work. */
+.cv-collapse { display:grid; grid-template-rows:0fr; transition:grid-template-rows var(--cv-collapse-dur) ease; }
+.cv-collapse[data-open] { grid-template-rows:1fr; }
+/* Clipped only while the track is MOVING — closed (no [data-open]) or opening ([data-settling]).
+   A permanent overflow:hidden here would quietly cut anything a row inside draws outside its own
+   box at rest (a :focus-visible ring is an outside box-shadow, so it goes first) and would make
+   this a scroll container for any sticky descendant. Same reasoning as .cv-motion-in below,
+   which arms its clip for the flight only. */
+.cv-collapse > * { min-height:0; }
+.cv-collapse:not([data-open]) > *,
+.cv-collapse[data-settling] > * { overflow:hidden; }
+
+/* The counter's landing pulse: the item flies UP into the block, so the block acknowledges
+   its ARRIVAL. Delayed by the flight time — the count itself increments at take-off (when
+   the fold rule moves), and without any signal you can't tell where the item went. */
+.cv-work-h[data-land] .cv-work-ico { animation:cv-work-land var(--cv-land-dur) ease var(--cv-exit-dur) both; }
+@keyframes cv-work-land {
+  0%, 100% { transform:scale(1); color:var(--wf-tx-xlo); }
+  38% { transform:scale(1.16); color:var(--wf-accent); }
+}
+
+/* ---- Clean-output travel choreography (live) -----------------------------------------
+   PURELY COSMETIC: what folds and when is decided elsewhere (liveVisibleStart) and is not
+   touched here. An item leaving the clear zone slides UP and under the section above
+   instead of being cut out.
+
+   Two halves of ONE movement, played SIMULTANEOUSLY (see useWorkExit / CleanBlocks):
+     - `exit`  — the copy held in the clear zone shrinks away;
+     - `enter` — its arrival inside the fold grows in, but ONLY when the fold is open, since
+                 a closed fold renders nothing.
+   Running them together is what keeps the thread's total height CONSTANT: the block gains
+   exactly what the clear zone loses, frame for frame. Play them in sequence instead and the
+   content below yo-yos by the row's full height.
+
+   The wrapper sits on EVERY item of the zone, not only the moving one: a TRANSITION needs a
+   start value the browser has already painted, so the node must pre-exist and merely gain
+   [data-motion]. (The enter half is an ANIMATION, which has no such constraint, but it shares
+   the wrapper so an arriving row is never re-mounted when its flight ends.)
+
+   Exit is clipped from the TOP, not squashed: `justify-content:flex-end` anchors the content
+   to the bottom of the shrinking window, so it is eaten by its own top edge — it reads as
+   sliding under the block. ⚠️ `margin-top:auto` does NOT work here: flex auto-margins collapse
+   to 0 once free space goes negative, i.e. exactly when the row is smaller than its content —
+   the content would stay pinned to the top and be clipped from the BOTTOM instead. */
+.cv-motion { display:grid; grid-template-rows:1fr; }
+/* The clip is armed only for the flight: a permanent `overflow:hidden` would quietly cut
+   anything a row draws outside its box at rest (focus ring, badge, shadow). */
+.cv-motion-in { min-height:0; display:flex; flex-direction:column; }
+.cv-motion[data-motion] .cv-motion-in { overflow:hidden; }
+.cv-motion[data-motion="exit"] .cv-motion-in { justify-content:flex-end; }
+.cv-motion[data-motion="exit"] {
+  grid-template-rows:0fr;
+  transition:
+    grid-template-rows var(--cv-exit-dur) ease var(--cv-exit-delay, 0ms),
+    margin-bottom var(--cv-exit-dur) ease var(--cv-exit-delay, 0ms);
+}
+/* The parent's flex `gap` survives a zero-height child, so without this the row's own space
+   goes but its 13px separator stays — and pops out only when the node is finally dropped,
+   re-introducing a small jump at the very end of the movement. Absorbed as a negative margin
+   that travels with the contraction. Not on the edge child: there is no gap beyond it, so the
+   same margin would instead yank the neighbouring block into it. */
+.cv-aibody > .cv-motion, .cv-work-b > .cv-motion { --cv-exit-gap:13px; }
+.cv-steps-b > .cv-motion { --cv-exit-gap:1px; }
+.cv-motion[data-motion="exit"]:not(:last-child) { margin-bottom:calc(-1 * var(--cv-exit-gap, 0px)); }
+.cv-motion[data-motion="enter"]:first-child { --cv-exit-gap:0px; }
+/* The translate rides the CONTENT inside the clipping window (never the window itself, which
+   would drag the clipped box over its neighbour), so a short row still visibly moves. The fade
+   is deliberately late — it lands at the end of the travel, so the eye follows the movement
+   rather than watching the row dissolve in place. */
+.cv-motion[data-motion="exit"] .cv-motion-in > * {
+  opacity:0;
+  transform:translateY(-6px);
+  transition:
+    transform var(--cv-exit-dur) ease var(--cv-exit-delay, 0ms),
+    opacity calc(var(--cv-exit-dur) * .5) ease calc(var(--cv-exit-delay, 0ms) + var(--cv-exit-dur) * .5);
+}
+/* The arrival, inside an OPEN fold. An ANIMATION rather than a transition: the row is mounted
+   at this very instant, so there is no painted start state to transition from.
+
+   No fade and no travel here, deliberately. Because the arriving half is clipped from the
+   BOTTOM (default anchoring) while the leaving half is clipped from the TOP, the two visible
+   pieces are complementary — at any moment you see the row's first N% inside the block and its
+   last (100−N)% below it, and the seam simply walks down. That reads as ONE row being drawn
+   into the block. Fading the arriving piece in would punch a pale hole in the middle of a row
+   that is, from the eye's point of view, whole the entire time. Measured live: exit + enter
+   heights sum to a constant across every frame. */
+.cv-motion[data-motion="enter"] {
+  animation:cv-motion-enter var(--cv-exit-dur) ease var(--cv-exit-delay, 0ms) both;
+}
+@keyframes cv-motion-enter {
+  from { grid-template-rows:0fr; margin-top:calc(-1 * var(--cv-exit-gap, 0px)); }
+  to { grid-template-rows:1fr; margin-top:0; }
+}
+
 /* A single compact step row inside a section. */
 .cv-step { border-radius:6px; }
 .cv-step-h { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:6px; color:var(--wf-tx); min-width:0; }
@@ -1008,6 +1122,17 @@
 @media (prefers-reduced-motion: reduce) {
   .cv-bgrun i { animation:none !important; opacity:.8; }
   .cv-step-run { animation:none !important; opacity:.8; }
+  /* Clean-output choreography: a short fade, no travel, no stagger. The height still
+     contracts (quickly): dropping THAT would not remove motion, it would bring back the
+     abrupt layout jump this whole thing exists to smooth out. */
+  .cv-motion[data-motion="exit"] { transition-duration:90ms; transition-delay:0ms; }
+  .cv-motion[data-motion="exit"] .cv-motion-in > * {
+    transform:none;
+    transition:opacity 90ms ease;
+  }
+  .cv-motion[data-motion="enter"] { animation-duration:90ms; animation-delay:0ms; }
+  .cv-collapse { transition-duration:0ms; }
+  .cv-work-h[data-land] .cv-work-ico { animation:none !important; }
 }
 
 /* Background shell commands (Bash run_in_background) — pinned rows in the same

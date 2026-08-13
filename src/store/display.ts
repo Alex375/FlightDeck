@@ -100,6 +100,27 @@ export interface DisplayPrefs {
    *  Read by {@link FlightDeckReplyModal}. */
   flightdeckModalZoom: boolean;
 
+  /** Animate a side panel opening and closing: the panel pushes its way in from the edge and
+   *  the region beside it gives way over the same fraction of a second, instead of the layout
+   *  jumping in one frame. Covers the conversation's right-hand region (editor / terminal /
+   *  artifact viewer / a TOSSE task), the terminal's own split inside it, and the TOSSE view's
+   *  task panel. ON by default (~0.19 s in, ~0.14 s out). Off → panels appear and disappear
+   *  instantly, as they did before. The OS "reduce motion" setting overrides this whichever way
+   *  it is set. Read by {@link panelSlideAllowed}. */
+  panelAnimations: boolean;
+
+  /** Animate the conversation thread itself: a tool section or work block opens and closes as a
+   *  movement rather than a cut, and — under clean output — a finished item slides up into the
+   *  work block instead of being swapped between the two render sites in one frame. ON by
+   *  default (~0.11 s for a disclosure, ~0.18 s for the travel). Off → the thread jumps between
+   *  states exactly as it did before, which is also the cheapest it can be. The OS "reduce
+   *  motion" setting overrides this whichever way it is set.
+   *
+   *  Deliberately SEPARATE from {@link panelAnimations}: this one plays on every single turn,
+   *  right where the text being read is, so the person who wants the thread still is not
+   *  necessarily the person who wants panels to stop sliding. */
+  conversationAnimations: boolean;
+
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
    *  offered on both the user's and Claude's messages. ON by default. Off → messages have no
@@ -253,6 +274,8 @@ const DEFAULTS: DisplayPrefs = {
   minimapHoverMode: "summary",
   workflowLiveCard: true,
   flightdeckModalZoom: true,
+  panelAnimations: true,
+  conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseRepoBadge: true,
@@ -321,6 +344,8 @@ export const useDisplay = create<DisplayState>((set) => ({
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
+        panelAnimations: patch.panelAnimations ?? s.panelAnimations,
+        conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,

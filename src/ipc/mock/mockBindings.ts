@@ -62,7 +62,8 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   TosseAccountStatus,
-  TosseBacklogTask,
+  TosseOffBoardTask,
+  TosseTaskProject,
   TosseBriefing,
   TosseCrmEvent,
   TosseLiveStateEvent,
@@ -369,48 +370,108 @@ const demoBriefing: TosseBriefing = {
 
 let demoNextId = 1;
 
+/** The project shape a `/api/v1/tasks` row carries — less than the briefing's (no dates, no
+ *  counts), which is exactly what makes a fabricated card a degraded one. */
+function demoTaskProject(
+  id: string,
+  name: string,
+  client: TosseTaskProject["client"] = null,
+): TosseTaskProject {
+  return { id, name, status: "En cours", client };
+}
+
+/** The task-row view of a project the BRIEFING already carries — projected from that entry,
+ *  never retyped. Two copies of an id would let `offBoardProjectCards` stop recognising the
+ *  project as briefed and fabricate a phantom card beside the real one; two copies of a name
+ *  would have a row's detail panel disagree with the card it is rendered under. */
+function demoBriefedProject(id: string): TosseTaskProject {
+  const p = demoBriefing.projects.find((x) => x.id === id);
+  if (!p) throw new Error(`demo fixture: no briefed project ${id}`);
+  return demoTaskProject(p.id, p.name, p.client);
+}
+
+const demoProjTosseCode = demoBriefedProject("p-tosse-code");
+const demoProjSanteCall = demoBriefedProject("p-santecall");
+/** ⚠️ Deliberately ABSENT from `demoBriefing`: a project whose whole queue is off the board.
+ *  Its card has to be BUILT from these rows, and a demo run is where that is seen. */
+const demoProjArchi = demoTaskProject("p-archi", "Archipel — portail client", demoClientWd);
+
 /**
- * The Backlog rows, hoisted out of the `tosseBacklog` command so `tosseTaskDetail` can answer
- * for them too. The real `GET /tasks/:id` knows every task whatever its status — and a task
- * the BRIEFING does not carry is precisely the one the app has to be able to ask about
- * (see `linkedTaskReconcile`), so a mock that 404s on it would hide that path.
+ * The off-board rows by status, hoisted out of the `tosseTasksByStatus` command so
+ * `tosseTaskDetail` can answer for them too. The real `GET /tasks/:id` knows every task
+ * whatever its status — and a task the BRIEFING does not carry is precisely the one the app
+ * has to be able to ask about (see `linkedTaskReconcile`), so a mock that 404s on it would
+ * hide that path.
  *
- * Spread across a project AND the project-less band, so a demo run exercises both places a
- * backlog row can appear.
+ * Spread across projects the briefing HAS, one it does NOT, and the project-less band, so a
+ * demo run exercises every place an off-board row can appear.
  */
-const demoBacklog: TosseBacklogTask[] = [
-  {
-    projectId: "p-tosse-code",
-    task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", { priority: "Haute" }),
-  },
-  {
-    projectId: "p-tosse-code",
-    task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
-      priority: "Basse",
-      assignedTo: "Armand",
-    }),
-  },
-  { projectId: "p-santecall", task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog") },
-  {
-    projectId: null,
-    task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
-  },
-];
+const demoOffBoard: Record<string, TosseOffBoardTask[]> = {
+  "En attente": [
+    {
+      project: demoProjSanteCall,
+      task: demoTask("w-vpn", "Accès VPN au préprod client", "En attente", { priority: "Haute" }),
+    },
+    {
+      project: demoProjArchi,
+      task: demoTask("w-maquettes", "Validation des maquettes", "En attente", {
+        priority: "Haute",
+        assignedTo: "Les deux",
+      }),
+    },
+    {
+      project: demoProjArchi,
+      task: demoTask("w-contrat", "Signature de l'avenant", "En attente", { kind: "Admin" }),
+    },
+    {
+      project: null,
+      task: demoTask("w-compta", "Retour du comptable sur le bilan", "En attente", {
+        kind: "Admin",
+      }),
+    },
+  ],
+  Backlog: [
+    {
+      project: demoProjTosseCode,
+      task: demoTask("b-mcp", "Serveur MCP de pilotage de l'IDE", "Backlog", { priority: "Haute" }),
+    },
+    {
+      project: demoProjTosseCode,
+      task: demoTask("b-readme", "Refondre la page d'accueil", "Backlog", {
+        priority: "Basse",
+        assignedTo: "Armand",
+      }),
+    },
+    {
+      project: demoProjSanteCall,
+      task: demoTask("b-audit", "Audit de sécurité annuel", "Backlog"),
+    },
+    {
+      project: null,
+      task: demoTask("b-mutuelle", "Changer de mutuelle", "Backlog", { kind: "Admin" }),
+    },
+  ],
+};
+
+/** Every off-board row, whatever its status. */
+function demoOffBoardRows(): TosseOffBoardTask[] {
+  return Object.values(demoOffBoard).flat();
+}
 
 /** Every demo task with the project it belongs to, for the detail command. */
 function demoAllTasks(): { task: TosseTask; projectId: string | null; projectName: string | null }[] {
   const rows = demoBriefing.projects.flatMap((p: TosseProject) =>
     p.tasks.map((task) => ({ task, projectId: p.id, projectName: p.name })),
   );
-  const projectName = (id: string | null) =>
-    demoBriefing.projects.find((p: TosseProject) => p.id === id)?.name ?? null;
   return [
     ...rows,
     ...demoBriefing.generalTasks.map((task) => ({ task, projectId: null, projectName: null })),
-    ...demoBacklog.map((row) => ({
+    // The row carries its own project name, so a task of a project the briefing never sent
+    // still resolves one — the very case the fabricated cards exist for.
+    ...demoOffBoardRows().map((row) => ({
       task: row.task,
-      projectId: row.projectId,
-      projectName: projectName(row.projectId),
+      projectId: row.project?.id ?? null,
+      projectName: row.project?.name ?? null,
     })),
   ];
 }
@@ -754,9 +815,11 @@ export const mockCommands = {
   async tosseWebUrl(): Promise<Result<string, string>> {
     return ok("https://frontend-production-7e11.up.railway.app");
   },
-  // Backlog comes from its own endpoint (the briefing excludes it) — see `demoBacklog`.
-  async tosseBacklog(): Promise<Result<TosseBacklogTask[], string>> {
-    return ok(demoBacklog);
+  // Each off-board status comes from its own request (the briefing excludes them all) — see
+  // `demoOffBoard`. An unknown status answers with nothing rather than pretending: the real
+  // core refuses anything outside its whitelist.
+  async tosseTasksByStatus(status: string): Promise<Result<TosseOffBoardTask[], string>> {
+    return ok(demoOffBoard[status] ?? []);
   },
   async tosseTaskDetail(taskId: string): Promise<Result<TosseTaskDetail, string>> {
     const found = demoAllTasks().find((row) => row.task.id === taskId);
@@ -794,24 +857,71 @@ export const mockCommands = {
     // Mirrors the server's briefing filter — a task moved to any of these leaves the board,
     // not just « Fait » (briefing.service.ts: notIn ['Archivé','Fait','Backlog','En attente']).
     const leavesTheBoard = ["Fait", "Backlog", "En attente", "Archivé"].includes(status);
+
+    // Lift the task out of wherever it is, remembering its project — the demo has to MOVE it
+    // between the briefing and the off-board lists, exactly as the server does. A mock that
+    // only deleted it would make a correct optimistic patch look like a bug on refetch (the
+    // row would come back missing), and would hide the very behaviour this fixture is for.
+    let task: TosseTask | null = null;
+    let project: TosseTaskProject | null = null;
     for (const p of demoBriefing.projects) {
       const t = p.tasks.find((x) => x.id === taskId);
       if (!t) continue;
-      if (leavesTheBoard) p.tasks = p.tasks.filter((x) => x.id !== taskId);
-      else t.status = status;
-      return ok(null);
+      task = t;
+      project = demoTaskProject(p.id, p.name, p.client);
+      p.tasks = p.tasks.filter((x) => x.id !== taskId);
+      break;
     }
     // Project-less tasks are a real band of the view, so the demo has to move them too:
     // a mock that silently accepted the write without changing anything could not show the
     // difference between an applied write and a swallowed one.
-    const g = demoBriefing.generalTasks.find((x) => x.id === taskId);
-    if (g) {
-      if (leavesTheBoard) {
+    if (!task) {
+      const g = demoBriefing.generalTasks.find((x) => x.id === taskId);
+      if (g) {
+        task = g;
         demoBriefing.generalTasks = demoBriefing.generalTasks.filter((x) => x.id !== taskId);
-      } else {
-        g.status = status;
       }
     }
+    if (!task) {
+      for (const [key, rows] of Object.entries(demoOffBoard)) {
+        const row = rows.find((r) => r.task.id === taskId);
+        if (!row) continue;
+        task = row.task;
+        project = row.project;
+        demoOffBoard[key] = rows.filter((r) => r.task.id !== taskId);
+        break;
+      }
+    }
+    if (!task) return ok(null);
+
+    task.status = status;
+    if (!leavesTheBoard) {
+      const card = project ? demoBriefing.projects.find((p) => p.id === project.id) : null;
+      if (card) card.tasks.push(task);
+      else if (!project) demoBriefing.generalTasks.push(task);
+      else {
+        // ⚠️ A project the briefing does not carry yet (the `p-archi` fixture) still has to
+        // keep its task SOMEWHERE. There is no server behind this mock to "start listing it one
+        // refetch later": dropping it here removed the row from every demo collection at once —
+        // gone from the board, gone from `demoAllTasks()`, and `tosseTaskDetail` began erroring
+        // on it. So the demo does what the server would end up doing, immediately: the project
+        // joins the briefing with its task.
+        demoBriefing.projects.push({
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          client: project.client,
+          startDate: null,
+          dueDate: null,
+          tasks: [task],
+          taskCount: 1,
+          taskDone: 0,
+        });
+      }
+    } else if (status in demoOffBoard) {
+      demoOffBoard[status].push({ project, task });
+    }
+    // « Fait » / « Archivé » land nowhere, which is what closing a task means here.
     return ok(null);
   },
   async tosseSetProjectStatus(projectId: string, status: string): Promise<Result<null, string>> {

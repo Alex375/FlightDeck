@@ -27,10 +27,47 @@ export const GENERAL_FOLD_KEY = "band:general";
  */
 export const backlogFoldKey = (projectId: string) => `backlog:${projectId}`;
 
+/**
+ * Fold key for a card's « En attente » section — read the NORMAL way round.
+ *
+ * The two off-board sections are rendered by one component but default oppositely, and
+ * deliberately (Alexandre, 2026-08-11): a parked-but-waiting task is live work whose ball
+ * is in someone else's court, so you want to see it; a backlog item is work you have
+ * decided not to start, so you don't. Hence its own key namespace, and the reading sense
+ * that goes with it.
+ */
+export const pendingFoldKey = (projectId: string) => `pending:${projectId}`;
+
 /** Fold key for a project card's body. Prefixed: a project id and a client id are both bare
  *  uuids from the same CRM, and un-prefixed they would share this map — folding a client
  *  would have folded a project that happens to be keyed alike. */
 export const projectFoldKey = (projectId: string) => `project:${projectId}`;
+
+/**
+ * How ONE off-board section folds: which key namespace it lives in, and which way its
+ * default runs.
+ *
+ * Both facts in one place because they must agree — the store records what is CLOSED, so a
+ * section that defaults to OPEN reads its key inverted. Splitting the two across the store
+ * and the component is how a section ends up permanently hidden.
+ */
+const OFF_BOARD_FOLD: Record<string, { key: (id: string) => string; defaultOpen: boolean }> = {
+  "En attente": { key: pendingFoldKey, defaultOpen: true },
+  Backlog: { key: backlogFoldKey, defaultOpen: false },
+};
+
+export function offBoardFold(status: string): { key: (id: string) => string; defaultOpen: boolean } {
+  const known = OFF_BOARD_FOLD[status];
+  if (known) return known;
+  // ⚠️ A TABLE with a per-status fallback, not a `status === "Backlog" ? … : pending`. The
+  // off-board status list is the CRM server's and can grow without this file being touched;
+  // routing everything else into the `pending:` namespace was not a default but a COLLISION —
+  // a third section would have shared one fold key with « En attente », so collapsing either
+  // would collapse both on every card, and `aria-expanded` would lie on one of them. A
+  // namespace derived from the status keeps each section its own, and open by default is the
+  // safe direction (this store only records what is CLOSED).
+  return { key: (id: string) => `offboard:${status}:${id}`, defaultOpen: true };
+}
 
 /** foldKey → true (folded). Absent = open. */
 type FoldMap = Record<string, boolean>;

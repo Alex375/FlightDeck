@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   backlogFoldKey,
   GENERAL_FOLD_KEY,
+  offBoardFold,
+  pendingFoldKey,
   projectFoldKey,
   useTosseFold,
 } from "./tosseFold";
@@ -27,6 +29,29 @@ describe("tosse fold keys", () => {
 
   it("prefixes a project key so it can never be a bare client id", () => {
     expect(projectFoldKey("abc")).toBe("project:abc");
+  });
+});
+
+describe("offBoardFold", () => {
+  it("gives the two known sections their namespace and their own default", () => {
+    // Opposite on purpose: a parked-but-waiting task is live work whose ball is in someone
+    // else's court, a backlog item is work deliberately not started.
+    expect(offBoardFold("En attente")).toEqual({ key: pendingFoldKey, defaultOpen: true });
+    expect(offBoardFold("Backlog")).toEqual({ key: backlogFoldKey, defaultOpen: false });
+  });
+
+  it("gives a status it has never seen a namespace of its OWN, not « En attente »'s", () => {
+    // The off-board status list belongs to the CRM server, so it can grow without this file
+    // being touched. The old `else` branch was not a default but a COLLISION: a third section
+    // shared `pending:<projectId>`, so collapsing either folded both on every card, and
+    // `aria-expanded` lied on one of them.
+    const third = offBoardFold("Bloqué");
+    expect(third.key("p1")).not.toBe(pendingFoldKey("p1"));
+    expect(third.key("p1")).not.toBe(backlogFoldKey("p1"));
+    expect(offBoardFold("Autre").key("p1")).not.toBe(third.key("p1"));
+    // …and it stays visible by default: this store records what is CLOSED, so the safe
+    // direction for a section nobody has ruled on is open.
+    expect(third.defaultOpen).toBe(true);
   });
 });
 
