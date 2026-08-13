@@ -21,7 +21,7 @@ import { TaskDetail } from "../tosse/TosseView";
 import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
-import { useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
+import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 
 // Lazy: the Git workspace pulls in Monaco's diff editor + ribbon overlay — its
 // own chunk, off the startup bundle, fetched only when Git mode is opened.
@@ -203,12 +203,9 @@ function MainArea({
         style={{
           // Grow-ratio split (not a rigid basis) so both panes honour their
           // min-size: the conversation never gets crushed below a usable width.
-          // When the side region is CLOSED the grow factor must be 1 (not
-          // 1-fraction): a single flex child whose grow factors sum to < 1 only
-          // fills that fraction of the row, leaving the rest blank. So full width
-          // on close — and equally while the panel SLIDES, where the slot holds a
-          // pixel size of its own and this pane takes whatever it hasn't claimed yet.
-          flex: `${slide.mounted && !slide.animating ? 1 - editorFraction : 1} 1 0`,
+          // Closed or travelling, the grow factor must be 1 — see neighborFlex,
+          // which owns that rule for every side panel in the app.
+          flex: neighborFlex(slide, 1 - editorFraction),
           // 552 = the composer's 500px floor + the 52px its card leaves on either side
           // (see MIN_COMPOSER_PX). Below it the composer bar can no longer hold the
           // slots the budget promised, so the splitter stops here instead.

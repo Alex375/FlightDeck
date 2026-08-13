@@ -362,6 +362,15 @@ function readBoardCaches(qc: ReturnType<typeof useQueryClient>): BoardCaches {
   };
 }
 
+/** The off-board list a task is currently sitting in, if any — what a status write is about to
+ *  take it OUT of, and therefore half of what the refetch has to cover. */
+function findOffBoardStatus(caches: BoardCaches, taskId: string): string | null {
+  for (const [status, rows] of Object.entries(caches.offBoard)) {
+    if (rows?.some((r) => r.task.id === taskId)) return status;
+  }
+  return null;
+}
+
 /** Write the caches back — the same call restores a snapshot on rollback and installs the
  *  optimistic patch, so the two can never diverge in shape. */
 function writeBoardCaches(qc: ReturnType<typeof useQueryClient>, caches: BoardCaches): void {
@@ -401,17 +410,27 @@ export function useSetTosseTaskStatus() {
         qc.cancelQueries({ queryKey: tosseOffBoardKeyPrefix }),
       ]);
       const previous = readBoardCaches(qc);
+      // Which off-board list the task is LEAVING, read before the patch moves it. Together
+      // with the destination this is the whole set of lists a refetch can change.
+      const from = findOffBoardStatus(previous, taskId);
       writeBoardCaches(qc, routeTaskStatus(previous, taskId, status));
-      return { previous };
+      return { previous, from };
     },
     onError: (_e, _v, ctx) => {
       if (ctx?.previous) writeBoardCaches(qc, ctx.previous);
     },
-    onSettled: () => {
+    onSettled: (_d, _e, { status }, ctx) => {
       void qc.invalidateQueries({ queryKey: tosseBriefingKey });
-      // A status write can move a task INTO or OUT OF any off-board list, so all of them are
-      // stale too — the prefix covers whichever ones exist.
-      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
+      // ⚠️ Only the lists this write can actually have changed — the one it left and the one
+      // it arrived in. Invalidating the whole prefix refetched BOTH off-board lists on every
+      // move, including « À faire » → « En cours », which cannot touch either: three CRM round
+      // trips for a checkbox tick, and again after the SSE burst maps the same event to the
+      // same keys.
+      for (const s of new Set([ctx?.from, status].filter(Boolean) as string[])) {
+        if (OFF_BOARD_SECTIONS.includes(s as (typeof OFF_BOARD_SECTIONS)[number])) {
+          void qc.invalidateQueries({ queryKey: tosseOffBoardKey(s) });
+        }
+      }
       // The WHOLE `tosse-task` prefix, not just the task we wrote. Ticking a SUBTASK writes
       // the subtask's id, while the panel on screen is keyed by its PARENT — invalidating
       // only the written id refreshed a query nobody was looking at, so the checkbox never
@@ -447,7 +466,16 @@ export function useSetTosseProjectStatus() {
     },
     // Always refetch: a project that changed state moves BETWEEN `projects` and
     // `pausedProjects` (and takes its tasks with it), which is the server's call to make.
-    onSettled: () => void qc.invalidateQueries({ queryKey: tosseBriefingKey }),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      // …and the off-board lists with it. They carry a `project` on every row, and the board
+      // BUILDS a card out of those rows for any project the briefing does not name (see
+      // `offBoardProjectCards`). So finishing a project whose queue is parked makes it drop
+      // out of the briefing while its parked rows stay in this 5-minute cache — and the card
+      // the user just closed is fabricated straight back onto the board. The task mutation
+      // already invalidates the same prefix; this one was missed.
+      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
+    },
   });
 }
 

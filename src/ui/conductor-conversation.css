@@ -628,7 +628,14 @@
    holds one fold per response and we don't render collapsed work. */
 .cv-collapse { display:grid; grid-template-rows:0fr; transition:grid-template-rows var(--cv-collapse-dur) ease; }
 .cv-collapse[data-open] { grid-template-rows:1fr; }
-.cv-collapse > * { min-height:0; overflow:hidden; }
+/* Clipped only while the track is MOVING — closed (no [data-open]) or opening ([data-settling]).
+   A permanent overflow:hidden here would quietly cut anything a row inside draws outside its own
+   box at rest (a :focus-visible ring is an outside box-shadow, so it goes first) and would make
+   this a scroll container for any sticky descendant. Same reasoning as .cv-motion-in below,
+   which arms its clip for the flight only. */
+.cv-collapse > * { min-height:0; }
+.cv-collapse:not([data-open]) > *,
+.cv-collapse[data-settling] > * { overflow:hidden; }
 
 /* The counter's landing pulse: the item flies UP into the block, so the block acknowledges
    its ARRIVAL. Delayed by the flight time — the count itself increments at take-off (when

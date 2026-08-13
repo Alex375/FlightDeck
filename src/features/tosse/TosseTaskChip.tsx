@@ -10,7 +10,7 @@
 
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import type { Conversation } from "../../store/conversationsStore";
-import { STATUS_TONE } from "./tosseModel";
+import { taskStatusTone } from "./tosseModel";
 import s from "./TosseTaskChip.module.css";
 
 export function TosseTaskChip({
@@ -29,7 +29,7 @@ export function TosseTaskChip({
   const title = conv.tosseTaskTitle;
   if (!conv.tosseTaskId || !title) return null;
   const status = conv.tosseTaskStatus;
-  const tone = status ? (STATUS_TONE[status] ?? "todo") : "todo";
+  const tone = taskStatusTone(status);
   const label = `TOSSE task: ${title}${status ? ` (${status})` : ""}${
     onOpen ? " — click to read it in the side panel" : ""
   }`;

@@ -537,9 +537,10 @@ describe("flattenWork / atomsToSegments", () => {
     const atoms = flattenWork(segs([tool("a", "Read"), tool("b", "Edit")]));
     const a = atomsToSegments(atoms, "vis");
     const b = atomsToSegments(atoms.slice(1), "vis");
-    expect(a[0].key).toBe("vis-run-a");
-    // Losing the run's first step does re-key it — that run genuinely changed identity.
-    expect(b[0].key).toBe("vis-run-b");
+    expect(a[0].key).toBe("vis-run-0");
+    // The boundary advancing THROUGH the run must NOT re-key it: it is the same run, and
+    // re-keying remounts the live tool section (every expanded step row snaps shut).
+    expect(b[0].key).toBe("vis-run-0");
   });
 
   it("does not re-key a run when an EARLIER one folds away", () => {
@@ -551,8 +552,8 @@ describe("flattenWork / atomsToSegments", () => {
     );
     const wide = atomsToSegments(atoms, "vis").filter((s) => s.kind === "run");
     const narrow = atomsToSegments(atoms.slice(2), "vis").filter((s) => s.kind === "run");
-    expect(wide.map((s) => s.key)).toEqual(["vis-run-a", "vis-run-b"]);
-    expect(narrow.map((s) => s.key)).toEqual(["vis-run-b"]); // same run, same key
+    expect(wide.map((s) => s.key)).toEqual(["vis-run-0", "vis-run-2"]);
+    expect(narrow.map((s) => s.key)).toEqual(["vis-run-2"]); // same run, same key
   });
 
   it("keeps a Skill as a non-step atom that breaks a run and round-trips", () => {

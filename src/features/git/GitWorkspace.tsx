@@ -21,7 +21,7 @@ import { type Conversation } from "../../store/conversationsStore";
 import { type ComposerHandle } from "../conversation/ConductorComposer";
 import { ConversationPane } from "../conversation/ConversationPane";
 import { Splitter } from "../editor/Splitter";
-import { useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
+import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
 import { useGitAutoRefresh, useGitStatus } from "../../ipc/useGit";
 import { useConvGitView, useGitViewStore } from "./gitViewStore";
@@ -154,8 +154,8 @@ export function GitWorkspace({
         className={styles.wsConv}
         style={{
           // Grow 1 while the diff travels: the slot holds a pixel size of its own then, and
-          // the conversation takes whatever it has not claimed yet.
-          flex: `${diffSlide.mounted && !diffSlide.animating ? gitConvFraction : 1} 1 0`,
+          // the conversation takes whatever it has not claimed yet (see neighborFlex).
+          flex: neighborFlex(diffSlide, gitConvFraction),
           minWidth: 220,
         }}
       >

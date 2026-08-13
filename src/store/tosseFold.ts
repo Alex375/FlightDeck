@@ -51,10 +51,22 @@ export const projectFoldKey = (projectId: string) => `project:${projectId}`;
  * section that defaults to OPEN reads its key inverted. Splitting the two across the store
  * and the component is how a section ends up permanently hidden.
  */
+const OFF_BOARD_FOLD: Record<string, { key: (id: string) => string; defaultOpen: boolean }> = {
+  "En attente": { key: pendingFoldKey, defaultOpen: true },
+  Backlog: { key: backlogFoldKey, defaultOpen: false },
+};
+
 export function offBoardFold(status: string): { key: (id: string) => string; defaultOpen: boolean } {
-  return status === "Backlog"
-    ? { key: backlogFoldKey, defaultOpen: false }
-    : { key: pendingFoldKey, defaultOpen: true };
+  const known = OFF_BOARD_FOLD[status];
+  if (known) return known;
+  // ⚠️ A TABLE with a per-status fallback, not a `status === "Backlog" ? … : pending`. The
+  // off-board status list is the CRM server's and can grow without this file being touched;
+  // routing everything else into the `pending:` namespace was not a default but a COLLISION —
+  // a third section would have shared one fold key with « En attente », so collapsing either
+  // would collapse both on every card, and `aria-expanded` would lie on one of them. A
+  // namespace derived from the status keeps each section its own, and open by default is the
+  // safe direction (this store only records what is CLOSED).
+  return { key: (id: string) => `offboard:${status}:${id}`, defaultOpen: true };
 }
 
 /** foldKey → true (folded). Absent = open. */

@@ -34,6 +34,7 @@ import {
   useConversationsStore,
 } from "../../store/conversationsStore";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { motionAllowed } from "../../ui/motion";
 import { effectiveCwd } from "../git/worktree";
 import { useFlightdeckModal } from "./flightdeckModalStore";
 import {
@@ -53,18 +54,10 @@ import styles from "./FlightDeckReplyModal.module.css";
 const INTERACTIVE =
   'a, button, input, textarea, select, label, summary, [role="button"], [role="option"], [role="tab"], [contenteditable="true"]';
 
-/** Whether the zoom may play at all: the user's preference AND the OS "reduce motion"
- *  setting, which always wins (an accessibility choice is not ours to override). Read
- *  imperatively at each open/close so flipping the setting takes effect immediately,
- *  without this component subscribing to it. */
-function zoomAllowed(): boolean {
-  if (!useDisplay.getState().flightdeckModalZoom) return false;
-  try {
-    return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  } catch {
-    return true; // no matchMedia (test env) — the preference alone decides
-  }
-}
+/** Whether the zoom may play at all — the app-wide policy (see `src/ui/motion.ts`) applied to
+ *  this animation's own preference. Read imperatively at each open/close so flipping the
+ *  setting takes effect immediately, without this component subscribing to it. */
+const zoomAllowed = (): boolean => motionAllowed(useDisplay.getState().flightdeckModalZoom);
 
 /** The card this conversation lives on RIGHT NOW, if it is still on the deck. Looked up by
  *  data attribute rather than kept as a ref: between opening and closing, the card may have

@@ -15,6 +15,8 @@
 // re-adding it afterwards would create a NEW node — a flicker plus a dead transition.
 
 import { useEffect, useState } from "react";
+import { useDisplay } from "../../store/display";
+import { motionAllowed } from "../../ui/motion";
 
 /** How long an item stays mounted while flying out. Mirrors `--cv-exit-dur` in
  *  conductor-conversation.css — keep the two in step. */
@@ -80,11 +82,20 @@ export function computeExits(opts: {
   const out = kept.slice();
   // ⚠️ ONE deadline for the whole batch, set by its LAST slot — the stagger lives purely in CSS
   // (`--cv-exit-delay`). Retiring them one by one instead would shorten the held region while
-  // the rest are still in the air, and `atomsToSegments` numbers reconstructed runs by ORDINAL
-  // from the start of that region: a run's key would change mid-flight (`vis-run-1` →
-  // `vis-run-0`), remounting a live tool section and slamming shut any step row the user had
-  // opened. Holding a zero-height node a few extra ms costs nothing.
-  const expiresAt = now + EXIT_MS + exitDelayMs(leaving.length - 1);
+  // the rest are still in the air, and the rendered clear zone is a CONTIGUOUS slice ending at
+  // the cut (see {@link heldVisibleStart}): dropping the atom nearest the cut takes every atom
+  // behind it out of the render in the same frame. Holding a zero-height node a few extra ms
+  // costs nothing.
+  //
+  // ⚠️ …and NEVER before a batch that is already in the air. Deadlines are otherwise free to
+  // invert — six atoms leaving at t=0 expire at t+355 (180 + a 175ms stagger tail) while a lone
+  // atom crossing at t=50 expires at t+230 — and the later, nearer-the-cut atom retiring first
+  // is exactly the case above: the whole earlier batch would be cut out mid-transition. Clamping
+  // to the latest live deadline keeps retirement in flight order.
+  const expiresAt = Math.max(
+    now + EXIT_MS + exitDelayMs(leaving.length - 1),
+    ...kept.map((h) => h.expiresAt),
+  );
   // Oldest (topmost) first: slot 0 leaves first, the rest trail behind it.
   leaving.forEach((key, i) => out.push({ key, slot: i, expiresAt }));
   return out;
@@ -140,9 +151,18 @@ export function useWorkExit(
   holdable?: (key: string) => boolean,
 ): { visStart: number; slots: ReadonlyMap<string, number> } {
   const visibleNow = atomKeys.slice(split);
+  // The user's way back to the instant fold (and the OS reduce-motion setting). Folded into
+  // `enabled` rather than short-circuited at the top: the state below must keep tracking the
+  // rule while the animation is off, or switching it back on would diff against a view from
+  // several turns ago and fly out a batch that left long ago.
+  //
+  // ⚠️ The hook call stands ALONE, never behind `enabled &&`: `&&` short-circuits, so a false
+  // `enabled` would skip it and change the hook order between renders.
+  const animate = motionAllowed(useDisplay((s) => s.conversationAnimations));
+  const enabledNow = enabled && animate;
   const [state, setState] = useState<ExitState>(() => ({ visible: visibleNow, held: [] }));
 
-  if (!enabled) {
+  if (!enabledNow) {
     // Stay in sync with the rule while disabled so re-enabling doesn't diff against a stale
     // view and fly out a batch that left long ago.
     if (state.held.length > 0 || !sameKeys(state.visible, visibleNow))
@@ -171,17 +191,36 @@ export function useWorkExit(
     const t = setTimeout(
       () =>
         setState((s) => {
-          const now = Date.now();
-          const held = s.held.filter((h) => h.expiresAt > now);
+          // ⚠️ Retire against the deadline this timer was ARMED for, never against a fresh
+          // clock read. The deadlines are wall-clock stamps (`Date.now()` at render) while the
+          // timer runs on the monotonic clock, so a clock step backwards (NTP, VM resume) would
+          // leave every hold un-expired: the updater would return the SAME object, React would
+          // bail out of the re-render, and this effect's only dep (`nextDeadline`) would never
+          // change — no timer left to release anything, and the leaving rows would stay pinned
+          // in the clear zone until the atom list moved again. Comparing against the deadline
+          // itself always retires at least one hold (it IS the minimum), so the effect always
+          // re-arms for whatever is still in the air.
+          const held = s.held.filter((h) => h.expiresAt > nextDeadline);
           return held.length === s.held.length ? s : { ...s, held };
         }),
-      Math.max(0, nextDeadline - Date.now()),
+      // Bounded by the longest legitimate flight for the same reason: a wall clock that jumped
+      // forward must not park a hold for hours.
+      Math.min(Math.max(0, nextDeadline - Date.now()), EXIT_MS + exitDelayMs(EXIT_MAX_SLOTS)),
     );
     return () => clearTimeout(t);
   }, [nextDeadline]);
 
   if (state.held.length === 0) return { visStart: split, slots: NO_SLOTS };
+  const visStart = heldVisibleStart(atomKeys, split, state.held);
+  // Only the atoms the clear zone actually RENDERS get a slot. A hold that `heldVisibleStart`
+  // could not reach — the walk stops at the first non-held atom, and `holdable` deliberately
+  // vetoes a plan/artifact/question sitting between the batch and the cut — has no wrapper to
+  // play the "exit" half. Handing its slot to the fold anyway would grow the arriving copy in
+  // over 180ms with nothing shrinking away: the thread would drop by the rows' full height in
+  // one frame and climb back, the double jump this choreography exists to cancel. Unreachable
+  // holds simply cross instantly, on both sides.
+  const rendered = new Set(atomKeys.slice(visStart, split));
   const slots = new Map<string, number>();
-  for (const h of state.held) slots.set(h.key, h.slot);
-  return { visStart: heldVisibleStart(atomKeys, split, state.held), slots };
+  for (const h of state.held) if (rendered.has(h.key)) slots.set(h.key, h.slot);
+  return { visStart, slots: slots.size > 0 ? slots : NO_SLOTS };
 }

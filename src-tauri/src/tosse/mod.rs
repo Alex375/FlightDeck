@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -473,15 +474,28 @@ fn ensure_crypto_provider() {
     }
 }
 
-/// Build the shared HTTP client. Timeouts are mandatory: the async client has none by
-/// default, so a stalled connection would hang the command future forever.
+/// The shared HTTP client. Timeouts are mandatory: the async client has none by default, so a
+/// stalled connection would hang the command future forever.
+///
+/// ⚠️ Built ONCE and cloned (a clone shares the connection pool — that is the whole point).
+/// A fresh client per request meant a fresh pool per request, so nothing was ever reused and
+/// every call paid a cold TCP + TLS handshake to Railway. That is invisible on one request and
+/// very visible on a board load, which is three of them, plus one per status write and one per
+/// burst of CRM events. The build is only retried while it has never succeeded; a failure is
+/// not cached.
+static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+
 fn http() -> R<reqwest::Client> {
+    if let Some(client) = HTTP.get() {
+        return Ok(client.clone());
+    }
     ensure_crypto_provider();
-    reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(8))
         .build()
-        .map_err(|e| TosseError::Network(format!("HTTP client build failed: {e}")))
+        .map_err(|e| TosseError::Network(format!("HTTP client build failed: {e}")))?;
+    Ok(HTTP.get_or_init(|| client).clone())
 }
 
 /// First ~300 chars of a body, for error text — never dump a whole payload into the UI.
@@ -1843,7 +1857,8 @@ pub async fn tasks_by_status(status: &str) -> R<Vec<TosseOffBoardTask>> {
     rows.iter()
         .map(|row| {
             Ok(TosseOffBoardTask {
-                project: parse_task_project(row.get("project")),
+                project: parse_task_project(row.get("project"))
+                    .or_else(|| parse_flat_task_project(row)),
                 task: parse_task(row)?,
             })
         })
@@ -1858,6 +1873,37 @@ pub async fn tasks_by_status(status: &str) -> R<Vec<TosseOffBoardTask>> {
 fn parse_task_project(v: Option<&Value>) -> Option<TosseTaskProject> {
     let v = v.filter(|p| !p.is_null())?;
     let id = v.get("id").and_then(Value::as_str)?.to_string();
+    parse_project_fields(v, id)
+}
+
+/// The same project, named the FLAT way: `projectId` beside the task instead of an embedded
+/// `project` object.
+///
+/// ⚠️ Kept as a fallback on purpose. The reader this replaced took the id from either shape
+/// (`/project/id` or `projectId`), and the payloads this API serves are camelCase — so a row
+/// that names its project flat must not silently become a project-LESS one: the front files
+/// those under « No project », and a project whose whole queue is parked exists on the board
+/// only through these rows, so it would lose its card too. Neither failure says anything.
+///
+/// The card the front builds needs a name and a client, which the flat shape does not carry;
+/// grouping by id still puts the task on the right card whenever the briefing names that
+/// project, which is the case this recovers.
+fn parse_flat_task_project(row: &Value) -> Option<TosseTaskProject> {
+    let id = row.get("projectId").and_then(Value::as_str)?.to_string();
+    let name = row
+        .get("projectName")
+        .and_then(Value::as_str)
+        .unwrap_or("Untitled project")
+        .to_string();
+    Some(TosseTaskProject {
+        id,
+        name,
+        status: None,
+        client: None,
+    })
+}
+
+fn parse_project_fields(v: &Value, id: String) -> Option<TosseTaskProject> {
     let client = v
         .pointer("/mission/client")
         .filter(|c| !c.is_null())
@@ -2359,6 +2405,35 @@ mod tests {
         // fetching anything of its own.
         assert_eq!(client.logo_url, None);
         assert_eq!(client.website, None);
+    }
+
+    /// The FLAT shape — `projectId` beside the task, no embedded object — still names a
+    /// project. This API's payloads are camelCase, and the reader that came before took the id
+    /// from either shape; dropping the fallback would silently file those rows under
+    /// "No project" and, for a project whose whole queue is parked, delete its card outright.
+    #[test]
+    fn an_off_board_row_naming_its_project_flat_is_still_filed_under_it() {
+        let row = serde_json::json!({
+            "id": "task-1",
+            "status": "En attente",
+            "projectId": "proj-1",
+            "projectName": "Refonte site"
+        });
+        let project = parse_task_project(row.get("project"))
+            .or_else(|| parse_flat_task_project(&row))
+            .expect("a flat projectId still names a project");
+        assert_eq!(project.id, "proj-1");
+        assert_eq!(project.name, "Refonte site");
+        // Neither is carried by the flat shape; grouping by id is what puts the task on the
+        // right card, and the briefing supplies the rest.
+        assert_eq!(project.status, None);
+        assert!(project.client.is_none());
+
+        // Without even a name it is still better filed than lost.
+        let bare = serde_json::json!({ "id": "t", "status": "Backlog", "projectId": "proj-2" });
+        assert_eq!(parse_flat_task_project(&bare).expect("id is enough").id, "proj-2");
+        // …and a row that names no project either way stays project-less.
+        assert!(parse_flat_task_project(&serde_json::json!({ "id": "t" })).is_none());
     }
 
     /// A task with no project — or with a project the endpoint sent without an id — must not

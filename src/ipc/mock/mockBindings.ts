@@ -380,12 +380,18 @@ function demoTaskProject(
   return { id, name, status: "En cours", client };
 }
 
-const demoProjTosseCode = demoTaskProject("p-tosse-code", "Tosse Code", demoClientInterne);
-const demoProjSanteCall = demoTaskProject(
-  "p-santecall",
-  "SanteCall 3.0 — Refonte plateforme",
-  demoClientWd,
-);
+/** The task-row view of a project the BRIEFING already carries — projected from that entry,
+ *  never retyped. Two copies of an id would let `offBoardProjectCards` stop recognising the
+ *  project as briefed and fabricate a phantom card beside the real one; two copies of a name
+ *  would have a row's detail panel disagree with the card it is rendered under. */
+function demoBriefedProject(id: string): TosseTaskProject {
+  const p = demoBriefing.projects.find((x) => x.id === id);
+  if (!p) throw new Error(`demo fixture: no briefed project ${id}`);
+  return demoTaskProject(p.id, p.name, p.client);
+}
+
+const demoProjTosseCode = demoBriefedProject("p-tosse-code");
+const demoProjSanteCall = demoBriefedProject("p-santecall");
 /** ⚠️ Deliberately ABSENT from `demoBriefing`: a project whose whole queue is off the board.
  *  Its card has to be BUILT from these rows, and a demo run is where that is seen. */
 const demoProjArchi = demoTaskProject("p-archi", "Archipel — portail client", demoClientWd);
@@ -893,8 +899,25 @@ export const mockCommands = {
       const card = project ? demoBriefing.projects.find((p) => p.id === project.id) : null;
       if (card) card.tasks.push(task);
       else if (!project) demoBriefing.generalTasks.push(task);
-      // A project the briefing does not carry gets nothing here: the demo mirrors the server,
-      // which only starts listing such a project once it has live work — one refetch later.
+      else {
+        // ⚠️ A project the briefing does not carry yet (the `p-archi` fixture) still has to
+        // keep its task SOMEWHERE. There is no server behind this mock to "start listing it one
+        // refetch later": dropping it here removed the row from every demo collection at once —
+        // gone from the board, gone from `demoAllTasks()`, and `tosseTaskDetail` began erroring
+        // on it. So the demo does what the server would end up doing, immediately: the project
+        // joins the briefing with its task.
+        demoBriefing.projects.push({
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          client: project.client,
+          startDate: null,
+          dueDate: null,
+          tasks: [task],
+          taskCount: 1,
+          taskDone: 0,
+        });
+      }
     } else if (status in demoOffBoard) {
       demoOffBoard[status].push({ project, task });
     }

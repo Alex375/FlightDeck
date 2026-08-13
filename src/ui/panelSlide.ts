@@ -28,6 +28,7 @@
 // lives in {@link usePanelSlide}.
 
 import type { CSSProperties } from "react";
+import { EASE_ENTER, EASE_EXIT } from "./motion";
 
 /** Which axis the panel grows along: `x` for a region beside the main one (the usual
  *  right-hand panel), `y` for one stacked below it. */
@@ -47,11 +48,12 @@ export const SLIDE_IN_MS = 190;
  *  like it already happened. */
 export const SLIDE_OUT_MS = 135;
 
-/** Decelerating: most of the travel happens early, then it settles. Same curve the
- *  reply modal opens with, so the two animations feel like one app. */
-export const EASE_SLIDE_IN = "cubic-bezier(0.32, 0.72, 0, 1)";
+/** Decelerating: most of the travel happens early, then it settles. The SAME constant the
+ *  reply modal opens with (`src/ui/motion.ts`), not a copy of it — the two animations have to
+ *  feel like one app, and a prose comment cannot keep two strings in step. */
+export const EASE_SLIDE_IN = EASE_ENTER;
 /** Accelerating away — the mirror of the entrance. */
-export const EASE_SLIDE_OUT = "cubic-bezier(0.4, 0, 0.9, 0.5)";
+export const EASE_SLIDE_OUT = EASE_EXIT;
 
 /** Below this, a size change is not worth animating (and animating it would just add a
  *  frame of latency to a panel that is already where it belongs). */
@@ -120,12 +122,19 @@ export function slidingSlotStyle(
 }
 
 /** The style for the content INSIDE an animating slot: frozen at the size the panel will
- *  settle at, so nothing inside it re-lays-out while the slot travels. */
+ *  settle at, so nothing inside it re-lays-out while the slot travels.
+ *
+ *  ⚠️ `flexDirection` is part of that freeze, exactly as in {@link restingPaneStyle}. Leaving
+ *  it out does not mean "unchanged" — it means `row`, the CSS initial value — so a `y`-axis
+ *  pane laid its children out side by side for the whole animation and snapped to a column on
+ *  landing: the terminal's 6px horizontal divider rendered as a vertical bar and xterm was
+ *  measured at the wrong box, which is the re-layout this whole module exists to avoid. */
 export function frozenPaneStyle(axis: SlideAxis, px: number): CSSProperties {
   const size = `${Math.max(0, px)}px`;
+  const flexDirection = axis === "x" ? ("row" as const) : ("column" as const);
   return axis === "x"
-    ? { flex: `0 0 ${size}`, width: size, height: "100%", display: "flex", minWidth: 0 }
-    : { flex: `0 0 ${size}`, height: size, width: "100%", display: "flex", minHeight: 0 };
+    ? { flex: `0 0 ${size}`, width: size, height: "100%", display: "flex", flexDirection, minWidth: 0 }
+    : { flex: `0 0 ${size}`, height: size, width: "100%", display: "flex", flexDirection, minHeight: 0 };
 }
 
 /** The content's style at REST — it simply fills the slot again, which is the same box it

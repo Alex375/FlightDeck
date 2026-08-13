@@ -15,7 +15,7 @@ import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { useTosseConnection } from "../../ipc/useTosse";
 import type { Conversation } from "../../store/conversationsStore";
-import { STATUS_TONE } from "../tosse/tosseModel";
+import { taskStatusTone } from "../tosse/tosseModel";
 import type { DeleteReason } from "./deleteGuard";
 import s from "./DeleteConversationDialog.module.css";
 
@@ -46,7 +46,7 @@ export function DeleteConversationDialog({
   const backend = conv.kind === "codex" ? "Codex" : "Claude";
   const status = conv.tosseTaskStatus;
   // The CRM's own colour for the status, as everywhere else a task status is shown.
-  const tone = status ? (STATUS_TONE[status] ?? "todo") : "todo";
+  const tone = taskStatusTone(status);
 
   // Same gate as the header's task chip: reading a task needs a live CRM session, so with
   // no connection the row states the task instead of offering a panel that could only load

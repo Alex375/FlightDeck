@@ -12,8 +12,10 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 ## v1.8.0
 
 - Improved: side panels (editor, terminal, Git) now slide open and closed instead of snapping into place.
-- Improved: in clean output mode, work folds and unfolds smoothly as the turn goes on, instead of jumping between states.
+- Improved: in clean output mode, work folds and unfolds smoothly as the turn goes on, instead of jumping between states. Both animations can be turned off in Settings → General.
 - Improved: the TOSSE view colors tasks by their CRM status and gained a "Waiting" section, so what is blocked stands out at a glance.
+- Fixed: a tool section no longer closes on its own while the agent works — expanded steps stay expanded for the whole turn.
+- Fixed: the TOSSE view now says when it could not load your waiting or backlog tasks, instead of showing the sections as empty.
 
 ## v1.7.0
 

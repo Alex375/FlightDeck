@@ -260,6 +260,7 @@ function DisplayPrefs() {
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
   const panelAnimations = useDisplay((s) => s.panelAnimations);
+  const conversationAnimations = useDisplay((s) => s.conversationAnimations);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
@@ -398,6 +399,23 @@ function DisplayPrefs() {
         checked={panelAnimations}
         onChange={(v) => set({ panelAnimations: v })}
         label="Animate side panels opening and closing"
+      />
+      <ToggleRow
+        title="Animate the conversation"
+        hint={
+          <>
+            A tool section or work block <strong>opens and closes as a movement</strong> rather
+            than a cut, and in <strong>clean output</strong> a finished step{" "}
+            <strong>slides up into the work block</strong> instead of being swapped between the
+            two in one frame. <strong>On by default</strong> (about a tenth of a second).
+            Unlike the side panels, this one plays on <strong>every turn</strong>, right where
+            you are reading. Off → the thread jumps between states as it did before. Your
+            system's <strong>"reduce motion"</strong> setting always wins over this.
+          </>
+        }
+        checked={conversationAnimations}
+        onChange={(v) => set({ conversationAnimations: v })}
+        label="Animate work folding and unfolding"
       />
       <ToggleRow
         title="Message controls"

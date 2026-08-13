@@ -345,7 +345,7 @@ export function ToolSection({
   }, [live]);
   // Open/close as a movement rather than a cut — including the automatic collapse on settle,
   // which used to make the run's rows vanish under a chevron that merely rotated.
-  const { mounted, expanded } = useCollapseAnim(open);
+  const { mounted, expanded, settling } = useCollapseAnim(open);
 
   return (
     <div className="cv-steps">
@@ -363,7 +363,11 @@ export function ToolSection({
         </span>
       </button>
       {mounted ? (
-        <div className="cv-collapse" data-open={expanded ? "1" : undefined}>
+        <div
+          className="cv-collapse"
+          data-open={expanded ? "1" : undefined}
+          data-settling={settling ? "1" : undefined}
+        >
           <div className="cv-steps-b">{children}</div>
         </div>
       ) : null}
@@ -404,7 +408,7 @@ export function ClaudeWorkBlock({
   const onToggle = persisted
     ? () => toggleStore(foldConv!, foldKey!)
     : () => setLocalOpen((o) => !o);
-  const { mounted, expanded } = useCollapseAnim(open);
+  const { mounted, expanded, settling } = useCollapseAnim(open);
   // Landing signal. In clean output the work flies UP into this block, so the block
   // acknowledges the arrival — otherwise you see an item leave and never learn where it went.
   // The count itself still increments at take-off (when the fold rule moves); only the pulse
@@ -436,7 +440,11 @@ export function ClaudeWorkBlock({
         </span>
       </button>
       {mounted ? (
-        <div className="cv-collapse" data-open={expanded ? "1" : undefined}>
+        <div
+          className="cv-collapse"
+          data-open={expanded ? "1" : undefined}
+          data-settling={settling ? "1" : undefined}
+        >
           <div className="cv-work-b">{children}</div>
         </div>
       ) : null}

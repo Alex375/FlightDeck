@@ -37,34 +37,6 @@ export const STATUSES_OFF_THE_BOARD = new Set([
 export const OFF_BOARD_SECTIONS = ["En attente", "Backlog"] as const;
 
 /**
- * The board as it looks the instant a task is moved to `status` — the optimistic patch.
- *
- * Covers `generalTasks` as well as the projects, because the project-less band is rendered
- * too: patching only `projects` meant a status change on one of those rows moved nothing,
- * and — the real damage — a REFUSED write had nothing to roll back, so failure and success
- * produced the identical screen.
- *
- * A task whose new status is off the board is removed rather than moved: the briefing does
- * not carry those. Where it GOES instead is {@link routeTaskStatus}'s business — this
- * function only ever describes the briefing.
- */
-export function applyStatusToBoard(
-  briefing: TosseBriefing,
-  taskId: string,
-  status: string,
-): TosseBriefing {
-  const patch = (tasks: TosseTask[]): TosseTask[] =>
-    STATUSES_OFF_THE_BOARD.has(status)
-      ? tasks.filter((t) => t.id !== taskId)
-      : tasks.map((t) => (t.id === taskId ? { ...t, status } : t));
-  return {
-    ...briefing,
-    projects: briefing.projects.map((p) => ({ ...p, tasks: patch(p.tasks) })),
-    generalTasks: patch(briefing.generalTasks),
-  };
-}
-
-/**
  * The three caches the view reads, as one value — the briefing plus one list per off-board
  * status. `null` means "not fetched / not in cache", which is NOT the same as an empty list
  * and must not be turned into one: writing back an empty array would tell the query cache
@@ -110,6 +82,13 @@ export function routeTaskStatus(
 ): BoardCaches {
   const found = findTask(caches, taskId);
   if (!found) return caches;
+  // ⚠️ Decided BEFORE anything is removed. A task coming back onto the board needs the briefing
+  // to land in, and it is legitimately absent from cache (a failed or evicted briefing next to
+  // an off-board list that fetched fine — `readBoardCaches` hands back exactly that). Stripping
+  // it from its off-board list anyway and then finding nowhere to put it made the row vanish
+  // from the screen until the refetch landed: the "looks like a deletion" reading this function
+  // exists to prevent. Nothing patched at all is the honest answer.
+  if (!STATUSES_OFF_THE_BOARD.has(status) && !caches.briefing) return caches;
 
   const moved: TosseTask = { ...found.task, status };
   const briefing = caches.briefing
@@ -128,7 +107,8 @@ export function routeTaskStatus(
     return { briefing, offBoard };
   }
 
-  // Destination 2 — back onto the board.
+  // Destination 2 — back onto the board. `briefing` is non-null here: the guard at the top
+  // returned early otherwise, rather than letting the row fall through to "gone on purpose".
   if (!STATUSES_OFF_THE_BOARD.has(status) && briefing) {
     return { briefing: insertIntoBriefing(briefing, moved, found.project), offBoard };
   }
@@ -272,13 +252,29 @@ export const PROJECT_STATUS_TONE: Record<string, StatusTone> = {
   "En pause": "hold",
   "À démarrer": "todo",
   Terminé: "done",
-  Actif: "done",
   Archivé: "archived",
 };
 
+/** The tone of a PROJECT status, neutral when absent or unknown. */
 export function projectStatusTone(status: string | null): StatusTone {
   if (!status) return "todo";
   return PROJECT_STATUS_TONE[status] ?? "todo";
+}
+
+/**
+ * The tone of a TASK status, neutral when unknown.
+ *
+ * ⚠️ Every surface that paints a task status goes through this, not through `STATUS_TONE[…] ??
+ * "todo"` written out again: the board, the card sections, the task chip and the delete dialog
+ * had nine copies of that fallback between them, one of which feeds a CSS class name. A new CRM
+ * status (or a change of what "unknown" should look like) then has to move all nine together,
+ * and the one that is missed paints a different colour on a single screen — exactly the split
+ * the shared `--ts-*` tokens were introduced to end. The palette was centralised; the LOOKUP is
+ * the other half of that.
+ */
+export function taskStatusTone(status: string | null | undefined): StatusTone {
+  if (!status) return "todo";
+  return STATUS_TONE[status] ?? "todo";
 }
 
 /**
@@ -356,37 +352,42 @@ export function sortedBacklog(tasks: TosseTask[]): TosseTask[] {
   return sortTasks(tasks);
 }
 
-/** File a flat off-board response under each project id. Tasks with no project are left
- *  out — the caller renders those in the project-less band. */
-export function groupOffBoardByProject(
-  rows: TosseOffBoardTask[],
-): Record<string, TosseTask[]> {
-  const by: Record<string, TosseTask[]> = {};
-  for (const row of rows) {
-    if (!row.project) continue;
-    (by[row.project.id] ??= []).push(row.task);
-  }
-  return by;
-}
-
 /** The rows of an off-board response that belong to no project at all. */
 export function offBoardWithoutProject(rows: TosseOffBoardTask[]): TosseTask[] {
   return rows.filter((r) => !r.project).map((r) => r.task);
 }
 
-/** One card's slice of the off-board grouping: status → its tasks for that project. Empty
- *  statuses are kept out, so a card asks only about what it has. */
-export function offBoardForScope(
-  byStatus: Record<string, Record<string, TosseTask[]>>,
-  scopeId: string,
-): Record<string, TosseTask[]> {
-  const out: Record<string, TosseTask[]> = {};
-  for (const [status, byProject] of Object.entries(byStatus)) {
-    const tasks = byProject[scopeId];
-    if (tasks?.length) out[status] = tasks;
+/**
+ * The off-board responses pivoted the way the CARDS consume them: project id → status → its
+ * tasks, in display order, empty statuses left out.
+ *
+ * ⚠️ Pivoted ONCE, in the caller's memo, and read by indexing. It used to be grouped
+ * status→project and then re-grouped per card inside the render `.map`, which allocated a
+ * fresh object for every project on every render — so a card could never be memoised on it,
+ * and the whole board (progress rings, actions, dates) re-rendered on any unrelated state
+ * change, down to the toolbar's "Syncing…" flip. Sorting here rather than in the section body
+ * is the same argument: it is a function of the data, not of the render.
+ */
+export function offBoardByScope(
+  byStatus: Record<string, TosseOffBoardTask[]>,
+): Record<string, Record<string, TosseTask[]>> {
+  const out: Record<string, Record<string, TosseTask[]>> = {};
+  for (const [status, rows] of Object.entries(byStatus)) {
+    for (const row of rows) {
+      if (!row.project) continue;
+      const scope = (out[row.project.id] ??= {});
+      (scope[status] ??= []).push(row.task);
+    }
+  }
+  for (const scope of Object.values(out)) {
+    for (const status of Object.keys(scope)) scope[status] = sortTasks(scope[status]);
   }
   return out;
 }
+
+/** The empty slice, shared: a card with nothing parked must get the SAME object every render,
+ *  or the identity churn this pivot exists to remove comes straight back. */
+export const NO_OFF_BOARD: Readonly<Record<string, TosseTask[]>> = Object.freeze({});
 
 /**
  * Cards for the projects that ONLY have off-board work.

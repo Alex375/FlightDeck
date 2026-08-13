@@ -2,7 +2,7 @@ import { lazy, Suspense, useRef } from "react";
 import { EditorPanel } from "../editor/EditorPanel";
 import { Splitter } from "../editor/Splitter";
 import { clamp, useEditorStore } from "../editor/editorStore";
-import { usePanelSlide } from "../../ui/usePanelSlide";
+import { neighborFlex, usePanelSlide } from "../../ui/usePanelSlide";
 
 // Lazy: xterm.js + its WebGL/fit addons stay out of the startup bundle (mirrors
 // Monaco) — fetched only when the integrated terminal is first opened.
@@ -45,7 +45,23 @@ export function SidePanel({
   const terminalFraction = useEditorStore((s) => s.terminalFraction);
   const setTerminalFraction = useEditorStore((s) => s.setTerminalFraction);
   const ref = useRef<HTMLDivElement>(null);
-  const both = editorOpen && terminalOpen;
+  // ⚠️ Sticky while BOTH panes are still on screen, not just while both props say so. On the
+  // render that closes one of them its prop is already false although the pane is still there,
+  // and recomputing the split as "one pane, take everything" right then commits BOTH slots at
+  // `flex: 1 1 0` before `usePanelSlide` measures — so the closing pane is measured at half the
+  // region and its animation starts by jumping there. Read from the previous render; it relaxes
+  // the moment the pane actually unmounts.
+  const bothRef = useRef(false);
+  const both = (editorOpen && terminalOpen) || bothRef.current;
+  const editorGrow = both ? 1 - terminalFraction : 1;
+  const terminalGrow = both ? terminalFraction : 1;
+  // Neither pane starts a travel while the OTHER one is already in flight: both slots would be
+  // sized in pixels at once, nobody would grow into the slack, and the region would show a
+  // blank band for the whole animation. The second one switches instantly instead — the same
+  // call as a pane arriving alone (see `enabled` below). Read from the previous render so a
+  // pane never revokes its OWN `enabled` mid-flight, which would cut its animation short.
+  const editorAnimRef = useRef(false);
+  const termAnimRef = useRef(false);
 
   // Inner direction is perpendicular to the region's placement: region-on-right
   // (sideBySide) stacks vertically (column); region-below stacks horizontally (row).
@@ -76,9 +92,9 @@ export function SidePanel({
     open: editorOpen,
     axis: innerAxis,
     edge: "start",
-    enabled: terminalOpen,
+    enabled: terminalOpen && !termAnimRef.current,
     restStyle: {
-      flex: `${both ? 1 - terminalFraction : 1} 1 0`,
+      flex: `${editorGrow} 1 0`,
       minWidth: 0,
       minHeight: 0,
       display: "flex",
@@ -88,18 +104,27 @@ export function SidePanel({
   const termSlide = usePanelSlide({
     open: terminalOpen,
     axis: innerAxis,
-    enabled: editorOpen,
+    enabled: editorOpen && !editorAnimRef.current,
     restStyle: {
-      flex: `${both ? terminalFraction : 1} 1 0`,
+      flex: `${terminalGrow} 1 0`,
       minWidth: 0,
       minHeight: 0,
       display: "flex",
       flexDirection: innerColumn ? "column" : "row",
     },
   });
-  // While one pane travels on a pixel size of its own, the other takes everything it has
-  // not claimed yet (grow 1) — the same reason the conversation does in MainArea.
-  const sliding = editorSlide.animating || termSlide.animating;
+  bothRef.current = editorSlide.mounted && termSlide.mounted;
+  editorAnimRef.current = editorSlide.animating;
+  termAnimRef.current = termSlide.animating;
+  // While one pane travels on a pixel size of its own, the other takes everything it has not
+  // claimed yet — the shared rule, not a transcription of it (see neighborFlex). A pane that is
+  // ITSELF travelling keeps the sliding style the hook gave it.
+  const editorSlotStyle = editorSlide.animating
+    ? editorSlide.slotStyle
+    : { ...editorSlide.slotStyle, flex: neighborFlex(termSlide, editorGrow) };
+  const termSlotStyle = termSlide.animating
+    ? termSlide.slotStyle
+    : { ...termSlide.slotStyle, flex: neighborFlex(editorSlide, terminalGrow) };
 
   return (
     <div
@@ -113,28 +138,14 @@ export function SidePanel({
       }}
     >
       {editorSlide.mounted ? (
-        <div
-          ref={editorSlide.slotRef}
-          style={
-            sliding && !editorSlide.animating
-              ? { ...editorSlide.slotStyle, flex: "1 1 0" }
-              : editorSlide.slotStyle
-          }
-        >
+        <div ref={editorSlide.slotRef} style={editorSlotStyle}>
           <div style={editorSlide.paneStyle}>
             <EditorPanel convId={convId} cwd={cwd} stacked={stacked} />
           </div>
         </div>
       ) : null}
       {termSlide.mounted ? (
-        <div
-          ref={termSlide.slotRef}
-          style={
-            sliding && !termSlide.animating
-              ? { ...termSlide.slotStyle, flex: "1 1 0" }
-              : termSlide.slotStyle
-          }
-        >
+        <div ref={termSlide.slotRef} style={termSlotStyle}>
           <div style={termSlide.paneStyle}>
             {/* The divider exists only while both panes do, and it rides INSIDE the
                 terminal's slot: a terminal folding away takes the divider with it instead

@@ -266,7 +266,17 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     if (!el || typeof ResizeObserver === "undefined") return;
     const inner = el.querySelector(".cv-thread-inner");
     if (!inner) return;
-    const ro = new ResizeObserver(() => {
+    // Height only, like the viewport observer above. A ResizeObserver also fires on WIDTH
+    // changes, and the width of this element moves on every frame of a side-panel slide
+    // (190ms of `flex-basis`), of a splitter drag and of a window resize — none of which move
+    // a single row, yet each one would run the anchor maths and write `scrollTop` on the
+    // app's hottest path. Read from the entry rather than the DOM: asking the node for its
+    // height inside the callback forces the layout we are trying not to pay for.
+    let lastH = -1;
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[entries.length - 1]?.contentRect.height ?? -1;
+      if (h === lastH) return;
+      lastH = h;
       const node = scrollEl.current;
       if (!node || restoring.current) return; // never fight the initial-position restore
       if (following.current) {

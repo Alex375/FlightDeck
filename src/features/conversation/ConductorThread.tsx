@@ -59,6 +59,7 @@ import {
   flattenWork,
   groupBlocks,
   interleaveMarkers,
+  isDecisionKind,
   liveVisibleStart,
   runHeader,
   splitFinalMessage,
@@ -802,9 +803,7 @@ function renderFoldedWork(
   // A `plan`, an `artifact` or a `question` is a decision/deliverable that must never hide
   // inside the fold, even when buried mid-round (e.g. an answered AskUserQuestion followed by
   // more work in the same group): split the fold at each so it renders in clear between runs.
-  const cuts = (s: Segment) =>
-    s.kind === "plan" || s.kind === "artifact" || s.kind === "question";
-  if (!folded.some(cuts)) {
+  if (!folded.some(isDecisionKind)) {
     return (
       <ClaudeWorkBlock count={countWorkSteps(folded)} foldConv={session} foldKey={roundKey}>
         {renderSegments(session, folded, false, -1, motion)}
@@ -831,7 +830,7 @@ function renderFoldedWork(
     chunk = [];
   };
   for (const seg of folded) {
-    if (cuts(seg)) {
+    if (isDecisionKind(seg)) {
       flush();
       // Rendered in CLEAR, outside the block — and never held in the clear zone either (the
       // `holdable` veto in CleanBlocks), so from the user's side this card simply stays put.
@@ -908,9 +907,7 @@ function CleanBlocks({
   // A round holding a plan / artifact / question splits into several blocks keyed
   // `${roundKey}#N` (see renderFoldedWork); scanning for those is gated on the round actually
   // containing one, so the common case stays a single map lookup per round.
-  const splitFold = work.some(
-    (s) => s.kind === "plan" || s.kind === "artifact" || s.kind === "question",
-  );
+  const splitFold = work.some(isDecisionKind);
   const foldOpen = useWorkFold((s) => {
     const m = s.open[session];
     if (!m) return false;
@@ -934,11 +931,7 @@ function CleanBlocks({
   // Decision/deliverable atoms are pulled back out of the block and rendered in clear whatever
   // the fold does (renderFoldedWork), so crossing the cut does not remove them from view —
   // holding one would put the SAME card on screen twice, at full height, for the whole flight.
-  const stayingInClear = new Set(
-    atoms
-      .filter((a) => a.kind === "plan" || a.kind === "artifact" || a.kind === "question")
-      .map((a) => a.key),
-  );
+  const stayingInClear = new Set(atoms.filter(isDecisionKind).map((a) => a.key));
   const split = live ? liveVisibleStart(atoms, isRunning, LIVE_WINDOW) : atoms.length;
   // Purely cosmetic: hold the atoms that just crossed the cut so they can animate towards the
   // block instead of being cut out. `split` — WHAT folds and WHEN — is untouched.

@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { useDisplay } from "../store/display";
-import { usePanelSlide, useFrozenWhile } from "./usePanelSlide";
+import { neighborFlex, usePanelSlide, useFrozenWhile } from "./usePanelSlide";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -202,6 +202,21 @@ describe("usePanelSlide, mid-flight", () => {
     expect(panel()).not.toBeNull();
     act(() => vi.advanceTimersByTime(5000)); // fail-safe
     expect(panel()).toBeNull();
+  });
+});
+
+describe("neighborFlex", () => {
+  it("hands the region its resting share only while the slot is settled", () => {
+    expect(neighborFlex({ mounted: true, animating: false }, 0.7)).toBe("0.7 1 0");
+  });
+
+  it("grows to 1 while the slot travels, and while it is not there at all", () => {
+    // The slot is sized in pixels mid-flight, so a neighbour still growing by its resting
+    // share leaves a blank band where the panel is heading — visible ONLY during the travel.
+    expect(neighborFlex({ mounted: true, animating: true }, 0.7)).toBe("1 1 0");
+    // …and a single flex child growing by 0.7 fills only 70% of the row, leaving the rest
+    // blank, so a closed panel means grow 1 too.
+    expect(neighborFlex({ mounted: false, animating: false }, 0.7)).toBe("1 1 0");
   });
 });
 

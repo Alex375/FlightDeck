@@ -113,6 +113,33 @@ describe("computeExits", () => {
     });
     expect(held).toEqual([]);
   });
+
+  it("never lets a later batch expire before one that is already in the air", () => {
+    // A big batch leaves at t=0 (6 atoms → 180ms + a 175ms stagger tail = t+355), then a lone
+    // atom crosses at t=50 (t+230). Retiring the LATER one first empties the rendered clear
+    // zone from the cut backwards, taking the earlier batch out mid-transition — so its
+    // deadline is clamped to the batch already flying.
+    const first = computeExits({
+      prevVisible: ["a", "b", "c", "d", "e", "f", "g"],
+      visibleNow: ["g"],
+      folded: folded("a", "b", "c", "d", "e", "f"),
+      held: [],
+      now: 0,
+    });
+    const batchDeadline = first[0].expiresAt;
+    expect(batchDeadline).toBe(EXIT_MS + exitDelayMs(5));
+
+    const second = computeExits({
+      prevVisible: ["g"],
+      visibleNow: [],
+      folded: folded("a", "b", "c", "d", "e", "f", "g"),
+      held: first,
+      now: 50,
+    });
+    const late = second.find((h) => h.key === "g");
+    expect(late?.expiresAt).toBe(batchDeadline);
+    expect(Math.min(...second.map((h) => h.expiresAt))).toBe(batchDeadline);
+  });
 });
 
 describe("heldVisibleStart", () => {
@@ -159,12 +186,14 @@ function Harness({
   keys,
   split,
   enabled,
+  holdable,
 }: {
   keys: string[];
   split: number;
   enabled: boolean;
+  holdable?: (key: string) => boolean;
 }) {
-  const { visStart, slots } = useWorkExit(keys, split, enabled);
+  const { visStart, slots } = useWorkExit(keys, split, enabled, holdable);
   return createElement(
     "div",
     null,
@@ -178,7 +207,12 @@ function Harness({
   );
 }
 
-function render(props: { keys: string[]; split: number; enabled: boolean }) {
+function render(props: {
+  keys: string[];
+  split: number;
+  enabled: boolean;
+  holdable?: (key: string) => boolean;
+}) {
   act(() => {
     root.render(createElement(StrictMode, null, createElement(Harness, props)));
   });
@@ -231,18 +265,18 @@ describe("useWorkExit", () => {
 
   it("keeps reconstructed run keys stable for the whole flight of a mixed batch", () => {
     // The regression this locks is one the harness above CANNOT see: it renders atom keys
-    // directly, whereas the real clear zone goes through `atomsToSegments`, which numbers runs
-    // keys runs from their first step. Two ways that used to break, both locked here: keys
-    // derived from the run's ORDINAL in the slice (the slice's start moves as work folds), and
-    // releasing a batch atom by atom (the start moves again while others are still flying).
+    // directly, whereas the real clear zone goes through `atomsToSegments`, which keys a run by
+    // the run it was flattened FROM. Two slice-local schemes that used to break, both locked
+    // here: the run's ORDINAL in the slice, and its FIRST STEP's id (the slice's start moves as
+    // work folds), plus releasing a batch atom by atom (it moves again mid-flight).
     // Either one re-keys a live, untouched run → React remounts it mid-animation and every step
     // row the user had expanded snaps shut.
     const atoms: WorkAtom[] = [
-      { kind: "step", key: "s1", step: { id: "s1", name: "Read", input: null } },
+      { kind: "step", key: "s1", step: { id: "s1", name: "Read", input: null }, runKey: "run-0" },
       { kind: "text", key: "t1", text: "narration" },
-      { kind: "step", key: "s2", step: { id: "s2", name: "Read", input: null } },
-      { kind: "step", key: "s3", step: { id: "s3", name: "Edit", input: null } },
-      { kind: "step", key: "s4", step: { id: "s4", name: "Bash", input: null } },
+      { kind: "step", key: "s2", step: { id: "s2", name: "Read", input: null }, runKey: "run-2" },
+      { kind: "step", key: "s3", step: { id: "s3", name: "Edit", input: null }, runKey: "run-2" },
+      { kind: "step", key: "s4", step: { id: "s4", name: "Bash", input: null }, runKey: "run-2" },
     ];
     const atomKeys = atoms.map((a) => a.key);
     const split = 2; // s1 and t1 just crossed the cut, together
@@ -262,12 +296,28 @@ describe("useWorkExit", () => {
     const duringFlight = runKeys(heldVisibleStart(atomKeys, split, held));
     const afterFlight = runKeys(heldVisibleStart(atomKeys, split, []));
     // The run carrying s2/s3/s4 must answer to the SAME key in both states.
-    expect(duringFlight).toContain("vis-run-s2");
-    expect(afterFlight).toEqual(["vis-run-s2"]);
+    expect(duringFlight).toContain("vis-run-2");
+    expect(afterFlight).toEqual(["vis-run-2"]);
 
     // …and there is no in-between state where only part of the batch has been released.
     const deadlines = new Set(held.map((h) => h.expiresAt));
     expect(deadlines.size).toBe(1);
+  });
+
+  it("gives no slot to a hold the clear zone cannot reach", () => {
+    // A vetoed atom (a plan/artifact/question, pulled back into clear by renderFoldedWork) sits
+    // between the batch and the cut, so `heldVisibleStart` stops on it and `b` is never
+    // rendered. Its slot must NOT be handed out either: the fold would grow the arriving copy
+    // in over 180ms with nothing shrinking away, and the thread would jump by the row's full
+    // height and climb back.
+    const withPlan = ["a", "b", "P", "c"];
+    const holdable = (k: string) => k !== "P";
+    render({ keys: withPlan, split: 1, enabled: true, holdable });
+    expect(shown()).toEqual(["b", "P", "c"]);
+
+    render({ keys: withPlan, split: 3, enabled: true, holdable });
+    expect(shown()).toEqual(["c"]);
+    expect(container.querySelectorAll("[data-slot]")).toHaveLength(0);
   });
 
   it("does not fly out work that folded while the animation was disabled", () => {

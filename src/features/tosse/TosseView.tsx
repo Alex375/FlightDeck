@@ -58,9 +58,9 @@ import type {
 import {
   briefingTotals,
   groupByClient,
-  groupOffBoardByProject,
+  offBoardByScope,
   isOverdue,
-  offBoardForScope,
+  NO_OFF_BOARD,
   offBoardProjectCards,
   offBoardWithoutProject,
   OFF_BOARD_SECTIONS,
@@ -71,13 +71,20 @@ import {
   sortedBacklog,
   shortDate,
   statusSections,
-  STATUS_TONE,
+  taskStatusTone,
   taskQuickAction,
   TASK_STATUS_CHOICES,
   type ProjectAction,
   type StatusSection,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
+
+/** One `useTosseOffBoard` call per off-board status, and a hook count cannot vary between
+ *  renders — so the board hard-codes how MANY there are. This is the tripwire: the day a third
+ *  status joins `OFF_BOARD_SECTIONS`, this line stops compiling instead of the new section
+ *  quietly rendering empty forever. */
+const OFF_BOARD_ARITY: 2 = OFF_BOARD_SECTIONS.length;
+void OFF_BOARD_ARITY;
 
 /** The progress ring on a project card (done / total across ALL its tasks). Pure SVG —
  *  the same shape the CRM draws, so the two read as one number. */
@@ -196,7 +203,7 @@ function OffBoardSection({
   const label = sectionLabel(status);
   if (tasks.length === 0) return null;
   return (
-    <div className={s.section} data-tone={STATUS_TONE[status] ?? "todo"}>
+    <div className={s.section} data-tone={taskStatusTone(status)}>
       <button
         className={`${s.sectionHead} ${s.sectionToggle}`}
         onClick={() => toggle(foldKey)}
@@ -215,7 +222,7 @@ function OffBoardSection({
         <span className={s.sectionRule} />
       </button>
       {open
-        ? sortedBacklog(tasks).map((task) => (
+        ? tasks.map((task) => (
             <div key={task.id}>
               <TaskRow
                 task={task}
@@ -578,7 +585,7 @@ function TaskRow({
   onOpen: () => void;
   onStatus: (status: string) => void;
 }) {
-  const tone = STATUS_TONE[task.status] ?? "todo";
+  const tone = taskStatusTone(task.status);
   const due = shortDate(task.dueDate);
   const late = isOverdue(task.dueDate, Date.now());
   const linked = useConversationsForTask(task.id);
@@ -781,7 +788,7 @@ function StatusSections({
         <div
           key={section.status}
           className={s.section}
-          data-tone={STATUS_TONE[section.status] ?? "todo"}
+          data-tone={taskStatusTone(section.status)}
         >
           <div className={s.sectionHead}>
             {/* Dot THEN icon THEN heading — the CRM draws all three, and the pair reads as
@@ -896,7 +903,7 @@ function ProjectCard({
                     <span
                       key={sec.status}
                       className={s.cardCount}
-                      data-tone={STATUS_TONE[sec.status] ?? "todo"}
+                      data-tone={taskStatusTone(sec.status)}
                     >
                       {sec.tasks.length} {sectionLabel(sec.status).toLowerCase()}
                     </span>
@@ -909,7 +916,7 @@ function ProjectCard({
                       <span
                         key={status}
                         className={s.cardCount}
-                        data-tone={STATUS_TONE[status] ?? "todo"}
+                        data-tone={taskStatusTone(status)}
                       >
                         {offBoard[status]?.length} {sectionLabel(status).toLowerCase()}
                       </span>
@@ -1100,7 +1107,7 @@ export function TaskDetail({
               portal
               trigger={
                 <button
-                  className={`${s.state} ${s.stateBtn} ${s[`state_${STATUS_TONE[data.task.status] ?? "todo"}`]}`}
+                  className={`${s.state} ${s.stateBtn} ${s[`state_${taskStatusTone(data.task.status)}`]}`}
                   title={`${data.task.status} — change status`}
                 >
                   {data.task.status}
@@ -1153,7 +1160,7 @@ export function TaskDetail({
             <div className={s.detailKey}>Blocked by</div>
             {data.blockedBy.map((b) => (
               <div key={b.id} className={`${s.blockRow} ${b.resolved ? s.blockDone : ""}`}>
-                <span className={s.blockDot} data-tone={STATUS_TONE[b.status ?? ""] ?? "todo"} />
+                <span className={s.blockDot} data-tone={taskStatusTone(b.status)} />
                 {b.title}
                 <span className={s.muted}>{b.status}</span>
               </div>
@@ -1313,7 +1320,7 @@ function ClientBand({
               project={p}
               index={i}
               paused={p.status === "En pause"}
-              offBoard={offBoardForScope(offBoardByProject, p.id)}
+              offBoard={offBoardByProject[p.id] ?? NO_OFF_BOARD}
               selectedTaskId={selectedTaskId}
               onOpenTask={onOpenTask}
             />
@@ -1389,26 +1396,41 @@ function TosseBoard() {
   // server-side), so they are filed under the right card HERE rather than by every card
   // asking for its own.
   //
-  // ⚠️ Fixed number of hooks, from a constant list — never a `.map` over data, which would
-  // change the hook count between renders the moment a status appeared or vanished.
-  const pending = useTosseOffBoard("En attente");
-  const backlog = useTosseOffBoard("Backlog");
+  // ⚠️ Fixed number of hooks, and the statuses come from the shared list rather than from two
+  // literals typed here — never a `.map` over data, which would change the hook count between
+  // renders the moment a status appeared or vanished. `OFF_BOARD_ARITY` above is what turns
+  // "someone added a third off-board status" into a TYPE error instead of a section that
+  // renders empty forever (a status never fetched is indistinguishable from one with no tasks).
+  const pending = useTosseOffBoard(OFF_BOARD_SECTIONS[0]);
+  const backlog = useTosseOffBoard(OFF_BOARD_SECTIONS[1]);
   const offBoardRows = useMemo<Record<string, TosseOffBoardTask[]>>(
-    () => ({ "En attente": pending.data ?? [], Backlog: backlog.data ?? [] }),
+    () => ({
+      [OFF_BOARD_SECTIONS[0]]: pending.data ?? [],
+      [OFF_BOARD_SECTIONS[1]]: backlog.data ?? [],
+    }),
     [pending.data, backlog.data],
   );
-  const offBoardByProject = useMemo(() => {
-    const out: Record<string, Record<string, TosseTask[]>> = {};
-    for (const [status, rows] of Object.entries(offBoardRows)) {
-      out[status] = groupOffBoardByProject(rows);
-    }
-    return out;
-  }, [offBoardRows]);
+  // ⚠️ The board is THREE reads, so it needs one error state and one loading state, not the
+  // briefing's. Consuming only `.data` from the two off-board queries rendered a failed fetch
+  // as "nothing is waiting" — no heading, no banner, no retry — and, because a project whose
+  // whole queue is parked exists on this screen ONLY through those rows, it also deleted that
+  // project's card. With an empty briefing on top of it the view went as far as announcing
+  // "Nothing open in TOSSE" while the CRM held blocked work.
+  const boardError = error ?? pending.error ?? backlog.error;
+  const boardLoading = isLoading || pending.isLoading || backlog.isLoading;
+  const refetchBoard = () => {
+    void refetch();
+    void pending.refetch();
+    void backlog.refetch();
+  };
+  // Pivoted straight to what a card reads (project → status → sorted tasks), so each card gets
+  // an identity-stable slice by indexing instead of a fresh object built in the render.
+  const offBoardByProject = useMemo(() => offBoardByScope(offBoardRows), [offBoardRows]);
   const generalOffBoard = useMemo(() => {
     const out: Record<string, TosseTask[]> = {};
     for (const [status, rows] of Object.entries(offBoardRows)) {
       const tasks = offBoardWithoutProject(rows);
-      if (tasks.length) out[status] = tasks;
+      if (tasks.length) out[status] = sortedBacklog(tasks);
     }
     return out;
   }, [offBoardRows]);
@@ -1425,6 +1447,10 @@ function TosseBoard() {
   // `flex: 0 1 auto` at rest, exactly as the panel itself sizes: the slot measures whatever
   // the CSS settles on (the stored width, clamped by the panel's own floor and viewport cap),
   // so the animation lands on the layout instead of on a number we guessed.
+  //
+  // No `neighborFlex` here, and that is not an omission: the slot never grows (`0 1 auto`) and
+  // the list beside it is `flex: 1` at all times (`.scroll`), so the list already takes every
+  // pixel the slot has not claimed — which is exactly what that rule buys elsewhere.
   const detailSlide = usePanelSlide({
     open: openTaskId !== null,
     axis: "x",
@@ -1477,11 +1503,11 @@ function TosseBoard() {
 
       {/* Connected but the read failed: say why and keep whatever is already on screen
           (stale data beats an empty page — the CRM is not the app's source of truth). */}
-      {error ? (
+      {boardError ? (
         <div className={s.banner}>
-          <span>{String(error.message)}</span>
+          <span>{String(boardError.message)}</span>
           <span className={s.spacer} />
-          <button className={s.bannerAct} onClick={() => void refetch()}>
+          <button className={s.bannerAct} onClick={refetchBoard}>
             Retry
           </button>
         </div>
@@ -1490,18 +1516,22 @@ function TosseBoard() {
       <div className={s.body} ref={bodyRef}>
         <div className={s.scroll}>
           <div className={s.column}>
-            {isLoading ? <div className={s.muted}>Loading the briefing…</div> : null}
+            {boardLoading ? <div className={s.muted}>Loading your tasks…</div> : null}
 
             {/* ⚠️ Gated on EVERYTHING the page renders, not just the client bands. The
                 project-less band is a sibling below, so counting only `bands` printed
                 "Nothing open in TOSSE" directly above a list of open tasks — while the
                 toolbar, which does count them, announced how many there were. The view
                 contradicted itself on the only question it exists to answer. */}
-            {!isLoading &&
+            {/* …and gated on the WHOLE board being settled, not just the briefing: a board whose
+                only work is parked resolves the briefing first (it is the warm query) and would
+                otherwise assert "every active project is clear" for as long as the two
+                off-board round trips took, then replace it with the waiting tasks. */}
+            {!boardLoading &&
             bands.length === 0 &&
             (data?.generalTasks.length ?? 0) === 0 &&
             !hasGeneralOffBoard &&
-            !error ? (
+            !boardError ? (
               <div className={s.empty}>
                 <div className={s.emptyBig}>Nothing open in TOSSE</div>
                 <div>Every active project is clear. Done tasks live in the CRM.</div>

@@ -28,6 +28,7 @@ import {
   type RefObject,
 } from "react";
 import { useDisplay } from "../store/display";
+import { motionAllowed } from "./motion";
 import {
   frozenPaneStyle,
   restingPaneStyle,
@@ -42,24 +43,19 @@ import {
 
 type Phase = "closed" | "measure" | "sliding" | "open";
 
-/** Whether the slide may play at all: the user's preference AND the OS "reduce motion"
- *  setting, which always wins (an accessibility choice is not ours to override). Read
- *  imperatively at each toggle, so flipping either takes effect on the very next open
- *  without every panel subscribing to the preference. */
-export function panelSlideAllowed(): boolean {
-  if (!useDisplay.getState().panelAnimations) return false;
-  try {
-    return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  } catch {
-    return true; // no matchMedia (test env) — the preference alone decides
-  }
-}
+/** Whether the slide may play at all — the app-wide motion policy (`src/ui/motion.ts`) applied
+ *  to this animation's own preference. Read imperatively at each toggle, so flipping either
+ *  takes effect on the very next open without every panel subscribing to the preference. */
+export const panelSlideAllowed = (): boolean =>
+  motionAllowed(useDisplay.getState().panelAnimations);
 
 /** Whether this engine can play the slide at all. */
 function hasWebAnimations(): boolean {
   return typeof Element !== "undefined" && typeof Element.prototype.animate === "function";
 }
 
+/** What a caller tells {@link usePanelSlide}: the intent, the geometry, and the style the slot
+ *  settles at. */
 export interface PanelSlideOptions {
   /** Whether the panel SHOULD be showing. The hook keeps it mounted past a `false` for as
    *  long as the closing animation runs. */
@@ -77,12 +73,14 @@ export interface PanelSlideOptions {
   enabled?: boolean;
 }
 
+/** What {@link usePanelSlide} hands back: whether to render the panel at all, and the two
+ *  styles that make it travel. The neighbouring region's style comes from
+ *  {@link neighborFlex}. */
 export interface PanelSlide {
   /** Render the panel? True while open AND for the length of a closing animation. */
   mounted: boolean;
-  /** An animation is playing. The parent must let the MAIN region take all the space the
-   *  slot is not using yet (`flex-grow: 1`): while the slot is sized in px, a neighbour
-   *  still growing by `1 - fraction` would leave a blank band where the panel is heading. */
+  /** An animation is playing — the slot is sized in px of its own. Its neighbour must then
+   *  grow into the rest; use {@link neighborFlex} rather than transcribing the rule. */
   animating: boolean;
   slotRef: RefObject<HTMLDivElement>;
   /** Style for the slot element (the animated box: splitter + panel). */
@@ -91,6 +89,37 @@ export interface PanelSlide {
   paneStyle: CSSProperties;
 }
 
+/**
+ * The `flex` the region NEXT TO a sliding slot must use.
+ *
+ * ⚠️ Load-bearing, and the one style this module cannot put on the slot itself. While the slot
+ * travels it is sized in pixels of its own (`flex: 0 0 Npx`), so its neighbour has to grow into
+ * everything the slot has not claimed yet; a neighbour still growing by its resting share
+ * leaves a blank band where the panel is heading, for the whole animation. That failure shows
+ * up ONLY mid-flight — at rest the layout is correct — so it reads as a rendering bug rather
+ * than as a missing prop, which is exactly why it belongs here and not in four transcriptions.
+ * The same `1` covers the slot being absent: a single flex child whose grow factors sum to
+ * less than 1 only fills that fraction of the row.
+ */
+export function neighborFlex(
+  slide: Pick<PanelSlide, "mounted" | "animating">,
+  restingGrow: number,
+): string {
+  return `${slide.mounted && !slide.animating ? restingGrow : 1} 1 0`;
+}
+
+/**
+ * Open and close a side panel by PUSHING the region beside it, rather than by appearing and
+ * vanishing in one frame.
+ *
+ * Returns what to render (`mounted`), whether a travel is in flight (`animating`), and the two
+ * styles that produce it: `slotStyle` for the animated box and `paneStyle` for the content
+ * frozen inside it. The neighbouring region's own style is {@link neighborFlex} — it is part of
+ * the same contract, and forgetting it is the module's classic failure.
+ *
+ * Falls back to an instant open/close, keeping the same phases, whenever the slide may not play
+ * (`enabled`, the user preference, OS reduce-motion, or an engine without Web Animations).
+ */
 export function usePanelSlide({
   open,
   axis,

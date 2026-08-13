@@ -102,6 +102,16 @@ describe("frozenPaneStyle", () => {
     expect(y.height).toBe("300px");
     expect(y.width).toBe("100%");
   });
+
+  it("freezes the flow DIRECTION too, matching the resting style", () => {
+    // Omitting it does not mean "unchanged": `display:flex` with no direction is `row`, so a
+    // y-axis pane laid its children out side by side for the whole slide and snapped to a
+    // column on landing — the terminal's horizontal divider rendered as a vertical bar and
+    // xterm was measured at the wrong box, i.e. exactly the re-layout the freeze prevents.
+    expect(frozenPaneStyle("x", 420).flexDirection).toBe(restingPaneStyle("x").flexDirection);
+    expect(frozenPaneStyle("y", 300).flexDirection).toBe(restingPaneStyle("y").flexDirection);
+    expect(frozenPaneStyle("y", 300).flexDirection).toBe("column");
+  });
 });
 
 describe("restingPaneStyle", () => {
