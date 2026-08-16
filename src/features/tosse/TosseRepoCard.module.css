@@ -247,6 +247,11 @@
   font-size: 12px;
   margin-top: 2px;
   overflow-wrap: anywhere;
+  /* Several things can go wrong around one gesture, and they are reported together, one
+     per line. Without this the lines run into each other and the second failure reads as
+     the tail of the first — which is how one of the two gets missed. (JSX collapses the
+     newlines of the static blocks, so they are unaffected.) */
+  white-space: pre-line;
 }
 
 .empty {

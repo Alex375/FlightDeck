@@ -24,7 +24,7 @@ import { useDisplay } from "../../store/display";
 import { resolveTaskFolder } from "./taskFolder";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
-import { enablePickupPlugin, findPickupPlugin, type PickupPlugin } from "./pickupPlugin";
+import { activationProblem, findPickupPlugin, type PickupPlugin } from "./pickupPlugin";
 import card from "./TosseRepoCard.module.css";
 import s from "./TaskLaunch.module.css";
 
@@ -175,7 +175,12 @@ export function TaskLaunchProvider({
       }
       setBusyTaskId(task.id);
       void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
-        .then((out) => handOff(mode, task.id, out.convId))
+        .then((out) => {
+          // The conversation IS open, so this is not a failed launch — but if equipping it
+          // went wrong, the toast is the only place that can say so from here.
+          setError(activationProblem(out.plugin));
+          handOff(mode, task.id, out.convId);
+        })
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
@@ -251,10 +256,19 @@ function TaskLaunchDialog({
   const [error, setError] = useState<string | null>(null);
   const [pickup, setPickup] = useState<PickupSupport | null>(pending.pickup);
   const [probing, setProbing] = useState(false);
-  // The installed-but-disabled plugin that provides the skill, when that is why it is
-  // missing — the difference between "nothing can be done" and "one toggle away".
-  const [dormant, setDormant] = useState<PickupPlugin | null>(null);
-  const [enabling, setEnabling] = useState(false);
+  // The plugin that provides the TOSSE skills, as this folder's extensions report it:
+  // `undefined` while unknown (or unreadable — nothing is concluded from a scan that
+  // failed), `null` when none is installed. READ-ONLY here; switching it on is the launch's
+  // job, so cancelling this dialog never writes anything.
+  const [provider, setProvider] = useState<PickupPlugin | null | undefined>(undefined);
+  // Whether that scan is still out. Held apart from `provider` because "not yet known" and
+  // "we looked and found none" must not share a value: the dialog stays silent on the first
+  // and speaks on the second.
+  const [scanning, setScanning] = useState(false);
+  // Installed but off — the launch will switch it on, which is why the dialog must NOT
+  // announce the written-instructions fallback in this case: it would describe a folder
+  // that stops being true the moment the button is pressed.
+  const dormant = provider && !provider.enabled ? provider : null;
 
   const resolution = useMemo(
     () => resolveTaskFolder(pins ?? [], links, pending.projectId, repos),
@@ -300,25 +314,39 @@ function TaskLaunchDialog({
     };
   }, [starting, repoPath]);
 
-  // The skill is missing here — but is it INSTALLED and merely switched off? That is the
-  // usual case (the plugin is enabled user-globally, so a folder without it is one the
-  // user turned off), and it is fixable in one click instead of silently degrading to
-  // written instructions.
+  // Which plugin, if any, would equip this folder. Asked for BOTH buttons: "Discuss" opens
+  // a conversation that lives on and will want the skills, so a folder where none is
+  // installed is worth saying before the question is even typed.
+  //
+  // "Start" asks only once its catalogue came back empty — there the answer is already
+  // known when the skill is published, and this scan exists to tell "nothing installed"
+  // apart from "installed, dormant".
   useEffect(() => {
-    if (!starting || !repoPath || pickup !== "absent") {
-      setDormant(null);
+    if (!repoPath || (starting && pickup !== "absent")) {
+      setProvider(undefined);
       return;
     }
     let alive = true;
-    void findPickupPlugin(repoPath).then((found) => {
-      if (alive) setDormant(found && !found.enabled ? found : null);
-    });
+    setScanning(true);
+    findPickupPlugin(repoPath)
+      .then((found) => {
+        if (alive) setProvider(found);
+      })
+      // A scan that failed says nothing about what is installed, so it must not read as
+      // "none". It is not swallowed either: the launch runs the same scan and reports the
+      // failure through `activationProblem`.
+      .catch(() => {
+        if (alive) setProvider(undefined);
+      })
+      .finally(() => {
+        if (alive) setScanning(false);
+      });
     return () => {
       alive = false;
     };
   }, [starting, repoPath, pickup]);
 
-  async function go(pickupName?: string | null, overrideRepoId?: string) {
+  async function go(overrideRepoId?: string) {
     // `overrideRepoId`: a folder just adopted in the SAME click — React state has not been
     // applied yet, so reading `repoId` here would launch in the previous folder (or in
     // none). The explicit id is the only correct one at this point.
@@ -344,14 +372,20 @@ function TaskLaunchDialog({
         mode: pending.mode,
         question,
         extra: pending.extra,
-        pickupName,
       });
-      if (pinError) {
-        // The conversation IS open; only the memory of the folder failed. Keep the
-        // dialog up to say so rather than navigating away from the message.
-        setError(
-          `The conversation opened, but this folder could not be remembered for the project: ${pinError}`,
-        );
+      // Two things can go wrong AROUND a launch that itself succeeded: the folder was not
+      // remembered, and the plugin was not switched on. Both are reported together —
+      // showing one and dropping the other would be a silent failure for whichever lost.
+      const problems = [
+        pinError
+          ? `The conversation opened, but this folder could not be remembered for the project: ${pinError}`
+          : null,
+        activationProblem(out.plugin),
+      ].filter((p): p is string => p != null);
+      if (problems.length > 0) {
+        // The conversation IS open; only what surrounds it failed. Keep the dialog up to
+        // say so rather than navigating away from the message.
+        setError(problems.join("\n"));
         setSending(false);
         return;
       }
@@ -363,33 +397,7 @@ function TaskLaunchDialog({
     }
   }
 
-  /** Switch the provider plugin back on, then start — one gesture, and the launch uses
-   *  the name the CLI publishes once it is live (re-read, never assumed). */
-  async function enableThenStart() {
-    if (!dormant || !repoPath) return;
-    setEnabling(true);
-    setError(null);
-    try {
-      const name = await enablePickupPlugin(dormant.id, repoPath);
-      setDormant(null);
-      setPickup(name ? "available" : "absent");
-      if (!name) {
-        // The write went through and the skill STILL is not advertised. Said out loud
-        // rather than sending a slash command that would arrive as plain text.
-        setError(
-          `« ${dormant.name} » was enabled, but this folder still does not offer the pickup skill. Starting will send written instructions instead.`,
-        );
-        return;
-      }
-      await go(name);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setEnabling(false);
-    }
-  }
-
-  const busy = sending || probing || enabling;
+  const busy = sending || probing;
 
   return (
     <div className={card.scrim} onClick={onClose}>
@@ -440,7 +448,7 @@ function TaskLaunchDialog({
                   setChosenRepoId(id);
                   // "Start" has nothing else to ask, so one click goes all the way.
                   // "Discuss" only selects: the question field below is the point of it.
-                  return starting ? go(undefined, id) : undefined;
+                  return starting ? go(id) : undefined;
                 }}
               />
             )}
@@ -473,35 +481,29 @@ function TaskLaunchDialog({
             </div>
           ) : null}
 
-          {/* ── The skill is installed, just switched off here: offer to switch it on ── */}
-          {starting && dormant ? (
+          {/* ── Nothing installed provides the skills: the conversation opens without them ──
+              Only for "Discuss": "Start" says it below, in the terms that matter there
+              (which prompt gets sent instead). */}
+          {!starting && repo && provider === null ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
-                <div className={card.problemTitle}>
-                  The « {dormant.name} » plugin is installed but disabled
-                </div>
+                <div className={card.problemTitle}>No TOSSE plugin in this folder</div>
                 <div className={card.problemBody}>
-                  It provides the pickup skill this button drives. Enabling it writes{" "}
-                  <code>enabledPlugins</code> in your Claude settings — the same switch as
-                  the extensions manager — and applies to every folder.
-                </div>
-                <div className={s.pickRow}>
-                  <button
-                    type="button"
-                    className={card.primaryBtn}
-                    disabled={busy}
-                    onClick={() => void enableThenStart()}
-                  >
-                    {enabling ? "Enabling…" : "Enable it and start"}
-                  </button>
+                  The conversation opens without its skills — no <code>/pickup</code>,{" "}
+                  <code>/done</code> or <code>/list-tasks</code> to carry the work on
+                  afterwards. The question below still works: the task travels inside the
+                  prompt.
                 </div>
               </div>
             </div>
           ) : null}
 
-          {/* ── The substitution, said out loud when nothing can be switched on ── */}
-          {starting && repo && !dormant && pickup !== null && pickup !== "available" ? (
+          {/* ── The substitution, said out loud when nothing can be switched on ──
+              Waits for the plugin scan: announcing the fallback while a dormant plugin is
+              still being looked for would describe a folder that stops being true the
+              moment Start is pressed. */}
+          {starting && repo && !dormant && !scanning && pickup !== null && pickup !== "available" ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
