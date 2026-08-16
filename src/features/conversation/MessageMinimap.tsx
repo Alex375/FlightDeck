@@ -21,7 +21,7 @@
 // ConversationPanes can be mounted at once and a document-wide lookup would hit another
 // instance (the same trap LastMessagePin documents).
 
-import { useCallback, useEffect, useMemo, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import { verticalScaleOf, verticalScaleOfEl } from "../../ui/visualScale";
 import { useUserMessageMarks, type UserMessageMark } from "../../store/conversationStore";
@@ -52,15 +52,71 @@ const TIP_BOTTOM_PAD_PX = 14;
 const TIP_TEXT_INSET_PX = 7;
 
 /**
- * How long the pointer must settle on a mark before its message is previewed, in ms.
+ * How long the pointer must settle on a mark before its message is previewed when arriving
+ * COLD — nothing showing, and you were not just reading the column.
  *
- * Without it, sweeping the column fires a hover per mark crossed and the preview strobes
- * through a dozen messages — unreadable, and it makes a deliberate hover feel twitchy. The
- * delay is the difference between "passing over" and "asking about" a mark. It gates ONLY
- * the preview card: the magnification stays instant, since that is the feedback that has to
- * track the cursor for the column to feel alive.
+ * This is the "passing over" vs "asking about" gate: brushing the right edge on the way to
+ * the scrollbar must light nothing up. ⚠️ The card also fades in over 130ms (see the CSS), so
+ * the felt wait is this plus that — count both when tuning.
  */
-const HOVER_INTENT_MS = 120;
+const HOVER_COLD_MS = 260;
+
+/**
+ * The same wait once the column is WARM — a card is up, so you are reading it and the preview
+ * should follow the pointer.
+ *
+ * Not a flat 0: at 0 a fast sweep swaps the card's TEXT on every one of a hundred marks
+ * crossed, which is the strobe the delay existed to prevent. A couple of frames groups the
+ * marks a quick pointer flies over without ever being felt as a wait.
+ */
+const HOVER_WARM_MS = 30;
+
+/**
+ * How long the warm regime outlives leaving the column, in ms.
+ *
+ * Load-bearing, not a nicety. Leaving clears the card at once (an empty column must never
+ * keep one floating over the thread) and the card itself takes no pointer events — so without
+ * a grace window, a pointer straying onto the card, or any quick round trip, would pay the
+ * cold delay all over again and break the "I'm reading my messages" mode every few seconds.
+ */
+const HOVER_EXIT_GRACE_MS = 300;
+
+/** Which regime the preview delay is in — see {@link hoverRegime}. */
+export type HoverRegime = "cold" | "warm";
+
+/**
+ * Which regime the column is in when the pointer arrives on a mark.
+ *
+ * The tooltip "warm-up / skip-delay" pattern applied to the minimap: the first preview asks
+ * for a moment of intent, and once one is up the column follows the pointer. Warm is earned
+ * by having had a card open — a pointer that swept the column without ever settling long
+ * enough to show one has shown no intent, so it starts cold again.
+ */
+export function hoverRegime({
+  previewOpen,
+  leftWarmAt,
+  now,
+}: {
+  /** A preview card is on screen right now. */
+  previewOpen: boolean;
+  /** When the pointer last left the column WITH a card open, in ms; null if it never has. */
+  leftWarmAt: number | null;
+  /** The current time, in ms. */
+  now: number;
+}): HoverRegime {
+  if (previewOpen) return "warm";
+  if (leftWarmAt !== null && now - leftWarmAt <= HOVER_EXIT_GRACE_MS) return "warm";
+  return "cold";
+}
+
+/**
+ * The wait a regime buys, in ms. It gates ONLY the preview card: the magnification stays
+ * instant in both regimes, since that is the feedback that has to track the cursor for the
+ * column to feel alive.
+ */
+export function hoverDelayMs(regime: HoverRegime): number {
+  return regime === "warm" ? HOVER_WARM_MS : HOVER_COLD_MS;
+}
 
 /** How many neighbours on each side the dock magnification reaches. */
 const DOCK_RANGE = 3;
@@ -276,10 +332,22 @@ export function MessageMinimap({
   const enabled = useDisplay((s) => s.messageMinimap);
   const hoverMode = useDisplay((s) => s.minimapHoverMode);
   // Two hover states, on purpose: `hovered` is instant (it drives the magnification, which
-  // must track the cursor), `previewed` lags by HOVER_INTENT_MS (it drives the preview card,
+  // must track the cursor), `preview` lags by the regime's delay (it drives the preview card,
   // which must not strobe when the column is swept).
   const [hovered, setHovered] = useState<string | null>(null);
-  const [previewed, setPreviewed] = useState<string | null>(null);
+  // The previewed mark, plus whether its card came up warm — the CSS trims the fade-in in
+  // that case, since a warm entry is the middle of a read, not a first appearance.
+  const [preview, setPreview] = useState<{ id: string; warm: boolean } | null>(null);
+  // `preview`, mirrored for the delay effect below — which must read it WITHOUT depending on
+  // it. The regime is decided when the pointer ARRIVES on a mark; re-running the effect each
+  // time a card opens would restart the very delay it just served.
+  const previewOpenRef = useRef(false);
+  /** When the pointer last left the column with a card open — see hoverRegime. */
+  const leftWarmAtRef = useRef<number | null>(null);
+  const showPreview = useCallback((id: string | null, warm: boolean) => {
+    previewOpenRef.current = id !== null;
+    setPreview(id === null ? null : { id, warm });
+  }, []);
   const [activeId, setActiveId] = useState<string | null>(null);
   // The column is sized and placed onto the SCROLL container's box, not the host's: in the
   // conversation the host also holds the floating bars and the composer, and centring on it
@@ -384,18 +452,27 @@ export function MessageMinimap({
     return () => ro.disconnect();
   }, [show, hostRef, scrollRef]);
 
-  // Hover intent: only a mark the pointer SETTLES on gets previewed. Leaving the column
+  // Hover intent: only a mark the pointer SETTLES on gets previewed — for as long as the
+  // regime asks (a beat when arriving cold, all but nothing while reading). Leaving the column
   // clears the card at once — an empty column should never keep a card floating over the
   // conversation — while moving between marks keeps the previous one up until the new one
   // settles, so a deliberate move reads as the card following rather than blinking.
   useEffect(() => {
     if (hovered === null) {
-      setPreviewed(null);
+      // Remember WHEN we left with a card up: that stamp is what keeps a quick round trip
+      // (or the pointer straying onto the card) inside the warm regime — see hoverRegime.
+      if (previewOpenRef.current) leftWarmAtRef.current = Date.now();
+      showPreview(null, false);
       return;
     }
-    const timer = setTimeout(() => setPreviewed(hovered), HOVER_INTENT_MS);
+    const regime = hoverRegime({
+      previewOpen: previewOpenRef.current,
+      leftWarmAt: leftWarmAtRef.current,
+      now: Date.now(),
+    });
+    const timer = setTimeout(() => showPreview(hovered, regime === "warm"), hoverDelayMs(regime));
     return () => clearTimeout(timer);
-  }, [hovered]);
+  }, [hovered, showPreview]);
 
   const scrollTo = useCallback(
     (id: string) => {
@@ -416,7 +493,7 @@ export function MessageMinimap({
   if (!show) return null;
 
   const hoveredIndex = hovered ? marks.findIndex((m) => m.id === hovered) : -1;
-  const previewedIndex = previewed ? marks.findIndex((m) => m.id === previewed) : -1;
+  const previewedIndex = preview ? marks.findIndex((m) => m.id === preview.id) : -1;
   // The hit area is exactly one pitch tall, so the bands TILE: every pixel of the block
   // belongs to its nearest bar and none is stolen by an overlapping neighbour (which would
   // shift every target by half a slot).
@@ -456,10 +533,13 @@ export function MessageMinimap({
           }}
         />
       ))}
-      {previewedIndex >= 0 ? (
+      {preview && previewedIndex >= 0 ? (
         <div
           className="cv-mmap-tip"
           data-mode={hoverMode}
+          // A warm entry skips most of the fade-in: replaying a first appearance mid-read
+          // would hand back the wait the warm regime just saved.
+          data-entry={preview.warm ? "warm" : "cold"}
           // TOP-aligned on the hovered mark, never centred on it: a multi-line preview
           // centred on the mark puts its MIDDLE under the eye, so the reader has to hunt
           // back up for the first words. Instead of shifting the preview up when it would

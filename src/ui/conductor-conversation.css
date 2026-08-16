@@ -316,6 +316,13 @@
   from { opacity:0; transform:translateX(4px); }
   to   { opacity:1; transform:none; }
 }
+/* The fade-in belongs to the COLD regime — it is the card announcing itself. Coming back
+   warm (a round trip inside the grace window, see hoverRegime) it is trimmed to a blink:
+   at full length it would hand back the 230ms the warm delay just saved, and the sweep would
+   feel gated again. ⚠️ Only the DURATION is set here, never the shorthand: reduced motion
+   clears `animation-name` below, and a shorthand at this higher specificity would name the
+   keyframes again and undo it. */
+.cv-mmap-tip[data-entry="warm"] { animation-duration:.06s; }
 @media (prefers-reduced-motion: reduce) {
   .cv-mmap-tip { transition:none; animation:none; }
   .cv-mmap-bar::before { transition:opacity .12s ease, background-color .12s ease; }
