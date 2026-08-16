@@ -2841,7 +2841,19 @@ export type ExtensionsSnapshot = { mcp_servers: McpServerInfo[]; plugins: Plugin
  * a corrupt `~/.claude.json` reads as an empty inventory, and a corrupt
  * `settings.json` would (wrongly) show every plugin as enabled. Empty = clean.
  */
-warnings: string[] }
+warnings: string[]; 
+/**
+ * Whether each plugin's `enabled` above is a READ value rather than a guess.
+ * 
+ * False when `~/.claude/settings.json` — the ONE file that holds
+ * `enabledPlugins` — could not be read: every plugin then falls back to the
+ * `.unwrap_or(true)` below and reads as ON whatever the user actually set.
+ * `warnings` alone cannot answer this (it also collects failures from files
+ * that say nothing about plugins), and a caller about to act on `enabled`
+ * needs "we read it" told apart from "we assumed it" — otherwise a corrupt
+ * config silently reports every plugin as already switched on.
+ */
+plugin_state_trusted: boolean }
 /**
  * A file's contents plus the guards the editor needs: `too_large` (skipped, over
  * [`MAX_FILE_BYTES`]) and `binary` (a NUL byte was found — not shown as text).

@@ -135,7 +135,13 @@ pub fn list_extensions(cwd: Option<&Path>) -> ExtensionsSnapshot {
     let Some(home) = codex_home() else {
         return snap;
     };
+    let before_config = snap.warnings.len();
     let toggles = read_config(&home.join("config.toml"), &mut snap);
+    // Same contract as the Claude scan: the plugin states below are READ from
+    // `config.toml`, so they are only trustworthy if that read went through. Measured
+    // here rather than at the end — the skill scans push warnings of their own, and
+    // those say nothing about whether a plugin's state was actually read.
+    snap.plugin_state_trusted = snap.warnings.len() == before_config;
     scan_skills(&home.join("skills"), ExtScope::User, &mut snap);
     if let Some(cwd) = cwd {
         scan_skills(&cwd.join(".codex/skills"), ExtScope::Project, &mut snap);

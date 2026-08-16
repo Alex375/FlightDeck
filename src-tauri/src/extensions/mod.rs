@@ -167,6 +167,16 @@ pub struct ExtensionsSnapshot {
     /// a corrupt `~/.claude.json` reads as an empty inventory, and a corrupt
     /// `settings.json` would (wrongly) show every plugin as enabled. Empty = clean.
     pub warnings: Vec<String>,
+    /// Whether each plugin's `enabled` above is a READ value rather than a guess.
+    ///
+    /// False when `~/.claude/settings.json` — the ONE file that holds
+    /// `enabledPlugins` — could not be read: every plugin then falls back to the
+    /// `.unwrap_or(true)` below and reads as ON whatever the user actually set.
+    /// `warnings` alone cannot answer this (it also collects failures from files
+    /// that say nothing about plugins), and a caller about to act on `enabled`
+    /// needs "we read it" told apart from "we assumed it" — otherwise a corrupt
+    /// config silently reports every plugin as already switched on.
+    pub plugin_state_trusted: bool,
 }
 
 /// Everything ONE plugin provides — for the per-plugin explorer (click a plugin →
@@ -456,8 +466,14 @@ pub fn list_extensions(repo_path: &str) -> ExtensionsSnapshot {
     // ~/.claude.json must not look like "no MCP", and a corrupt settings.json must not
     // make every plugin look enabled (the `.unwrap_or(true)` below).
     let claude_json: ClaudeJson = read_or_warn(&home.join(".claude.json"), &mut snap.warnings);
+    let before_settings = snap.warnings.len();
     let settings: SettingsJson =
         read_or_warn(&home.join(".claude/settings.json"), &mut snap.warnings);
+    // Recorded from THIS read alone, not from `warnings` as a whole: it is the only file
+    // that carries `enabledPlugins`, so it is the only one whose failure turns the
+    // `enabled` flags below into assumptions (see `plugin_state_trusted`). A missing file
+    // is not a failure — no settings.json means no overrides, which is genuinely "on".
+    snap.plugin_state_trusted = snap.warnings.len() == before_settings;
     let project = claude_json.projects.get(repo_path);
 
     // --- MCP: user scope (named servers; disabled per-project via disabledMcpServers)
@@ -1946,11 +1962,12 @@ mod tests {
     fn list_extensions_reads_real_config() {
         let snap = list_extensions(&std::env::var("HOME").unwrap());
         eprintln!(
-            "mcp={} plugins={} skills={} agents={}",
+            "mcp={} plugins={} skills={} agents={} plugin_state_trusted={}",
             snap.mcp_servers.len(),
             snap.plugins.len(),
             snap.skills.len(),
-            snap.agents.len()
+            snap.agents.len(),
+            snap.plugin_state_trusted
         );
     }
 }

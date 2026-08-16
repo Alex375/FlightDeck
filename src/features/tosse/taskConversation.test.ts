@@ -17,6 +17,9 @@ const h = vi.hoisted(() => ({
   /** What the folder's `/` catalogue advertises — empty until the plugin is switched on,
    *  which is exactly the state a dormant plugin leaves it in. */
   catalogue: [] as { name: string }[],
+  /** The store's conversations, MUTABLE so a test can have one appear mid-launch — which
+   *  is what a second launch fired while this one waits on the plugin looks like. */
+  conversations: [] as { id: string }[],
   linkConversationToTask: vi.fn(),
   renameConversation: vi.fn(),
   addErrorTurn: vi.fn(),
@@ -36,12 +39,14 @@ vi.mock("../../store/commandsStore", () => ({
   useCommandsStore: { getState: () => ({ byCwd: { "/repo": h.catalogue } }) },
 }));
 vi.mock("../../store/conversationsStore", () => ({
-  conversationsForTask: () => [],
+  // Every conversation in the store counts as this task's — the numbering is what is under
+  // test, not the filtering.
+  conversationsForTask: (convs: { id: string }[]) => convs,
   createConversationInRepo: vi.fn(() => "conv-1"),
   useConversationsStore: {
     getState: () => ({
       repos: [{ id: "repo-1", path: "/repo" }],
-      conversations: [],
+      conversations: h.conversations,
       linkConversationToTask: h.linkConversationToTask,
       renameConversation: h.renameConversation,
     }),
@@ -84,6 +89,7 @@ function installed(enabled: boolean) {
       skills: [{ name: "tosse-workflow:pickup", source: "tosse-workflow@tosse-plugins" }],
       agents: [],
       warnings: [],
+      plugin_state_trusted: true,
     },
   };
 }
@@ -110,7 +116,26 @@ describe("launchTaskConversation equips the folder", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     h.catalogue = [];
+    h.conversations = [];
     setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+  });
+
+  // ⚠️ The store is read AFTER the plugin work, never before it. Equipping a folder can take
+  // seconds (a config scan, and a short-lived `claude` on the dormant path); a snapshot taken
+  // on the near side would have two launches fired inside that window both see the task as
+  // carrying nothing, so both would name themselves after the bare title and the "(2)" that
+  // tells a second pass from the first would never appear.
+  it("counts the task's conversations after equipping, not before", async () => {
+    listExtensions.mockResolvedValue(installed(false));
+    // Another launch lands while this one waits on the plugin write.
+    setPluginEnabled.mockImplementation(async () => {
+      h.conversations = [{ id: "conv-0" }];
+      return { status: "ok", data: null };
+    });
+
+    await launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "discuss" });
+
+    expect(h.renameConversation).toHaveBeenCalledWith("conv-1", "Ship it (2)");
   });
 
   // The regression this whole task exists for: "Discuss" used to skip the plugin entirely

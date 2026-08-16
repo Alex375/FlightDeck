@@ -99,14 +99,32 @@ export function hoverRegime({
 }: {
   /** A preview card is on screen right now. */
   previewOpen: boolean;
-  /** When the pointer last left the column WITH a card open, in ms; null if it never has. */
+  /** When the pointer last left the column WITH a card open, on the same clock as `now`;
+   *  null if it never has. */
   leftWarmAt: number | null;
-  /** The current time, in ms. */
+  /** The current time, on {@link monotonicNow}'s clock. */
   now: number;
 }): HoverRegime {
   if (previewOpen) return "warm";
-  if (leftWarmAt !== null && now - leftWarmAt <= HOVER_EXIT_GRACE_MS) return "warm";
+  // The window is BOUNDED BELOW as well: a stamp from the future can only come from a
+  // clock that moved under us, and a negative age would otherwise pass the test forever
+  // and leave the column warm across a leave that should have cooled it.
+  if (leftWarmAt !== null) {
+    const age = now - leftWarmAt;
+    if (age >= 0 && age <= HOVER_EXIT_GRACE_MS) return "warm";
+  }
   return "cold";
+}
+
+/**
+ * The clock the grace window is measured on.
+ *
+ * `performance.now()`, not `Date.now()`: this is an ELAPSED-TIME comparison, and the wall
+ * clock is not monotonic — an NTP correction or a manual change between the stamp and the
+ * read would either cool a column mid-read or keep it warm indefinitely.
+ */
+function monotonicNow(): number {
+  return performance.now();
 }
 
 /**
@@ -346,7 +364,15 @@ export function MessageMinimap({
   const leftWarmAtRef = useRef<number | null>(null);
   const showPreview = useCallback((id: string | null, warm: boolean) => {
     previewOpenRef.current = id !== null;
-    setPreview(id === null ? null : { id, warm });
+    setPreview((prev) => {
+      if (id === null) return null;
+      // `warm` describes how the card CAME UP, so it is decided once and frozen for that
+      // card's life. Following the pointer to the next mark reuses the same element (that
+      // is what makes it glide), and flipping the flag under it would change the entry
+      // animation's duration mid-run — which per spec jumps straight to its last frame:
+      // a visible pop in the middle of the very fade it is meant to be playing.
+      return prev ? { id, warm: prev.warm } : { id, warm };
+    });
   }, []);
   const [activeId, setActiveId] = useState<string | null>(null);
   // The column is sized and placed onto the SCROLL container's box, not the host's: in the
@@ -452,6 +478,20 @@ export function MessageMinimap({
     return () => ro.disconnect();
   }, [show, hostRef, scrollRef]);
 
+  // A previewed mark can stop existing under the card: a rewind truncates the thread, or the
+  // host switches conversation and hands down a different set. The card unmounts on its own
+  // (it is only rendered for a mark still in `marks`), but `previewOpenRef` tracks the TIMER
+  // having fired, not the card being on screen — left saying "open", it would stamp the warm
+  // exit for a card nobody read, and serve the next arrival a 30ms preview on what is really
+  // a cold sweep. Dropping the preview here keeps the two in step.
+  const previewId = preview?.id ?? null;
+  useEffect(() => {
+    if (previewId === null) return;
+    if (show && marks.some((m) => m.id === previewId)) return;
+    previewOpenRef.current = false;
+    setPreview(null);
+  }, [marks, previewId, show]);
+
   // Hover intent: only a mark the pointer SETTLES on gets previewed — for as long as the
   // regime asks (a beat when arriving cold, all but nothing while reading). Leaving the column
   // clears the card at once — an empty column should never keep a card floating over the
@@ -461,14 +501,14 @@ export function MessageMinimap({
     if (hovered === null) {
       // Remember WHEN we left with a card up: that stamp is what keeps a quick round trip
       // (or the pointer straying onto the card) inside the warm regime — see hoverRegime.
-      if (previewOpenRef.current) leftWarmAtRef.current = Date.now();
+      if (previewOpenRef.current) leftWarmAtRef.current = monotonicNow();
       showPreview(null, false);
       return;
     }
     const regime = hoverRegime({
       previewOpen: previewOpenRef.current,
       leftWarmAt: leftWarmAtRef.current,
-      now: Date.now(),
+      now: monotonicNow(),
     });
     const timer = setTimeout(() => showPreview(hovered, regime === "warm"), hoverDelayMs(regime));
     return () => clearTimeout(timer);
@@ -538,7 +578,8 @@ export function MessageMinimap({
           className="cv-mmap-tip"
           data-mode={hoverMode}
           // A warm entry skips most of the fade-in: replaying a first appearance mid-read
-          // would hand back the wait the warm regime just saved.
+          // would hand back the wait the warm regime just saved. Frozen at the card's
+          // first appearance and never flipped afterwards — see showPreview.
           data-entry={preview.warm ? "warm" : "cold"}
           // TOP-aligned on the hovered mark, never centred on it: a multi-line preview
           // centred on the mark puts its MIDDLE under the eye, so the reader has to hunt

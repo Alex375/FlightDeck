@@ -615,6 +615,7 @@ export const mockCommands = {
       ],
       agents: [],
       warnings: [],
+      plugin_state_trusted: true,
     });
   },
   // ---- Extensions v2 (Codex) — toggles + live inventories, demo-shaped ----------
@@ -1884,7 +1885,7 @@ export const mockCommands = {
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------
   // Without these, the extensions manager calls `undefined(...)` in `?demo=` mode.
   async listExtensions(_repoPath: string): Promise<Result<ExtensionsSnapshot, string>> {
-    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [] });
+    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true });
   },
   async listPluginContents(_repoPath: string, _pluginId: string): Promise<Result<PluginContents, string>> {
     return ok({ skills: [], agents: [], mcp_servers: [] });

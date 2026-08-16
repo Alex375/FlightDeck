@@ -24,6 +24,12 @@ export interface PickupPlugin {
   id: string;
   name: string;
   enabled: boolean;
+  /** Whether {@link enabled} was READ or merely assumed. False when the one file that
+   *  holds `enabledPlugins` could not be parsed: the scan then reports every plugin as on
+   *  (`plugin_state_trusted` in the Rust snapshot documents why). Kept apart from
+   *  `enabled` rather than folded into it, because the two answers lead opposite ways —
+   *  "it is on" means leave it alone, "we could not tell" means do not conclude. */
+  enabledTrusted: boolean;
 }
 
 /**
@@ -51,7 +57,12 @@ export async function findPickupPlugin(repoPath: string): Promise<PickupPlugin |
   );
   const plugin = snapshot.plugins.find((p) => providers.has(p.id));
   if (!plugin) return null;
-  return { id: plugin.id, name: plugin.name, enabled: plugin.enabled };
+  return {
+    id: plugin.id,
+    name: plugin.name,
+    enabled: plugin.enabled,
+    enabledTrusted: snapshot.plugin_state_trusted,
+  };
 }
 
 /**
@@ -101,15 +112,27 @@ export type PluginActivation =
  * by pressing a TOSSE button, and a confirmation for a switch they never wanted flipped off
  * would be noise. Silent means "quiet when it WORKS" — every other outcome is reported.
  */
-export async function ensurePickupPlugin(repoPath: string): Promise<PluginActivation> {
+export async function ensurePickupPlugin(
+  repoPath: string,
+  /** An answer the caller already has from its own {@link findPickupPlugin} — `null` means
+   *  it looked and found none. Omit it (undefined) to scan here. The dialog holds this
+   *  answer before the button is even pressed, and scanning again would read the same
+   *  four config files a second time for the same launch. */
+  known?: PickupPlugin | null,
+): Promise<PluginActivation> {
   let plugin: PickupPlugin | null;
   try {
-    plugin = await findPickupPlugin(repoPath);
+    plugin = known === undefined ? await findPickupPlugin(repoPath) : known;
   } catch (e) {
     return { kind: "unknown", error: errorText(e) };
   }
   if (!plugin) return { kind: "missing" };
-  if (plugin.enabled) return { kind: "present", plugin: plugin.name };
+  // `enabled` is only worth acting on when it was actually READ. Untrusted, we do not
+  // conclude "already on" — we attempt the write, which either goes through (harmless, it
+  // is the state we want) or comes back with the parse error that made the state
+  // unreadable in the first place. Either beats opening an unequipped conversation while
+  // reporting it as equipped.
+  if (plugin.enabled && plugin.enabledTrusted) return { kind: "present", plugin: plugin.name };
   try {
     return { kind: "enabled", plugin: plugin.name, pickup: await enablePickupPlugin(plugin.id, repoPath) };
   } catch (e) {
@@ -127,6 +150,11 @@ export async function ensurePickupPlugin(repoPath: string): Promise<PluginActiva
  * `missing` is not handled here on purpose — "this folder has no TOSSE plugin at all" is a
  * standing fact about the folder that the dialog says BEFORE launching, not an outcome of
  * having tried.
+ *
+ * ⚠️ EXHAUSTIVE on purpose, with no `default` arm: silence is this function's most
+ * dangerous answer, so a variant added to {@link PluginActivation} later must not fall into
+ * it by omission. Every case is listed, and the unreachable arm below turns a new one into
+ * a compile error instead of a conversation that quietly opens without its skills.
  */
 export function activationProblem(a: PluginActivation): string | null {
   switch (a.kind) {
@@ -138,8 +166,13 @@ export function activationProblem(a: PluginActivation): string | null {
       return a.pickup
         ? null
         : `« ${a.plugin} » was enabled, but this folder still does not offer the pickup skill.`;
-    default:
+    case "present":
+    case "missing":
       return null;
+    default: {
+      const exhaustive: never = a;
+      return exhaustive;
+    }
   }
 }
 

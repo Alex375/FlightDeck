@@ -321,7 +321,11 @@
    at full length it would hand back the 230ms the warm delay just saved, and the sweep would
    feel gated again. ⚠️ Only the DURATION is set here, never the shorthand: reduced motion
    clears `animation-name` below, and a shorthand at this higher specificity would name the
-   keyframes again and undo it. */
+   keyframes again and undo it.
+   ⚠️ This describes how the card ENTERED, so `data-entry` is frozen for the element's life
+   (see showPreview). Changing it on the live element — which is reused as the card follows
+   the pointer — would retime an animation already running, and one that is past its new
+   duration snaps to its last frame: a pop mid-fade. */
 .cv-mmap-tip[data-entry="warm"] { animation-duration:.06s; }
 @media (prefers-reduced-motion: reduce) {
   .cv-mmap-tip { transition:none; animation:none; }
