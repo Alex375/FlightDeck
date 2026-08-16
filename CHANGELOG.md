@@ -9,6 +9,11 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.9.0
+
+- Improved: the conversation minimap now tells arriving from sweeping — it stays calm when your pointer lands on it, and previews follow instantly once you start scanning.
+- Fixed: starting or discussing a TOSSE task now equips the conversation with the TOSSE plugin in both cases, so the task actually moves in the CRM.
+
 ## v1.8.0
 
 - Improved: side panels (editor, terminal, Git) now slide open and closed instead of snapping into place.
