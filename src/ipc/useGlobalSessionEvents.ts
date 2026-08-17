@@ -54,6 +54,7 @@ import {
   armedAgentNotificationKind,
   cancelAgentNotification,
   dispatchAgentNotification,
+  peekInterrupt,
 } from "../notifications/notify";
 import {
   SETTLE_MS,
@@ -187,8 +188,22 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // the backgrounding suppression, but BEFORE the "user is watching" gate below
   // (the voice agent wants the event regardless of window focus). Same single
   // transition source as the human notifications, so the two can never drift.
+  // A user-INTERRUPTED turn is a non-completion: the human path swallows it a
+  // step later (consumeInterrupt inside dispatchAgentNotification), so the
+  // journal peeks the same flag here — the voice agent must not hear a
+  // "turn_completed: success" for work the user halted themselves.
   const meta = kind === "done" ? lastTurnResultMeta(entry) : null;
   const pending = entry.pendingPermissions[0] ?? null;
+  if (kind === "done" && peekInterrupt(convId)) {
+    dispatchAgentNotification({
+      kind,
+      convId,
+      title: conv.name,
+      repoName: repo ? repoName(repo.path) : null,
+      activeId: convs.activeId,
+    });
+    return;
+  }
   void commands
     .publishControlEvent(
       kind === "done" ? "turn_completed" : "needs_attention",

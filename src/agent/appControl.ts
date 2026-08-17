@@ -32,13 +32,17 @@ import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
-import type { SessionEntry, NormalizedBlock } from "../store/types";
+import type { SessionEntry, Turn } from "../store/types";
 import type { View } from "../ui/shortcuts";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
 export interface AppControlHelpers {
   changeView: (view: View) => void;
+  /** Whether the TOSSE view currently exists (signed in + pref on). `changeView`
+   *  silently no-ops on an unavailable view; a TOOL result must not — the caller
+   *  needs the refusal, not a success that did nothing. */
+  tosseAvailable: boolean;
 }
 
 /** Trim long free text for a voice/text summary payload. */
@@ -49,6 +53,33 @@ function clip(text: string, max: number): string {
 /** The last path segment, as a human repo label (mirrors repoName elsewhere). */
 function baseName(path: string): string {
   return path.replace(/\/+$/, "").split("/").pop() ?? path;
+}
+
+/** Lexically canonicalize an agent-supplied ABSOLUTE folder path: collapse
+ *  `//`, resolve `.`/`..` segments, strip the trailing slash. `addRepo`'s
+ *  idempotence is exact string equality on the stored path, so `/x/y/` must
+ *  normalize to `/x/y` — models emit trailing slashes all the time, and each
+ *  variant would otherwise register a duplicate, persisted repo group. */
+function normalizeFolderPath(tool: string, raw: string): string {
+  if (!raw.startsWith("/")) throw new Error(`${tool}: the path must be absolute`);
+  const out: string[] = [];
+  for (const part of raw.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return `/${out.join("/")}`;
+}
+
+/** Assert the path is an existing FOLDER. `pathExists` is `Path::exists()` —
+ *  true for plain files too — while `readDir` errors on both a missing path and
+ *  a file, which is exactly the check a repo root needs. */
+async function assertFolder(tool: string, path: string): Promise<void> {
+  const dir = await commands.readDir(path);
+  if (dir.status !== "ok") throw new Error(`${tool}: '${path}' is not an existing folder`);
 }
 
 // ---- Caller / target resolution ---------------------------------------------
@@ -110,15 +141,28 @@ function statusJson(s: AgentStatus): Record<string, unknown> {
 }
 
 /** One turn → readable text. User turns quote the prompt; assistant turns join
- *  their text blocks and summarize tool calls in one line each. */
-function turnText(blocks: NormalizedBlock[], streaming: string): string {
+ *  their text blocks and summarize tool calls in one line each. Images become
+ *  an `[image]` placeholder (the transcript convention — `history.rs`
+ *  `push_user`), so an image-only turn never vanishes from the digest. */
+function turnText(turn: Turn): string {
   const parts: string[] = [];
-  for (const b of blocks) {
+  for (const b of turn.blocks) {
     if (b.type === "text" && b.text.trim()) parts.push(b.text.trim());
     else if (b.type === "tool_use") parts.push(`[tool: ${b.name}]`);
-    // thinking / images / unknown blocks are noise for a text digest.
+    // Images ride the unspecialized "other" bucket (NormalizedBlock has no
+    // image variant) — surface a placeholder rather than dropping the turn.
+    else if (
+      b.type === "other" &&
+      typeof b.raw === "object" &&
+      b.raw !== null &&
+      (b.raw as { type?: unknown }).type === "image"
+    )
+      parts.push("[image]");
+    // thinking / unknown blocks are noise for a text digest.
   }
-  if (streaming.trim()) parts.push(streaming.trim());
+  if (turn.streamingText.trim()) parts.push(turn.streamingText.trim());
+  // Optimistic user turns carry their images OUTSIDE the blocks (Turn.images).
+  if (parts.length === 0 && turn.images?.length) parts.push("[image]");
   return parts.join("\n");
 }
 
@@ -142,7 +186,7 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     const turn = entry.turns[e.id];
     // Sub-agent (Task) side-thread turns are internal work, not the dialogue.
     if (!turn || turn.parentToolUseId) continue;
-    const text = turnText(turn.blocks, turn.streamingText);
+    const text = turnText(turn);
     if (!text) continue;
     out.push({ role: turn.role, text: clip(text, 4000) });
   }
@@ -209,8 +253,17 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   const caller = convBySession(session);
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
+  // Hydrate a COLD conversation's timeline BEFORE the send creates a live entry:
+  // `loadConversationHistory` is additive and assumes it runs on a fresh entry —
+  // loading it later (read_conversation, or the user opening the thread) would
+  // replay the whole past transcript ON TOP of the live turns, corrupting the
+  // timeline (same order-of-operations as FlightDeckReplyModal's send path).
+  await loadConversationHistory(conv.id);
   const busy = useConversationStore.getState().sessions[conv.id]?.state.busy ?? false;
-  await sendConversationMessage(conv.id, { text });
+  // `queued: busy` mirrors the composer's own send exactly (pending badge +
+  // durable injectedMidTurn flag for clean-output's round grouping) — a tool
+  // call and the equivalent click must never mean two different things.
+  await sendConversationMessage(conv.id, { text, queued: busy });
   return {
     conversation_id: conv.id,
     delivered: true,
@@ -219,14 +272,22 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
 }
 
 async function createConversation(args: Record<string, unknown>) {
-  const repoPath = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
-  if (!repoPath) throw new Error("create_conversation: 'repo_path' is required");
-  // Validate the folder exists BEFORE registering anything — a typo'd path
-  // would otherwise create a permanent empty repo group in the sidebar.
-  if (!(await commands.pathExists(repoPath)))
-    throw new Error(`create_conversation: '${repoPath}' is not an existing folder`);
+  const raw = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
+  if (!raw) throw new Error("create_conversation: 'repo_path' is required");
+  const repoPath = normalizeFolderPath("create_conversation", raw);
+  // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
+  // a plain file) would otherwise create a permanent empty repo group.
+  await assertFolder("create_conversation", repoPath);
   const backend = args.backend === "codex" ? "codex" : "claude";
+  // Creating from a tool must not steal what the human is looking at:
+  // `addConversation` auto-selects (the "+"-button semantic), so restore the
+  // previous selection afterwards — `focus_conversation` is the explicit tool
+  // for bringing it on screen.
+  const prevActive = useConversationsStore.getState().activeId;
   const id = createConversationInRepo(repoPath, backend);
+  if (prevActive && prevActive !== id) {
+    useConversationsStore.getState().selectConversation(prevActive);
+  }
   const title = typeof args.title === "string" ? args.title.trim() : "";
   if (title) useConversationsStore.getState().renameConversation(id, title);
   const first = typeof args.first_message === "string" ? args.first_message.trim() : "";
@@ -254,15 +315,15 @@ function renameConversation(args: Record<string, unknown>, session: string | nul
 }
 
 async function addRepo(args: Record<string, unknown>) {
-  const path = typeof args.path === "string" ? args.path.trim() : "";
-  if (!path) throw new Error("add_repo: 'path' is required");
-  if (!(await commands.pathExists(path)))
-    throw new Error(`add_repo: '${path}' is not an existing folder`);
+  const raw = typeof args.path === "string" ? args.path.trim() : "";
+  if (!raw) throw new Error("add_repo: 'path' is required");
+  const path = normalizeFolderPath("add_repo", raw);
+  await assertFolder("add_repo", path);
   const repo = useConversationsStore.getState().addRepo(path);
   return { repo_id: repo.id, name: baseName(path), path };
 }
 
-function openFile(
+async function openFile(
   args: Record<string, unknown>,
   session: string | null,
   helpers: AppControlHelpers,
@@ -270,8 +331,16 @@ function openFile(
   const conv = resolveTarget(args, session);
   const path = typeof args.path === "string" ? args.path.trim() : "";
   if (!path) throw new Error("open_file: 'path' is required");
+  // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
+  // would "succeed" into a nonsense tab. Refuse with the fix in the message.
+  if (path === "~" || path.startsWith("~/"))
+    throw new Error("open_file: '~' is not expanded — use an absolute path");
   const cwd = conv.liveCwd ?? conv.cwd;
   const abs = resolveMentionAbs(cwd, path);
+  // Check existence BEFORE reporting success: revealInEditor would open a
+  // preview tab whose read then fails, while the tool told the agent all was well.
+  if (!(await commands.pathExists(abs)))
+    throw new Error(`open_file: '${abs}' does not exist`);
   const line = typeof args.line === "number" ? Math.max(1, Math.floor(args.line)) : undefined;
   const column =
     typeof args.column === "number" ? Math.max(1, Math.floor(args.column)) : undefined;
@@ -289,7 +358,10 @@ function openView(args: Record<string, unknown>, helpers: AppControlHelpers) {
   const view = args.view;
   if (view !== "conversation" && view !== "flightdeck" && view !== "tosse")
     throw new Error("open_view: 'view' must be conversation | flightdeck | tosse");
-  // `changeView` no-ops on an unavailable view (TOSSE signed out) by design.
+  // `changeView` silently no-ops on an unavailable view; a TOOL must report the
+  // refusal instead of returning a success that did nothing.
+  if (view === "tosse" && !helpers.tosseAvailable)
+    throw new Error("open_view: the TOSSE view is unavailable (not signed in to the CRM)");
   helpers.changeView(view);
   return { view };
 }
@@ -308,8 +380,9 @@ function openPanel(
   helpers.changeView("conversation");
   const editor = useEditorStore.getState();
   editor.ensureConv(conv.id, conv.liveCwd ?? conv.cwd);
-  // The three panels are mutually exclusive; each setter already closes the
-  // others (and clears the artifact/task side views).
+  // Git takes the side region over everything; editor and terminal can coexist
+  // as a split (each setter closes Git and clears the artifact/task side views —
+  // deliberately NOT each other).
   if (panel === "editor") editor.setOpen(true);
   else if (panel === "terminal") editor.setTerminalOpen(true);
   else if (panel === "git") editor.setGitOpen(true);
@@ -324,8 +397,12 @@ function openPanel(
 function notifyUser(args: Record<string, unknown>) {
   const message = typeof args.message === "string" ? args.message.trim() : "";
   if (!message) throw new Error("notify_user: 'message' is required");
-  notifyFromAgent(clip(message, 500), args.critical === true);
-  return { notified: true };
+  const channels = notifyFromAgent(clip(message, 500), args.critical === true);
+  const any = channels.banner || channels.dock || channels.sound;
+  return {
+    notified: any,
+    ...(any ? {} : { note: "every notification channel is disabled in Settings → Notifications" }),
+  };
 }
 
 // ---- Dispatch ----------------------------------------------------------------

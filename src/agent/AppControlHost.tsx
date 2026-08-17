@@ -12,16 +12,27 @@ import { commands, events } from "../ipc/client";
 import { executeAppControlTool, type AppControlHelpers } from "./appControl";
 import type { View } from "../ui/shortcuts";
 
-export function AppControlHost({ changeView }: { changeView: (view: View) => void }) {
+export function AppControlHost({
+  changeView,
+  tosseAvailable,
+}: {
+  changeView: (view: View) => void;
+  tosseAvailable: boolean;
+}) {
   // The listener is mounted once (empty deps) but must always use the LIVE
-  // changeView (it re-binds on tosse availability); a ref bridges the two.
+  // changeView / availability (they re-bind on tosse sign-in); refs bridge.
   const changeViewRef = useRef(changeView);
   changeViewRef.current = changeView;
+  const tosseRef = useRef(tosseAvailable);
+  tosseRef.current = tosseAvailable;
 
   useEffect(() => {
     let disposed = false;
     const helpers: AppControlHelpers = {
       changeView: (view) => changeViewRef.current(view),
+      get tosseAvailable() {
+        return tosseRef.current;
+      },
     };
 
     async function handle(payload: {

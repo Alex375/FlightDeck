@@ -180,10 +180,11 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 },
                 ToolSpec {
                     name: "open_panel",
-                    description: "Open (or close) the conversation view's side panel: 'editor' \
-                        (file tree + code), 'terminal', 'git', or 'none' to close it. Panels are \
-                        mutually exclusive. Targets a conversation (default: the calling one) \
-                        and brings it on screen.",
+                    description: "Open (or close with 'none') a side panel of the conversation \
+                        view: 'editor' (file tree + code), 'terminal', or 'git'. Editor and \
+                        terminal can be open together (a split); git takes the side region over \
+                        both. Targets a conversation (default: the calling one) and brings it \
+                        on screen.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({

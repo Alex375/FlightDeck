@@ -16,6 +16,7 @@ vi.mock("../ipc/client", () => {
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),
       pathExists: vi.fn(() => Promise.resolve(true)),
+      readDir: vi.fn(() => ok([])),
     },
   };
 });
@@ -25,7 +26,7 @@ vi.mock("../ipc/useCommands", () => ({
 }));
 
 vi.mock("../notifications/notify", () => ({
-  notifyFromAgent: vi.fn(),
+  notifyFromAgent: vi.fn(() => ({ banner: true, dock: true, sound: true })),
 }));
 
 const editorActions = {
@@ -109,9 +110,9 @@ function pushTurn(convId: string, turn: Partial<Turn> & { role: Turn["role"] }) 
   });
 }
 
-const helpers = (): AppControlHelpers & { views: string[] } => {
+const helpers = (tosseAvailable = true): AppControlHelpers & { views: string[] } => {
   const views: string[] = [];
-  return { views, changeView: (v) => views.push(v) };
+  return { views, changeView: (v) => views.push(v), tosseAvailable };
 };
 
 beforeEach(() => {
@@ -217,12 +218,13 @@ describe("appControl — conversations", () => {
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
-    expect(sendConversationMessage).toHaveBeenCalledWith("c2", { text: "go" });
+    // `queued` mirrors the composer's send exactly (false here: c2 is idle).
+    expect(sendConversationMessage).toHaveBeenCalledWith("c2", { text: "go", queued: false });
     expect(out.delivered).toBe(true);
   });
 
   it("create_conversation validates the folder, then creates + titles + sends", async () => {
-    vi.mocked(commands.pathExists).mockResolvedValueOnce(false);
+    vi.mocked(commands.readDir).mockResolvedValueOnce({ status: "error", error: "x" } as never);
     await expect(
       executeAppControlTool("create_conversation", { repo_path: "/nope" }, null, helpers()),
     ).rejects.toThrow(/not an existing folder/);
@@ -239,6 +241,21 @@ describe("appControl — conversations", () => {
     expect(created?.name).toBe("Probe");
     expect(sendConversationMessage).toHaveBeenCalledWith(out.conversation_id, { text: "start" });
     expect(out.started).toBe(true);
+  });
+
+  it("create_conversation normalizes the path and never steals the selection", async () => {
+    // The user is looking at c1; a trailing-slash spelling of the SAME repo must
+    // not duplicate the group, and creating must not switch the active conv.
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/tmp/r1/" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.repo_path).toBe("/tmp/r1");
+    const repos = useConversationsStore.getState().repos;
+    expect(repos).toHaveLength(1); // no duplicate group from '/tmp/r1/'
+    expect(useConversationsStore.getState().activeId).toBe("c1"); // selection kept
   });
 
   it("rename_conversation defaults to the calling conversation", async () => {
@@ -276,7 +293,27 @@ describe("appControl — UI actions", () => {
     expect(out.path).toBe("/tmp/r1/src/main.rs");
   });
 
-  it("open_view validates and delegates; open_panel drives the exclusive panels", async () => {
+  it("open_view refuses the TOSSE view when it is unavailable, instead of a silent no-op", async () => {
+    const h = helpers(false);
+    await expect(executeAppControlTool("open_view", { view: "tosse" }, null, h)).rejects.toThrow(
+      /unavailable/,
+    );
+    expect(h.views).toEqual([]);
+  });
+
+  it("open_file refuses '~' paths and nonexistent files", async () => {
+    seed(conv({ handle: "session-7" }));
+    await expect(
+      executeAppControlTool("open_file", { path: "~/notes.md" }, "session-7", helpers()),
+    ).rejects.toThrow(/absolute path/);
+    vi.mocked(commands.pathExists).mockResolvedValueOnce(false);
+    await expect(
+      executeAppControlTool("open_file", { path: "gone.rs" }, "session-7", helpers()),
+    ).rejects.toThrow(/does not exist/);
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("open_view validates and delegates; open_panel drives the panels", async () => {
     const h = helpers();
     await expect(executeAppControlTool("open_view", { view: "settings" }, null, h)).rejects.toThrow(
       /view/,

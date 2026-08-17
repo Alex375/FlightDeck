@@ -45,6 +45,18 @@ function consumeInterrupt(convId: string): boolean {
   return Date.now() - ts < INTERRUPT_WINDOW_MS;
 }
 
+/**
+ * Same check WITHOUT consuming — the app-control event journal peeks before
+ * publishing a `turn_completed` (an interrupted turn is a non-completion the
+ * voice agent must not hear either), while `dispatchAgentNotification` still
+ * consumes the flag to swallow the human ping. Peek-then-consume is safe: both
+ * run synchronously in the same `fireAgentNotification` call.
+ */
+export function peekInterrupt(convId: string): boolean {
+  const ts = interruptedAt.get(convId);
+  return ts !== undefined && Date.now() - ts < INTERRUPT_WINDOW_MS;
+}
+
 // Notifications armed but not yet delivered, at most one per conversation: a state
 // edge arms one, and the conversation has a short window to prove the edge meant what
 // it looked like before it reaches the user (see `SETTLE_MS` in transition.ts). The
@@ -170,13 +182,27 @@ export function dispatchAgentNotification(ev: AgentNotification): void {
 /**
  * A free-form notification requested BY an agent (the app-control `notify_user`
  * tool) — distinct from the state-transition notifications above: the agent
- * explicitly asked for it, so it fires regardless of what the user is watching
- * and ignores the transition machinery (no arming/settling). It still honours
- * the OS-permission plumbing, and `critical` adds the until-focused Dock bounce.
+ * explicitly asked for it, so it skips the focus gate and the arming/settling
+ * machinery. It does NOT skip the user's channel toggles: Settings →
+ * Notifications governs WHICH channels may fire, agent-requested or not — an
+ * agent must never be louder than the user allowed. Returns which channels
+ * actually fired so the tool can tell the agent when everything was off.
  */
-export function notifyFromAgent(message: string, critical: boolean): void {
-  fireOsNotification("Flight Deck agent", message);
-  if (inTauri()) {
+export function notifyFromAgent(
+  message: string,
+  critical: boolean,
+): { banner: boolean; dock: boolean; sound: boolean } {
+  const prefs = useNotifications.getState();
+  if (prefs.sound) {
+    try {
+      playChime(critical ? "attention" : "done");
+    } catch (e) {
+      console.error("notification sound failed:", e);
+    }
+  }
+  if (prefs.systemNotification) fireOsNotification("Flight Deck agent", message);
+  const dock = prefs.dockBounce && inTauri();
+  if (dock) {
     void commands
       .requestUserAttention(critical)
       .then((r) => {
@@ -184,6 +210,11 @@ export function notifyFromAgent(message: string, critical: boolean): void {
       })
       .catch((e) => console.error("dock bounce threw:", e));
   }
+  return {
+    banner: prefs.systemNotification && inTauri(),
+    dock,
+    sound: prefs.sound,
+  };
 }
 
 /** Send one OS notification (permission-aware). Shared by the transition path
