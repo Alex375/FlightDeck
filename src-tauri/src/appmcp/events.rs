@@ -133,7 +133,11 @@ impl EventJournal {
 
     /// Events strictly after `after` (up to [`MAX_BATCH`]), waiting up to
     /// `timeout` when none are available yet. Returns the new cursor to poll
-    /// from (the last returned event's, or the latest when returning empty).
+    /// from: the last returned event's, or — on an EMPTY return — `after`
+    /// UNCHANGED. Never a fresher cursor with an empty batch: that would tell
+    /// the client to skip events it was never given (an event published in the
+    /// deadline race would be silently lost forever — the one failure mode a
+    /// delivery journal must not have).
     pub async fn wait(&self, after: u64, timeout: Duration) -> (u64, Vec<ControlEvent>) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -155,16 +159,16 @@ impl EventJournal {
                     let cursor = events.last().expect("non-empty").cursor;
                     return (cursor, events);
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    return (j.next_cursor - 1, events);
-                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return (after, Vec::new());
             }
             tokio::select! {
                 _ = notified.as_mut() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    let j = self.state.lock().expect("journal lock");
-                    return (j.next_cursor - 1, Vec::new());
-                }
+                // Deadline hit — but a publish may have landed between the check
+                // above and now: fall through and loop ONCE more, so the re-check
+                // under the lock runs before the empty return.
+                _ = tokio::time::sleep_until(deadline) => {}
             }
         }
     }
@@ -220,6 +224,23 @@ mod tests {
         // MAX_BATCH caps one poll; the oldest surviving cursor proves the drop.
         assert_eq!(events.len(), MAX_BATCH);
         assert_eq!(events[0].cursor, 11); // 266 published, ring keeps 11..=266
+    }
+
+    /// REGRESSION (event loss): an EMPTY return must echo the caller's cursor
+    /// UNCHANGED — never the journal's latest. Returning a fresher cursor with
+    /// no events would make the client skip whatever was published in the
+    /// deadline race, losing it forever.
+    #[tokio::test]
+    async fn an_empty_timeout_never_advances_the_cursor() {
+        let j = EventJournal::new();
+        for _ in 0..6 {
+            j.publish("turn_completed", "c1", "t", Value::Null);
+        }
+        // A caller already past the tail (e.g. cursor from a previous poll that
+        // raced a prune) waits, gets nothing — and keeps ITS cursor.
+        let (cursor, events) = j.wait(10, Duration::from_millis(5)).await;
+        assert!(events.is_empty());
+        assert_eq!(cursor, 10);
     }
 
     /// The tool-args wrapper: no cursor → immediate baseline, no events.

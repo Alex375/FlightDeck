@@ -46,12 +46,28 @@ pub async fn handle(
     caller: &Caller,
     msg: &Value,
 ) -> Option<Value> {
-    let method = msg.get("method").and_then(Value::as_str)?;
-    // Per JSON-RPC, a request has a non-null id; anything else is a notification.
+    // Per JSON-RPC, a request has a non-null id; anything else is a notification
+    // (or a stray response — we never send server-initiated requests, so those
+    // are dropped).
     let id = match msg.get("id") {
-        Some(v) if !v.is_null() => v.clone(),
-        _ => return None,
+        Some(v) if !v.is_null() => Some(v.clone()),
+        _ => None,
     };
+    let method = match msg.get("method").and_then(Value::as_str) {
+        Some(m) => m,
+        None => {
+            // A RESPONSE (it has result/error) is dropped silently — answering
+            // it would send the peer an error it never asked for. Anything else
+            // carrying an id is a malformed REQUEST and must still be answered:
+            // swallowing it would leave the caller's pending id hanging until
+            // its own timeout, with no diagnostic (-32600 per JSON-RPC).
+            if msg.get("result").is_some() || msg.get("error").is_some() {
+                return None;
+            }
+            return id.map(|id| err(id, -32600, "Invalid Request: missing method".to_string()));
+        }
+    };
+    let Some(id) = id else { return None };
     Some(match method {
         "initialize" => ok(id, initialize_result(surface, msg.get("params"))),
         "ping" => ok(id, json!({})),
@@ -161,14 +177,24 @@ mod tests {
         assert_eq!(resp["result"]["serverInfo"]["name"], "flightdeck-voice");
     }
 
-    /// Notifications produce no wire response.
+    /// Notifications produce no wire response; a stray RESPONSE is dropped; a
+    /// malformed REQUEST (id but no usable method) is answered -32600 rather
+    /// than swallowed (the caller's pending id must resolve).
     #[tokio::test]
     async fn notifications_yield_none() {
         let h = hub();
         let msg = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&h, Surface::App, &Caller::External, &msg).await.is_none());
-        // A stray response (no method) is dropped too.
+        // A stray response (no method, has result) is dropped.
         let msg = json!({ "jsonrpc": "2.0", "id": 4, "result": {} });
+        assert!(handle(&h, Surface::App, &Caller::External, &msg).await.is_none());
+        // A request with a non-string method gets -32600, not silence.
+        let msg = json!({ "jsonrpc": "2.0", "id": 7, "method": 42 });
+        let resp = handle(&h, Surface::App, &Caller::External, &msg).await.unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+        assert_eq!(resp["id"], 7);
+        // The same shape WITHOUT an id is a malformed notification: no reply.
+        let msg = json!({ "jsonrpc": "2.0", "method": 42 });
         assert!(handle(&h, Surface::App, &Caller::External, &msg).await.is_none());
     }
 

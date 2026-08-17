@@ -106,12 +106,16 @@ pub struct VoiceConfig {
 pub const DEFAULT_VOICE_PORT: u16 = 7068;
 
 /// Runtime half of the voice bridge: the desired config plus what the listener
-/// actually achieved (`running`/`error`) and the stop signal of the accept loop.
+/// actually achieved (`running`/`error`), the stop signal of the accept loop,
+/// and the loop's task handle (awaited on restart so the old listener socket is
+/// actually RELEASED before the new bind — same-port re-applies would otherwise
+/// race the old task's wakeup straight into EADDRINUSE).
 struct VoiceRuntime {
     cfg: VoiceConfig,
     running: bool,
     error: Option<String>,
     stop: Option<watch::Sender<bool>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The app-control hub: pending front-bridge calls, the fleet event journal and
@@ -147,6 +151,7 @@ impl ControlHub {
                 running: false,
                 error: None,
                 stop: None,
+                task: None,
             }),
         }
     }
@@ -256,15 +261,30 @@ impl ControlHub {
     /// is recorded for [`Self::voice_status`], never thrown away: the Settings
     /// switch must reflect what actually happened.
     pub async fn apply_voice(self: &Arc<Self>, cfg: VoiceConfig) {
-        // Stop the previous listener (if any) and store the desired config.
-        {
+        // Stop the previous listener (if any) and store the desired config. The
+        // handles are taken OUT of the lock so the await below never holds it.
+        let (old_stop, old_task) = {
             let mut v = self.voice.lock().expect("voice lock");
-            if let Some(stop) = v.stop.take() {
-                let _ = stop.send(true);
-            }
             v.cfg = cfg.clone();
             v.running = false;
             v.error = None;
+            (v.stop.take(), v.task.take())
+        };
+        if let Some(stop) = old_stop {
+            let _ = stop.send(true);
+        }
+        // Await the old accept loop's exit so its listener socket is RELEASED
+        // before we bind again — a same-port re-apply (the common case: toggling
+        // or rotating the token) would otherwise race straight into EADDRINUSE.
+        // Bounded + abort as a backstop: a wedged loop must not hang the toggle.
+        if let Some(mut task) = old_task {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                eprintln!("[appmcp] the previous voice-bridge listener did not stop in time");
+            }
         }
         if !cfg.enabled {
             return;
@@ -273,11 +293,13 @@ impl ControlHub {
         match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
             Ok(listener) => {
                 let (stop_tx, stop_rx) = watch::channel(false);
-                tokio::spawn(http::serve(listener, self.clone(), cfg.token.clone(), stop_rx));
+                let task =
+                    tokio::spawn(http::serve(listener, self.clone(), cfg.token.clone(), stop_rx));
                 let mut v = self.voice.lock().expect("voice lock");
                 v.running = true;
                 v.error = None;
                 v.stop = Some(stop_tx);
+                v.task = Some(task);
             }
             Err(e) => {
                 let mut v = self.voice.lock().expect("voice lock");
@@ -345,6 +367,27 @@ mod tests {
     async fn responding_to_an_unknown_request_reports_false() {
         let hub = ControlHub::new();
         assert!(!hub.respond("appctl-404", Ok(Value::Null)));
+    }
+
+    /// REGRESSION (EADDRINUSE): re-applying the SAME port (the token-rotation /
+    /// quick-retoggle path) must release the old listener before rebinding —
+    /// apply_voice awaits the old accept loop, so this restarts cleanly.
+    #[tokio::test]
+    async fn re_applying_the_same_port_restarts_cleanly() {
+        let hub = Arc::new(ControlHub::new());
+        // Discover a free port, then release it for the bridge to claim.
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let cfg = |token: &str| VoiceConfig { enabled: true, port, token: token.to_string() };
+        hub.apply_voice(cfg("t1")).await;
+        assert!(hub.voice_status().running, "first bind: {:?}", hub.voice_status().error);
+        hub.apply_voice(cfg("t2")).await;
+        let st = hub.voice_status();
+        assert!(st.running, "same-port re-apply must not EADDRINUSE: {:?}", st.error);
+        assert_eq!(st.token, "t2");
+        hub.apply_voice(VoiceConfig { enabled: false, port, token: "t2".to_string() }).await;
+        assert!(!hub.voice_status().running);
     }
 
     /// A call made before the front installed its sink fails cleanly (no hang).

@@ -1086,7 +1086,14 @@ impl SessionCore {
                     ));
                     return;
                 };
-                let outbound = self.outbound.clone();
+                // A WEAK outbound sender, upgraded only at reply time: a strong
+                // clone held for up to the bridge timeout (30s) would keep the
+                // writer channel open across `drop(core)` and structurally defeat
+                // the graceful EOF rung of the teardown ladder (stdin could never
+                // close while a bridged call was in flight). With the weak handle,
+                // teardown proceeds normally and a reply that loses the race is
+                // simply dropped — the process is gone, nobody is listening.
+                let outbound = self.outbound.downgrade();
                 let session_id = self.id.clone();
                 tokio::spawn(async move {
                     let caller = crate::appmcp::Caller::Session(session_id);
@@ -1094,7 +1101,9 @@ impl SessionCore {
                         .handle_mcp(crate::appmcp::Surface::App, &caller, &message)
                         .await
                         .unwrap_or_else(crate::appmcp::router::notification_ack);
-                    let _ = outbound.send(control::mcp_control_response(&request_id, response));
+                    if let Some(outbound) = outbound.upgrade() {
+                        let _ = outbound.send(control::mcp_control_response(&request_id, response));
+                    }
                 });
             }
             // Hooks / dialogs are not supported yet. Reply with an error so the

@@ -19,6 +19,7 @@
 //! guard, per the MCP transport security notes) — a native client sends none.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -32,8 +33,18 @@ use super::{router, Caller, ControlHub, Surface};
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 
+/// Hard lifetime of one connection, request to response. Must comfortably cover
+/// the longest legitimate request — a `wait_for_events` long-poll (≤ 55 s) —
+/// while guaranteeing that a stalled peer (connects and goes silent, or sends a
+/// partial request) can never pin a task, an fd and its buffers forever.
+const CONN_DEADLINE: Duration = Duration::from_secs(90);
+
 /// Accept loop. Exits when `stop` flips (the Settings toggle turning the bridge
-/// off, or a config change restarting it on another port).
+/// off, or a config change restarting it on another port). Every accepted
+/// connection is ALSO raced against the same stop signal and a hard deadline:
+/// "off" (and a token rotation, which restarts the listener) must sever
+/// in-flight connections too — an already-open socket keeping the OLD token
+/// serviceable after the switch says off would make the toggle a lie.
 pub async fn serve(
     listener: TcpListener,
     hub: Arc<ControlHub>,
@@ -50,9 +61,22 @@ pub async fn serve(
                 let Ok((stream, _addr)) = accepted else { continue };
                 let hub = hub.clone();
                 let token = token.clone();
+                let mut stop = stop.clone();
                 tokio::spawn(async move {
-                    // Per-connection failures are the peer's problem; never the app's.
-                    let _ = handle_connection(stream, hub, &token).await;
+                    let stopped = async {
+                        while !*stop.borrow() {
+                            if stop.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        // Per-connection failures are the peer's problem; never the app's.
+                        r = tokio::time::timeout(CONN_DEADLINE, handle_connection(stream, hub, &token)) => {
+                            let _ = r;
+                        }
+                        _ = stopped => {}
+                    }
                 });
             }
         }
@@ -81,6 +105,9 @@ struct Request {
     path: String,
     authorization: Option<String>,
     origin: Option<String>,
+    /// A `Transfer-Encoding` header was present: we only speak Content-Length
+    /// framing, so the request's body cannot be read — answered `411`.
+    transfer_encoded: bool,
     body: Vec<u8>,
 }
 
@@ -111,6 +138,7 @@ async fn read_request(
     let mut content_length = 0usize;
     let mut authorization = None;
     let mut origin = None;
+    let mut transfer_encoded = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else { continue };
         let value = value.trim();
@@ -118,19 +146,27 @@ async fn read_request(
             "content-length" => content_length = value.parse().unwrap_or(0),
             "authorization" => authorization = Some(value.to_string()),
             "origin" => origin = Some(value.to_string()),
+            "transfer-encoding" => transfer_encoded = true,
             _ => {}
         }
     }
     if content_length > MAX_BODY {
         return Ok(None);
     }
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).await?;
+    // A chunked body can't be read with Content-Length framing — don't try
+    // (misreading it as empty would answer a misleading -32700). The route
+    // layer answers 411 Length Required.
+    let mut body = Vec::new();
+    if !transfer_encoded {
+        body = vec![0u8; content_length];
+        reader.read_exact(&mut body).await?;
+    }
     Ok(Some(Request {
         method: method.to_string(),
         path: path.to_string(),
         authorization,
         origin,
+        transfer_encoded,
         body,
     }))
 }
@@ -155,9 +191,19 @@ fn origin_ok(req: &Request) -> bool {
     match &req.origin {
         None => true,
         Some(o) => {
-            let host = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")).unwrap_or(o);
-            let host = host.split(':').next().unwrap_or(host);
-            matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+            let rest = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")).unwrap_or(o);
+            // A bracketed IPv6 authority contains colons INSIDE the brackets, so
+            // the port split must peel the bracket group first — a naive
+            // `split(':')` would reduce "[::1]:7068" to "[" and reject it.
+            let host = if let Some(after) = rest.strip_prefix('[') {
+                match after.split_once(']') {
+                    Some((h, _port)) => h,
+                    None => return false, // malformed bracket authority
+                }
+            } else {
+                rest.split(':').next().unwrap_or(rest)
+            };
+            matches!(host, "localhost" | "127.0.0.1" | "::1")
         }
     }
 }
@@ -181,6 +227,10 @@ fn json_response(status: &str, body: &Value) -> Vec<u8> {
 async fn route(req: &Request, hub: &Arc<ControlHub>, token: &str) -> Vec<u8> {
     if !origin_ok(req) {
         return http_response("403 Forbidden", None, b"", "");
+    }
+    // Unsupported body framing: the body was never read, so no handler may run.
+    if req.transfer_encoded {
+        return http_response("411 Length Required", None, b"", "");
     }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => json_response("200 OK", &serde_json::json!({ "ok": true })),
@@ -294,6 +344,30 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
         let resp = call(port, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.contains(r#"{"ok":true}"#), "{resp}");
+    }
+
+    /// REGRESSION: a chunked body cannot be read with Content-Length framing —
+    /// it must be REFUSED (411), never misread as an empty body (-32700).
+    #[tokio::test]
+    async fn chunked_bodies_get_411() {
+        let (port, _hub) = boot("sekret").await;
+        let raw = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sekret\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let resp = call(port, raw).await;
+        assert!(resp.starts_with("HTTP/1.1 411"), "{resp}");
+    }
+
+    /// REGRESSION: a bracketed IPv6 localhost Origin must pass the guard (a
+    /// naive colon split reduced "[::1]:5173" to "[" and rejected it).
+    #[tokio::test]
+    async fn ipv6_localhost_origin_passes() {
+        let (port, _hub) = boot("sekret").await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let raw = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://[::1]:5173\r\nAuthorization: Bearer sekret\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let resp = call(port, &raw).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     }
 
     /// A foreign Origin header (DNS rebinding) is refused even with the token.
