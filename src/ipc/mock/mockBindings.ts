@@ -76,10 +76,12 @@ import type {
   TosseTask,
   TosseTaskDetail,
   SlashCommand,
+  AppControlRequestEvent,
   TerminalExitEvent,
   TerminalOutputEvent,
   TickEvent,
   UsageError,
+  VoiceBridgeStatus,
   WorkflowJournal,
   WorkflowJournalEvent,
   WorkflowPhase,
@@ -173,6 +175,9 @@ const fsWatchErrorEvent = new MockEmitter<FsWatchErrorEvent>();
 // integrated terminal can subscribe without crashing.
 const terminalOutputEvent = new MockEmitter<TerminalOutputEvent>();
 const terminalExitEvent = new MockEmitter<TerminalExitEvent>();
+// No app-hosted MCP server in the browser mock — never fires, but must exist so
+// the AppControlHost can subscribe without crashing.
+const appControlRequestEvent = new MockEmitter<AppControlRequestEvent>();
 
 export const mockEvents = {
   sessionMessageEvent,
@@ -195,6 +200,7 @@ export const mockEvents = {
   workflowJournalEvent,
   terminalOutputEvent,
   terminalExitEvent,
+  appControlRequestEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
@@ -227,6 +233,16 @@ function getRecord(session: string): SessionRecord {
 
 const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
+
+// In-memory voice-bridge state for the browser mock (no real listener).
+const mockVoiceBridge: VoiceBridgeStatus = {
+  enabled: false,
+  running: false,
+  port: 7068,
+  token: "mock-voice-token",
+  url: null,
+  error: null,
+};
 
 let mockCounter = 0;
 /** Distinguishes the wire uuids the mock hands back for successive sends. */
@@ -962,6 +978,7 @@ export const mockCommands = {
     ultracode: boolean,
     _backend: "claude" | "codex",
     _allowBypassPermissions?: boolean,
+    _appControl?: boolean,
   ): Promise<Result<string, string>> {
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
@@ -1415,6 +1432,45 @@ export const mockCommands = {
 
   async wipeAllData(): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  // ---- App control (the app-hosted MCP servers) ----
+  // No Rust hub in the browser mock: responding is accepted (and dropped), the
+  // journal publish is a no-op, and the voice bridge pretends to apply configs
+  // in memory so the Settings card is fully exercisable.
+
+  async appControlRespond(
+    _requestId: string,
+    _result: unknown,
+    _error: string | null,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
+  async publishControlEvent(
+    _kind: string,
+    _conversationId: string,
+    _title: string,
+    _detail: unknown,
+  ): Promise<void> {},
+
+  async voiceBridgeStatus(): Promise<VoiceBridgeStatus> {
+    return { ...mockVoiceBridge };
+  },
+
+  async setVoiceBridge(
+    enabled: boolean | null,
+    port: number | null,
+    regenerateToken: boolean,
+  ): Promise<Result<VoiceBridgeStatus, string>> {
+    if (enabled !== null) mockVoiceBridge.enabled = enabled;
+    if (port !== null) mockVoiceBridge.port = port;
+    if (regenerateToken) mockVoiceBridge.token = `mock-token-${Date.now()}`;
+    mockVoiceBridge.running = mockVoiceBridge.enabled;
+    mockVoiceBridge.url = mockVoiceBridge.running
+      ? `http://127.0.0.1:${mockVoiceBridge.port}/mcp`
+      : null;
+    return ok({ ...mockVoiceBridge });
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

@@ -173,6 +173,38 @@ impl crate::tosse::sse::LiveSink for TosseLiveEmitter {
     }
 }
 
+/// One bridged app-control tool call (from an app-hosted MCP server — see
+/// `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
+/// the hub forwards `{tool, args}` here and awaits the executor's
+/// `app_control_respond`. `session` is the calling live session handle when the
+/// call came from a conversation's own agent (the in-process SDK server), or
+/// null for an external caller (the voice bridge).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct AppControlRequestEvent {
+    pub request_id: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub session: Option<String>,
+}
+
+/// Bridges the app-control hub's [`crate::appmcp::ToolSink`] onto the Tauri
+/// event bus — same shape as [`TauriEmitter`] / [`TosseLiveEmitter`], keeping
+/// `appmcp` free of Tauri types.
+pub struct AppControlEmitter {
+    pub app: tauri::AppHandle,
+}
+
+impl crate::appmcp::ToolSink for AppControlEmitter {
+    fn request(&self, request_id: &str, tool: &str, args: &serde_json::Value, session: Option<&str>) {
+        emit_logged(&self.app, "app_control_request", AppControlRequestEvent {
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            session: session.map(str::to_string),
+        });
+    }
+}
+
 /// Coalesced filesystem change notification for the editor panel: the (de-noised,
 /// debounced) set of paths that changed under the watched working directory. The
 /// UI reloads any open file in this set and refreshes any expanded tree dirs it

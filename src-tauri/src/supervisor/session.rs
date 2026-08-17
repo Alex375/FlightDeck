@@ -489,15 +489,21 @@ impl SessionHandle {
 /// whatever the cause (explicit stop, the process exiting on its own, or the
 /// command channel closing). The IPC layer uses it to evict the dead session
 /// from its registry so entries never leak.
+///
+/// `appmcp` is the app-control hub when THIS session must expose the in-process
+/// "flightdeck" SDK MCP server (Settings toggle, decided at spawn like the
+/// bypass unlock): `Some` advertises it on `initialize` and serves inbound
+/// `mcp_message` traffic; `None` keeps the wire identical to the pre-MCP client.
 pub fn spawn_session(
     id: String,
     cfg: SpawnConfig,
     initial: InitialControls,
     emitter: Arc<dyn SessionEmitter>,
     on_exit: Box<dyn FnOnce() + Send + 'static>,
+    appmcp: Option<Arc<crate::appmcp::ControlHub>>,
 ) -> Result<SessionHandle, SessionError> {
     let (transport, msg_rx) = Transport::spawn(cfg).map_err(SessionError::Spawn)?;
-    let core = SessionCore::new(id.clone(), initial, emitter, transport.outbound());
+    let core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit));
     Ok(SessionHandle { id, cmd_tx })
@@ -599,6 +605,11 @@ struct SessionCore {
     /// Outbound JSON lines (→ the process stdin in production, → a test channel
     /// in unit tests).
     outbound: mpsc::UnboundedSender<Value>,
+    /// The app-control hub, when this session hosts the in-process "flightdeck"
+    /// SDK MCP server (advertised on `initialize`, served on `mcp_message`).
+    /// `None` = the server is not exposed to this session (Settings toggle off,
+    /// or a unit test).
+    appmcp: Option<Arc<crate::appmcp::ControlHub>>,
 }
 
 impl SessionCore {
@@ -607,6 +618,7 @@ impl SessionCore {
         initial: InitialControls,
         emitter: Arc<dyn SessionEmitter>,
         outbound: mpsc::UnboundedSender<Value>,
+        appmcp: Option<Arc<crate::appmcp::ControlHub>>,
     ) -> Self {
         let mut assembler = Assembler::new();
         // Seed the live state with the spawn controls so the UI shows the right
@@ -632,6 +644,7 @@ impl SessionCore {
             pending_remote_control: HashMap::new(),
             next_req: 0,
             outbound,
+            appmcp,
         }
     }
 
@@ -776,7 +789,14 @@ impl SessionCore {
     fn initialize(&mut self) {
         let rid = self.next_request_id();
         self.init_request_id = Some(rid.clone());
-        self.send(control::initialize_request(&rid));
+        // Advertise the in-process app-control MCP server when this session got
+        // the hub — the CLI then drives the MCP handshake through `mcp_message`.
+        let sdk_servers: &[&str] = if self.appmcp.is_some() {
+            &[crate::appmcp::SDK_SERVER_NAME]
+        } else {
+            &[]
+        };
+        self.send(control::initialize_request(&rid, sdk_servers));
         // The `--effort` spawn flag set the effort LEVEL; if this conversation was
         // running ultracode, re-enable the separate flag (it has no spawn flag).
         if self.restore_ultracode {
@@ -1045,7 +1065,39 @@ impl SessionCore {
                 self.emit(SessionEvent::Permission(payload));
                 self.emit(state_ev);
             }
-            // Hooks / MCP / dialogs are not supported yet. Reply with an error so the
+            // MCP client traffic for an SDK server we host ("flightdeck"): route the
+            // JSON-RPC to the app-control hub. Handled on a SPAWNED task, never inline —
+            // a tool call round-trips through the front (and `create_conversation` can
+            // await a session spawn), and the actor must keep draining the stream
+            // meanwhile. The response rides the cloned outbound sender; a notification
+            // still gets the `{result:{}, id:0}` ack the CLI expects (see
+            // `control::mcp_control_response`).
+            InboundControl::McpMessage { server_name, message } => {
+                let hub = self
+                    .appmcp
+                    .clone()
+                    .filter(|_| server_name == crate::appmcp::SDK_SERVER_NAME);
+                let Some(hub) = hub else {
+                    // Unknown server, or the session was spawned without the hub
+                    // (toggle off): same error the SDK client raises in that case.
+                    self.send(control::control_error_response(
+                        &request_id,
+                        &format!("SDK MCP server not found: {server_name}"),
+                    ));
+                    return;
+                };
+                let outbound = self.outbound.clone();
+                let session_id = self.id.clone();
+                tokio::spawn(async move {
+                    let caller = crate::appmcp::Caller::Session(session_id);
+                    let response = hub
+                        .handle_mcp(crate::appmcp::Surface::App, &caller, &message)
+                        .await
+                        .unwrap_or_else(crate::appmcp::router::notification_ack);
+                    let _ = outbound.send(control::mcp_control_response(&request_id, response));
+                });
+            }
+            // Hooks / dialogs are not supported yet. Reply with an error so the
             // CLI does not hang waiting on us (spec §4.1/§4.6). These are benign and
             // routine, so they're LOGGED (no longer 100% silent) but not surfaced as a
             // thread error — that would be noise, not signal.
@@ -1354,6 +1406,7 @@ mod tests {
             InitialControls::default(),
             Arc::new(ChannelEmitter { tx: event_tx }),
             out_tx,
+            None,
         );
         (core, event_rx, out_rx)
     }
@@ -1418,6 +1471,120 @@ mod tests {
         assert_eq!(line["response"]["response"]["behavior"], json!("deny"));
         assert_eq!(line["response"]["response"]["message"], json!("no"));
         assert_eq!(line["response"]["response"]["toolUseID"], json!("toolu_1"));
+    }
+
+    /// Build a `SessionCore` that HOSTS the app-control MCP server (a fresh hub).
+    fn test_core_with_hub() -> (
+        SessionCore,
+        Arc<crate::appmcp::ControlHub>,
+        mpsc::UnboundedReceiver<SessionEvent>,
+        mpsc::UnboundedReceiver<Value>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let hub = Arc::new(crate::appmcp::ControlHub::new());
+        let core = SessionCore::new(
+            "session-9".to_string(),
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            out_tx,
+            Some(hub.clone()),
+        );
+        (core, hub, event_rx, out_rx)
+    }
+
+    fn mcp_message(request_id: &str, server: &str, message: Value) -> CliMessage {
+        serde_json::from_value(json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "mcp_message", "server_name": server, "message": message }
+        }))
+        .unwrap()
+    }
+
+    /// ACCEPTANCE: with the hub attached, `initialize` advertises the flightdeck
+    /// SDK MCP server; without it the field is absent (wire parity with the
+    /// pre-MCP client).
+    #[test]
+    fn initialize_advertises_the_sdk_server_only_with_a_hub() {
+        let (mut core, _hub, _events, mut out) = test_core_with_hub();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert_eq!(init["request"]["sdkMcpServers"], json!(["flightdeck"]));
+
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert!(init["request"].get("sdkMcpServers").is_none());
+    }
+
+    /// ACCEPTANCE: an inbound `mcp_message` tools/list is answered on the wire as
+    /// a success control_response carrying `{mcp_response}` — without blocking the
+    /// actor (the handler runs on a spawned task).
+    #[tokio::test]
+    async fn mcp_message_tools_list_round_trips() {
+        let (mut core, _hub, _events, mut out) = test_core_with_hub();
+        core.on_message(mcp_message(
+            "mcp-req-1",
+            "flightdeck",
+            json!({ "jsonrpc": "2.0", "id": 42, "method": "tools/list" }),
+        ));
+        // The reply arrives from the spawned task; await it (bounded).
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+            .await
+            .expect("a reply within 5s")
+            .expect("channel alive");
+        assert_eq!(line["type"], json!("control_response"));
+        assert_eq!(line["response"]["subtype"], json!("success"));
+        assert_eq!(line["response"]["request_id"], json!("mcp-req-1"));
+        let mcp = &line["response"]["response"]["mcp_response"];
+        assert_eq!(mcp["id"], json!(42));
+        let tools = mcp["result"]["tools"].as_array().expect("tools array");
+        assert!(tools.iter().any(|t| t["name"] == json!("open_file")));
+    }
+
+    /// A NOTIFICATION (no id) still gets the `{result:{}, id:0}` ack the CLI's
+    /// SDK transport expects — never silence (the CLI would hang on the request).
+    #[tokio::test]
+    async fn mcp_notification_is_acked() {
+        let (mut core, _hub, _events, mut out) = test_core_with_hub();
+        core.on_message(mcp_message(
+            "mcp-req-2",
+            "flightdeck",
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        ));
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+            .await
+            .expect("a reply within 5s")
+            .expect("channel alive");
+        assert_eq!(line["response"]["request_id"], json!("mcp-req-2"));
+        assert_eq!(
+            line["response"]["response"]["mcp_response"],
+            json!({ "jsonrpc": "2.0", "result": {}, "id": 0 })
+        );
+    }
+
+    /// REGRESSION (spec §4.6): an `mcp_message` for a server we do NOT host — or
+    /// arriving on a session spawned without the hub — answers the standard
+    /// "SDK MCP server not found" error instead of hanging the CLI.
+    #[test]
+    fn mcp_message_without_a_matching_server_errors() {
+        // Hub attached, wrong server name.
+        let (mut core, _hub, _events, mut out) = test_core_with_hub();
+        core.on_message(mcp_message("mcp-req-3", "elsewhere", json!({"id": 1, "method": "ping"})));
+        let line = drain(&mut out).pop().expect("an error reply");
+        assert_eq!(line["response"]["subtype"], json!("error"));
+        assert_eq!(
+            line["response"]["error"],
+            json!("SDK MCP server not found: elsewhere")
+        );
+        // No hub at all (toggle off): same contract.
+        let (mut core, _events, mut out) = test_core();
+        core.on_message(mcp_message("mcp-req-4", "flightdeck", json!({"id": 1, "method": "ping"})));
+        let line = drain(&mut out).pop().expect("an error reply");
+        assert_eq!(line["response"]["subtype"], json!("error"));
     }
 
     /// REGRESSION: the CLI checks permissions for parallel tool calls concurrently,
@@ -1595,6 +1762,7 @@ mod tests {
             },
             Arc::new(ChannelEmitter { tx: event_tx }),
             out_tx,
+            None,
         );
 
         core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
@@ -2152,6 +2320,7 @@ mod tests {
             InitialControls::default(),
             emitter,
             Box::new(|| {}),
+            None,
         )
         .expect("session should spawn");
 
@@ -2191,6 +2360,138 @@ mod tests {
         assert_eq!(turn_ok, Some(true), "expected a successful turn");
     }
 
+    /// LIVE end-to-end for the app-hosted MCP server: spawn a real `claude` that
+    /// ADVERTISES `sdkMcpServers: ["flightdeck"]`, ask the model to call
+    /// `mcp__flightdeck__whoami`, and assert the whole loop closes: the CLI drives
+    /// the MCP handshake over `mcp_message`, our router serves tools/list, the
+    /// tools/call reaches the (test) front bridge, and the canned answer comes back
+    /// in the assistant's reply.
+    ///
+    /// Also PROBES the audit's open security question (A5): does an SDK-MCP tool
+    /// call go through `can_use_tool`? We spawn in permission mode "default" (so
+    /// non-allowlisted tools prompt) and report whether a permission request for
+    /// the MCP tool arrived. Finding (claude 2.1.233, 2026-08-17): YES — the MCP
+    /// tool triggers `can_use_tool` like any other tool (tool_name
+    /// `mcp__flightdeck__whoami`), so the app's permission system gates these
+    /// tools for free.
+    ///
+    /// Ignored by default (needs the binary, network, auth, quota). Run with:
+    ///   cargo test --lib -- --ignored live_sdk_mcp_server --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary (network + auth + quota)"]
+    async fn live_sdk_mcp_server_round_trips() {
+        use std::sync::{Mutex, OnceLock};
+
+        /// A front-bridge stand-in that answers every bridged tool call at once
+        /// with a canned whoami payload (there is no webview in a live test).
+        struct AutoSink {
+            hub: OnceLock<Arc<crate::appmcp::ControlHub>>,
+            calls: Mutex<Vec<String>>,
+        }
+        impl crate::appmcp::ToolSink for AutoSink {
+            fn request(&self, request_id: &str, tool: &str, _args: &Value, session: Option<&str>) {
+                self.calls.lock().unwrap().push(tool.to_string());
+                if let Some(hub) = self.hub.get() {
+                    hub.respond(
+                        request_id,
+                        Ok(json!({
+                            "conversation_id": "conv-live-probe",
+                            "title": "Live probe conversation",
+                            "session": session,
+                        })),
+                    );
+                }
+            }
+        }
+
+        let hub = Arc::new(crate::appmcp::ControlHub::new());
+        let sink = Arc::new(AutoSink { hub: OnceLock::new(), calls: Mutex::new(Vec::new()) });
+        let _ = sink.hub.set(hub.clone());
+        hub.set_sink(sink.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let emitter = Arc::new(ChannelEmitter { tx });
+        let cwd = std::env::current_dir().unwrap();
+        // "default" permission mode so non-allowlisted tools PROMPT — that is what
+        // makes the A5 probe conclusive (mode "auto" could auto-allow silently).
+        let mut cfg = SpawnConfig::new(cwd);
+        cfg.permission_mode = Some("default".to_string());
+        let handle = spawn_session(
+            "test-mcp".to_string(),
+            cfg,
+            InitialControls::default(),
+            emitter,
+            Box::new(|| {}),
+            Some(hub.clone()),
+        )
+        .expect("session should spawn");
+
+        handle
+            .send_user_text(
+                "Call the MCP tool mcp__flightdeck__whoami (from the flightdeck MCP server), \
+                 then reply with EXACTLY the conversation_id value it returned and nothing else. \
+                 You MUST call that tool. Do not use any other tool.",
+            )
+            .await
+            .expect("send should queue");
+
+        let mut mcp_permission_prompted = false;
+        let mut final_text = String::new();
+        let mut turn_ok = None;
+
+        let drain_loop = async {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    SessionEvent::Permission(p) => {
+                        // The A5 probe: did the MCP tool route through can_use_tool?
+                        if p.tool_name.contains("flightdeck") {
+                            mcp_permission_prompted = true;
+                        }
+                        handle
+                            .answer_permission(
+                                p.request_id,
+                                PermissionDecision::Allow { updated_input: None },
+                            )
+                            .await
+                            .expect("answer should queue");
+                    }
+                    SessionEvent::Item(ConversationItem::AssistantMessage { blocks, .. }) => {
+                        for b in &blocks {
+                            if let crate::supervisor::model::NormalizedBlock::Text { text } = b {
+                                final_text.push_str(text);
+                            }
+                        }
+                    }
+                    SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) => {
+                        turn_ok = Some(!is_error);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(180), drain_loop)
+            .await
+            .expect("turn should complete within the deadline");
+        handle.shutdown().await.ok();
+
+        let calls = sink.calls.lock().unwrap().clone();
+        eprintln!("[live] bridged tool calls: {calls:?}");
+        eprintln!("[live] can_use_tool fired for the MCP tool: {mcp_permission_prompted}");
+        eprintln!("[live] final assistant text: {final_text:?}");
+
+        assert_eq!(turn_ok, Some(true), "expected a successful turn");
+        assert!(
+            calls.iter().any(|t| t == "whoami"),
+            "the whoami tools/call should reach the front bridge (got {calls:?})"
+        );
+        assert!(
+            final_text.contains("conv-live-probe"),
+            "the model should echo the canned conversation_id"
+        );
+    }
+
     /// LIVE: the whole feature hinges on the binary supporting the
     /// `generate_session_title` control request. Spawn a real `claude`, ask it to
     /// title a description, and assert a non-empty `Title` event comes back. No user
@@ -2211,6 +2512,7 @@ mod tests {
             InitialControls::default(),
             emitter,
             Box::new(|| {}),
+            None,
         )
         .expect("session should spawn");
 
@@ -2276,6 +2578,7 @@ mod tests {
             InitialControls::default(),
             emitter,
             Box::new(|| {}),
+            None,
         )
         .expect("session should spawn");
 

@@ -13,7 +13,7 @@
 
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { events } from "./client";
+import { commands, events } from "./client";
 import type {
   AccountLoginEvent,
   SessionCodexPlanUsageEvent,
@@ -42,7 +42,7 @@ import { useAppErrors } from "../store/appErrors";
 import { useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
-import { agentStatusForEntry, lastTurnResultMeta } from "../agent/useAgentStatus";
+import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
@@ -181,6 +181,35 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   }
 
   const repo = convs.repos.find((r) => r.id === conv.repoId);
+
+  // Feed the app-control event journal (the voice bridge's `wait_for_events`)
+  // from THIS settled point — after the settle window, the no-op-turn check and
+  // the backgrounding suppression, but BEFORE the "user is watching" gate below
+  // (the voice agent wants the event regardless of window focus). Same single
+  // transition source as the human notifications, so the two can never drift.
+  const meta = kind === "done" ? lastTurnResultMeta(entry) : null;
+  const pending = entry.pendingPermissions[0] ?? null;
+  void commands
+    .publishControlEvent(
+      kind === "done" ? "turn_completed" : "needs_attention",
+      convId,
+      conv.name,
+      kind === "done"
+        ? {
+            outcome: meta?.isError ? "error" : "success",
+            ...(meta?.subtype ? { subtype: meta.subtype } : {}),
+            last_assistant_text: clipForEvent(lastAssistantText(entry)),
+            repository: repo ? repoName(repo.path) : null,
+          }
+        : {
+            reason: pending ? "permission" : "question",
+            ...(pending ? { tool: pending.tool_name } : {}),
+            prompt: clipForEvent(pending?.title ?? pending?.description ?? null),
+            repository: repo ? repoName(repo.path) : null,
+          },
+    )
+    .catch((e) => console.error("publish_control_event failed:", e));
+
   dispatchAgentNotification({
     kind,
     convId,
@@ -188,6 +217,12 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
     repoName: repo ? repoName(repo.path) : null,
     activeId: convs.activeId,
   });
+}
+
+/** Bound the free text carried by a control event (voice digests, not transcripts). */
+function clipForEvent(text: string | null): string | null {
+  if (!text) return null;
+  return text.length <= 700 ? text : `${text.slice(0, 699)}…`;
 }
 
 export function useGlobalSessionEvents(): void {

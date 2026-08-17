@@ -38,6 +38,7 @@ import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
+import { agentServerEnabled } from "./appControl";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
@@ -1318,6 +1319,9 @@ export async function ensureConversationSession(
     // Remembered on the conversation below so the composer knows what this live session
     // can actually honour.
     const allowBypass = bypassPermissionsAllowed();
+    // Same spawn-time read for the app-control policy: whether THIS session
+    // advertises the in-process "flightdeck" MCP server (Settings → Control).
+    const appControl = agentServerEnabled();
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1328,6 +1332,7 @@ export async function ensureConversationSession(
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
       allowBypass,
+      appControl,
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1363,6 +1368,7 @@ export async function ensureConversationSession(
           // Same backend on the fresh-worktree re-spawn.
           atSpawn.kind,
           allowBypass,
+          appControl,
         );
       }
     }

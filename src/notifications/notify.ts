@@ -167,15 +167,29 @@ export function dispatchAgentNotification(ev: AgentNotification): void {
   }
 }
 
-function sendOsNotification(ev: AgentNotification): void {
-  if (!inTauri()) return;
-  const where = ev.repoName ? ` · ${ev.repoName}` : "";
-  const title = ev.kind === "attention" ? "Action required" : "Agent finished";
-  const body =
-    ev.kind === "attention"
-      ? `${ev.title}${where} needs your attention.`
-      : `${ev.title}${where} finished.`;
+/**
+ * A free-form notification requested BY an agent (the app-control `notify_user`
+ * tool) — distinct from the state-transition notifications above: the agent
+ * explicitly asked for it, so it fires regardless of what the user is watching
+ * and ignores the transition machinery (no arming/settling). It still honours
+ * the OS-permission plumbing, and `critical` adds the until-focused Dock bounce.
+ */
+export function notifyFromAgent(message: string, critical: boolean): void {
+  fireOsNotification("Flight Deck agent", message);
+  if (inTauri()) {
+    void commands
+      .requestUserAttention(critical)
+      .then((r) => {
+        if (r.status !== "ok") console.error("dock bounce failed:", r.error);
+      })
+      .catch((e) => console.error("dock bounce threw:", e));
+  }
+}
 
+/** Send one OS notification (permission-aware). Shared by the transition path
+ *  and the agent-requested path. */
+function fireOsNotification(title: string, body: string): void {
+  if (!inTauri()) return;
   const fire = () => {
     try {
       sendNotification({ title, body });
@@ -183,7 +197,6 @@ function sendOsNotification(ev: AgentNotification): void {
       console.error("notification send failed:", e);
     }
   };
-
   if (osGranted) {
     fire();
     return;
@@ -197,6 +210,16 @@ function sendOsNotification(ev: AgentNotification): void {
       console.error("notification permission re-check failed:", e);
     }
   })();
+}
+
+function sendOsNotification(ev: AgentNotification): void {
+  const where = ev.repoName ? ` · ${ev.repoName}` : "";
+  const title = ev.kind === "attention" ? "Action required" : "Agent finished";
+  const body =
+    ev.kind === "attention"
+      ? `${ev.title}${where} needs your attention.`
+      : `${ev.title}${where} finished.`;
+  fireOsNotification(title, body);
 }
 
 /** Play just the chime — used by the Settings "Test sound" button. */

@@ -125,11 +125,15 @@ fn unknown_session() -> String {
 /// Permissions): it UNLOCKS `bypassPermissions` as a selectable mode for this process
 /// without turning it on. It can only be decided at spawn — a live session cannot gain
 /// it — so the front end restarts, or greys out the choice, accordingly.
+///
+/// `app_control` (Settings → Control) exposes the in-process "flightdeck" MCP server
+/// to THIS session: its agent gains the app-piloting tools (open files, create/message
+/// conversations, …). Claude-only (Codex has no SDK-server channel) and, like the
+/// bypass unlock, decided at spawn — the `initialize` handshake advertises it once.
 #[tauri::command]
 #[specta::specta]
 pub async fn spawn_session(
     app: tauri::AppHandle,
-    sessions: tauri::State<'_, Sessions>,
     repo_path: String,
     resume: Option<String>,
     model: Option<String>,
@@ -138,7 +142,11 @@ pub async fn spawn_session(
     ultracode: bool,
     backend: Backend,
     allow_bypass_permissions: bool,
+    app_control: bool,
 ) -> Result<String, String> {
+    // Resolved through the AppHandle rather than a `State` param: specta caps a
+    // command at 10 parameters and `app_control` used the last slot.
+    let sessions = app.state::<Sessions>();
     let id = sessions.next_id();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
@@ -193,7 +201,13 @@ pub async fn spawn_session(
             let server: Arc<CodexServer> = (*app.state::<Arc<CodexServer>>()).clone();
             codex::spawn_session(id.clone(), cfg, initial, emitter, on_exit, server)
         }
-        Backend::Claude => session::spawn_session(id.clone(), cfg, initial, emitter, on_exit),
+        Backend::Claude => {
+            // Hand the app-control hub to sessions that expose the in-process MCP
+            // server; `None` keeps the wire identical to the pre-MCP client.
+            let appmcp = app_control
+                .then(|| (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone());
+            session::spawn_session(id.clone(), cfg, initial, emitter, on_exit, appmcp)
+        }
     }
     .map_err(|e| e.to_string())?;
     sessions.insert(id.clone(), backend, handle);
@@ -980,7 +994,7 @@ pub async fn fetch_slash_commands(cwd: String) -> Result<Vec<SlashCommand>, Stri
     // This transport serves exactly one request, so a fixed id is fine.
     let request_id = "tosse-cmd-fetch";
     transport
-        .send_line(control::initialize_request(request_id))
+        .send_line(control::initialize_request(request_id, &[]))
         .map_err(|e| e.to_string())?;
 
     let commands = tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -2535,6 +2549,131 @@ pub fn set_active_conversation(
 #[specta::specta]
 pub fn wipe_all_data(store: tauri::State<'_, Store>) -> Result<(), String> {
     store.wipe_all().map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// App control (the app-hosted MCP servers — see `crate::appmcp`)
+// ---------------------------------------------------------------------------
+
+/// The front executor's answer to one bridged `app_control_request` event.
+/// Exactly one of `result` / `error` is meaningful: `error` set → the tool call
+/// failed with that message; otherwise `result` (or null) is the tool's value.
+/// Errors out when the request id is unknown (already timed out / answered) so
+/// a wiring bug in the executor can never be silent.
+#[tauri::command]
+#[specta::specta]
+pub fn app_control_respond(
+    hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
+    request_id: String,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) -> Result<(), String> {
+    let outcome = match error {
+        Some(message) => Err(message),
+        None => Ok(result.unwrap_or(serde_json::Value::Null)),
+    };
+    if hub.respond(&request_id, outcome) {
+        Ok(())
+    } else {
+        Err(format!("no pending app-control request '{request_id}' (timed out or already answered)"))
+    }
+}
+
+/// Publish one fleet event into the journal `wait_for_events` long-polls (the
+/// voice bridge). The FRONT calls this from its settled notification point
+/// (`fireAgentNotification`), so the voice agent hears exactly what the human
+/// would have been pinged about.
+#[tauri::command]
+#[specta::specta]
+pub fn publish_control_event(
+    hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
+    kind: String,
+    conversation_id: String,
+    title: String,
+    detail: serde_json::Value,
+) {
+    hub.events.publish(&kind, &conversation_id, &title, detail);
+}
+
+/// Keys under which the voice bridge persists its config in the store's `meta`
+/// table.
+const VOICE_ENABLED_KEY: &str = "voice_bridge_enabled";
+const VOICE_PORT_KEY: &str = "voice_bridge_port";
+const VOICE_TOKEN_KEY: &str = "voice_bridge_token";
+
+/// Load the voice bridge's persisted config, minting (and persisting) the
+/// Bearer token on first use so the Settings page always has one to show.
+/// Best-effort on read errors: the bridge then starts disabled with defaults.
+pub fn load_voice_config(store: &Store) -> crate::appmcp::VoiceConfig {
+    let read = |key: &str| store.get_config(key).ok().flatten();
+    let token = match read(VOICE_TOKEN_KEY) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let t = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = store.set_config(VOICE_TOKEN_KEY, &t) {
+                eprintln!("[appmcp] failed to persist the voice-bridge token: {e}");
+            }
+            t
+        }
+    };
+    crate::appmcp::VoiceConfig {
+        enabled: read(VOICE_ENABLED_KEY).as_deref() == Some("1"),
+        port: read(VOICE_PORT_KEY)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(crate::appmcp::DEFAULT_VOICE_PORT),
+        token,
+    }
+}
+
+/// The voice bridge's current status (Settings read-back: config + whether the
+/// listener is actually up, with the error when it is not).
+#[tauri::command]
+#[specta::specta]
+pub fn voice_bridge_status(
+    hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
+) -> crate::appmcp::VoiceBridgeStatus {
+    hub.voice_status()
+}
+
+/// Change the voice bridge's config (any subset of enable/port/token-regen),
+/// persist it, and (re)start or stop the listener accordingly. Returns the
+/// honest post-apply status — a failed bind comes back as `running:false` +
+/// `error`, never as a silently-lying switch.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_voice_bridge(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    port: Option<u16>,
+    regenerate_token: bool,
+) -> Result<crate::appmcp::VoiceBridgeStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    let mut cfg = {
+        let store = app.state::<Store>();
+        let mut cfg = load_voice_config(&store);
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
+        }
+        if let Some(port) = port {
+            cfg.port = port;
+        }
+        if regenerate_token {
+            cfg.token = uuid::Uuid::new_v4().to_string();
+        }
+        store
+            .set_config(VOICE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
+            .and_then(|_| store.set_config(VOICE_PORT_KEY, &cfg.port.to_string()))
+            .and_then(|_| store.set_config(VOICE_TOKEN_KEY, &cfg.token))
+            .map_err(|e| e.to_string())?;
+        cfg
+    };
+    // Never start a listener with an empty token (defence in depth; the loader
+    // always mints one).
+    if cfg.token.is_empty() {
+        cfg.token = uuid::Uuid::new_v4().to_string();
+    }
+    hub.apply_voice(cfg).await;
+    Ok(hub.voice_status())
 }
 
 #[tauri::command]

@@ -30,6 +30,7 @@ import { UpdateBanner } from "./features/settings/UpdateBanner";
 import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
+import { AppControlHost } from "./agent/AppControlHost";
 import { startUpdaterAutoCheck } from "./store/updater";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
 import { initNotifications } from "./notifications/notify";
@@ -321,6 +322,10 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): executes the app-control tool calls bridged from the
+          app-hosted MCP servers (agents piloting the app). Mounted HERE so it can
+          drive the view, like the keyboard shortcuts. */}
+      <AppControlHost changeView={changeView} />
       {/* Idem (render-null): keeps each linked conversation's copy of its TOSSE task in step
           with the CRM, so the delete warning stops asking about tasks that are already done. */}
       <LinkedTaskSync />
