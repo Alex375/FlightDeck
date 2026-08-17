@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { ChipBtn, Menu } from "../../ui/kit";
 import { EFFORT_LABELS } from "../../agent/subagentMeta";
-import { backendOfModel } from "./models";
+import { backendOfModel, modelFamily, modelOption } from "./models";
 
 /**
  * Claude Code reasoning-effort levels (low → max), plus the top "Ultra code" tier.
@@ -44,6 +44,19 @@ export function effortLevelsForModel(model: string | null | undefined): EffortLe
     if (m.includes("gpt-5.6")) return ["low", "medium", "high", "xhigh", "max", "ultra"];
     return ["low", "medium", "high", "xhigh"];
   }
+  // Claude: the catalogue carries each model's OWN capability tokens, transcribed from
+  // the registry baked into the binary — the only way to know that Opus 4.6 / Sonnet 4.6
+  // take `max` but not `xhigh`, and that 4.5-and-older have no effort control at all.
+  // A resolved live id (`claude-opus-4-8[1m]`) maps back through modelFamily.
+  const known = modelOption(model || "") ?? modelOption(modelFamily(model) || "");
+  if (known?.caps) {
+    if (!known.caps.includes("effort")) return [];
+    const levels: EffortLevel[] = ["low", "medium", "high"];
+    if (known.caps.includes("xhigh_effort")) levels.push("xhigh");
+    if (known.caps.includes("max_effort")) levels.push("max");
+    return levels;
+  }
+  // Unknown id (a model the catalogue doesn't carry): fall back to the family shape.
   if (m.includes("haiku")) return []; // Haiku 4.5 has no effort support → slider hidden
   if (m.includes("opus")) return ["low", "medium", "high", "xhigh", "max"]; // xhigh + max
   if (m.includes("fable")) return ["low", "medium", "high", "xhigh", "max"]; // same tier as Opus

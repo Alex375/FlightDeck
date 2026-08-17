@@ -31,10 +31,13 @@ import { useRemoteControlStore } from "./remoteControl";
 import { refreshActiveGoal, useGoalStore } from "./goalStore";
 import { useCodexPlanUsageStore } from "./codexPlanUsage";
 import { useLastMessageSummaryStore } from "./lastMessageSummary";
-// The Codex default model — seeds a Codex conversation so its persisted `model` is
-// always a real Codex wire id. models.ts only imports `BackendKind` as a TYPE from
-// here (erased at runtime), so this value edge is acyclic.
-import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
+// The user's configured defaults (Settings → Models) — per backend, so a Codex
+// conversation is always seeded with a real Codex wire id (a Claude alias would be
+// rejected at thread/start) and vice versa. Read through these helpers, never captured
+// at module load: a conversation created after the setting changes must seed the NEW
+// value. modelPrefs only imports `BackendKind` as a TYPE from here (erased at runtime),
+// so this value edge is acyclic.
+import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
@@ -49,11 +52,7 @@ import {
   clearArtifactsCache,
   clearAllArtifactsCache,
 } from "../features/conversation/artifacts";
-import {
-  clearCodexControls,
-  clearAllCodexControls,
-  DEFAULT_CODEX_EFFORT,
-} from "../features/conversation/codexControls";
+import { clearCodexControls, clearAllCodexControls } from "../features/conversation/codexControls";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
 import {
   clearPlanAnnotations,
@@ -86,7 +85,16 @@ export const DEFAULT_CONV_NAME = "New conversation";
 // Product defaults for a conversation's controls — also the spawn defaults the
 // Rust core falls back to. A conversation seeds these at creation; the composer
 // uses the same values as its display fallback, so UI and stream never disagree.
-export const DEFAULT_MODEL = "opus";
+//
+// FACTORY values: what the app ships with. The user can move the model and the effort
+// in Settings → Models, so anything seeding a conversation reads `defaultModelFor` /
+// `defaultEffortFor` (store/modelPrefs) instead of these constants — which stay as the
+// last-resort floor and as what "Reset" returns to.
+//
+// Opus 4.8 by its FULL name, not a family alias: `opus` always resolves to the LATEST
+// Opus, so pinning 4.8 requires naming it (see CLAUDE_MODELS). Keep in sync with the
+// Rust spawn fallback in `ipc/commands.rs`.
+export const DEFAULT_MODEL = "claude-opus-4-8";
 export const DEFAULT_EFFORT = "xhigh";
 // "auto" is the binary's own native default and what the live session reports;
 // keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.
@@ -946,11 +954,10 @@ export function createConversationInRepo(
     handle: null, // no live process until the first message
     liveCwd: null,
     bypassAllowed: false,
-    // Seed the backend's own default model so a Codex conversation never carries a
-    // Claude alias (which its binary would reject at thread/start).
-    model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
-    // Seed the backend's own default effort (Codex "medium" vs Claude "xhigh").
-    effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
+    // Seed the backend's OWN configured default (Settings → Models), so a Codex
+    // conversation never carries a Claude alias its binary would reject at thread/start.
+    model: defaultModelFor(kind),
+    effort: defaultEffortFor(kind),
     ultracode: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     pendingReminder: null,
@@ -995,11 +1002,10 @@ export function createConversationInWorktree(
     handle: null, // no live process until the first message
     liveCwd: null,
     bypassAllowed: false,
-    // Seed the backend's own default model so a Codex conversation never carries a
-    // Claude alias (which its binary would reject at thread/start).
-    model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
-    // Seed the backend's own default effort (Codex "medium" vs Claude "xhigh").
-    effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
+    // Seed the backend's OWN configured default (Settings → Models), so a Codex
+    // conversation never carries a Claude alias its binary would reject at thread/start.
+    model: defaultModelFor(kind),
+    effort: defaultEffortFor(kind),
     ultracode: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     pendingReminder: null,
@@ -1106,8 +1112,8 @@ export function reactivateDiskConversation(
   // alias its binary would reject at thread/start.
   const kind: BackendKind = d.backend === "codex" ? "codex" : "claude";
   const controls: InheritedControls = inherit ?? {
-    model: kind === "codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
-    effort: kind === "codex" ? DEFAULT_CODEX_EFFORT : DEFAULT_EFFORT,
+    model: defaultModelFor(kind),
+    effort: defaultEffortFor(kind),
     ultracode: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     // null = inherit the global "clean output" default; the composer chip sets an
@@ -1179,8 +1185,8 @@ export function materializeCodexBranch(
     liveCwd: null,
     bypassAllowed: false,
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
-    model: forkModel ?? inherit.model ?? DEFAULT_CODEX_MODEL,
-    effort: inherit.effort ?? DEFAULT_CODEX_EFFORT,
+    model: forkModel ?? inherit.model ?? defaultModelFor("codex"),
+    effort: inherit.effort ?? defaultEffortFor("codex"),
     // "Ultra code" is a Claude-only app tier — a Codex branch never carries it, whatever
     // the source says (its own top rung is the `ultra` EFFORT, covered by `effort` above).
     ultracode: false,

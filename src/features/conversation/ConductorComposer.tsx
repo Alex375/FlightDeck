@@ -17,12 +17,8 @@ import { isTauri } from "../../ipc/provider";
 import { useShallow } from "zustand/react/shallow";
 import { useInterrupt, useSendMessage } from "../../ipc/useCommands";
 import { useSessionState, useUserMessageHistory } from "../../store/conversationStore";
-import {
-  DEFAULT_EFFORT,
-  DEFAULT_MODEL,
-  DEFAULT_PERMISSION_MODE,
-  useConversationsStore,
-} from "../../store/conversationsStore";
+import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
+import { defaultEffortFor, defaultModelFor, useModelPrefs } from "../../store/modelPrefs";
 import {
   prefetchSlashCommands,
   refetchSlashCommands,
@@ -201,8 +197,8 @@ export const ConductorComposer = forwardRef<
       };
     }),
   );
-  const modelId = state?.model ?? ctl.model ?? DEFAULT_MODEL;
-  const effortLevel = (state?.effort ?? ctl.effort ?? DEFAULT_EFFORT) as EffortLevel;
+  const modelId = state?.model ?? ctl.model ?? defaultModelFor(ctl.kind);
+  const effortLevel = (state?.effort ?? ctl.effort ?? defaultEffortFor(ctl.kind)) as EffortLevel;
   const ultracodeOn = state?.ultracode ?? ctl.ultracode;
   const gaugeValue: EffortLevel = ultracodeOn ? "ultracode" : effortLevel;
   // "Start this conversation in a fresh worktree" toggle — only meaningful on the
@@ -238,7 +234,18 @@ export const ConductorComposer = forwardRef<
     tiersById: codexTiers,
     defaultTierById: codexDefaultTier,
   } = useCodexModels(codexAvailable);
-  const pickerGroups = modelsForPicker(ctl.kind, { locked, codexAvailable, codexModels });
+  // The picker offers what the user kept in Settings → Models, in the order they set
+  // there — subscribed, so hiding or dragging a model re-renders the open menu.
+  const hiddenModels = useModelPrefs((s) => s.hidden);
+  const modelOrder = useModelPrefs((s) => s.order);
+  const pickerGroups = modelsForPicker(ctl.kind, {
+    locked,
+    codexAvailable,
+    codexModels,
+    hidden: hiddenModels,
+    order: modelOrder,
+    current: modelId,
+  });
   // Account state per backend, for the picker's "not connected" badges (definitive
   // logged-out only — cf. useAccountsLoggedOut). Shared cached queries, cost ~nil.
   const loggedOut = useAccountsLoggedOut(claudeAvailable, codexAvailable);

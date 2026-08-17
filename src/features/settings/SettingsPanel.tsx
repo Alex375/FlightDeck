@@ -17,6 +17,7 @@ import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
+import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
@@ -33,6 +34,9 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  // Next to Conversation (both shape what a conversation is), its own tab for the same
+  // reason as Composer: arranging two lists by drag is a task, not a row of switches.
+  { id: "models", label: "Models", icon: "spark" },
   // Its own tab rather than a group under General: arranging the bar is a task with a
   // preview and a drag surface, not a row of switches.
   { id: "composer", label: "Composer", icon: "wand" },
@@ -158,6 +162,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
+
+            {section === "models" && <ModelsSection />}
 
             {section === "composer" && <ComposerSection />}
 

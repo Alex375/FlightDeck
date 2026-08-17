@@ -43,7 +43,7 @@ import {
   useConversationsStore,
   type Conversation,
 } from "./conversationsStore";
-import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
+import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
 
 const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
@@ -608,6 +608,12 @@ describe("reactivateDiskConversation — backend-aware", () => {
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
     expect(conv.kind).toBe("claude");
     expect(conv.model).toBe(DEFAULT_MODEL);
+  });
+
+  // A default the picker doesn't offer would seed every conversation with a row the
+  // menu can't highlight (and, for a mistyped id, a model the binary would reject).
+  it("the Claude default is a model the picker actually offers", () => {
+    expect(CLAUDE_MODELS.map((m) => m.value)).toContain(DEFAULT_MODEL);
   });
 });
 

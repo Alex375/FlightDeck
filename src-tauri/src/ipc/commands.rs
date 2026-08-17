@@ -143,7 +143,7 @@ pub async fn spawn_session(
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
-    // Product defaults when unset: Opus 5 + Extra (xhigh) effort + Auto (`auto`)
+    // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
     // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
@@ -154,7 +154,9 @@ pub async fn spawn_session(
     let effort = effort
         .filter(|e| control::is_valid_effort_level(e))
         .unwrap_or_else(|| "xhigh".into());
-    cfg.model = Some(model.unwrap_or_else(|| "opus".into()));
+    // Full model name, not the `opus` alias — that alias tracks the LATEST Opus, so
+    // pinning 4.8 means naming it. Mirrors the front-end seed `DEFAULT_MODEL`.
+    cfg.model = Some(model.unwrap_or_else(|| "claude-opus-4-8".into()));
     cfg.effort = Some(effort);
     // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
     // off (e.g. the user turned the Settings toggle back off while a conversation still

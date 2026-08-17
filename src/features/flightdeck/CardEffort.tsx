@@ -11,11 +11,8 @@
 import { useShallow } from "zustand/react/shallow";
 import { EffortGauge, type EffortLevel } from "../conversation/EffortGauge";
 import { useSessionState } from "../../store/conversationStore";
-import {
-  DEFAULT_EFFORT,
-  DEFAULT_MODEL,
-  useConversationsStore,
-} from "../../store/conversationsStore";
+import { useConversationsStore } from "../../store/conversationsStore";
+import { defaultEffortFor, defaultModelFor } from "../../store/modelPrefs";
 
 export function CardEffort({ convId }: { convId: string }) {
   const state = useSessionState(convId);
@@ -26,6 +23,7 @@ export function CardEffort({ convId }: { convId: string }) {
         model: c?.model ?? null,
         effort: c?.effort ?? null,
         ultracode: c?.ultracode ?? false,
+        kind: c?.kind ?? "claude",
       };
     }),
   );
@@ -36,8 +34,8 @@ export function CardEffort({ convId }: { convId: string }) {
     state?.effort != null || !!state?.ultracode || ctl.effort != null || ctl.ultracode;
   if (!hasEffort) return null;
 
-  const modelId = state?.model ?? ctl.model ?? DEFAULT_MODEL;
-  const effortLevel = (state?.effort ?? ctl.effort ?? DEFAULT_EFFORT) as EffortLevel;
+  const modelId = state?.model ?? ctl.model ?? defaultModelFor(ctl.kind);
+  const effortLevel = (state?.effort ?? ctl.effort ?? defaultEffortFor(ctl.kind)) as EffortLevel;
   const ultra = state?.ultracode ?? ctl.ultracode;
   const gaugeValue: EffortLevel = ultra ? "ultracode" : effortLevel;
 
