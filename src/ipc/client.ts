@@ -88,6 +88,7 @@ export type {
   TosseTaskLink,
   UsageError,
   UsageWindow,
+  VoiceAgentStatus,
   VoiceBridgeStatus,
   WorkflowJournal,
   WorkflowJournalAgent,

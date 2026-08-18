@@ -56,6 +56,8 @@ import {
   dispatchAgentNotification,
   peekInterrupt,
 } from "../notifications/notify";
+import { queueVoiceAnnouncement } from "../voice/announce";
+import { useVoicePrefs } from "../voice/voicePrefs";
 import {
   SETTLE_MS,
   agentEventFor,
@@ -224,6 +226,34 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
           },
     )
     .catch((e) => console.error("publish_control_event failed:", e));
+
+  // Same settled event, third consumer: the in-app voice agent's spoken
+  // announcements — gated on its own opt-in pref so a disabled feature costs
+  // nothing (the queue caps and drains in src/voice). Fed HERE, not from the
+  // Rust journal, so all three surfaces (OS ping, voice bridge, spoken line)
+  // share one truth about "what just happened".
+  if (useVoicePrefs.getState().announcements) {
+    queueVoiceAnnouncement(
+      kind === "done"
+        ? {
+            kind: "turn_completed",
+            conversationId: convId,
+            title: conv.name,
+            outcome: meta?.isError ? "error" : "success",
+            lastAssistantText: clipForEvent(lastAssistantText(entry)),
+            repository: repo ? repoName(repo.path) : null,
+          }
+        : {
+            kind: "needs_attention",
+            conversationId: convId,
+            title: conv.name,
+            reason: pending ? "permission" : "question",
+            tool: pending?.tool_name ?? null,
+            prompt: clipForEvent(pending?.title ?? pending?.description ?? null),
+            repository: repo ? repoName(repo.path) : null,
+          },
+    );
+  }
 
   dispatchAgentNotification({
     kind,

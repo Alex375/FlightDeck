@@ -12,6 +12,7 @@ pub mod supervisor;
 pub mod terminal;
 pub mod tosse;
 pub mod usage;
+pub mod voice;
 
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
@@ -55,6 +56,8 @@ use ipc::commands::{
     tosse_repo_links, tosse_set_project_status,
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
+    voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
+    app_control_tools,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -216,6 +219,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             publish_control_event,
             voice_bridge_status,
             set_voice_bridge,
+            voice_agent_status,
+            set_voice_agent_key,
+            clear_voice_agent_key,
+            voice_agent_client_secret,
+            app_control_tools,
         ])
         .events(collect_events![
             TickEvent,

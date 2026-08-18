@@ -2678,6 +2678,55 @@ pub async fn set_voice_bridge(
     Ok(hub.voice_status())
 }
 
+// ---------------------------------------------------------------------------
+// In-app voice agent (OpenAI Realtime — see `crate::voice`)
+// ---------------------------------------------------------------------------
+
+/// Whether an OpenAI key is stored (plus its masked hint). `configured: false`
+/// is the NORMAL optional-feature state, never an error.
+#[tauri::command]
+#[specta::specta]
+pub fn voice_agent_status() -> crate::voice::VoiceAgentStatus {
+    crate::voice::status()
+}
+
+/// Store the user's OpenAI API key in the macOS Keychain (verified by
+/// read-back). Returns the fresh status.
+#[tauri::command]
+#[specta::specta]
+pub fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
+    crate::voice::set_key(&key)
+}
+
+/// Forget the stored OpenAI key (absent item = success).
+#[tauri::command]
+#[specta::specta]
+pub fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
+    crate::voice::clear_key()
+}
+
+/// Mint a short-lived Realtime client secret for ONE voice session — the only
+/// shape of the credential the webview ever sees.
+#[tauri::command]
+#[specta::specta]
+pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, String> {
+    crate::voice::mint_client_secret().await
+}
+
+/// The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
+/// JSON. The in-app voice agent reads it to declare its Realtime function
+/// tools from the SAME source the MCP servers serve — one catalogue, no drift.
+#[tauri::command]
+#[specta::specta]
+pub fn app_control_tools(surface: String) -> Result<serde_json::Value, String> {
+    let surface = match surface.as_str() {
+        "app" => crate::appmcp::Surface::App,
+        "voice" => crate::appmcp::Surface::Voice,
+        other => return Err(format!("unknown surface '{other}' (app | voice)")),
+    };
+    Ok(crate::appmcp::tools::list_json(surface))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn ping(msg: String) -> Pong {

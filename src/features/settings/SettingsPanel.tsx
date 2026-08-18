@@ -22,6 +22,7 @@ import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
 import { ControlSection } from "./ControlSection";
+import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -189,6 +190,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   subtitle="Let agents pilot the app — from inside a conversation, or from an external voice assistant."
                 />
                 <ControlSection />
+                <VoiceAgentSection />
               </div>
             )}
 

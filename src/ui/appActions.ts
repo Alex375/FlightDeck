@@ -18,6 +18,7 @@ import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
+import { toggleVoiceSession } from "../voice/realtime";
 import type { ShortcutAction, View } from "./shortcuts";
 
 export interface AppActionOptions {
@@ -112,6 +113,11 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
     }
     case "open-history":
       useHistoryUi.getState().openPanel();
+      return true;
+    case "toggle-voice":
+      // Fire-and-forget: session state lives in voiceStore, failures surface on
+      // the chip. The action reports true so the chord is consumed either way.
+      void toggleVoiceSession();
       return true;
     case "zoom-in":
     case "zoom-out":

@@ -81,6 +81,8 @@ import type {
   TerminalOutputEvent,
   TickEvent,
   UsageError,
+  ClientSecret,
+  VoiceAgentStatus,
   VoiceBridgeStatus,
   WorkflowJournal,
   WorkflowJournalEvent,
@@ -242,6 +244,12 @@ const mockVoiceBridge: VoiceBridgeStatus = {
   token: "mock-voice-token",
   url: null,
   error: null,
+};
+
+// In-memory voice-agent key state for the browser mock (no real Keychain).
+const mockVoiceAgent: VoiceAgentStatus = {
+  configured: false,
+  key_hint: null,
 };
 
 let mockCounter = 0;
@@ -1471,6 +1479,35 @@ export const mockCommands = {
       ? `http://127.0.0.1:${mockVoiceBridge.port}/mcp`
       : null;
     return ok({ ...mockVoiceBridge });
+  },
+
+  // ---- In-app voice agent ----
+  // No Keychain / OpenAI in the browser mock: the key "stores" in memory so the
+  // Settings card is exercisable, but a session can never start (clear error).
+
+  async voiceAgentStatus(): Promise<VoiceAgentStatus> {
+    return { ...mockVoiceAgent };
+  },
+
+  async setVoiceAgentKey(key: string): Promise<Result<VoiceAgentStatus, string>> {
+    if (key.trim().length < 20) return err("that is too short to be an OpenAI API key");
+    mockVoiceAgent.configured = true;
+    mockVoiceAgent.key_hint = `sk-…${key.trim().slice(-4)}`;
+    return ok({ ...mockVoiceAgent });
+  },
+
+  async clearVoiceAgentKey(): Promise<Result<VoiceAgentStatus, string>> {
+    mockVoiceAgent.configured = false;
+    mockVoiceAgent.key_hint = null;
+    return ok({ ...mockVoiceAgent });
+  },
+
+  async voiceAgentClientSecret(): Promise<Result<ClientSecret, string>> {
+    return err("the voice agent is not available in the browser mock");
+  },
+
+  async appControlTools(_surface: string): Promise<Result<unknown, string>> {
+    return ok({ tools: [] });
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

@@ -203,6 +203,7 @@ export type ShortcutAction =
   | "prev-conversation"
   | "next-conversation"
   | "open-history"
+  | "toggle-voice"
   | "zoom-in"
   | "zoom-out"
   | "zoom-reset";
@@ -234,6 +235,9 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "prev-conversation", spec: { code: "ArrowUp", alt: true }, scope: "global" },
   { action: "next-conversation", spec: { code: "ArrowDown", alt: true }, scope: "global" },
   { action: "open-history", spec: { key: "o", shift: true }, scope: "global" },
+  // Voice agent push-to-talk — global: talking to the fleet must work from any
+  // view. Inert (the action no-ops) while no OpenAI key is configured.
+  { action: "toggle-voice", spec: { key: "v", shift: true }, scope: "global" },
   // Interface zoom — the browser chords, and global on purpose: making the app readable
   // must work from wherever focus happens to be, editor and terminal included (neither
   // binds these).
@@ -286,6 +290,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘⌥ ↑ / ⌘⌥ ↓", label: "Previous / next conversation" },
       { keys: "⌘⇧ O", label: "Open conversation history" },
       { keys: "⌘⇧ M", label: "Mute / unmute notification sound" },
+      { keys: "⌘⇧ V", label: "Voice agent — start / stop talking (needs an OpenAI key)" },
       { keys: "⌘ ,", label: "Open Settings" },
       { keys: "⌘ Z", label: "Restore the last deleted conversation" },
       { keys: "⌘ + / ⌘ −", label: "Zoom the interface in / out" },

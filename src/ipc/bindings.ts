@@ -1880,6 +1880,61 @@ async setVoiceBridge(enabled: boolean | null, port: number | null, regenerateTok
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Whether an OpenAI key is stored (plus its masked hint). `configured: false`
+ * is the NORMAL optional-feature state, never an error.
+ */
+async voiceAgentStatus() : Promise<VoiceAgentStatus> {
+    return await TAURI_INVOKE("voice_agent_status");
+},
+/**
+ * Store the user's OpenAI API key in the macOS Keychain (verified by
+ * read-back). Returns the fresh status.
+ */
+async setVoiceAgentKey(key: string) : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_voice_agent_key", { key }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget the stored OpenAI key (absent item = success).
+ */
+async clearVoiceAgentKey() : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_voice_agent_key") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Mint a short-lived Realtime client secret for ONE voice session — the only
+ * shape of the credential the webview ever sees.
+ */
+async voiceAgentClientSecret() : Promise<Result<ClientSecret, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
+ * JSON. The in-app voice agent reads it to declare its Realtime function
+ * tools from the SAME source the MCP servers serve — one catalogue, no drift.
+ */
+async appControlTools(surface: string) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("app_control_tools", { surface }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2213,6 +2268,15 @@ to: string | null;
  * The CLI's own result line, bounded — shown verbatim so the user sees exactly what it said.
  */
 message: string }
+/**
+ * A short-lived Realtime client secret, safe to hand to the webview: it opens
+ * exactly one WebRTC session and expires on its own.
+ */
+export type ClientSecret = { value: string; 
+/**
+ * Unix seconds, as reported by OpenAI.
+ */
+expires_at: number; model: string }
 /**
  * The signed-in Codex account, whitelisted from `account/read` (no tokens — the wire
  * response carries none, and we forward only these fields).
@@ -3849,6 +3913,16 @@ export type UsageError =
  * the frontend converts it with the JS `Date` parser.
  */
 export type UsageWindow = { used_percentage: number; resets_at: string | null }
+/**
+ * What the Settings card needs to render the voice-agent state: whether a key
+ * is stored, and a masked hint so the user can tell WHICH key without ever
+ * seeing it again.
+ */
+export type VoiceAgentStatus = { configured: boolean; 
+/**
+ * e.g. `"sk-…d4f2"` — never more than the tail of the key.
+ */
+key_hint: string | null }
 /**
  * The live state of the voice bridge, as reported to the Settings UI. This is
  * the honest read-back: `running`/`error` reflect what the listener actually
