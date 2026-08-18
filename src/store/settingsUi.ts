@@ -14,6 +14,7 @@ export type SettingsSection =
   | "composer"
   | "reordering"
   | "shortcuts"
+  | "control"
   | "notifications"
   | "updates"
   | "data";

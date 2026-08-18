@@ -65,6 +65,16 @@ pub enum PermissionDecision {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum InboundControl {
     CanUseTool(CanUseToolReq),
+    /// A JSON-RPC message for an SDK MCP server WE host (spec §4.6): the CLI
+    /// routes the MCP client traffic of every server advertised in
+    /// `initialize.sdkMcpServers` through the control channel. `message` is the
+    /// raw JSON-RPC request/notification; the reply must ride a success
+    /// `control_response` as `{mcp_response: <JSON-RPC>}` (see
+    /// [`mcp_control_response`], dissected from the 2.1.233 binary).
+    McpMessage {
+        server_name: String,
+        message: Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -209,9 +219,18 @@ fn control_request(request_id: &str, request: Value) -> Value {
 }
 
 /// `initialize` — sent fire-and-forget at session start (spec §4.4). Minimal
-/// body; we advertise no hooks / MCP servers / dialogs yet.
-pub fn initialize_request(request_id: &str) -> Value {
-    control_request(request_id, json!({ "subtype": "initialize" }))
+/// body, plus the SDK MCP servers we host (`sdkMcpServers` is an array of
+/// NAMES — the CLI registers each as a `{type:"sdk"}` server and then drives
+/// the MCP handshake through inbound `mcp_message` control requests; verified
+/// against the 2.1.233 binary, which rejects anything but an array of strings).
+/// The field is OMITTED when empty, keeping the wire identical to the pre-MCP
+/// client for sessions that don't expose app control. No hooks / dialogs yet.
+pub fn initialize_request(request_id: &str, sdk_mcp_servers: &[&str]) -> Value {
+    let mut body = json!({ "subtype": "initialize" });
+    if !sdk_mcp_servers.is_empty() {
+        body["sdkMcpServers"] = json!(sdk_mcp_servers);
+    }
+    control_request(request_id, body)
 }
 
 /// `interrupt` — stop the current turn without killing the process (spec §2.4).
@@ -792,6 +811,22 @@ pub fn permission_deny_response(request_id: &str, tool_use_id: &str, message: &s
     })
 }
 
+/// The success `control_response` answering an inbound `mcp_message`: the SDK
+/// MCP server's JSON-RPC reply rides the doubly-nested success payload as
+/// `{mcp_response: <JSON-RPC>}`. Dissected from the CLI (2.1.233):
+/// `sendMcpMessage` validates exactly that shape, and a NOTIFICATION (no `id`)
+/// is acked with `{jsonrpc:"2.0", result:{}, id:0}` in the same envelope.
+pub fn mcp_control_response(request_id: &str, mcp_response: Value) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": { "mcp_response": mcp_response }
+        }
+    })
+}
+
 /// An error `control_response` for an inbound request we cannot satisfy (spec
 /// §4.1: `error` is a string). Used for unsupported inbound control subtypes so
 /// the CLI does not hang waiting on us.
@@ -946,8 +981,49 @@ mod tests {
                 assert_eq!(req.tool_use_id, "toolu_123");
                 assert_eq!(req.input["command"], json!("echo hi"));
             }
-            InboundControl::Unknown => panic!("expected can_use_tool"),
+            other => panic!("expected can_use_tool, got {other:?}"),
         }
+    }
+
+    /// The `mcp_message` subtype (SDK MCP servers we host) types into its own
+    /// variant, carrying the raw JSON-RPC payload untouched.
+    #[test]
+    fn mcp_message_inbound_control_parses() {
+        let line = json!({
+            "type": "control_request",
+            "request_id": "req-9",
+            "request": {
+                "subtype": "mcp_message",
+                "server_name": "flightdeck",
+                "message": { "jsonrpc": "2.0", "id": 3, "method": "tools/list" }
+            }
+        });
+        let (rid, body) = parse_inbound_control(&line).expect("should parse");
+        assert_eq!(rid, "req-9");
+        match body.expect("body should type") {
+            InboundControl::McpMessage { server_name, message } => {
+                assert_eq!(server_name, "flightdeck");
+                assert_eq!(message["method"], json!("tools/list"));
+            }
+            other => panic!("expected mcp_message, got {other:?}"),
+        }
+    }
+
+    /// The wire shapes of the MCP hosting handshake: `initialize` carries
+    /// `sdkMcpServers` as an array of names ONLY when servers exist, and the
+    /// `mcp_response` reply nests inside the doubly-nested success payload.
+    #[test]
+    fn mcp_hosting_wire_shapes() {
+        let init = initialize_request("r1", &["flightdeck"]);
+        assert_eq!(init["request"]["sdkMcpServers"], json!(["flightdeck"]));
+        let bare = initialize_request("r2", &[]);
+        assert!(bare["request"].get("sdkMcpServers").is_none());
+
+        let resp = mcp_control_response("req-9", json!({ "jsonrpc": "2.0", "id": 3, "result": {} }));
+        assert_eq!(resp["type"], json!("control_response"));
+        assert_eq!(resp["response"]["subtype"], json!("success"));
+        assert_eq!(resp["response"]["request_id"], json!("req-9"));
+        assert_eq!(resp["response"]["response"]["mcp_response"]["id"], json!(3));
     }
 
     #[test]
@@ -1291,7 +1367,7 @@ mod tests {
         let (mut transport, mut rx) =
             Transport::spawn(SpawnConfig::new(cwd)).expect("claude should spawn");
         transport
-            .send_line(initialize_request("probe-init"))
+            .send_line(initialize_request("probe-init", &[]))
             .expect("send initialize");
 
         // MCP servers connect asynchronously after startup, so query a few times
@@ -1381,7 +1457,7 @@ mod tests {
         .collect();
         let (mut transport, mut rx) = Transport::spawn(cfg).expect("claude should spawn");
         transport
-            .send_line(initialize_request("cap-init"))
+            .send_line(initialize_request("cap-init", &[]))
             .expect("send initialize");
 
         // Pull the tool_use blocks (id, name, input) out of an assistant `message` Value.
@@ -1634,7 +1710,7 @@ mod tests {
         cfg.allowed_tools = ["Skill"].iter().map(|s| s.to_string()).collect();
         let (mut transport, mut rx) = Transport::spawn(cfg).expect("claude should spawn");
         transport
-            .send_line(initialize_request("cap-init"))
+            .send_line(initialize_request("cap-init", &[]))
             .expect("send initialize");
 
         // Concatenate a user `message` Value's text blocks (or string content).

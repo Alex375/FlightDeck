@@ -474,6 +474,16 @@ near-empty): `hooks`, `sdkMcpServers`, `jsonSchema`, `systemPrompt` (string coer
 `promptSuggestions`, etc. Hook callbacks are registered locally as `hook_<n>` ids; the CLI later
 invokes them via inbound `control_request{subtype:"hook_callback", callback_id, input, tool_use_id}`.
 
+**`sdkMcpServers`** (`confirmed`, dissected from 2.1.233 + live-verified): an **array of server
+NAMES** (strings — the CLI validates exactly that and errors otherwise). Each name is registered
+CLI-side as an MCP server of `{type:"sdk", name}`; the CLI then runs a full MCP client handshake
+(initialize → notifications/initialized → tools/list → tools/call …) against US, each JSON-RPC
+message delivered as an inbound `control_request{subtype:"mcp_message"}` (§4.6). The app uses
+this to host the `"flightdeck"` app-control server (`src-tauri/src/appmcp/`), advertised only
+when the session was spawned with the hub (Settings → Control). Tools surface to the model as
+`mcp__<server>__<tool>` and — **live-verified (2.1.233, permission mode "default")** — DO route
+through the normal `can_use_tool` permission flow like any other tool.
+
 **Response** (`response.response`): at least `{commands, models, agents}` (consumed as opaque
 arrays — exact element shapes unknown, §7), optionally `account`. May ALSO carry
 `pending_permission_requests` / `pending_user_dialog_requests` arrays which are honored **only on
@@ -524,8 +534,21 @@ plus oauth/host token refresh. We must:
    (e.g. `request_user_dialog` we cannot settle).
 
 **`mcp_message`** (inbound only): `{subtype:"mcp_message", server_name, message:<JSON-RPC>}`.
-For MVP we host **no** SDK MCP servers, so we never advertise `sdkMcpServers` and the CLI will
-not send `mcp_message`; if one arrives, reply `error` ("SDK MCP server not found").
+We HOST SDK MCP servers now (the `"flightdeck"` app-control server — `src-tauri/src/appmcp/`,
+advertised per session via `sdkMcpServers`, §4.4). Handling (`confirmed`, dissected from the
+2.1.233 SDK client and mirrored):
+- unknown `server_name` (or a session spawned without the hub) → `control_response` **error**
+  `"SDK MCP server not found: <name>"` (the SDK client's exact behaviour);
+- `message` is a JSON-RPC REQUEST (`method` + non-null `id`) → run it through the MCP router
+  and reply success with the response nested as **`{mcp_response: <JSON-RPC response>}`** in the
+  doubly-nested payload (`control.rs::mcp_control_response`);
+- `message` is a NOTIFICATION (no `id`) → still reply success with the fixed ack
+  `{mcp_response: {jsonrpc:"2.0", result:{}, id:0}}` — never silence, the CLI awaits every
+  `mcp_message` it sends.
+Handled on a SPAWNED task (never inline in the session actor): a tools/call round-trips through
+the front executor and must not block the stream. Observed live (2.1.233): after our replies the
+CLI emits `control_response` lines keyed by its own `mcp_message` request ids — untracked on our
+side, logged and dropped, benign.
 
 ### 4.7 Housekeeping types
 

@@ -21,6 +21,7 @@ import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
+import { ControlSection } from "./ControlSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -42,6 +43,8 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   { id: "composer", label: "Composer", icon: "wand" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
+  // Agents piloting the app: the in-process MCP server + the voice bridge.
+  { id: "control", label: "Control", icon: "wand" },
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
   { id: "data", label: "Data", icon: "trash" },
@@ -178,6 +181,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             )}
 
             {section === "shortcuts" && <ShortcutsSection />}
+
+            {section === "control" && (
+              <div className={styles.page}>
+                <PageHead
+                  title="Control"
+                  subtitle="Let agents pilot the app — from inside a conversation, or from an external voice assistant."
+                />
+                <ControlSection />
+              </div>
+            )}
 
             {section === "notifications" && <NotificationsSection />}
 
