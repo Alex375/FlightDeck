@@ -6,6 +6,7 @@
 // verifies by read-back Rust-side, and the UI only ever shows the masked hint.
 import { useCallback, useEffect, useState } from "react";
 import { commands, type VoiceAgentStatus } from "../../ipc/client";
+import { useVoiceStore } from "../../voice/voiceStore";
 import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -21,15 +22,23 @@ export function VoiceAgentSection() {
   const [error, setError] = useState<string | null>(null);
   const [closeDraft, setCloseDraft] = useState<string | null>(null);
 
+  // Every status learned here also lands in the SHARED voiceStore mirror, so
+  // the title-bar chip (and ⌘⇧V / the announcement gate) update immediately —
+  // never "save the key, chip appears after an app refocus".
+  const publish = useCallback((s: VoiceAgentStatus) => {
+    setStatus(s);
+    useVoiceStore.getState().setConfigured(s);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     void commands.voiceAgentStatus().then((s) => {
-      if (!disposed) setStatus(s);
+      if (!disposed) publish(s);
     });
     return () => {
       disposed = true;
     };
-  }, []);
+  }, [publish]);
 
   const saveKey = useCallback(async () => {
     const key = keyDraft.trim();
@@ -39,7 +48,7 @@ export function VoiceAgentSection() {
     try {
       const res = await commands.setVoiceAgentKey(key);
       if (res.status === "ok") {
-        setStatus(res.data);
+        publish(res.data);
         setKeyDraft("");
       } else {
         setError(res.error);
@@ -47,19 +56,19 @@ export function VoiceAgentSection() {
     } finally {
       setBusy(false);
     }
-  }, [keyDraft]);
+  }, [keyDraft, publish]);
 
   const removeKey = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
       const res = await commands.clearVoiceAgentKey();
-      if (res.status === "ok") setStatus(res.data);
+      if (res.status === "ok") publish(res.data);
       else setError(res.error);
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [publish]);
 
   const commitAutoClose = useCallback(() => {
     if (closeDraft === null) return;
@@ -132,7 +141,7 @@ export function VoiceAgentSection() {
       <ToggleRow
         title="Spoken announcements"
         hint="Speak fleet events aloud (a turn finished, an agent waits on you) even without an open session. Announcement sessions are output-only: the microphone stays off."
-        checked={configured && announcements}
+        checked={announcements}
         onChange={(next) => setPrefs({ announcements: next })}
         disabled={!configured}
       />

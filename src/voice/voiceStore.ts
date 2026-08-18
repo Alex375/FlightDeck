@@ -22,8 +22,18 @@ interface VoiceState {
   /** Whether the CURRENT session has the microphone (push-to-talk) or is an
    *  output-only announcement session. */
   micLive: boolean;
+  /**
+   * Whether an OpenAI key is stored — the SHARED mirror of the Rust
+   * `voice_agent_status` truth, written by whoever learns it (VoiceHost's
+   * mount seed, the Settings card after save/remove). One synchronous source
+   * for the chip's visibility, the ⌘⇧V inertness and the announcement gate,
+   * so those three can never disagree. `null` = not read yet.
+   */
+  configured: boolean | null;
+  keyHint: string | null;
   setPhase: (phase: VoicePhase) => void;
   setMicLive: (micLive: boolean) => void;
+  setConfigured: (status: { configured: boolean; key_hint: string | null }) => void;
   fail: (error: string) => void;
   reset: () => void;
 }
@@ -32,8 +42,12 @@ export const useVoiceStore = create<VoiceState>((set) => ({
   phase: "off",
   error: null,
   micLive: false,
+  configured: null,
+  keyHint: null,
   setPhase: (phase) => set(phase === "off" ? { phase, micLive: false } : { phase, error: null }),
   setMicLive: (micLive) => set({ micLive }),
+  setConfigured: (status) =>
+    set({ configured: status.configured, keyHint: status.key_hint }),
   fail: (error) => set({ phase: "error", error, micLive: false }),
   reset: () => set({ phase: "off", error: null, micLive: false }),
 }));

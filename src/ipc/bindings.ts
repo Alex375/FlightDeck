@@ -1883,10 +1883,17 @@ async setVoiceBridge(enabled: boolean | null, port: number | null, regenerateTok
 },
 /**
  * Whether an OpenAI key is stored (plus its masked hint). `configured: false`
- * is the NORMAL optional-feature state, never an error.
+ * is the NORMAL optional-feature state, never an error. Async + off-thread:
+ * every one of these spawns `/usr/bin/security`, which must never run on the
+ * main thread (a Keychain ACL prompt can block it for seconds).
  */
-async voiceAgentStatus() : Promise<VoiceAgentStatus> {
-    return await TAURI_INVOKE("voice_agent_status");
+async voiceAgentStatus() : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 /**
  * Store the user's OpenAI API key in the macOS Keychain (verified by

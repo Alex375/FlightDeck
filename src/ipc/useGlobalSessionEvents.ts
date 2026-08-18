@@ -58,6 +58,7 @@ import {
 } from "../notifications/notify";
 import { queueVoiceAnnouncement } from "../voice/announce";
 import { useVoicePrefs } from "../voice/voicePrefs";
+import { useVoiceStore } from "../voice/voiceStore";
 import {
   SETTLE_MS,
   agentEventFor,
@@ -232,7 +233,7 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // nothing (the queue caps and drains in src/voice). Fed HERE, not from the
   // Rust journal, so all three surfaces (OS ping, voice bridge, spoken line)
   // share one truth about "what just happened".
-  if (useVoicePrefs.getState().announcements) {
+  if (useVoicePrefs.getState().announcements && useVoiceStore.getState().configured === true) {
     queueVoiceAnnouncement(
       kind === "done"
         ? {

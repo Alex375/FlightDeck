@@ -12,12 +12,43 @@
 //! "add an OpenAI key", and nothing else in the app touches this module. No
 //! background polling, no startup cost, no error — absence is a normal state.
 
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 /// Keychain identity of the stored key. Distinct service name so it can never
 /// collide with the TOSSE credentials or Claude's own items.
 const KEYCHAIN_SERVICE: &str = "Flight Deck OpenAI";
 const KEYCHAIN_ACCOUNT: &str = "api-key";
+const PRODUCTION_IDENTIFIER: &str = "com.tosse.desktop";
+
+/// This build's bundle identifier, published once at setup (same discipline as
+/// `tosse::set_bundle_identifier`). ⚠️ Without the per-identity suffix below, a
+/// `/build-app` test build and the production app would read, overwrite (`-U`)
+/// and delete the SAME Keychain item — the exact cross-talk bug class the TOSSE
+/// store documents as previously shipped and fixed.
+static BUNDLE_IDENTIFIER: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_bundle_identifier(identifier: String) {
+    if let Ok(mut guard) = BUNDLE_IDENTIFIER.lock() {
+        *guard = Some(identifier);
+    }
+}
+
+/// The Keychain item name for THIS build: production keeps the bare name, every
+/// other identity (dev build, per-feature test builds) gets its own suffixed item.
+fn keychain_service() -> String {
+    service_name_for(BUNDLE_IDENTIFIER.lock().ok().and_then(|g| g.clone()).as_deref())
+}
+
+/// The naming rule, split out for tests. `None` (identifier never published,
+/// e.g. a unit test) keeps the production name.
+fn service_name_for(identifier: Option<&str>) -> String {
+    match identifier {
+        Some(id) if id != PRODUCTION_IDENTIFIER => format!("{KEYCHAIN_SERVICE} ({id})"),
+        _ => KEYCHAIN_SERVICE.to_string(),
+    }
+}
 
 /// Realtime session defaults. The model is OpenAI's GA speech-to-speech model;
 /// the voice is one of its natural presets. Deliberately constants for v1 — a
@@ -86,7 +117,7 @@ pub fn set_key(key: &str) -> Result<VoiceAgentStatus, String> {
             "add-generic-password",
             "-U",
             "-s",
-            KEYCHAIN_SERVICE,
+            &keychain_service(),
             "-a",
             KEYCHAIN_ACCOUNT,
             "-D",
@@ -114,7 +145,7 @@ pub fn set_key(key: &str) -> Result<VoiceAgentStatus, String> {
 /// error — only a real Keychain failure surfaces.
 pub fn clear_key() -> Result<VoiceAgentStatus, String> {
     let out = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+        .args(["delete-generic-password", "-s", &keychain_service(), "-a", KEYCHAIN_ACCOUNT])
         .output()
         .map_err(|e| format!("failed to run /usr/bin/security: {e}"))?;
     // Exit 44 = item not found — already the state we want.
@@ -136,7 +167,7 @@ fn read_key() -> Option<String> {
         .args([
             "find-generic-password",
             "-s",
-            KEYCHAIN_SERVICE,
+            &keychain_service(),
             "-a",
             KEYCHAIN_ACCOUNT,
             "-w",

@@ -544,6 +544,9 @@ pub fn run() {
             // signed both out; test builds now get their own item, production keeps the
             // historic one (renaming it there would orphan every existing install's).
             tosse::set_bundle_identifier(app.config().identifier.clone());
+            // Same per-identity isolation for the voice agent's OpenAI key item:
+            // a test build must never read or clobber production's key.
+            voice::set_bundle_identifier(app.config().identifier.clone());
 
             // Open the persistence store in the app data dir (created if absent).
             // The store is the single owner of SQLite; the rest of the core and

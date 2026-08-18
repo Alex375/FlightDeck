@@ -2683,26 +2683,34 @@ pub async fn set_voice_bridge(
 // ---------------------------------------------------------------------------
 
 /// Whether an OpenAI key is stored (plus its masked hint). `configured: false`
-/// is the NORMAL optional-feature state, never an error.
+/// is the NORMAL optional-feature state, never an error. Async + off-thread:
+/// every one of these spawns `/usr/bin/security`, which must never run on the
+/// main thread (a Keychain ACL prompt can block it for seconds).
 #[tauri::command]
 #[specta::specta]
-pub fn voice_agent_status() -> crate::voice::VoiceAgentStatus {
-    crate::voice::status()
+pub async fn voice_agent_status() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::status)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))
 }
 
 /// Store the user's OpenAI API key in the macOS Keychain (verified by
 /// read-back). Returns the fresh status.
 #[tauri::command]
 #[specta::specta]
-pub fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
-    crate::voice::set_key(&key)
+pub async fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
 }
 
 /// Forget the stored OpenAI key (absent item = success).
 #[tauri::command]
 #[specta::specta]
-pub fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
-    crate::voice::clear_key()
+pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::clear_key)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
 }
 
 /// Mint a short-lived Realtime client secret for ONE voice session — the only

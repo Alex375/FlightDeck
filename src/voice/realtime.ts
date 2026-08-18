@@ -11,14 +11,21 @@
 // (`executeAppControlTool`) — a voice command and an in-app agent tool call can
 // never mean two different things.
 //
-// Cost guard: an idle session self-closes after `autoCloseSeconds` without
-// activity (Realtime bills per audio minute) — every protocol event re-arms it.
+// Lifecycle invariants (each one covers a reviewed failure mode):
+// - A FAILED start releases everything it acquired — mic tracks, peer
+//   connection, audio sink. A hot microphone with the chip showing "error"
+//   is the one state this file must never produce.
+// - `session.ready` always SETTLES (open → resolve; any teardown → reject), so
+//   nothing can park on it forever.
+// - The idle cost-guard never fires mid-playback (audio outlives the data
+//   channel events), and "disconnected" is transient in WebRTC — only
+//   failed/closed tear the session down.
 
 import { commands } from "../ipc/client";
 import { executeAppControlTool, type AppControlHelpers } from "../agent/appControl";
 import { useVoicePrefs } from "./voicePrefs";
 import { useVoiceStore } from "./voiceStore";
-import { announcementText, type FleetAnnouncement } from "./announce";
+import { announcementText, clearVoiceAnnouncements, type FleetAnnouncement } from "./announce";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
@@ -48,9 +55,16 @@ interface LiveSession {
   dc: RTCDataChannel;
   mic: MediaStream | null;
   audioEl: HTMLAudioElement;
+  /** Settles when the data channel opens (resolve) or the session tears down
+   *  first (reject). ALWAYS settles — see `settleReady`. */
   ready: Promise<void>;
+  settleReady: (err?: Error) => void;
   idleTimer: ReturnType<typeof setTimeout> | null;
-  /** Resolvers waiting for the next `response.done` (announcement drain). */
+  /** Responses the server is currently generating (`response.created` −
+   *  `response.done`), so announcements never talk over an active exchange. */
+  activeResponses: number;
+  /** One-shot listeners flushed on every `response.done` and on teardown; each
+   *  waiter also self-removes on its own timeout (no stale resolvers). */
   responseWaiters: Array<() => void>;
 }
 
@@ -69,16 +83,24 @@ export function voiceSessionLive(): boolean {
 
 /** The push-to-talk entry point (header chip + ⌘⇧V): off → start with mic;
  *  live without mic (announcement session) → restart WITH mic; live with mic
- *  → stop. */
+ *  → hang up. A start still in flight is awaited first so a press during the
+ *  connect window is honoured, never silently swallowed. */
 export async function toggleVoiceSession(): Promise<void> {
-  const { micLive } = useVoiceStore.getState();
+  if (starting) await starting.catch(() => {});
   if (session) {
+    const wasMicless = !useVoiceStore.getState().micLive;
     stopVoiceSession();
-    // Upgrading an output-only session to push-to-talk: restart with the mic.
-    if (!micLive) await startVoiceSession({ withMic: true });
+    if (wasMicless) {
+      // Upgrading an output-only session to push-to-talk: restart with the mic.
+      await startVoiceSession({ withMic: true }).catch(() => {});
+    } else {
+      // A real hang-up: drop the announcement backlog too, or the drain would
+      // reopen a session seconds later to finish reading it out.
+      clearVoiceAnnouncements();
+    }
     return;
   }
-  await startVoiceSession({ withMic: true });
+  await startVoiceSession({ withMic: true }).catch(() => {});
 }
 
 export async function startVoiceSession(opts: { withMic: boolean }): Promise<void> {
@@ -93,6 +115,11 @@ export async function startVoiceSession(opts: { withMic: boolean }): Promise<voi
 async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
   const store = useVoiceStore.getState();
   store.setPhase("connecting");
+  // Hoisted so the catch can release EVERYTHING already acquired: a failed
+  // start must never leave a hot mic or an open peer connection behind.
+  let mic: MediaStream | null = null;
+  let pc: RTCPeerConnection | null = null;
+  let audioEl: HTMLAudioElement | null = null;
   try {
     // 1. Short-lived credential + the tool catalogue (single source: Rust).
     const secretRes = await commands.voiceAgentClientSecret();
@@ -111,7 +138,6 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
       }));
 
     // 2. Microphone only for push-to-talk — never for announcements.
-    let mic: MediaStream | null = null;
     if (withMic) {
       try {
         mic = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -125,14 +151,14 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
     }
 
     // 3. WebRTC leg. The audio sink must be in the DOM for WebKit to play it.
-    const pc = new RTCPeerConnection();
-    const audioEl = document.createElement("audio");
+    pc = new RTCPeerConnection();
+    audioEl = document.createElement("audio");
     audioEl.autoplay = true;
     audioEl.style.display = "none";
-    audioEl.dataset.voiceAgent = "1"; // lets a failed start's orphan be swept
     document.body.appendChild(audioEl);
+    const sink = audioEl;
     pc.ontrack = (e) => {
-      audioEl.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+      sink.srcObject = e.streams[0] ?? new MediaStream([e.track]);
     };
     if (mic) {
       for (const track of mic.getTracks()) pc.addTrack(track, mic);
@@ -147,15 +173,25 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
       readyResolve = res;
       readyReject = rej;
     });
+    let readySettled = false;
     const next: LiveSession = {
       pc,
       dc,
       mic,
       audioEl,
       ready,
+      settleReady: (err?: Error) => {
+        if (readySettled) return;
+        readySettled = true;
+        if (err) readyReject(err);
+        else readyResolve();
+      },
       idleTimer: null,
+      activeResponses: 0,
       responseWaiters: [],
     };
+    // A rejected `ready` is normal teardown; never let it surface as unhandled.
+    void ready.catch(() => {});
     dc.onopen = () => {
       // Declare instructions + tools; audio/voice were fixed at mint time.
       dcSend(next, {
@@ -163,7 +199,7 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
         session: { type: "realtime", instructions: INSTRUCTIONS, tools, tool_choice: "auto" },
       });
       useVoiceStore.getState().setPhase(withMic ? "listening" : "saying");
-      readyResolve();
+      next.settleReady();
     };
     dc.onmessage = (e) => {
       try {
@@ -173,8 +209,10 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
       }
     };
     pc.onconnectionstatechange = () => {
-      if (session !== next) return;
-      if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+      if (session !== next || !pc) return;
+      // "disconnected" is TRANSIENT in WebRTC (brief ICE liveness loss that
+      // usually self-recovers) — only failed/closed are terminal.
+      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
         stopVoiceSession();
         useVoiceStore.getState().fail("the voice connection dropped");
       }
@@ -197,30 +235,35 @@ async function doStart({ withMic }: { withMic: boolean }): Promise<void> {
     useVoiceStore.getState().setMicLive(withMic);
     armIdleTimer(next);
     // Surface a data-channel that never opens (network middlebox) as a failure
-    // instead of a forever-"connecting" chip.
+    // instead of a forever-"connecting" chip. stopVoiceSession settles `ready`,
+    // so nothing awaiting it can wedge.
     setTimeout(() => {
       if (session === next && next.dc.readyState !== "open") {
         stopVoiceSession();
         useVoiceStore.getState().fail("the voice channel never opened");
       }
     }, 10_000);
-    void ready.catch(() => {});
-    void readyReject; // reserved for symmetric teardown paths
   } catch (e) {
-    cleanupDom();
+    mic?.getTracks().forEach((t) => t.stop());
+    try {
+      pc?.close();
+    } catch { /* already closed */ }
+    audioEl?.remove();
     useVoiceStore.getState().fail(e instanceof Error ? e.message : String(e));
     throw e;
   }
 }
 
 /** Tear the session down (idle timeout, toggle off, connection drop). Safe to
- *  call twice. */
+ *  call twice. Settles `ready` and flushes every waiter so no async caller can
+ *  stay parked on a dead session. */
 export function stopVoiceSession(): void {
   const s = session;
   session = null;
   if (!s) return;
   if (s.idleTimer) clearTimeout(s.idleTimer);
-  s.responseWaiters.forEach((w) => w());
+  s.settleReady(new Error("the voice session ended"));
+  s.responseWaiters.slice().forEach((w) => w());
   s.responseWaiters.length = 0;
   try {
     s.dc.close();
@@ -233,26 +276,46 @@ export function stopVoiceSession(): void {
   useVoiceStore.getState().reset();
 }
 
-/** Remove any orphaned audio sink after a failed start. */
-function cleanupDom(): void {
-  // A failed doStart never assigned `session`, so its element is the only
-  // audio sink without a live session; stopVoiceSession removes the live one.
-  if (!session) {
-    document.querySelectorAll("audio[data-voice-agent]").forEach((el) => el.remove());
-  }
-}
-
 function dcSend(s: LiveSession, payload: unknown): void {
   if (s.dc.readyState === "open") s.dc.send(JSON.stringify(payload));
 }
 
-/** Re-arm the cost guard: close the session after N silent seconds. */
+/** Re-arm the cost guard. When it fires mid-PLAYBACK (audio keeps flowing on
+ *  the media track long after the last data-channel event — that lag is what
+ *  `output_audio_buffer.*` exists for), it re-arms instead of hanging up:
+ *  cutting an answer mid-sentence to save seconds is the wrong trade. */
 function armIdleTimer(s: LiveSession): void {
   if (s.idleTimer) clearTimeout(s.idleTimer);
   const seconds = useVoicePrefs.getState().autoCloseSeconds;
   s.idleTimer = setTimeout(() => {
-    if (session === s) stopVoiceSession();
+    if (session !== s) return;
+    if (useVoiceStore.getState().phase === "speaking") {
+      armIdleTimer(s);
+      return;
+    }
+    stopVoiceSession();
   }, seconds * 1000);
+}
+
+/** Park until the next `response.done` (or teardown), self-removing on its own
+ *  timeout so a stale resolver can never satisfy a LATER caller's wait. */
+function waitEvent(s: LiveSession, timeoutMs: number): Promise<void> {
+  return new Promise<void>((res) => {
+    const timer = setTimeout(() => {
+      remove();
+      res();
+    }, timeoutMs);
+    const waiter = () => {
+      clearTimeout(timer);
+      remove();
+      res();
+    };
+    const remove = () => {
+      const i = s.responseWaiters.indexOf(waiter);
+      if (i >= 0) s.responseWaiters.splice(i, 1);
+    };
+    s.responseWaiters.push(waiter);
+  });
 }
 
 function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unknown>): void {
@@ -266,13 +329,16 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
     case "output_audio_buffer.started":
       store.setPhase("speaking");
       break;
+    case "response.created":
+      s.activeResponses += 1;
+      break;
     case "output_audio_buffer.stopped":
-    case "response.done": {
       store.setPhase(store.micLive ? "listening" : "saying");
-      if (ev.type === "response.done") {
-        s.responseWaiters.forEach((w) => w());
-        s.responseWaiters.length = 0;
-      }
+      break;
+    case "response.done": {
+      s.activeResponses = Math.max(0, s.activeResponses - 1);
+      if (store.phase !== "speaking") store.setPhase(store.micLive ? "listening" : "saying");
+      s.responseWaiters.slice().forEach((w) => w());
       break;
     }
     case "response.output_item.done": {
@@ -323,22 +389,44 @@ async function runToolCall(
 
 /**
  * Speak one fleet announcement: reuse the live session or open an OUTPUT-ONLY
- * one (no microphone), inject the event as a user message and request a
- * response. Resolves when the response finished, so the caller can drain a
- * queue without the agent talking over itself.
+ * one (no microphone), wait for any active exchange to finish (never talk over
+ * the user's own response), inject the event and request a response. Resolves
+ * when that response is done (bounded), so the caller drains a queue one
+ * spoken line at a time. Returns silently when the session cannot start / died
+ * mid-way — the error is on the store, and the drain loop stops on it.
  */
 export async function sayAnnouncement(a: FleetAnnouncement): Promise<void> {
-  if (!session) await startVoiceSession({ withMic: false });
+  if (!session) {
+    try {
+      await startVoiceSession({ withMic: false });
+    } catch {
+      return; // start failed; voiceStore carries the error
+    }
+  }
   const s = session;
-  if (!s) return; // start failed; the store carries the error
-  await s.ready;
-  const done = new Promise<void>((res) => s.responseWaiters.push(res));
+  if (!s) return;
+  try {
+    await s.ready;
+  } catch {
+    return; // torn down before the channel opened
+  }
+  // Never inject over an active response (the server rejects a second
+  // response.create) — wait for quiet, bounded.
+  const quietBy = Date.now() + 30_000;
+  while (session === s && s.activeResponses > 0 && Date.now() < quietBy) {
+    await waitEvent(s, 5_000);
+  }
+  if (session !== s) return;
   dcSend(s, {
     type: "conversation.item.create",
     item: { type: "message", role: "user", content: [{ type: "input_text", text: announcementText(a) }] },
   });
   dcSend(s, { type: "response.create" });
   armIdleTimer(s);
-  // Bounded wait: a wedged response must not deadlock the announcement drain.
-  await Promise.race([done, new Promise<void>((res) => setTimeout(res, 60_000))]);
+  // Wait for OUR response to end (bounded): loop until the server is quiet
+  // again — the first waitEvent also covers the created→done window.
+  const doneBy = Date.now() + 60_000;
+  do {
+    await waitEvent(s, 10_000);
+  } while (session === s && s.activeResponses > 0 && Date.now() < doneBy);
 }
