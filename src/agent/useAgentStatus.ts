@@ -47,8 +47,10 @@ const NEUTRAL: InnerSignals = {
 
 /** Text of the most recent assistant turn (its joined text blocks), for the
  *  open-question heuristic. Scans the timeline tail backwards and stops at the
- *  first assistant turn, so it visits only a few entries in practice. */
-function lastAssistantText(entry: SessionEntry): string | null {
+ *  first assistant turn, so it visits only a few entries in practice. Exported
+ *  for the app-control executor (voice events + read tools) so "the last
+ *  reply" always means the same thing everywhere. */
+export function lastAssistantText(entry: SessionEntry): string | null {
   for (let i = entry.timeline.length - 1; i >= 0; i--) {
     const e = entry.timeline[i];
     if (e.kind !== "turn") continue;

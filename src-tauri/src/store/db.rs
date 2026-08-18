@@ -657,6 +657,28 @@ impl Store {
         Ok(())
     }
 
+    /// Read one app-level config value from the `meta` table (e.g. the voice
+    /// bridge's `voice_bridge_*` keys). `None` when the key was never set.
+    pub fn get_config(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Upsert one app-level config value into the `meta` table.
+    pub fn set_config(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Wipe all user data: every repo, conversation, and the active selection.
     /// The schema and `schema_version` are kept. Dev escape hatch + the Settings
     /// "drop all" button.

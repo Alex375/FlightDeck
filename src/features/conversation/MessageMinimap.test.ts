@@ -6,6 +6,8 @@ import {
   activeAnchorId,
   dockMagnification,
   dockPushPx,
+  hoverDelayMs,
+  hoverRegime,
   isScrolledToBottom,
   tipStyle,
   markOffsetPx,
@@ -153,6 +155,48 @@ describe("dockPushPx", () => {
 
   it("does nothing at all when no mark is hovered", () => {
     for (const i of [0, 3, 20]) expect(dockPushPx(i, -1)).toBe(0);
+  });
+});
+
+describe("hoverRegime (cold on arrival, warm while reading)", () => {
+  const T = 10_000; // an arbitrary "now"
+
+  it("is cold on a first arrival — a pointer brushing past lights nothing up", () => {
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: null, now: T })).toBe("cold");
+  });
+
+  it("is warm while a card is up: sweeping the column follows the pointer", () => {
+    expect(hoverRegime({ previewOpen: true, leftWarmAt: null, now: T })).toBe("warm");
+  });
+
+  it("stays warm through a quick round trip out of the column", () => {
+    // Left 120ms ago with a card up — well inside the 300ms grace.
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T - 120, now: T })).toBe("warm");
+    // Exactly on the edge still counts as reading.
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T - 300, now: T })).toBe("warm");
+  });
+
+  it("goes cold again once the grace window has passed", () => {
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T - 301, now: T })).toBe("cold");
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T - 30_000, now: T })).toBe("cold");
+  });
+
+  it("does not warm up on a sweep that never showed a card", () => {
+    // The component only stamps `leftWarmAt` when a card was actually open, so a pointer that
+    // crossed the column without settling arrives with nothing to inherit.
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: null, now: T })).toBe("cold");
+  });
+});
+
+describe("hoverDelayMs", () => {
+  it("asks for a beat of intent when cold", () => {
+    expect(hoverDelayMs("cold")).toBe(260);
+  });
+
+  it("is imperceptible when warm — but never a flat 0, which strobes on a fast sweep", () => {
+    expect(hoverDelayMs("warm")).toBe(30);
+    expect(hoverDelayMs("warm")).toBeGreaterThan(0);
+    expect(hoverDelayMs("warm")).toBeLessThan(hoverDelayMs("cold") / 4);
   });
 });
 

@@ -17,9 +17,11 @@ import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
+import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
+import { ControlSection } from "./ControlSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -33,11 +35,16 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  // Next to Conversation (both shape what a conversation is), its own tab for the same
+  // reason as Composer: arranging two lists by drag is a task, not a row of switches.
+  { id: "models", label: "Models", icon: "spark" },
   // Its own tab rather than a group under General: arranging the bar is a task with a
   // preview and a drag surface, not a row of switches.
   { id: "composer", label: "Composer", icon: "wand" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
+  // Agents piloting the app: the in-process MCP server + the voice bridge.
+  { id: "control", label: "Control", icon: "wand" },
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
   { id: "data", label: "Data", icon: "trash" },
@@ -159,6 +166,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {section === "conversation" && <ConversationSection />}
 
+            {section === "models" && <ModelsSection />}
+
             {section === "composer" && <ComposerSection />}
 
             {section === "reordering" && (
@@ -172,6 +181,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             )}
 
             {section === "shortcuts" && <ShortcutsSection />}
+
+            {section === "control" && (
+              <div className={styles.page}>
+                <PageHead
+                  title="Control"
+                  subtitle="Let agents pilot the app — from inside a conversation, or from an external voice assistant."
+                />
+                <ControlSection />
+              </div>
+            )}
 
             {section === "notifications" && <NotificationsSection />}
 

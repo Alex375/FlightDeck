@@ -9,6 +9,17 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v1.10.0
+
+- New: agents can now pilot the app itself. Each conversation gets a `flightdeck` MCP server — ask your agent to open the file it just wrote at the right line, switch views or panels, create conversations in other repos, message and read the other agents, or notify you. Toggle in Settings → Control (on by default; nothing destructive is ever exposed, and the usual permission prompts apply).
+- New: Voice bridge — an opt-in local MCP server (Settings → Control) that lets an external assistant follow your fleet: list conversations, read the latest exchanges, send prompts, and get woken up the moment a turn finishes or an agent needs input.
+- New: the model catalogue is now configurable, with Opus 4.8 available and set as the default model for new conversations.
+
+## v1.9.0
+
+- Improved: the conversation minimap now tells arriving from sweeping — it stays calm when your pointer lands on it, and previews follow instantly once you start scanning.
+- Fixed: starting or discussing a TOSSE task now equips the conversation with the TOSSE plugin in both cases, so the task actually moves in the CRM.
+
 ## v1.8.0
 
 - Improved: side panels (editor, terminal, Git) now slide open and closed instead of snapping into place.

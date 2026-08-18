@@ -20,10 +20,15 @@ async ping(msg: string) : Promise<Pong> {
  * Permissions): it UNLOCKS `bypassPermissions` as a selectable mode for this process
  * without turning it on. It can only be decided at spawn — a live session cannot gain
  * it — so the front end restarts, or greys out the choice, accordingly.
+ * 
+ * `app_control` (Settings → Control) exposes the in-process "flightdeck" MCP server
+ * to THIS session: its agent gains the app-piloting tools (open files, create/message
+ * conversations, …). Claude-only (Codex has no SDK-server channel) and, like the
+ * bypass unlock, decided at spawn — the `initialize` handshake advertises it once.
  */
-async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean) : Promise<Result<string, string>> {
+async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean, appControl: boolean) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions }) };
+    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions, appControl }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1830,6 +1835,51 @@ async setClaudeCliAutoUpdate(enabled: boolean) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The front executor's answer to one bridged `app_control_request` event.
+ * Exactly one of `result` / `error` is meaningful: `error` set → the tool call
+ * failed with that message; otherwise `result` (or null) is the tool's value.
+ * Errors out when the request id is unknown (already timed out / answered) so
+ * a wiring bug in the executor can never be silent.
+ */
+async appControlRespond(requestId: string, result: JsonValue | null, error: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("app_control_respond", { requestId, result, error }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Publish one fleet event into the journal `wait_for_events` long-polls (the
+ * voice bridge). The FRONT calls this from its settled notification point
+ * (`fireAgentNotification`), so the voice agent hears exactly what the human
+ * would have been pinged about.
+ */
+async publishControlEvent(kind: string, conversationId: string, title: string, detail: JsonValue) : Promise<void> {
+    await TAURI_INVOKE("publish_control_event", { kind, conversationId, title, detail });
+},
+/**
+ * The voice bridge's current status (Settings read-back: config + whether the
+ * listener is actually up, with the error when it is not).
+ */
+async voiceBridgeStatus() : Promise<VoiceBridgeStatus> {
+    return await TAURI_INVOKE("voice_bridge_status");
+},
+/**
+ * Change the voice bridge's config (any subset of enable/port/token-regen),
+ * persist it, and (re)start or stop the listener accordingly. Returns the
+ * honest post-apply status — a failed bind comes back as `running:false` +
+ * `error`, never as a silently-lying switch.
+ */
+async setVoiceBridge(enabled: boolean | null, port: number | null, regenerateToken: boolean) : Promise<Result<VoiceBridgeStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_voice_bridge", { enabled, port, regenerateToken }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1838,6 +1888,7 @@ async setClaudeCliAutoUpdate(enabled: boolean) : Promise<Result<null, string>> {
 
 export const events = __makeEvents__<{
 accountLoginEvent: AccountLoginEvent,
+appControlRequestEvent: AppControlRequestEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -1859,6 +1910,7 @@ tosseLiveStateEvent: TosseLiveStateEvent,
 workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
+appControlRequestEvent: "app-control-request-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -1903,6 +1955,15 @@ export type AgentInfo = { name: string; description: string | null; model: strin
  * clean markdown view of the sub-agent.
  */
 path: string }
+/**
+ * One bridged app-control tool call (from an app-hosted MCP server — see
+ * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
+ * the hub forwards `{tool, args}` here and awaits the executor's
+ * `app_control_respond`. `session` is the calling live session handle when the
+ * call came from a conversation's own agent (the in-process SDK server), or
+ * null for an external caller (the voice bridge).
+ */
+export type AppControlRequestEvent = { request_id: string; tool: string; args: JsonValue; session: string | null }
 /**
  * Which agent backend a new conversation runs on — the IPC discriminant
  * [`spawn_session`] dispatches on. Serialized lowercase to match the front's
@@ -3788,6 +3849,20 @@ export type UsageError =
  * the frontend converts it with the JS `Date` parser.
  */
 export type UsageWindow = { used_percentage: number; resets_at: string | null }
+/**
+ * The live state of the voice bridge, as reported to the Settings UI. This is
+ * the honest read-back: `running`/`error` reflect what the listener actually
+ * did, never what the toggle optimistically hoped (a failed bind must show).
+ */
+export type VoiceBridgeStatus = { enabled: boolean; running: boolean; port: number; token: string; 
+/**
+ * The MCP endpoint to paste into the external client, when running.
+ */
+url: string | null; 
+/**
+ * Why the server is not running although enabled (bind failure, …).
+ */
+error: string | null }
 /**
  * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is

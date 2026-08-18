@@ -1,0 +1,164 @@
+/* Settings → Models. Plain global classes (not a CSS module) for the same reason as
+   composer-section.css: the rows sit inside SettingsPanel's module-styled shell and are
+   easier to reason about when the two naming schemes stay visibly separate. */
+
+.mdset-lane {
+  border: 1px solid var(--wf-line-2);
+  border-radius: 12px;
+  padding: 6px;
+  margin-top: 8px;
+  background: var(--wf-panel);
+}
+/* The drop target lights up while a row hovers it — the only feedback that says "let go
+   here and it changes list", which is the whole point of dragging between the two. */
+.mdset-lane[data-over] {
+  border-color: var(--wf-accent);
+  background: color-mix(in srgb, var(--wf-accent) 6%, var(--wf-panel));
+}
+.mdset-lane[data-lane="available"] {
+  border-style: dashed;
+}
+
+.mdset-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--wf-tx-lo);
+  padding: 4px 6px 6px;
+}
+.mdset-count {
+  font-size: 10px;
+  color: var(--wf-tx-xlo);
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.mdset-empty {
+  font-size: 11px;
+  color: var(--wf-tx-xlo);
+  padding: 8px 8px 10px;
+}
+
+.mdset-row {
+  display: grid;
+  grid-template-columns: 20px minmax(96px, 1fr) 74px minmax(0, 1.4fr) 96px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: grab;
+  touch-action: none;
+  background: transparent;
+}
+.mdset-row:hover {
+  background: var(--wf-panel-3);
+}
+.mdset-row:active {
+  cursor: grabbing;
+}
+/* An available (hidden) model reads as inactive — the user asked for it greyed out, so
+   the state is legible without reading the checkbox. */
+.mdset-row[data-off] {
+  opacity: 0.5;
+}
+.mdset-row[data-off]:hover {
+  opacity: 0.8;
+}
+.mdset-row[data-overlay] {
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-accent);
+  box-shadow: 0 6px 18px #0006;
+}
+
+.mdset-check {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--wf-line);
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--wf-accent);
+}
+.mdset-check[aria-checked="true"] {
+  border-color: var(--wf-accent);
+}
+.mdset-check:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 1px;
+}
+
+.mdset-name {
+  color: var(--wf-tx-hi);
+  font-weight: 500;
+}
+.mdset-prov {
+  color: var(--wf-tx-lo);
+  font-size: 11px;
+}
+/* The wire id: useful when two rows read alike (Opus 4.8 vs 4.7), never the main thing. */
+.mdset-id {
+  color: var(--wf-tx-xlo);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mdset-eff {
+  color: var(--wf-tx-xlo);
+  font-size: 11px;
+  text-align: right;
+}
+
+.mdset-defaults {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.mdset-select {
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 6px;
+  border-radius: 7px;
+  border: 1px solid var(--wf-line);
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+  cursor: pointer;
+}
+.mdset-noeffort {
+  font-size: 11px;
+  color: var(--wf-tx-xlo);
+}
+
+.mdset-reset {
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.mdset-reset:hover {
+  color: var(--wf-tx);
+  border-color: var(--wf-accent);
+}
+
+/* Narrow panel: the wire id is the first thing to go — the name and provider carry the
+   row on their own. */
+@media (max-width: 720px) {
+  .mdset-row {
+    grid-template-columns: 20px minmax(96px, 1fr) 70px 90px;
+  }
+  .mdset-id {
+    display: none;
+  }
+}

@@ -1247,7 +1247,12 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
 /// Friendly label for a model id (alias OR resolved id) — matches the composer's.
 fn model_label(id: &str) -> String {
     let s = id.to_lowercase();
-    if s.contains("opus") {
+    // The full-name check comes FIRST: a resolved id carries both the full name and
+    // the family alias (`claude-opus-4-8[1m]` contains "opus"), so the generic branch
+    // would otherwise announce Opus 4.8 as "Opus 5".
+    if s.contains("opus-4-8") {
+        "Opus 4.8".to_string()
+    } else if s.contains("opus") {
         "Opus 5".to_string()
     } else if s.contains("sonnet") {
         "Sonnet 5".to_string()
@@ -2167,8 +2172,11 @@ mod tests {
     #[test]
     fn effort_change_announces_only_a_real_move() {
         let mut asm = seeded();
-        // The initial get_settings confirms the seed → state only, no notice.
-        let evs = asm.apply_settings(Some("claude-opus-4-8[1m]".into()), Some("xhigh".into()), Some(false));
+        // The initial get_settings confirms the seed → state only, no notice. The
+        // resolved id has to be the one the `opus` alias actually names — the LATEST
+        // Opus, i.e. Opus 5 (`claude-opus-4-8` is now its own catalogue row, so reading
+        // it back against an `opus` seed is a genuine model change, not a confirmation).
+        let evs = asm.apply_settings(Some("claude-opus-5[1m]".into()), Some("xhigh".into()), Some(false));
         assert!(first_notice(evs).is_none(), "confirming the seed must stay silent");
         // Now a genuine change xhigh → high.
         let (subtype, detail) = first_notice(asm.apply_settings(None, Some("high".into()), Some(false)))
@@ -2218,6 +2226,24 @@ mod tests {
         assert_eq!(detail["control"], serde_json::json!("Model"));
         assert_eq!(detail["from"], serde_json::json!("Opus 5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
+    }
+
+    /// Opus 4.8 is a DISTINCT row from the Opus family alias (and the app default), so
+    /// its notice must name it — the resolved id contains "opus", which would otherwise
+    /// announce a switch to "Opus 5" while the session actually runs 4.8.
+    #[test]
+    fn opus_4_8_is_labelled_by_its_own_name_not_the_family() {
+        let mut asm = seeded();
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "s", "uuid": "u", "cwd": "/x",
+            "model": "claude-opus-4-8[1m]", "permissionMode": "default",
+            "tools": ["Bash"], "slash_commands": []
+        }))
+        .unwrap();
+        let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
+        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["to"], serde_json::json!("Opus 4.8"));
     }
 
     /// A connection failure mid-turn must be VISIBLE: the CLI retries by itself, so

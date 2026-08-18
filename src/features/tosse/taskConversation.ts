@@ -13,6 +13,7 @@ import {
   useConversationsStore,
 } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
+import { ensurePickupPlugin, type PluginActivation } from "./pickupPlugin";
 import {
   discussPrompt,
   pickupCommand,
@@ -54,12 +55,6 @@ export interface LaunchRequest {
   question?: string;
   /** "Start" only: an extra instruction for THIS run, typed in the button's drop-down. */
   extra?: string;
-  /**
-   * The pickup skill's published name in that folder, when the caller has just resolved
-   * it (e.g. right after enabling the plugin, where the store's cache is fresher than
-   * this call could re-derive). Omitted → resolved here.
-   */
-  pickupName?: string | null;
 }
 
 export interface LaunchOutcome {
@@ -67,6 +62,9 @@ export interface LaunchOutcome {
   /** How `/pickup` was resolved for this folder — "absent"/"unknown" means written
    *  instructions were sent instead, which the caller SAYS out loud. */
   pickup: PickupSupport | null;
+  /** What equipping the folder with the TOSSE plugin did. The caller passes it to
+   *  `activationProblem` and says whatever comes back. */
+  plugin: PluginActivation;
 }
 
 /**
@@ -83,6 +81,14 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
     // opening a conversation in some other folder.
     throw new Error("This project's folder is no longer registered in Flight Deck.");
   }
+
+  // Equip the folder FIRST — before the conversation exists, and well before the send that
+  // spawns `claude`. BOTH buttons need this, not just "Start": the skill only matters to
+  // the first message, but the conversation that opens lives on, and a "Discuss" that turns
+  // into work has to have `/pickup`, `/done`… available. It is also the last moment where
+  // enabling is enough on its own — `set_plugin_enabled` writes `settings.json`, which is
+  // read at startup, so a session already spawned would need `reload_plugins` too.
+  const plugin = await ensurePickupPlugin(repo.path);
 
   // How many this task already carries — the next one is numbered, so a second pass is
   // told apart from the first in the sidebar and in the task's own "Open" menu.
@@ -101,12 +107,15 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // auto-title eligibility, so the model never overwrites it.)
   store.renameConversation(convId, nth > 1 ? `${req.task.title} (${nth})` : req.task.title);
 
-  // Only "Start" needs the skill; "Discuss" is plain prose that works anywhere.
+  // Only "Start" SENDS the skill; "Discuss" is plain prose that works anywhere (it still
+  // needed the plugin above — being equipped and invoking a command are two things).
+  // Asked after the plugin work, so an activation that just refreshed the catalogue is
+  // reflected here instead of a stale "absent".
   const pickup = req.mode === "pickup" ? await pickupSupport(repo.path) : null;
   // The name the CLI actually publishes — `pickup` for a project skill,
   // `tosse-workflow:pickup` for the plugin's. NEVER guessed: sending a name this folder
   // does not know reaches the agent as plain text.
-  const name = req.pickupName ?? (pickup === "available" ? pickupCommandName(repo.path) : null);
+  const name = pickup === "available" ? pickupCommandName(repo.path) : null;
   const text =
     req.mode === "discuss"
       ? discussPrompt(req.task, req.question ?? "")
@@ -126,5 +135,5 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
     useConversationStore.getState().addErrorTurn(convId, message);
     throw e;
   }
-  return { convId, pickup };
+  return { convId, pickup, plugin };
 }

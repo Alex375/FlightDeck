@@ -28,6 +28,7 @@ vi.mock("../ipc/client", () => {
 import { commands } from "../ipc/client";
 import type { DiskConversation } from "../ipc/client";
 import { usePermissionPrefs } from "./permissions";
+import { useAppControlPrefs } from "./appControl";
 import {
   acknowledgeConversation,
   createConversationInRepo,
@@ -43,7 +44,7 @@ import {
   useConversationsStore,
   type Conversation,
 } from "./conversationsStore";
-import { DEFAULT_CODEX_MODEL } from "../features/conversation/models";
+import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
 
 const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
@@ -159,9 +160,10 @@ describe("conversationsStore — bypass-permissions unlock", () => {
   it("passes the app-wide opt-in to the spawn and remembers it on the conversation", async () => {
     usePermissionPrefs.setState({ allowBypassPermissions: true });
     await ensureConversationSession("c1");
-    // Last positional arg of spawnSession — the process gets the unlock flag…
+    // Second-to-last positional arg of spawnSession (the trailing one is the
+    // app-control flag) — the process gets the unlock flag…
     const args = vi.mocked(commands.spawnSession).mock.calls[0];
-    expect(args[args.length - 1]).toBe(true);
+    expect(args[args.length - 2]).toBe(true);
     // …and the conversation records that THIS live session can honour bypass.
     expect(conv0().bypassAllowed).toBe(true);
   });
@@ -169,7 +171,7 @@ describe("conversationsStore — bypass-permissions unlock", () => {
   it("spawns WITHOUT the flag while the opt-in is off", async () => {
     await ensureConversationSession("c1");
     const args = vi.mocked(commands.spawnSession).mock.calls[0];
-    expect(args[args.length - 1]).toBe(false);
+    expect(args[args.length - 2]).toBe(false);
     expect(conv0().bypassAllowed).toBe(false);
   });
 
@@ -554,8 +556,9 @@ describe("conversationsStore — controls applied at spawn", () => {
     const handle = await ensureConversationSession("c1");
     expect(handle).toBe("session-1");
     // (cwd, resume, model, effort, permissionMode, ultracode, backend,
-    // allowBypassPermissions) — the conversation's own controls + its backend + the
-    // app-wide bypass opt-in, NOT the old hardcoded defaults.
+    // allowBypassPermissions, appControl) — the conversation's own controls + its
+    // backend + the app-wide bypass opt-in + the app-control policy (default ON),
+    // NOT the old hardcoded defaults.
     expect(commands.spawnSession).toHaveBeenCalledWith(
       "/tmp/r1",
       null,
@@ -565,7 +568,19 @@ describe("conversationsStore — controls applied at spawn", () => {
       false,
       "claude",
       false,
+      true,
     );
+  });
+
+  it("spawns WITHOUT app control once the policy is switched off", async () => {
+    useAppControlPrefs.setState({ agentServer: false });
+    try {
+      await ensureConversationSession("c1");
+      const args = vi.mocked(commands.spawnSession).mock.calls[0];
+      expect(args[args.length - 1]).toBe(false);
+    } finally {
+      useAppControlPrefs.setState({ agentServer: true });
+    }
   });
 });
 
@@ -608,6 +623,12 @@ describe("reactivateDiskConversation — backend-aware", () => {
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
     expect(conv.kind).toBe("claude");
     expect(conv.model).toBe(DEFAULT_MODEL);
+  });
+
+  // A default the picker doesn't offer would seed every conversation with a row the
+  // menu can't highlight (and, for a mistyped id, a model the binary would reject).
+  it("the Claude default is a model the picker actually offers", () => {
+    expect(CLAUDE_MODELS.map((m) => m.value)).toContain(DEFAULT_MODEL);
   });
 });
 

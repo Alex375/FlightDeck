@@ -16,6 +16,7 @@ describe("backendOfModel", () => {
     expect(backendOfModel("sonnet")).toBe("claude");
     expect(backendOfModel("haiku")).toBe("claude");
     expect(backendOfModel("fable")).toBe("claude");
+    expect(backendOfModel("claude-opus-4-8")).toBe("claude");
     expect(backendOfModel("claude-opus-5[1m]")).toBe("claude");
   });
 
@@ -49,6 +50,15 @@ describe("modelLabel", () => {
     expect(modelLabel("claude-sonnet-5")).toBe("Sonnet 5");
   });
 
+  it("labels Opus 4.8 by its full name, never as Opus 5", () => {
+    expect(modelLabel("claude-opus-4-8")).toBe("Opus 4.8");
+    // The resolved 1M-context id contains BOTH "claude-opus-4-8" and "opus" — the
+    // longest catalogue value has to win.
+    expect(modelLabel("claude-opus-4-8[1m]")).toBe("Opus 4.8");
+    // …and the generic Opus family still reads as Opus 5.
+    expect(modelLabel("claude-opus-5[1m]")).toBe("Opus 5");
+  });
+
   it("falls back to the raw id / placeholder", () => {
     expect(modelLabel(null)).toBe("Model");
     expect(modelLabel("weird-id")).toBe("weird-id");
@@ -58,6 +68,10 @@ describe("modelLabel", () => {
 describe("modelFamily (menu highlight)", () => {
   it("maps a resolved Claude id back to its picker value", () => {
     expect(modelFamily("claude-opus-5[1m]")).toBe("opus");
+  });
+  it("highlights Opus 4.8 (full name) rather than the Opus family row", () => {
+    expect(modelFamily("claude-opus-4-8")).toBe("claude-opus-4-8");
+    expect(modelFamily("claude-opus-4-8[1m]")).toBe("claude-opus-4-8");
   });
   it("maps a Codex id (exact + longest-first) to its value", () => {
     expect(modelFamily("gpt-5.5")).toBe("gpt-5.5");
@@ -87,16 +101,54 @@ describe("modelsForPicker (backend lock)", () => {
   it("locked Codex conv → only Codex models (backend frozen)", () => {
     const g = modelsForPicker("codex", { locked: true, codexAvailable: true });
     expect(g.map((x) => x.backend)).toEqual(["codex"]);
-    expect(g[0].models).toBe(CODEX_MODELS);
+    expect(g[0].models).toEqual(CODEX_MODELS);
   });
 
-  it("offers the curated Claude catalogue, not the binary's own menu", () => {
+  it("offers our own catalogue, not the binary's own menu", () => {
     // Deliberate: `list_models` reports a CLI-shaped menu (a "Default (recommended)" row,
     // and the same model twice under its alias and its 1M variant). The picker shows our
-    // four curated rows instead.
+    // catalogue rows instead — all of them when the user has hidden nothing.
     const g = modelsForPicker("claude", { locked: true, codexAvailable: false });
-    expect(g[0].models).toBe(CLAUDE_MODELS);
+    expect(g[0].models).toEqual(CLAUDE_MODELS);
     expect(g[0].models.length).toBeGreaterThan(0);
+  });
+
+  it("offers only what the user kept, in the order they set", () => {
+    const g = modelsForPicker("claude", {
+      locked: true,
+      codexAvailable: false,
+      hidden: ["opus", "haiku"],
+      order: ["sonnet", "claude-opus-4-8"],
+    });
+    const values = g[0].models.map((m) => m.value);
+    expect(values).not.toContain("opus");
+    expect(values).not.toContain("haiku");
+    // Ordered ones first, in the user's order; everything else keeps its catalogue rank.
+    expect(values.slice(0, 2)).toEqual(["sonnet", "claude-opus-4-8"]);
+    expect(values[2]).toBe("fable");
+  });
+
+  it("still offers the model the conversation is RUNNING, even if it was hidden", () => {
+    // Opus 5 ships hidden, so a conversation started on it before that must not end up
+    // with a picker that can't show what it is on. Works from the resolved live id too.
+    const g = modelsForPicker("claude", {
+      locked: true,
+      codexAvailable: false,
+      hidden: ["opus", "haiku"],
+      current: "claude-opus-5[1m]",
+    });
+    const values = g[0].models.map((m) => m.value);
+    expect(values).toContain("opus");
+    expect(values).not.toContain("haiku"); // the other hidden one stays hidden
+  });
+
+  it("drops a section the user emptied instead of rendering a bare heading", () => {
+    const g = modelsForPicker("claude", {
+      locked: true,
+      codexAvailable: false,
+      hidden: CLAUDE_MODELS.map((m) => m.value),
+    });
+    expect(g).toEqual([]);
   });
 
   it("locked Codex conv still shows its section even if Codex became unavailable (never empty)", () => {

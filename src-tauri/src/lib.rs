@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod appmcp;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
@@ -13,7 +14,8 @@ pub mod tosse;
 pub mod usage;
 
 use ipc::commands::{
-    answer_permission, copy_entry, create_dir, create_file, create_worktree, delete_conversation,
+    answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
+    delete_conversation,
     delete_repo, delete_to_trash, fetch_slash_commands,
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
@@ -35,7 +37,7 @@ use ipc::commands::{
     codex_load_history, codex_marketplace_add, codex_marketplace_remove,
     codex_marketplace_upgrade, codex_plugin_contents,
     codex_set_mcp_enabled, codex_set_plugin_enabled, codex_set_skill_enabled,
-    path_exists, ping, prime_history_index,
+    path_exists, ping, prime_history_index, publish_control_event,
     read_dir, read_file, read_image,
     read_task_output_file,
     refresh_plugin_marketplaces, reload_plugins,
@@ -52,10 +54,12 @@ use ipc::commands::{
     tosse_login_start, tosse_logout, tosse_project_repos,
     tosse_repo_links, tosse_set_project_status,
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
+    set_voice_bridge, voice_bridge_status,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
-    AccountLoginEvent, FsChangeEvent, FsWatchErrorEvent, SessionCodexPlanUsageEvent,
+    AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
+    SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
@@ -208,6 +212,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             claude_cli_status,
             claude_cli_update,
             set_claude_cli_auto_update,
+            app_control_respond,
+            publish_control_event,
+            voice_bridge_status,
+            set_voice_bridge,
         ])
         .events(collect_events![
             TickEvent,
@@ -230,6 +238,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             WorkflowJournalEvent,
             TerminalOutputEvent,
             TerminalExitEvent,
+            AppControlRequestEvent,
         ])
 }
 
@@ -476,6 +485,10 @@ pub fn run() {
         // one process multiplexing every Codex thread. An Arc so a conversation actor
         // can hold it beyond the spawning command's lifetime.
         .manage(std::sync::Arc::new(supervisor::codex::CodexServer::new()))
+        // The app-control hub: the app-hosted MCP servers' shared core (front
+        // bridge + fleet event journal + voice-bridge runtime). An Arc so each
+        // Claude session actor can hold it beyond the spawning command.
+        .manage(std::sync::Arc::new(appmcp::ControlHub::new()))
         .setup(move |app| {
             use tauri::Manager;
 
@@ -547,6 +560,20 @@ pub fn run() {
                 eprintln!("last_activity_at backfill failed: {e}");
             }
             app.manage(store);
+
+            // App-control hub: install its front outlet, then start the voice
+            // bridge if it was left enabled (the honest outcome — including a
+            // failed bind — lands in `voice_bridge_status` for the Settings UI).
+            {
+                let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                hub.set_sink(std::sync::Arc::new(ipc::events::AppControlEmitter {
+                    app: app.handle().clone(),
+                }));
+                let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
+                if cfg.enabled {
+                    tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
+                }
+            }
 
             // Rust timer: emit a TickEvent every second (Rust -> React) — kept as
             // a heartbeat / proof of the outbound event leg.
