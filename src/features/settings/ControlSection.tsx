@@ -1,21 +1,42 @@
-// "Control" tab: the two app-hosted MCP servers through which agents pilot the
-// app. Card 1 — the in-process "flightdeck" server exposed to each conversation's
-// own agent (a localStorage policy read at spawn). Card 2 — the voice bridge, a
-// loopback HTTP MCP server for an EXTERNAL client (a voice agent), configured in
-// the Rust core so it can start with the app. Its rows follow the honest-toggle
-// rule: every state shown here is the post-apply READ-BACK from the core
-// (`voice_bridge_status`), so a failed bind shows as an error instead of a
-// switch that lies.
+// "MCP Control" tab cards for the two app-hosted MCP servers through which
+// agents pilot the app — split in two components so the tab can interleave the
+// voice-agent card between them. Card 1 (AgentControlGroup) — the in-process
+// "flightdeck" server exposed to each conversation's own agent (a localStorage
+// policy read at spawn). Card 2 (VoiceBridgeGroup) — the voice bridge, a
+// loopback HTTP MCP server for an EXTERNAL client, configured in the Rust core
+// so it can start with the app. Its rows follow the honest-toggle rule: every
+// state shown is the post-apply READ-BACK from the core (`voice_bridge_status`),
+// so a failed bind shows as an error instead of a switch that lies.
 import { useCallback, useEffect, useState } from "react";
 import { commands, type VoiceBridgeStatus } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
-export function ControlSection() {
+export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
   const setPrefs = useAppControlPrefs((s) => s.set);
+  return (
+    <SettingsGroup title="Agent control of the app" icon="wand">
+      <ToggleRow
+        title="Let agents pilot the app"
+        hint={
+          <>
+            New conversations expose the <span className={styles.mono}>flightdeck</span> MCP
+            server to their agent: open files in the editor, switch views, create / read /
+            message the other conversations, notify you. Applies to sessions started from now
+            on — a live conversation keeps what it spawned with until restarted. Nothing
+            destructive is ever exposed (no permission changes, no deletes, no rewind).
+          </>
+        }
+        checked={agentServer}
+        onChange={(next) => setPrefs({ agentServer: next })}
+      />
+    </SettingsGroup>
+  );
+}
 
+export function VoiceBridgeGroup() {
   const [voice, setVoice] = useState<VoiceBridgeStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -82,23 +103,6 @@ export function ControlSection() {
 
   return (
     <>
-      <SettingsGroup title="Agent control of the app" icon="wand">
-        <ToggleRow
-          title="Let agents pilot the app"
-          hint={
-            <>
-              New conversations expose the <span className={styles.mono}>flightdeck</span> MCP
-              server to their agent: open files in the editor, switch views, create / read /
-              message the other conversations, notify you. Applies to sessions started from now
-              on — a live conversation keeps what it spawned with until restarted. Nothing
-              destructive is ever exposed (no permission changes, no deletes, no rewind).
-            </>
-          }
-          checked={agentServer}
-          onChange={(next) => setPrefs({ agentServer: next })}
-        />
-      </SettingsGroup>
-
       <SettingsGroup title="Voice bridge" icon="bell">
         <ToggleRow
           title="Local MCP server for an external agent"

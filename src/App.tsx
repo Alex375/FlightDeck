@@ -32,7 +32,7 @@ import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
-import { VoiceToggle } from "./voice/VoiceToggle";
+import { VoiceMicToggle, VoiceModeToggle } from "./voice/VoiceToggle";
 import { startUpdaterAutoCheck } from "./store/updater";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
 import { initNotifications } from "./notifications/notify";
@@ -259,9 +259,10 @@ export default function App() {
         <>
           {/* Always visible (both views): mute/unmute the notification chime on the
               spot, without opening Settings. Also bound to ⌘⇧M. */}
-          {/* Voice-agent push-to-talk — renders nothing until an OpenAI key is
-              configured (strictly optional feature). */}
-          <VoiceToggle />
+          {/* Voice agent: arm/disarm the session, then open/close the mic within
+              it. Both render nothing until an OpenAI key is configured. */}
+          <VoiceModeToggle />
+          <VoiceMicToggle />
           <SoundToggle />
           {/* Always visible (both views): arm/disarm Caffeinate (keep the Mac awake). */}
           <CaffeinateToggle />

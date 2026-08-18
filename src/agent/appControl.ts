@@ -394,6 +394,26 @@ function openPanel(
   return { conversation_id: conv.id, panel };
 }
 
+async function browseFolders(args: Record<string, unknown>) {
+  const path = typeof args.path === "string" && args.path.trim() ? args.path.trim() : null;
+  const depth = typeof args.depth === "number" ? Math.max(1, Math.min(3, Math.floor(args.depth))) : null;
+  if (path && !path.startsWith("/"))
+    throw new Error("browse_folders: 'path' must be absolute (or omitted for the home overview)");
+  const res = await commands.folderTree(path, depth);
+  if (res.status !== "ok") throw new Error(`browse_folders: ${res.error}`);
+  // The registered repos ARE the agent's primary map — the tree is for finding
+  // what is not registered yet.
+  const s = useConversationsStore.getState();
+  return {
+    registered_repos: s.repos.map((r) => ({ name: baseName(r.path), path: r.path })),
+    root: res.data.root,
+    tree: res.data.tree,
+    ...(res.data.truncated
+      ? { note: "the tree was truncated — absent ≠ nonexistent; browse a subfolder for more" }
+      : {}),
+  };
+}
+
 function notifyUser(args: Record<string, unknown>) {
   const message = typeof args.message === "string" ? args.message.trim() : "";
   if (!message) throw new Error("notify_user: 'message' is required");
@@ -435,6 +455,8 @@ export async function executeAppControlTool(
       return renameConversation(args, session);
     case "add_repo":
       return addRepo(args);
+    case "browse_folders":
+      return browseFolders(args);
     case "open_file":
       return openFile(args, session, helpers);
     case "open_view":

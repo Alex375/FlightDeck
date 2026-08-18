@@ -103,6 +103,25 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "browse_folders",
+            description: "Explore this Mac's folder layout to find where to work: a compact, \
+                depth-limited tree of directories with git repositories marked (and not \
+                descended into), plus the folders already registered in the app. Call it \
+                WITHOUT a path first for an overview from the user's home folder; pass a path \
+                to look deeper. Use it to locate a repository path for create_conversation or \
+                add_repo instead of asking the user to dictate one.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "path": { "type": "string",
+                        "description": "Absolute folder to explore (default: the user's home folder)." },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 3,
+                        "description": "Tree depth (default 2)." },
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
             name: "focus_conversation",
             description: "Bring a conversation on screen in the app (select it and switch to \
                 the conversation view).",
@@ -267,7 +286,8 @@ mod tests {
         let app: Vec<_> = for_surface(Surface::App).iter().map(|t| t.name).collect();
         let voice: Vec<_> = for_surface(Surface::Voice).iter().map(|t| t.name).collect();
         for shared in ["list_conversations", "read_conversation", "send_message",
-                       "create_conversation", "focus_conversation", "rename_conversation"] {
+                       "create_conversation", "browse_folders", "focus_conversation",
+                       "rename_conversation"] {
             assert!(app.contains(&shared), "app missing {shared}");
             assert!(voice.contains(&shared), "voice missing {shared}");
         }

@@ -57,7 +57,6 @@ import {
   peekInterrupt,
 } from "../notifications/notify";
 import { queueVoiceAnnouncement } from "../voice/announce";
-import { useVoicePrefs } from "../voice/voicePrefs";
 import { useVoiceStore } from "../voice/voiceStore";
 import {
   SETTLE_MS,
@@ -229,11 +228,12 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
     .catch((e) => console.error("publish_control_event failed:", e));
 
   // Same settled event, third consumer: the in-app voice agent's spoken
-  // announcements — gated on its own opt-in pref so a disabled feature costs
-  // nothing (the queue caps and drains in src/voice). Fed HERE, not from the
-  // Rust journal, so all three surfaces (OS ping, voice bridge, spoken line)
-  // share one truth about "what just happened".
-  if (useVoicePrefs.getState().announcements && useVoiceStore.getState().configured === true) {
+  // announcements — gated on the ARMED voice mode (the on-screen "session
+  // vocale" toggle), so a disarmed feature costs nothing (the queue caps and
+  // drains in src/voice, opening the mic for the user's reply). Fed HERE, not
+  // from the Rust journal, so all three surfaces (OS ping, voice bridge,
+  // spoken line) share one truth about "what just happened".
+  if (useVoiceStore.getState().mode) {
     queueVoiceAnnouncement(
       kind === "done"
         ? {

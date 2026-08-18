@@ -21,7 +21,7 @@ import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
-import { ControlSection } from "./ControlSection";
+import { AgentControlGroup, VoiceBridgeGroup } from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
@@ -44,8 +44,8 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   { id: "composer", label: "Composer", icon: "wand" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
-  // Agents piloting the app: the in-process MCP server + the voice bridge.
-  { id: "control", label: "Control", icon: "wand" },
+  // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
+  { id: "control", label: "MCP Control", icon: "wand" },
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
   { id: "data", label: "Data", icon: "trash" },
@@ -186,11 +186,14 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "control" && (
               <div className={styles.page}>
                 <PageHead
-                  title="Control"
-                  subtitle="Let agents pilot the app — from inside a conversation, or from an external voice assistant."
+                  title="MCP Control"
+                  subtitle="Let agents pilot the app — from inside a conversation, by voice, or from an external client."
                 />
-                <ControlSection />
+                {/* Order: in-app control, then the built-in voice agent, then the
+                    bridge for EXTERNAL clients (the most niche card last). */}
+                <AgentControlGroup />
                 <VoiceAgentSection />
+                <VoiceBridgeGroup />
               </div>
             )}
 

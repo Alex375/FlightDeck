@@ -57,7 +57,7 @@ use ipc::commands::{
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
-    app_control_tools,
+    app_control_tools, folder_tree,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -224,6 +224,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             clear_voice_agent_key,
             voice_agent_client_secret,
             app_control_tools,
+            folder_tree,
         ])
         .events(collect_events![
             TickEvent,

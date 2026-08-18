@@ -8,12 +8,13 @@ import { useCallback, useEffect, useState } from "react";
 import { commands, type VoiceAgentStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
 import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
+import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
 export function VoiceAgentSection() {
-  const announcements = useVoicePrefs((s) => s.announcements);
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
+  const pttShortcut = useVoicePrefs((s) => s.pttShortcut);
   const setPrefs = useVoicePrefs((s) => s.set);
 
   const [status, setStatus] = useState<VoiceAgentStatus | null>(null);
@@ -69,6 +70,48 @@ export function VoiceAgentSection() {
       setBusy(false);
     }
   }, [publish]);
+
+  // Shortcut recorder: while recording, the NEXT clean key gesture becomes the
+  // push-to-talk shortcut — a lone modifier tap (captured on its keyup, only if
+  // nothing else was pressed while it was held) or a regular key chord
+  // (captured on keydown). Escape cancels.
+  const [recording, setRecording] = useState(false);
+  useEffect(() => {
+    if (!recording) return;
+    let modifierArmed: string | null = null;
+    const onKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.code === "Escape") {
+        setRecording(false);
+        return;
+      }
+      if (isModifierCode(e.code)) {
+        modifierArmed = modifierArmed === null ? e.code : null;
+        return;
+      }
+      modifierArmed = null;
+      const next = shortcutFromEvent(e);
+      if (next) {
+        setPrefs({ pttShortcut: next });
+        setRecording(false);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isModifierCode(e.code) && modifierArmed === e.code) {
+        setPrefs({ pttShortcut: { code: e.code, tap: true } });
+        setRecording(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+    };
+  }, [recording, setPrefs]);
 
   const commitAutoClose = useCallback(() => {
     if (closeDraft === null) return;
@@ -130,24 +173,32 @@ export function VoiceAgentSection() {
         }
       />
       <ToggleRow
-        title="Push-to-talk"
+        title="Voice session & announcements"
         hint={
           configured
-            ? "Click the mic in the title bar (or press ⌘⇧V) to talk to the fleet: statuses, reading replies, sending prompts. The mic is live only during a session."
+            ? "Arm the voice session with the headset button in the title bar. While armed, fleet events (a turn finished, an agent waits on you) are announced aloud and the microphone opens for your reply; the mic button (or the key below) opens and closes the mic at any time. Telling the agent you're done closes the mic — the session stays armed."
             : "Add an OpenAI key above to enable the voice agent."
         }
-        control={<span className={styles.mono}>⌘⇧V</span>}
       />
       <ToggleRow
-        title="Spoken announcements"
-        hint="Speak fleet events aloud (a turn finished, an agent waits on you) even without an open session. Announcement sessions are output-only: the microphone stays off."
-        checked={announcements}
-        onChange={(next) => setPrefs({ announcements: next })}
-        disabled={!configured}
+        title="Push-to-talk key"
+        hint="Opens / closes the microphone (arms the session first if needed). A lone modifier works as a tap — press and release it by itself. Click Change, then press the key you want; Escape cancels."
+        control={
+          <span className={styles.tokenRow}>
+            <span className={styles.mono}>{recording ? "Press a key…" : describePtt(pttShortcut)}</span>
+            <button
+              className={`${styles.btn} ${styles.ghost}`}
+              onClick={() => setRecording((r) => !r)}
+              disabled={!configured}
+            >
+              {recording ? "Cancel" : "Change"}
+            </button>
+          </span>
+        }
       />
       <ToggleRow
-        title="Hang up after silence"
-        hint="Close an idle voice session after this many seconds — the cost guard (Realtime bills per audio minute)."
+        title="Close the mic after silence"
+        hint="The microphone closes by itself after this many seconds without speech — the cost and privacy guard. The armed session stays up (it exchanges no audio while the mic is closed)."
         control={
           <span className={styles.tokenRow}>
             <input

@@ -18,8 +18,6 @@ import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
-import { toggleVoiceSession } from "../voice/realtime";
-import { useVoiceStore } from "../voice/voiceStore";
 import type { ShortcutAction, View } from "./shortcuts";
 
 export interface AppActionOptions {
@@ -114,14 +112,6 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
     }
     case "open-history":
       useHistoryUi.getState().openPanel();
-      return true;
-    case "toggle-voice":
-      // Inert without a configured OpenAI key: the chip is hidden then, so an
-      // error state would have NO visible surface — and the chord must not be
-      // consumed (⌘⇧V can then keep meaning whatever a focused control makes
-      // of it). With a key: fire-and-forget, state lives in voiceStore.
-      if (useVoiceStore.getState().configured !== true) return false;
-      void toggleVoiceSession();
       return true;
     case "zoom-in":
     case "zoom-out":

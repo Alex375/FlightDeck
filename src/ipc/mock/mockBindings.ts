@@ -82,6 +82,7 @@ import type {
   TickEvent,
   UsageError,
   ClientSecret,
+  FolderTree,
   VoiceAgentStatus,
   VoiceBridgeStatus,
   WorkflowJournal,
@@ -1508,6 +1509,17 @@ export const mockCommands = {
 
   async appControlTools(_surface: string): Promise<Result<unknown, string>> {
     return ok({ tools: [] });
+  },
+
+  async folderTree(
+    path: string | null,
+    _depth: number | null,
+  ): Promise<Result<FolderTree, string>> {
+    return ok({
+      root: path ?? "/Users/demo",
+      tree: "Documents/\n  repositories/\n    demo-app/ (git repo)\nDesktop/",
+      truncated: false,
+    });
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

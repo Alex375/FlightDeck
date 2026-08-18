@@ -1942,6 +1942,19 @@ async appControlTools(surface: string) : Promise<Result<JsonValue, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * A compact, bounded directory tree for AGENT orientation (the `browse_folders`
+ * app-control tool): where could I work on this Mac? `path: None` starts at the
+ * user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.
+ */
+async folderTree(path: string | null, depth: number | null) : Promise<Result<FolderTree, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("folder_tree", { path, depth }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2737,6 +2750,28 @@ exists: boolean; size: number;
  * doesn't report a modification time — callers then compare `size` alone.
  */
 mtime_ms: number | null }
+/**
+ * A compact, depth- and size-bounded directory tree, built for AGENT
+ * orientation ("where on this Mac could I work?"), not for the editor: the
+ * app-control `browse_folders` tool serves it so a voice/app agent can find a
+ * repository path instead of making the user dictate one.
+ */
+export type FolderTree = { 
+/**
+ * The absolute root the tree was built from.
+ */
+root: string; 
+/**
+ * Indented text (two spaces per level), one directory per line. A directory
+ * holding a `.git` is marked `(git repo)` and NOT descended into — its
+ * internals are noise for orientation. Over-cap sublists end with `… (+N)`.
+ */
+tree: string; 
+/**
+ * The line budget cut the walk short — "not in the tree" must never be
+ * read as "does not exist".
+ */
+truncated: boolean }
 /**
  * The result of a fork ("branch a new conversation here"): the freshly-written
  * branch conversation (ready to bring into the app via `reactivateDiskConversation`) and,

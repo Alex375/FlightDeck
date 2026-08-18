@@ -2721,6 +2721,23 @@ pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, S
     crate::voice::mint_client_secret().await
 }
 
+/// A compact, bounded directory tree for AGENT orientation (the `browse_folders`
+/// app-control tool): where could I work on this Mac? `path: None` starts at the
+/// user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.
+#[tauri::command]
+#[specta::specta]
+pub async fn folder_tree(
+    path: Option<String>,
+    depth: Option<u32>,
+) -> Result<crate::fs::FolderTree, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::fs::folder_tree(path.as_deref(), depth.unwrap_or(2) as usize)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("folder tree task failed: {e}"))?
+}
+
 /// The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
 /// JSON. The in-app voice agent reads it to declare its Realtime function
 /// tools from the SAME source the MCP servers serve — one catalogue, no drift.

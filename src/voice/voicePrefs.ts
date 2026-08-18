@@ -4,22 +4,24 @@
 // the user both adds an OpenAI key (Keychain, via the Rust `voice` module) and
 // opts in here. The KEY itself is never in this store.
 import { create } from "zustand";
+import { DEFAULT_PTT, type PttShortcut } from "./pttShortcut";
 
 const STORAGE_KEY = "tosse:voice";
 
 export interface VoicePrefs {
-  /** Speak fleet events aloud (turn finished / agent needs input) even when the
-   *  user did not open a voice session. Output-only: an announcement session
-   *  never opens the microphone. */
-  announcements: boolean;
-  /** Close an idle voice session after this many seconds of silence — the cost
-   *  guard (Realtime bills per audio minute). */
+  /** Close the MICROPHONE after this many seconds of silence — the cost/privacy
+   *  guard (Realtime bills per audio minute; the armed session itself stays up,
+   *  it exchanges no audio while the mic is closed). */
   autoCloseSeconds: number;
+  /** The push-to-talk key (default: a clean tap of Right ⌘) — customizable in
+   *  Settings, matched by VoiceHost's listener (see pttShortcut.ts). It toggles
+   *  the mic, arming the session first when pressed from cold. */
+  pttShortcut: PttShortcut;
 }
 
 const DEFAULTS: VoicePrefs = {
-  announcements: false,
   autoCloseSeconds: 25,
+  pttShortcut: DEFAULT_PTT,
 };
 
 function load(): VoicePrefs {
@@ -56,11 +58,11 @@ export const useVoicePrefs = create<VoicePrefsState>((set) => ({
   set: (patch) =>
     set((s) => {
       const next: VoicePrefs = {
-        announcements: patch.announcements ?? s.announcements,
         autoCloseSeconds:
           patch.autoCloseSeconds !== undefined
             ? clampAutoClose(patch.autoCloseSeconds)
             : s.autoCloseSeconds,
+        pttShortcut: patch.pttShortcut ?? s.pttShortcut,
       };
       save(next);
       return next;
