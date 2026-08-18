@@ -46,8 +46,8 @@ jobs:
       - name: Vérifier l'autorisation du déclencheur
         env:
           # Comptes GitHub autorisés à publier une release (séparés par des espaces).
-          # Ajouter Armand ici le jour où il doit pouvoir releaser.
-          ALLOWED: "Alex375"
+          # clousty8 (Armand) ajouté pour la v1.10.0 — Alexandre en vacances.
+          ALLOWED: "Alex375 clousty8"
         run: |
           if [[ " ${ALLOWED} " != *" ${{ github.actor }} "* ]]; then
             echo "::error::@${{ github.actor }} n'est pas autorisé à publier une release (autorisés : ${ALLOWED})."
