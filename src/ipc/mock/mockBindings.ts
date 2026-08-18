@@ -1485,8 +1485,8 @@ export const mockCommands = {
   // No Keychain / OpenAI in the browser mock: the key "stores" in memory so the
   // Settings card is exercisable, but a session can never start (clear error).
 
-  async voiceAgentStatus(): Promise<VoiceAgentStatus> {
-    return { ...mockVoiceAgent };
+  async voiceAgentStatus(): Promise<Result<VoiceAgentStatus, string>> {
+    return ok({ ...mockVoiceAgent });
   },
 
   async setVoiceAgentKey(key: string): Promise<Result<VoiceAgentStatus, string>> {

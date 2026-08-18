@@ -32,8 +32,8 @@ export function VoiceAgentSection() {
 
   useEffect(() => {
     let disposed = false;
-    void commands.voiceAgentStatus().then((s) => {
-      if (!disposed) publish(s);
+    void commands.voiceAgentStatus().then((res) => {
+      if (!disposed && res.status === "ok") publish(res.data);
     });
     return () => {
       disposed = true;

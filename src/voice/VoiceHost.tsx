@@ -39,7 +39,10 @@ export function VoiceHost({
     // ⌘⇧V's inertness and the announcement gate all read it synchronously.
     void commands
       .voiceAgentStatus()
-      .then((s) => useVoiceStore.getState().setConfigured(s))
+      .then((res) => {
+        if (res.status === "ok") useVoiceStore.getState().setConfigured(res.data);
+        else console.error("voice status read failed:", res.error);
+      })
       .catch((e) => console.error("voice status read failed:", e));
     return () => registerVoiceHelpers(null);
   }, []);
