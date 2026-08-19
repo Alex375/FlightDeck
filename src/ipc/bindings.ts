@@ -1931,6 +1931,27 @@ async voiceAgentClientSecret() : Promise<Result<ClientSecret, string>> {
 }
 },
 /**
+ * Current honest wake-word status: the config plus whether the detector is really
+ * capturing, with the reason when it is not.
+ */
+async wakeWordStatus() : Promise<WakeStatus> {
+    return await TAURI_INVOKE("wake_word_status");
+},
+/**
+ * Change the wake-word config (any subset of enable/phrase/sensitivity), persist
+ * it, and (re)start or stop the detector to match. Blocking (model load + mic
+ * open), so run off the async thread. Returns the honest post-apply status — a
+ * mic/model failure comes back as `running:false` + `error`, never a lying switch.
+ */
+async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null) : Promise<Result<WakeStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
  * JSON. The in-app voice agent reads it to declare its Realtime function
  * tools from the SAME source the MCP servers serve — one catalogue, no drift.
@@ -1982,6 +2003,7 @@ terminalOutputEvent: TerminalOutputEvent,
 tickEvent: TickEvent,
 tosseCrmEvent: TosseCrmEvent,
 tosseLiveStateEvent: TosseLiveStateEvent,
+wakeWordEvent: WakeWordEvent,
 workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
@@ -2004,6 +2026,7 @@ terminalOutputEvent: "terminal-output-event",
 tickEvent: "tick-event",
 tosseCrmEvent: "tosse-crm-event",
 tosseLiveStateEvent: "tosse-live-state-event",
+wakeWordEvent: "wake-word-event",
 workflowJournalEvent: "workflow-journal-event"
 })
 
@@ -3979,6 +4002,34 @@ url: string | null;
  * Why the server is not running although enabled (bind failure, …).
  */
 error: string | null }
+/**
+ * One selectable wake phrase for the Settings picker.
+ */
+export type WakePhrase = { key: string; label: string }
+/**
+ * The Settings read-back: the config PLUS whether the detector is actually up,
+ * with the reason when it is not (no mic, model load failure…). Honest by design.
+ */
+export type WakeStatus = { enabled: boolean; phrase: string; sensitivity: number; 
+/**
+ * The capture + inference worker is live right now.
+ */
+running: boolean; 
+/**
+ * Why the detector is not running while `enabled` — surfaced in Settings.
+ */
+error: string | null; 
+/**
+ * The phrases the user can choose from (bundled classifiers).
+ */
+phrases: WakePhrase[] }
+/**
+ * The wake word was heard by the on-device detector (`crate::wake`). The front
+ * reacts like a spoken push-to-talk — arm the voice session and open the mic (see
+ * `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`
+ * is the detected phrase key, `score` the classifier confidence.
+ */
+export type WakeWordEvent = { phrase: string; score: number }
 /**
  * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is

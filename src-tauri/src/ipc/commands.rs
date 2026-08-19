@@ -2721,6 +2721,84 @@ pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, S
     crate::voice::mint_client_secret().await
 }
 
+// ---------------------------------------------------------------------------
+// Wake word — on-device "Alexa" / "Hey Jarvis" trigger (see `crate::wake`)
+// ---------------------------------------------------------------------------
+
+/// Keys under which the wake-word config persists in the store's `meta` table.
+const WAKE_ENABLED_KEY: &str = "wake_word_enabled";
+const WAKE_PHRASE_KEY: &str = "wake_word_phrase";
+const WAKE_SENSITIVITY_KEY: &str = "wake_word_sensitivity";
+
+/// Load the persisted wake-word config (best-effort; unset/garbled → defaults),
+/// sanitized so an unknown phrase or out-of-range sensitivity can never reach the
+/// detector. Read at startup so the detector can arm with the app.
+pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
+    let read = |key: &str| store.get_config(key).ok().flatten();
+    let default = crate::wake::WakeConfig::default();
+    let phrase = read(WAKE_PHRASE_KEY).unwrap_or(default.phrase);
+    let sensitivity = read(WAKE_SENSITIVITY_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default.sensitivity);
+    let (phrase, sensitivity) = crate::wake::sanitize(&phrase, sensitivity);
+    crate::wake::WakeConfig {
+        enabled: read(WAKE_ENABLED_KEY).as_deref() == Some("1"),
+        phrase,
+        sensitivity,
+    }
+}
+
+/// Current honest wake-word status: the config plus whether the detector is really
+/// capturing, with the reason when it is not.
+#[tauri::command]
+#[specta::specta]
+pub fn wake_word_status(
+    wake: tauri::State<'_, Arc<crate::wake::WakeController>>,
+) -> crate::wake::WakeStatus {
+    wake.status()
+}
+
+/// Change the wake-word config (any subset of enable/phrase/sensitivity), persist
+/// it, and (re)start or stop the detector to match. Blocking (model load + mic
+/// open), so run off the async thread. Returns the honest post-apply status — a
+/// mic/model failure comes back as `running:false` + `error`, never a lying switch.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_wake_word_config(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    phrase: Option<String>,
+    sensitivity: Option<f32>,
+) -> Result<crate::wake::WakeStatus, String> {
+    // Scope the store guard so it is dropped before the `.await` (it is not Send).
+    let cfg = {
+        let store = app.state::<Store>();
+        let mut cfg = load_wake_config(&store);
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
+        }
+        if let Some(phrase) = phrase {
+            cfg.phrase = phrase;
+        }
+        if let Some(sensitivity) = sensitivity {
+            cfg.sensitivity = sensitivity;
+        }
+        let (phrase, sensitivity) = crate::wake::sanitize(&cfg.phrase, cfg.sensitivity);
+        cfg.phrase = phrase;
+        cfg.sensitivity = sensitivity;
+        store
+            .set_config(WAKE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
+            .and_then(|_| store.set_config(WAKE_PHRASE_KEY, &cfg.phrase))
+            .and_then(|_| store.set_config(WAKE_SENSITIVITY_KEY, &cfg.sensitivity.to_string()))
+            .map_err(|e| e.to_string())?;
+        cfg
+    };
+    let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
+    tokio::task::spawn_blocking(move || wake.apply(cfg))
+        .await
+        .map_err(|e| format!("wake apply task failed: {e}"))
+}
+
 /// A compact, bounded directory tree for AGENT orientation (the `browse_folders`
 /// app-control tool): where could I work on this Mac? `path: None` starts at the
 /// user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.

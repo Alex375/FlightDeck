@@ -85,6 +85,7 @@ import type {
   FolderTree,
   VoiceAgentStatus,
   VoiceBridgeStatus,
+  WakeStatus,
   WorkflowJournal,
   WorkflowJournalEvent,
   WorkflowPhase,
@@ -245,6 +246,19 @@ const mockVoiceBridge: VoiceBridgeStatus = {
   token: "mock-voice-token",
   url: null,
   error: null,
+};
+
+// In-memory wake-word state for the browser mock (no real capture / models).
+const mockWake: WakeStatus = {
+  enabled: false,
+  phrase: "alexa",
+  sensitivity: 0.5,
+  running: false,
+  error: null,
+  phrases: [
+    { key: "alexa", label: "Alexa" },
+    { key: "hey_jarvis", label: "Hey Jarvis" },
+  ],
 };
 
 // In-memory voice-agent key state for the browser mock (no real Keychain).
@@ -1505,6 +1519,30 @@ export const mockCommands = {
 
   async voiceAgentClientSecret(): Promise<Result<ClientSecret, string>> {
     return err("the voice agent is not available in the browser mock");
+  },
+
+  // ---- Wake word ----
+  // No real microphone / ONNX models in the browser mock: the config "sticks" so
+  // the Settings rows are exercisable, but the detector can never actually run.
+
+  async wakeWordStatus(): Promise<WakeStatus> {
+    return { ...mockWake };
+  },
+
+  async setWakeWordConfig(
+    enabled: boolean | null,
+    phrase: string | null,
+    sensitivity: number | null,
+  ): Promise<Result<WakeStatus, string>> {
+    if (enabled !== null) mockWake.enabled = enabled;
+    if (phrase !== null) mockWake.phrase = phrase;
+    if (sensitivity !== null) mockWake.sensitivity = Math.min(1, Math.max(0, sensitivity));
+    // The mock has no capture backend, so "running" can never be true.
+    mockWake.running = false;
+    mockWake.error = mockWake.enabled
+      ? "the wake-word detector is not available in the browser mock"
+      : null;
+    return ok({ ...mockWake });
   },
 
   async appControlTools(_surface: string): Promise<Result<unknown, string>> {

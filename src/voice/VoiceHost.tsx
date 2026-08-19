@@ -3,7 +3,7 @@
 // the announcement queue into the Realtime session, one at a time, only while
 // the feature is armed. Mounted once in App.
 import { useEffect, useRef } from "react";
-import { commands } from "../ipc/client";
+import { commands, events } from "../ipc/client";
 import type { AppControlHelpers } from "../agent/appControl";
 import {
   clearVoiceAnnouncements,
@@ -15,6 +15,8 @@ import { registerVoiceHelpers, sayAnnouncement, toggleMic } from "./realtime";
 import { useVoiceStore } from "./voiceStore";
 import { useVoicePrefs } from "./voicePrefs";
 import { makeTapDetector, matchesChord } from "./pttShortcut";
+import { wakeTrigger } from "./wake";
+import { useWakeStore, wakeEnabled } from "./wakeStore";
 import type { View } from "../ui/shortcuts";
 
 export function VoiceHost({
@@ -74,6 +76,28 @@ export function VoiceHost({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+
+  // Wake word: seed the status mirror, then react to a detected phrase exactly
+  // like a spoken push-to-talk — open the microphone. The whole gate (a key is
+  // configured, the wake word is enabled, and the agent isn't mid-sentence) lives
+  // in wakeTrigger/shouldFireWake. The Rust detector only emits while enabled, so
+  // this listener is inert until the user opts in.
+  useEffect(() => {
+    let disposed = false;
+    void commands
+      .wakeWordStatus()
+      .then((s) => {
+        if (!disposed) useWakeStore.getState().setStatus(s);
+      })
+      .catch((e) => console.error("wake status read failed:", e));
+    const un = events.wakeWordEvent.listen(() => {
+      if (!disposed) void wakeTrigger(wakeEnabled());
+    });
+    return () => {
+      disposed = true;
+      void un.then((f) => f()).catch(() => {});
     };
   }, []);
 
