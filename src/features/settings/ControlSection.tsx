@@ -7,8 +7,9 @@
 // (`voice_bridge_status`), so a failed bind shows as an error instead of a
 // switch that lies.
 import { useCallback, useEffect, useState } from "react";
-import { commands, type VoiceBridgeStatus } from "../../ipc/client";
+import { commands, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
+import { useCaffeinate } from "../../store/caffeinate";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -77,6 +78,83 @@ export function ControlSection() {
     }
     if (port !== voice.port) void apply({ port });
   }, [portDraft, voice, apply]);
+
+  // --- Remote access (phone) -------------------------------------------------
+  const [remote, setRemote] = useState<RemoteStatus | null>(null);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    void commands.remoteStatus().then((s) => {
+      if (!disposed) setRemote(s);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const applyRemote = useCallback(
+    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean }) => {
+      setRemoteBusy(true);
+      setRemoteError(null);
+      try {
+        const res = await commands.setRemote(
+          patch.enabled ?? null,
+          patch.relayUrl ?? null,
+          patch.regeneratePairing ?? false,
+        );
+        if (res.status === "ok") setRemote(res.data);
+        else setRemoteError(res.error);
+      } catch (e) {
+        setRemoteError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRemoteBusy(false);
+      }
+    },
+    [],
+  );
+
+  // Remote access needs the Mac awake; enabling it forces Caffeinate "Hard" and
+  // snapshots the prior policy so turning it off restores what the user had.
+  const onToggleRemote = useCallback(
+    (next: boolean) => {
+      const SNAP = "tosse:remote:caffSnapshot";
+      const caff = useCaffeinate.getState();
+      if (next) {
+        try {
+          localStorage.setItem(SNAP, JSON.stringify({ enabled: caff.enabled, mode: caff.mode }));
+        } catch {
+          /* storage disabled — best effort */
+        }
+        caff.set({ enabled: true, mode: "hard" });
+      } else {
+        try {
+          const raw = localStorage.getItem(SNAP);
+          if (raw) {
+            const s = JSON.parse(raw) as { enabled?: boolean; mode?: string };
+            caff.set({ enabled: !!s.enabled, mode: s.mode === "hard" ? "hard" : "light" });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      void applyRemote({ enabled: next });
+    },
+    [applyRemote],
+  );
+
+  const copyPairing = useCallback(async () => {
+    if (!remote?.pairing_url) return;
+    try {
+      await navigator.clipboard.writeText(remote.pairing_url);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1500);
+    } catch {
+      /* clipboard denied */
+    }
+  }, [remote]);
 
   const url = voice?.url ?? (voice ? `http://127.0.0.1:${voice.port}/mcp` : "");
 
@@ -168,6 +246,73 @@ export function ControlSection() {
             </span>
           }
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Remote access (phone)" icon="globe">
+        <ToggleRow
+          title="Reach your agents from your phone"
+          hint={
+            <>
+              Connects this Mac to a cloud relay so a phone web app can list and drive your
+              conversations from anywhere — no local network needed, no app store. Turning this on
+              keeps the Mac awake (Caffeinate) so it can answer; the Mac must stay powered on.
+              {remote?.error ? <div className={styles.dangerText}>⚠️ {remote.error}</div> : null}
+              {remoteError ? <div className={styles.dangerText}>⚠️ {remoteError}</div> : null}
+            </>
+          }
+          checked={!!remote?.enabled}
+          onChange={onToggleRemote}
+          disabled={remoteBusy || !remote}
+        />
+        <ToggleRow
+          title="Status"
+          hint="Whether this Mac is connected to the relay right now."
+          control={
+            <span className={styles.mono}>
+              {remote?.enabled ? (remote.connected ? "connected" : "connecting…") : "off"}
+            </span>
+          }
+        />
+        <ToggleRow
+          title="Relay"
+          hint="The cloud relay this Mac dials. Change it only if you host your own."
+          control={<span className={styles.mono}>{remote?.relay_url ?? "—"}</span>}
+        />
+        <ToggleRow
+          title="Pair a phone"
+          hint="Scan this QR with your phone's camera to open the app already paired. Keep it private — it grants control of your agents. Regenerating unpairs every phone."
+          control={
+            <span className={styles.tokenRow}>
+              <button
+                className={`${styles.btn} ${styles.ghost}`}
+                onClick={() => void copyPairing()}
+                disabled={!remote?.pairing_url}
+              >
+                {linkCopied ? "Copied" : "Copy link"}
+              </button>
+              <button
+                className={`${styles.btn} ${styles.ghost}`}
+                onClick={() => void applyRemote({ regeneratePairing: true })}
+                disabled={remoteBusy || !remote}
+              >
+                Regenerate
+              </button>
+            </span>
+          }
+        />
+        {remote?.pairing_qr_svg ? (
+          <div
+            style={{
+              background: "#fff",
+              padding: 12,
+              borderRadius: 12,
+              width: 190,
+              height: 190,
+              margin: "4px auto 10px",
+            }}
+            dangerouslySetInnerHTML={{ __html: remote.pairing_qr_svg }}
+          />
+        ) : null}
       </SettingsGroup>
     </>
   );
