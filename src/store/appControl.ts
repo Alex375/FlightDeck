@@ -39,11 +39,23 @@ export interface AppControlPrefs {
    *  executor (`agent/appControl.ts`), which covers every agent surface; the
    *  in-app voice agent also stops advertising the tool when this is off. */
   agentRemoveConversations: boolean;
+  /** May a REMOTE client (paired phone / relay) ANSWER pending requests —
+   *  permission prompts, questionnaires, plan approvals?
+   *
+   *  Answering a SPECIFIC pending request is not privilege-raising (the human
+   *  sees the exact tool + command and decides), unlike changing the permission
+   *  MODE, which stays forbidden everywhere. Still, it hands real control to
+   *  whoever holds the pairing token, so it is an explicit opt-in.
+   *
+   *  OFF by default. Enforced in the front executor (`agent/appControl.ts`),
+   *  which covers every surface the `answer_request` tool rides. */
+  remoteAnswers: boolean;
 }
 
 const DEFAULTS: AppControlPrefs = {
   agentServer: true,
   agentRemoveConversations: true,
+  remoteAnswers: false,
 };
 
 function load(): AppControlPrefs {
@@ -78,6 +90,7 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
         agentServer: patch.agentServer ?? s.agentServer,
         agentRemoveConversations:
           patch.agentRemoveConversations ?? s.agentRemoveConversations,
+        remoteAnswers: patch.remoteAnswers ?? s.remoteAnswers,
       };
       save(next);
       return next;
@@ -92,4 +105,9 @@ export function agentServerEnabled(): boolean {
 /** May an agent remove a conversation from the active list? (executor gate). */
 export function agentRemoveConversationsEnabled(): boolean {
   return useAppControlPrefs.getState().agentRemoveConversations;
+}
+
+/** May a remote client answer pending permission requests? (executor gate). */
+export function remoteAnswersEnabled(): boolean {
+  return useAppControlPrefs.getState().remoteAnswers;
 }

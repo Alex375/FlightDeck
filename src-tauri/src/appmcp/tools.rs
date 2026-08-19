@@ -172,6 +172,85 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "interrupt_conversation",
+            description: "Interrupt the conversation's CURRENT turn (the stop button) without \
+                killing the session — the agent stops working and waits for the next message.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_stream",
+            description: "Power the conversation's live process off WITHOUT archiving it — the \
+                conversation stays on the list and resumes on the next message.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "list_background_tasks",
+            description: "The conversation's background tasks (bg shell commands, monitors, \
+                sub-agents, workflows): task_id, kind, status, label. Live-only — a reloaded \
+                conversation has none.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_background_task",
+            description: "Stop ONE background task by task_id (see list_background_tasks) \
+                without ending the turn or the session.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "task_id": { "type": "string",
+                        "description": "The task to stop (from list_background_tasks)." },
+                }),
+                &["conversation_id", "task_id"],
+            ),
+        },
+        ToolSpec {
+            name: "get_pending_request",
+            description: "Full detail of the conversation's pending requests waiting on the \
+                human: permission prompts (tool + input), questionnaires (questions + options \
+                in `input`), plan approvals (plan markdown in `input`). Read-only. Answer with \
+                answer_request.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "answer_request",
+            description: "Answer ONE pending request (from get_pending_request): allow or deny \
+                a permission prompt / plan approval; questionnaires answer with behavior \
+                'allow' plus `updated_input` carrying the chosen options. Gated by an explicit \
+                desktop opt-in (Settings → Control), off by default.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "request_id": { "type": "string",
+                        "description": "The pending request to answer (from get_pending_request)." },
+                    "behavior": { "type": "string", "enum": ["allow", "deny"],
+                        "description": "Allow or deny the request." },
+                    "message": { "type": "string",
+                        "description": "Optional reason shown to the agent on deny." },
+                    "updated_input": { "description": "Optional rewritten tool input on allow \
+                        (questionnaire answers ride here, mirroring the desktop card)." },
+                }),
+                &["conversation_id", "request_id", "behavior"],
+            ),
+        },
+        ToolSpec {
             name: "rename_conversation",
             description: "Rename a conversation. Without conversation_id it renames the calling \
                 conversation (in-app callers only). The new name sticks: automatic titling stops \

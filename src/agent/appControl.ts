@@ -12,16 +12,22 @@
 // Kept React-free: pure functions over `.getState()`, so every tool is directly
 // unit-testable. The React side is a thin listener host (AppControlHost.tsx).
 
-import { commands, type DiskConversation } from "../ipc/client";
+import {
+  commands,
+  type DiskConversation,
+  type JsonValue,
+  type PermissionDecision,
+} from "../ipc/client";
 import {
   useConversationsStore,
   loadConversationHistory,
   createConversationInRepo,
   acknowledgeConversation,
   reactivateDiskConversation,
+  stopConversationSession,
   type Conversation,
 } from "../store/conversationsStore";
-import { agentRemoveConversationsEnabled } from "../store/appControl";
+import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
@@ -211,6 +217,8 @@ function listConversations(session: string | null): unknown {
       repository: repo ? { name: baseName(repo.path), path: repo.path } : null,
       backend: c.kind,
       status: statusJson(statusFor(c)),
+      model: c.model,
+      effort: c.ultracode ? "ultracode" : c.effort,
       last_activity_at: c.lastActivityAt,
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
     };
@@ -270,6 +278,121 @@ function setConversationModel(args: Record<string, unknown>, session: string | n
     throw new Error(`set_conversation_model: unknown model '${model}' (see list_models)`);
   useConversationsStore.getState().setConvModel(conv.id, model);
   return { conversation_id: conv.id, model };
+}
+
+/** Interrupt the target conversation's CURRENT turn (the composer's stop button). */
+async function interruptConversation(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
+  const res = await commands.interruptSession(conv.handle);
+  if (res.status === "error") throw new Error(res.error);
+  return { conversation_id: conv.id, interrupted: true };
+}
+
+/** Power the live process off WITHOUT archiving — the stream's "turn off". */
+async function stopStream(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  if (!conv.handle) return { conversation_id: conv.id, stopped: false, note: "already off" };
+  await stopConversationSession(conv.id);
+  return { conversation_id: conv.id, stopped: true };
+}
+
+/** The conversation's background tasks (live-only registry). */
+function listBackgroundTasksTool(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
+  return {
+    conversation_id: conv.id,
+    tasks: Object.values(tasks).map((t) => ({
+      task_id: t.task_id,
+      kind: t.kind,
+      status: t.status,
+      label: t.label ?? null,
+    })),
+  };
+}
+
+/** Stop ONE background task (bg Bash / Monitor / sub-agent / workflow) by id. */
+async function stopBackgroundTask(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+  if (!taskId) throw new Error("stop_background_task: 'task_id' is required (see list_background_tasks)");
+  if (!conv.handle) throw new Error("the conversation is not running");
+  const res = await commands.stopTask(conv.handle, taskId);
+  if (res.status === "error") throw new Error(res.error);
+  return { conversation_id: conv.id, task_id: taskId, stopping: true };
+}
+
+/** Classify a pending can_use_tool request for a remote card. */
+function pendingKind(toolName: string): "questions" | "plan" | "permission" {
+  if (toolName === "AskUserQuestion") return "questions";
+  if (toolName === "ExitPlanMode") return "plan";
+  return "permission";
+}
+
+/** Full detail of the target conversation's pending requests (permission prompts,
+ *  questionnaires, plan approvals). Read-only; the raw `input` carries the
+ *  questionnaire's options / the plan's markdown, exactly as the desktop sees them. */
+function getPendingRequest(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const perms = useConversationStore.getState().sessions[conv.id]?.pendingPermissions ?? [];
+  return {
+    conversation_id: conv.id,
+    requests: perms.map((p) => ({
+      request_id: p.request_id,
+      kind: pendingKind(p.tool_name),
+      tool_name: p.tool_name,
+      title: p.title,
+      description: p.description,
+      input: p.input,
+    })),
+  };
+}
+
+/** Answer ONE pending request (allow/deny; questionnaires answer via
+ *  `updated_input`, mirroring the desktop cards). Gated by the explicit
+ *  Settings → Control opt-in — answering a SPECIFIC visible request is not
+ *  privilege-raising (unlike changing the permission MODE, which stays banned),
+ *  but it hands real control to the token holder, so it is off by default. */
+async function answerRequest(args: Record<string, unknown>, session: string | null) {
+  if (!remoteAnswersEnabled()) {
+    throw new Error(
+      "answering requests is turned off — enable it in Settings → Control " +
+        '("Answer permission requests remotely")',
+    );
+  }
+  const conv = resolveTarget(args, session);
+  const requestId = typeof args.request_id === "string" ? args.request_id.trim() : "";
+  if (!requestId) throw new Error("answer_request: 'request_id' is required (see get_pending_request)");
+  const behavior = args.behavior === "allow" || args.behavior === "deny" ? args.behavior : null;
+  if (!behavior) throw new Error("answer_request: 'behavior' must be 'allow' or 'deny'");
+  const perms = useConversationStore.getState().sessions[conv.id]?.pendingPermissions ?? [];
+  const pending = perms.find((p) => p.request_id === requestId);
+  if (!pending) {
+    throw new Error(
+      `no pending request '${requestId}' — it may have been answered or withdrawn (see get_pending_request)`,
+    );
+  }
+  // Mirror useAnswerPermission: fail loudly when the process died with the card
+  // up — silently dismissing is indistinguishable from a delivered answer.
+  if (!conv.handle) throw new Error("the session ended before the answer could be sent");
+  const decision: PermissionDecision =
+    behavior === "allow"
+      ? { behavior: "allow", updated_input: (args.updated_input ?? null) as JsonValue | null }
+      : {
+          behavior: "deny",
+          message:
+            typeof args.message === "string" && args.message.trim() ? args.message.trim() : "Rejected.",
+        };
+  useConversationStore.getState().removePermission(conv.id, requestId);
+  const res = await commands.answerPermission(conv.handle, requestId, decision);
+  if (res.status === "error") throw new Error(res.error);
+  void commands.publishControlEvent("attention_cleared", conv.id, conv.name, {
+    reason: "answered",
+    request_id: requestId,
+    behavior,
+  });
+  return { conversation_id: conv.id, request_id: requestId, behavior };
 }
 
 function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
@@ -629,6 +752,18 @@ export async function executeAppControlTool(
       return setConversationModel(args, session);
     case "set_conversation_effort":
       return setConversationEffort(args, session);
+    case "interrupt_conversation":
+      return interruptConversation(args, session);
+    case "stop_stream":
+      return stopStream(args, session);
+    case "list_background_tasks":
+      return listBackgroundTasksTool(args, session);
+    case "stop_background_task":
+      return stopBackgroundTask(args, session);
+    case "get_pending_request":
+      return getPendingRequest(args, session);
+    case "answer_request":
+      return answerRequest(args, session);
     case "focus_conversation":
       return focusConversation(args, session, helpers);
     case "rename_conversation":

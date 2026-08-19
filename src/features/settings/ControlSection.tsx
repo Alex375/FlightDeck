@@ -190,6 +190,8 @@ export function VoiceBridgeGroup() {
 }
 
 export function RemoteAccessGroup() {
+  const remoteAnswers = useAppControlPrefs((s) => s.remoteAnswers);
+  const setPrefs = useAppControlPrefs((s) => s.set);
   const [remote, setRemote] = useState<RemoteStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -290,6 +292,19 @@ export function RemoteAccessGroup() {
         checked={!!remote?.enabled}
         onChange={onToggle}
         disabled={busy || !remote}
+      />
+      <ToggleRow
+        title="Answer permission requests remotely"
+        hint={
+          <>
+            Lets a paired phone see the full pending request — tool, command, plan — and answer
+            Allow / Deny (questionnaires and plan approvals included). Off: remote clients see
+            that something is waiting, but only this Mac can answer. Changing the permission
+            MODE stays impossible from remote either way.
+          </>
+        }
+        checked={remoteAnswers}
+        onChange={(next) => setPrefs({ remoteAnswers: next })}
       />
       <ToggleRow
         title="Status"
