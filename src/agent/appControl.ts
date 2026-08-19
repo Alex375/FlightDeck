@@ -23,6 +23,8 @@ import {
 } from "../store/conversationsStore";
 import { agentRemoveConversationsEnabled } from "../store/appControl";
 import { useConversationStore } from "../store/conversationStore";
+import { CLAUDE_MODELS } from "../features/conversation/models";
+import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
 import {
   runningBashCountsByConv,
   runningCountsByConv,
@@ -243,8 +245,49 @@ async function readConversation(args: Record<string, unknown>, session: string |
     conversation_id: conv.id,
     title: conv.name,
     status: statusJson(statusFor(conv)),
+    model: conv.model,
+    effort: conv.ultracode ? "ultracode" : conv.effort,
     turns,
   };
+}
+
+/** The curated Claude model catalogue + the effort levels each one supports. */
+function listModels(): unknown {
+  return {
+    models: CLAUDE_MODELS.map((m) => ({
+      value: m.value,
+      label: m.label,
+      efforts: effortLevelsForModel(m.value),
+    })),
+  };
+}
+
+function setConversationModel(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const model = typeof args.model === "string" ? args.model.trim() : "";
+  if (!model) throw new Error("set_conversation_model: 'model' is required");
+  if (!CLAUDE_MODELS.some((m) => m.value === model))
+    throw new Error(`set_conversation_model: unknown model '${model}' (see list_models)`);
+  useConversationsStore.getState().setConvModel(conv.id, model);
+  return { conversation_id: conv.id, model };
+}
+
+function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const effort = typeof args.effort === "string" ? args.effort.trim() : "";
+  if (!effort) throw new Error("set_conversation_effort: 'effort' is required");
+  const store = useConversationsStore.getState();
+  if (effort === "ultracode") {
+    store.setConvUltracode(conv.id);
+  } else {
+    const valid = effortLevelsForModel(conv.model);
+    if (!valid.includes(effort as EffortLevel))
+      throw new Error(
+        `set_conversation_effort: '${effort}' not available for this model (valid: ${valid.join(", ")})`,
+      );
+    store.setConvEffort(conv.id, effort);
+  }
+  return { conversation_id: conv.id, effort };
 }
 
 async function sendMessage(args: Record<string, unknown>, session: string | null) {
@@ -580,6 +623,12 @@ export async function executeAppControlTool(
       return sendMessage(args, session);
     case "create_conversation":
       return createConversation(args);
+    case "list_models":
+      return listModels();
+    case "set_conversation_model":
+      return setConversationModel(args, session);
+    case "set_conversation_effort":
+      return setConversationEffort(args, session);
     case "focus_conversation":
       return focusConversation(args, session, helpers);
     case "rename_conversation":

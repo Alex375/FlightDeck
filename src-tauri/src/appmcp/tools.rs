@@ -137,6 +137,41 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "list_models",
+            description: "The curated Claude model catalogue with, for each, the effort levels \
+                it supports. Use it to offer a model / effort picker.",
+            kind: ToolKind::Front,
+            schema: obj(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "set_conversation_model",
+            description: "Set the model of a conversation (takes effect on its next turn; \
+                applied live if it is running). Values come from list_models.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "model": { "type": "string",
+                        "description": "Model wire value (from list_models)." },
+                }),
+                &["conversation_id", "model"],
+            ),
+        },
+        ToolSpec {
+            name: "set_conversation_effort",
+            description: "Set the reasoning-effort level of a conversation. Valid levels depend \
+                on the model (see list_models); 'ultracode' is the top Claude tier.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "effort": { "type": "string",
+                        "description": "Effort level: low | medium | high | xhigh | max | ultracode." },
+                }),
+                &["conversation_id", "effort"],
+            ),
+        },
+        ToolSpec {
             name: "rename_conversation",
             description: "Rename a conversation. Without conversation_id it renames the calling \
                 conversation (in-app callers only). The new name sticks: automatic titling stops \
