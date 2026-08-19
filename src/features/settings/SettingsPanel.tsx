@@ -21,7 +21,7 @@ import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
-import { AgentControlGroup, VoiceBridgeGroup } from "./ControlSection";
+import { AgentControlGroup, RemoteAccessGroup, VoiceBridgeGroup } from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
@@ -187,12 +187,13 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               <div className={styles.page}>
                 <PageHead
                   title="MCP Control"
-                  subtitle="Let agents pilot the app — from inside a conversation, by voice, or from an external client."
+                  subtitle="Let agents pilot the app — from inside a conversation, by voice, from your phone, or from an external client."
                 />
-                {/* Order: in-app control, then the built-in voice agent, then the
-                    bridge for EXTERNAL clients (the most niche card last). */}
+                {/* Order: in-app control, the built-in voice agent, phone remote
+                    access, then the bridge for EXTERNAL clients (most niche last). */}
                 <AgentControlGroup />
                 <VoiceAgentSection />
+                <RemoteAccessGroup />
                 <VoiceBridgeGroup />
               </div>
             )}

@@ -25,9 +25,11 @@
 
 import { commands } from "../ipc/client";
 import { executeAppControlTool, type AppControlHelpers } from "../agent/appControl";
+import { agentRemoveConversationsEnabled } from "../store/appControl";
 import { useVoicePrefs } from "./voicePrefs";
 import { useVoiceStore } from "./voiceStore";
 import { announcementText, clearVoiceAnnouncements, type FleetAnnouncement } from "./announce";
+import { buildTurnDetection } from "./vad";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
@@ -43,10 +45,21 @@ const VOICE_TOOL_NAMES = new Set([
   "browse_folders",
   "focus_conversation",
   "rename_conversation",
+  "acknowledge_conversation",
+  "remove_conversation",
+  "search_past_conversations",
+  "reopen_conversation",
   "open_file",
   "open_view",
   "open_panel",
 ]);
+
+/** Tools the agent only gets when their user policy allows it (read at arm
+ *  time, like the app-control spawn gate — re-arm to pick up a change). */
+function voiceToolAllowed(name: string): boolean {
+  if (name === "remove_conversation") return agentRemoveConversationsEnabled();
+  return true;
+}
 
 /** Session-local tool (NOT in the shared catalogue): ends the current voice
  *  EXCHANGE — closes the microphone; the armed session stays up for the next
@@ -64,8 +77,9 @@ const END_CALL_TOOL = {
 
 const INSTRUCTIONS = `You are Flight Deck's voice agent — the cockpit voice for the fleet of coding agents (conversations) the user runs in the Flight Deck desktop app.
 Style: spoken and brief — one to three short sentences, unless the user asks you to read details. Match the user's spoken language (this user usually speaks French).
-Ground everything in the tools: list_conversations for live statuses, read_conversation before summarizing a reply, send_message to relay the user's answer (name the target conversation before sending when there could be any doubt). Never invent conversation ids or content.
+Ground everything in the tools: list_conversations for the LIVE ones on the board, read_conversation before summarizing a reply, send_message to relay the user's answer (name the target conversation before sending when there could be any doubt). When the user refers to a past conversation that isn't on the active list, find it with search_past_conversations and bring it back with reopen_conversation. Never invent conversation ids or content.
 When a [Flight Deck event] message arrives, tell the user what happened in one or two sentences, then ask if they want to react — their microphone was just opened for the reply.
+Once the user has heard about a conversation and no longer needs it flagged, call acknowledge_conversation to clear its attention highlight. If they ask to clear a conversation off their board, call remove_conversation — it only takes it off the active list (the history is kept and it's undoable), so reassure them nothing is lost.
 When the user says they are done with you, say a short goodbye and call end_call. When they ask to work in a folder you don't know, orient yourself with browse_folders before asking them to spell out a path.`;
 
 interface LiveSession {
@@ -199,6 +213,21 @@ export function closeMic(): void {
   if (store.phase === "listening") store.setPhase("armed");
 }
 
+/** Push the current VAD threshold to the LIVE session, so the Settings slider
+ *  takes effect without re-arming. No-op when nothing is connected (the next
+ *  arm reads the pref on `dc.onopen`). */
+export function applyVadSettings(): void {
+  const s = session;
+  if (!s) return;
+  dcSend(s, {
+    type: "session.update",
+    session: {
+      type: "realtime",
+      audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
+    },
+  });
+}
+
 // ---- Session plumbing -------------------------------------------------------
 
 async function doStart(): Promise<void> {
@@ -218,7 +247,7 @@ async function doStart(): Promise<void> {
     const catalogue = (toolsRes.data as { tools?: Array<Record<string, unknown>> }).tools ?? [];
     const tools = [
       ...catalogue
-        .filter((t) => VOICE_TOOL_NAMES.has(String(t.name)))
+        .filter((t) => VOICE_TOOL_NAMES.has(String(t.name)) && voiceToolAllowed(String(t.name)))
         .map((t) => ({
           type: "function",
           name: t.name,
@@ -272,10 +301,19 @@ async function doStart(): Promise<void> {
     // A rejected `ready` is normal teardown; never let it surface as unhandled.
     void ready.catch(() => {});
     dc.onopen = () => {
-      // Declare instructions + tools; audio/voice were fixed at mint time.
+      // Declare instructions + tools, and configure turn detection EXPLICITLY
+      // (voice/model were fixed at mint time; the input turn_detection was
+      // not, so we were inheriting OpenAI's over-sensitive default). The
+      // amplitude threshold is user-tunable — see vad.ts / applyVadSettings.
       dcSend(next, {
         type: "session.update",
-        session: { type: "realtime", instructions: INSTRUCTIONS, tools, tool_choice: "auto" },
+        session: {
+          type: "realtime",
+          instructions: INSTRUCTIONS,
+          tools,
+          tool_choice: "auto",
+          audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
+        },
       });
       useVoiceStore.getState().setPhase("armed");
       next.settleReady();

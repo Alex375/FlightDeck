@@ -78,14 +78,19 @@ export function ToggleRow({
         {hint ? <div className={styles.thint}>{hint}</div> : null}
       </div>
       {action}
-      {control ?? (
-        <Toggle
-          checked={!!checked}
-          onChange={onChange ?? (() => {})}
-          label={label ?? title}
-          disabled={disabled}
-        />
-      )}
+      {/* Render the default Toggle only when the row actually IS a toggle (it
+          passes `checked`/`onChange`). A purely informational row — no control,
+          no toggle props — renders nothing on the right, instead of a dead
+          OFF toggle that swallows clicks and looks like a broken setting. */}
+      {control ??
+        (checked !== undefined || onChange !== undefined ? (
+          <Toggle
+            checked={!!checked}
+            onChange={onChange ?? (() => {})}
+            label={label ?? title}
+            disabled={disabled}
+          />
+        ) : null)}
     </div>
   );
 }

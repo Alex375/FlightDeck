@@ -5,6 +5,7 @@
 // opts in here. The KEY itself is never in this store.
 import { create } from "zustand";
 import { DEFAULT_PTT, type PttShortcut } from "./pttShortcut";
+import { VAD_THRESHOLD_DEFAULT, clampVadThreshold } from "./vad";
 
 const STORAGE_KEY = "tosse:voice";
 
@@ -17,11 +18,17 @@ export interface VoicePrefs {
    *  Settings, matched by VoiceHost's listener (see pttShortcut.ts). It toggles
    *  the mic, arming the session first when pressed from cold. */
   pttShortcut: PttShortcut;
+  /** Server-VAD amplitude threshold (0..1): how loud incoming audio must be to
+   *  count as speech. Higher = LESS sensitive (ignores background noise and
+   *  faint sounds); lower = picks up quieter speech. The Settings slider tunes
+   *  it; it's pushed to the live session via `applyVadSettings`. See vad.ts. */
+  vadThreshold: number;
 }
 
 const DEFAULTS: VoicePrefs = {
   autoCloseSeconds: 25,
   pttShortcut: DEFAULT_PTT,
+  vadThreshold: VAD_THRESHOLD_DEFAULT,
 };
 
 function load(): VoicePrefs {
@@ -63,6 +70,10 @@ export const useVoicePrefs = create<VoicePrefsState>((set) => ({
             ? clampAutoClose(patch.autoCloseSeconds)
             : s.autoCloseSeconds,
         pttShortcut: patch.pttShortcut ?? s.pttShortcut,
+        vadThreshold:
+          patch.vadThreshold !== undefined
+            ? clampVadThreshold(patch.vadThreshold)
+            : s.vadThreshold,
       };
       save(next);
       return next;

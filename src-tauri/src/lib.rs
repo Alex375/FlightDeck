@@ -60,6 +60,7 @@ use ipc::commands::{
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
+    remote_status, set_remote,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -229,6 +230,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_wake_word_config,
             app_control_tools,
             folder_tree,
+            remote_status,
+            set_remote,
         ])
         .events(collect_events![
             TickEvent,
@@ -615,6 +618,16 @@ pub fn run() {
                         let _ = wake.apply(cfg);
                     });
                 }
+            }
+
+            // Remote access (phone): always seed the relay config into the hub so
+            // Settings can render the pairing QR, and dial the relay out if it was
+            // left enabled (apply_remote stores the config either way, then only
+            // connects when enabled).
+            {
+                let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
+                tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
 
             // Rust timer: emit a TickEvent every second (Rust -> React) — kept as

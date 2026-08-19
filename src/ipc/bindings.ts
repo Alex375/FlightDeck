@@ -1976,6 +1976,27 @@ async folderTree(path: string | null, depth: number | null) : Promise<Result<Fol
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The remote-access relay's current status (Settings read-back: config + whether
+ * the outbound connection is actually up, plus the pairing QR).
+ */
+async remoteStatus() : Promise<RemoteStatus> {
+    return await TAURI_INVOKE("remote_status");
+},
+/**
+ * Change the remote-access config (enable, relay URL, regenerate the pairing
+ * token), persist it, and (re)connect or disconnect accordingly. Regenerating
+ * the pairing token revokes every previously-paired phone. Returns the honest
+ * post-apply status.
+ */
+async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean) : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -3355,6 +3376,12 @@ error: string | null;
  * enabled. The front keeps it visible across status-only pushes while still active.
  */
 pairing_code: string | null }
+/**
+ * Live state of the outbound remote-access relay connection, for the Settings
+ * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
+ * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+ */
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
 /**
  * A working folder a conversation can be opened in.
  */
