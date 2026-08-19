@@ -84,6 +84,7 @@ import type {
   ClientSecret,
   FolderTree,
   VoiceAgentStatus,
+  RemoteStatus,
   VoiceBridgeStatus,
   WorkflowJournal,
   WorkflowJournalEvent,
@@ -251,6 +252,18 @@ const mockVoiceBridge: VoiceBridgeStatus = {
 const mockVoiceAgent: VoiceAgentStatus = {
   configured: false,
   key_hint: null,
+};
+
+// In-memory remote-access state for the browser mock (no real relay connection).
+const mockRemote: RemoteStatus = {
+  enabled: false,
+  connected: false,
+  relay_url: "https://relay-production-8fd4.up.railway.app",
+  mac_id: "mock-mac-id",
+  phone_token: "mock-phone-token",
+  pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
+  pairing_qr_svg: null,
+  error: null,
 };
 
 let mockCounter = 0;
@@ -1520,6 +1533,23 @@ export const mockCommands = {
       tree: "Documents/\n  repositories/\n    demo-app/ (git repo)\nDesktop/",
       truncated: false,
     });
+  },
+
+  async remoteStatus(): Promise<RemoteStatus> {
+    return { ...mockRemote };
+  },
+
+  async setRemote(
+    enabled: boolean | null,
+    relayUrl: string | null,
+    regeneratePairing: boolean,
+  ): Promise<Result<RemoteStatus, string>> {
+    if (enabled !== null) mockRemote.enabled = enabled;
+    if (relayUrl !== null && relayUrl.trim()) mockRemote.relay_url = relayUrl.trim();
+    if (regeneratePairing) mockRemote.phone_token = `mock-pt-${Date.now()}`;
+    mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockRemote.phone_token}`;
+    mockRemote.connected = mockRemote.enabled;
+    return ok({ ...mockRemote });
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

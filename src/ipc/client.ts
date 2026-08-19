@@ -50,6 +50,7 @@ export type {
   PluginInfo,
   Pong,
   RemoteControlState,
+  RemoteStatus,
   RepoRecord,
   Result,
   RewindOutcome,
