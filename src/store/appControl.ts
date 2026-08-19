@@ -27,10 +27,23 @@ export interface AppControlPrefs {
    *  exposed tool is non-destructive by design (no permission-mode changes, no
    *  deletes, no rewind — see the Rust-side catalogue). */
   agentServer: boolean;
+  /** May an agent REMOVE a conversation from the active Flight Deck list?
+   *
+   *  Non-destructive: the transcript stays on disk (re-openable from the
+   *  History panel) and the removal is ⌘Z-undoable — it only takes the
+   *  conversation off the live list (and stops its session). It is NOT a
+   *  history delete.
+   *
+   *  ON by default (the voice agent's "clear that one off my board" command),
+   *  but toggleable so removal can be kept human-only. Enforced in the front
+   *  executor (`agent/appControl.ts`), which covers every agent surface; the
+   *  in-app voice agent also stops advertising the tool when this is off. */
+  agentRemoveConversations: boolean;
 }
 
 const DEFAULTS: AppControlPrefs = {
   agentServer: true,
+  agentRemoveConversations: true,
 };
 
 function load(): AppControlPrefs {
@@ -63,6 +76,8 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
     set((s) => {
       const next: AppControlPrefs = {
         agentServer: patch.agentServer ?? s.agentServer,
+        agentRemoveConversations:
+          patch.agentRemoveConversations ?? s.agentRemoveConversations,
       };
       save(next);
       return next;
@@ -72,4 +87,9 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
 /** Read the current policy outside React (spawn path). */
 export function agentServerEnabled(): boolean {
   return useAppControlPrefs.getState().agentServer;
+}
+
+/** May an agent remove a conversation from the active list? (executor gate). */
+export function agentRemoveConversationsEnabled(): boolean {
+  return useAppControlPrefs.getState().agentRemoveConversations;
 }

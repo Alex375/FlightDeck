@@ -15,6 +15,7 @@ import styles from "./SettingsPanel.module.css";
 
 export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
+  const agentRemoveConversations = useAppControlPrefs((s) => s.agentRemoveConversations);
   const setPrefs = useAppControlPrefs((s) => s.set);
   return (
     <SettingsGroup title="Agent control of the app" icon="wand">
@@ -25,12 +26,26 @@ export function AgentControlGroup() {
             New conversations expose the <span className={styles.mono}>flightdeck</span> MCP
             server to their agent: open files in the editor, switch views, create / read /
             message the other conversations, notify you. Applies to sessions started from now
-            on — a live conversation keeps what it spawned with until restarted. Nothing
-            destructive is ever exposed (no permission changes, no deletes, no rewind).
+            on — a live conversation keeps what it spawned with until restarted. Nothing that
+            destroys data is ever exposed (no permission changes, no history deletes, no
+            rewind).
           </>
         }
         checked={agentServer}
         onChange={(next) => setPrefs({ agentServer: next })}
+      />
+      <ToggleRow
+        title="Let agents remove conversations from the list"
+        hint={
+          <>
+            Agents — the voice agent especially — can take a conversation off the active Flight
+            Deck list when you ask (&ldquo;clear that one off my board&rdquo;). It&rsquo;s not a
+            delete: the history stays on disk, it reopens from the History panel, and ⌘Z brings
+            it back. Turn off to keep removal a human-only action.
+          </>
+        }
+        checked={agentRemoveConversations}
+        onChange={(next) => setPrefs({ agentRemoveConversations: next })}
       />
     </SettingsGroup>
   );

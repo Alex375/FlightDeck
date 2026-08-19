@@ -8,6 +8,8 @@ import { useCallback, useEffect, useState } from "react";
 import { commands, type VoiceAgentStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
 import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
+import { applyVadSettings } from "../../voice/realtime";
+import { VadMeter } from "../../voice/VadMeter";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -15,6 +17,7 @@ import styles from "./SettingsPanel.module.css";
 export function VoiceAgentSection() {
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
   const pttShortcut = useVoicePrefs((s) => s.pttShortcut);
+  const vadThreshold = useVoicePrefs((s) => s.vadThreshold);
   const setPrefs = useVoicePrefs((s) => s.set);
 
   const [status, setStatus] = useState<VoiceAgentStatus | null>(null);
@@ -215,6 +218,27 @@ export function VoiceAgentSection() {
             />
             <span className={styles.thintInline}>s</span>
           </span>
+        }
+      />
+      <ToggleRow
+        title="Voice detection threshold"
+        hint={
+          <>
+            How loud speech must be before the agent starts listening. Drag the handle right to
+            make it less sensitive — it then ignores background noise and faint sounds, so it
+            won&rsquo;t cut in or interrupt on stray sound. Drag left to pick up quieter speech.
+            You can still interrupt the agent by speaking.
+            <VadMeter
+              threshold={vadThreshold}
+              onThresholdChange={(v) => {
+                setPrefs({ vadThreshold: v });
+                applyVadSettings();
+              }}
+              valueClassName={styles.mono}
+              buttonClassName={`${styles.btn} ${styles.ghost}`}
+              disabled={!configured}
+            />
+          </>
         }
       />
     </SettingsGroup>

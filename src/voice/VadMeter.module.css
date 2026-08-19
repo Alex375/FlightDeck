@@ -1,0 +1,97 @@
+/* Discord-style live microphone meter for tuning the VAD threshold. The live
+   input level fills the track; a draggable vertical handle (an overlaid range
+   input) marks the threshold ON THE SAME BAR. When the level crosses the handle
+   the fill turns "hot" (the accent) — that's the moment the agent would treat it
+   as speech. Level and handle share the 0..1 scale, so they line up exactly. */
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.track {
+  position: relative;
+  flex: 1;
+  height: 14px;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  overflow: visible; /* the handle sticks out above/below the track */
+}
+/* Live level fill — width is driven imperatively (rAF) to avoid a React render
+   per frame. Muted while below threshold, accent once it crosses ("hot"). */
+.fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0%;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--text-muted);
+  transition: background-color 60ms linear;
+}
+.fill[data-hot="1"] {
+  background: var(--accent);
+}
+/* The threshold handle: a transparent native range overlaying the whole track.
+   Its thumb is a slim vertical bar (Discord's threshold line) that sits over the
+   live fill on the same scale. */
+.slider {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: ew-resize;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.slider:focus {
+  outline: none;
+}
+.slider:disabled {
+  cursor: default;
+}
+.slider::-webkit-slider-runnable-track {
+  background: transparent;
+  height: 100%;
+  border: none;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 4px;
+  height: 24px;
+  margin-top: -6px; /* center a 24px handle on the 14px track (+1px border) */
+  background: var(--text-primary);
+  border: 1px solid var(--bg);
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
+  cursor: ew-resize;
+}
+.slider::-moz-range-track {
+  background: transparent;
+  height: 100%;
+  border: none;
+}
+.slider::-moz-range-thumb {
+  width: 4px;
+  height: 24px;
+  background: var(--text-primary);
+  border: 1px solid var(--bg);
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
+  cursor: ew-resize;
+}
+.hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
