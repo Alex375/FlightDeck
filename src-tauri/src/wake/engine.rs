@@ -45,9 +45,6 @@ const MEL_HOP: usize = 160;
 const MEL_WINDOW_SAMPLES: usize = EMB_FRAMES * MEL_HOP + 640;
 /// Silero VAD frame size at 16 kHz.
 const VAD_FRAME: usize = 512;
-/// Keep the pipeline "hot" for this many steps after the last speech frame, so a
-/// wake word straddling a brief VAD dropout is not cut (hangover).
-const VAD_HANGOVER_STEPS: u32 = 8;
 /// Suppress re-fires for this many steps after a detection (~1.2 s) and clear the
 /// embedding buffer, so one spoken phrase triggers exactly once.
 const REFIRE_COOLDOWN_STEPS: u32 = 15;
@@ -183,10 +180,10 @@ pub struct Engine {
     pending: usize,
     /// The last `CLASSIFIER_EMBEDDINGS` embeddings (flattened, 96 each).
     embeddings: std::collections::VecDeque<Vec<f32>>,
-    /// Steps remaining while still "hot" after the last speech (hangover).
-    hot_steps: u32,
     /// Steps remaining in the post-detection cooldown.
     cooldown: u32,
+    /// Previous VAD state, to log speech rising edges (diagnostics).
+    was_speech: bool,
 }
 
 impl Engine {
@@ -204,8 +201,8 @@ impl Engine {
             audio: Vec::with_capacity(MEL_WINDOW_SAMPLES + CHUNK),
             pending: 0,
             embeddings: std::collections::VecDeque::with_capacity(CLASSIFIER_EMBEDDINGS),
-            hot_steps: 0,
             cooldown: 0,
+            was_speech: false,
         })
     }
 
@@ -218,10 +215,18 @@ impl Engine {
     /// the configured phrase is detected (at most once per spoken phrase, thanks
     /// to the cooldown). `None` otherwise.
     pub fn feed(&mut self, samples: &[f32]) -> Option<f32> {
+        // VAD is computed for diagnostics only — it no longer GATES the pipeline.
+        // openWakeWord needs a CONTINUOUS rolling window of embeddings (~2 s); a
+        // hard VAD gate that ran the stack only during speech (and cleared the
+        // embedding buffer on silence) mis-anchored that window and starved the
+        // classifier of the 16 consecutive embeddings it needs — so a short
+        // utterance never fired. Run the stack every step; VAD-based CPU savings
+        // can come back later WITHOUT breaking the rolling window.
         let speech = self.vad.is_speech(samples);
-        if speech {
-            self.hot_steps = VAD_HANGOVER_STEPS;
+        if speech && !self.was_speech {
+            eprintln!("[wake] VAD: speech");
         }
+        self.was_speech = speech;
         self.audio.extend_from_slice(samples);
         self.pending += samples.len();
         // Cap the rolling buffer.
@@ -240,24 +245,19 @@ impl Engine {
         hit
     }
 
-    /// One 80 ms detection step. Skips the expensive stack when neither speech nor
-    /// the hangover keep it hot; advances the cooldown; otherwise runs
-    /// mel → embedding → (once 16 collected) classifier.
+    /// One 80 ms detection step: append the newest embedding to a CONTINUOUS
+    /// rolling window of the last 16, and (once the window is full) classify.
+    /// Runs every step — the rolling window must never be gated/cleared on silence
+    /// or the classifier loses the context it was trained on. The cooldown after a
+    /// hit is the only thing that pauses it.
     fn step(&mut self) -> Option<f32> {
         if self.cooldown > 0 {
             self.cooldown -= 1;
             return None;
         }
-        if self.hot_steps == 0 {
-            // Silence: let the embedding history lapse so a later phrase starts clean.
-            self.embeddings.clear();
-            return None;
-        }
-        self.hot_steps -= 1;
-
         let embedding = match self.newest_embedding() {
             Some(e) => e,
-            None => return None,
+            None => return None, // audio buffer not primed yet
         };
         if self.embeddings.len() == CLASSIFIER_EMBEDDINGS {
             self.embeddings.pop_front();
@@ -268,6 +268,11 @@ impl Engine {
         }
 
         let score = self.classify()?;
+        // The pipeline runs continuously now, so only log a score worth noticing —
+        // ambient/silence sits near 0 (no spam), a near-miss or a hit is visible.
+        if score > 0.3 {
+            eprintln!("[wake] score={score:.3} (threshold {:.3})", self.threshold);
+        }
         if score >= self.threshold {
             self.cooldown = REFIRE_COOLDOWN_STEPS;
             self.embeddings.clear();
@@ -422,5 +427,49 @@ mod tests {
             }
         }
         assert!(!fired, "silence must never trigger the wake word");
+    }
+
+    /// Diagnostic (ignored): feed a 16 kHz mono WAV at $WAKE_WAV through the engine
+    /// and print the score trajectory + any hits — validates real detection without
+    /// a live mic. Run e.g.:
+    ///   WAKE_WAV=target/alexa16.wav cargo test --lib wake::engine::tests::detect_wav -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn detect_wav() {
+        let path = std::env::var("WAKE_WAV").expect("set WAKE_WAV=/path/to/16k-mono.wav");
+        let phrase = std::env::var("WAKE_PHRASE").unwrap_or_else(|_| DEFAULT_PHRASE.to_string());
+        let bytes = std::fs::read(&path).expect("read wav");
+        let samples = parse_wav_i16(&bytes);
+        eprintln!(
+            "[test] {} samples ({:.2}s) from {path}",
+            samples.len(),
+            samples.len() as f32 / SAMPLE_RATE as f32
+        );
+        // 1 s leading silence primes the mel buffer; 0.5 s trailing lets the rolling
+        // window slide the phrase fully through — the mic streams continuously in
+        // real life, so priming context always exists there.
+        let mut audio = vec![0.0f32; SAMPLE_RATE as usize];
+        audio.extend_from_slice(&samples);
+        audio.extend(std::iter::repeat(0.0f32).take(SAMPLE_RATE as usize / 2));
+        let mut engine = Engine::new(&phrase, 0.5).expect("engine builds");
+        let mut hits = 0;
+        for chunk in audio.chunks(CHUNK) {
+            if engine.feed(chunk).is_some() {
+                hits += 1;
+            }
+        }
+        eprintln!("[test] phrase={phrase} hits={hits} (see [wake] score= lines above for the trajectory)");
+    }
+
+    /// Minimal PCM-16 WAV reader: locate the `data` subchunk, decode i16 LE → f32.
+    fn parse_wav_i16(bytes: &[u8]) -> Vec<f32> {
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("no data chunk in WAV");
+        bytes[pos + 8..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect()
     }
 }

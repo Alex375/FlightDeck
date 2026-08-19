@@ -235,10 +235,12 @@ fn run_worker(
     })();
     let (mut engine, _capture) = match setup {
         Ok(v) => {
+            eprintln!("[wake] detector RUNNING (phrase={phrase}, sensitivity={sensitivity})");
             let _ = report.send(Ok(()));
             v
         }
         Err(e) => {
+            eprintln!("[wake] detector FAILED to start: {e}");
             let _ = report.send(Err(e));
             return;
         }
@@ -248,6 +250,7 @@ fn run_worker(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 if let Some(score) = engine.feed(&chunk) {
+                    eprintln!("[wake] DETECTED phrase={} score={score:.3} → firing event", engine.phrase());
                     if let Some(cb) = &on_detect {
                         cb(engine.phrase(), score);
                     }

@@ -79,6 +79,9 @@ impl Capture {
         stream
             .play()
             .map_err(|e| format!("could not start the microphone: {e}"))?;
+        eprintln!(
+            "[wake] mic stream started: device_rate={src_rate} Hz, channels={channels}, format={sample_format:?}"
+        );
         Ok(Self { _stream: stream })
     }
 }
