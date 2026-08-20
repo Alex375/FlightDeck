@@ -56,10 +56,17 @@ const EMBEDDING_MODEL: &[u8] = include_bytes!("../../assets/wake/embedding_model
 const VAD_MODEL: &[u8] = include_bytes!("../../assets/wake/silero_vad.onnx");
 const ALEXA_MODEL: &[u8] = include_bytes!("../../assets/wake/alexa_v0.1.onnx");
 const HEY_JARVIS_MODEL: &[u8] = include_bytes!("../../assets/wake/hey_jarvis_v0.1.onnx");
+/// Custom phrase trained locally (macOS `say` voices + augmentation, same feature
+/// pipeline as this engine) — the "Ground Control" cockpit call, Flight Deck's own.
+const GROUND_CONTROL_MODEL: &[u8] = include_bytes!("../../assets/wake/ground_control.onnx");
 
 /// The phrases we ship a classifier for. The `key` is what the config stores and
 /// the front shows; `label` is the human name for Settings.
-pub const PHRASES: &[(&str, &str)] = &[("alexa", "Alexa"), ("hey_jarvis", "Hey Jarvis")];
+pub const PHRASES: &[(&str, &str)] = &[
+    ("alexa", "Alexa"),
+    ("hey_jarvis", "Hey Jarvis"),
+    ("ground_control", "Ground Control"),
+];
 
 /// The default phrase — the most accent-robust of the pre-trained set (a proper
 /// noun pronounced the same in French and English).
@@ -68,6 +75,7 @@ pub const DEFAULT_PHRASE: &str = "alexa";
 fn classifier_bytes(phrase: &str) -> &'static [u8] {
     match phrase {
         "hey_jarvis" => HEY_JARVIS_MODEL,
+        "ground_control" => GROUND_CONTROL_MODEL,
         _ => ALEXA_MODEL, // unknown / "alexa" → the default classifier
     }
 }

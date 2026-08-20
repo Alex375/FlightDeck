@@ -259,6 +259,7 @@ const mockWake: WakeStatus = {
   phrases: [
     { key: "alexa", label: "Alexa" },
     { key: "hey_jarvis", label: "Hey Jarvis" },
+    { key: "ground_control", label: "Ground Control" },
   ],
 };
 
