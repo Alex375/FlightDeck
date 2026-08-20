@@ -1257,6 +1257,13 @@ export function liveHandle(convId: string): string | null {
 export function acknowledgeConversation(convId: string): void {
   useConversationStore.getState().markSeen(convId);
   useConversationsStore.getState().setReminder(convId, null);
+  // Tell remote clients the alert is gone — without this, a phone keeps showing
+  // an attention state the desktop already dismissed. Single "Seen" entry point,
+  // so every surface (row ✓, card button, remote tool) publishes exactly once.
+  const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
+  void commands.publishControlEvent("attention_cleared", convId, conv?.name ?? "", {
+    reason: "acknowledged",
+  });
 }
 
 // In-flight spawns keyed by conversation id. Spawning is async (a round-trip to

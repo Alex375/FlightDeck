@@ -96,7 +96,18 @@ tokio = { version = "1", features = [
     "macros",
     "sync",
     "time",
+    "net",
 ] }
+
+# Outbound WebSocket client for phone remote-access (`appmcp::relay`): the app
+# dials a cloud relay and speaks WS. rustls (webpki roots) reuses our existing
+# rustls/`ring` TLS stack — no native-tls/openssl pulled in. `futures-util` gives
+# the split sink/stream used to read RPCs and write replies/events concurrently.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# QR code for the phone-pairing deep link, rendered to a tiny inline SVG by hand
+# (default features OFF → no `image` crate, no PNG codecs).
+qrcode = { version = "0.14", default-features = false }
 
 # Typed IPC (Rust -> TS). RC versions: pin EXACTLY with "=".
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }

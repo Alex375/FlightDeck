@@ -18,5 +18,7 @@
   <string>Flight Deck needs access to your Documents to open and edit the files of projects you place there.</string>
   <key>NSDownloadsFolderUsageDescription</key>
   <string>Flight Deck needs access to your Downloads to open and edit the files of projects you place there.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Flight Deck uses the microphone only while you talk to the voice agent (push-to-talk).</string>
 </dict>
 </plist>

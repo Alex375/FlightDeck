@@ -12,6 +12,7 @@ pub mod supervisor;
 pub mod terminal;
 pub mod tosse;
 pub mod usage;
+pub mod voice;
 
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
@@ -55,6 +56,9 @@ use ipc::commands::{
     tosse_repo_links, tosse_set_project_status,
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
+    voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
+    app_control_tools, folder_tree,
+    remote_status, set_remote,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -216,6 +220,14 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             publish_control_event,
             voice_bridge_status,
             set_voice_bridge,
+            voice_agent_status,
+            set_voice_agent_key,
+            clear_voice_agent_key,
+            voice_agent_client_secret,
+            app_control_tools,
+            folder_tree,
+            remote_status,
+            set_remote,
         ])
         .events(collect_events![
             TickEvent,
@@ -536,6 +548,9 @@ pub fn run() {
             // signed both out; test builds now get their own item, production keeps the
             // historic one (renaming it there would orphan every existing install's).
             tosse::set_bundle_identifier(app.config().identifier.clone());
+            // Same per-identity isolation for the voice agent's OpenAI key item:
+            // a test build must never read or clobber production's key.
+            voice::set_bundle_identifier(app.config().identifier.clone());
 
             // Open the persistence store in the app data dir (created if absent).
             // The store is the single owner of SQLite; the rest of the core and
@@ -573,6 +588,16 @@ pub fn run() {
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
                 }
+            }
+
+            // Remote access (phone): always seed the relay config into the hub so
+            // Settings can render the pairing QR, and dial the relay out if it was
+            // left enabled (apply_remote stores the config either way, then only
+            // connects when enabled).
+            {
+                let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
+                tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
 
             // Rust timer: emit a TickEvent every second (Rust -> React) — kept as

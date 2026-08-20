@@ -21,6 +21,8 @@ vi.mock("../ipc/client", () => {
       loadSessionGoal: vi.fn(() => ok(null)),
       deleteConversation: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
+      // acknowledgeConversation publishes attention_cleared to the remote journal.
+      publishControlEvent: vi.fn(() => Promise.resolve(null)),
     },
   };
 });

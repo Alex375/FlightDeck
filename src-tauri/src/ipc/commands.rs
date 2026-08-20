@@ -2678,6 +2678,166 @@ pub async fn set_voice_bridge(
     Ok(hub.voice_status())
 }
 
+// ---------------------------------------------------------------------------
+// In-app voice agent (OpenAI Realtime — see `crate::voice`)
+// ---------------------------------------------------------------------------
+
+/// Whether an OpenAI key is stored (plus its masked hint). `configured: false`
+/// is the NORMAL optional-feature state, never an error. Async + off-thread:
+/// every one of these spawns `/usr/bin/security`, which must never run on the
+/// main thread (a Keychain ACL prompt can block it for seconds).
+#[tauri::command]
+#[specta::specta]
+pub async fn voice_agent_status() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::status)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))
+}
+
+/// Store the user's OpenAI API key in the macOS Keychain (verified by
+/// read-back). Returns the fresh status.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
+}
+
+/// Forget the stored OpenAI key (absent item = success).
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::clear_key)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
+}
+
+/// Mint a short-lived Realtime client secret for ONE voice session — the only
+/// shape of the credential the webview ever sees.
+#[tauri::command]
+#[specta::specta]
+pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, String> {
+    crate::voice::mint_client_secret().await
+}
+
+/// A compact, bounded directory tree for AGENT orientation (the `browse_folders`
+/// app-control tool): where could I work on this Mac? `path: None` starts at the
+/// user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.
+#[tauri::command]
+#[specta::specta]
+pub async fn folder_tree(
+    path: Option<String>,
+    depth: Option<u32>,
+) -> Result<crate::fs::FolderTree, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::fs::folder_tree(path.as_deref(), depth.unwrap_or(2) as usize)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("folder tree task failed: {e}"))?
+}
+
+/// The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
+/// JSON. The in-app voice agent reads it to declare its Realtime function
+/// tools from the SAME source the MCP servers serve — one catalogue, no drift.
+#[tauri::command]
+#[specta::specta]
+pub fn app_control_tools(surface: String) -> Result<serde_json::Value, String> {
+    let surface = match surface.as_str() {
+        "app" => crate::appmcp::Surface::App,
+        "voice" => crate::appmcp::Surface::Voice,
+        other => return Err(format!("unknown surface '{other}' (app | voice)")),
+    };
+    Ok(crate::appmcp::tools::list_json(surface))
+}
+
+/// Keys under which the remote-access relay persists its config in `meta`.
+const REMOTE_ENABLED_KEY: &str = "remote_enabled";
+const REMOTE_URL_KEY: &str = "remote_relay_url";
+const REMOTE_MAC_ID_KEY: &str = "remote_mac_id";
+const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
+const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
+
+/// Load the remote-access config, minting (and persisting) the stable mac id, the
+/// mac secret and the phone pairing token on first use so Settings always has a QR
+/// to show. Best-effort on read errors (then it starts disabled with defaults).
+pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
+    let read = |key: &str| store.get_config(key).ok().flatten();
+    let mint = |key: &str| -> String {
+        match read(key) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                let v = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = store.set_config(key, &v) {
+                    eprintln!("[appmcp] failed to persist {key}: {e}");
+                }
+                v
+            }
+        }
+    };
+    crate::appmcp::RemoteConfig {
+        enabled: read(REMOTE_ENABLED_KEY).as_deref() == Some("1"),
+        relay_url: read(REMOTE_URL_KEY)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::appmcp::DEFAULT_RELAY_URL.to_string()),
+        mac_id: mint(REMOTE_MAC_ID_KEY),
+        mac_token: mint(REMOTE_MAC_TOKEN_KEY),
+        phone_token: mint(REMOTE_PHONE_TOKEN_KEY),
+    }
+}
+
+/// The remote-access relay's current status (Settings read-back: config + whether
+/// the outbound connection is actually up, plus the pairing QR).
+#[tauri::command]
+#[specta::specta]
+pub fn remote_status(
+    hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
+) -> crate::appmcp::RemoteStatus {
+    hub.remote_status()
+}
+
+/// Change the remote-access config (enable, relay URL, regenerate the pairing
+/// token), persist it, and (re)connect or disconnect accordingly. Regenerating
+/// the pairing token revokes every previously-paired phone. Returns the honest
+/// post-apply status.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_remote(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    relay_url: Option<String>,
+    regenerate_pairing: bool,
+) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    let cfg = {
+        let store = app.state::<Store>();
+        let mut cfg = load_remote_config(&store);
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
+        }
+        if let Some(url) = relay_url {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                cfg.relay_url = url;
+            }
+        }
+        if regenerate_pairing {
+            cfg.phone_token = uuid::Uuid::new_v4().to_string();
+        }
+        store
+            .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
+            .and_then(|_| store.set_config(REMOTE_URL_KEY, &cfg.relay_url))
+            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &cfg.mac_id))
+            .and_then(|_| store.set_config(REMOTE_MAC_TOKEN_KEY, &cfg.mac_token))
+            .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
+            .map_err(|e| e.to_string())?;
+        cfg
+    };
+    hub.apply_remote(cfg).await;
+    Ok(hub.remote_status())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn ping(msg: String) -> Pong {

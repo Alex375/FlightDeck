@@ -820,3 +820,25 @@
   align-items: center;
   gap: 8px;
 }
+
+/* ---- Voice agent card (Control tab) ---- */
+/* The OpenAI key entry — wider than the port field, masked by type=password. */
+.keyInput {
+  width: 190px;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm, 6px);
+  padding: 4px 8px;
+}
+.keyInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* A small unit label next to an inline input ("s" for seconds). */
+.thintInline {
+  font-size: 12px;
+  color: var(--text-muted);
+}

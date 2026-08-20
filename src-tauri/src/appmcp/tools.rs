@@ -6,9 +6,14 @@
 //! (served Rust-side from the event journal). Keep the two sides in step: a
 //! tool listed here with no front case answers "unknown tool" at call time.
 //!
-//! Scope guard (deliberate omissions): nothing destructive or privilege-raising
-//! is exposed — no `set_permission_mode`, no remote control, no delete/wipe, no
-//! rewind/fork, no terminal writes. Those stay human-only.
+//! Scope guard (deliberate omissions): nothing that DESTROYS data or raises
+//! privilege is exposed — no `set_permission_mode`, no remote control, no
+//! history delete/wipe, no rewind/fork, no terminal writes. Those stay
+//! human-only (see the `forbidden_tools_are_absent` test).
+//! `remove_conversation` is the one intentional exception, and it is NOT
+//! destructive: it takes a conversation off the active list while the transcript
+//! stays on disk (re-openable from History) and the removal is ⌘Z-undoable. It
+//! is additionally gated by a user policy, enforced in the front executor.
 
 use serde_json::{json, Value};
 
@@ -103,6 +108,25 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "browse_folders",
+            description: "Explore this Mac's folder layout to find where to work: a compact, \
+                depth-limited tree of directories with git repositories marked (and not \
+                descended into), plus the folders already registered in the app. Call it \
+                WITHOUT a path first for an overview from the user's home folder; pass a path \
+                to look deeper. Use it to locate a repository path for create_conversation or \
+                add_repo instead of asking the user to dictate one.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "path": { "type": "string",
+                        "description": "Absolute folder to explore (default: the user's home folder)." },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 3,
+                        "description": "Tree depth (default 2)." },
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
             name: "focus_conversation",
             description: "Bring a conversation on screen in the app (select it and switch to \
                 the conversation view).",
@@ -110,6 +134,120 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             schema: obj(
                 json!({ "conversation_id": conversation_id_prop("Conversation to show.") }),
                 &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "list_models",
+            description: "The curated Claude model catalogue with, for each, the effort levels \
+                it supports. Use it to offer a model / effort picker.",
+            kind: ToolKind::Front,
+            schema: obj(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "set_conversation_model",
+            description: "Set the model of a conversation (takes effect on its next turn; \
+                applied live if it is running). Values come from list_models.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "model": { "type": "string",
+                        "description": "Model wire value (from list_models)." },
+                }),
+                &["conversation_id", "model"],
+            ),
+        },
+        ToolSpec {
+            name: "set_conversation_effort",
+            description: "Set the reasoning-effort level of a conversation. Valid levels depend \
+                on the model (see list_models); 'ultracode' is the top Claude tier.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "effort": { "type": "string",
+                        "description": "Effort level: low | medium | high | xhigh | max | ultracode." },
+                }),
+                &["conversation_id", "effort"],
+            ),
+        },
+        ToolSpec {
+            name: "interrupt_conversation",
+            description: "Interrupt the conversation's CURRENT turn (the stop button) without \
+                killing the session — the agent stops working and waits for the next message.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_stream",
+            description: "Power the conversation's live process off WITHOUT archiving it — the \
+                conversation stays on the list and resumes on the next message.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "list_background_tasks",
+            description: "The conversation's background tasks (bg shell commands, monitors, \
+                sub-agents, workflows): task_id, kind, status, label. Live-only — a reloaded \
+                conversation has none.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_background_task",
+            description: "Stop ONE background task by task_id (see list_background_tasks) \
+                without ending the turn or the session.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "task_id": { "type": "string",
+                        "description": "The task to stop (from list_background_tasks)." },
+                }),
+                &["conversation_id", "task_id"],
+            ),
+        },
+        ToolSpec {
+            name: "get_pending_request",
+            description: "Full detail of the conversation's pending requests waiting on the \
+                human: permission prompts (tool + input), questionnaires (questions + options \
+                in `input`), plan approvals (plan markdown in `input`). Read-only. Answer with \
+                answer_request.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "answer_request",
+            description: "Answer ONE pending request (from get_pending_request): allow or deny \
+                a permission prompt / plan approval; questionnaires answer with behavior \
+                'allow' plus `updated_input` carrying the chosen options. Gated by an explicit \
+                desktop opt-in (Settings → Control), off by default.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "request_id": { "type": "string",
+                        "description": "The pending request to answer (from get_pending_request)." },
+                    "behavior": { "type": "string", "enum": ["allow", "deny"],
+                        "description": "Allow or deny the request." },
+                    "message": { "type": "string",
+                        "description": "Optional reason shown to the agent on deny." },
+                    "updated_input": { "description": "Optional rewritten tool input on allow \
+                        (questionnaire answers ride here, mirroring the desktop card)." },
+                }),
+                &["conversation_id", "request_id", "behavior"],
             ),
         },
         ToolSpec {
@@ -124,6 +262,70 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     "conversation_id": conversation_id_prop("Target conversation (default: the calling one)."),
                 }),
                 &["name"],
+            ),
+        },
+        ToolSpec {
+            name: "acknowledge_conversation",
+            description: "Mark a conversation as seen — clears its 'needs attention' highlight \
+                (the same as the card's 'Seen' button), once the user has heard about it and \
+                does not need it flagged anymore. Non-destructive: it only dismisses the alert; \
+                the conversation, its live session and its history are untouched. Without \
+                conversation_id it acknowledges the calling conversation (in-app callers only).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Conversation to acknowledge (default: the calling one)."),
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "remove_conversation",
+            description: "Take a conversation OFF the active Flight Deck list — the tidy-up \
+                action ('clear that one off my board', 'get rid of that conversation'). This is \
+                NOT a delete: the full transcript stays on disk, the conversation reopens from \
+                the History panel, and the user can undo it with ⌘Z. It does stop the \
+                conversation's live session. Requires a conversation_id (a conversation cannot \
+                remove itself). May be turned off by the user — the call then returns an error.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Conversation to remove from the active list (required)."),
+                }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "search_past_conversations",
+            description: "Search the on-disk history of PAST conversations (ones not on the \
+                active list anymore, or never opened this session) — the History panel's index. \
+                With a query it ranks by relevance; without one it returns the most recent. \
+                Read-only: each result carries a session_id, title, repo, backend, last-activity \
+                time, and an 'already_active' flag. Use it to find a conversation the user \
+                refers to, then reopen_conversation to bring it back.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "query": { "type": "string", "description": "Text to search for. Omit to list the most recent past conversations." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 40,
+                        "description": "Max results (default 15)." },
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "reopen_conversation",
+            description: "Bring a PAST conversation back onto the active Flight Deck list, by the \
+                session_id from search_past_conversations. Additive and non-destructive: it \
+                re-creates the list entry from the on-disk transcript, lazily (no process starts \
+                until the next message). If that conversation is already active, it just focuses \
+                it instead of duplicating.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "session_id": { "type": "string", "description": "The session_id of the past conversation (from search_past_conversations)." },
+                }),
+                &["session_id"],
             ),
         },
     ];
@@ -267,7 +469,9 @@ mod tests {
         let app: Vec<_> = for_surface(Surface::App).iter().map(|t| t.name).collect();
         let voice: Vec<_> = for_surface(Surface::Voice).iter().map(|t| t.name).collect();
         for shared in ["list_conversations", "read_conversation", "send_message",
-                       "create_conversation", "focus_conversation", "rename_conversation"] {
+                       "create_conversation", "browse_folders", "focus_conversation",
+                       "rename_conversation", "acknowledge_conversation", "remove_conversation",
+                       "search_past_conversations", "reopen_conversation"] {
             assert!(app.contains(&shared), "app missing {shared}");
             assert!(voice.contains(&shared), "voice missing {shared}");
         }
