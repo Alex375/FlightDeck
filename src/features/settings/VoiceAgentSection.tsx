@@ -5,8 +5,9 @@
 // the rest of the app never touches the module. Key handling is honest: save
 // verifies by read-back Rust-side, and the UI only ever shows the masked hint.
 import { useCallback, useEffect, useState } from "react";
-import { commands, type VoiceAgentStatus } from "../../ipc/client";
+import { commands, type VoiceAgentStatus, type WakeStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
+import { useWakeStore } from "../../voice/wakeStore";
 import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { applyVadSettings } from "../../voice/realtime";
 import { VadMeter } from "../../voice/VadMeter";
@@ -25,6 +26,8 @@ export function VoiceAgentSection() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [closeDraft, setCloseDraft] = useState<string | null>(null);
+  const [wake, setWake] = useState<WakeStatus | null>(null);
+  const [wakeBusy, setWakeBusy] = useState(false);
 
   // Every status learned here also lands in the SHARED voiceStore mirror, so
   // the title-bar chip (and ⌘⇧V / the announcement gate) update immediately —
@@ -43,6 +46,43 @@ export function VoiceAgentSection() {
       disposed = true;
     };
   }, [publish]);
+
+  // Wake-word status: seed here and mirror to the shared store (VoiceHost's
+  // trigger gate reads it), so enabling from Settings takes effect immediately.
+  useEffect(() => {
+    let disposed = false;
+    void commands.wakeWordStatus().then((s) => {
+      if (disposed) return;
+      setWake(s);
+      useWakeStore.getState().setStatus(s);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const applyWake = useCallback(
+    async (patch: { enabled?: boolean; phrase?: string; sensitivity?: number }) => {
+      setWakeBusy(true);
+      setError(null);
+      try {
+        const res = await commands.setWakeWordConfig(
+          patch.enabled ?? null,
+          patch.phrase ?? null,
+          patch.sensitivity ?? null,
+        );
+        if (res.status === "ok") {
+          setWake(res.data);
+          useWakeStore.getState().setStatus(res.data);
+        } else {
+          setError(res.error);
+        }
+      } finally {
+        setWakeBusy(false);
+      }
+    },
+    [],
+  );
 
   const saveKey = useCallback(async () => {
     const key = keyDraft.trim();
@@ -239,6 +279,65 @@ export function VoiceAgentSection() {
               disabled={!configured}
             />
           </>
+        }
+      />
+      <ToggleRow
+        title="Wake word"
+        hint={
+          configured ? (
+            <>
+              Say the wake word to open the microphone hands-free (like “OK Google”). It runs
+              fully on-device — the audio never leaves this Mac, nothing is sent anywhere. Off by
+              default; while on, the microphone listens continuously (the macOS mic indicator stays
+              lit).
+              {wake?.error ? <div className={styles.dangerText}>⚠️ {wake.error}</div> : null}
+            </>
+          ) : (
+            "Add an OpenAI key above first — the wake word opens the voice agent."
+          )
+        }
+        checked={!!wake?.enabled}
+        onChange={(next) => void applyWake({ enabled: next })}
+        disabled={!configured || !wake || wakeBusy}
+      />
+      <ToggleRow
+        title="Wake phrase"
+        hint="What you say to trigger it. “Alexa” is the most robust to a French accent; switch to “Hey Jarvis” if an Amazon Echo nearby keeps waking."
+        control={
+          <select
+            className={styles.mono}
+            value={wake?.phrase ?? "alexa"}
+            onChange={(e) => void applyWake({ phrase: e.target.value })}
+            disabled={!configured || !wake || !wake.enabled || wakeBusy}
+            aria-label="Wake phrase"
+          >
+            {(wake?.phrases ?? []).map((p) => (
+              <option key={p.key} value={p.key}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        }
+      />
+      <ToggleRow
+        title="Sensitivity"
+        hint="Higher catches the phrase more easily but risks false triggers; lower is stricter. A false trigger is harmless — it just opens the mic, which closes itself on silence."
+        control={
+          <span className={styles.tokenRow}>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={wake?.sensitivity ?? 0.5}
+              onChange={(e) => void applyWake({ sensitivity: Number(e.target.value) })}
+              disabled={!configured || !wake || !wake.enabled || wakeBusy}
+              aria-label="Wake word sensitivity"
+            />
+            <span className={styles.thintInline}>
+              {Math.round((wake?.sensitivity ?? 0.5) * 100)}%
+            </span>
+          </span>
         }
       />
     </SettingsGroup>

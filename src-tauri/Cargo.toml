@@ -116,6 +116,22 @@ tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta = { version = "=2.0.0-rc.22", features = ["derive", "serde_json"] }
 specta-typescript = "=0.0.9"
 
+# Wake word — a hands-free "Hey Jarvis" / "Alexa" trigger that opens the voice
+# agent's microphone (see `wake/mod.rs`). 100% on-device: NO network, NO cloud,
+# the captured audio never leaves the Mac. `cpal` captures the default input
+# device; `ort` (ONNX Runtime) runs the openWakeWord pipeline (melspectrogram →
+# shared speech embedding → per-phrase classifier), gated by a Silero VAD so the
+# neural nets run ONLY on speech (the battery guard). All five ONNX models are
+# bundled into the binary (`include_bytes!` from `assets/wake/`), so the feature
+# works offline on first launch — no download, no external asset host. `ort` is an
+# RC, pinned EXACTLY like the specta/tauri-specta RCs above.
+cpal = "0.15"
+# Default features (incl. `download-binaries`) pull a prebuilt ONNX Runtime at
+# build time. We drive the models with flat `(shape, Vec<f32>)` tensors +
+# `try_extract_tensor` (a `(&Shape, &[f32])` slice), so we need NO `ndarray`
+# feature / dependency — one fewer crate + version to keep aligned.
+ort = "=2.0.0-rc.13"
+
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is
 # `SIGKILL`-only and single-process.

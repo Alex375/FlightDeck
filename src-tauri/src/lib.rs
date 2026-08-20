@@ -13,6 +13,7 @@ pub mod terminal;
 pub mod tosse;
 pub mod usage;
 pub mod voice;
+pub mod wake;
 
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
@@ -57,6 +58,7 @@ use ipc::commands::{
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
+    wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
     remote_status, set_remote,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -67,7 +69,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
-    TosseCrmEvent, TosseLiveStateEvent, WorkflowJournalEvent,
+    TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
@@ -224,6 +226,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_voice_agent_key,
             clear_voice_agent_key,
             voice_agent_client_secret,
+            wake_word_status,
+            set_wake_word_config,
             app_control_tools,
             folder_tree,
             remote_status,
@@ -251,6 +255,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             TerminalOutputEvent,
             TerminalExitEvent,
             AppControlRequestEvent,
+            WakeWordEvent,
         ])
 }
 
@@ -501,6 +506,9 @@ pub fn run() {
         // bridge + fleet event journal + voice-bridge runtime). An Arc so each
         // Claude session actor can hold it beyond the spawning command.
         .manage(std::sync::Arc::new(appmcp::ControlHub::new()))
+        // The wake-word detector: sole owner of the always-on mic capture +
+        // on-device inference. An Arc so a blocking `apply` can run off-thread.
+        .manage(std::sync::Arc::new(wake::WakeController::new()))
         .setup(move |app| {
             use tauri::Manager;
 
@@ -587,6 +595,28 @@ pub fn run() {
                 let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
+                }
+            }
+
+            // Wake word: wire the detection sink to a WakeWordEvent, then arm the
+            // detector if it was left enabled. `apply` loads the models and opens
+            // the mic (blocking, up to a few seconds), so run it off the setup
+            // thread — its honest outcome lands in `wake_word_status`.
+            {
+                let wake = (*app.state::<std::sync::Arc<wake::WakeController>>()).clone();
+                let emit_handle = app.handle().clone();
+                wake.set_on_detect(std::sync::Arc::new(move |phrase: &str, score: f32| {
+                    let ev = ipc::events::WakeWordEvent { phrase: phrase.to_string(), score };
+                    if let Err(e) = ev.emit(&emit_handle) {
+                        eprintln!("[wake] failed to emit WakeWordEvent: {e}");
+                    }
+                }));
+                let cfg = ipc::commands::load_wake_config(&app.state::<store::Store>());
+                if cfg.enabled {
+                    let wake = wake.clone();
+                    std::thread::spawn(move || {
+                        let _ = wake.apply(cfg);
+                    });
                 }
             }
 

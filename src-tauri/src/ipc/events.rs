@@ -205,6 +205,16 @@ impl crate::appmcp::ToolSink for AppControlEmitter {
     }
 }
 
+/// The wake word was heard by the on-device detector (`crate::wake`). The front
+/// reacts like a spoken push-to-talk — arm the voice session and open the mic (see
+/// `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`
+/// is the detected phrase key, `score` the classifier confidence.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct WakeWordEvent {
+    pub phrase: String,
+    pub score: f32,
+}
+
 /// Coalesced filesystem change notification for the editor panel: the (de-noised,
 /// debounced) set of paths that changed under the watched working directory. The
 /// UI reloads any open file in this set and refreshes any expanded tree dirs it
