@@ -17,6 +17,7 @@ import {
   useMachines,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
+import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -217,19 +218,6 @@ function parseTicket(raw: string): { label: string; host: string; port: string; 
   }
 }
 
-/** The parent of a POSIX path, or null at the root. */
-function parentDir(p: string): string | null {
-  if (!p || p === "/") return null;
-  const t = p.replace(/\/+$/, "");
-  const i = t.lastIndexOf("/");
-  return i <= 0 ? "/" : t.slice(0, i);
-}
-
-/** Join a directory and a child name into a POSIX path. */
-function joinDir(base: string, name: string): string {
-  return `${base.replace(/\/+$/, "")}/${name}`;
-}
-
 /** Pair remote SSH servers and open conversations that run on them (the alpha
  *  "machine boundary"). Primary flow: run one command on the server — it authorizes a
  *  Flight-Deck-generated key, checks Claude, and prints a ticket that carries the
@@ -253,12 +241,6 @@ export function RemoteServersGroup() {
 
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
-  const [convRepos, setConvRepos] = useState<string[] | null>(null);
-  const [convPath, setConvPath] = useState("");
-  const [detecting, setDetecting] = useState(false);
-  const [browsePath, setBrowsePath] = useState("");
-  const [browseDirs, setBrowseDirs] = useState<string[] | null>(null);
-  const [convError, setConvError] = useState<string | null>(null);
 
   const resetAdd = useCallback(() => {
     setAdding(false);
@@ -338,49 +320,16 @@ export function RemoteServersGroup() {
     else setError(res.error);
   }, [label, host, port, user, genKey, resetAdd]);
 
-  const browseTo = useCallback(async (machineId: string, path: string) => {
-    setBrowseDirs(null);
-    const listing = await useConversationsStore.getState().listRemoteDir(machineId, path);
-    if (!listing) return;
-    setBrowsePath(listing.path);
-    setBrowseDirs(listing.dirs);
-    setConvPath(listing.path); // the path field tracks the browsed folder → "Open here"
+  const toggleConv = useCallback((machineId: string) => {
+    setAdding(false);
+    setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
 
-  const toggleConv = useCallback(
-    async (machineId: string) => {
-      if (convFor === machineId) { setConvFor(null); return; }
-      setAdding(false);
-      setConvFor(machineId);
-      setConvRepos(null);
-      setConvPath("");
-      setConvError(null);
-      setBrowsePath("");
-      setBrowseDirs(null);
-      setDetecting(true);
-      // In parallel: detect git repos AND open the browser at the real $HOME (so the
-      // path field starts from a folder that actually exists, not a made-up example).
-      const store = useConversationsStore.getState();
-      const [repos] = await Promise.all([
-        store.listRemoteRepos(machineId),
-        browseTo(machineId, ""),
-      ]);
-      setDetecting(false);
-      setConvRepos(repos);
-    },
-    [convFor, browseTo],
-  );
-
-  const openConv = useCallback(async (machineId: string, path: string) => {
-    const p = path.trim();
-    if (!p) return;
-    setConvError(null);
-    // Create the LEAF folder if it doesn't exist AND its parent does (mkdir, not -p);
-    // a wrong parent chain fails here instead of running claude in a bogus directory.
-    const prep = await useConversationsStore.getState().prepareRemoteDir(machineId, p);
-    if (!prep.ok) { setConvError(prep.error); return; }
-    useConversationsStore.getState().addRemoteRepo(machineId, p);
-    const id = createConversationInRepo(p, "claude");
+  // When the picker hands back a chosen (existing-or-created) remote folder: register
+  // the remote repo, open a conversation in it, and get out of Settings to it.
+  const openConv = useCallback((machineId: string, path: string) => {
+    useConversationsStore.getState().addRemoteRepo(machineId, path);
+    const id = createConversationInRepo(path, "claude");
     useConversationsStore.getState().selectConversation(id);
     useSettingsUi.getState().closeSettings();
   }, []);
@@ -418,85 +367,12 @@ export function RemoteServersGroup() {
 
           {convFor === m.id && (
             <div className={styles.remotePanel}>
-              {detecting && (
-                <div className={styles.remoteStep}>
-                  Looking at <b>{m.label}</b>…
-                </div>
-              )}
-
-              {convRepos && convRepos.length > 0 && (
-                <>
-                  <div className={styles.remoteStep}>
-                    Repositories detected on <b>{m.label}</b>:
-                  </div>
-                  <div className={styles.repoList}>
-                    {convRepos.map((p) => (
-                      <button
-                        key={p}
-                        className={styles.repoOption}
-                        onClick={() => void openConv(m.id, p)}
-                      >
-                        {p}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-
-              {/* Folder browser — the remote stand-in for the native folder picker. */}
-              <div className={styles.remoteStep}>
-                Or browse <b>{m.label}</b>
-                {browsePath ? <> — {browsePath}</> : null}:
-              </div>
-              <div className={styles.repoList}>
-                {parentDir(browsePath) && (
-                  <button
-                    className={styles.repoOption}
-                    onClick={() => void browseTo(m.id, parentDir(browsePath)!)}
-                  >
-                    ../
-                  </button>
-                )}
-                {browseDirs === null ? (
-                  <div className={styles.remoteStep}>…</div>
-                ) : browseDirs.length === 0 ? (
-                  <div className={styles.remoteStep}>(no sub-folders here)</div>
-                ) : (
-                  browseDirs.map((d) => (
-                    <button
-                      key={d}
-                      className={styles.repoOption}
-                      onClick={() => void browseTo(m.id, joinDir(browsePath, d))}
-                    >
-                      {d}/
-                    </button>
-                  ))
-                )}
-              </div>
-
-              <div className={styles.remoteStep}>
-                Folder for the conversation (created if it doesn't exist yet — only the last
-                folder, so the parent must be right):
-              </div>
-              <div className={styles.fieldRow}>
-                <input
-                  className={styles.field}
-                  placeholder="/home/you/project"
-                  value={convPath}
-                  onChange={(e) => setConvPath(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void openConv(m.id, convPath);
-                  }}
-                />
-                <button
-                  className={`${styles.btn} ${styles.primary}`}
-                  disabled={!convPath.trim()}
-                  onClick={() => void openConv(m.id, convPath)}
-                >
-                  Open here
-                </button>
-              </div>
-              {convError && <div className={styles.errorMsg}>{convError}</div>}
+              <RemoteFolderPicker
+                key={m.id}
+                machineId={m.id}
+                machineLabel={m.label}
+                onOpen={(path) => openConv(m.id, path)}
+              />
               <div className={styles.btnRow}>
                 <button className={`${styles.btn} ${styles.ghost}`} onClick={() => setConvFor(null)}>
                   Cancel

@@ -945,6 +945,41 @@
   background: var(--bg-hover);
 }
 
+/* The folder picker in a modal (sidebar "+ new conversation on a server"). */
+.rfdScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.rfdPanel {
+  width: min(560px, 100%);
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--wf-line);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+.rfdHead {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.rfdBody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+
 /* ---- Voice agent card (Control tab) ---- */
 /* The OpenAI key entry — wider than the port field, masked by type=password. */
 .keyInput {
