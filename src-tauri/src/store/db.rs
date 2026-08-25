@@ -552,6 +552,30 @@ impl Store {
             .optional()
     }
 
+    /// One remote server by id, or `None`.
+    pub fn machine_by_id(&self, id: &str) -> rusqlite::Result<Option<MachineRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, label, host, port, user, identity_file, added_at
+                 FROM machines WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(MachineRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        host: row.get(2)?,
+                        port: row.get(3)?,
+                        user: row.get(4)?,
+                        identity_file: row.get(5)?,
+                        added_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     /// Insert or update a remote server (idempotent by id). Connection coordinates
     /// only — never key material (see [`MachineRecord`]).
     pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {

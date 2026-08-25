@@ -61,7 +61,7 @@ use ipc::commands::{
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
     remote_status, set_remote,
-    add_machine, delete_machine, generate_machine_key,
+    add_machine, delete_machine, generate_machine_key, list_remote_repos,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -290,6 +290,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             generate_machine_key,
             add_machine,
             delete_machine,
+            list_remote_repos,
             upsert_conversation,
             delete_conversation,
             set_active_conversation,

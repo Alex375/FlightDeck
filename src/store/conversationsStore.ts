@@ -426,6 +426,8 @@ interface ConversationsState {
   removeMachine: (id: string) => void;
   /** Register a repo that lives on a remote server (idempotent by path+machine). */
   addRemoteRepo: (machineId: string, path: string) => Repo;
+  /** Detect git repositories on a paired server (over SSH) for the picker. */
+  listRemoteRepos: (machineId: string) => Promise<string[]>;
   /** Idempotent by canonical path: returns the existing repo or a new one. */
   addRepo: (path: string) => Repo;
   /** Remove a repo and all of its conversations. */
@@ -586,6 +588,11 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     set((s) => ({ repos: [...s.repos, repo] }));
     syncToCore("upsertRepo", () => commands.upsertRepo(repoToRecord(repo)));
     return repo;
+  },
+
+  listRemoteRepos: async (machineId) => {
+    const res = await commands.listRemoteRepos(machineId);
+    return res.status === "ok" ? res.data : [];
   },
 
   addRepo: (path) => {

@@ -1758,6 +1758,19 @@ async deleteMachine(id: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Discover git repositories on a paired server (a bounded `find` for `.git` dirs
+ * under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
+ * of making the user recall a path. Returns repo folder paths, most-shallow first.
+ */
+async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_repos", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Insert or update a conversation's metadata (idempotent by stable id).
  */
 async upsertConversation(conversation: ConversationRecord) : Promise<Result<null, string>> {

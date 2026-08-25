@@ -2714,6 +2714,83 @@ pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), 
     store.delete_machine(&id).map_err(|e| e.to_string())
 }
 
+/// Run a command on a server over SSH (batch, never-prompting), returning stdout on
+/// success or the last stderr line on failure. The connection coordinates come from
+/// the [`MachineRecord`]; `known_hosts` is Flight Deck's own file (TOFU pinning).
+async fn run_ssh_on_machine(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(m.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(id) = &m.identity_file {
+        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("ssh command failed")
+            .to_string())
+    }
+}
+
+/// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
+/// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
+/// of making the user recall a path. Returns repo folder paths, most-shallow first.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_remote_repos(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<Vec<String>, String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    // Search $HOME plus a few common server roots (missing dirs are silently skipped),
+    // so repos outside the home folder (e.g. /work, /srv) are still found.
+    let out = run_ssh_on_machine(
+        &machine,
+        known_hosts.as_deref(),
+        "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
+         2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
 /// Insert or update a conversation's metadata (idempotent by stable id).
 #[tauri::command]
 #[specta::specta]
