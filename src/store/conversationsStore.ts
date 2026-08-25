@@ -428,6 +428,16 @@ interface ConversationsState {
   addRemoteRepo: (machineId: string, path: string) => Repo;
   /** Detect git repositories on a paired server (over SSH) for the picker. */
   listRemoteRepos: (machineId: string) => Promise<string[]>;
+  /** List a directory's sub-folders on a server (folder browser). Empty path = $HOME. */
+  listRemoteDir: (
+    machineId: string,
+    path: string,
+  ) => Promise<{ path: string; dirs: string[] } | null>;
+  /** Ensure a remote folder exists (mkdir the LEAF if its parent exists). */
+  prepareRemoteDir: (
+    machineId: string,
+    path: string,
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Idempotent by canonical path: returns the existing repo or a new one. */
   addRepo: (path: string) => Repo;
   /** Remove a repo and all of its conversations. */
@@ -593,6 +603,16 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   listRemoteRepos: async (machineId) => {
     const res = await commands.listRemoteRepos(machineId);
     return res.status === "ok" ? res.data : [];
+  },
+
+  listRemoteDir: async (machineId, path) => {
+    const res = await commands.listRemoteDir(machineId, path);
+    return res.status === "ok" ? res.data : null;
+  },
+
+  prepareRemoteDir: async (machineId, path) => {
+    const res = await commands.prepareRemoteDir(machineId, path);
+    return res.status === "ok" ? { ok: true } : { ok: false, error: res.error };
   },
 
   addRepo: (path) => {

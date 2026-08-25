@@ -2791,6 +2791,110 @@ pub async fn list_remote_repos(
         .collect())
 }
 
+/// POSIX single-quote escaping so a user-supplied remote path can't break out of the
+/// remote shell command (wrap in single quotes; rewrite each embedded quote as `'\''`).
+fn shq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// One level of a remote server's filesystem: the resolved absolute `path` and its
+/// immediate SUB-directories (names only). Powers the remote folder browser.
+#[derive(serde::Serialize, specta::Type)]
+pub struct RemoteListing {
+    pub path: String,
+    pub dirs: Vec<String>,
+}
+
+/// List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
+/// so the "new remote conversation" flow can offer a click-to-descend folder browser —
+/// the remote stand-in for the native folder picker. Hidden dirs are omitted.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_remote_dir(
+    app: tauri::AppHandle,
+    machine_id: String,
+    path: String,
+) -> Result<RemoteListing, String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    // First stdout line = the resolved absolute dir (pwd -P); the rest = its sub-dirs.
+    let script = format!(
+        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
+         if ! cd \"$P\" 2>/dev/null; then printf 'cannot open %s\\n' \"$P\" >&2; exit 4; fi; \
+         pwd -P; ls -1p . 2>/dev/null | grep '/$' | sed 's#/$##'",
+        p = shq(&path)
+    );
+    let out = run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await?;
+    let mut lines = out.lines();
+    let resolved = lines.next().unwrap_or("").trim().to_string();
+    let dirs = lines
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    Ok(RemoteListing { path: resolved, dirs })
+}
+
+/// Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its
+/// parent already exists — a remote `mkdir` (NOT `mkdir -p`). So a typo in the parent
+/// chain fails loudly instead of silently materialising a wrong deep path. Idempotent
+/// when the folder is already there. Called just before opening a remote conversation.
+#[tauri::command]
+#[specta::specta]
+pub async fn prepare_remote_dir(
+    app: tauri::AppHandle,
+    machine_id: String,
+    path: String,
+) -> Result<(), String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    let script = format!(
+        "D={d}; if [ -d \"$D\" ]; then exit 0; fi; \
+         PARENT=$(dirname \"$D\"); \
+         if [ ! -d \"$PARENT\" ]; then printf 'parent-missing\\n' >&2; exit 6; fi; \
+         mkdir \"$D\" 2>/dev/null || {{ printf 'mkdir-failed\\n' >&2; exit 5; }}",
+        d = shq(&path)
+    );
+    match run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("parent-missing") => Err(
+            "The parent folder doesn't exist on the server — only the final folder is \
+             created, so check the path."
+                .to_string(),
+        ),
+        Err(e) if e.contains("mkdir-failed") => {
+            Err("Couldn't create that folder on the server (permission?).".to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Insert or update a conversation's metadata (idempotent by stable id).
 #[tauri::command]
 #[specta::specta]

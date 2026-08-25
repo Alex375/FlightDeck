@@ -1771,6 +1771,33 @@ async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
 }
 },
 /**
+ * List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
+ * so the "new remote conversation" flow can offer a click-to-descend folder browser —
+ * the remote stand-in for the native folder picker. Hidden dirs are omitted.
+ */
+async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteListing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its
+ * parent already exists — a remote `mkdir` (NOT `mkdir -p`). So a typo in the parent
+ * chain fails loudly instead of silently materialising a wrong deep path. Idempotent
+ * when the folder is already there. Called just before opening a remote conversation.
+ */
+async prepareRemoteDir(machineId: string, path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Insert or update a conversation's metadata (idempotent by stable id).
  */
 async upsertConversation(conversation: ConversationRecord) : Promise<Result<null, string>> {
@@ -3480,6 +3507,11 @@ error: string | null;
  * enabled. The front keeps it visible across status-only pushes while still active.
  */
 pairing_code: string | null }
+/**
+ * One level of a remote server's filesystem: the resolved absolute `path` and its
+ * immediate SUB-directories (names only). Powers the remote folder browser.
+ */
+export type RemoteListing = { path: string; dirs: string[] }
 /**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
