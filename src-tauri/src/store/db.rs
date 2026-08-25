@@ -28,7 +28,7 @@ use super::model::{
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -58,6 +58,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v6,
     migrate_v7,
     migrate_v8,
+    migrate_v9,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -278,6 +279,22 @@ fn migrate_v8(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v9 — a repo that lives on a REMOTE host reached over SSH. `ssh_target` holds the
+/// SSH destination (a `~/.ssh/config` alias or `user@host`) whose `claude` runs this
+/// repo's conversations; the existing `path` column becomes the path ON THAT HOST.
+/// NULL (every existing row, and every local folder) means "local", so nothing
+/// changes for a user who never adds a remote server — the "machine boundary",
+/// SSH-first (see `supervisor::transport`). Additive + guarded, like every column
+/// migration above.
+fn migrate_v9(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "ssh_target",
+        "ALTER TABLE repos ADD COLUMN ssh_target TEXT",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -374,14 +391,16 @@ impl Store {
     pub fn load_state(&self) -> rusqlite::Result<PersistedState> {
         let conn = self.conn.lock().unwrap();
 
-        let mut repos_stmt =
-            conn.prepare("SELECT id, path, added_at FROM repos ORDER BY added_at ASC")?;
+        let mut repos_stmt = conn
+            .prepare("SELECT id, path, added_at, ssh_target FROM repos ORDER BY added_at ASC")?;
         let repos = repos_stmt
             .query_map([], |row| {
                 Ok(RepoRecord {
                     id: row.get(0)?,
                     path: row.get(1)?,
                     added_at: row.get(2)?,
+                    // NULL (pre-v9 rows + every local folder) → None (local).
+                    ssh_target: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -434,13 +453,43 @@ impl Store {
     }
 
     /// Insert or update a repo (idempotent by id).
+    ///
+    /// `ssh_target` (a repo's remoteness) is written on insert but, on update, is
+    /// PRESERVED when the incoming value is NULL: `COALESCE(excluded.ssh_target,
+    /// repos.ssh_target)`. Callers that rewrite the record wholesale but know nothing
+    /// about remoteness (rename, undo, add-a-folder) pass `None` and so can never
+    /// blank a repo the user connected over SSH — mirroring the deliberate care around
+    /// the TOSSE link. To CHANGE a target, pass the new one; to make it local again,
+    /// delete and re-add (no un-remote path exists, by design).
     pub fn upsert_repo(&self, repo: &RepoRecord) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO repos (id, path, added_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET path = excluded.path, added_at = excluded.added_at",
-            params![repo.id, repo.path, repo.added_at],
+            "INSERT INTO repos (id, path, added_at, ssh_target) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 path = excluded.path,
+                 added_at = excluded.added_at,
+                 ssh_target = COALESCE(excluded.ssh_target, repos.ssh_target)",
+            params![repo.id, repo.path, repo.added_at, repo.ssh_target],
         )?;
         Ok(())
+    }
+
+    /// The SSH destination for the repo whose `path` matches, when that repo is
+    /// remote (`ssh_target` non-null); `None` for a local repo or no match. Called
+    /// at spawn so a conversation opened in a remote repo launches its `claude` on
+    /// that host (see the `spawn_session` command). Keyed by `path` because that is
+    /// what the spawn command receives (the conversation's cwd == the repo path for a
+    /// remote repo; remote worktrees are out of scope for the SSH-first alpha).
+    pub fn repo_ssh_target_for_path(&self, path: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT ssh_target FROM repos
+                 WHERE path = ?1 AND ssh_target IS NOT NULL LIMIT 1",
+                params![path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
     }
 
     /// Every repo with the TOSSE repository it is pinned to, if any. Feeds the
@@ -713,6 +762,7 @@ mod tests {
             id: id.into(),
             path: format!("/tmp/{id}"),
             added_at,
+            ssh_target: None,
         }
     }
 

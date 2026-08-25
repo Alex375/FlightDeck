@@ -75,6 +75,60 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 /// Declare the IPC contract (commands + events) once. Shared by `run()` and the
 /// TS-bindings export so they can never drift.
+/// Dev/demo seed for the SSH-first "machine boundary": when `$TOSSE_SEED_REMOTE_SSH`
+/// (an ssh destination or `~/.ssh/config` `Host` alias) and `$TOSSE_SEED_REMOTE_PATH`
+/// (the repo path ON THAT HOST) are both set, ensure a remote repo + one conversation
+/// in it exist, so the app opens already connected to a remote container over SSH.
+/// Idempotent (fixed ids) and a complete no-op without the env vars — it never touches
+/// a normal run's data. The conversation spawns lazily on first message like any other;
+/// the spawn resolves the repo's `ssh_target` and runs `claude` on the remote host.
+fn seed_remote_demo_if_requested(store: &store::Store) {
+    let (Some(ssh), Some(path)) = (
+        std::env::var("TOSSE_SEED_REMOTE_SSH").ok().filter(|s| !s.is_empty()),
+        std::env::var("TOSSE_SEED_REMOTE_PATH").ok().filter(|s| !s.is_empty()),
+    ) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let repo = store::RepoRecord {
+        id: "remote-demo".to_string(),
+        path: path.clone(),
+        added_at: now,
+        ssh_target: Some(ssh.clone()),
+    };
+    if let Err(e) = store.upsert_repo(&repo) {
+        eprintln!("[seed] failed to upsert remote demo repo: {e}");
+        return;
+    }
+    let conv = store::ConversationRecord {
+        id: "remote-demo-conv".to_string(),
+        name: std::env::var("TOSSE_SEED_REMOTE_NAME").unwrap_or_else(|_| format!("Remote demo ({ssh})")),
+        repo_id: repo.id.clone(),
+        cwd: path,
+        created_at: now,
+        last_activity_at: now,
+        session_id: None,
+        backend: "claude".to_string(),
+        model: None,
+        effort: None,
+        ultracode: false,
+        permission_mode: None,
+        clean_output: None,
+        pending_reminder: None,
+        tosse_task_id: None,
+        tosse_task_title: None,
+        tosse_task_status: None,
+    };
+    if let Err(e) = store.upsert_conversation(&conv) {
+        eprintln!("[seed] failed to upsert remote demo conversation: {e}");
+        return;
+    }
+    eprintln!("[seed] remote demo ready: conversation \"{}\" in {} on {}", conv.name, repo.path, ssh);
+}
+
 fn ipc_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
@@ -582,6 +636,10 @@ pub fn run() {
             {
                 eprintln!("last_activity_at backfill failed: {e}");
             }
+            // Dev/demo: seed a remote (SSH) conversation when asked, so the app opens
+            // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
+            // on a normal run (env vars unset).
+            seed_remote_demo_if_requested(&store);
             app.manage(store);
 
             // App-control hub: install its front outlet, then start the voice

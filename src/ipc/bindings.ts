@@ -3389,7 +3389,18 @@ export type RepoRecord = { id: string; path: string;
 /**
  * Unix ms timestamp the repo was first added.
  */
-added_at: number }
+added_at: number; 
+/**
+ * When set, this repo lives on a REMOTE host reached over SSH: the SSH
+ * destination (a `~/.ssh/config` `Host` alias or `user@host`) whose `claude`
+ * runs this repo's conversations, and whose filesystem `path` refers to. `None`
+ * (every pre-existing row, and every local folder) is the unchanged local case —
+ * the whole app treats a NULL `ssh_target` exactly as before. See the SSH
+ * transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an existing
+ * non-null value when a caller passes `None`, so a rename/undo can never blank a
+ * repo's remoteness.
+ */
+ssh_target: string | null }
 /**
  * An in-flight automatic retry of the current turn's API call.
  */

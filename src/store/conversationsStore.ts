@@ -104,9 +104,15 @@ export const DEFAULT_PERMISSION_MODE = "auto";
 /** A working folder / repository a conversation can be opened in. */
 export interface Repo {
   id: string;
-  /** Absolute path, or "." for the default local project. */
+  /** Absolute path, or "." for the default local project. For a remote repo
+   *  (`sshTarget` set) this is the path ON THAT HOST. */
   path: string;
   addedAt: number;
+  /** When set, this repo lives on a REMOTE host reached over SSH: the SSH
+   *  destination (a `~/.ssh/config` `Host` alias or `user@host`) whose `claude`
+   *  runs its conversations. `undefined`/`null` is the unchanged local case — the
+   *  UI keys "is this remote?" off this. */
+  sshTarget?: string | null;
 }
 
 /** Which agent backend drives a conversation. Chosen at creation, immutable after
@@ -290,6 +296,9 @@ const repoToRecord = (r: Repo): RepoRecord => ({
   id: r.id,
   path: r.path,
   added_at: r.addedAt,
+  // NULL preserves an existing target server-side (upsert_repo COALESCEs it), so a
+  // rename/undo that round-trips a local Repo never blanks a remote repo.
+  ssh_target: r.sshTarget ?? null,
 });
 
 const convToRecord = (c: Conversation): ConversationRecord => ({
@@ -316,6 +325,7 @@ const recordToRepo = (r: RepoRecord): Repo => ({
   id: r.id,
   path: r.path,
   addedAt: r.added_at,
+  sshTarget: r.ssh_target,
 });
 
 const recordToConv = (c: ConversationRecord): Conversation => ({

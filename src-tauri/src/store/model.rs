@@ -17,6 +17,15 @@ pub struct RepoRecord {
     pub path: String,
     /// Unix ms timestamp the repo was first added.
     pub added_at: i64,
+    /// When set, this repo lives on a REMOTE host reached over SSH: the SSH
+    /// destination (a `~/.ssh/config` `Host` alias or `user@host`) whose `claude`
+    /// runs this repo's conversations, and whose filesystem `path` refers to. `None`
+    /// (every pre-existing row, and every local folder) is the unchanged local case —
+    /// the whole app treats a NULL `ssh_target` exactly as before. See the SSH
+    /// transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an existing
+    /// non-null value when a caller passes `None`, so a rename/undo can never blank a
+    /// repo's remoteness.
+    pub ssh_target: Option<String>,
 }
 
 /// A repo together with the TOSSE repository the user pinned it to, if any.

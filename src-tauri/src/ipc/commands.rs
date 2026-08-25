@@ -148,6 +148,15 @@ pub async fn spawn_session(
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
     let id = sessions.next_id();
+    // A conversation opened in a REMOTE repo (one added with an ssh_target) launches
+    // its `claude` on that host over SSH instead of locally. Resolved from the repo by
+    // path here — no new IPC param (spawn_session is at specta's 10-arg cap) and no
+    // change to the front's hot path. A NULL/absent target is the unchanged local case.
+    let remote_target = app
+        .state::<Store>()
+        .repo_ssh_target_for_path(&repo_path)
+        .ok()
+        .flatten();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
@@ -177,6 +186,19 @@ pub async fn spawn_session(
         )
         .to_string(),
     );
+    // Route this session to its remote host when the repo is remote. Claude-only for
+    // now: the Codex backend has its own local-only transport, so a "remote" Codex
+    // conversation would silently run on THIS Mac — refuse it loudly instead.
+    if let Some(ssh_destination) = remote_target {
+        if matches!(backend, Backend::Codex) {
+            return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
+        }
+        cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
+            ssh_destination,
+            remote_bin: std::env::var("TOSSE_REMOTE_CLAUDE_BIN")
+                .unwrap_or_else(|_| "claude".to_string()),
+        });
+    }
     let initial = InitialControls {
         model: cfg.model.clone(),
         effort: cfg.effort.clone(),
