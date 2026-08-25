@@ -1057,4 +1057,71 @@ mod tests {
         assert!(saw_assistant_text, "expected the assistant to stream 'hello world'");
         assert_eq!(result_ok, Some(true), "expected a successful result");
     }
+
+    /// Live end-to-end REMOTE transport check: the exact app code path for a remote
+    /// conversation — `SpawnConfig.remote` → `Transport::spawn` launches `ssh` →
+    /// remote `claude` streams back → we parse the same `CliMessage`s. Proves the SSH
+    /// branch (argv build, quoting, cd, exec) streams a real turn, not just a local one.
+    ///
+    /// Ignored by default: needs the `flightdeck-m0` container up with fresh creds AND
+    /// `TOSSE_SSH_CONFIG` pointing at its ssh_config (the alias). Run with:
+    ///   TOSSE_SSH_CONFIG=.../m0-ssh-remote/.secrets/ssh_config \
+    ///   cargo test -p tosse-code --lib -- --ignored remote_transport_streams_over_ssh --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + remote claude (needs the flightdeck-m0 container + TOSSE_SSH_CONFIG)"]
+    async fn remote_transport_streams_over_ssh() {
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(RemoteTarget {
+            ssh_destination: "flightdeck-m0".into(),
+            remote_bin: "claude".into(),
+        });
+
+        let (mut transport, mut rx) =
+            Transport::spawn(cfg).expect("remote (ssh) spawn should start");
+        transport
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .expect("send should queue");
+
+        let mut saw_init = false;
+        let mut saw_assistant_text = false;
+        let mut result_ok: Option<bool> = None;
+
+        // Remote adds an SSH round-trip; give it comfortable headroom.
+        let deadline = Duration::from_secs(120);
+        let drain = async {
+            while let Some(msg) = rx.recv().await {
+                match &msg {
+                    CliMessage::System(crate::supervisor::protocol::SystemMsg::Init(_)) => {
+                        saw_init = true;
+                    }
+                    CliMessage::Assistant(a) => {
+                        if a.message.to_string().to_lowercase().contains("hello world") {
+                            saw_assistant_text = true;
+                        }
+                    }
+                    CliMessage::Result(r) => {
+                        result_ok = Some(!r.is_error);
+                        break;
+                    }
+                    // Tolerate Unknown here (unlike the local test): the app NEVER
+                    // panics on it — it's the logged protocol-drift canary — and a live
+                    // persistent session can carry housekeeping lines this build doesn't
+                    // model. We assert on the things that prove streaming works instead.
+                    _ => {}
+                }
+            }
+        };
+
+        tokio::time::timeout(deadline, drain)
+            .await
+            .expect("remote turn should complete within the deadline");
+
+        transport.shutdown().await;
+
+        assert!(saw_init, "expected a system/init message from the remote claude");
+        assert!(saw_assistant_text, "expected the remote assistant to stream 'hello world'");
+        assert_eq!(result_ok, Some(true), "expected a successful remote result");
+    }
 }
