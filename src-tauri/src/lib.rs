@@ -61,6 +61,7 @@ use ipc::commands::{
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
     remote_status, set_remote,
+    add_machine, delete_machine, generate_machine_key,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -73,31 +74,47 @@ use ipc::events::{
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
-/// Declare the IPC contract (commands + events) once. Shared by `run()` and the
-/// TS-bindings export so they can never drift.
-/// Dev/demo seed for the SSH-first "machine boundary": when `$TOSSE_SEED_REMOTE_SSH`
-/// (an ssh destination or `~/.ssh/config` `Host` alias) and `$TOSSE_SEED_REMOTE_PATH`
-/// (the repo path ON THAT HOST) are both set, ensure a remote repo + one conversation
-/// in it exist, so the app opens already connected to a remote container over SSH.
-/// Idempotent (fixed ids) and a complete no-op without the env vars — it never touches
-/// a normal run's data. The conversation spawns lazily on first message like any other;
-/// the spawn resolves the repo's `ssh_target` and runs `claude` on the remote host.
+/// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
+/// `$TOSSE_SEED_REMOTE_PATH` (the repo path ON THAT SERVER) are set, ensure a remote
+/// server + a repo on it + one conversation exist, so the app opens already connected
+/// over SSH — a shortcut past the pairing UI for quick verification. Optional env:
+/// `_PORT` (22), `_USER` (root), `_IDENTITY` (private key path), `_MACHINE`/`_NAME`
+/// (labels). Idempotent (fixed ids) and a complete no-op without the env vars.
 fn seed_remote_demo_if_requested(store: &store::Store) {
-    let (Some(ssh), Some(path)) = (
-        std::env::var("TOSSE_SEED_REMOTE_SSH").ok().filter(|s| !s.is_empty()),
+    let (Some(host), Some(path)) = (
+        std::env::var("TOSSE_SEED_REMOTE_HOST").ok().filter(|s| !s.is_empty()),
         std::env::var("TOSSE_SEED_REMOTE_PATH").ok().filter(|s| !s.is_empty()),
     ) else {
         return;
     };
+    let port: u16 = std::env::var("TOSSE_SEED_REMOTE_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
+    let user = std::env::var("TOSSE_SEED_REMOTE_USER").unwrap_or_else(|_| "root".to_string());
+    let identity_file = std::env::var("TOSSE_SEED_REMOTE_IDENTITY").ok().filter(|s| !s.is_empty());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    let machine = store::MachineRecord {
+        id: "seed-machine".to_string(),
+        label: std::env::var("TOSSE_SEED_REMOTE_MACHINE").unwrap_or_else(|_| format!("{user}@{host}")),
+        host,
+        port,
+        user,
+        identity_file,
+        added_at: now,
+    };
+    if let Err(e) = store.upsert_machine(&machine) {
+        eprintln!("[seed] failed to upsert remote demo machine: {e}");
+        return;
+    }
     let repo = store::RepoRecord {
         id: "remote-demo".to_string(),
         path: path.clone(),
         added_at: now,
-        ssh_target: Some(ssh.clone()),
+        machine_id: Some(machine.id.clone()),
     };
     if let Err(e) = store.upsert_repo(&repo) {
         eprintln!("[seed] failed to upsert remote demo repo: {e}");
@@ -105,7 +122,8 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
     }
     let conv = store::ConversationRecord {
         id: "remote-demo-conv".to_string(),
-        name: std::env::var("TOSSE_SEED_REMOTE_NAME").unwrap_or_else(|_| format!("Remote demo ({ssh})")),
+        name: std::env::var("TOSSE_SEED_REMOTE_NAME")
+            .unwrap_or_else(|_| format!("Remote demo ({})", machine.label)),
         repo_id: repo.id.clone(),
         cwd: path,
         created_at: now,
@@ -126,8 +144,14 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         eprintln!("[seed] failed to upsert remote demo conversation: {e}");
         return;
     }
-    eprintln!("[seed] remote demo ready: conversation \"{}\" in {} on {}", conv.name, repo.path, ssh);
+    eprintln!(
+        "[seed] remote demo ready: conversation \"{}\" in {} on {}",
+        conv.name, repo.path, machine.label
+    );
 }
+
+/// Declare the IPC contract (commands + events) once. Shared by `run()` and the
+/// TS-bindings export so they can never drift.
 
 fn ipc_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
@@ -263,6 +287,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_persisted_state,
             upsert_repo,
             delete_repo,
+            generate_machine_key,
+            add_machine,
+            delete_machine,
             upsert_conversation,
             delete_conversation,
             set_active_conversation,

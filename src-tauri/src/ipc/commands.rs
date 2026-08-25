@@ -148,13 +148,13 @@ pub async fn spawn_session(
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
     let id = sessions.next_id();
-    // A conversation opened in a REMOTE repo (one added with an ssh_target) launches
-    // its `claude` on that host over SSH instead of locally. Resolved from the repo by
-    // path here — no new IPC param (spawn_session is at specta's 10-arg cap) and no
-    // change to the front's hot path. A NULL/absent target is the unchanged local case.
-    let remote_target = app
+    // A conversation opened in a REMOTE repo (one whose repo carries a machine_id)
+    // launches its `claude` on that server over SSH instead of locally. Resolved from
+    // the repo by path here — no new IPC param (spawn_session is at specta's 10-arg
+    // cap) and no change to the front's hot path. No machine = the unchanged local case.
+    let remote_machine = app
         .state::<Store>()
-        .repo_ssh_target_for_path(&repo_path)
+        .machine_for_repo_path(&repo_path)
         .ok()
         .flatten();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
@@ -186,15 +186,26 @@ pub async fn spawn_session(
         )
         .to_string(),
     );
-    // Route this session to its remote host when the repo is remote. Claude-only for
+    // Route this session to its remote server when the repo is remote. Claude-only for
     // now: the Codex backend has its own local-only transport, so a "remote" Codex
     // conversation would silently run on THIS Mac — refuse it loudly instead.
-    if let Some(ssh_destination) = remote_target {
+    if let Some(machine) = remote_machine {
         if matches!(backend, Backend::Codex) {
             return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
         }
+        // A dedicated known_hosts under the app data dir, so pinning a server's host
+        // key never touches the user's ~/.ssh/known_hosts.
+        let known_hosts_file = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
         cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
-            ssh_destination,
+            host: machine.host,
+            port: machine.port,
+            user: machine.user,
+            identity_file: machine.identity_file,
+            known_hosts_file,
             remote_bin: std::env::var("TOSSE_REMOTE_CLAUDE_BIN")
                 .unwrap_or_else(|_| "claude".to_string()),
         });
@@ -2536,6 +2547,171 @@ pub fn upsert_repo(store: tauri::State<'_, Store>, repo: RepoRecord) -> Result<(
 #[specta::specta]
 pub fn delete_repo(store: tauri::State<'_, Store>, id: String) -> Result<(), String> {
     store.delete_repo(&id).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Remote servers (the SSH "machine boundary" — pairing + connection)
+// ---------------------------------------------------------------------------
+
+/// A freshly generated dedicated SSH key for a server. The PRIVATE key stays on this
+/// Mac at `identity_file`; `public_key` is the single line to authorize on the server.
+#[derive(serde::Serialize, specta::Type)]
+pub struct GeneratedKey {
+    /// Absolute path to the private key on this Mac (goes on the MachineRecord).
+    pub identity_file: String,
+    /// The public key line to append to the server's `~/.ssh/authorized_keys`.
+    pub public_key: String,
+}
+
+/// Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
+/// key), stored under the app data dir. Returns the private-key path and the public
+/// key to paste on the server. The private key never leaves this Mac. Wraps the system
+/// `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+#[tauri::command]
+#[specta::specta]
+pub async fn generate_machine_key(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<GeneratedKey, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("ssh_keys");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let slug: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let key = dir.join(format!("{slug}-{}", uuid::Uuid::new_v4()));
+    let pub_path = PathBuf::from(format!("{}.pub", key.display()));
+    let out = tokio::process::Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("") // no passphrase (BatchMode auth)
+        .arg("-C")
+        .arg(format!("flightdeck-{slug}"))
+        .arg("-f")
+        .arg(&key)
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh-keygen: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let public_key = std::fs::read_to_string(&pub_path)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    Ok(GeneratedKey {
+        identity_file: key.to_string_lossy().into_owned(),
+        public_key,
+    })
+}
+
+/// Verify we can SSH into a server AND that `claude` runs there, with a fast, batch
+/// (never-prompting) probe. Returns the server's `claude --version` on success, or an
+/// actionable error (unreachable / auth refused / claude missing).
+async fn probe_remote(
+    host: &str,
+    port: u16,
+    user: &str,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(id) = identity {
+        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{user}@{host}")).arg(
+        "command -v claude >/dev/null 2>&1 && claude --version || { echo FLIGHTDECK_NO_CLAUDE >&2; exit 3; }",
+    );
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(3) || stderr.contains("FLIGHTDECK_NO_CLAUDE") {
+        return Err("Connected over SSH, but `claude` is not installed on the server. \
+                    On the server run: curl -fsSL https://claude.ai/install.sh | sh — \
+                    then log Claude in there (`claude`), and retry."
+            .to_string());
+    }
+    Err(format!(
+        "Could not connect over SSH: {}",
+        stderr.trim().lines().last().unwrap_or("unknown error")
+    ))
+}
+
+/// Pair a remote server: probe it (SSH reachable + `claude` present), and on success
+/// persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
+/// probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
+/// not at the first message.
+#[tauri::command]
+#[specta::specta]
+pub async fn add_machine(
+    app: tauri::AppHandle,
+    label: String,
+    host: String,
+    port: u16,
+    user: String,
+    identity_file: Option<String>,
+) -> Result<crate::store::MachineRecord, String> {
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    probe_remote(
+        &host,
+        port,
+        &user,
+        identity_file.as_deref(),
+        known_hosts.as_deref(),
+    )
+    .await?;
+    let machine = crate::store::MachineRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        label,
+        host,
+        port,
+        user,
+        identity_file,
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    };
+    app.state::<Store>()
+        .upsert_machine(&machine)
+        .map_err(|e| e.to_string())?;
+    Ok(machine)
+}
+
+/// Un-pair a remote server: removes it and every repo/conversation anchored to it.
+#[tauri::command]
+#[specta::specta]
+pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), String> {
+    store.delete_machine(&id).map_err(|e| e.to_string())
 }
 
 /// Insert or update a conversation's metadata (idempotent by stable id).

@@ -21,7 +21,7 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import type { ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
@@ -105,14 +105,26 @@ export const DEFAULT_PERMISSION_MODE = "auto";
 export interface Repo {
   id: string;
   /** Absolute path, or "." for the default local project. For a remote repo
-   *  (`sshTarget` set) this is the path ON THAT HOST. */
+   *  (`machineId` set) this is the path ON THAT SERVER. */
   path: string;
   addedAt: number;
-  /** When set, this repo lives on a REMOTE host reached over SSH: the SSH
-   *  destination (a `~/.ssh/config` `Host` alias or `user@host`) whose `claude`
-   *  runs its conversations. `undefined`/`null` is the unchanged local case — the
-   *  UI keys "is this remote?" off this. */
-  sshTarget?: string | null;
+  /** When set, this repo lives on a REMOTE server (a `Machine.id`): its
+   *  conversations run their `claude` there over SSH. `undefined`/`null` is the
+   *  unchanged local case — the UI keys "is this remote?" off this. */
+  machineId?: string | null;
+}
+
+/** A paired remote server (SSH). Mirrors the persisted `MachineRecord`. */
+export interface Machine {
+  id: string;
+  /** Human label shown in the UI. */
+  label: string;
+  host: string;
+  port: number;
+  user: string;
+  /** Path to the private key on this Mac Flight Deck authenticates with. */
+  identityFile?: string | null;
+  addedAt: number;
 }
 
 /** Which agent backend drives a conversation. Chosen at creation, immutable after
@@ -296,9 +308,19 @@ const repoToRecord = (r: Repo): RepoRecord => ({
   id: r.id,
   path: r.path,
   added_at: r.addedAt,
-  // NULL preserves an existing target server-side (upsert_repo COALESCEs it), so a
+  // NULL preserves an existing machine server-side (upsert_repo COALESCEs it), so a
   // rename/undo that round-trips a local Repo never blanks a remote repo.
-  ssh_target: r.sshTarget ?? null,
+  machine_id: r.machineId ?? null,
+});
+
+const recordToMachine = (m: MachineRecord): Machine => ({
+  id: m.id,
+  label: m.label,
+  host: m.host,
+  port: m.port,
+  user: m.user,
+  identityFile: m.identity_file,
+  addedAt: m.added_at,
 });
 
 const convToRecord = (c: Conversation): ConversationRecord => ({
@@ -325,7 +347,7 @@ const recordToRepo = (r: RepoRecord): Repo => ({
   id: r.id,
   path: r.path,
   addedAt: r.added_at,
-  sshTarget: r.ssh_target,
+  machineId: r.machine_id,
 });
 
 const recordToConv = (c: ConversationRecord): Conversation => ({
@@ -384,6 +406,26 @@ interface ConversationsState {
   repos: Repo[];
   conversations: Conversation[];
   activeId: string | null;
+  /** Paired remote servers (SSH). */
+  machines: Machine[];
+  /** Generate a dedicated SSH key for a server (private key stays on this Mac).
+   *  Returns the public key to authorize on the server + the identity path to save. */
+  generateMachineKey: (
+    label: string,
+  ) => Promise<{ ok: true; key: GeneratedKey } | { ok: false; error: string }>;
+  /** Pair a remote server: probe it (SSH + `claude`) and, on success, persist +
+   *  add it. Returns the saved machine, or an actionable error the form shows. */
+  addMachine: (input: {
+    label: string;
+    host: string;
+    port: number;
+    user: string;
+    identityFile: string | null;
+  }) => Promise<{ ok: true; machine: Machine } | { ok: false; error: string }>;
+  /** Un-pair a server: removes it and every repo/conversation anchored to it. */
+  removeMachine: (id: string) => void;
+  /** Register a repo that lives on a remote server (idempotent by path+machine). */
+  addRemoteRepo: (machineId: string, path: string) => Repo;
   /** Idempotent by canonical path: returns the existing repo or a new one. */
   addRepo: (path: string) => Repo;
   /** Remove a repo and all of its conversations. */
@@ -494,6 +536,57 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   repos: [],
   conversations: [],
   activeId: null,
+  machines: [],
+
+  generateMachineKey: async (label) => {
+    const res = await commands.generateMachineKey(label);
+    return res.status === "ok"
+      ? { ok: true, key: res.data }
+      : { ok: false, error: res.error };
+  },
+
+  addMachine: async (input) => {
+    // The core probes the server (SSH reachable + `claude` present) BEFORE saving,
+    // so a bad host / key / paste / missing claude surfaces as an error here.
+    const res = await commands.addMachine(
+      input.label,
+      input.host,
+      input.port,
+      input.user,
+      input.identityFile,
+    );
+    if (res.status !== "ok") return { ok: false, error: res.error };
+    const machine = recordToMachine(res.data);
+    set((s) => ({
+      machines: [...s.machines.filter((m) => m.id !== machine.id), machine],
+    }));
+    return { ok: true, machine };
+  },
+
+  removeMachine: (id) => {
+    // Remove the server and everything anchored to it (its repos + their conversations),
+    // mirroring the core's cascade so the UI matches without a reload.
+    const repoIds = new Set(
+      get().repos.filter((r) => r.machineId === id).map((r) => r.id),
+    );
+    set((s) => ({
+      machines: s.machines.filter((m) => m.id !== id),
+      repos: s.repos.filter((r) => r.machineId !== id),
+      conversations: s.conversations.filter((c) => !repoIds.has(c.repoId)),
+    }));
+    syncToCore("deleteMachine", () => commands.deleteMachine(id));
+  },
+
+  addRemoteRepo: (machineId, path) => {
+    const existing = get().repos.find(
+      (r) => r.path === path && r.machineId === machineId,
+    );
+    if (existing) return existing;
+    const repo: Repo = { id: uid(), path, addedAt: Date.now(), machineId };
+    set((s) => ({ repos: [...s.repos, repo] }));
+    syncToCore("upsertRepo", () => commands.upsertRepo(repoToRecord(repo)));
+    return repo;
+  },
 
   addRepo: (path) => {
     const existing = get().repos.find((r) => r.path === path);
@@ -1230,6 +1323,7 @@ export async function bootConversations(): Promise<void> {
   const res = await commands.loadPersistedState();
   if (res.status === "ok") {
     useConversationsStore.setState({
+      machines: (res.data.machines ?? []).map(recordToMachine),
       repos: res.data.repos.map(recordToRepo),
       conversations: res.data.conversations.map(recordToConv),
       activeId: res.data.active_id,
@@ -1806,7 +1900,7 @@ export async function wipeAllData(): Promise<void> {
   removedConversations.length = 0; // nothing to "undo" back into a wiped slate
   removedPlanAnnotations.clear();
   clearMentionCache();
-  useConversationsStore.setState({ repos: [], conversations: [], activeId: null });
+  useConversationsStore.setState({ machines: [], repos: [], conversations: [], activeId: null });
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.getState().clear();
   useWorkflowLiveStore.getState().clear();
@@ -1822,6 +1916,7 @@ export async function wipeAllData(): Promise<void> {
 export const useConversations = () =>
   useConversationsStore(useShallow((s) => s.conversations));
 export const useRepos = () => useConversationsStore(useShallow((s) => s.repos));
+export const useMachines = () => useConversationsStore(useShallow((s) => s.machines));
 export const useActiveConversationId = () => useConversationsStore((s) => s.activeId);
 
 /**

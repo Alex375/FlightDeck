@@ -1719,6 +1719,45 @@ async deleteRepo(id: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
+ * key), stored under the app data dir. Returns the private-key path and the public
+ * key to paste on the server. The private key never leaves this Mac. Wraps the system
+ * `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+ */
+async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_machine_key", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pair a remote server: probe it (SSH reachable + `claude` present), and on success
+ * persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
+ * probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
+ * not at the first message.
+ */
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null) : Promise<Result<MachineRecord, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Un-pair a remote server: removes it and every repo/conversation anchored to it.
+ */
+async deleteMachine(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_machine", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Insert or update a conversation's metadata (idempotent by stable id).
  */
 async upsertConversation(conversation: ConversationRecord) : Promise<Result<null, string>> {
@@ -2841,6 +2880,19 @@ export type FsEntry = { name: string; path: string; is_dir: boolean }
  */
 export type FsWatchErrorEvent = { message: string }
 /**
+ * A freshly generated dedicated SSH key for a server. The PRIVATE key stays on this
+ * Mac at `identity_file`; `public_key` is the single line to authorize on the server.
+ */
+export type GeneratedKey = { 
+/**
+ * Absolute path to the private key on this Mac (goes on the MachineRecord).
+ */
+identity_file: string; 
+/**
+ * The public key line to append to the server's `~/.ssh/authorized_keys`.
+ */
+public_key: string }
+/**
  * A file's contents on both sides of a diff, handed to the front's Monaco diff
  * editor (which computes the visual diff itself). An empty `old_text` means the
  * file was added; an empty `new_text` means it was deleted. When either side is
@@ -3087,6 +3139,40 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
+ * A remote host (a "server") reached over SSH, on which repos can live and their
+ * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
+ * the connection coordinates so a user adds a server from the UI without editing any
+ * SSH config by hand. Deliberately holds NO secret — only a pointer to a key file on
+ * this Mac (`identity_file`), never the key material itself.
+ */
+export type MachineRecord = { id: string; 
+/**
+ * Human label shown in the UI (e.g. "my-vps").
+ */
+label: string; 
+/**
+ * Hostname or IP reachable from this Mac.
+ */
+host: string; 
+/**
+ * SSH port (usually 22).
+ */
+port: number; 
+/**
+ * SSH user to log in as.
+ */
+user: string; 
+/**
+ * Absolute path to the PRIVATE key file (on this Mac) Flight Deck authenticates
+ * with — typically the dedicated key it generated for this server. `None` falls
+ * back to the user's default SSH keys / agent.
+ */
+identity_file: string | null; 
+/**
+ * Unix ms timestamp the server was added.
+ */
+added_at: number }
+/**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
  * granularity the CLI exposes — there is no per-plugin auto-update). The count of
@@ -3252,7 +3338,12 @@ agent_id: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
-export type PersistedState = { repos: RepoRecord[]; conversations: ConversationRecord[]; 
+export type PersistedState = { 
+/**
+ * Remote servers the user has paired, so the UI can list them and mark which
+ * repos are remote at boot.
+ */
+machines?: MachineRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
 /**
  * Stable id of the conversation that was active when last persisted.
  */
@@ -3385,22 +3476,26 @@ export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: st
 /**
  * A working folder a conversation can be opened in.
  */
-export type RepoRecord = { id: string; path: string; 
+export type RepoRecord = { id: string; 
+/**
+ * Absolute path of the folder. For a remote repo (`machine_id` set) this is the
+ * path ON THAT SERVER.
+ */
+path: string; 
 /**
  * Unix ms timestamp the repo was first added.
  */
 added_at: number; 
 /**
- * When set, this repo lives on a REMOTE host reached over SSH: the SSH
- * destination (a `~/.ssh/config` `Host` alias or `user@host`) whose `claude`
- * runs this repo's conversations, and whose filesystem `path` refers to. `None`
- * (every pre-existing row, and every local folder) is the unchanged local case —
- * the whole app treats a NULL `ssh_target` exactly as before. See the SSH
- * transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an existing
- * non-null value when a caller passes `None`, so a rename/undo can never blank a
- * repo's remoteness.
+ * When set, this repo lives on a REMOTE server (FK to [`MachineRecord::id`]): its
+ * conversations spawn `claude` on that machine over SSH, and `path` is a path on
+ * it. `None` (every pre-existing row and every local folder) is the unchanged
+ * local case — the whole app treats a NULL `machine_id` exactly as before. See
+ * the SSH transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an
+ * existing non-null value when a caller passes `None`, so a rename/undo can never
+ * blank a repo's remoteness.
  */
-ssh_target: string | null }
+machine_id: string | null }
 /**
  * An in-flight automatic retry of the current turn's API call.
  */

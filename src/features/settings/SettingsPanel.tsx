@@ -21,7 +21,12 @@ import { ModelsSection } from "./ModelsSection";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
-import { AgentControlGroup, RemoteAccessGroup, VoiceBridgeGroup } from "./ControlSection";
+import {
+  AgentControlGroup,
+  RemoteAccessGroup,
+  RemoteServersGroup,
+  VoiceBridgeGroup,
+} from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
@@ -192,6 +197,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 {/* Order: in-app control, the built-in voice agent, phone remote
                     access, then the bridge for EXTERNAL clients (most niche last). */}
                 <AgentControlGroup />
+                <RemoteServersGroup />
                 <VoiceAgentSection />
                 <RemoteAccessGroup />
                 <VoiceBridgeGroup />

@@ -7,10 +7,16 @@
 //    interleaved between these by SettingsPanel.
 // Every core-backed card follows the honest-toggle rule: what it shows is the
 // post-apply READ-BACK from the core, so a failure shows instead of a switch that lies.
-import { useCallback, useEffect, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useState } from "react";
 import { commands, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
 import { useCaffeinate } from "../../store/caffeinate";
+import {
+  createConversationInRepo,
+  useConversationsStore,
+  useMachines,
+} from "../../store/conversationsStore";
+import { useSettingsUi } from "../../store/settingsUi";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -185,6 +191,215 @@ export function VoiceBridgeGroup() {
           </span>
         }
       />
+    </SettingsGroup>
+  );
+}
+
+/** Pair remote SSH servers and open conversations that run on them. The alpha
+ *  "machine boundary": add a server (generate a dedicated key → authorize it on the
+ *  box → probe SSH + `claude`), then start a conversation in one of its folders. */
+export function RemoteServersGroup() {
+  const machines = useMachines();
+  const [adding, setAdding] = useState(false);
+  const [label, setLabel] = useState("");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("22");
+  const [user, setUser] = useState("");
+  const [genKey, setGenKey] = useState<{ identityFile: string; publicKey: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = useCallback(() => {
+    setAdding(false);
+    setLabel("");
+    setHost("");
+    setPort("22");
+    setUser("");
+    setGenKey(null);
+    setError(null);
+    setCopied(false);
+  }, []);
+
+  // The one-liner to paste ONCE on the server: authorize Flight Deck's public key.
+  const authorizeCmd = genKey
+    ? `mkdir -p ~/.ssh && printf '%s\\n' '${genKey.publicKey}' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys`
+    : "";
+
+  const onGenerate = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const res = await useConversationsStore.getState().generateMachineKey(label || host || "server");
+    setBusy(false);
+    if (res.ok) setGenKey({ identityFile: res.key.identity_file, publicKey: res.key.public_key });
+    else setError(res.error);
+  }, [label, host]);
+
+  const onPair = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const res = await useConversationsStore.getState().addMachine({
+      label: label || host,
+      host,
+      port: Number(port) || 22,
+      user,
+      identityFile: genKey?.identityFile ?? null,
+    });
+    setBusy(false);
+    if (res.ok) reset();
+    else setError(res.error);
+  }, [label, host, port, user, genKey, reset]);
+
+  const openHere = useCallback((machineId: string, machineLabel: string) => {
+    const path = window.prompt(`Folder path on ${machineLabel} (e.g. /home/you/project):`)?.trim();
+    if (!path) return;
+    useConversationsStore.getState().addRemoteRepo(machineId, path);
+    const id = createConversationInRepo(path, "claude");
+    useConversationsStore.getState().selectConversation(id);
+    useSettingsUi.getState().closeSettings();
+  }, []);
+
+  const inputStyle: CSSProperties = {
+    display: "block",
+    width: "100%",
+    boxSizing: "border-box",
+    marginBottom: 6,
+    padding: "6px 8px",
+    borderRadius: 6,
+    border: "1px solid rgba(128,128,128,0.4)",
+    background: "transparent",
+    color: "inherit",
+    font: "inherit",
+  };
+
+  return (
+    <SettingsGroup title="Remote servers (SSH)" icon="globe">
+      {machines.length === 0 && !adding && (
+        <p className={styles.desc}>
+          No remote server yet. Pair a Linux box to run conversations on it, over SSH.
+        </p>
+      )}
+
+      {machines.map((m) => (
+        <div key={m.id} className={styles.row} style={{ alignItems: "center", gap: 8 }}>
+          <span style={{ flex: 1 }}>
+            <strong>{m.label}</strong>{" "}
+            <span className={styles.mono}>
+              {m.user}@{m.host}:{m.port}
+            </span>
+          </span>
+          <button className={`${styles.btn} ${styles.ghost}`} onClick={() => openHere(m.id, m.label)}>
+            New conversation…
+          </button>
+          <button
+            className={`${styles.btn} ${styles.ghost}`}
+            onClick={() => useConversationsStore.getState().removeMachine(m.id)}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+
+      {!adding ? (
+        <button className={styles.btn} onClick={() => setAdding(true)} style={{ marginTop: 8 }}>
+          + Add a server
+        </button>
+      ) : (
+        <div style={{ marginTop: 8 }}>
+          <input
+            style={inputStyle}
+            placeholder="Name (e.g. my-vps)"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+          />
+          <input
+            style={inputStyle}
+            placeholder="Host or IP (reachable from this Mac)"
+            value={host}
+            onChange={(e) => setHost(e.target.value)}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              style={{ ...inputStyle, width: 90 }}
+              placeholder="Port"
+              inputMode="numeric"
+              value={port}
+              onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+            />
+            <input
+              style={{ ...inputStyle, flex: 1 }}
+              placeholder="User (e.g. root)"
+              value={user}
+              onChange={(e) => setUser(e.target.value)}
+            />
+          </div>
+
+          <button
+            className={styles.btn}
+            disabled={busy || !host}
+            onClick={() => void onGenerate()}
+            style={{ marginTop: 4 }}
+          >
+            1 · Generate access key
+          </button>
+
+          {genKey && (
+            <div style={{ marginTop: 8 }}>
+              <p className={styles.desc}>
+                2 · Run this ONCE on <strong>{host || "the server"}</strong> — it authorizes Flight
+                Deck. Also make sure <span className={styles.mono}>claude</span> is installed there
+                and logged in (<span className={styles.mono}>claude</span>).
+              </p>
+              <code
+                className={styles.mono}
+                style={{
+                  display: "block",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                  padding: 8,
+                  borderRadius: 6,
+                  background: "rgba(128,128,128,0.12)",
+                  marginBottom: 6,
+                }}
+              >
+                {authorizeCmd}
+              </code>
+              <button
+                className={`${styles.btn} ${styles.ghost}`}
+                onClick={() => {
+                  void navigator.clipboard.writeText(authorizeCmd);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                }}
+              >
+                {copied ? "Copied" : "Copy command"}
+              </button>
+              <button
+                className={styles.btn}
+                disabled={busy || !host || !user}
+                onClick={() => void onPair()}
+                style={{ marginLeft: 6 }}
+              >
+                {busy ? "Testing…" : "3 · Test & pair"}
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <p className={styles.errorMsg} style={{ marginTop: 8 }}>
+              {error}
+            </p>
+          )}
+
+          <button
+            className={`${styles.btn} ${styles.ghost}`}
+            onClick={reset}
+            style={{ marginTop: 8 }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
     </SettingsGroup>
   );
 }

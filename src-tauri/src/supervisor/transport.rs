@@ -88,15 +88,24 @@ pub struct SpawnConfig {
     pub remote: Option<RemoteTarget>,
 }
 
-/// How to reach a remote host that runs `claude` over SSH. Deliberately thin: the
-/// port, identity file and host-key policy live in the user's `~/.ssh/config` (or a
-/// dedicated config pointed at by `$TOSSE_SSH_CONFIG`), so `ssh_destination` is just
-/// a destination or `Host` alias — no SSH secret is ever stored by the app.
+/// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
+/// Deck owns the connection coordinates (from the paired [`super::super::store::
+/// MachineRecord`]), so no `~/.ssh/config` editing is required. Holds NO secret: only
+/// a path to a private-key FILE on this Mac, never the key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTarget {
-    /// SSH destination: a `~/.ssh/config` `Host` alias, or `user@host`. Passed to
-    /// `ssh` verbatim, so anything a bare `ssh <this>` accepts works.
-    pub ssh_destination: String,
+    /// Hostname or IP reachable from this Mac.
+    pub host: String,
+    /// SSH port.
+    pub port: u16,
+    /// SSH user to log in as.
+    pub user: String,
+    /// Path to the private key file (`ssh -i`). `None` uses the user's default keys /
+    /// agent.
+    pub identity_file: Option<String>,
+    /// A dedicated `known_hosts` file (`UserKnownHostsFile`), so pinning a server's
+    /// host key never touches the user's `~/.ssh/known_hosts`. `None` uses the default.
+    pub known_hosts_file: Option<String>,
     /// The `claude` binary name/path ON THE REMOTE host (resolved on the remote
     /// PATH). Defaults to `"claude"`.
     pub remote_bin: String,
@@ -440,18 +449,24 @@ impl Transport {
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
             let mut cmd = Command::new("ssh");
-            cmd.arg("-T"); // no PTY: the channel carries raw JSON lines both ways
-            // Optional dedicated ssh config (Port / IdentityFile / known-hosts), so
-            // nothing host-specific — and no SSH secret — is baked into the app.
-            if let Some(config_file) = std::env::var_os("TOSSE_SSH_CONFIG") {
-                cmd.arg("-F").arg(config_file);
-            }
-            cmd.arg("-o")
+            cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
+                .arg("-p")
+                .arg(remote.port.to_string())
+                .arg("-o")
                 .arg("BatchMode=yes") // never block a GUI app on a password prompt
                 .arg("-o")
                 .arg("ConnectTimeout=10") // fail fast if the host is unreachable
-                .arg(&remote.ssh_destination)
-                .arg(remote_cmd);
+                .arg("-o")
+                .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
+            if let Some(kh) = &remote.known_hosts_file {
+                cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+            }
+            if let Some(identity) = &remote.identity_file {
+                // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
+                // authentication failures" when the agent holds many keys).
+                cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+            }
+            cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(remote_cmd);
             cmd
         } else {
             // Local: a conversation whose cwd has vanished (e.g. its worktree was
@@ -833,7 +848,11 @@ mod tests {
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-opus-4-8".into());
         let remote = RemoteTarget {
-            ssh_destination: "flightdeck-m0".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
             remote_bin: "claude".into(),
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
@@ -1074,7 +1093,15 @@ mod tests {
         cfg.model = Some("claude-haiku-4-5-20251001".into());
         cfg.permission_mode = Some("auto".into());
         cfg.remote = Some(RemoteTarget {
-            ssh_destination: "flightdeck-m0".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: Some(
+                "/Users/armand_mounsi/Documents/repositories/flightdeck-server/\
+                 m0-ssh-remote/.secrets/id_ed25519"
+                    .into(),
+            ),
+            known_hosts_file: Some("/dev/null".into()),
             remote_bin: "claude".into(),
         });
 
