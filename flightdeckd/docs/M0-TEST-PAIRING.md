@@ -31,35 +31,42 @@ conversation distante. Deux tests t'attendent.
 
 ## Partie 1b — Le vrai parcours d'appairage (ce qu'on veut valider)
 
-Simule l'ajout d'un serveur **neuf**, en autonomie, depuis l'UI.
+Le principe : **tu ne tapes pas** le host/user/port. Tu colles **une commande** sur le
+serveur ; elle se décrit et te renvoie un **ticket** que tu recolles dans Flight Deck.
 
-1. **Réglages** (⌘,) → onglet **Control** → carte **« Remote servers (SSH) »** → **`+ Add a server`**.
-2. Remplis :
-   - **Name** : `mock`
-   - **Host or IP** : `127.0.0.1`
-   - **Port** : `2222`
-   - **User** : `agent`
-3. Clique **`1 · Generate access key`**. Flight Deck crée une **clé dédiée à ce serveur**
-   (la privée reste sur le Mac) et affiche **une commande à coller sur le serveur**.
-4. **`Copy command`**, puis colle-la **sur le serveur**. Ici le serveur est le conteneur,
-   donc :
+1. **Réglages** (⌘,) → onglet **Control** → carte **« Remote servers (SSH) »** →
+   **`+ Add a server`**. Flight Deck génère aussitôt une **clé dédiée** (la privée
+   reste sur le Mac) et affiche **la commande à coller sur le serveur**.
+2. **`Copy command`**. Ouvre un shell sur le serveur et colle-la. Ici le serveur est le
+   conteneur, donc un shell dedans :
    ```bash
-   docker exec -i flightdeck-m0 bash -lc '<COLLE LA COMMANDE ICI>'
+   docker exec -it flightdeck-m0 bash    # puis Cmd-V (colle la commande) + Entrée
    ```
-   (Sur un vrai serveur ce serait : `ssh toi@serveur`, puis coller la commande. La
-   commande n'autorise que Flight Deck — elle ajoute sa clé publique à
-   `authorized_keys`.)
-5. Clique **`3 · Test & pair`**. Flight Deck se connecte en SSH avec **sa** clé, vérifie
-   que `claude` est présent, et **enregistre le serveur**. Il apparaît dans la liste
-   (`agent@127.0.0.1:2222`).
-   - _Échec attendu si tu sautes l'étape 4_ : « Could not connect over SSH » — c'est le
-     signe que la vérification est réelle.
-6. Sur la ligne du serveur → **`New conversation…`** → saisis le chemin **`/work/demo`**
-   → une conversation s'ouvre, branchée sur ce serveur. Envoie un message → il tourne
-   dans le conteneur.
+   (Sur un vrai serveur : `ssh toi@serveur` puis coller.) La commande autorise la clé de
+   Flight Deck, vérifie `claude`, **découvre** hostname/user/port, et imprime une ligne
+   **`fdpair:…`**.
+3. Copie cette ligne **`fdpair:…`** et **colle-la** dans le champ ticket de Flight Deck →
+   **`Continue`**. Les champs se **pré-remplissent** tout seuls (Name, Host, Port, User).
+4. **Écran de confirmation** : pour le conteneur, deux valeurs sont à corriger (le
+   docker port-mapping fait que le serveur ne connaît pas son adresse côté Mac) —
+   mets **Host = `127.0.0.1`** et **Port = `2222`**. _(Sur un vrai VPS joignable en
+   direct, tout est correct automatiquement, rien à toucher.)_
+5. **`Test & pair`** → Flight Deck se connecte avec **sa** clé, vérifie `claude`, et
+   enregistre le serveur (`agent@127.0.0.1:2222`).
+6. Sur la ligne du serveur → **`New conversation…`** : Flight Deck **détecte les repos
+   git** du serveur (dont `/work/demo`) — clique dessus (ou tape le chemin) → une
+   conversation s'ouvre, branchée sur le serveur. Envoie un message → il tourne dans le
+   conteneur.
 
-> Ce que ça prouve : le parcours « je pars d'un serveur nu, je l'appaire en 3 gestes
-> depuis l'app, j'y ouvre un repo » — sans éditer un seul fichier de config SSH.
+> Ce que ça prouve : « je pars d'un serveur, je colle une commande, il se présente, je
+> recolle le ticket, j'ouvre un repo détecté » — sans connaître ni taper les coords, et
+> sans éditer un fichier de config SSH.
+
+> **Note d'honnêteté** : l'idéal (que tu as évoqué) serait que le serveur **pousse**
+> lui-même la demande d'appairage à ton Flight Deck (zéro copier-coller de ticket). C'est
+> faisable **via le relais** (le serveur POSTe une demande, Flight Deck la reçoit) mais
+> demande du code relais + protocole en plus — c'est l'étape d'après. Le ticket
+> ci-dessus donne déjà l'essentiel du « tenir par la main » sans cette infra.
 
 ---
 
