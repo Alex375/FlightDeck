@@ -40,24 +40,27 @@ pub async fn serve(manager: Arc<SessionManager>) {
     ensure_crypto_provider();
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_once(&manager).await {
-            Ok(()) => {
-                backoff = Duration::from_secs(1);
-            }
-            Err(e) => {
-                warn!("relay connection failed: {e:#} — retrying in {backoff:?}");
-            }
+        // `connect_once` only ever returns Err (a healthy connection runs until
+        // it breaks) — so the backoff reset keys off whether a connection was
+        // actually ESTABLISHED this round, not off the return value.
+        let mut was_connected = false;
+        if let Err(e) = connect_once(&manager, &mut was_connected).await {
+            warn!("relay connection ended: {e:#} — retrying in {backoff:?}");
+        }
+        if was_connected {
+            backoff = Duration::from_secs(1);
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-async fn connect_once(manager: &Arc<SessionManager>) -> Result<()> {
+async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -> Result<()> {
     let cfg = &manager.cfg;
     let url = ws_url(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token);
     info!("connecting to relay {}", cfg.relay_url);
     let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    *was_connected = true;
     info!("relay connected (macId {})", cfg.mac_id);
     let (mut sink, mut stream) = ws.split();
 
@@ -122,7 +125,16 @@ async fn read_loop(
     out_tx: &mpsc::UnboundedSender<Message>,
     stream: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
 ) -> Result<()> {
-    while let Some(msg) = stream.next().await {
+    // Read-side liveness: the relay pings every ~30s (tungstenite auto-pongs),
+    // so a healthy link ALWAYS delivers something within 90s. A silently-dead
+    // TCP path (no FIN) would otherwise leave the daemon "connected" but deaf
+    // until the OS gives up on the socket — many minutes.
+    loop {
+        let msg = match tokio::time::timeout(Duration::from_secs(90), stream.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(_) => return Err(anyhow!("relay silent for 90s — assuming a dead link")),
+        };
         let msg = msg.map_err(|e| anyhow!("relay read: {e}"))?;
         let Message::Text(raw) = msg else { continue };
         let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };

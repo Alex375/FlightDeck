@@ -45,14 +45,27 @@ pub fn is_replayable_line(line: &str) -> bool {
 }
 
 /// First line the daemon sends on a (re)attach: identifies the conversation,
-/// the claude-process epoch, and where the replay starts.
-pub fn fd_attach(conversation: &str, epoch: &str, replay_from: u64, seq_now: u64) -> String {
+/// the claude-process epoch, and where the replay starts. `busy` is the
+/// daemon's OWN turn state (a client whose optimistic busy flag disagrees can
+/// resync — a message lost in a dead link would otherwise leave it stuck);
+/// `pending` lists the outstanding can_use_tool request ids (a client drops
+/// stale permission cards not in this list).
+pub fn fd_attach(
+    conversation: &str,
+    epoch: &str,
+    replay_from: u64,
+    seq_now: u64,
+    busy: bool,
+    pending: &[&str],
+) -> String {
     json!({
         "type": "fd_attach",
         "conversation": conversation,
         "epoch": epoch,
         "replay_from": replay_from,
         "seq": seq_now,
+        "busy": busy,
+        "pending": pending,
     })
     .to_string()
 }
@@ -145,11 +158,13 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"]);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
         assert_eq!(v["seq"], 10);
+        assert_eq!(v["busy"], true);
+        assert_eq!(v["pending"][0], "rq-1");
         let d = fd_detach("exited", Some(1));
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v["reason"], "exited");

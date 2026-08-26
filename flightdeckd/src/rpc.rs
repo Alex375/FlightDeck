@@ -12,6 +12,17 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+/// Bound on waiting for a session actor's ack — a wedged claude must fail the
+/// one RPC, never hang the phone's relay task forever.
+const RPC_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn await_ack<T>(rx: oneshot::Receiver<T>) -> Result<T> {
+    tokio::time::timeout(RPC_ACK_TIMEOUT, rx)
+        .await
+        .map_err(|_| anyhow!("the session did not answer in time"))?
+        .map_err(|_| anyhow!("conversation just ended"))
+}
+
 fn conv_id_of(params: &Value) -> Result<String> {
     params
         .get("conversation_id")
@@ -32,7 +43,7 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
             let id = conv_id_of(params)?;
             let (ack, rx) = oneshot::channel();
             m.route(&id, SessionMsg::Interrupt { ack }).await?;
-            rx.await.map_err(|_| anyhow!("conversation just ended"))?.map_err(|e| anyhow!(e))?;
+            await_ack(rx).await?.map_err(|e| anyhow!(e))?;
             Ok(json!({"conversation_id": id, "interrupted": true}))
         }
         "stop_stream" => {
@@ -40,7 +51,7 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
             let (ack, rx) = oneshot::channel();
             match m.route(&id, SessionMsg::Stop { ack }).await {
                 Ok(()) => {
-                    let _ = rx.await;
+                    let _ = await_ack(rx).await;
                     Ok(json!({"conversation_id": id, "stopped": true}))
                 }
                 Err(_) => Ok(json!({"conversation_id": id, "stopped": false, "note": "it was not running"})),
@@ -73,7 +84,7 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
             // transcript stay on disk).
             let (ack, rx) = oneshot::channel();
             if m.route(&id, SessionMsg::Stop { ack }).await.is_ok() {
-                let _ = rx.await;
+                let _ = await_ack(rx).await;
             }
             m.with_registry(|r| r.set_archived(&id, true))?;
             Ok(json!({"conversation_id": id, "removed": true}))
@@ -172,12 +183,24 @@ async fn read_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<Va
             .collect();
     }
     let status = status_json(m, &id).await;
-    Ok(json!({
+    // Frame budget: the relay closes the socket on frames over 256 KB
+    // (maxPayload). 40 turns × 4000 chars can get there — drop the OLDEST
+    // turns until the serialized result fits comfortably.
+    const RESULT_BYTES_MAX: usize = 200_000;
+    let mut result = json!({
         "conversation_id": id,
         "title": if title.is_empty() { "New conversation".to_string() } else { title },
         "status": status,
         "turns": turns,
-    }))
+    });
+    while result.to_string().len() > RESULT_BYTES_MAX {
+        let arr = result["turns"].as_array_mut().expect("turns array");
+        if arr.is_empty() {
+            break;
+        }
+        arr.remove(0);
+    }
+    Ok(result)
 }
 
 async fn send_message(m: &Arc<SessionManager>, params: &Value) -> Result<Value> {
@@ -190,9 +213,7 @@ async fn send_message(m: &Arc<SessionManager>, params: &Value) -> Result<Value> 
     m.ensure_running(&id).await?;
     let (ack, rx) = oneshot::channel();
     m.route(&id, SessionMsg::Send { text: text.to_string(), ack }).await?;
-    rx.await
-        .map_err(|_| anyhow!("conversation just ended"))?
-        .map_err(|e| anyhow!(e))?;
+    await_ack(rx).await?.map_err(|e| anyhow!(e))?;
     Ok(json!({"conversation_id": id, "delivered": true}))
 }
 
@@ -210,7 +231,7 @@ async fn create_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<
     if let Some(text) = first {
         let (ack, rx) = oneshot::channel();
         m.route(&conv_id, SessionMsg::Send { text: text.to_string(), ack }).await?;
-        let _ = rx.await;
+        let _ = await_ack(rx).await;
     }
     Ok(json!({
         "conversation_id": conv_id,
@@ -249,9 +270,7 @@ async fn answer_request(m: &Arc<SessionManager>, params: &Value) -> Result<Value
         },
     )
     .await?;
-    rx.await
-        .map_err(|_| anyhow!("conversation just ended"))?
-        .map_err(|e| anyhow!(e))?;
+    await_ack(rx).await?.map_err(|e| anyhow!(e))?;
     Ok(json!({"conversation_id": id, "request_id": request_id, "behavior": behavior}))
 }
 

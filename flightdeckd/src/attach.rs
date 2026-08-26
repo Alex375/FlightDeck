@@ -1,23 +1,26 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
-//! over SSH by the Mac) bridges to its stdio. First line in is the attach
-//! request; after that the connection is a transparent line pipe:
-//! client → claude stdin, claude stdout (replay + live) → client.
+//! over SSH by the Mac) bridges to its stdio. First line in is the request
+//! (`attach`, `status` or `stop`); for `attach` the connection then becomes a
+//! transparent line pipe: client → claude stdin, claude stdout (replay + live)
+//! → client.
 
-use crate::session::{SessionManager, SessionMsg};
+use crate::session::{ClientQueue, SessionManager, SessionMsg, ACTOR_REPLY_TIMEOUT};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 struct FirstLine {
     attach: Option<AttachParams>,
     status: Option<serde_json::Value>,
+    stop: Option<StopParams>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +35,11 @@ struct AttachParams {
     claude_args: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StopParams {
+    conversation: String,
+}
+
 pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
     if socket.exists() {
         std::fs::remove_file(socket).ok();
@@ -43,13 +51,22 @@ pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
         .with_context(|| format!("cannot bind {}", socket.display()))?;
     info!("attach socket ready at {}", socket.display());
     loop {
-        let (conn, _) = listener.accept().await?;
-        let manager = manager.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(manager, conn).await {
-                warn!("attach connection ended with error: {e:#}");
+        // One failed accept (EMFILE, a raced peer) must not take the whole
+        // daemon — and every live session — down with it.
+        match listener.accept().await {
+            Ok((conn, _)) => {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_conn(manager, conn).await {
+                        warn!("attach connection ended with error: {e:#}");
+                    }
+                });
             }
-        });
+            Err(e) => {
+                warn!("attach accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
@@ -89,15 +106,30 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         return Ok(());
     }
 
+    if let Some(stop) = parsed.stop {
+        let (ack, rx) = oneshot::channel();
+        let line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
+            Ok(()) => {
+                let _ = tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await;
+                json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": true})
+            }
+            Err(_) => {
+                json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": false, "note": "it was not running"})
+            }
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
     let Some(p) = parsed.attach else {
-        let msg = json!({"type": "fd_detach", "reason": "error", "message": "missing attach or status"});
+        let msg = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status or stop"});
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
     };
 
-    let (lines_tx, mut lines_rx) = mpsc::unbounded_channel::<String>();
+    let (queue, mut lines_rx, outstanding) = ClientQueue::new();
     let attached = manager
-        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, lines_tx)
+        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, queue)
         .await;
     let (conv_id, client_id) = match attached {
         Ok(x) => x,
@@ -108,13 +140,20 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         }
     };
 
-    // daemon → client
+    // daemon → client. The outstanding counter tracks queued-but-unwritten
+    // bytes: the actor refuses to queue past the budget (stalled link) and
+    // drops the client instead — it reattaches from its cursor.
     let writer = tokio::spawn(async move {
         while let Some(line) = lines_rx.recv().await {
-            if write_half.write_all(format!("{line}\n").as_bytes()).await.is_err() {
-                break;
+            let bytes = line.len() as i64 + 1;
+            let write = async {
+                write_half.write_all(line.as_bytes()).await?;
+                write_half.write_all(b"\n").await?;
+                write_half.flush().await
             }
-            if write_half.flush().await.is_err() {
+            .await;
+            outstanding.fetch_sub(bytes, Ordering::Relaxed);
+            if write.is_err() {
                 break;
             }
         }
@@ -148,7 +187,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// The client side (`flightdeckd attach` / `flightdeckd status`), run over SSH.
+// The client side (`flightdeckd attach` / `status` / `stop`), run over SSH.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn attach_client(
@@ -214,15 +253,25 @@ pub async fn attach_client(
     Ok(())
 }
 
-pub async fn status_client(socket: &Path) -> Result<String> {
+async fn one_shot(socket: &Path, request: serde_json::Value) -> Result<String> {
     let conn = UnixStream::connect(socket).await.with_context(|| {
         format!("flightdeckd is not running (no socket at {})", socket.display())
     })?;
     let (read_half, mut write_half) = conn.into_split();
-    write_half.write_all(b"{\"status\":{}}\n").await?;
+    write_half.write_all(format!("{request}\n").as_bytes()).await?;
     write_half.flush().await?;
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     Ok(line.trim().to_string())
+}
+
+pub async fn status_client(socket: &Path) -> Result<String> {
+    one_shot(socket, json!({"status": {}})).await
+}
+
+/// Stop one conversation's claude process (used by the Mac's explicit Stop when
+/// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
+pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
+    one_shot(socket, json!({"stop": {"conversation": conversation}})).await
 }

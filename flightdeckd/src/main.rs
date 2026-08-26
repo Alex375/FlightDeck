@@ -76,6 +76,14 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Stop one conversation's claude process (the Mac's explicit Stop path
+    /// when its attach link is already gone).
+    Stop {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Print the phone pairing link for the current config.
     Pairing {
         #[arg(long)]
@@ -173,6 +181,11 @@ async fn main() -> Result<()> {
         Cmd::Status { socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
             println!("{}", attach::status_client(&socket).await?);
+            Ok(())
+        }
+        Cmd::Stop { conversation, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::stop_client(&socket, &conversation).await?);
             Ok(())
         }
         Cmd::Pairing { config: cfg_path } => {

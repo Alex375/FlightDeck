@@ -8,6 +8,17 @@
 //! The supervision model (spawn args, pumps, teardown ladder, control-channel
 //! semantics) is ported from tosse-code `supervisor/transport.rs` — the daemon
 //! is that transport's server side.
+//!
+//! Concurrency rules that keep this correct:
+//!  - ALL session creation happens under the `sessions` lock (resolve + spawn +
+//!    insert as one critical section), so two racing clients can never
+//!    double-spawn one conversation;
+//!  - map entries carry a GENERATION token and an exiting actor only removes
+//!    its own generation, so a stale actor can never unmap a live one;
+//!  - the actor never awaits into a pipe: claude's stdin has its own writer
+//!    task (queue-accept), and the attach client's queue is unbounded with a
+//!    byte-budget kill switch — a wedged claude or a stalled ssh link can slow
+//!    ITS session, never the daemon.
 
 use crate::config::Config;
 use crate::events::Event;
@@ -18,20 +29,53 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::process::Child;
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, MutexGuard};
 use tracing::{info, warn};
 
 /// Ring budget: how many bytes of replayable stream lines each session keeps.
 const RING_BYTES_MAX: usize = 64 * 1024 * 1024;
+/// A stalled attach client (half-open ssh link) is dropped once this many bytes
+/// sit unacknowledged in its outgoing queue — it will reattach from its cursor,
+/// so nothing is lost.
+const CLIENT_QUEUE_BYTES_MAX: i64 = 128 * 1024 * 1024;
 /// Teardown ladder pauses (mirrors tosse-code: EOF → SIGTERM(group) → SIGKILL).
 const LADDER_STEP: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound on any actor round-trip (status queries, RPC acks) so one wedged
+/// session can never hang a daemon-wide listing or a phone RPC.
+pub const ACTOR_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Messages into a session actor
+
+/// The attach client's outgoing line queue: unbounded sends from the actor,
+/// with a shared byte counter the attach writer decrements after each write.
+#[derive(Clone)]
+pub struct ClientQueue {
+    tx: mpsc::UnboundedSender<String>,
+    outstanding: Arc<AtomicI64>,
+}
+
+impl ClientQueue {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>, Arc<AtomicI64>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let outstanding = Arc::new(AtomicI64::new(0));
+        (Self { tx, outstanding: outstanding.clone() }, rx, outstanding)
+    }
+
+    /// Queue one line. `false` = the client is gone or hopelessly stalled
+    /// (byte budget blown) — the caller should drop it.
+    fn push(&self, line: String) -> bool {
+        let bytes = line.len() as i64 + 1;
+        if self.outstanding.fetch_add(bytes, Ordering::Relaxed) > CLIENT_QUEUE_BYTES_MAX {
+            return false;
+        }
+        self.tx.send(line).is_ok()
+    }
+}
 
 pub struct AttachReq {
     pub client_id: u64,
@@ -39,8 +83,7 @@ pub struct AttachReq {
     pub epoch: Option<String>,
     /// Count of replayable lines the client has already received this epoch.
     pub cursor: u64,
-    /// Where daemon→client lines go (each item is one line, no trailing \n).
-    pub lines_tx: mpsc::UnboundedSender<String>,
+    pub queue: ClientQueue,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +110,10 @@ pub struct StatusSnapshot {
 
 pub enum SessionMsg {
     FromClaude(String),
+    /// The stdout pump reached EOF — every line is in. Paired with
+    /// [`SessionMsg::ClaudeExited`]; the actor finishes only when BOTH have
+    /// arrived, so a racing exit can never drop claude's final lines.
+    StdoutClosed,
     ClaudeExited(Option<i32>),
     Attach(AttachReq),
     /// The attach connection with this client_id went away.
@@ -82,7 +129,8 @@ pub enum SessionMsg {
         ack: oneshot::Sender<Result<(), String>>,
     },
     Status { reply: oneshot::Sender<StatusSnapshot> },
-    /// Kill the claude process (explicit stop — fd_stop or phone stop_stream).
+    /// Kill the claude process (explicit stop — fd_stop, phone stop_stream, or
+    /// `flightdeckd stop`).
     Stop { ack: oneshot::Sender<()> },
 }
 
@@ -91,12 +139,17 @@ pub enum SessionMsg {
 
 struct SessionEntry {
     msg_tx: mpsc::UnboundedSender<SessionMsg>,
+    /// Identity token: an exiting actor only removes ITS entry, never a
+    /// successor's under the same conversation id.
+    generation: u64,
 }
+
+type SessionsMap = HashMap<String, SessionEntry>;
 
 pub struct SessionManager {
     pub cfg: Config,
     registry: StdMutex<Registry>,
-    sessions: Mutex<HashMap<String, SessionEntry>>,
+    sessions: Mutex<SessionsMap>,
     pub events_tx: broadcast::Sender<Event>,
     ids: AtomicU64,
 }
@@ -122,8 +175,8 @@ impl SessionManager {
         f(&guard)
     }
 
-    async fn entry_tx(&self, conv_id: &str) -> Option<mpsc::UnboundedSender<SessionMsg>> {
-        let mut sessions = self.sessions.lock().await;
+    /// The live sender for a conversation, dropping a stale (closed) entry.
+    fn live_tx(sessions: &mut SessionsMap, conv_id: &str) -> Option<mpsc::UnboundedSender<SessionMsg>> {
         match sessions.get(conv_id) {
             Some(e) if !e.msg_tx.is_closed() => Some(e.msg_tx.clone()),
             Some(_) => {
@@ -134,31 +187,30 @@ impl SessionManager {
         }
     }
 
-    pub async fn status(&self, conv_id: &str) -> Option<StatusSnapshot> {
-        let tx = self.entry_tx(conv_id).await?;
+    async fn entry_tx(&self, conv_id: &str) -> Option<mpsc::UnboundedSender<SessionMsg>> {
+        Self::live_tx(&mut *self.sessions.lock().await, conv_id)
+    }
+
+    /// Bounded status query — never hangs on a wedged actor.
+    async fn query_status(tx: &mpsc::UnboundedSender<SessionMsg>) -> Option<StatusSnapshot> {
         let (reply, rx) = oneshot::channel();
         tx.send(SessionMsg::Status { reply }).ok()?;
-        rx.await.ok()
+        tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await.ok()?.ok()
     }
 
-    /// Find the live conversation currently running claude session `sid`.
-    pub async fn conv_for_claude_session(&self, sid: &str) -> Option<String> {
-        let ids: Vec<String> = { self.sessions.lock().await.keys().cloned().collect() };
-        for id in ids {
-            if let Some(st) = self.status(&id).await {
-                if st.running && st.session_id.as_deref() == Some(sid) {
-                    return Some(id);
-                }
-            }
-        }
-        None
+    pub async fn status(&self, conv_id: &str) -> Option<StatusSnapshot> {
+        let tx = self.entry_tx(conv_id).await?;
+        Self::query_status(&tx).await
     }
 
-    /// Attach a client. Resolution order:
-    ///  1. explicit conversation id, if it has a live actor;
-    ///  2. the live session running `resume_session`;
-    ///  3. cold start: spawn claude (client args, `--resume` injected as needed)
-    ///     under the given — or a fresh — conversation id.
+    /// Attach a client. Resolution order (the whole flow holds the sessions
+    /// lock, so a racing second client serializes behind this one):
+    ///  1. the conversation id, if it has a live actor;
+    ///  2. the live session currently running claude session `resume_session`
+    ///     (an app restart mints a fresh conversation id but must re-join the
+    ///     running process, not double-spawn it);
+    ///  3. cold start: spawn claude (client args, `--resume` injected as
+    ///     needed) under the given — or a fresh — conversation id.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         self: &Arc<Self>,
@@ -168,70 +220,90 @@ impl SessionManager {
         claude_args: Vec<String>,
         epoch: Option<String>,
         cursor: u64,
-        lines_tx: mpsc::UnboundedSender<String>,
+        queue: ClientQueue,
     ) -> Result<(String, u64)> {
         let client_id = self.next_client_id();
+        let mut sessions = self.sessions.lock().await;
 
         // 1. by conversation id
-        let mut conv_id = conversation.clone();
-        if let Some(id) = &conv_id {
-            if let Some(tx) = self.entry_tx(id).await {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, lines_tx }))
+        if let Some(id) = &conversation {
+            if let Some(tx) = Self::live_tx(&mut sessions, id) {
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
                 return Ok((id.clone(), client_id));
             }
         }
-        // 2. by running claude session id
-        if conv_id.is_none() {
-            if let Some(sid) = &resume_session {
-                if let Some(found) = self.conv_for_claude_session(sid).await {
-                    if let Some(tx) = self.entry_tx(&found).await {
-                        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, lines_tx }))
-                            .map_err(|_| anyhow!("session just ended — retry"))?;
-                        return Ok((found, client_id));
-                    }
+        // 2. by running claude session id (even when a fresh conversation id
+        //    was supplied — re-join beats double-spawn)
+        if let Some(sid) = &resume_session {
+            let candidates: Vec<(String, mpsc::UnboundedSender<SessionMsg>)> = sessions
+                .iter()
+                .filter(|(_, e)| !e.msg_tx.is_closed())
+                .map(|(id, e)| (id.clone(), e.msg_tx.clone()))
+                .collect();
+            for (id, tx) in candidates {
+                let matched = Self::query_status(&tx)
+                    .await
+                    .map(|st| st.running && st.session_id.as_deref() == Some(sid))
+                    .unwrap_or(false);
+                if matched {
+                    tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue }))
+                        .map_err(|_| anyhow!("session just ended — retry"))?;
+                    return Ok((id, client_id));
                 }
-                // known-but-cold conversation for this session id?
-                let cold = self.with_registry(|r| {
-                    r.list(true).ok().and_then(|rows| {
-                        rows.into_iter().find(|row| row.session_id.as_deref() == Some(sid)).map(|r| r.id)
-                    })
-                });
-                conv_id = cold;
             }
         }
 
-        // 3. cold start
-        let conv_id = match conv_id {
-            Some(id) => id,
-            None => uuid::Uuid::new_v4().to_string(),
-        };
+        // 3. cold start. When a resume session id is given, the EXISTING
+        //    registry row for that session outranks any client-supplied
+        //    conversation id (the Mac pre-mints a fresh id per spawn for
+        //    idempotent retries — honoring it over the row would duplicate the
+        //    conversation after a daemon restart).
+        let mut conv_id = None;
+        if let Some(sid) = &resume_session {
+            conv_id = self.with_registry(|r| {
+                r.list(true).ok().and_then(|rows| {
+                    rows.into_iter()
+                        .find(|row| row.session_id.as_deref() == Some(sid))
+                        .map(|r| r.id)
+                })
+            });
+        }
+        let conv_id = conv_id
+            .or(conversation)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let known = self.with_registry(|r| r.get(&conv_id).ok().flatten());
         let cwd = cwd
             .or_else(|| known.as_ref().map(|k| k.repo_path.clone()))
             .ok_or_else(|| anyhow!("attach needs --cwd for a new conversation"))?;
         let resume = resume_session.or_else(|| known.as_ref().and_then(|k| k.session_id.clone()));
-        if known.is_none() {
-            let now = frames::now_ms();
-            self.with_registry(|r| {
-                r.upsert(&ConversationRow {
-                    id: conv_id.clone(),
-                    session_id: resume.clone(),
-                    title: String::new(),
-                    repo_path: cwd.clone(),
-                    created_at: now,
-                    last_activity_at: now,
-                    archived: false,
-                })
-            })?;
+        let now = frames::now_ms();
+        match &known {
+            None => {
+                self.with_registry(|r| {
+                    r.upsert(&ConversationRow {
+                        id: conv_id.clone(),
+                        session_id: resume.clone(),
+                        title: String::new(),
+                        repo_path: cwd.clone(),
+                        created_at: now,
+                        last_activity_at: now,
+                        archived: false,
+                    })
+                })?;
+            }
+            Some(k) if k.archived => {
+                // Attaching to an archived conversation resurrects it — it must
+                // be visible again (the phone lists un-archived only).
+                self.with_registry(|r| r.set_archived(&conv_id, false))?;
+            }
+            Some(_) => {}
         }
         let args = ensure_args(claude_args, resume.as_deref(), &self.cfg);
-        self.spawn_session(&conv_id, &cwd, args).await?;
-        let tx = self
-            .entry_tx(&conv_id)
-            .await
+        self.spawn_into(&mut sessions, &conv_id, &cwd, args)?;
+        let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
-        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, lines_tx }))
+        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue }))
             .map_err(|_| anyhow!("session failed to start"))?;
         Ok((conv_id, client_id))
     }
@@ -239,14 +311,18 @@ impl SessionManager {
     /// Make sure a conversation's claude process is up (lazy respawn with
     /// --resume), e.g. before a phone send lands on a cold conversation.
     pub async fn ensure_running(self: &Arc<Self>, conv_id: &str) -> Result<()> {
-        if self.entry_tx(conv_id).await.is_some() {
+        let mut sessions = self.sessions.lock().await;
+        if Self::live_tx(&mut sessions, conv_id).is_some() {
             return Ok(());
         }
         let row = self
             .with_registry(|r| r.get(conv_id).ok().flatten())
             .ok_or_else(|| anyhow!("no such conversation"))?;
+        if row.archived {
+            self.with_registry(|r| r.set_archived(conv_id, false))?;
+        }
         let args = ensure_args(Vec::new(), row.session_id.as_deref(), &self.cfg);
-        self.spawn_session(conv_id, &row.repo_path, args).await
+        self.spawn_into(&mut sessions, conv_id, &row.repo_path, args)
     }
 
     pub async fn create_conversation(self: &Arc<Self>, repo_path: &str, title: &str) -> Result<String> {
@@ -268,7 +344,8 @@ impl SessionManager {
             })
         })?;
         let args = ensure_args(Vec::new(), None, &self.cfg);
-        self.spawn_session(&conv_id, repo_path, args).await?;
+        let mut sessions = self.sessions.lock().await;
+        self.spawn_into(&mut sessions, &conv_id, repo_path, args)?;
         Ok(conv_id)
     }
 
@@ -283,7 +360,15 @@ impl SessionManager {
 
     // -- spawning ----------------------------------------------------------
 
-    async fn spawn_session(self: &Arc<Self>, conv_id: &str, cwd: &str, args: Vec<String>) -> Result<()> {
+    /// Spawn claude + its pumps + the actor, inserting the entry — all while the
+    /// caller holds the sessions lock (no check-then-spawn race window).
+    fn spawn_into(
+        self: &Arc<Self>,
+        sessions: &mut MutexGuard<'_, SessionsMap>,
+        conv_id: &str,
+        cwd: &str,
+        args: Vec<String>,
+    ) -> Result<()> {
         let cwd_path = PathBuf::from(cwd);
         if !cwd_path.is_dir() {
             bail!("working folder is missing on the server: {cwd}");
@@ -317,9 +402,32 @@ impl SessionManager {
         let stderr = child.stderr.take().context("claude stderr")?;
 
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<SessionMsg>();
+        let generation = self.ids.fetch_add(1, Ordering::Relaxed);
+
+        // claude-stdin writer: the actor queue-accepts lines and NEVER blocks on
+        // a full pipe; a wedged claude wedges only this task. Dropping the
+        // sender closes stdin (the EOF rung of the stop ladder).
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        {
+            let conv = conv_id.to_string();
+            let mut stdin = stdin;
+            tokio::spawn(async move {
+                while let Some(line) = stdin_rx.recv().await {
+                    if stdin.write_all(line.as_bytes()).await.is_err()
+                        || stdin.write_all(b"\n").await.is_err()
+                        || stdin.flush().await.is_err()
+                    {
+                        warn!(conv = conv.as_str(), "claude stdin write failed");
+                        break;
+                    }
+                }
+                // stdin drops here → EOF to claude
+            });
+        }
 
         // stdout pump: complete lines only (an EOF-truncated tail is dropped —
-        // the replay-cursor contract counts newline-terminated lines).
+        // the replay-cursor contract counts newline-terminated lines). Signals
+        // StdoutClosed at EOF so the actor knows every line is in.
         {
             let tx = msg_tx.clone();
             tokio::spawn(async move {
@@ -341,6 +449,7 @@ impl SessionManager {
                         Err(_) => break,
                     }
                 }
+                let _ = tx.send(SessionMsg::StdoutClosed);
             });
         }
         // stderr pump: log through the daemon's own stderr (visible in journald
@@ -366,12 +475,13 @@ impl SessionManager {
 
         let actor = SessionActor {
             conv_id: conv_id.to_string(),
+            generation,
             manager: Arc::downgrade(self),
             epoch: uuid::Uuid::new_v4().to_string(),
             seq: 0,
             ring: VecDeque::new(),
             ring_bytes: 0,
-            stdin: Some(stdin),
+            stdin_tx: Some(stdin_tx),
             pid,
             exited: watch::channel(false),
             attached: None,
@@ -379,20 +489,24 @@ impl SessionManager {
             session_id: None,
             busy: false,
             running: true,
+            exit_code: None,
+            stdout_closed: false,
             last_assistant_text: None,
             control_seq: 0,
         };
         tokio::spawn(actor.run(msg_rx));
 
-        self.sessions
-            .lock()
-            .await
-            .insert(conv_id.to_string(), SessionEntry { msg_tx });
+        sessions.insert(conv_id.to_string(), SessionEntry { msg_tx, generation });
         Ok(())
     }
 
-    async fn forget(&self, conv_id: &str) {
-        self.sessions.lock().await.remove(conv_id);
+    /// Remove a conversation's entry — only if it still belongs to the exiting
+    /// actor's generation (a successor under the same id must survive).
+    async fn forget(&self, conv_id: &str, generation: u64) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(conv_id).map(|e| e.generation) == Some(generation) {
+            sessions.remove(conv_id);
+        }
     }
 
     fn emit(&self, ev: Event) {
@@ -422,8 +536,13 @@ fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec
     }
     if let Some(sid) = resume {
         if let Some(i) = args.iter().position(|a| a == "--resume") {
-            if args.get(i + 1).map(String::as_str) != Some(sid) {
-                args[i + 1] = sid.to_string();
+            match args.get_mut(i + 1) {
+                Some(v) => {
+                    if v != sid {
+                        *v = sid.to_string();
+                    }
+                }
+                None => args.push(sid.to_string()), // bare trailing --resume
             }
         } else {
             args.push("--resume".into());
@@ -438,20 +557,26 @@ fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec
 
 struct SessionActor {
     conv_id: String,
+    generation: u64,
     manager: std::sync::Weak<SessionManager>,
     epoch: String,
     /// Count of replayable lines emitted by this claude process so far.
     seq: u64,
     ring: VecDeque<(u64, String)>,
     ring_bytes: usize,
-    stdin: Option<ChildStdin>,
+    /// Queue into the claude-stdin writer task; `None` once closed (EOF sent).
+    stdin_tx: Option<mpsc::UnboundedSender<String>>,
     pid: Option<u32>,
     exited: (watch::Sender<bool>, watch::Receiver<bool>),
-    attached: Option<(u64, mpsc::UnboundedSender<String>)>,
+    attached: Option<(u64, ClientQueue)>,
     pending: HashMap<String, PendingPermission>,
     session_id: Option<String>,
     busy: bool,
     running: bool,
+    /// Exit finalization needs BOTH signals: the exit status and stdout EOF
+    /// (all lines delivered). Whichever lands second finishes the actor.
+    exit_code: Option<Option<i32>>,
+    stdout_closed: bool,
     last_assistant_text: Option<String>,
     control_seq: u64,
 }
@@ -460,10 +585,21 @@ impl SessionActor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                SessionMsg::FromClaude(line) => self.on_claude_line(line).await,
+                SessionMsg::FromClaude(line) => self.on_claude_line(line),
+                SessionMsg::StdoutClosed => {
+                    self.stdout_closed = true;
+                    if self.exit_code.is_some() {
+                        self.finish_exit();
+                        break;
+                    }
+                }
                 SessionMsg::ClaudeExited(code) => {
-                    self.on_exited(code);
-                    break;
+                    self.exit_code = Some(code);
+                    let _ = self.exited.0.send(true);
+                    if self.stdout_closed {
+                        self.finish_exit();
+                        break;
+                    }
                 }
                 SessionMsg::Attach(req) => self.on_attach(req),
                 SessionMsg::ClientGone(id) => {
@@ -475,7 +611,7 @@ impl SessionActor {
                 SessionMsg::ClientLine(line) => self.on_client_line(line).await,
                 SessionMsg::Send { text, ack } => {
                     let uuid = uuid::Uuid::new_v4().to_string();
-                    let res = self.write_claude(&frames::user_message(&text, &uuid)).await;
+                    let res = self.write_claude(&frames::user_message(&text, &uuid));
                     if res.is_ok() {
                         self.busy = true;
                         self.touch();
@@ -485,11 +621,11 @@ impl SessionActor {
                 SessionMsg::Interrupt { ack } => {
                     self.control_seq += 1;
                     let id = format!("fdd-{}", self.control_seq);
-                    let res = self.write_claude(&frames::interrupt_request(&id)).await;
+                    let res = self.write_claude(&frames::interrupt_request(&id));
                     let _ = ack.send(res.map_err(|e| e.to_string()));
                 }
                 SessionMsg::AnswerPermission { request_id, behavior, message, updated_input, ack } => {
-                    let res = self.answer_permission(&request_id, &behavior, message, updated_input).await;
+                    let res = self.answer_permission(&request_id, &behavior, message, updated_input);
                     let _ = ack.send(res.map_err(|e| e.to_string()));
                 }
                 SessionMsg::Status { reply } => {
@@ -502,20 +638,20 @@ impl SessionActor {
                     });
                 }
                 SessionMsg::Stop { ack } => {
-                    self.stop_claude().await;
+                    self.stop_claude();
                     let _ = ack.send(());
-                    // stay in the loop: ClaudeExited arrives and finishes us.
+                    // stay in the loop: StdoutClosed + ClaudeExited finish us.
                 }
             }
         }
         if let Some(m) = self.manager.upgrade() {
-            m.forget(&self.conv_id).await;
+            m.forget(&self.conv_id, self.generation).await;
         }
     }
 
     // -- claude → world ----------------------------------------------------
 
-    async fn on_claude_line(&mut self, line: String) {
+    fn on_claude_line(&mut self, line: String) {
         let probe = frames::probe(&line);
         let kind = probe.as_ref().and_then(|p| p.kind.clone()).unwrap_or_default();
 
@@ -634,7 +770,7 @@ impl SessionActor {
             "fd_stop" => {
                 info!(conv = self.conv_id.as_str(), "explicit stop from client");
                 self.detach_current("stopped", None);
-                self.stop_claude().await;
+                self.stop_claude();
             }
             "control_response" => {
                 if let Some(rid) = serde_json::from_str::<Value>(&line)
@@ -645,20 +781,20 @@ impl SessionActor {
                         self.emit_event("attention_cleared", None, json!({"reason": "answered", "request_id": rid}));
                     }
                 }
-                let _ = self.write_claude(&line).await;
+                let _ = self.write_claude(&line);
             }
             "user" => {
                 self.busy = true;
                 self.touch();
-                let _ = self.write_claude(&line).await;
+                let _ = self.write_claude(&line);
             }
             _ => {
-                let _ = self.write_claude(&line).await;
+                let _ = self.write_claude(&line);
             }
         }
     }
 
-    async fn answer_permission(
+    fn answer_permission(
         &mut self,
         request_id: &str,
         behavior: &str,
@@ -682,7 +818,7 @@ impl SessionActor {
                 message.as_deref().unwrap_or("Rejected."),
             )
         };
-        self.write_claude(&line).await?;
+        self.write_claude(&line)?;
         self.emit_event(
             "attention_cleared",
             None,
@@ -691,11 +827,11 @@ impl SessionActor {
         Ok(())
     }
 
-    async fn write_claude(&mut self, line: &str) -> Result<()> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("claude stdin is closed"))?;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
+    /// Queue one line for claude's stdin. Non-blocking: the writer task owns
+    /// the pipe, so a claude that stops draining can never wedge this actor.
+    fn write_claude(&mut self, line: &str) -> Result<()> {
+        let tx = self.stdin_tx.as_ref().ok_or_else(|| anyhow!("claude stdin is closed"))?;
+        tx.send(line.to_string()).map_err(|_| anyhow!("claude stdin is closed"))?;
         Ok(())
     }
 
@@ -715,36 +851,47 @@ impl SessionActor {
             Some((first_seq, _)) => from.max(first_seq.saturating_sub(1)),
             None => self.seq,
         };
-        let _ = req
-            .lines_tx
-            .send(frames::fd_attach(&self.conv_id, &self.epoch, effective_from, self.seq));
+        let pending_ids: Vec<&str> = self.pending.keys().map(String::as_str).collect();
+        if !req.queue.push(frames::fd_attach(
+            &self.conv_id,
+            &self.epoch,
+            effective_from,
+            self.seq,
+            self.busy && self.running,
+            &pending_ids,
+        )) {
+            return;
+        }
         for (s, line) in self.ring.iter() {
             if *s > effective_from {
-                if req.lines_tx.send(line.clone()).is_err() {
+                if !req.queue.push(line.clone()) {
                     return;
                 }
             }
         }
         // Outstanding permission prompts re-arrive after the replay.
         for perm in self.pending.values() {
-            let _ = req.lines_tx.send(perm.raw_line.clone());
+            let _ = req.queue.push(perm.raw_line.clone());
         }
         info!(
             conv = self.conv_id.as_str(),
             "client {} attached (replay from {} of {})", req.client_id, effective_from, self.seq
         );
-        self.attached = Some((req.client_id, req.lines_tx));
+        self.attached = Some((req.client_id, req.queue));
     }
 
     fn detach_current(&mut self, reason: &str, exit_code: Option<i32>) {
-        if let Some((_, tx)) = self.attached.take() {
-            let _ = tx.send(frames::fd_detach(reason, exit_code));
+        if let Some((_, q)) = self.attached.take() {
+            let _ = q.push(frames::fd_detach(reason, exit_code));
         }
     }
 
     fn forward(&mut self, line: &str) {
-        if let Some((_, tx)) = &self.attached {
-            if tx.send(line.to_string()).is_err() {
+        if let Some((_, q)) = &self.attached {
+            if !q.push(line.to_string()) {
+                // Gone, or stalled past the byte budget: drop it — the client
+                // reattaches from its cursor and the ring replays the gap.
+                warn!(conv = self.conv_id.as_str(), "attach client dropped (gone or stalled)");
                 self.attached = None;
             }
         }
@@ -765,12 +912,11 @@ impl SessionActor {
     // -- lifecycle ---------------------------------------------------------
 
     /// EOF → SIGTERM(group) → SIGKILL(group), checking for exit between rungs.
-    async fn stop_claude(&mut self) {
-        self.stdin = None; // EOF
+    fn stop_claude(&mut self) {
+        self.stdin_tx = None; // writer task drains, then stdin drops → EOF
         let Some(pid) = self.pid else { return };
         let mut exited = self.exited.1.clone();
-        let already = *exited.borrow();
-        if already {
+        if *exited.borrow() {
             return;
         }
         tokio::spawn(async move {
@@ -794,11 +940,12 @@ impl SessionActor {
         });
     }
 
-    fn on_exited(&mut self, code: Option<i32>) {
+    /// Both exit signals are in (status + stdout EOF): tell the world.
+    fn finish_exit(&mut self) {
+        let code = self.exit_code.flatten();
         info!(conv = self.conv_id.as_str(), code = ?code, "claude exited");
         self.running = false;
         self.busy = false;
-        let _ = self.exited.0.send(true);
         self.detach_current("exited", code);
         let pending: Vec<String> = self.pending.keys().cloned().collect();
         for rid in pending {
@@ -861,5 +1008,26 @@ mod tests {
         let client = vec!["--output-format".to_string(), "stream-json".to_string()];
         let a = ensure_args(client.clone(), None, &cfg);
         assert_eq!(a, client);
+        // a bare trailing --resume must not panic — the sid is appended
+        let client = vec!["--output-format".to_string(), "--resume".to_string()];
+        let a = ensure_args(client, Some("sid-2"), &cfg);
+        assert!(a.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-2"));
+    }
+
+    #[test]
+    fn client_queue_kills_stalled_clients() {
+        let (q, mut rx, _outstanding) = ClientQueue::new();
+        assert!(q.push("hello".into()));
+        assert_eq!(rx.try_recv().ok().as_deref(), Some("hello"));
+        // Nothing drains from now on: blow the byte budget → push refuses.
+        let big = "x".repeat(1024 * 1024);
+        let mut refused = false;
+        for _ in 0..200 {
+            if !q.push(big.clone()) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a stalled client must be refused once the budget is blown");
     }
 }
