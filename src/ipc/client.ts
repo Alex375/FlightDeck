@@ -27,6 +27,8 @@ export type {
   FileContent,
   FileStat,
   ForkOutcome,
+  GeneratedKey,
+  MachineRecord,
   FsChangeEvent,
   FsEntry,
   FsWatchErrorEvent,

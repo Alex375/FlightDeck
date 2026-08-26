@@ -1394,7 +1394,7 @@ export const mockCommands = {
     if (!demo) return ok({ repos: [], conversations: [], active_id: null });
     const now = Date.now();
     return ok({
-      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now }],
+      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
       conversations: [
         {
           id: "conv-demo",

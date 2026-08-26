@@ -10,13 +10,47 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+/// A remote host (a "server") reached over SSH, on which repos can live and their
+/// conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
+/// the connection coordinates so a user adds a server from the UI without editing any
+/// SSH config by hand. Deliberately holds NO secret — only a pointer to a key file on
+/// this Mac (`identity_file`), never the key material itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MachineRecord {
+    pub id: String,
+    /// Human label shown in the UI (e.g. "my-vps").
+    pub label: String,
+    /// Hostname or IP reachable from this Mac.
+    pub host: String,
+    /// SSH port (usually 22).
+    pub port: u16,
+    /// SSH user to log in as.
+    pub user: String,
+    /// Absolute path to the PRIVATE key file (on this Mac) Flight Deck authenticates
+    /// with — typically the dedicated key it generated for this server. `None` falls
+    /// back to the user's default SSH keys / agent.
+    pub identity_file: Option<String>,
+    /// Unix ms timestamp the server was added.
+    pub added_at: i64,
+}
+
 /// A working folder a conversation can be opened in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct RepoRecord {
     pub id: String,
+    /// Absolute path of the folder. For a remote repo (`machine_id` set) this is the
+    /// path ON THAT SERVER.
     pub path: String,
     /// Unix ms timestamp the repo was first added.
     pub added_at: i64,
+    /// When set, this repo lives on a REMOTE server (FK to [`MachineRecord::id`]): its
+    /// conversations spawn `claude` on that machine over SSH, and `path` is a path on
+    /// it. `None` (every pre-existing row and every local folder) is the unchanged
+    /// local case — the whole app treats a NULL `machine_id` exactly as before. See
+    /// the SSH transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an
+    /// existing non-null value when a caller passes `None`, so a rename/undo can never
+    /// blank a repo's remoteness.
+    pub machine_id: Option<String>,
 }
 
 /// A repo together with the TOSSE repository the user pinned it to, if any.
@@ -134,6 +168,10 @@ pub struct ConversationRecord {
 /// The full persisted snapshot the UI hydrates from at boot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct PersistedState {
+    /// Remote servers the user has paired, so the UI can list them and mark which
+    /// repos are remote at boot.
+    #[serde(default)]
+    pub machines: Vec<MachineRecord>,
     pub repos: Vec<RepoRecord>,
     pub conversations: Vec<ConversationRecord>,
     /// Stable id of the conversation that was active when last persisted.
