@@ -66,25 +66,37 @@ const main = async () => {
   const c1 = await connect();
   const created = await c1.call("create_conversation", {
     repo_path: REPO,
-    first_message: "Run: sleep 8 && echo PHONE_CUT_SURVIVED. Then reply with exactly the single word DONE_PHONE.",
+    first_message:
+      "Run this bash command in the FOREGROUND and wait for it to finish (do NOT background it): sleep 8 && echo OK. Then reply with exactly the single word DONE_PHONE.",
   });
   console.log("   created:", created.conversation_id);
 
   console.log("== 2: CUT — phone loses network mid-turn");
   c1.ws.terminate(); // no clean close: simulates a dropped network
 
-  await sleep(16000); // the turn finishes while the phone is offline
+  await sleep(12000); // the turn keeps running while the phone is offline
 
-  console.log("== 3: phone reconnects, reads the conversation");
+  console.log("== 3: phone reconnects, polls the conversation (like the real PWA)");
   const c2 = await connect();
   const list = await c2.call("list_conversations");
   const mine = (list || []).find((c) => c.conversation_id === created.conversation_id);
   if (!mine) throw new Error("conversation missing after reconnect");
-  console.log(`   status after cut: ${mine.status?.kind}`);
-  const read = await c2.call("read_conversation", { conversation_id: created.conversation_id, max_turns: 40 });
-  const text = (read.turns || []).map((t) => `${t.role}: ${t.text}`).join("\n");
+  console.log(`   status after cut: ${mine.status?.kind} (alive either way — the cut didn't kill it)`);
+  // Poll until the turn settles — assert on ASSISTANT turns only (the user
+  // turn contains the sentinel word too).
+  const deadline = Date.now() + 90_000;
+  let assistantText = "";
+  let lastRead = null;
+  while (Date.now() < deadline) {
+    lastRead = await c2.call("read_conversation", { conversation_id: created.conversation_id, max_turns: 40 });
+    assistantText = (lastRead.turns || []).filter((t) => t.role === "assistant").map((t) => t.text).join("\n");
+    if (/DONE_PHONE/.test(assistantText)) break;
+    await sleep(2500);
+  }
+  const text = ((lastRead && lastRead.turns) || []).map((t) => `${t.role}: ${t.text}`).join("\n");
   console.log("   turns:\n" + text.split("\n").map((l) => "     " + l).join("\n"));
-  if (!/DONE_PHONE/.test(text)) throw new Error("assistant reply missing — turn did not survive the phone cut");
+  if (!/DONE_PHONE/.test(assistantText))
+    throw new Error("assistant reply missing — turn did not survive the phone cut");
 
   console.log("== 4: ping sanity");
   const pong = await c2.call("ping");

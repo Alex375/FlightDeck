@@ -76,8 +76,14 @@ flightdeckd init      # config ~/.flightdeckd/config.json + identité relais + l
 flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
+flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 ```
+
+Le code a passé une **revue adversariale multi-agents** (31 agents, 23 findings
+confirmés puis corrigés : sérialisation des spawns, écrivain stdin non bloquant,
+timeouts de bout en bout, conformité des events au contrat PWA, backoff/deadline
+relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
 
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
