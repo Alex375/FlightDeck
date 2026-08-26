@@ -18,6 +18,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,13 +80,29 @@ pub struct SpawnConfig {
     /// the bypass ON outright, which is never what this flag is for. Off unless the
     /// user opted in via Settings → General → Permissions.
     pub allow_bypass_permissions: bool,
-    /// When set, this session's `claude` runs on a REMOTE host over SSH instead of
-    /// locally — the "machine boundary" alpha (SSH-first). The stream-json protocol,
-    /// the [`CliMessage`] stream and every layer above the transport are identical;
-    /// only the launch moves: `cwd`, the env and the binary all apply on the remote
-    /// side (see [`Transport::spawn`]). `None` (the default) is the unchanged local
-    /// path. Codex ignores this — remote is Claude-only for now.
+    /// When set, this session runs on a REMOTE host: ssh executes `flightdeckd
+    /// attach`, and the DAEMON on the server owns the actual `claude` process —
+    /// detached from this connection, so a network cut never kills the session.
+    /// The stream-json protocol, the [`CliMessage`] stream and every layer above
+    /// the transport are identical; the daemon replays what was missed on
+    /// reattach (see [`SpawnConfig::attach`]). `None` (the default) is the
+    /// unchanged local path. Codex ignores this — remote is Claude-only for now.
     pub remote: Option<RemoteTarget>,
+    /// Reattach coordinates for a REMOTE session (ignored locally). `None` on
+    /// the first spawn; the session actor fills it from the daemon's
+    /// `fd_attach` handshake to reconnect after a drop without losing stream.
+    pub attach: Option<AttachPoint>,
+}
+
+/// Where to resume a remote attach stream: the daemon-side conversation, the
+/// claude-process epoch, and how many replayable lines this client has already
+/// received in that epoch (the cursor). See flightdeckd `frames.rs` — the
+/// replay-eligibility predicate ([`is_replayable_line`]) is a shared contract.
+#[derive(Debug, Clone, Default)]
+pub struct AttachPoint {
+    pub conversation: Option<String>,
+    pub epoch: Option<String>,
+    pub cursor: u64,
 }
 
 /// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
@@ -106,9 +123,10 @@ pub struct RemoteTarget {
     /// A dedicated `known_hosts` file (`UserKnownHostsFile`), so pinning a server's
     /// host key never touches the user's `~/.ssh/known_hosts`. `None` uses the default.
     pub known_hosts_file: Option<String>,
-    /// The `claude` binary name/path ON THE REMOTE host (resolved on the remote
-    /// PATH). Defaults to `"claude"`.
-    pub remote_bin: String,
+    /// The `flightdeckd` binary name/path ON THE REMOTE host (resolved on the
+    /// remote PATH). Defaults to `"flightdeckd"`. The daemon resolves `claude`
+    /// itself, server-side.
+    pub daemon_bin: String,
 }
 
 impl SpawnConfig {
@@ -127,6 +145,7 @@ impl SpawnConfig {
             permission_mode: None,
             allow_bypass_permissions: false,
             remote: None,
+            attach: None,
         }
     }
 }
@@ -200,31 +219,57 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
     a
 }
 
-/// Build the single POSIX-sh command `ssh` runs on the remote host. Mirrors the
-/// local launch: it exports the same env the local spawn sets, `cd`s into the
-/// remote `cwd`, then `exec`s the remote `claude` with the identical stream-json
-/// argv — so `claude` replaces the shell and receives stdin-EOF / signals directly
-/// (the graceful teardown path). Every interpolated value is single-quote-escaped,
-/// so remote paths/args with spaces or shell metacharacters are safe.
+/// Build the single POSIX-sh command `ssh` runs on the remote host: `exec
+/// flightdeckd attach …`. The DAEMON owns the `claude` process server-side
+/// (spawning it with the argv passed after `--` if it isn't already running,
+/// env included) and bridges this ssh channel to it — replaying everything the
+/// client missed since [`AttachPoint::cursor`]. Every interpolated value is
+/// single-quote-escaped, so remote paths/args with spaces or metacharacters are
+/// safe.
 fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String]) -> String {
-    let mut s = String::new();
-    // Same env the local branch sets via `.env(...)`, exported into the remote
-    // command's environment (setting it on the local ssh client would be useless).
-    s.push_str("export CLAUDE_CODE_ENTRYPOINT=tosse-code; ");
-    s.push_str("export MCP_CONNECTION_NONBLOCKING=true; ");
-    s.push_str("export CLAUDE_CODE_ENABLE_TASKS=0; ");
-    s.push_str("export CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1; ");
-    s.push_str("unset NODE_OPTIONS; ");
-    s.push_str(&format!(
-        "cd {} && exec {}",
-        shell_quote(&cfg.cwd.to_string_lossy()),
-        shell_quote(&remote.remote_bin),
-    ));
+    let attach = cfg.attach.clone().unwrap_or_default();
+    let mut s = format!("exec {} attach", shell_quote(&remote.daemon_bin));
+    s.push_str(&format!(" --cwd {}", shell_quote(&cfg.cwd.to_string_lossy())));
+    if let Some(resume) = &cfg.resume {
+        s.push_str(&format!(" --resume-session {}", shell_quote(resume)));
+    }
+    if let Some(conv) = &attach.conversation {
+        s.push_str(&format!(" --conversation {}", shell_quote(conv)));
+    }
+    if let Some(epoch) = &attach.epoch {
+        s.push_str(&format!(" --epoch {}", shell_quote(epoch)));
+    }
+    s.push_str(&format!(" --cursor {}", attach.cursor));
+    s.push_str(" --");
     for arg in args {
         s.push(' ');
         s.push_str(&shell_quote(arg));
     }
     s
+}
+
+/// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
+/// line-for-line with flightdeckd (`frames::is_replayable_line`): a line counts
+/// iff it parses as a JSON object whose `type` is a string outside the control
+/// plane (`control_request` / `control_response` / `control_cancel_request` /
+/// `keep_alive`, which are correlation-scoped to one client and never
+/// replayed) and not a daemon `fd_*` frame. Both sides count the same lines or
+/// reattach cursors would drift.
+fn is_replayable_line(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    match serde_json::from_str::<Probe>(line) {
+        Ok(Probe { kind: Some(k) }) => {
+            !matches!(
+                k.as_str(),
+                "control_response" | "control_request" | "control_cancel_request" | "keep_alive"
+            ) && !k.starts_with("fd_")
+        }
+        _ => false,
+    }
 }
 
 /// POSIX single-quote escaping: wrap in single quotes and rewrite each embedded
@@ -425,6 +470,12 @@ pub struct Transport {
     reader_err: ErrSlot,
     /// Set if the stdin writer died on a write/flush/serialize failure.
     writer_err: ErrSlot,
+    /// Count of REPLAYABLE stdout lines received (see [`is_replayable_line`]) —
+    /// the reattach cursor for remote sessions. Always 0-based per transport.
+    lines_seen: Arc<AtomicU64>,
+    /// Whether this transport is an ssh→flightdeckd attach stream (drives the
+    /// `fd_stop` escalation in [`Transport::shutdown`]).
+    is_remote: bool,
 }
 
 impl Transport {
@@ -521,9 +572,10 @@ impl Transport {
         let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX)));
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         let pumps = vec![
-            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone())),
+            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone(), lines_seen.clone())),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
         ];
@@ -537,9 +589,18 @@ impl Transport {
                 stderr_tail,
                 reader_err,
                 writer_err,
+                lines_seen,
+                is_remote: cfg.remote.is_some(),
             },
             msg_rx,
         ))
+    }
+
+    /// How many replayable stream lines this transport has delivered — the
+    /// reattach cursor contribution of the CURRENT connection (the actor adds
+    /// the daemon's `replay_from` base).
+    pub fn lines_seen(&self) -> u64 {
+        self.lines_seen.load(Ordering::Relaxed)
     }
 
     /// OS process id, while the child is alive.
@@ -616,7 +677,18 @@ impl Transport {
     ///
     /// `kill_on_drop` remains the backstop if this is never called. On non-Unix
     /// the signal steps degrade to `tokio`'s force-kill (`SIGKILL`-equivalent).
-    pub async fn shutdown(&mut self) {
+    ///
+    /// `stop_remote` (remote transports only): send `fd_stop` first, telling the
+    /// DAEMON to kill the server-side `claude` too. Without it, closing an
+    /// attach stream merely DETACHES — the session keeps running on the server
+    /// (that's the point: app quit / handle drop must not kill remote work; only
+    /// the user's explicit Stop does).
+    pub async fn shutdown(&mut self, stop_remote: bool) {
+        if stop_remote && self.is_remote {
+            if let Some(tx) = &self.writer_tx {
+                let _ = tx.send(serde_json::json!({ "type": "fd_stop" }));
+            }
+        }
         // Step 1 — graceful EOF: drop the writer sender → writer_loop ends → stdin
         // is dropped → the child sees EOF and normally exits once the turn settles.
         self.writer_tx = None;
@@ -682,6 +754,7 @@ async fn reader_loop(
     stdout: ChildStdout,
     tx: mpsc::UnboundedSender<CliMessage>,
     reader_err: ErrSlot,
+    lines_seen: Arc<AtomicU64>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -690,6 +763,9 @@ async fn reader_loop(
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
+                }
+                if is_replayable_line(trimmed) {
+                    lines_seen.fetch_add(1, Ordering::Relaxed);
                 }
                 match serde_json::from_str::<CliMessage>(trimmed) {
                     Ok(msg) => {
@@ -841,27 +917,60 @@ mod tests {
         assert_eq!(a[model_at + 1], "claude-opus-4-8");
     }
 
-    /// The remote command mirrors the local launch: same env exports, a `cd` into the
-    /// remote cwd, then `exec claude <same argv>`, everything shell-quoted.
+    /// The remote command hands the session to the server's daemon: `exec
+    /// flightdeckd attach` with the reattach coordinates, then the claude argv
+    /// after `--` (the daemon spawns claude with it when the session is cold).
+    /// Everything shell-quoted.
     #[test]
-    fn build_remote_command_cds_execs_and_quotes() {
+    fn build_remote_command_execs_flightdeckd_attach() {
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-opus-4-8".into());
+        cfg.resume = Some("sid-123".into());
         let remote = RemoteTarget {
             host: "127.0.0.1".into(),
             port: 2222,
             user: "agent".into(),
             identity_file: None,
             known_hosts_file: None,
-            remote_bin: "claude".into(),
+            daemon_bin: "flightdeckd".into(),
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
-        assert!(cmd.contains("cd '/work/demo' && exec 'claude'"), "cmd was: {cmd}");
-        assert!(cmd.contains("export CLAUDE_CODE_ENTRYPOINT=tosse-code"));
-        assert!(cmd.contains("export CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1"));
-        assert!(cmd.contains("unset NODE_OPTIONS"));
+        assert!(cmd.starts_with("exec 'flightdeckd' attach"), "cmd was: {cmd}");
+        assert!(cmd.contains("--cwd '/work/demo'"));
+        assert!(cmd.contains("--resume-session 'sid-123'"));
+        assert!(cmd.contains("--cursor 0"));
+        assert!(cmd.contains(" -- "));
         assert!(cmd.contains("'--output-format' 'stream-json'"));
         assert!(cmd.contains("'--model' 'claude-opus-4-8'"));
+
+        // A reconnect carries the daemon conversation, epoch and cursor.
+        cfg.attach = Some(AttachPoint {
+            conversation: Some("conv-1".into()),
+            epoch: Some("ep-1".into()),
+            cursor: 42,
+        });
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
+        assert!(cmd.contains("--epoch 'ep-1'"));
+        assert!(cmd.contains("--cursor 42"));
+    }
+
+    /// The replay-cursor predicate — MUST mirror flightdeckd frames.rs
+    /// `is_replayable_line` line-for-line (shared contract; drift = cursor bugs).
+    #[test]
+    fn replayable_line_predicate_matches_daemon_contract() {
+        assert!(is_replayable_line(r#"{"type":"assistant","message":{}}"#));
+        assert!(is_replayable_line(r#"{"type":"system","subtype":"init"}"#));
+        assert!(is_replayable_line(r#"{"type":"stream_event","event":{}}"#));
+        assert!(is_replayable_line(r#"{"type":"result","subtype":"success"}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_response","response":{}}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_request","request":{}}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_cancel_request"}"#));
+        assert!(!is_replayable_line(r#"{"type":"keep_alive"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_attach"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_detach"}"#));
+        assert!(!is_replayable_line("not json"));
+        assert!(!is_replayable_line(r#"{"no_type":true}"#));
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real
@@ -979,7 +1088,7 @@ mod tests {
             .expect("grandchild pid should be recorded");
         assert!(is_alive(grandchild), "grandchild should run before shutdown");
 
-        transport.shutdown().await;
+        transport.shutdown(false).await;
 
         assert!(
             wait_until_dead(grandchild).await,
@@ -1070,7 +1179,7 @@ mod tests {
             .await
             .expect("turn should complete within the deadline");
 
-        transport.shutdown().await;
+        transport.shutdown(false).await;
 
         assert!(saw_init, "expected a system/init message");
         assert!(saw_assistant_text, "expected the assistant to stream 'hello world'");
@@ -1079,34 +1188,40 @@ mod tests {
 
     /// Live end-to-end REMOTE transport check: the exact app code path for a remote
     /// conversation — `SpawnConfig.remote` → `Transport::spawn` launches `ssh` →
-    /// remote `claude` streams back → we parse the same `CliMessage`s. Proves the SSH
-    /// branch (argv build, quoting, cd, exec) streams a real turn, not just a local one.
+    /// `flightdeckd attach` on the server → the DAEMON-owned `claude` streams back →
+    /// we parse the same `CliMessage`s. Proves the attach handshake (`fd_attach`),
+    /// the streamed turn, AND the detach/reattach replay: after the turn we drop the
+    /// transport (detach — the session survives server-side), reattach with the
+    /// cursor, and expect NO duplicated stream (replay resumes exactly).
     ///
-    /// Ignored by default: needs the `flightdeck-m0` container up with fresh creds AND
-    /// `TOSSE_SSH_CONFIG` pointing at its ssh_config (the alias). Run with:
-    ///   TOSSE_SSH_CONFIG=.../m0-ssh-remote/.secrets/ssh_config \
+    /// Ignored by default: needs the `flightdeck-m1` container up with fresh creds
+    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored remote_transport_streams_over_ssh --nocapture
     #[tokio::test]
-    #[ignore = "spawns real ssh + remote claude (needs the flightdeck-m0 container + TOSSE_SSH_CONFIG)"]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
     async fn remote_transport_streams_over_ssh() {
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(
+                std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+                    format!(
+                        "{}/.ssh/flightdeck_m0_ed25519",
+                        std::env::var("HOME").unwrap_or_default()
+                    )
+                }),
+            ),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+        };
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-haiku-4-5-20251001".into());
         cfg.permission_mode = Some("auto".into());
-        cfg.remote = Some(RemoteTarget {
-            host: "127.0.0.1".into(),
-            port: 2222,
-            user: "agent".into(),
-            identity_file: Some(
-                "/Users/armand_mounsi/Documents/repositories/flightdeck-server/\
-                 m0-ssh-remote/.secrets/id_ed25519"
-                    .into(),
-            ),
-            known_hosts_file: Some("/dev/null".into()),
-            remote_bin: "claude".into(),
-        });
+        cfg.remote = Some(remote);
 
         let (mut transport, mut rx) =
-            Transport::spawn(cfg).expect("remote (ssh) spawn should start");
+            Transport::spawn(cfg.clone()).expect("remote (ssh) spawn should start");
         transport
             .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
             .expect("send should queue");
@@ -1114,12 +1229,14 @@ mod tests {
         let mut saw_init = false;
         let mut saw_assistant_text = false;
         let mut result_ok: Option<bool> = None;
+        let mut attach: Option<crate::supervisor::protocol::FdAttachMsg> = None;
 
         // Remote adds an SSH round-trip; give it comfortable headroom.
         let deadline = Duration::from_secs(120);
         let drain = async {
             while let Some(msg) = rx.recv().await {
                 match &msg {
+                    CliMessage::FdAttach(a) => attach = Some(a.clone()),
                     CliMessage::System(crate::supervisor::protocol::SystemMsg::Init(_)) => {
                         saw_init = true;
                     }
@@ -1145,7 +1262,39 @@ mod tests {
             .await
             .expect("remote turn should complete within the deadline");
 
-        transport.shutdown().await;
+        let attach = attach.expect("expected the daemon's fd_attach handshake");
+        let cursor = attach.replay_from + transport.lines_seen();
+
+        // DETACH without stopping (the app-quit path): the session must survive.
+        transport.shutdown(false).await;
+
+        // REATTACH with the cursor: the daemon must accept and NOT re-stream the
+        // finished turn (no line with a seq we already counted).
+        let mut cfg2 = cfg.clone();
+        cfg2.attach = Some(AttachPoint {
+            conversation: Some(attach.conversation.clone()),
+            epoch: Some(attach.epoch.clone()),
+            cursor,
+        });
+        let (mut transport2, mut rx2) =
+            Transport::spawn(cfg2).expect("reattach spawn should start");
+        let reattach = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(msg) = rx2.recv().await {
+                if let CliMessage::FdAttach(a) = msg {
+                    return Some(a);
+                }
+            }
+            None
+        })
+        .await
+        .expect("reattach should answer quickly")
+        .expect("expected fd_attach on reattach");
+        assert_eq!(reattach.epoch, attach.epoch, "same claude process across the detach");
+        assert_eq!(
+            reattach.replay_from, cursor,
+            "replay must resume exactly at our cursor (no duplicates, no gaps)"
+        );
+        transport2.shutdown(false).await;
 
         assert!(saw_init, "expected a system/init message from the remote claude");
         assert!(saw_assistant_text, "expected the remote assistant to stream 'hello world'");

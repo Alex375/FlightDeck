@@ -123,7 +123,15 @@ pub enum SessionCommand {
     /// caller can wait for the `claude` process to ACTUALLY be gone — required before any
     /// operation that mutates the on-disk transcript (a rewind), which must NOT race a
     /// still-alive writer. `None` = fire-and-forget (the quit path polls `is_empty`).
-    Shutdown { ack: Option<oneshot::Sender<()>> },
+    ///
+    /// `stop_remote`: for a REMOTE session, also stop the server-side `claude`
+    /// (`fd_stop` to the daemon). `false` merely detaches — the session keeps
+    /// running on the server (app quit must never kill remote work; only the
+    /// user's explicit Stop passes `true`). Ignored for local sessions.
+    Shutdown {
+        ack: Option<oneshot::Sender<()>>,
+        stop_remote: bool,
+    },
 }
 
 /// The controls a session starts with, threaded from the spawn config so the core
@@ -460,18 +468,32 @@ impl SessionHandle {
     }
 
     /// Request teardown WITHOUT waiting for the process to be reaped (the quit path uses
-    /// this and then polls [`Sessions::is_empty`]).
+    /// this and then polls [`Sessions::is_empty`]). For a REMOTE session this only
+    /// DETACHES — the server-side `claude` keeps running (quitting the app must never
+    /// kill remote work); the explicit-stop path is [`Self::shutdown_and_wait_stopping`].
     pub async fn shutdown(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::Shutdown { ack: None }).await
+        self.send(SessionCommand::Shutdown { ack: None, stop_remote: false }).await
     }
 
     /// Request teardown AND wait until the `claude` process is actually gone (the actor
     /// fires the ack after `transport.shutdown()` completes). Bounded so a wedged teardown
     /// can't hang the caller. This is the stop a REWIND must use before truncating the
     /// transcript — otherwise the still-alive process can re-write the file after the cut.
+    /// Remote sessions: detaches only (see [`Self::shutdown`]).
     pub async fn shutdown_and_wait(&self) -> Result<(), SessionError> {
+        self.shutdown_and_wait_inner(false).await
+    }
+
+    /// The USER's explicit Stop: like [`Self::shutdown_and_wait`], but a remote
+    /// session's server-side `claude` is stopped too (`fd_stop` to the daemon)
+    /// instead of merely detached.
+    pub async fn shutdown_and_wait_stopping(&self) -> Result<(), SessionError> {
+        self.shutdown_and_wait_inner(true).await
+    }
+
+    async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<(), SessionError> {
         let (tx, rx) = oneshot::channel();
-        self.send(SessionCommand::Shutdown { ack: Some(tx) }).await?;
+        self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
         // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(8), rx).await;
         Ok(())
@@ -502,39 +524,129 @@ pub fn spawn_session(
     on_exit: Box<dyn FnOnce() + Send + 'static>,
     appmcp: Option<Arc<crate::appmcp::ControlHub>>,
 ) -> Result<SessionHandle, SessionError> {
-    let (transport, msg_rx) = Transport::spawn(cfg).map_err(SessionError::Spawn)?;
+    let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
     let core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit));
+    tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit, cfg));
     Ok(SessionHandle { id, cmd_tx })
 }
 
 /// The actor loop: drive [`SessionCore`] from the transport stream and the
 /// command channel, then tear the process down and announce the exit.
+///
+/// REMOTE sessions get one extra behavior: the server-side daemon owns the
+/// actual `claude` process, so when the ssh transport drops WITHOUT the daemon
+/// saying goodbye (`fd_detach`), the session is still alive server-side — the
+/// actor re-spawns the transport with the reattach cursor (daemon `fd_attach`
+/// base + replayable lines seen on this connection) and the daemon replays what
+/// was missed. The same core/assembler keeps running: a network cut mid-turn
+/// heals without losing stream. Backoff 1s → ×2 → 30s, forever, interruptible
+/// by Shutdown.
 async fn run_actor(
     mut core: SessionCore,
     mut transport: Transport,
     mut msg_rx: mpsc::UnboundedReceiver<CliMessage>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     on_exit: Box<dyn FnOnce() + Send + 'static>,
+    cfg: SpawnConfig,
 ) {
     core.initialize();
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let mut stop_remote = false;
+    // Remote reattach state, learned from the daemon's fd_attach handshake.
+    let mut attach = cfg.attach.clone().unwrap_or_default();
+    let mut attach_base: u64 = attach.cursor;
+    // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
+    // exited / error) — auto-reconnect must not fight that.
+    let mut no_reconnect: Option<String> = None;
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
-    let process_gone = loop {
-        tokio::select! {
-            maybe_msg = msg_rx.recv() => match maybe_msg {
-                Some(msg) => core.on_message(msg),
-                None => break true, // transport closed: the process exited on its own
-            },
-            maybe_cmd = cmd_rx.recv() => match maybe_cmd {
-                Some(SessionCommand::Shutdown { ack }) => { shutdown_ack = ack; break false; }
-                None => break false, // command channel closed: requested stop
-                Some(cmd) => core.on_command(cmd),
-            },
+    let process_gone = 'outer: loop {
+        // Drive the CURRENT transport until it closes or a Shutdown lands.
+        loop {
+            tokio::select! {
+                maybe_msg = msg_rx.recv() => match maybe_msg {
+                    Some(CliMessage::FdAttach(a)) => {
+                        attach.conversation = Some(a.conversation);
+                        attach.epoch = Some(a.epoch);
+                        attach_base = a.replay_from;
+                    }
+                    Some(CliMessage::FdDetach(d)) => {
+                        if d.reason == "error" {
+                            core.emit_error_notice("error", json!({
+                                "message": d.message.clone().unwrap_or_else(|| "remote attach failed".to_string()),
+                            }));
+                        }
+                        no_reconnect = Some(d.reason);
+                    }
+                    Some(msg) => core.on_message(msg),
+                    None => break, // transport closed
+                },
+                maybe_cmd = cmd_rx.recv() => match maybe_cmd {
+                    Some(SessionCommand::Shutdown { ack, stop_remote: sr }) => {
+                        shutdown_ack = ack;
+                        stop_remote = sr;
+                        break 'outer false;
+                    }
+                    None => break 'outer false, // command channel closed: requested stop
+                    Some(cmd) => core.on_command(cmd),
+                },
+            }
+        }
+        // The transport closed on its own. Local session, or a deliberate remote
+        // goodbye → the normal end-of-life path.
+        if cfg.remote.is_none() || no_reconnect.is_some() {
+            break 'outer true;
+        }
+        // Remote link lost while the server-side session lives on: reconnect.
+        let cursor = attach_base + transport.lines_seen();
+        transport.shutdown(false).await; // reap the dead ssh client quietly
+        core.emit_error_notice("remote_link", json!({
+            "message": "Connection to the server lost — reconnecting…",
+        }));
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            // Wait out the backoff, staying responsive to commands (a send while
+            // offline surfaces as send_failed instead of blocking).
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                maybe_cmd = cmd_rx.recv() => match maybe_cmd {
+                    Some(SessionCommand::Shutdown { ack, stop_remote: sr }) => {
+                        shutdown_ack = ack;
+                        stop_remote = sr;
+                        break 'outer false;
+                    }
+                    None => break 'outer false,
+                    Some(cmd) => { core.on_command(cmd); continue; }
+                },
+            }
+            let mut cfg2 = cfg.clone();
+            // Resume by the LIVE claude session id when we know it (a brand-new
+            // session learned it from init after spawn), so a daemon that lost
+            // the process can restart it from the right transcript.
+            cfg2.resume = core.session_id().or_else(|| cfg.resume.clone());
+            cfg2.attach = Some(transport::AttachPoint {
+                conversation: attach.conversation.clone(),
+                epoch: attach.epoch.clone(),
+                cursor,
+            });
+            match Transport::spawn(cfg2) {
+                Ok((t, rx)) => {
+                    transport = t;
+                    msg_rx = rx;
+                    core.set_outbound(transport.outbound());
+                    core.emit_error_notice("remote_link", json!({
+                        "message": "Reconnected to the server.",
+                    }));
+                    continue 'outer;
+                }
+                Err(e) => {
+                    eprintln!("[session] remote reconnect failed (retrying in {delay:?}): {e}");
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
         }
     };
     // The process vanished without us asking: surface why (exit code + last stderr)
@@ -553,7 +665,7 @@ async fn run_actor(
     // Drop the core (and its outbound sender clone) so the writer's channel can
     // close and stdin can EOF, then run the graceful teardown ladder.
     drop(core);
-    transport.shutdown().await;
+    transport.shutdown(stop_remote).await;
     // Let the owner (e.g. the IPC registry) evict this dead session.
     on_exit();
     // The process is now fully reaped: release any caller waiting on `shutdown_and_wait`
@@ -646,6 +758,18 @@ impl SessionCore {
             outbound,
             appmcp,
         }
+    }
+
+    /// Swap the outbound line sender for a NEW transport's writer — the remote
+    /// reconnect path. The core's state (assembler, pendings) carries over; only
+    /// the pipe changes.
+    fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
+        self.outbound = tx;
+    }
+
+    /// The claude session id the assembler learned from `system/init`, if any.
+    fn session_id(&self) -> Option<String> {
+        self.assembler.state().session_id.clone()
     }
 
     /// Queue an outbound line. Returns `false` if the writer channel is closed (the
@@ -2649,5 +2773,103 @@ mod tests {
             .expect("output file should be readable via the absolute path");
         eprintln!("[live] read_task_output_file {output_file}:\n{out}");
         assert!(out.contains("tosse-bg-done"), "output file should hold the echo");
+    }
+
+    /// Live M1 acceptance check, Mac side: "piloting a remote session from the
+    /// Mac must survive a network cut". Full actor path: spawn a real remote
+    /// session (ssh → flightdeckd → daemon-owned claude), start a slow tool
+    /// turn, SIGKILL the ssh client mid-turn (the network cut), and assert the
+    /// ACTOR reconnects by itself and the turn's result still arrives (the
+    /// daemon kept the session alive and replayed what we missed).
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored actor_survives_ssh_cut --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
+    async fn actor_survives_ssh_cut_and_replays() {
+        use std::time::Duration;
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(format!(
+                "{}/.ssh/flightdeck_m0_ed25519",
+                std::env::var("HOME").unwrap_or_default()
+            )),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "live-cut".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("remote spawn should start");
+
+        handle
+            .send_user_text(
+                "Run: sleep 8 && echo CUT_SURVIVED. Then reply with exactly the single word DONE_ACTOR.",
+            )
+            .await
+            .expect("send should queue");
+
+        // Wait for evidence the turn is really streaming, then cut the link.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::MessageStarted { .. })
+                    | SessionEvent::Item(ConversationItem::TextDelta { .. }) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn should start streaming");
+
+        // The "network cut": kill the ssh client (the attach channel) hard.
+        let killed = std::process::Command::new("pkill")
+            .args(["-9", "-f", "2224.*flightdeckd.*attach"])
+            .status()
+            .expect("pkill should run");
+        assert!(killed.success(), "expected to kill the live ssh attach client");
+
+        // The actor must reconnect on its own and the turn must complete.
+        let mut reconnected = false;
+        let mut result: Option<bool> = None;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { ref subtype, ref detail })
+                        if subtype == "remote_link" =>
+                    {
+                        eprintln!("[live] remote_link: {detail}");
+                        if detail.to_string().contains("Reconnected") {
+                            reconnected = true;
+                        }
+                    }
+                    SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) => {
+                        result = Some(!is_error);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the cut turn should still complete after auto-reconnect");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        assert!(reconnected, "expected a 'Reconnected to the server.' notice");
+        assert_eq!(result, Some(true), "the interrupted turn's result should arrive via replay");
     }
 }
