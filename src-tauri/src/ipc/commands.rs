@@ -209,6 +209,17 @@ pub async fn spawn_session(
             daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
                 .unwrap_or_else(|_| "flightdeckd".to_string()),
         });
+        // Pre-mint the daemon-side conversation id so retries are idempotent: if
+        // the FIRST attach dies before its fd_attach handshake lands, the
+        // reconnect presents the same id and re-joins the same daemon
+        // conversation instead of cold-starting a duplicate (and leaking a
+        // claude process server-side). The daemon prefers a LIVE session
+        // matching `resume` over this id, so resumes still re-join correctly.
+        cfg.attach = Some(crate::supervisor::transport::AttachPoint {
+            conversation: Some(uuid::Uuid::new_v4().to_string()),
+            epoch: None,
+            cursor: 0,
+        });
     }
     let initial = InitialControls {
         model: cfg.model.clone(),

@@ -557,7 +557,20 @@ async fn run_actor(
     let mut stop_remote = false;
     // Remote reattach state, learned from the daemon's fd_attach handshake.
     let mut attach = cfg.attach.clone().unwrap_or_default();
+    // The replay position: `attach_base` (the daemon's replay_from) plus the
+    // replayable lines counted on the transport that RECEIVED that fd_attach.
+    // `cursor` is only advanced when a transport actually got its handshake —
+    // a reconnect attempt that dies before fd_attach must not roll it back.
     let mut attach_base: u64 = attach.cursor;
+    let mut cursor: u64 = attach.cursor;
+    let mut attach_seen = false;
+    // True from link-loss until the next fd_attach: gates the one "lost" notice
+    // per outage, the "Reconnected" notice, and the backoff escalation.
+    let mut reconnect_pending = false;
+    // Backoff across the WHOLE outage: ssh spawning is not success (it forks
+    // even when the server is unreachable) — only a received fd_attach is, and
+    // only that resets the delay.
+    let mut delay = std::time::Duration::from_secs(1);
     // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
     // exited / error) — auto-reconnect must not fight that.
     let mut no_reconnect: Option<String> = None;
@@ -572,12 +585,35 @@ async fn run_actor(
                         attach.conversation = Some(a.conversation);
                         attach.epoch = Some(a.epoch);
                         attach_base = a.replay_from;
+                        attach_seen = true;
+                        delay = std::time::Duration::from_secs(1);
+                        if reconnect_pending {
+                            reconnect_pending = false;
+                            core.emit_error_notice("remote_link", json!({
+                                "message": "Reconnected to the server.",
+                            }));
+                        }
+                        // Resync with the daemon's truth: turn state + pending
+                        // permission prompts (see the core methods' docs).
+                        if let Some(daemon_busy) = a.busy {
+                            core.sync_remote_busy(daemon_busy);
+                        }
+                        if let Some(pending) = &a.pending {
+                            core.sync_pending_permissions(pending);
+                        }
                     }
                     Some(CliMessage::FdDetach(d)) => {
-                        if d.reason == "error" {
-                            core.emit_error_notice("error", json!({
-                                "message": d.message.clone().unwrap_or_else(|| "remote attach failed".to_string()),
-                            }));
+                        let message = match d.reason.as_str() {
+                            "exited" => Some(match d.exit_code {
+                                Some(c) => format!("The remote session exited (code {c})."),
+                                None => "The remote session exited.".to_string(),
+                            }),
+                            "replaced" => Some("Another client took over this remote session.".to_string()),
+                            "stopped" => None, // we asked; the stop path narrates itself
+                            _ => Some(d.message.clone().unwrap_or_else(|| "Remote attach failed.".to_string())),
+                        };
+                        if let Some(message) = message {
+                            core.emit_error_notice("remote_link", json!({ "message": message }));
                         }
                         no_reconnect = Some(d.reason);
                     }
@@ -601,12 +637,23 @@ async fn run_actor(
             break 'outer true;
         }
         // Remote link lost while the server-side session lives on: reconnect.
-        let cursor = attach_base + transport.lines_seen();
+        // Advance the cursor ONLY if this transport completed its handshake;
+        // otherwise keep the last known-good position.
+        if attach_seen {
+            cursor = attach_base + transport.lines_seen();
+            attach_seen = false;
+        }
         transport.shutdown(false).await; // reap the dead ssh client quietly
-        core.emit_error_notice("remote_link", json!({
-            "message": "Connection to the server lost — reconnecting…",
-        }));
-        let mut delay = std::time::Duration::from_secs(1);
+        if !reconnect_pending {
+            reconnect_pending = true;
+            core.emit_error_notice("remote_link", json!({
+                "message": "Connection to the server lost — reconnecting…",
+            }));
+        } else {
+            // Still in the same outage (the previous attempt spawned ssh but
+            // never got an fd_attach): escalate the backoff.
+            delay = (delay * 2).min(std::time::Duration::from_secs(30));
+        }
         loop {
             // Wait out the backoff, staying responsive to commands (a send while
             // offline surfaces as send_failed instead of blocking).
@@ -637,9 +684,9 @@ async fn run_actor(
                     transport = t;
                     msg_rx = rx;
                     core.set_outbound(transport.outbound());
-                    core.emit_error_notice("remote_link", json!({
-                        "message": "Reconnected to the server.",
-                    }));
+                    // NOT success yet — that's the daemon's fd_attach. Go drive
+                    // the new transport; an instant EOF loops back here with the
+                    // escalated backoff still in force.
                     continue 'outer;
                 }
                 Err(e) => {
@@ -650,15 +697,21 @@ async fn run_actor(
         }
     };
     // The process vanished without us asking: surface why (exit code + last stderr)
-    // so a crash / OOM / auth failure mid-turn is never a silent stop.
+    // so a crash / OOM / auth failure mid-turn is never a silent stop — EXCEPT a
+    // deliberate remote goodbye (exited / replaced / stopped), which was already
+    // narrated with its real reason; the local ssh exit status would only add
+    // noise ("exited (code 0)").
     if process_gone {
+        let deliberate = matches!(no_reconnect.as_deref(), Some("exited" | "replaced" | "stopped"));
         let status = transport.wait_status().await;
-        core.emit_process_exit(
-            status,
-            transport.reader_error(),
-            transport.writer_error(),
-            transport.stderr_tail(),
-        );
+        if !deliberate {
+            core.emit_process_exit(
+                status,
+                transport.reader_error(),
+                transport.writer_error(),
+                transport.stderr_tail(),
+            );
+        }
     }
     // Announce the end so the UI stops showing a live session.
     core.emit_ended();
@@ -666,6 +719,15 @@ async fn run_actor(
     // close and stdin can EOF, then run the graceful teardown ladder.
     drop(core);
     transport.shutdown(stop_remote).await;
+    // The user's explicit Stop must reach the server even when the attach link
+    // is already dead (the fd_stop inside `shutdown` rode a live writer, or
+    // died with it). One idempotent `flightdeckd stop` over a fresh ssh makes
+    // it deterministic; stopping an already-stopped session is a no-op.
+    if stop_remote {
+        if let (Some(remote), Some(conversation)) = (cfg.remote.as_ref(), attach.conversation.as_ref()) {
+            transport::run_remote_stop(remote, conversation).await;
+        }
+    }
     // Let the owner (e.g. the IPC registry) evict this dead session.
     on_exit();
     // The process is now fully reaped: release any caller waiting on `shutdown_and_wait`
@@ -770,6 +832,45 @@ impl SessionCore {
     /// The claude session id the assembler learned from `system/init`, if any.
     fn session_id(&self) -> Option<String> {
         self.assembler.state().session_id.clone()
+    }
+
+    /// Remote-attach resync: adopt the DAEMON's turn state when it disagrees
+    /// with ours. Our busy flag is optimistic (set on send) — a message that
+    /// died in a dead link leaves it stuck `true` forever, since the turn it
+    /// announced never runs. The daemon KNOWS whether a turn is running.
+    fn sync_remote_busy(&mut self, daemon_busy: bool) {
+        if self.assembler.state().busy != daemon_busy {
+            if !daemon_busy {
+                self.emit_error_notice(
+                    "remote_link",
+                    json!({ "message": "The server has no turn running — your last message may not have been delivered. Send it again." }),
+                );
+            }
+            let ev = self.assembler.set_busy(daemon_busy);
+            self.emit(ev);
+        }
+    }
+
+    /// Remote-attach resync: permission prompts answered or withdrawn while we
+    /// were detached never reach us as `control_cancel_request` — the daemon's
+    /// `fd_attach.pending` list is the truth. Resolve away anything stale so no
+    /// dead card stays clickable.
+    fn sync_pending_permissions(&mut self, live: &[String]) {
+        let stale: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|k| !live.iter().any(|l| l == *k))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for request_id in stale {
+            self.pending.remove(&request_id);
+            self.emit(SessionEvent::PermissionResolved(PermissionResolvedPayload { request_id }));
+        }
+        let ev = self.awaiting_permission_event();
+        self.emit(ev);
     }
 
     /// Queue an outbound line. Returns `false` if the writer channel is closed (the

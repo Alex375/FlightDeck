@@ -81,6 +81,16 @@ pub struct FdAttachMsg {
     /// The daemon's current sequence number (diagnostic).
     #[serde(default)]
     pub seq: u64,
+    /// The daemon's OWN turn state. `Some(false)` while our assembler thinks
+    /// we're busy means a send died in the dead link — the actor resyncs and
+    /// tells the user to resend. `None` = an older daemon without the field.
+    #[serde(default)]
+    pub busy: Option<bool>,
+    /// The outstanding can_use_tool request ids server-side; locally-pending
+    /// prompts NOT in this list are stale (answered/withdrawn while detached)
+    /// and get resolved away. `None` = an older daemon without the field.
+    #[serde(default)]
+    pub pending: Option<Vec<String>>,
 }
 
 /// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.

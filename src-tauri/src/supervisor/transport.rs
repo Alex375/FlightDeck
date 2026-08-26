@@ -248,6 +248,51 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     s
 }
 
+/// Best-effort remote stop: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
+/// The deterministic tail of the user's explicit Stop for a remote session —
+/// the in-band `fd_stop` only reaches the daemon while the attach link is
+/// alive, and an explicit Stop must work precisely when it is not. Idempotent
+/// server-side (stopping a stopped session is a no-op). Returns whether the
+/// command ran and exited 0; failures are logged, never surfaced (the session
+/// is already torn down locally).
+pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = &remote.known_hosts_file {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(identity) = &remote.identity_file {
+        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+        "exec {} stop --conversation {}",
+        shell_quote(&remote.daemon_bin),
+        shell_quote(conversation),
+    ));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    match cmd.spawn() {
+        Ok(mut child) => matches!(
+            tokio::time::timeout(Duration::from_secs(15), child.wait()).await,
+            Ok(Ok(status)) if status.success()
+        ),
+        Err(e) => {
+            eprintln!("[transport] remote stop failed to launch ssh: {e}");
+            false
+        }
+    }
+}
+
 /// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
 /// line-for-line with flightdeckd (`frames::is_replayable_line`): a line counts
 /// iff it parses as a JSON object whose `type` is a string outside the control
@@ -507,6 +552,15 @@ impl Transport {
                 .arg("BatchMode=yes") // never block a GUI app on a password prompt
                 .arg("-o")
                 .arg("ConnectTimeout=10") // fail fast if the host is unreachable
+                // A REAL network cut (wifi off, cable pulled) sends no FIN: without
+                // keepalives the ssh client hangs on a dead TCP connection for many
+                // minutes and the actor never sees the EOF that triggers its
+                // auto-reconnect. 5s probes × 3 misses → a dead link is detected in
+                // ~15s and the reattach/replay path takes over.
+                .arg("-o")
+                .arg("ServerAliveInterval=5")
+                .arg("-o")
+                .arg("ServerAliveCountMax=3")
                 .arg("-o")
                 .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
             if let Some(kh) = &remote.known_hosts_file {
