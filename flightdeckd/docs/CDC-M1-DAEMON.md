@@ -100,23 +100,24 @@ autorisés** → petite addition côté relais (voir §8, décision 5).
 
 ## 7. Découpage proposé (jalons)
 
-- **M1.0 — Preuve** : agent minimal **dans le conteneur** qui possède **une** session
-  `claude` persistante + répond au téléphone **en direct** via le relais. On prouve
-  *détachement* (coupe le lien → la session vit → reconnexion OK) **et** *phone-direct*
-  (Mac éteint), d'abord headless (mock-phone), puis ton vrai téléphone.
-- **M1.1 — Le vrai démon** : service systemd, registre SQLite, RPC complets, rejou du
-  stream, reconnexion relais robuste.
+- **M1.0 — Preuve (en Rust, directement le vrai crate)** : `flightdeckd` minimal
+  **dans le conteneur** qui possède des sessions `claude` détachées + répond au
+  téléphone **en direct** via le relais. On prouve *détachement* (coupe le lien →
+  la session vit → reconnexion + rejeu OK, côté Mac **et** côté téléphone) **et**
+  *phone-direct* (Mac éteint), d'abord headless (mock-phone), puis le vrai téléphone.
+- **M1.1 — Durcissement** : service systemd, registre SQLite, RPC complets,
+  reconnexion relais robuste (même crate, pas de réécriture).
 - **M1.2 — Orchestration Mac** : « Ajouter un serveur » installe le démon en SSH +
   provisionne son identité relais + pousse l'accès téléphone (journeys A & B).
 - **M1.3 — PWA multi-cible** : sélecteur « Mon Mac / Serveur X » + découverte des
   nœuds.
 
-## 8. Décisions à trancher (avec ma reco)
+## 8. Décisions (tranchées le 26/08/2026)
 
-1. **Langage du démon** — *reco* : **prototyper M1.0 en Node** (réutilise le
-   `mock-mac.mjs` du relais → preuve rapide), **cible M1.1 en Rust** en extrayant le
-   supervisor de tosse-code (le vrai `flightdeckd`, zéro logique dupliquée à terme).
-   *Alternative* : Rust direct (pas de proto jetable, mais preuve plus lente).
+1. **Langage du démon** — **TRANCHÉ : Rust direct**, pas de prototype Node jetable
+   (« ça ne va pas nous coûter grand-chose de faire les choses bien du premier
+   coup »). Le crate `flightdeckd` vit dans ce repo ; le modèle de supervision est
+   porté depuis le supervisor de tosse-code.
 2. **Détachement / rejeu** — *reco* : le démon tient les pipes de `claude`, bufferise
    les events par session, rejoue depuis un curseur « dernier event vu » à la
    reconnexion. Réutiliser le modèle du supervisor tosse-code.
@@ -127,16 +128,18 @@ autorisés** → petite addition côté relais (voir §8, décision 5).
    seule chose** : « un téléphone découvre l'ensemble de ses nœuds autorisés »
    (multi-pairing), nécessaire aux journeys A/B et au sélecteur PWA.
 6. **PWA multi-cible** — *reco* : minimal (un sélecteur + 1 serveur d'abord) pour M1.
-7. **Alpha SSH** — *reco* : **merger `feat/remote-ssh` → `dev`** au passage (jalon
-   propre, cas « Mac en ligne » + bootstrap du démon), documenté honnêtement (ne
-   survit pas aux coupures, pas de phone-direct — c'est justement ce que M1 apporte).
+7. **Alpha SSH** — **TRANCHÉ et FAIT** : `feat/remote-ssh` mergé dans `dev`
+   (commit local `00b9289`, rien poussé), documenté honnêtement (ne survit pas aux
+   coupures, pas de phone-direct — c'est justement ce que M1 apporte).
 
-## 9. Critères d'acceptation M1
+## 9. Critères d'acceptation M1 (formulation d'Armand, 26/08/2026)
 
-- [ ] **Mac éteint**, le téléphone **liste et pilote** les conversations d'un serveur
-      **en direct** (via le relais).
-- [ ] Une session **survit** à une coupure réseau du client et est **retrouvée vivante**
-      à la reconnexion (rejeu du stream).
+- [ ] **Pilotage depuis le Mac** : une session distante pilotée depuis le Mac
+      **résiste à une coupure réseau côté Mac** — la session continue sur le
+      serveur, le Mac la retrouve vivante et rejoue le flux à la reconnexion.
+- [ ] **Pilotage depuis le téléphone, Mac éteint** : le téléphone contrôle le
+      conteneur **en direct** (via le relais), avec **coupures réseau côté
+      téléphone** possibles — reprise sans perte à la reconnexion.
 - [ ] **Ajouter un serveur** depuis le Mac **installe le démon** et **donne accès au
       téléphone** (journeys A & B).
 - [ ] Le serveur utilise **son propre compte Claude**.
