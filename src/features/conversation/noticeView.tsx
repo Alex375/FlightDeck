@@ -114,6 +114,20 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
     );
   }
 
+  // Remote-session link lifecycle (flightdeckd attach): connection lost /
+  // reconnected / remote exit / takeover / resend hint. Informational, not an
+  // error bubble — a cut is self-healing (the daemon keeps the session and
+  // replays on reattach) — but it must be VISIBLE so the user knows a gap
+  // happened and whether their last message needs resending.
+  if (subtype === "remote_link") {
+    return (
+      <div className={styles.controlChange}>
+        <Ico name="globe" className="sm" />
+        <span>{get("message")}</span>
+      </div>
+    );
+  }
+
   if (subtype === "control_error") {
     return (
       <ErrorBlock detail={noticeDetailText(d)}>

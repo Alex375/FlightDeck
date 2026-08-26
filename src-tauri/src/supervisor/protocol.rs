@@ -57,9 +57,51 @@ pub enum CliMessage {
     KeepAlive,
     /// Housekeeping transcript mirror — consume.
     TranscriptMirror(Value),
+    /// flightdeckd handshake: first line of every remote attach stream. Carries
+    /// the daemon-side conversation id, the claude-process epoch and where the
+    /// replay starts — the session actor's reconnect state. Never emitted by
+    /// `claude` itself; local sessions never see it.
+    FdAttach(FdAttachMsg),
+    /// flightdeckd goodbye: the daemon is closing this attach stream. The
+    /// `reason` decides whether the actor may auto-reconnect ("replaced",
+    /// "stopped", "exited" and "error" all mean NO).
+    FdDetach(FdDetachMsg),
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
     Unknown,
+}
+
+/// See [`CliMessage::FdAttach`]. Wire shape: flightdeckd `frames::fd_attach`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FdAttachMsg {
+    pub conversation: String,
+    pub epoch: String,
+    /// The cursor position the replay starts AFTER (lines with seq > this).
+    pub replay_from: u64,
+    /// The daemon's current sequence number (diagnostic).
+    #[serde(default)]
+    pub seq: u64,
+    /// The daemon's OWN turn state. `Some(false)` while our assembler thinks
+    /// we're busy means a send died in the dead link — the actor resyncs and
+    /// tells the user to resend. `None` = an older daemon without the field.
+    #[serde(default)]
+    pub busy: Option<bool>,
+    /// The outstanding can_use_tool request ids server-side; locally-pending
+    /// prompts NOT in this list are stale (answered/withdrawn while detached)
+    /// and get resolved away. `None` = an older daemon without the field.
+    #[serde(default)]
+    pub pending: Option<Vec<String>>,
+}
+
+/// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FdDetachMsg {
+    pub reason: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// Human-readable detail (attach errors).
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 impl CliMessage {
@@ -77,6 +119,8 @@ impl CliMessage {
             CliMessage::ControlCancelRequest { .. } => "control_cancel_request",
             CliMessage::KeepAlive => "keep_alive",
             CliMessage::TranscriptMirror(_) => "transcript_mirror",
+            CliMessage::FdAttach(_) => "fd_attach",
+            CliMessage::FdDetach(_) => "fd_detach",
             CliMessage::Unknown => "unknown",
         }
     }

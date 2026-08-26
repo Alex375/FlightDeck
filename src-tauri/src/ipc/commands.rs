@@ -206,8 +206,19 @@ pub async fn spawn_session(
             user: machine.user,
             identity_file: machine.identity_file,
             known_hosts_file,
-            remote_bin: std::env::var("TOSSE_REMOTE_CLAUDE_BIN")
-                .unwrap_or_else(|_| "claude".to_string()),
+            daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
+                .unwrap_or_else(|_| "flightdeckd".to_string()),
+        });
+        // Pre-mint the daemon-side conversation id so retries are idempotent: if
+        // the FIRST attach dies before its fd_attach handshake lands, the
+        // reconnect presents the same id and re-joins the same daemon
+        // conversation instead of cold-starting a duplicate (and leaking a
+        // claude process server-side). The daemon prefers a LIVE session
+        // matching `resume` over this id, so resumes still re-join correctly.
+        cfg.attach = Some(crate::supervisor::transport::AttachPoint {
+            conversation: Some(uuid::Uuid::new_v4().to_string()),
+            epoch: None,
+            cursor: 0,
         });
     }
     let initial = InitialControls {
@@ -239,7 +250,10 @@ pub async fn spawn_session(
         Backend::Claude => {
             // Hand the app-control hub to sessions that expose the in-process MCP
             // server; `None` keeps the wire identical to the pre-MCP client.
-            let appmcp = app_control
+            // Remote sessions never get it: their claude runs detached on the
+            // server — an mcp_message arriving while no Mac is attached would
+            // hang the tool call there with nobody to answer it.
+            let appmcp = (app_control && cfg.remote.is_none())
                 .then(|| (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone());
             session::spawn_session(id.clone(), cfg, initial, emitter, on_exit, appmcp)
         }
@@ -1049,7 +1063,7 @@ pub async fn fetch_slash_commands(cwd: String) -> Result<Vec<SlashCommand>, Stri
     .await
     .unwrap_or_default();
 
-    transport.shutdown().await;
+    transport.shutdown(false).await;
     Ok(commands)
 }
 
@@ -1819,7 +1833,9 @@ pub async fn stop_session(
         // enqueued): a rewind truncates the transcript right after stopping the session and
         // must not race a still-alive `claude` writer. Ignore a closed channel / timeout —
         // the actor may have already exited on its own, in which case it's stopped anyway.
-        let _ = handle.shutdown_and_wait().await;
+        // The user's explicit Stop: a remote session's server-side claude is
+        // stopped too (fd_stop), not merely detached.
+        let _ = handle.shutdown_and_wait_stopping().await;
     }
     Ok(())
 }
