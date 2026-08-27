@@ -12,6 +12,8 @@ pub mod supervisor;
 pub mod terminal;
 pub mod tosse;
 pub mod usage;
+pub mod voice;
+pub mod wake;
 
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
@@ -55,6 +57,12 @@ use ipc::commands::{
     tosse_repo_links, tosse_set_project_status,
     tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
+    voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
+    wake_word_status, set_wake_word_config,
+    app_control_tools, folder_tree,
+    remote_status, set_remote,
+    add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
+    prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use ipc::events::{
@@ -63,12 +71,89 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
-    TosseCrmEvent, TosseLiveStateEvent, WorkflowJournalEvent,
+    TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
+/// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
+/// `$TOSSE_SEED_REMOTE_PATH` (the repo path ON THAT SERVER) are set, ensure a remote
+/// server + a repo on it + one conversation exist, so the app opens already connected
+/// over SSH — a shortcut past the pairing UI for quick verification. Optional env:
+/// `_PORT` (22), `_USER` (root), `_IDENTITY` (private key path), `_MACHINE`/`_NAME`
+/// (labels). Idempotent (fixed ids) and a complete no-op without the env vars.
+fn seed_remote_demo_if_requested(store: &store::Store) {
+    let (Some(host), Some(path)) = (
+        std::env::var("TOSSE_SEED_REMOTE_HOST").ok().filter(|s| !s.is_empty()),
+        std::env::var("TOSSE_SEED_REMOTE_PATH").ok().filter(|s| !s.is_empty()),
+    ) else {
+        return;
+    };
+    let port: u16 = std::env::var("TOSSE_SEED_REMOTE_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
+    let user = std::env::var("TOSSE_SEED_REMOTE_USER").unwrap_or_else(|_| "root".to_string());
+    let identity_file = std::env::var("TOSSE_SEED_REMOTE_IDENTITY").ok().filter(|s| !s.is_empty());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let machine = store::MachineRecord {
+        id: "seed-machine".to_string(),
+        label: std::env::var("TOSSE_SEED_REMOTE_MACHINE").unwrap_or_else(|_| format!("{user}@{host}")),
+        host,
+        port,
+        user,
+        identity_file,
+        added_at: now,
+    };
+    if let Err(e) = store.upsert_machine(&machine) {
+        eprintln!("[seed] failed to upsert remote demo machine: {e}");
+        return;
+    }
+    let repo = store::RepoRecord {
+        id: "remote-demo".to_string(),
+        path: path.clone(),
+        added_at: now,
+        machine_id: Some(machine.id.clone()),
+    };
+    if let Err(e) = store.upsert_repo(&repo) {
+        eprintln!("[seed] failed to upsert remote demo repo: {e}");
+        return;
+    }
+    let conv = store::ConversationRecord {
+        id: "remote-demo-conv".to_string(),
+        name: std::env::var("TOSSE_SEED_REMOTE_NAME")
+            .unwrap_or_else(|_| format!("Remote demo ({})", machine.label)),
+        repo_id: repo.id.clone(),
+        cwd: path,
+        created_at: now,
+        last_activity_at: now,
+        session_id: None,
+        backend: "claude".to_string(),
+        model: None,
+        effort: None,
+        ultracode: false,
+        permission_mode: None,
+        clean_output: None,
+        pending_reminder: None,
+        tosse_task_id: None,
+        tosse_task_title: None,
+        tosse_task_status: None,
+    };
+    if let Err(e) = store.upsert_conversation(&conv) {
+        eprintln!("[seed] failed to upsert remote demo conversation: {e}");
+        return;
+    }
+    eprintln!(
+        "[seed] remote demo ready: conversation \"{}\" in {} on {}",
+        conv.name, repo.path, machine.label
+    );
+}
+
 /// Declare the IPC contract (commands + events) once. Shared by `run()` and the
 /// TS-bindings export so they can never drift.
+
 fn ipc_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
@@ -203,6 +288,12 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_persisted_state,
             upsert_repo,
             delete_repo,
+            generate_machine_key,
+            add_machine,
+            delete_machine,
+            list_remote_repos,
+            list_remote_dir,
+            prepare_remote_dir,
             upsert_conversation,
             delete_conversation,
             set_active_conversation,
@@ -216,6 +307,16 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             publish_control_event,
             voice_bridge_status,
             set_voice_bridge,
+            voice_agent_status,
+            set_voice_agent_key,
+            clear_voice_agent_key,
+            voice_agent_client_secret,
+            wake_word_status,
+            set_wake_word_config,
+            app_control_tools,
+            folder_tree,
+            remote_status,
+            set_remote,
         ])
         .events(collect_events![
             TickEvent,
@@ -239,6 +340,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             TerminalOutputEvent,
             TerminalExitEvent,
             AppControlRequestEvent,
+            WakeWordEvent,
         ])
 }
 
@@ -489,6 +591,9 @@ pub fn run() {
         // bridge + fleet event journal + voice-bridge runtime). An Arc so each
         // Claude session actor can hold it beyond the spawning command.
         .manage(std::sync::Arc::new(appmcp::ControlHub::new()))
+        // The wake-word detector: sole owner of the always-on mic capture +
+        // on-device inference. An Arc so a blocking `apply` can run off-thread.
+        .manage(std::sync::Arc::new(wake::WakeController::new()))
         .setup(move |app| {
             use tauri::Manager;
 
@@ -536,6 +641,9 @@ pub fn run() {
             // signed both out; test builds now get their own item, production keeps the
             // historic one (renaming it there would orphan every existing install's).
             tosse::set_bundle_identifier(app.config().identifier.clone());
+            // Same per-identity isolation for the voice agent's OpenAI key item:
+            // a test build must never read or clobber production's key.
+            voice::set_bundle_identifier(app.config().identifier.clone());
 
             // Open the persistence store in the app data dir (created if absent).
             // The store is the single owner of SQLite; the rest of the core and
@@ -559,6 +667,10 @@ pub fn run() {
             {
                 eprintln!("last_activity_at backfill failed: {e}");
             }
+            // Dev/demo: seed a remote (SSH) conversation when asked, so the app opens
+            // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
+            // on a normal run (env vars unset).
+            seed_remote_demo_if_requested(&store);
             app.manage(store);
 
             // App-control hub: install its front outlet, then start the voice
@@ -573,6 +685,38 @@ pub fn run() {
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
                 }
+            }
+
+            // Wake word: wire the detection sink to a WakeWordEvent, then arm the
+            // detector if it was left enabled. `apply` loads the models and opens
+            // the mic (blocking, up to a few seconds), so run it off the setup
+            // thread — its honest outcome lands in `wake_word_status`.
+            {
+                let wake = (*app.state::<std::sync::Arc<wake::WakeController>>()).clone();
+                let emit_handle = app.handle().clone();
+                wake.set_on_detect(std::sync::Arc::new(move |phrase: &str, score: f32| {
+                    let ev = ipc::events::WakeWordEvent { phrase: phrase.to_string(), score };
+                    if let Err(e) = ev.emit(&emit_handle) {
+                        eprintln!("[wake] failed to emit WakeWordEvent: {e}");
+                    }
+                }));
+                let cfg = ipc::commands::load_wake_config(&app.state::<store::Store>());
+                if cfg.enabled {
+                    let wake = wake.clone();
+                    std::thread::spawn(move || {
+                        let _ = wake.apply(cfg);
+                    });
+                }
+            }
+
+            // Remote access (phone): always seed the relay config into the hub so
+            // Settings can render the pairing QR, and dial the relay out if it was
+            // left enabled (apply_remote stores the config either way, then only
+            // connects when enabled).
+            {
+                let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
+                tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
 
             // Rust timer: emit a TickEvent every second (Rust -> React) — kept as

@@ -30,6 +30,10 @@ const WF_PATHS: Record<string, string> = {
   // A "reply"/return arrow — marks the user's own last message on a Flight Deck card.
   reply: "M9 7 5 11l4 4M5 11h7a4 4 0 0 0 4-4V5",
   bell: "M6 9a5 5 0 0 1 10 0c0 4 2 5 2 5H4s2-1 2-5ZM9 18a2 2 0 0 0 4 0",
+  /** A microphone — the voice-agent mic open/close button. */
+  mic: "M11 3.5a2.5 2.5 0 0 1 2.5 2.5v5a2.5 2.5 0 0 1-5 0V6A2.5 2.5 0 0 1 11 3.5ZM6 11a5 5 0 0 0 10 0M11 16v2.5M8.5 18.5h5",
+  /** A headset — the voice-session (mode) arm/disarm button. */
+  headset: "M4.5 12v-1a6.5 6.5 0 0 1 13 0v1M4.5 12h1.8a.7.7 0 0 1 .7.7v3.1a.7.7 0 0 1-.7.7H5.2a.7.7 0 0 1-.7-.7ZM17.5 12h-1.8a.7.7 0 0 0-.7.7v3.1a.7.7 0 0 0 .7.7h1.1a.7.7 0 0 0 .7-.7ZM17.5 16.5v.8a2 2 0 0 1-2 2H13",
   clock: "M11 5a6 6 0 1 1 0 12 6 6 0 0 1 0-12ZM11 8v3l2 2",
   // The two glyphs the TOSSE view's status sections need, mirroring the CRM Briefing's own
   // icons: an eye for « En revue » and a dotted circle for « En attente ».

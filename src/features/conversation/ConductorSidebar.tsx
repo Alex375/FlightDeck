@@ -10,8 +10,11 @@ import {
   useActiveConversationId,
   useConversationsByRepo,
   useConversationsStore,
+  useMachines,
   type Conversation,
+  type Machine,
 } from "../../store/conversationsStore";
+import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
 import {
@@ -379,6 +382,10 @@ export function ConductorSidebar() {
   const openHistory = useHistoryUi((s) => s.openPanel);
   const openSettings = useSettingsUi((s) => s.openSettings);
   const showFleet = useDisplay((s) => s.fleetBannerConversation);
+  // Paired remote servers → the "+ new conversation" flow can start a folder on one of
+  // them, not just on this Mac.
+  const machines = useMachines();
+  const [remoteDialogMachine, setRemoteDialogMachine] = useState<Machine | null>(null);
 
   // Resizable width, persisted (localStorage). The grip is an absolute handle on the
   // right edge (reusing the editor's Splitter for pointer-capture + hover accent), so
@@ -425,10 +432,37 @@ export function ConductorSidebar() {
               {repoName(r.path)}
             </MenuItem>
           ))}
-          <MenuItem icon="plus" onClick={() => void newConversationInPickedFolder()}>
-            Add a folder…
-          </MenuItem>
+          {machines.length === 0 ? (
+            <MenuItem icon="plus" onClick={() => void newConversationInPickedFolder()}>
+              Add a folder…
+            </MenuItem>
+          ) : (
+            <>
+              <MenuLabel>Add a folder on…</MenuLabel>
+              <MenuItem icon="plus" onClick={() => void newConversationInPickedFolder()}>
+                This Mac…
+              </MenuItem>
+              {machines.map((m) => (
+                <MenuItem key={m.id} icon="globe" onClick={() => setRemoteDialogMachine(m)}>
+                  {m.label}…
+                </MenuItem>
+              ))}
+            </>
+          )}
         </Menu>
+        {remoteDialogMachine && (
+          <RemoteFolderDialog
+            machine={remoteDialogMachine}
+            onClose={() => setRemoteDialogMachine(null)}
+            onOpen={(path) => {
+              const store = useConversationsStore.getState();
+              store.addRemoteRepo(remoteDialogMachine.id, path);
+              const id = createConversationInRepo(path, "claude");
+              store.selectConversation(id);
+              setRemoteDialogMachine(null);
+            }}
+          />
+        )}
       </div>
 
       <button

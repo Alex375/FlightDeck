@@ -1415,7 +1415,7 @@ mod tests {
                 None => eprintln!("  <no mcpServers in response>"),
             }
         }
-        transport.shutdown().await;
+        transport.shutdown(false).await;
     }
 
     /// Live capture: reproduce the "sub-agent woken via SendMessage" bug and DUMP the
@@ -1664,7 +1664,7 @@ mod tests {
         logln!("wake_task_started_seen     = {wake_task_started_seen}  (fresh task_started on wake?)");
         logln!("wake_running_seen          = {wake_running_seen}  (woken agent re-entered running?)");
         logln!("log written to {log_path}");
-        transport.shutdown().await;
+        transport.shutdown(false).await;
     }
 
     /// Live capture: does a MODEL-invoked skill's SKILL.md body leak as a user turn?
@@ -1810,6 +1810,6 @@ mod tests {
         logln!("Skill tool_use id = {skill_tool_use_id:?}");
         logln!("log written to {log_path}");
         let _ = std::fs::remove_dir_all(&tmp);
-        transport.shutdown().await;
+        transport.shutdown(false).await;
     }
 }

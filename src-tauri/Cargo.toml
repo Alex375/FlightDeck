@@ -96,7 +96,18 @@ tokio = { version = "1", features = [
     "macros",
     "sync",
     "time",
+    "net",
 ] }
+
+# Outbound WebSocket client for phone remote-access (`appmcp::relay`): the app
+# dials a cloud relay and speaks WS. rustls (webpki roots) reuses our existing
+# rustls/`ring` TLS stack — no native-tls/openssl pulled in. `futures-util` gives
+# the split sink/stream used to read RPCs and write replies/events concurrently.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# QR code for the phone-pairing deep link, rendered to a tiny inline SVG by hand
+# (default features OFF → no `image` crate, no PNG codecs).
+qrcode = { version = "0.14", default-features = false }
 
 # Typed IPC (Rust -> TS). RC versions: pin EXACTLY with "=".
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
@@ -104,6 +115,22 @@ tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 # IPC events can carry arbitrary tool inputs / results (exported to TS as JsonValue).
 specta = { version = "=2.0.0-rc.22", features = ["derive", "serde_json"] }
 specta-typescript = "=0.0.9"
+
+# Wake word — a hands-free "Hey Jarvis" / "Alexa" trigger that opens the voice
+# agent's microphone (see `wake/mod.rs`). 100% on-device: NO network, NO cloud,
+# the captured audio never leaves the Mac. `cpal` captures the default input
+# device; `ort` (ONNX Runtime) runs the openWakeWord pipeline (melspectrogram →
+# shared speech embedding → per-phrase classifier), gated by a Silero VAD so the
+# neural nets run ONLY on speech (the battery guard). All five ONNX models are
+# bundled into the binary (`include_bytes!` from `assets/wake/`), so the feature
+# works offline on first launch — no download, no external asset host. `ort` is an
+# RC, pinned EXACTLY like the specta/tauri-specta RCs above.
+cpal = "0.15"
+# Default features (incl. `download-binaries`) pull a prebuilt ONNX Runtime at
+# build time. We drive the models with flat `(shape, Vec<f32>)` tensors +
+# `try_extract_tensor` (a `(&Shape, &[f32])` slice), so we need NO `ndarray`
+# feature / dependency — one fewer crate + version to keep aligned.
+ort = "=2.0.0-rc.13"
 
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is

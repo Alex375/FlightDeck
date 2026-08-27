@@ -234,6 +234,9 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "prev-conversation", spec: { code: "ArrowUp", alt: true }, scope: "global" },
   { action: "next-conversation", spec: { code: "ArrowDown", alt: true }, scope: "global" },
   { action: "open-history", spec: { key: "o", shift: true }, scope: "global" },
+  // (The voice agent's push-to-talk key is NOT here: it is user-customizable —
+  // default a Right ⌘ tap — so it lives as DATA in the voice prefs and is
+  // matched by VoiceHost's own listener. See src/voice/pttShortcut.ts.)
   // Interface zoom — the browser chords, and global on purpose: making the app readable
   // must work from wherever focus happens to be, editor and terminal included (neither
   // binds these).
@@ -286,6 +289,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘⌥ ↑ / ⌘⌥ ↓", label: "Previous / next conversation" },
       { keys: "⌘⇧ O", label: "Open conversation history" },
       { keys: "⌘⇧ M", label: "Mute / unmute notification sound" },
+      { keys: "Right ⌘ (tap)", label: "Voice agent — open / close the mic (customizable, needs an OpenAI key)" },
       { keys: "⌘ ,", label: "Open Settings" },
       { keys: "⌘ Z", label: "Restore the last deleted conversation" },
       { keys: "⌘ + / ⌘ −", label: "Zoom the interface in / out" },

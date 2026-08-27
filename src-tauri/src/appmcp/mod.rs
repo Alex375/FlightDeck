@@ -29,6 +29,7 @@
 
 pub mod events;
 pub mod http;
+pub mod relay;
 pub mod router;
 pub mod tools;
 
@@ -105,6 +106,36 @@ pub struct VoiceConfig {
 /// Default loopback port for the voice bridge ("FD" → 70/68).
 pub const DEFAULT_VOICE_PORT: u16 = 7068;
 
+/// The cloud relay the app dials for phone remote-access, unless overridden in
+/// Settings. Deployed from the `flightdeck-remote` repo (Railway).
+pub const DEFAULT_RELAY_URL: &str = "https://relay-production-8fd4.up.railway.app";
+
+/// Live state of the outbound remote-access relay connection, for the Settings
+/// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
+/// failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct RemoteStatus {
+    pub enabled: bool,
+    pub connected: bool,
+    pub relay_url: String,
+    pub mac_id: String,
+    pub phone_token: String,
+    pub pairing_url: Option<String>,
+    pub pairing_qr_svg: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Desired remote-access configuration (persisted in SQLite `meta` by the IPC
+/// layer; the hub never touches the store).
+#[derive(Debug, Clone)]
+pub struct RemoteConfig {
+    pub enabled: bool,
+    pub relay_url: String,
+    pub mac_id: String,
+    pub mac_token: String,
+    pub phone_token: String,
+}
+
 /// Runtime half of the voice bridge: the desired config plus what the listener
 /// actually achieved (`running`/`error`), the stop signal of the accept loop,
 /// and the loop's task handle (awaited on restart so the old listener socket is
@@ -113,6 +144,17 @@ pub const DEFAULT_VOICE_PORT: u16 = 7068;
 struct VoiceRuntime {
     cfg: VoiceConfig,
     running: bool,
+    error: Option<String>,
+    stop: Option<watch::Sender<bool>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Runtime half of the outbound relay connection. Unlike the voice bridge (which
+/// binds a listener synchronously), connectedness changes over the connection's
+/// life, so [`relay::serve`]'s reconnect loop updates `connected`/`error` as it goes.
+struct RemoteRuntime {
+    cfg: RemoteConfig,
+    connected: bool,
     error: Option<String>,
     stop: Option<watch::Sender<bool>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -127,6 +169,7 @@ pub struct ControlHub {
     next_req: AtomicU64,
     pub events: events::EventJournal,
     voice: Mutex<VoiceRuntime>,
+    remote: Mutex<RemoteRuntime>,
 }
 
 impl Default for ControlHub {
@@ -149,6 +192,19 @@ impl ControlHub {
                     token: String::new(),
                 },
                 running: false,
+                error: None,
+                stop: None,
+                task: None,
+            }),
+            remote: Mutex::new(RemoteRuntime {
+                cfg: RemoteConfig {
+                    enabled: false,
+                    relay_url: DEFAULT_RELAY_URL.to_string(),
+                    mac_id: String::new(),
+                    mac_token: String::new(),
+                    phone_token: String::new(),
+                },
+                connected: false,
                 error: None,
                 stop: None,
                 task: None,
@@ -307,6 +363,74 @@ impl ControlHub {
                 v.error = Some(format!("could not listen on 127.0.0.1:{}: {e}", cfg.port));
             }
         }
+    }
+
+    /// The remote-access relay's current status (Settings read-back): config plus
+    /// the honest connection state and the pairing QR/link.
+    pub fn remote_status(&self) -> RemoteStatus {
+        let r = self.remote.lock().expect("remote lock");
+        let pairing = (!r.cfg.mac_id.is_empty() && !r.cfg.phone_token.is_empty())
+            .then(|| relay::pairing_url(&r.cfg.relay_url, &r.cfg.mac_id, &r.cfg.phone_token));
+        let qr = pairing.as_deref().and_then(relay::qr_svg);
+        RemoteStatus {
+            enabled: r.cfg.enabled,
+            connected: r.connected,
+            relay_url: r.cfg.relay_url.clone(),
+            mac_id: r.cfg.mac_id.clone(),
+            phone_token: r.cfg.phone_token.clone(),
+            pairing_url: pairing,
+            pairing_qr_svg: qr,
+            error: r.error.clone(),
+        }
+    }
+
+    /// Called by the relay connection loop as the socket connects/drops.
+    pub(crate) fn set_remote_connected(&self, connected: bool) {
+        let mut r = self.remote.lock().expect("remote lock");
+        r.connected = connected;
+        if connected {
+            r.error = None;
+        }
+    }
+
+    /// Record the last relay failure (surfaced in [`Self::remote_status`]).
+    pub(crate) fn set_remote_error(&self, error: Option<String>) {
+        let mut r = self.remote.lock().expect("remote lock");
+        r.connected = false;
+        r.error = error;
+    }
+
+    /// Apply a (new) remote-access configuration: stop the running relay
+    /// connection if any, store the config (so the pairing QR is available even
+    /// when disabled), then dial out when enabled. The connection loop keeps
+    /// `connected`/`error` current for [`Self::remote_status`].
+    pub async fn apply_remote(self: &Arc<Self>, cfg: RemoteConfig) {
+        let (old_stop, old_task) = {
+            let mut r = self.remote.lock().expect("remote lock");
+            r.cfg = cfg.clone();
+            r.connected = false;
+            r.error = None;
+            (r.stop.take(), r.task.take())
+        };
+        if let Some(stop) = old_stop {
+            let _ = stop.send(true);
+        }
+        if let Some(mut task) = old_task {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        if !cfg.enabled {
+            return;
+        }
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(relay::serve(self.clone(), cfg, stop_rx));
+        let mut r = self.remote.lock().expect("remote lock");
+        r.stop = Some(stop_tx);
+        r.task = Some(task);
     }
 }
 

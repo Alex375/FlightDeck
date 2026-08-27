@@ -1204,8 +1204,14 @@ fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
             }
             _ => {}
         }
-        // A title is the best label — nothing better lies further in; stop now.
-        if title.is_some() {
+        // A title is the best label, but the excerpt is REQUIRED (the noise filter below
+        // drops a row with none) and the cwd is what groups it under a repo. A recent CLI
+        // writes the `ai-title` line FIRST — before any user message — so breaking on the
+        // title alone would return here with no excerpt and silently drop every such
+        // conversation from the list (while `index_one`, which reads the whole file, still
+        // indexes it → list/index diverge and search hits get dropped on the front). Only
+        // stop early once everything is actually in hand.
+        if cwd.is_some() && excerpt.is_some() && title.is_some() {
             break;
         }
         // Otherwise, once cwd + excerpt are known, read only a short grace window more
@@ -2178,6 +2184,43 @@ mod tests {
         // The worktree cwd rolled up to the repo root for grouping/reactivation.
         assert_eq!(orphan.repo_root, "/Users/me/Repos/app");
         assert_eq!(orphan.cwd, "/Users/me/Repos/app/.claude/worktrees/feat-x");
+    }
+
+    /// Regression: a recent Claude CLI writes the `ai-title` line as the VERY FIRST line
+    /// of the transcript, before any user message. The head-scan must not stop on that
+    /// title before it has read the excerpt (the noise filter requires one) — otherwise
+    /// the whole conversation is dropped from the list while `index_one` (which reads the
+    /// full file) still indexes it, so the list/index diverge and search hits on the row
+    /// get silently dropped on the front. This is exactly what hid every recent
+    /// conversation from the history panel.
+    #[test]
+    fn list_includes_conversations_whose_transcript_opens_with_ai_title() {
+        let base =
+            std::env::temp_dir().join(format!("tosse-list-aititle-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        write_transcript(
+            &base,
+            "-Users-me-Repos-app",
+            "44444444-4444-4444-4444-444444444444",
+            &[
+                // ai-title FIRST, no cwd on it, the human prompt comes after.
+                r#"{"type":"ai-title","aiTitle":"Recent CLI conversation","sessionId":"44444444-4444-4444-4444-444444444444"}"#,
+                r#"{"type":"user","cwd":"/Users/me/Repos/app","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"Hello, plenty of recent work"}]}}"#,
+                r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}}"#,
+            ],
+        );
+
+        let got = list_disk_conversations_in(&base);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(got.len(), 1, "ai-title-first conversation must be listed: {got:#?}");
+        let c = &got[0];
+        assert_eq!(c.session_id, "44444444-4444-4444-4444-444444444444");
+        assert_eq!(c.title.as_deref(), Some("Recent CLI conversation"));
+        assert_eq!(c.excerpt, "Hello, plenty of recent work");
+        assert_eq!(c.cwd, "/Users/me/Repos/app");
+        assert_eq!(c.repo_root, "/Users/me/Repos/app");
+        assert_eq!(c.git_branch.as_deref(), Some("main"));
     }
 
     /// A two-exchange transcript: bookkeeping line, prompt P1 + its assistant reply

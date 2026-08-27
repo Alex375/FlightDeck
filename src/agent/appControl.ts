@@ -12,14 +12,25 @@
 // Kept React-free: pure functions over `.getState()`, so every tool is directly
 // unit-testable. The React side is a thin listener host (AppControlHost.tsx).
 
-import { commands } from "../ipc/client";
+import {
+  commands,
+  type DiskConversation,
+  type JsonValue,
+  type PermissionDecision,
+} from "../ipc/client";
 import {
   useConversationsStore,
   loadConversationHistory,
   createConversationInRepo,
+  acknowledgeConversation,
+  reactivateDiskConversation,
+  stopConversationSession,
   type Conversation,
 } from "../store/conversationsStore";
+import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
 import { useConversationStore } from "../store/conversationStore";
+import { CLAUDE_MODELS } from "../features/conversation/models";
+import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
 import {
   runningBashCountsByConv,
   runningCountsByConv,
@@ -206,6 +217,8 @@ function listConversations(session: string | null): unknown {
       repository: repo ? { name: baseName(repo.path), path: repo.path } : null,
       backend: c.kind,
       status: statusJson(statusFor(c)),
+      model: c.model,
+      effort: c.ultracode ? "ultracode" : c.effort,
       last_activity_at: c.lastActivityAt,
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
     };
@@ -240,8 +253,164 @@ async function readConversation(args: Record<string, unknown>, session: string |
     conversation_id: conv.id,
     title: conv.name,
     status: statusJson(statusFor(conv)),
+    model: conv.model,
+    effort: conv.ultracode ? "ultracode" : conv.effort,
     turns,
   };
+}
+
+/** The curated Claude model catalogue + the effort levels each one supports. */
+function listModels(): unknown {
+  return {
+    models: CLAUDE_MODELS.map((m) => ({
+      value: m.value,
+      label: m.label,
+      efforts: effortLevelsForModel(m.value),
+    })),
+  };
+}
+
+function setConversationModel(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const model = typeof args.model === "string" ? args.model.trim() : "";
+  if (!model) throw new Error("set_conversation_model: 'model' is required");
+  if (!CLAUDE_MODELS.some((m) => m.value === model))
+    throw new Error(`set_conversation_model: unknown model '${model}' (see list_models)`);
+  useConversationsStore.getState().setConvModel(conv.id, model);
+  return { conversation_id: conv.id, model };
+}
+
+/** Interrupt the target conversation's CURRENT turn (the composer's stop button). */
+async function interruptConversation(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
+  const res = await commands.interruptSession(conv.handle);
+  if (res.status === "error") throw new Error(res.error);
+  return { conversation_id: conv.id, interrupted: true };
+}
+
+/** Power the live process off WITHOUT archiving — the stream's "turn off". */
+async function stopStream(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  if (!conv.handle) return { conversation_id: conv.id, stopped: false, note: "already off" };
+  await stopConversationSession(conv.id);
+  return { conversation_id: conv.id, stopped: true };
+}
+
+/** The conversation's background tasks (live-only registry). */
+function listBackgroundTasksTool(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
+  return {
+    conversation_id: conv.id,
+    tasks: Object.values(tasks).map((t) => ({
+      task_id: t.task_id,
+      kind: t.kind,
+      status: t.status,
+      label: t.label ?? null,
+    })),
+  };
+}
+
+/** Stop ONE background task (bg Bash / Monitor / sub-agent / workflow) by id. */
+async function stopBackgroundTask(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+  if (!taskId) throw new Error("stop_background_task: 'task_id' is required (see list_background_tasks)");
+  if (!conv.handle) throw new Error("the conversation is not running");
+  const res = await commands.stopTask(conv.handle, taskId);
+  if (res.status === "error") throw new Error(res.error);
+  return { conversation_id: conv.id, task_id: taskId, stopping: true };
+}
+
+/** Classify a pending can_use_tool request for a remote card. */
+function pendingKind(toolName: string): "questions" | "plan" | "permission" {
+  if (toolName === "AskUserQuestion") return "questions";
+  if (toolName === "ExitPlanMode") return "plan";
+  return "permission";
+}
+
+/** Full detail of the target conversation's pending requests (permission prompts,
+ *  questionnaires, plan approvals). Read-only; the raw `input` carries the
+ *  questionnaire's options / the plan's markdown, exactly as the desktop sees them. */
+function getPendingRequest(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const perms = useConversationStore.getState().sessions[conv.id]?.pendingPermissions ?? [];
+  return {
+    conversation_id: conv.id,
+    requests: perms.map((p) => ({
+      request_id: p.request_id,
+      kind: pendingKind(p.tool_name),
+      tool_name: p.tool_name,
+      title: p.title,
+      description: p.description,
+      input: p.input,
+    })),
+  };
+}
+
+/** Answer ONE pending request (allow/deny; questionnaires answer via
+ *  `updated_input`, mirroring the desktop cards). Gated by the explicit
+ *  Settings → Control opt-in — answering a SPECIFIC visible request is not
+ *  privilege-raising (unlike changing the permission MODE, which stays banned),
+ *  but it hands real control to the token holder, so it is off by default. */
+async function answerRequest(args: Record<string, unknown>, session: string | null) {
+  if (!remoteAnswersEnabled()) {
+    throw new Error(
+      "answering requests is turned off — enable it in Settings → Control " +
+        '("Answer permission requests remotely")',
+    );
+  }
+  const conv = resolveTarget(args, session);
+  const requestId = typeof args.request_id === "string" ? args.request_id.trim() : "";
+  if (!requestId) throw new Error("answer_request: 'request_id' is required (see get_pending_request)");
+  const behavior = args.behavior === "allow" || args.behavior === "deny" ? args.behavior : null;
+  if (!behavior) throw new Error("answer_request: 'behavior' must be 'allow' or 'deny'");
+  const perms = useConversationStore.getState().sessions[conv.id]?.pendingPermissions ?? [];
+  const pending = perms.find((p) => p.request_id === requestId);
+  if (!pending) {
+    throw new Error(
+      `no pending request '${requestId}' — it may have been answered or withdrawn (see get_pending_request)`,
+    );
+  }
+  // Mirror useAnswerPermission: fail loudly when the process died with the card
+  // up — silently dismissing is indistinguishable from a delivered answer.
+  if (!conv.handle) throw new Error("the session ended before the answer could be sent");
+  const decision: PermissionDecision =
+    behavior === "allow"
+      ? { behavior: "allow", updated_input: (args.updated_input ?? null) as JsonValue | null }
+      : {
+          behavior: "deny",
+          message:
+            typeof args.message === "string" && args.message.trim() ? args.message.trim() : "Rejected.",
+        };
+  useConversationStore.getState().removePermission(conv.id, requestId);
+  const res = await commands.answerPermission(conv.handle, requestId, decision);
+  if (res.status === "error") throw new Error(res.error);
+  void commands.publishControlEvent("attention_cleared", conv.id, conv.name, {
+    reason: "answered",
+    request_id: requestId,
+    behavior,
+  });
+  return { conversation_id: conv.id, request_id: requestId, behavior };
+}
+
+function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
+  const conv = resolveTarget(args, session);
+  const effort = typeof args.effort === "string" ? args.effort.trim() : "";
+  if (!effort) throw new Error("set_conversation_effort: 'effort' is required");
+  const store = useConversationsStore.getState();
+  if (effort === "ultracode") {
+    store.setConvUltracode(conv.id);
+  } else {
+    const valid = effortLevelsForModel(conv.model);
+    if (!valid.includes(effort as EffortLevel))
+      throw new Error(
+        `set_conversation_effort: '${effort}' not available for this model (valid: ${valid.join(", ")})`,
+      );
+    store.setConvEffort(conv.id, effort);
+  }
+  return { conversation_id: conv.id, effort };
 }
 
 async function sendMessage(args: Record<string, unknown>, session: string | null) {
@@ -312,6 +481,134 @@ function renameConversation(args: Record<string, unknown>, session: string | nul
   if (!name) throw new Error("rename_conversation: 'name' is required");
   useConversationsStore.getState().renameConversation(conv.id, name);
   return { conversation_id: conv.id, title: name };
+}
+
+/** Mark a conversation as seen — clears its "needs attention" highlight, exactly
+ *  as the card's "Seen" button does. Non-destructive: it only dismisses the
+ *  alert; the conversation, its live session and its history are untouched. */
+function acknowledgeConv(args: Record<string, unknown>, session: string | null) {
+  const conv = resolveTarget(args, session);
+  acknowledgeConversation(conv.id);
+  return { conversation_id: conv.id, acknowledged: true };
+}
+
+/** Remove a conversation from the active Flight Deck list. NOT a history delete:
+ *  the transcript stays on disk (re-openable from History) and ⌘Z undoes it — it
+ *  just clears the conversation from the live list (and stops its session).
+ *  Gated by a user policy (`agentRemoveConversations`) and refuses to remove the
+ *  caller's own conversation (that would tear down the session mid-tool-call). */
+function removeConversationTool(args: Record<string, unknown>, session: string | null) {
+  if (!agentRemoveConversationsEnabled()) {
+    throw new Error(
+      "removing conversations is turned off — enable it in Settings → Control " +
+        "(\"Let agents remove conversations from the list\")",
+    );
+  }
+  const conv = resolveTarget(args, session);
+  if (session && conv.handle === session) {
+    throw new Error("can't remove the calling conversation — target another one by conversation_id");
+  }
+  const title = conv.name;
+  useConversationsStore.getState().removeConversation(conv.id);
+  return {
+    conversation_id: conv.id,
+    title,
+    removed: true,
+    note: "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
+  };
+}
+
+/** The best label for a past (on-disk) conversation: its AI title, else its
+ *  first human message, capped. */
+function diskTitle(d: DiskConversation): string {
+  const t = (d.title ?? "").trim();
+  return t || clip(d.excerpt, 80) || "(untitled)";
+}
+
+/** Search the on-disk history of PAST conversations (the History panel's index).
+ *  With a query it ranks by relevance; without one it returns the most recent.
+ *  Read-only — it surfaces candidates the agent can then `reopen_conversation`.
+ *  Marks rows already live so the agent focuses instead of duplicating. */
+async function searchPastConversations(args: Record<string, unknown>) {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  const rawLimit = typeof args.limit === "number" ? Math.floor(args.limit) : 15;
+  const limit = Math.min(40, Math.max(1, rawLimit || 15));
+
+  const listRes = await commands.listDiskConversations();
+  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
+  const byId = new Map(listRes.data.map((d) => [d.session_id, d]));
+  const activeSessionIds = new Set(
+    useConversationsStore
+      .getState()
+      .conversations.map((c) => c.sessionId)
+      .filter((s): s is string => !!s),
+  );
+
+  let rows: Array<{ d: DiskConversation; match?: string }>;
+  if (query) {
+    const hitRes = await commands.searchConversations(query);
+    if (hitRes.status !== "ok") throw new Error(`search failed: ${hitRes.error}`);
+    rows = hitRes.data
+      .map((h) => ({ d: byId.get(h.session_id), match: h.snippet }))
+      .filter((r): r is { d: DiskConversation; match: string } => !!r.d)
+      .slice(0, limit);
+  } else {
+    rows = [...listRes.data]
+      .sort((a, b) => b.mtime_ms - a.mtime_ms)
+      .slice(0, limit)
+      .map((d) => ({ d }));
+  }
+
+  return {
+    query: query || null,
+    count: rows.length,
+    conversations: rows.map(({ d, match }) => ({
+      session_id: d.session_id,
+      title: diskTitle(d),
+      repo: baseName(d.repo_root),
+      backend: d.backend,
+      last_activity_ms: d.mtime_ms,
+      already_active: activeSessionIds.has(d.session_id),
+      ...(match ? { match: clip(match, 160) } : {}),
+    })),
+  };
+}
+
+/** Bring a PAST conversation back onto the active Flight Deck list (by the
+ *  session_id from search_past_conversations). Non-destructive and additive:
+ *  it re-creates the list entry from the on-disk transcript, lazily (no process
+ *  until the next message). If it's already active, it focuses it instead. */
+async function reopenConversation(args: Record<string, unknown>) {
+  const sessionId = typeof args.session_id === "string" ? args.session_id.trim() : "";
+  if (!sessionId) {
+    throw new Error("reopen_conversation: 'session_id' is required (from search_past_conversations)");
+  }
+  const existing = useConversationsStore
+    .getState()
+    .conversations.find((c) => c.sessionId === sessionId);
+  if (existing) {
+    useConversationsStore.getState().selectConversation(existing.id);
+    return {
+      conversation_id: existing.id,
+      session_id: sessionId,
+      reopened: false,
+      note: "Already on the active list — focused it.",
+    };
+  }
+  const listRes = await commands.listDiskConversations();
+  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
+  const d = listRes.data.find((x) => x.session_id === sessionId);
+  if (!d) {
+    throw new Error(`no past conversation with session_id '${sessionId}' (see search_past_conversations)`);
+  }
+  const id = reactivateDiskConversation(d);
+  return {
+    conversation_id: id,
+    session_id: sessionId,
+    title: diskTitle(d),
+    reopened: true,
+    note: "Brought back onto the active Flight Deck list.",
+  };
 }
 
 async function addRepo(args: Record<string, unknown>) {
@@ -394,6 +691,26 @@ function openPanel(
   return { conversation_id: conv.id, panel };
 }
 
+async function browseFolders(args: Record<string, unknown>) {
+  const path = typeof args.path === "string" && args.path.trim() ? args.path.trim() : null;
+  const depth = typeof args.depth === "number" ? Math.max(1, Math.min(3, Math.floor(args.depth))) : null;
+  if (path && !path.startsWith("/"))
+    throw new Error("browse_folders: 'path' must be absolute (or omitted for the home overview)");
+  const res = await commands.folderTree(path, depth);
+  if (res.status !== "ok") throw new Error(`browse_folders: ${res.error}`);
+  // The registered repos ARE the agent's primary map — the tree is for finding
+  // what is not registered yet.
+  const s = useConversationsStore.getState();
+  return {
+    registered_repos: s.repos.map((r) => ({ name: baseName(r.path), path: r.path })),
+    root: res.data.root,
+    tree: res.data.tree,
+    ...(res.data.truncated
+      ? { note: "the tree was truncated — absent ≠ nonexistent; browse a subfolder for more" }
+      : {}),
+  };
+}
+
 function notifyUser(args: Record<string, unknown>) {
   const message = typeof args.message === "string" ? args.message.trim() : "";
   if (!message) throw new Error("notify_user: 'message' is required");
@@ -429,12 +746,40 @@ export async function executeAppControlTool(
       return sendMessage(args, session);
     case "create_conversation":
       return createConversation(args);
+    case "list_models":
+      return listModels();
+    case "set_conversation_model":
+      return setConversationModel(args, session);
+    case "set_conversation_effort":
+      return setConversationEffort(args, session);
+    case "interrupt_conversation":
+      return interruptConversation(args, session);
+    case "stop_stream":
+      return stopStream(args, session);
+    case "list_background_tasks":
+      return listBackgroundTasksTool(args, session);
+    case "stop_background_task":
+      return stopBackgroundTask(args, session);
+    case "get_pending_request":
+      return getPendingRequest(args, session);
+    case "answer_request":
+      return answerRequest(args, session);
     case "focus_conversation":
       return focusConversation(args, session, helpers);
     case "rename_conversation":
       return renameConversation(args, session);
+    case "acknowledge_conversation":
+      return acknowledgeConv(args, session);
+    case "remove_conversation":
+      return removeConversationTool(args, session);
+    case "search_past_conversations":
+      return searchPastConversations(args);
+    case "reopen_conversation":
+      return reopenConversation(args);
     case "add_repo":
       return addRepo(args);
+    case "browse_folders":
+      return browseFolders(args);
     case "open_file":
       return openFile(args, session, helpers);
     case "open_view":

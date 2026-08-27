@@ -27,10 +27,35 @@ export interface AppControlPrefs {
    *  exposed tool is non-destructive by design (no permission-mode changes, no
    *  deletes, no rewind — see the Rust-side catalogue). */
   agentServer: boolean;
+  /** May an agent REMOVE a conversation from the active Flight Deck list?
+   *
+   *  Non-destructive: the transcript stays on disk (re-openable from the
+   *  History panel) and the removal is ⌘Z-undoable — it only takes the
+   *  conversation off the live list (and stops its session). It is NOT a
+   *  history delete.
+   *
+   *  ON by default (the voice agent's "clear that one off my board" command),
+   *  but toggleable so removal can be kept human-only. Enforced in the front
+   *  executor (`agent/appControl.ts`), which covers every agent surface; the
+   *  in-app voice agent also stops advertising the tool when this is off. */
+  agentRemoveConversations: boolean;
+  /** May a REMOTE client (paired phone / relay) ANSWER pending requests —
+   *  permission prompts, questionnaires, plan approvals?
+   *
+   *  Answering a SPECIFIC pending request is not privilege-raising (the human
+   *  sees the exact tool + command and decides), unlike changing the permission
+   *  MODE, which stays forbidden everywhere. Still, it hands real control to
+   *  whoever holds the pairing token, so it is an explicit opt-in.
+   *
+   *  OFF by default. Enforced in the front executor (`agent/appControl.ts`),
+   *  which covers every surface the `answer_request` tool rides. */
+  remoteAnswers: boolean;
 }
 
 const DEFAULTS: AppControlPrefs = {
   agentServer: true,
+  agentRemoveConversations: true,
+  remoteAnswers: false,
 };
 
 function load(): AppControlPrefs {
@@ -63,6 +88,9 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
     set((s) => {
       const next: AppControlPrefs = {
         agentServer: patch.agentServer ?? s.agentServer,
+        agentRemoveConversations:
+          patch.agentRemoveConversations ?? s.agentRemoveConversations,
+        remoteAnswers: patch.remoteAnswers ?? s.remoteAnswers,
       };
       save(next);
       return next;
@@ -72,4 +100,14 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
 /** Read the current policy outside React (spawn path). */
 export function agentServerEnabled(): boolean {
   return useAppControlPrefs.getState().agentServer;
+}
+
+/** May an agent remove a conversation from the active list? (executor gate). */
+export function agentRemoveConversationsEnabled(): boolean {
+  return useAppControlPrefs.getState().agentRemoveConversations;
+}
+
+/** May a remote client answer pending permission requests? (executor gate). */
+export function remoteAnswersEnabled(): boolean {
+  return useAppControlPrefs.getState().remoteAnswers;
 }

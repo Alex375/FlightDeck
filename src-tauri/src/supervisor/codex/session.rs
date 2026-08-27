@@ -136,7 +136,7 @@ async fn run_codex_actor(
                 None => break true, // route/server closed: the app-server died
             },
             maybe_cmd = cmd_rx.recv() => match maybe_cmd {
-                Some(SessionCommand::Shutdown { ack }) => { shutdown_ack = ack; break false; }
+                Some(SessionCommand::Shutdown { ack, .. }) => { shutdown_ack = ack; break false; }
                 None => break false, // command channel closed: requested stop
                 Some(cmd) => core.on_command(cmd, &thread_id, &server).await,
             },

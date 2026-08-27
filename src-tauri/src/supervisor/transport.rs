@@ -18,6 +18,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,6 +80,53 @@ pub struct SpawnConfig {
     /// the bypass ON outright, which is never what this flag is for. Off unless the
     /// user opted in via Settings → General → Permissions.
     pub allow_bypass_permissions: bool,
+    /// When set, this session runs on a REMOTE host: ssh executes `flightdeckd
+    /// attach`, and the DAEMON on the server owns the actual `claude` process —
+    /// detached from this connection, so a network cut never kills the session.
+    /// The stream-json protocol, the [`CliMessage`] stream and every layer above
+    /// the transport are identical; the daemon replays what was missed on
+    /// reattach (see [`SpawnConfig::attach`]). `None` (the default) is the
+    /// unchanged local path. Codex ignores this — remote is Claude-only for now.
+    pub remote: Option<RemoteTarget>,
+    /// Reattach coordinates for a REMOTE session (ignored locally). `None` on
+    /// the first spawn; the session actor fills it from the daemon's
+    /// `fd_attach` handshake to reconnect after a drop without losing stream.
+    pub attach: Option<AttachPoint>,
+}
+
+/// Where to resume a remote attach stream: the daemon-side conversation, the
+/// claude-process epoch, and how many replayable lines this client has already
+/// received in that epoch (the cursor). See flightdeckd `frames.rs` — the
+/// replay-eligibility predicate ([`is_replayable_line`]) is a shared contract.
+#[derive(Debug, Clone, Default)]
+pub struct AttachPoint {
+    pub conversation: Option<String>,
+    pub epoch: Option<String>,
+    pub cursor: u64,
+}
+
+/// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
+/// Deck owns the connection coordinates (from the paired [`super::super::store::
+/// MachineRecord`]), so no `~/.ssh/config` editing is required. Holds NO secret: only
+/// a path to a private-key FILE on this Mac, never the key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTarget {
+    /// Hostname or IP reachable from this Mac.
+    pub host: String,
+    /// SSH port.
+    pub port: u16,
+    /// SSH user to log in as.
+    pub user: String,
+    /// Path to the private key file (`ssh -i`). `None` uses the user's default keys /
+    /// agent.
+    pub identity_file: Option<String>,
+    /// A dedicated `known_hosts` file (`UserKnownHostsFile`), so pinning a server's
+    /// host key never touches the user's `~/.ssh/known_hosts`. `None` uses the default.
+    pub known_hosts_file: Option<String>,
+    /// The `flightdeckd` binary name/path ON THE REMOTE host (resolved on the
+    /// remote PATH). Defaults to `"flightdeckd"`. The daemon resolves `claude`
+    /// itself, server-side.
+    pub daemon_bin: String,
 }
 
 impl SpawnConfig {
@@ -96,6 +144,8 @@ impl SpawnConfig {
             effort: None,
             permission_mode: None,
             allow_bypass_permissions: false,
+            remote: None,
+            attach: None,
         }
     }
 }
@@ -104,6 +154,183 @@ fn default_claude_bin() -> PathBuf {
     std::env::var_os("TOSSE_CLAUDE_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("claude"))
+}
+
+/// Build the `claude` argv (everything after the binary) from a [`SpawnConfig`].
+/// Shared verbatim by the local and remote launchers: the SAME flags must run
+/// whether `claude` is spawned here or over SSH, so the wire protocol is identical
+/// on both sides. The fixed prefix is the persistent bidirectional stream-json mode
+/// (spec §1–§2); the rest are the optional per-session flags.
+fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        // Persistent bidirectional stream-json mode. NOT `-p`/`--print`: with
+        // `--input-format stream-json` the process lives for the whole session and
+        // reads many messages from stdin (spec §1.1).
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--input-format".into(),
+        "stream-json".into(),
+        "--include-partial-messages".into(),
+        // Route permission decisions back over the stdio control channel as
+        // `control_request{can_use_tool}` (answered in subtask 2).
+        "--permission-prompt-tool".into(),
+        "stdio".into(),
+        // Re-emit user messages on stdout (`isReplay:true`) — the only way a turn
+        // injected by Remote Control (phone/web) reaches us live; our own turns are
+        // deduped by the uuid we stamp. Unconditional, like the official extension.
+        "--replay-user-messages".into(),
+        // Forward a sub-agent's OWN text and thinking, not just its tool calls
+        // (verified present in 2.1.220 / 2.1.222).
+        "--forward-subagent-text".into(),
+    ];
+    if let Some(resume) = &cfg.resume {
+        a.push("--resume".into());
+        a.push(resume.clone());
+    }
+    if !cfg.allowed_tools.is_empty() {
+        a.push("--allowedTools".into());
+        a.push(cfg.allowed_tools.join(","));
+    }
+    if !cfg.disallowed_tools.is_empty() {
+        a.push("--disallowedTools".into());
+        a.push(cfg.disallowed_tools.join(","));
+    }
+    for dir in &cfg.add_dirs {
+        a.push("--add-dir".into());
+        a.push(dir.to_string_lossy().into_owned());
+    }
+    if let Some(model) = &cfg.model {
+        a.push("--model".into());
+        a.push(model.clone());
+    }
+    if let Some(effort) = &cfg.effort {
+        a.push("--effort".into());
+        a.push(effort.clone());
+    }
+    if let Some(mode) = &cfg.permission_mode {
+        a.push("--permission-mode".into());
+        a.push(mode.clone());
+    }
+    // Unlocks `bypassPermissions` as a choice (it does NOT enable it). Opt-in.
+    if cfg.allow_bypass_permissions {
+        a.push("--allow-dangerously-skip-permissions".into());
+    }
+    a
+}
+
+/// Build the single POSIX-sh command `ssh` runs on the remote host: `exec
+/// flightdeckd attach …`. The DAEMON owns the `claude` process server-side
+/// (spawning it with the argv passed after `--` if it isn't already running,
+/// env included) and bridges this ssh channel to it — replaying everything the
+/// client missed since [`AttachPoint::cursor`]. Every interpolated value is
+/// single-quote-escaped, so remote paths/args with spaces or metacharacters are
+/// safe.
+fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String]) -> String {
+    let attach = cfg.attach.clone().unwrap_or_default();
+    let mut s = format!("exec {} attach", shell_quote(&remote.daemon_bin));
+    s.push_str(&format!(" --cwd {}", shell_quote(&cfg.cwd.to_string_lossy())));
+    if let Some(resume) = &cfg.resume {
+        s.push_str(&format!(" --resume-session {}", shell_quote(resume)));
+    }
+    if let Some(conv) = &attach.conversation {
+        s.push_str(&format!(" --conversation {}", shell_quote(conv)));
+    }
+    if let Some(epoch) = &attach.epoch {
+        s.push_str(&format!(" --epoch {}", shell_quote(epoch)));
+    }
+    s.push_str(&format!(" --cursor {}", attach.cursor));
+    s.push_str(" --");
+    for arg in args {
+        s.push(' ');
+        s.push_str(&shell_quote(arg));
+    }
+    s
+}
+
+/// Best-effort remote stop: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
+/// The deterministic tail of the user's explicit Stop for a remote session —
+/// the in-band `fd_stop` only reaches the daemon while the attach link is
+/// alive, and an explicit Stop must work precisely when it is not. Idempotent
+/// server-side (stopping a stopped session is a no-op). Returns whether the
+/// command ran and exited 0; failures are logged, never surfaced (the session
+/// is already torn down locally).
+pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = &remote.known_hosts_file {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(identity) = &remote.identity_file {
+        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+        "exec {} stop --conversation {}",
+        shell_quote(&remote.daemon_bin),
+        shell_quote(conversation),
+    ));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    match cmd.spawn() {
+        Ok(mut child) => matches!(
+            tokio::time::timeout(Duration::from_secs(15), child.wait()).await,
+            Ok(Ok(status)) if status.success()
+        ),
+        Err(e) => {
+            eprintln!("[transport] remote stop failed to launch ssh: {e}");
+            false
+        }
+    }
+}
+
+/// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
+/// line-for-line with flightdeckd (`frames::is_replayable_line`): a line counts
+/// iff it parses as a JSON object whose `type` is a string outside the control
+/// plane (`control_request` / `control_response` / `control_cancel_request` /
+/// `keep_alive`, which are correlation-scoped to one client and never
+/// replayed) and not a daemon `fd_*` frame. Both sides count the same lines or
+/// reattach cursors would drift.
+fn is_replayable_line(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    match serde_json::from_str::<Probe>(line) {
+        Ok(Probe { kind: Some(k) }) => {
+            !matches!(
+                k.as_str(),
+                "control_response" | "control_request" | "control_cancel_request" | "keep_alive"
+            ) && !k.starts_with("fd_")
+        }
+        _ => false,
+    }
+}
+
+/// POSIX single-quote escaping: wrap in single quotes and rewrite each embedded
+/// quote as `'\''`. Safe for arbitrary values inside a `/bin/sh -c` command.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// The `claude` binary path this app would spawn, resolved exactly as at session
@@ -288,6 +515,12 @@ pub struct Transport {
     reader_err: ErrSlot,
     /// Set if the stdin writer died on a write/flush/serialize failure.
     writer_err: ErrSlot,
+    /// Count of REPLAYABLE stdout lines received (see [`is_replayable_line`]) —
+    /// the reattach cursor for remote sessions. Always 0-based per transport.
+    lines_seen: Arc<AtomicU64>,
+    /// Whether this transport is an ssh→flightdeckd attach stream (drives the
+    /// `fd_stop` escalation in [`Transport::shutdown`]).
+    is_remote: bool,
 }
 
 impl Transport {
@@ -299,110 +532,86 @@ impl Transport {
     pub fn spawn(
         cfg: SpawnConfig,
     ) -> Result<(Transport, mpsc::UnboundedReceiver<CliMessage>), TransportError> {
-        let mut cmd = Command::new(resolve_bin(&cfg.claude_bin));
+        let args = build_claude_args(&cfg);
 
-        // Persistent bidirectional stream-json mode. NOT `-p`/`--print`: with
-        // `--input-format stream-json` the process lives for the whole session
-        // and reads many messages from stdin (spec §1.1).
-        cmd.arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--input-format")
-            .arg("stream-json")
-            .arg("--include-partial-messages")
-            // Route permission decisions back over the stdio control channel as
-            // `control_request{can_use_tool}` (answered in subtask 2).
-            .arg("--permission-prompt-tool")
-            .arg("stdio")
-            // Re-emit user messages on stdout (`isReplay:true`). Without this the CLI
-            // NEVER echoes a `user` turn — not ours (we render them optimistically) NOR
-            // one injected by Remote Control (a message typed on the phone/web). It is
-            // the ONLY way those remote turns reach us live; otherwise they'd surface
-            // only on reload (from the on-disk transcript). Unconditional, exactly like
-            // the official VS Code extension. Requires stream-json in+out (satisfied
-            // above). We stamp each user message we write with a uuid and suppress the
-            // echo of our OWN turns by it (see `user_message` + the assembler).
-            //
-            // ASSUMPTION (verified, re-check on every `claude` upgrade — like every wire
-            // pin here): the CLI re-emits our turn with the SAME top-level uuid we
-            // stamped, so the uuid dedup matches and our own message isn't rendered
-            // twice. Confirmed two ways: (1) the VS Code extension relies on the exact
-            // same round-trip; (2) dogfooded against 2.1.187 — locally-typed messages
-            // did NOT double. If a future build reassigns the uuid, the symptom is
-            // loud & immediate (every local message doubles), not silent.
-            .arg("--replay-user-messages")
-            // Forward a sub-agent's OWN text and thinking, not just its tool calls.
-            // Without this the binary filters sub-agent messages before forwarding —
-            // `if (!forwardSubagentText && type !== "tool_use" && type !== "tool_result")
-            // continue;` — and that filter applies at depth 1 already, which is why a
-            // live sub-agent drill-in showed steps but no prose while the SAME
-            // conversation reloaded from disk showed both. It also carries nested
-            // (depth-2+) sub-agents, keyed by the Agent tool_use that spawned them.
-            //
-            // Flag verified present in 2.1.220 (the installed build) and 2.1.222.
-            .arg("--forward-subagent-text");
+        // Local vs remote (SSH) launch. Everything downstream — the CliMessage
+        // stream, the session actor, the emit layer, the whole UI — is
+        // transport-neutral: only HOW `claude` is started, and where its cwd/env
+        // live, differs here (the "machine boundary", SSH-first).
+        let mut cmd = if let Some(remote) = &cfg.remote {
+            // Remote: `ssh <dest> "<export env; cd cwd && exec claude …>"`. The
+            // IDENTICAL stream-json argv runs on the remote host; stdin/stdout/stderr
+            // are the ssh channel, so the reader/writer/stderr pumps below are reused
+            // verbatim. No local cwd/bin check — both live on the remote side.
+            let remote_cmd = build_remote_command(&cfg, remote, &args);
+            let mut cmd = Command::new("ssh");
+            cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
+                .arg("-p")
+                .arg(remote.port.to_string())
+                .arg("-o")
+                .arg("BatchMode=yes") // never block a GUI app on a password prompt
+                .arg("-o")
+                .arg("ConnectTimeout=10") // fail fast if the host is unreachable
+                // A REAL network cut (wifi off, cable pulled) sends no FIN: without
+                // keepalives the ssh client hangs on a dead TCP connection for many
+                // minutes and the actor never sees the EOF that triggers its
+                // auto-reconnect. 5s probes × 3 misses → a dead link is detected in
+                // ~15s and the reattach/replay path takes over.
+                .arg("-o")
+                .arg("ServerAliveInterval=5")
+                .arg("-o")
+                .arg("ServerAliveCountMax=3")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
+            if let Some(kh) = &remote.known_hosts_file {
+                cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+            }
+            if let Some(identity) = &remote.identity_file {
+                // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
+                // authentication failures" when the agent holds many keys).
+                cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+            }
+            cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(remote_cmd);
+            cmd
+        } else {
+            // Local: a conversation whose cwd has vanished (e.g. its worktree was
+            // removed) makes `spawn` fail with NotFound — indistinguishable from a
+            // missing `claude` binary. Check first so the error names the real cause.
+            // (A relative cwd like "." resolves against the process dir and exists.)
+            if !cfg.cwd.exists() {
+                return Err(TransportError::CwdMissing(cfg.cwd.clone()));
+            }
+            let mut cmd = Command::new(resolve_bin(&cfg.claude_bin));
+            cmd.args(&args)
+                .current_dir(&cfg.cwd)
+                .env("CLAUDE_CODE_ENTRYPOINT", "tosse-code")
+                .env("MCP_CONNECTION_NONBLOCKING", "true")
+                .env("CLAUDE_CODE_ENABLE_TASKS", "0")
+                // Turn on the binary's file checkpointing so `rewind_files` can restore
+                // what a turn edited. In SDK/piloted mode (our case) its
+                // `fileHistoryEnabled` gate reads ONLY this env var — without it every
+                // rewind answers "File rewinding is not enabled." (verified live against
+                // 2.1.224). Costs nothing when unused.
+                .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
+                .env_remove("NODE_OPTIONS");
+            cmd
+        };
 
-        if let Some(resume) = &cfg.resume {
-            cmd.arg("--resume").arg(resume);
-        }
-        if !cfg.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(cfg.allowed_tools.join(","));
-        }
-        if !cfg.disallowed_tools.is_empty() {
-            cmd.arg("--disallowedTools").arg(cfg.disallowed_tools.join(","));
-        }
-        for dir in &cfg.add_dirs {
-            cmd.arg("--add-dir").arg(dir);
-        }
-        if let Some(model) = &cfg.model {
-            cmd.arg("--model").arg(model);
-        }
-        if let Some(effort) = &cfg.effort {
-            cmd.arg("--effort").arg(effort);
-        }
-        if let Some(mode) = &cfg.permission_mode {
-            cmd.arg("--permission-mode").arg(mode);
-        }
-        // Unlocks `bypassPermissions` as a choice (it does NOT enable it) — see the
-        // field doc. Opt-in, off by default.
-        if cfg.allow_bypass_permissions {
-            cmd.arg("--allow-dangerously-skip-permissions");
-        }
-
-        cmd.current_dir(&cfg.cwd)
-            .env("CLAUDE_CODE_ENTRYPOINT", "tosse-code")
-            .env("MCP_CONNECTION_NONBLOCKING", "true")
-            .env("CLAUDE_CODE_ENABLE_TASKS", "0")
-            // Turn on the binary's file checkpointing so `rewind_files` can restore what
-            // a turn edited. In interactive mode the CLI enables this itself, but in
-            // SDK/piloted mode (our case) its `fileHistoryEnabled` gate reads ONLY this
-            // env var — without it every rewind answers "File rewinding is not enabled."
-            // (verified live against 2.1.224). Costs nothing when unused: the binary just
-            // snapshots the files IT edits, and rewinding stays an explicit user action.
-            .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
-            .env_remove("NODE_OPTIONS")
-            .stdin(Stdio::piped())
+        // Shared by both launchers: piped stdio + own process group + drop backstop.
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Backstop: if the handle is dropped without shutdown, don't orphan
-            // the process.
+            // Backstop: if the handle is dropped without shutdown, don't orphan the
+            // process (locally the `claude` child; remotely the `ssh` client).
             .kill_on_drop(true);
 
-        // Put `claude` in its OWN process group (it becomes the group leader, so
-        // its pgid == its pid). On shutdown we signal the whole group (`-pid`),
-        // reaching every descendant — tool subprocesses, MCP servers — so none is
-        // ever orphaned. `kill_on_drop` only reaches the direct child and would
-        // miss those grandchildren.
+        // Own process group (group leader, pgid == pid). On shutdown we signal the
+        // whole group (`-pid`), reaching every descendant — tool subprocesses / MCP
+        // servers locally, or the `ssh` client remotely — so none is orphaned.
+        // A remote `claude` then exits on its own when the ssh channel closes
+        // (stdin EOF), the same graceful path the local child follows.
         #[cfg(unix)]
         cmd.process_group(0);
-
-        // A conversation whose cwd has vanished (e.g. its worktree was removed)
-        // makes `spawn` fail with NotFound — indistinguishable from a missing
-        // `claude` binary. Check first so the error names the real cause. (A
-        // relative cwd like "." resolves against the process dir and exists.)
-        if !cfg.cwd.exists() {
-            return Err(TransportError::CwdMissing(cfg.cwd.clone()));
-        }
 
         let mut child = cmd.spawn().map_err(TransportError::Spawn)?;
         let pid = child.id();
@@ -417,9 +626,10 @@ impl Transport {
         let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX)));
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         let pumps = vec![
-            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone())),
+            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone(), lines_seen.clone())),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
         ];
@@ -433,9 +643,18 @@ impl Transport {
                 stderr_tail,
                 reader_err,
                 writer_err,
+                lines_seen,
+                is_remote: cfg.remote.is_some(),
             },
             msg_rx,
         ))
+    }
+
+    /// How many replayable stream lines this transport has delivered — the
+    /// reattach cursor contribution of the CURRENT connection (the actor adds
+    /// the daemon's `replay_from` base).
+    pub fn lines_seen(&self) -> u64 {
+        self.lines_seen.load(Ordering::Relaxed)
     }
 
     /// OS process id, while the child is alive.
@@ -512,7 +731,18 @@ impl Transport {
     ///
     /// `kill_on_drop` remains the backstop if this is never called. On non-Unix
     /// the signal steps degrade to `tokio`'s force-kill (`SIGKILL`-equivalent).
-    pub async fn shutdown(&mut self) {
+    ///
+    /// `stop_remote` (remote transports only): send `fd_stop` first, telling the
+    /// DAEMON to kill the server-side `claude` too. Without it, closing an
+    /// attach stream merely DETACHES — the session keeps running on the server
+    /// (that's the point: app quit / handle drop must not kill remote work; only
+    /// the user's explicit Stop does).
+    pub async fn shutdown(&mut self, stop_remote: bool) {
+        if stop_remote && self.is_remote {
+            if let Some(tx) = &self.writer_tx {
+                let _ = tx.send(serde_json::json!({ "type": "fd_stop" }));
+            }
+        }
         // Step 1 — graceful EOF: drop the writer sender → writer_loop ends → stdin
         // is dropped → the child sees EOF and normally exits once the turn settles.
         self.writer_tx = None;
@@ -578,6 +808,7 @@ async fn reader_loop(
     stdout: ChildStdout,
     tx: mpsc::UnboundedSender<CliMessage>,
     reader_err: ErrSlot,
+    lines_seen: Arc<AtomicU64>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -586,6 +817,9 @@ async fn reader_loop(
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
+                }
+                if is_replayable_line(trimmed) {
+                    lines_seen.fetch_add(1, Ordering::Relaxed);
                 }
                 match serde_json::from_str::<CliMessage>(trimmed) {
                     Ok(msg) => {
@@ -697,6 +931,100 @@ mod tests {
         let cfg = SpawnConfig::new("/tmp");
         assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
         assert_eq!(cfg.cwd, PathBuf::from("/tmp"));
+        // Local by default: no remote target, so `spawn` takes the local path.
+        assert!(cfg.remote.is_none());
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes_single_quotes() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote("/work/demo"), "'/work/demo'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        // The classic POSIX single-quote escape: close, escaped quote, reopen.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// The wire protocol MUST be identical local vs remote: the argv builder is the
+    /// single source of truth, and it starts with the persistent bidirectional
+    /// stream-json prefix, in order, then carries the optional per-session flags.
+    #[test]
+    fn build_claude_args_is_the_stream_json_protocol() {
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-opus-4-8".into());
+        cfg.permission_mode = Some("auto".into());
+        let a = build_claude_args(&cfg);
+        assert_eq!(
+            &a[0..6],
+            &[
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--input-format",
+                "stream-json",
+                "--include-partial-messages",
+            ]
+        );
+        assert!(a.iter().any(|s| s == "--replay-user-messages"));
+        assert!(a.iter().any(|s| s == "--forward-subagent-text"));
+        // Optional flags flow through as adjacent (flag, value) pairs.
+        let model_at = a.iter().position(|s| s == "--model").unwrap();
+        assert_eq!(a[model_at + 1], "claude-opus-4-8");
+    }
+
+    /// The remote command hands the session to the server's daemon: `exec
+    /// flightdeckd attach` with the reattach coordinates, then the claude argv
+    /// after `--` (the daemon spawns claude with it when the session is cold).
+    /// Everything shell-quoted.
+    #[test]
+    fn build_remote_command_execs_flightdeckd_attach() {
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-opus-4-8".into());
+        cfg.resume = Some("sid-123".into());
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+        };
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.starts_with("exec 'flightdeckd' attach"), "cmd was: {cmd}");
+        assert!(cmd.contains("--cwd '/work/demo'"));
+        assert!(cmd.contains("--resume-session 'sid-123'"));
+        assert!(cmd.contains("--cursor 0"));
+        assert!(cmd.contains(" -- "));
+        assert!(cmd.contains("'--output-format' 'stream-json'"));
+        assert!(cmd.contains("'--model' 'claude-opus-4-8'"));
+
+        // A reconnect carries the daemon conversation, epoch and cursor.
+        cfg.attach = Some(AttachPoint {
+            conversation: Some("conv-1".into()),
+            epoch: Some("ep-1".into()),
+            cursor: 42,
+        });
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
+        assert!(cmd.contains("--epoch 'ep-1'"));
+        assert!(cmd.contains("--cursor 42"));
+    }
+
+    /// The replay-cursor predicate — MUST mirror flightdeckd frames.rs
+    /// `is_replayable_line` line-for-line (shared contract; drift = cursor bugs).
+    #[test]
+    fn replayable_line_predicate_matches_daemon_contract() {
+        assert!(is_replayable_line(r#"{"type":"assistant","message":{}}"#));
+        assert!(is_replayable_line(r#"{"type":"system","subtype":"init"}"#));
+        assert!(is_replayable_line(r#"{"type":"stream_event","event":{}}"#));
+        assert!(is_replayable_line(r#"{"type":"result","subtype":"success"}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_response","response":{}}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_request","request":{}}"#));
+        assert!(!is_replayable_line(r#"{"type":"control_cancel_request"}"#));
+        assert!(!is_replayable_line(r#"{"type":"keep_alive"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_attach"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_detach"}"#));
+        assert!(!is_replayable_line("not json"));
+        assert!(!is_replayable_line(r#"{"no_type":true}"#));
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real
@@ -814,7 +1142,7 @@ mod tests {
             .expect("grandchild pid should be recorded");
         assert!(is_alive(grandchild), "grandchild should run before shutdown");
 
-        transport.shutdown().await;
+        transport.shutdown(false).await;
 
         assert!(
             wait_until_dead(grandchild).await,
@@ -905,10 +1233,125 @@ mod tests {
             .await
             .expect("turn should complete within the deadline");
 
-        transport.shutdown().await;
+        transport.shutdown(false).await;
 
         assert!(saw_init, "expected a system/init message");
         assert!(saw_assistant_text, "expected the assistant to stream 'hello world'");
         assert_eq!(result_ok, Some(true), "expected a successful result");
+    }
+
+    /// Live end-to-end REMOTE transport check: the exact app code path for a remote
+    /// conversation — `SpawnConfig.remote` → `Transport::spawn` launches `ssh` →
+    /// `flightdeckd attach` on the server → the DAEMON-owned `claude` streams back →
+    /// we parse the same `CliMessage`s. Proves the attach handshake (`fd_attach`),
+    /// the streamed turn, AND the detach/reattach replay: after the turn we drop the
+    /// transport (detach — the session survives server-side), reattach with the
+    /// cursor, and expect NO duplicated stream (replay resumes exactly).
+    ///
+    /// Ignored by default: needs the `flightdeck-m1` container up with fresh creds
+    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored remote_transport_streams_over_ssh --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
+    async fn remote_transport_streams_over_ssh() {
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(
+                std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+                    format!(
+                        "{}/.ssh/flightdeck_m0_ed25519",
+                        std::env::var("HOME").unwrap_or_default()
+                    )
+                }),
+            ),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+        };
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(remote);
+
+        let (mut transport, mut rx) =
+            Transport::spawn(cfg.clone()).expect("remote (ssh) spawn should start");
+        transport
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .expect("send should queue");
+
+        let mut saw_init = false;
+        let mut saw_assistant_text = false;
+        let mut result_ok: Option<bool> = None;
+        let mut attach: Option<crate::supervisor::protocol::FdAttachMsg> = None;
+
+        // Remote adds an SSH round-trip; give it comfortable headroom.
+        let deadline = Duration::from_secs(120);
+        let drain = async {
+            while let Some(msg) = rx.recv().await {
+                match &msg {
+                    CliMessage::FdAttach(a) => attach = Some(a.clone()),
+                    CliMessage::System(crate::supervisor::protocol::SystemMsg::Init(_)) => {
+                        saw_init = true;
+                    }
+                    CliMessage::Assistant(a) => {
+                        if a.message.to_string().to_lowercase().contains("hello world") {
+                            saw_assistant_text = true;
+                        }
+                    }
+                    CliMessage::Result(r) => {
+                        result_ok = Some(!r.is_error);
+                        break;
+                    }
+                    // Tolerate Unknown here (unlike the local test): the app NEVER
+                    // panics on it — it's the logged protocol-drift canary — and a live
+                    // persistent session can carry housekeeping lines this build doesn't
+                    // model. We assert on the things that prove streaming works instead.
+                    _ => {}
+                }
+            }
+        };
+
+        tokio::time::timeout(deadline, drain)
+            .await
+            .expect("remote turn should complete within the deadline");
+
+        let attach = attach.expect("expected the daemon's fd_attach handshake");
+        let cursor = attach.replay_from + transport.lines_seen();
+
+        // DETACH without stopping (the app-quit path): the session must survive.
+        transport.shutdown(false).await;
+
+        // REATTACH with the cursor: the daemon must accept and NOT re-stream the
+        // finished turn (no line with a seq we already counted).
+        let mut cfg2 = cfg.clone();
+        cfg2.attach = Some(AttachPoint {
+            conversation: Some(attach.conversation.clone()),
+            epoch: Some(attach.epoch.clone()),
+            cursor,
+        });
+        let (mut transport2, mut rx2) =
+            Transport::spawn(cfg2).expect("reattach spawn should start");
+        let reattach = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(msg) = rx2.recv().await {
+                if let CliMessage::FdAttach(a) = msg {
+                    return Some(a);
+                }
+            }
+            None
+        })
+        .await
+        .expect("reattach should answer quickly")
+        .expect("expected fd_attach on reattach");
+        assert_eq!(reattach.epoch, attach.epoch, "same claude process across the detach");
+        assert_eq!(
+            reattach.replay_from, cursor,
+            "replay must resume exactly at our cursor (no duplicates, no gaps)"
+        );
+        transport2.shutdown(false).await;
+
+        assert!(saw_init, "expected a system/init message from the remote claude");
+        assert!(saw_assistant_text, "expected the remote assistant to stream 'hello world'");
+        assert_eq!(result_ok, Some(true), "expected a successful remote result");
     }
 }

@@ -21,14 +21,14 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    ConversationRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
+    ConversationRecord, MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 10;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -58,6 +58,8 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v6,
     migrate_v7,
     migrate_v8,
+    migrate_v9,
+    migrate_v10,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -278,6 +280,51 @@ fn migrate_v8(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v9 — a repo that lives on a REMOTE host reached over SSH. `ssh_target` holds the
+/// SSH destination (a `~/.ssh/config` alias or `user@host`) whose `claude` runs this
+/// repo's conversations; the existing `path` column becomes the path ON THAT HOST.
+/// NULL (every existing row, and every local folder) means "local", so nothing
+/// changes for a user who never adds a remote server — the "machine boundary",
+/// SSH-first (see `supervisor::transport`). Additive + guarded, like every column
+/// migration above.
+fn migrate_v9(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "ssh_target",
+        "ALTER TABLE repos ADD COLUMN ssh_target TEXT",
+    )
+}
+
+/// v10 — the "machine boundary": a `machines` table (paired remote servers) and a
+/// `repos.machine_id` FK. A repo with a non-null `machine_id` lives on that server and
+/// runs its conversations there over SSH (superseding the raw `ssh_target` string from
+/// v9, now vestigial — additive discipline: we don't drop it). NULL machine_id = local
+/// (every existing row), so nothing changes for a user with no remote server. The
+/// machines row holds connection coordinates only — never key material.
+fn migrate_v10(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machines (
+             id            TEXT PRIMARY KEY,
+             label         TEXT NOT NULL,
+             host          TEXT NOT NULL,
+             port          INTEGER NOT NULL,
+             user          TEXT NOT NULL,
+             identity_file TEXT,
+             added_at      INTEGER NOT NULL
+         );",
+    )?;
+    // No inline REFERENCES on the added column: SQLite's ALTER TABLE ADD COLUMN is
+    // fussy about FK clauses across versions, so the machine→repos cascade is enforced
+    // in `delete_machine` instead (delete the machine's repos first). NULL = local.
+    add_column_if_absent(
+        conn,
+        "repos",
+        "machine_id",
+        "ALTER TABLE repos ADD COLUMN machine_id TEXT",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -374,14 +421,34 @@ impl Store {
     pub fn load_state(&self) -> rusqlite::Result<PersistedState> {
         let conn = self.conn.lock().unwrap();
 
-        let mut repos_stmt =
-            conn.prepare("SELECT id, path, added_at FROM repos ORDER BY added_at ASC")?;
+        let mut machines_stmt = conn.prepare(
+            "SELECT id, label, host, port, user, identity_file, added_at
+             FROM machines ORDER BY added_at ASC",
+        )?;
+        let machines = machines_stmt
+            .query_map([], |row| {
+                Ok(MachineRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    user: row.get(4)?,
+                    identity_file: row.get(5)?,
+                    added_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut repos_stmt = conn
+            .prepare("SELECT id, path, added_at, machine_id FROM repos ORDER BY added_at ASC")?;
         let repos = repos_stmt
             .query_map([], |row| {
                 Ok(RepoRecord {
                     id: row.get(0)?,
                     path: row.get(1)?,
                     added_at: row.get(2)?,
+                    // NULL (pre-v10 rows + every local folder) → None (local).
+                    machine_id: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -427,6 +494,7 @@ impl Store {
             .optional()?;
 
         Ok(PersistedState {
+            machines,
             repos,
             conversations,
             active_id,
@@ -434,12 +502,102 @@ impl Store {
     }
 
     /// Insert or update a repo (idempotent by id).
+    ///
+    /// `machine_id` (a repo's remoteness) is written on insert but, on update, is
+    /// PRESERVED when the incoming value is NULL: `COALESCE(excluded.machine_id,
+    /// repos.machine_id)`. Callers that rewrite the record wholesale but know nothing
+    /// about remoteness (rename, undo, add-a-folder) pass `None` and so can never
+    /// blank a repo the user connected to a server — mirroring the deliberate care
+    /// around the TOSSE link. To move a repo to another server, pass the new id; to
+    /// make it local again, delete and re-add (no un-remote path exists, by design).
     pub fn upsert_repo(&self, repo: &RepoRecord) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO repos (id, path, added_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET path = excluded.path, added_at = excluded.added_at",
-            params![repo.id, repo.path, repo.added_at],
+            "INSERT INTO repos (id, path, added_at, machine_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 path = excluded.path,
+                 added_at = excluded.added_at,
+                 machine_id = COALESCE(excluded.machine_id, repos.machine_id)",
+            params![repo.id, repo.path, repo.added_at, repo.machine_id],
         )?;
+        Ok(())
+    }
+
+    /// The remote server the repo at `path` lives on, when that repo is remote
+    /// (`machine_id` set); `None` for a local repo or no match. Called at spawn so a
+    /// conversation opened in a remote repo launches its `claude` on that server (see
+    /// the `spawn_session` command). Keyed by `path` because that is what the spawn
+    /// command receives (the conversation's cwd == the repo path for a remote repo;
+    /// remote worktrees are out of scope for the SSH-first alpha).
+    pub fn machine_for_repo_path(&self, path: &str) -> rusqlite::Result<Option<MachineRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at
+                 FROM repos r JOIN machines m ON m.id = r.machine_id
+                 WHERE r.path = ?1 AND r.machine_id IS NOT NULL LIMIT 1",
+                params![path],
+                |row| {
+                    Ok(MachineRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        host: row.get(2)?,
+                        port: row.get(3)?,
+                        user: row.get(4)?,
+                        identity_file: row.get(5)?,
+                        added_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// One remote server by id, or `None`.
+    pub fn machine_by_id(&self, id: &str) -> rusqlite::Result<Option<MachineRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, label, host, port, user, identity_file, added_at
+                 FROM machines WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(MachineRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        host: row.get(2)?,
+                        port: row.get(3)?,
+                        user: row.get(4)?,
+                        identity_file: row.get(5)?,
+                        added_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Insert or update a remote server (idempotent by id). Connection coordinates
+    /// only — never key material (see [`MachineRecord`]).
+    pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 label = excluded.label, host = excluded.host, port = excluded.port,
+                 user = excluded.user, identity_file = excluded.identity_file",
+            params![m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a remote server and everything anchored to it. Deletes its repos first
+    /// (which cascades to their conversations via the repos→conversations FK), then
+    /// the machine row — the machine→repos cascade enforced in code (see
+    /// [`migrate_v10`], which omits the column-level FK for ALTER-TABLE portability).
+    pub fn delete_machine(&self, id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM repos WHERE machine_id = ?1", params![id])?;
+        conn.execute("DELETE FROM machines WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -713,11 +871,62 @@ mod tests {
             id: id.into(),
             path: format!("/tmp/{id}"),
             added_at,
+            machine_id: None,
         }
     }
 
     fn repo(id: &str) -> RepoRecord {
         repo_at(id, 1)
+    }
+
+    /// The v10 "machine boundary": pair a server, mark a repo remote, resolve it by
+    /// path, keep the COALESCE guard, and cascade repos away when the server is removed.
+    #[test]
+    fn machines_pair_repos_resolve_and_cascade() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: Some("/keys/id".into()),
+            added_at: 1,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        // A remote repo ON that server, and a plain local repo.
+        let mut remote = repo_at("r-remote", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+
+        // Resolve remoteness by the path the spawn command receives.
+        let got = s.machine_for_repo_path("/work/demo").unwrap().unwrap();
+        assert_eq!((got.host.as_str(), got.port, got.user.as_str()), ("h.example", 2222, "agent"));
+        assert!(s.machine_for_repo_path("/tmp/r-local").unwrap().is_none(), "local repo has no machine");
+
+        // Machines hydrate into PersistedState.
+        assert_eq!(s.load_state().unwrap().machines.len(), 1);
+
+        // A wholesale re-upsert with machine_id=None must NOT blank the remoteness.
+        let mut touch = repo_at("r-remote", 1);
+        touch.path = "/work/demo".into();
+        touch.machine_id = None;
+        s.upsert_repo(&touch).unwrap();
+        assert!(
+            s.machine_for_repo_path("/work/demo").unwrap().is_some(),
+            "None machine_id must be COALESCEd to the existing value"
+        );
+
+        // Un-pairing the server removes it AND its repos; local repos survive.
+        s.delete_machine("m1").unwrap();
+        assert!(s.machine_for_repo_path("/work/demo").unwrap().is_none());
+        let after = s.load_state().unwrap();
+        assert!(after.machines.is_empty());
+        assert!(after.repos.iter().all(|r| r.id != "r-remote"), "remote repo gone with its server");
+        assert!(after.repos.iter().any(|r| r.id == "r-local"), "local repo stays");
     }
 
     fn conv_at(

@@ -1719,6 +1719,85 @@ async deleteRepo(id: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
+ * key), stored under the app data dir. Returns the private-key path and the public
+ * key to paste on the server. The private key never leaves this Mac. Wraps the system
+ * `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+ */
+async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_machine_key", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pair a remote server: probe it (SSH reachable + `claude` present), and on success
+ * persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
+ * probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
+ * not at the first message.
+ */
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null) : Promise<Result<MachineRecord, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Un-pair a remote server: removes it and every repo/conversation anchored to it.
+ */
+async deleteMachine(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_machine", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Discover git repositories on a paired server (a bounded `find` for `.git` dirs
+ * under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
+ * of making the user recall a path. Returns repo folder paths, most-shallow first.
+ */
+async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_repos", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
+ * so the "new remote conversation" flow can offer a click-to-descend folder browser —
+ * the remote stand-in for the native folder picker. Hidden dirs are omitted.
+ */
+async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteListing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its
+ * parent already exists — a remote `mkdir` (NOT `mkdir -p`). So a typo in the parent
+ * chain fails loudly instead of silently materialising a wrong deep path. Idempotent
+ * when the folder is already there. Called just before opening a remote conversation.
+ */
+async prepareRemoteDir(machineId: string, path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Insert or update a conversation's metadata (idempotent by stable id).
  */
 async upsertConversation(conversation: ConversationRecord) : Promise<Result<null, string>> {
@@ -1880,6 +1959,123 @@ async setVoiceBridge(enabled: boolean | null, port: number | null, regenerateTok
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Whether an OpenAI key is stored (plus its masked hint). `configured: false`
+ * is the NORMAL optional-feature state, never an error. Async + off-thread:
+ * every one of these spawns `/usr/bin/security`, which must never run on the
+ * main thread (a Keychain ACL prompt can block it for seconds).
+ */
+async voiceAgentStatus() : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Store the user's OpenAI API key in the macOS Keychain (verified by
+ * read-back). Returns the fresh status.
+ */
+async setVoiceAgentKey(key: string) : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_voice_agent_key", { key }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget the stored OpenAI key (absent item = success).
+ */
+async clearVoiceAgentKey() : Promise<Result<VoiceAgentStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_voice_agent_key") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Mint a short-lived Realtime client secret for ONE voice session — the only
+ * shape of the credential the webview ever sees.
+ */
+async voiceAgentClientSecret() : Promise<Result<ClientSecret, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Current honest wake-word status: the config plus whether the detector is really
+ * capturing, with the reason when it is not.
+ */
+async wakeWordStatus() : Promise<WakeStatus> {
+    return await TAURI_INVOKE("wake_word_status");
+},
+/**
+ * Change the wake-word config (any subset of enable/phrase/sensitivity), persist
+ * it, and (re)start or stop the detector to match. Blocking (model load + mic
+ * open), so run off the async thread. Returns the honest post-apply status — a
+ * mic/model failure comes back as `running:false` + `error`, never a lying switch.
+ */
+async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null) : Promise<Result<WakeStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
+ * JSON. The in-app voice agent reads it to declare its Realtime function
+ * tools from the SAME source the MCP servers serve — one catalogue, no drift.
+ */
+async appControlTools(surface: string) : Promise<Result<JsonValue, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("app_control_tools", { surface }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * A compact, bounded directory tree for AGENT orientation (the `browse_folders`
+ * app-control tool): where could I work on this Mac? `path: None` starts at the
+ * user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.
+ */
+async folderTree(path: string | null, depth: number | null) : Promise<Result<FolderTree, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("folder_tree", { path, depth }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The remote-access relay's current status (Settings read-back: config + whether
+ * the outbound connection is actually up, plus the pairing QR).
+ */
+async remoteStatus() : Promise<RemoteStatus> {
+    return await TAURI_INVOKE("remote_status");
+},
+/**
+ * Change the remote-access config (enable, relay URL, regenerate the pairing
+ * token), persist it, and (re)connect or disconnect accordingly. Regenerating
+ * the pairing token revokes every previously-paired phone. Returns the honest
+ * post-apply status.
+ */
+async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean) : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1907,6 +2103,7 @@ terminalOutputEvent: TerminalOutputEvent,
 tickEvent: TickEvent,
 tosseCrmEvent: TosseCrmEvent,
 tosseLiveStateEvent: TosseLiveStateEvent,
+wakeWordEvent: WakeWordEvent,
 workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
@@ -1929,6 +2126,7 @@ terminalOutputEvent: "terminal-output-event",
 tickEvent: "tick-event",
 tosseCrmEvent: "tosse-crm-event",
 tosseLiveStateEvent: "tosse-live-state-event",
+wakeWordEvent: "wake-word-event",
 workflowJournalEvent: "workflow-journal-event"
 })
 
@@ -2213,6 +2411,15 @@ to: string | null;
  * The CLI's own result line, bounded — shown verbatim so the user sees exactly what it said.
  */
 message: string }
+/**
+ * A short-lived Realtime client secret, safe to hand to the webview: it opens
+ * exactly one WebRTC session and expires on its own.
+ */
+export type ClientSecret = { value: string; 
+/**
+ * Unix seconds, as reported by OpenAI.
+ */
+expires_at: number; model: string }
 /**
  * The signed-in Codex account, whitelisted from `account/read` (no tokens — the wire
  * response carries none, and we forward only these fields).
@@ -2667,6 +2874,28 @@ exists: boolean; size: number;
  */
 mtime_ms: number | null }
 /**
+ * A compact, depth- and size-bounded directory tree, built for AGENT
+ * orientation ("where on this Mac could I work?"), not for the editor: the
+ * app-control `browse_folders` tool serves it so a voice/app agent can find a
+ * repository path instead of making the user dictate one.
+ */
+export type FolderTree = { 
+/**
+ * The absolute root the tree was built from.
+ */
+root: string; 
+/**
+ * Indented text (two spaces per level), one directory per line. A directory
+ * holding a `.git` is marked `(git repo)` and NOT descended into — its
+ * internals are noise for orientation. Over-cap sublists end with `… (+N)`.
+ */
+tree: string; 
+/**
+ * The line budget cut the walk short — "not in the tree" must never be
+ * read as "does not exist".
+ */
+truncated: boolean }
+/**
  * The result of a fork ("branch a new conversation here"): the freshly-written
  * branch conversation (ready to bring into the app via `reactivateDiskConversation`) and,
  * for a USER-message fork, the removed prompt text to seed the new conversation's composer.
@@ -2690,6 +2919,19 @@ export type FsEntry = { name: string; path: string; is_dir: boolean }
  * hint instead of silently going stale. Not session-keyed (single active watch).
  */
 export type FsWatchErrorEvent = { message: string }
+/**
+ * A freshly generated dedicated SSH key for a server. The PRIVATE key stays on this
+ * Mac at `identity_file`; `public_key` is the single line to authorize on the server.
+ */
+export type GeneratedKey = { 
+/**
+ * Absolute path to the private key on this Mac (goes on the MachineRecord).
+ */
+identity_file: string; 
+/**
+ * The public key line to append to the server's `~/.ssh/authorized_keys`.
+ */
+public_key: string }
 /**
  * A file's contents on both sides of a diff, handed to the front's Monaco diff
  * editor (which computes the visual diff itself). An empty `old_text` means the
@@ -2937,6 +3179,40 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
+ * A remote host (a "server") reached over SSH, on which repos can live and their
+ * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
+ * the connection coordinates so a user adds a server from the UI without editing any
+ * SSH config by hand. Deliberately holds NO secret — only a pointer to a key file on
+ * this Mac (`identity_file`), never the key material itself.
+ */
+export type MachineRecord = { id: string; 
+/**
+ * Human label shown in the UI (e.g. "my-vps").
+ */
+label: string; 
+/**
+ * Hostname or IP reachable from this Mac.
+ */
+host: string; 
+/**
+ * SSH port (usually 22).
+ */
+port: number; 
+/**
+ * SSH user to log in as.
+ */
+user: string; 
+/**
+ * Absolute path to the PRIVATE key file (on this Mac) Flight Deck authenticates
+ * with — typically the dedicated key it generated for this server. `None` falls
+ * back to the user's default SSH keys / agent.
+ */
+identity_file: string | null; 
+/**
+ * Unix ms timestamp the server was added.
+ */
+added_at: number }
+/**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
  * granularity the CLI exposes — there is no per-plugin auto-update). The count of
@@ -3102,7 +3378,12 @@ agent_id: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
-export type PersistedState = { repos: RepoRecord[]; conversations: ConversationRecord[]; 
+export type PersistedState = { 
+/**
+ * Remote servers the user has paired, so the UI can list them and mark which
+ * repos are remote at boot.
+ */
+machines?: MachineRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
 /**
  * Stable id of the conversation that was active when last persisted.
  */
@@ -3227,13 +3508,39 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * One level of a remote server's filesystem: the resolved absolute `path` and its
+ * immediate SUB-directories (names only). Powers the remote folder browser.
+ */
+export type RemoteListing = { path: string; dirs: string[] }
+/**
+ * Live state of the outbound remote-access relay connection, for the Settings
+ * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
+ * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+ */
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+/**
  * A working folder a conversation can be opened in.
  */
-export type RepoRecord = { id: string; path: string; 
+export type RepoRecord = { id: string; 
+/**
+ * Absolute path of the folder. For a remote repo (`machine_id` set) this is the
+ * path ON THAT SERVER.
+ */
+path: string; 
 /**
  * Unix ms timestamp the repo was first added.
  */
-added_at: number }
+added_at: number; 
+/**
+ * When set, this repo lives on a REMOTE server (FK to [`MachineRecord::id`]): its
+ * conversations spawn `claude` on that machine over SSH, and `path` is a path on
+ * it. `None` (every pre-existing row and every local folder) is the unchanged
+ * local case — the whole app treats a NULL `machine_id` exactly as before. See
+ * the SSH transport in `supervisor::transport`. NB `upsert_repo` PRESERVES an
+ * existing non-null value when a caller passes `None`, so a rename/undo can never
+ * blank a repo's remoteness.
+ */
+machine_id: string | null }
 /**
  * An in-flight automatic retry of the current turn's API call.
  */
@@ -3850,6 +4157,16 @@ export type UsageError =
  */
 export type UsageWindow = { used_percentage: number; resets_at: string | null }
 /**
+ * What the Settings card needs to render the voice-agent state: whether a key
+ * is stored, and a masked hint so the user can tell WHICH key without ever
+ * seeing it again.
+ */
+export type VoiceAgentStatus = { configured: boolean; 
+/**
+ * e.g. `"sk-…d4f2"` — never more than the tail of the key.
+ */
+key_hint: string | null }
+/**
  * The live state of the voice bridge, as reported to the Settings UI. This is
  * the honest read-back: `running`/`error` reflect what the listener actually
  * did, never what the toggle optimistically hoped (a failed bind must show).
@@ -3863,6 +4180,34 @@ url: string | null;
  * Why the server is not running although enabled (bind failure, …).
  */
 error: string | null }
+/**
+ * One selectable wake phrase for the Settings picker.
+ */
+export type WakePhrase = { key: string; label: string }
+/**
+ * The Settings read-back: the config PLUS whether the detector is actually up,
+ * with the reason when it is not (no mic, model load failure…). Honest by design.
+ */
+export type WakeStatus = { enabled: boolean; phrase: string; sensitivity: number; 
+/**
+ * The capture + inference worker is live right now.
+ */
+running: boolean; 
+/**
+ * Why the detector is not running while `enabled` — surfaced in Settings.
+ */
+error: string | null; 
+/**
+ * The phrases the user can choose from (bundled classifiers).
+ */
+phrases: WakePhrase[] }
+/**
+ * The wake word was heard by the on-device detector (`crate::wake`). The front
+ * reacts like a spoken push-to-talk — arm the voice session and open the mic (see
+ * `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`
+ * is the detected phrase key, `score` the classifier confidence.
+ */
+export type WakeWordEvent = { phrase: string; score: number }
 /**
  * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is

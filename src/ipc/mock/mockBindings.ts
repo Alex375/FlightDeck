@@ -81,7 +81,12 @@ import type {
   TerminalOutputEvent,
   TickEvent,
   UsageError,
+  ClientSecret,
+  FolderTree,
+  VoiceAgentStatus,
+  RemoteStatus,
   VoiceBridgeStatus,
+  WakeStatus,
   WorkflowJournal,
   WorkflowJournalEvent,
   WorkflowPhase,
@@ -241,6 +246,38 @@ const mockVoiceBridge: VoiceBridgeStatus = {
   port: 7068,
   token: "mock-voice-token",
   url: null,
+  error: null,
+};
+
+// In-memory wake-word state for the browser mock (no real capture / models).
+const mockWake: WakeStatus = {
+  enabled: false,
+  phrase: "alexa",
+  sensitivity: 0.5,
+  running: false,
+  error: null,
+  phrases: [
+    { key: "alexa", label: "Alexa" },
+    { key: "hey_jarvis", label: "Hey Jarvis" },
+    { key: "ground_control", label: "Ground Control" },
+  ],
+};
+
+// In-memory voice-agent key state for the browser mock (no real Keychain).
+const mockVoiceAgent: VoiceAgentStatus = {
+  configured: false,
+  key_hint: null,
+};
+
+// In-memory remote-access state for the browser mock (no real relay connection).
+const mockRemote: RemoteStatus = {
+  enabled: false,
+  connected: false,
+  relay_url: "https://relay-production-8fd4.up.railway.app",
+  mac_id: "mock-mac-id",
+  phone_token: "mock-phone-token",
+  pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
+  pairing_qr_svg: null,
   error: null,
 };
 
@@ -1357,7 +1394,7 @@ export const mockCommands = {
     if (!demo) return ok({ repos: [], conversations: [], active_id: null });
     const now = Date.now();
     return ok({
-      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now }],
+      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
       conversations: [
         {
           id: "conv-demo",
@@ -1471,6 +1508,87 @@ export const mockCommands = {
       ? `http://127.0.0.1:${mockVoiceBridge.port}/mcp`
       : null;
     return ok({ ...mockVoiceBridge });
+  },
+
+  // ---- In-app voice agent ----
+  // No Keychain / OpenAI in the browser mock: the key "stores" in memory so the
+  // Settings card is exercisable, but a session can never start (clear error).
+
+  async voiceAgentStatus(): Promise<Result<VoiceAgentStatus, string>> {
+    return ok({ ...mockVoiceAgent });
+  },
+
+  async setVoiceAgentKey(key: string): Promise<Result<VoiceAgentStatus, string>> {
+    if (key.trim().length < 20) return err("that is too short to be an OpenAI API key");
+    mockVoiceAgent.configured = true;
+    mockVoiceAgent.key_hint = `sk-…${key.trim().slice(-4)}`;
+    return ok({ ...mockVoiceAgent });
+  },
+
+  async clearVoiceAgentKey(): Promise<Result<VoiceAgentStatus, string>> {
+    mockVoiceAgent.configured = false;
+    mockVoiceAgent.key_hint = null;
+    return ok({ ...mockVoiceAgent });
+  },
+
+  async voiceAgentClientSecret(): Promise<Result<ClientSecret, string>> {
+    return err("the voice agent is not available in the browser mock");
+  },
+
+  // ---- Wake word ----
+  // No real microphone / ONNX models in the browser mock: the config "sticks" so
+  // the Settings rows are exercisable, but the detector can never actually run.
+
+  async wakeWordStatus(): Promise<WakeStatus> {
+    return { ...mockWake };
+  },
+
+  async setWakeWordConfig(
+    enabled: boolean | null,
+    phrase: string | null,
+    sensitivity: number | null,
+  ): Promise<Result<WakeStatus, string>> {
+    if (enabled !== null) mockWake.enabled = enabled;
+    if (phrase !== null) mockWake.phrase = phrase;
+    if (sensitivity !== null) mockWake.sensitivity = Math.min(1, Math.max(0, sensitivity));
+    // The mock has no capture backend, so "running" can never be true.
+    mockWake.running = false;
+    mockWake.error = mockWake.enabled
+      ? "the wake-word detector is not available in the browser mock"
+      : null;
+    return ok({ ...mockWake });
+  },
+
+  async appControlTools(_surface: string): Promise<Result<unknown, string>> {
+    return ok({ tools: [] });
+  },
+
+  async folderTree(
+    path: string | null,
+    _depth: number | null,
+  ): Promise<Result<FolderTree, string>> {
+    return ok({
+      root: path ?? "/Users/demo",
+      tree: "Documents/\n  repositories/\n    demo-app/ (git repo)\nDesktop/",
+      truncated: false,
+    });
+  },
+
+  async remoteStatus(): Promise<RemoteStatus> {
+    return { ...mockRemote };
+  },
+
+  async setRemote(
+    enabled: boolean | null,
+    relayUrl: string | null,
+    regeneratePairing: boolean,
+  ): Promise<Result<RemoteStatus, string>> {
+    if (enabled !== null) mockRemote.enabled = enabled;
+    if (relayUrl !== null && relayUrl.trim()) mockRemote.relay_url = relayUrl.trim();
+    if (regeneratePairing) mockRemote.phone_token = `mock-pt-${Date.now()}`;
+    mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockRemote.phone_token}`;
+    mockRemote.connected = mockRemote.enabled;
+    return ok({ ...mockRemote });
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

@@ -160,6 +160,107 @@ pub fn read_dir(path: &str) -> std::io::Result<Vec<FsEntry>> {
     Ok(entries)
 }
 
+/// A compact, depth- and size-bounded directory tree, built for AGENT
+/// orientation ("where on this Mac could I work?"), not for the editor: the
+/// app-control `browse_folders` tool serves it so a voice/app agent can find a
+/// repository path instead of making the user dictate one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct FolderTree {
+    /// The absolute root the tree was built from.
+    pub root: String,
+    /// Indented text (two spaces per level), one directory per line. A directory
+    /// holding a `.git` is marked `(git repo)` and NOT descended into — its
+    /// internals are noise for orientation. Over-cap sublists end with `… (+N)`.
+    pub tree: String,
+    /// The line budget cut the walk short — "not in the tree" must never be
+    /// read as "does not exist".
+    pub truncated: bool,
+}
+
+/// Directories that never help an agent orient itself: build output, dependency
+/// caches, and the macOS home folders that are either huge or never hold code.
+const TREE_SKIP: &[&str] = &[
+    "node_modules", "target", "dist", "build", "vendor", "Pods", "venv", ".venv",
+    "__pycache__", "Library", "Applications", "Movies", "Music", "Pictures", "Public",
+];
+
+/// Hard caps keeping the tree a prompt-sized artefact: total lines, children
+/// listed per directory, and maximum depth.
+const TREE_MAX_LINES: usize = 150;
+const TREE_MAX_CHILDREN: usize = 25;
+const TREE_MAX_DEPTH: usize = 3;
+
+/// Build a [`FolderTree`]. `root: None` starts at the user's home folder; depth
+/// is clamped to 1..=[`TREE_MAX_DEPTH`]. Directories only, hidden entries and
+/// [`TREE_SKIP`] excluded, symlinks not followed (a cloud/network mount behind a
+/// link must not stall the walk).
+pub fn folder_tree(root: Option<&str>, depth: usize) -> std::io::Result<FolderTree> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
+        _ => std::env::var("HOME")
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?,
+    };
+    let depth = depth.clamp(1, TREE_MAX_DEPTH);
+    let meta = fs::metadata(&root)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{root} is not a directory"),
+        ));
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut truncated = false;
+    walk_tree(Path::new(&root), 0, depth, &mut lines, &mut truncated);
+    Ok(FolderTree { root, tree: lines.join("\n"), truncated })
+}
+
+fn walk_tree(dir: &Path, level: usize, max_depth: usize, lines: &mut Vec<String>, truncated: &mut bool) {
+    if level >= max_depth {
+        return;
+    }
+    let Ok(read) = fs::read_dir(dir) else { return };
+    // Sub-directories only, filtered, alphabetical for a stable readable tree.
+    let mut dirs: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
+    for dent in read.flatten() {
+        let name = dent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || TREE_SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        // Symlinks are NOT followed: file_type() is the link itself here.
+        let Ok(ft) = dent.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = dent.path();
+        let is_git = path.join(".git").exists();
+        dirs.push((name, path, is_git));
+    }
+    dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    let over_cap = dirs.len().saturating_sub(TREE_MAX_CHILDREN);
+    for (name, path, is_git) in dirs.into_iter().take(TREE_MAX_CHILDREN) {
+        if lines.len() >= TREE_MAX_LINES {
+            *truncated = true;
+            return;
+        }
+        let indent = "  ".repeat(level);
+        lines.push(if is_git {
+            format!("{indent}{name}/ (git repo)")
+        } else {
+            format!("{indent}{name}/")
+        });
+        // A git repo's internals are noise for orientation — stop there.
+        if !is_git {
+            walk_tree(&path, level + 1, max_depth, lines, truncated);
+        }
+    }
+    if over_cap > 0 {
+        *truncated = true;
+        if lines.len() < TREE_MAX_LINES {
+            lines.push(format!("{}… (+{over_cap} more)", "  ".repeat(level)));
+        }
+    }
+}
+
 /// Read a file for the editor, guarding size and binariness. A file over
 /// [`MAX_FILE_BYTES`] returns `too_large`; one with a NUL byte in its first 8 KiB
 /// returns `binary`; otherwise its bytes are decoded UTF-8 (lossily, so an odd
@@ -515,6 +616,43 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// ACCEPTANCE (agent orientation): the tree lists directories only, marks a
+    /// git repo WITHOUT descending into it, skips hidden/noise dirs, and
+    /// respects the depth bound.
+    #[test]
+    fn folder_tree_orients_without_noise() {
+        let root = fresh_dir();
+        for d in ["projects/alpha/.git", "projects/alpha/src", "projects/beta/sub/deep",
+                  "node_modules/junk", ".hidden/x", "Documents/notes"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        fs::write(root.join("stray-file.txt"), "x").unwrap();
+        let out = folder_tree(Some(root.to_str().unwrap()), 3).unwrap();
+        assert!(out.tree.contains("alpha/ (git repo)"), "{}", out.tree);
+        // No descent into a git repo, no files, no hidden, no skip-list dirs.
+        assert!(!out.tree.contains("src"), "{}", out.tree);
+        assert!(!out.tree.contains("stray-file"), "{}", out.tree);
+        assert!(!out.tree.contains(".hidden"), "{}", out.tree);
+        assert!(!out.tree.contains("node_modules"), "{}", out.tree);
+        // Depth 3 from root: projects/ → beta/ → sub/ shown, deep/ (level 4) not.
+        assert!(out.tree.contains("sub/"), "{}", out.tree);
+        assert!(!out.tree.contains("deep"), "{}", out.tree);
+        assert!(!out.truncated);
+    }
+
+    /// The caps make the tree a bounded artefact: an over-wide directory is cut
+    /// with an explicit marker and the truncated flag — never silently complete.
+    #[test]
+    fn folder_tree_caps_are_loud() {
+        let root = fresh_dir();
+        for i in 0..30 {
+            fs::create_dir_all(root.join(format!("dir{i:02}"))).unwrap();
+        }
+        let out = folder_tree(Some(root.to_str().unwrap()), 1).unwrap();
+        assert!(out.truncated);
+        assert!(out.tree.contains("(+5 more)"), "{}", out.tree);
+    }
 
     /// A fresh, empty temp directory unique to this test run.
     fn fresh_dir() -> PathBuf {

@@ -148,6 +148,15 @@ pub async fn spawn_session(
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
     let id = sessions.next_id();
+    // A conversation opened in a REMOTE repo (one whose repo carries a machine_id)
+    // launches its `claude` on that server over SSH instead of locally. Resolved from
+    // the repo by path here — no new IPC param (spawn_session is at specta's 10-arg
+    // cap) and no change to the front's hot path. No machine = the unchanged local case.
+    let remote_machine = app
+        .state::<Store>()
+        .machine_for_repo_path(&repo_path)
+        .ok()
+        .flatten();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
@@ -177,6 +186,41 @@ pub async fn spawn_session(
         )
         .to_string(),
     );
+    // Route this session to its remote server when the repo is remote. Claude-only for
+    // now: the Codex backend has its own local-only transport, so a "remote" Codex
+    // conversation would silently run on THIS Mac — refuse it loudly instead.
+    if let Some(machine) = remote_machine {
+        if matches!(backend, Backend::Codex) {
+            return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
+        }
+        // A dedicated known_hosts under the app data dir, so pinning a server's host
+        // key never touches the user's ~/.ssh/known_hosts.
+        let known_hosts_file = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+        cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
+            host: machine.host,
+            port: machine.port,
+            user: machine.user,
+            identity_file: machine.identity_file,
+            known_hosts_file,
+            daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
+                .unwrap_or_else(|_| "flightdeckd".to_string()),
+        });
+        // Pre-mint the daemon-side conversation id so retries are idempotent: if
+        // the FIRST attach dies before its fd_attach handshake lands, the
+        // reconnect presents the same id and re-joins the same daemon
+        // conversation instead of cold-starting a duplicate (and leaking a
+        // claude process server-side). The daemon prefers a LIVE session
+        // matching `resume` over this id, so resumes still re-join correctly.
+        cfg.attach = Some(crate::supervisor::transport::AttachPoint {
+            conversation: Some(uuid::Uuid::new_v4().to_string()),
+            epoch: None,
+            cursor: 0,
+        });
+    }
     let initial = InitialControls {
         model: cfg.model.clone(),
         effort: cfg.effort.clone(),
@@ -206,7 +250,10 @@ pub async fn spawn_session(
         Backend::Claude => {
             // Hand the app-control hub to sessions that expose the in-process MCP
             // server; `None` keeps the wire identical to the pre-MCP client.
-            let appmcp = app_control
+            // Remote sessions never get it: their claude runs detached on the
+            // server — an mcp_message arriving while no Mac is attached would
+            // hang the tool call there with nobody to answer it.
+            let appmcp = (app_control && cfg.remote.is_none())
                 .then(|| (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone());
             session::spawn_session(id.clone(), cfg, initial, emitter, on_exit, appmcp)
         }
@@ -1016,7 +1063,7 @@ pub async fn fetch_slash_commands(cwd: String) -> Result<Vec<SlashCommand>, Stri
     .await
     .unwrap_or_default();
 
-    transport.shutdown().await;
+    transport.shutdown(false).await;
     Ok(commands)
 }
 
@@ -1786,7 +1833,9 @@ pub async fn stop_session(
         // enqueued): a rewind truncates the transcript right after stopping the session and
         // must not race a still-alive `claude` writer. Ignore a closed channel / timeout —
         // the actor may have already exited on its own, in which case it's stopped anyway.
-        let _ = handle.shutdown_and_wait().await;
+        // The user's explicit Stop: a remote session's server-side claude is
+        // stopped too (fd_stop), not merely detached.
+        let _ = handle.shutdown_and_wait_stopping().await;
     }
     Ok(())
 }
@@ -2516,6 +2565,352 @@ pub fn delete_repo(store: tauri::State<'_, Store>, id: String) -> Result<(), Str
     store.delete_repo(&id).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Remote servers (the SSH "machine boundary" — pairing + connection)
+// ---------------------------------------------------------------------------
+
+/// A freshly generated dedicated SSH key for a server. The PRIVATE key stays on this
+/// Mac at `identity_file`; `public_key` is the single line to authorize on the server.
+#[derive(serde::Serialize, specta::Type)]
+pub struct GeneratedKey {
+    /// Absolute path to the private key on this Mac (goes on the MachineRecord).
+    pub identity_file: String,
+    /// The public key line to append to the server's `~/.ssh/authorized_keys`.
+    pub public_key: String,
+}
+
+/// Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
+/// key), stored under the app data dir. Returns the private-key path and the public
+/// key to paste on the server. The private key never leaves this Mac. Wraps the system
+/// `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+#[tauri::command]
+#[specta::specta]
+pub async fn generate_machine_key(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<GeneratedKey, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("ssh_keys");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let slug: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let key = dir.join(format!("{slug}-{}", uuid::Uuid::new_v4()));
+    let pub_path = PathBuf::from(format!("{}.pub", key.display()));
+    let out = tokio::process::Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("") // no passphrase (BatchMode auth)
+        .arg("-C")
+        .arg(format!("flightdeck-{slug}"))
+        .arg("-f")
+        .arg(&key)
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh-keygen: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let public_key = std::fs::read_to_string(&pub_path)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    Ok(GeneratedKey {
+        identity_file: key.to_string_lossy().into_owned(),
+        public_key,
+    })
+}
+
+/// Verify we can SSH into a server AND that `claude` runs there, with a fast, batch
+/// (never-prompting) probe. Returns the server's `claude --version` on success, or an
+/// actionable error (unreachable / auth refused / claude missing).
+async fn probe_remote(
+    host: &str,
+    port: u16,
+    user: &str,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(id) = identity {
+        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{user}@{host}")).arg(
+        "command -v claude >/dev/null 2>&1 && claude --version || { echo FLIGHTDECK_NO_CLAUDE >&2; exit 3; }",
+    );
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(3) || stderr.contains("FLIGHTDECK_NO_CLAUDE") {
+        return Err("Connected over SSH, but `claude` is not installed on the server. \
+                    On the server run: curl -fsSL https://claude.ai/install.sh | sh — \
+                    then log Claude in there (`claude`), and retry."
+            .to_string());
+    }
+    Err(format!(
+        "Could not connect over SSH: {}",
+        stderr.trim().lines().last().unwrap_or("unknown error")
+    ))
+}
+
+/// Pair a remote server: probe it (SSH reachable + `claude` present), and on success
+/// persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
+/// probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
+/// not at the first message.
+#[tauri::command]
+#[specta::specta]
+pub async fn add_machine(
+    app: tauri::AppHandle,
+    label: String,
+    host: String,
+    port: u16,
+    user: String,
+    identity_file: Option<String>,
+) -> Result<crate::store::MachineRecord, String> {
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    probe_remote(
+        &host,
+        port,
+        &user,
+        identity_file.as_deref(),
+        known_hosts.as_deref(),
+    )
+    .await?;
+    let machine = crate::store::MachineRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        label,
+        host,
+        port,
+        user,
+        identity_file,
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    };
+    app.state::<Store>()
+        .upsert_machine(&machine)
+        .map_err(|e| e.to_string())?;
+    Ok(machine)
+}
+
+/// Un-pair a remote server: removes it and every repo/conversation anchored to it.
+#[tauri::command]
+#[specta::specta]
+pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), String> {
+    store.delete_machine(&id).map_err(|e| e.to_string())
+}
+
+/// Run a command on a server over SSH (batch, never-prompting), returning stdout on
+/// success or the last stderr line on failure. The connection coordinates come from
+/// the [`MachineRecord`]; `known_hosts` is Flight Deck's own file (TOFU pinning).
+async fn run_ssh_on_machine(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(m.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(id) = &m.identity_file {
+        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("ssh command failed")
+            .to_string())
+    }
+}
+
+/// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
+/// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
+/// of making the user recall a path. Returns repo folder paths, most-shallow first.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_remote_repos(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<Vec<String>, String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    // Search $HOME plus a few common server roots (missing dirs are silently skipped),
+    // so repos outside the home folder (e.g. /work, /srv) are still found.
+    let out = run_ssh_on_machine(
+        &machine,
+        known_hosts.as_deref(),
+        "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
+         2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
+/// POSIX single-quote escaping so a user-supplied remote path can't break out of the
+/// remote shell command (wrap in single quotes; rewrite each embedded quote as `'\''`).
+fn shq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// One level of a remote server's filesystem: the resolved absolute `path` and its
+/// immediate SUB-directories (names only). Powers the remote folder browser.
+#[derive(serde::Serialize, specta::Type)]
+pub struct RemoteListing {
+    pub path: String,
+    pub dirs: Vec<String>,
+}
+
+/// List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
+/// so the "new remote conversation" flow can offer a click-to-descend folder browser —
+/// the remote stand-in for the native folder picker. Hidden dirs are omitted.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_remote_dir(
+    app: tauri::AppHandle,
+    machine_id: String,
+    path: String,
+) -> Result<RemoteListing, String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    // First stdout line = the resolved absolute dir (pwd -P); the rest = its sub-dirs.
+    let script = format!(
+        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
+         if ! cd \"$P\" 2>/dev/null; then printf 'cannot open %s\\n' \"$P\" >&2; exit 4; fi; \
+         pwd -P; ls -1p . 2>/dev/null | grep '/$' | sed 's#/$##'",
+        p = shq(&path)
+    );
+    let out = run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await?;
+    let mut lines = out.lines();
+    let resolved = lines.next().unwrap_or("").trim().to_string();
+    let dirs = lines
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    Ok(RemoteListing { path: resolved, dirs })
+}
+
+/// Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its
+/// parent already exists — a remote `mkdir` (NOT `mkdir -p`). So a typo in the parent
+/// chain fails loudly instead of silently materialising a wrong deep path. Idempotent
+/// when the folder is already there. Called just before opening a remote conversation.
+#[tauri::command]
+#[specta::specta]
+pub async fn prepare_remote_dir(
+    app: tauri::AppHandle,
+    machine_id: String,
+    path: String,
+) -> Result<(), String> {
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    let script = format!(
+        "D={d}; if [ -d \"$D\" ]; then exit 0; fi; \
+         PARENT=$(dirname \"$D\"); \
+         if [ ! -d \"$PARENT\" ]; then printf 'parent-missing\\n' >&2; exit 6; fi; \
+         mkdir \"$D\" 2>/dev/null || {{ printf 'mkdir-failed\\n' >&2; exit 5; }}",
+        d = shq(&path)
+    );
+    match run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("parent-missing") => Err(
+            "The parent folder doesn't exist on the server — only the final folder is \
+             created, so check the path."
+                .to_string(),
+        ),
+        Err(e) if e.contains("mkdir-failed") => {
+            Err("Couldn't create that folder on the server (permission?).".to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Insert or update a conversation's metadata (idempotent by stable id).
 #[tauri::command]
 #[specta::specta]
@@ -2676,6 +3071,244 @@ pub async fn set_voice_bridge(
     }
     hub.apply_voice(cfg).await;
     Ok(hub.voice_status())
+}
+
+// ---------------------------------------------------------------------------
+// In-app voice agent (OpenAI Realtime — see `crate::voice`)
+// ---------------------------------------------------------------------------
+
+/// Whether an OpenAI key is stored (plus its masked hint). `configured: false`
+/// is the NORMAL optional-feature state, never an error. Async + off-thread:
+/// every one of these spawns `/usr/bin/security`, which must never run on the
+/// main thread (a Keychain ACL prompt can block it for seconds).
+#[tauri::command]
+#[specta::specta]
+pub async fn voice_agent_status() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::status)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))
+}
+
+/// Store the user's OpenAI API key in the macOS Keychain (verified by
+/// read-back). Returns the fresh status.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
+}
+
+/// Forget the stored OpenAI key (absent item = success).
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
+    tokio::task::spawn_blocking(crate::voice::clear_key)
+        .await
+        .map_err(|e| format!("keychain task failed: {e}"))?
+}
+
+/// Mint a short-lived Realtime client secret for ONE voice session — the only
+/// shape of the credential the webview ever sees.
+#[tauri::command]
+#[specta::specta]
+pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, String> {
+    crate::voice::mint_client_secret().await
+}
+
+// ---------------------------------------------------------------------------
+// Wake word — on-device "Alexa" / "Hey Jarvis" trigger (see `crate::wake`)
+// ---------------------------------------------------------------------------
+
+/// Keys under which the wake-word config persists in the store's `meta` table.
+const WAKE_ENABLED_KEY: &str = "wake_word_enabled";
+const WAKE_PHRASE_KEY: &str = "wake_word_phrase";
+const WAKE_SENSITIVITY_KEY: &str = "wake_word_sensitivity";
+
+/// Load the persisted wake-word config (best-effort; unset/garbled → defaults),
+/// sanitized so an unknown phrase or out-of-range sensitivity can never reach the
+/// detector. Read at startup so the detector can arm with the app.
+pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
+    let read = |key: &str| store.get_config(key).ok().flatten();
+    let default = crate::wake::WakeConfig::default();
+    let phrase = read(WAKE_PHRASE_KEY).unwrap_or(default.phrase);
+    let sensitivity = read(WAKE_SENSITIVITY_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default.sensitivity);
+    let (phrase, sensitivity) = crate::wake::sanitize(&phrase, sensitivity);
+    crate::wake::WakeConfig {
+        enabled: read(WAKE_ENABLED_KEY).as_deref() == Some("1"),
+        phrase,
+        sensitivity,
+    }
+}
+
+/// Current honest wake-word status: the config plus whether the detector is really
+/// capturing, with the reason when it is not.
+#[tauri::command]
+#[specta::specta]
+pub fn wake_word_status(
+    wake: tauri::State<'_, Arc<crate::wake::WakeController>>,
+) -> crate::wake::WakeStatus {
+    wake.status()
+}
+
+/// Change the wake-word config (any subset of enable/phrase/sensitivity), persist
+/// it, and (re)start or stop the detector to match. Blocking (model load + mic
+/// open), so run off the async thread. Returns the honest post-apply status — a
+/// mic/model failure comes back as `running:false` + `error`, never a lying switch.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_wake_word_config(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    phrase: Option<String>,
+    sensitivity: Option<f32>,
+) -> Result<crate::wake::WakeStatus, String> {
+    // Scope the store guard so it is dropped before the `.await` (it is not Send).
+    let cfg = {
+        let store = app.state::<Store>();
+        let mut cfg = load_wake_config(&store);
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
+        }
+        if let Some(phrase) = phrase {
+            cfg.phrase = phrase;
+        }
+        if let Some(sensitivity) = sensitivity {
+            cfg.sensitivity = sensitivity;
+        }
+        let (phrase, sensitivity) = crate::wake::sanitize(&cfg.phrase, cfg.sensitivity);
+        cfg.phrase = phrase;
+        cfg.sensitivity = sensitivity;
+        store
+            .set_config(WAKE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
+            .and_then(|_| store.set_config(WAKE_PHRASE_KEY, &cfg.phrase))
+            .and_then(|_| store.set_config(WAKE_SENSITIVITY_KEY, &cfg.sensitivity.to_string()))
+            .map_err(|e| e.to_string())?;
+        cfg
+    };
+    let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
+    tokio::task::spawn_blocking(move || wake.apply(cfg))
+        .await
+        .map_err(|e| format!("wake apply task failed: {e}"))
+}
+
+/// A compact, bounded directory tree for AGENT orientation (the `browse_folders`
+/// app-control tool): where could I work on this Mac? `path: None` starts at the
+/// user's home. Off-thread — a slow (cloud-synced) folder must not stall the app.
+#[tauri::command]
+#[specta::specta]
+pub async fn folder_tree(
+    path: Option<String>,
+    depth: Option<u32>,
+) -> Result<crate::fs::FolderTree, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::fs::folder_tree(path.as_deref(), depth.unwrap_or(2) as usize)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("folder tree task failed: {e}"))?
+}
+
+/// The app-control tool catalogue for a surface ("app" | "voice"), as MCP tool
+/// JSON. The in-app voice agent reads it to declare its Realtime function
+/// tools from the SAME source the MCP servers serve — one catalogue, no drift.
+#[tauri::command]
+#[specta::specta]
+pub fn app_control_tools(surface: String) -> Result<serde_json::Value, String> {
+    let surface = match surface.as_str() {
+        "app" => crate::appmcp::Surface::App,
+        "voice" => crate::appmcp::Surface::Voice,
+        other => return Err(format!("unknown surface '{other}' (app | voice)")),
+    };
+    Ok(crate::appmcp::tools::list_json(surface))
+}
+
+/// Keys under which the remote-access relay persists its config in `meta`.
+const REMOTE_ENABLED_KEY: &str = "remote_enabled";
+const REMOTE_URL_KEY: &str = "remote_relay_url";
+const REMOTE_MAC_ID_KEY: &str = "remote_mac_id";
+const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
+const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
+
+/// Load the remote-access config, minting (and persisting) the stable mac id, the
+/// mac secret and the phone pairing token on first use so Settings always has a QR
+/// to show. Best-effort on read errors (then it starts disabled with defaults).
+pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
+    let read = |key: &str| store.get_config(key).ok().flatten();
+    let mint = |key: &str| -> String {
+        match read(key) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                let v = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = store.set_config(key, &v) {
+                    eprintln!("[appmcp] failed to persist {key}: {e}");
+                }
+                v
+            }
+        }
+    };
+    crate::appmcp::RemoteConfig {
+        enabled: read(REMOTE_ENABLED_KEY).as_deref() == Some("1"),
+        relay_url: read(REMOTE_URL_KEY)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::appmcp::DEFAULT_RELAY_URL.to_string()),
+        mac_id: mint(REMOTE_MAC_ID_KEY),
+        mac_token: mint(REMOTE_MAC_TOKEN_KEY),
+        phone_token: mint(REMOTE_PHONE_TOKEN_KEY),
+    }
+}
+
+/// The remote-access relay's current status (Settings read-back: config + whether
+/// the outbound connection is actually up, plus the pairing QR).
+#[tauri::command]
+#[specta::specta]
+pub fn remote_status(
+    hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
+) -> crate::appmcp::RemoteStatus {
+    hub.remote_status()
+}
+
+/// Change the remote-access config (enable, relay URL, regenerate the pairing
+/// token), persist it, and (re)connect or disconnect accordingly. Regenerating
+/// the pairing token revokes every previously-paired phone. Returns the honest
+/// post-apply status.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_remote(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    relay_url: Option<String>,
+    regenerate_pairing: bool,
+) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    let cfg = {
+        let store = app.state::<Store>();
+        let mut cfg = load_remote_config(&store);
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
+        }
+        if let Some(url) = relay_url {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                cfg.relay_url = url;
+            }
+        }
+        if regenerate_pairing {
+            cfg.phone_token = uuid::Uuid::new_v4().to_string();
+        }
+        store
+            .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
+            .and_then(|_| store.set_config(REMOTE_URL_KEY, &cfg.relay_url))
+            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &cfg.mac_id))
+            .and_then(|_| store.set_config(REMOTE_MAC_TOKEN_KEY, &cfg.mac_token))
+            .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
+            .map_err(|e| e.to_string())?;
+        cfg
+    };
+    hub.apply_remote(cfg).await;
+    Ok(hub.remote_status())
 }
 
 #[tauri::command]

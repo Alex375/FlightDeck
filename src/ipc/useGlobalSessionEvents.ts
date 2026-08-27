@@ -56,6 +56,8 @@ import {
   dispatchAgentNotification,
   peekInterrupt,
 } from "../notifications/notify";
+import { queueVoiceAnnouncement } from "../voice/announce";
+import { useVoiceStore } from "../voice/voiceStore";
 import {
   SETTLE_MS,
   agentEventFor,
@@ -224,6 +226,35 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
           },
     )
     .catch((e) => console.error("publish_control_event failed:", e));
+
+  // Same settled event, third consumer: the in-app voice agent's spoken
+  // announcements — gated on the ARMED voice mode (the on-screen "session
+  // vocale" toggle), so a disarmed feature costs nothing (the queue caps and
+  // drains in src/voice, opening the mic for the user's reply). Fed HERE, not
+  // from the Rust journal, so all three surfaces (OS ping, voice bridge,
+  // spoken line) share one truth about "what just happened".
+  if (useVoiceStore.getState().mode) {
+    queueVoiceAnnouncement(
+      kind === "done"
+        ? {
+            kind: "turn_completed",
+            conversationId: convId,
+            title: conv.name,
+            outcome: meta?.isError ? "error" : "success",
+            lastAssistantText: clipForEvent(lastAssistantText(entry)),
+            repository: repo ? repoName(repo.path) : null,
+          }
+        : {
+            kind: "needs_attention",
+            conversationId: convId,
+            title: conv.name,
+            reason: pending ? "permission" : "question",
+            tool: pending?.tool_name ?? null,
+            prompt: clipForEvent(pending?.title ?? pending?.description ?? null),
+            repository: repo ? repoName(repo.path) : null,
+          },
+    );
+  }
 
   dispatchAgentNotification({
     kind,
@@ -492,6 +523,13 @@ export function useGlobalSessionEvents(): void {
       const session = convIdForHandle(payload.session);
       if (!session) return;
       useConversationStore.getState().removePermission(session, payload.request_id);
+      // Remote clients rendering the prompt must drop it too — without this the
+      // phone shows an answerable card that no longer exists.
+      const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
+      void commands.publishControlEvent("attention_cleared", session, conv?.name ?? "", {
+        reason: "withdrawn",
+        request_id: payload.request_id,
+      });
     }
 
     function onTitle(payload: SessionTitleEvent) {
@@ -595,8 +633,22 @@ export function useGlobalSessionEvents(): void {
       const session = convIdForHandle(payload.session);
       if (!session) return;
       const task = payload.task;
+      // Terminal edge (running → done/failed/stopped), captured BEFORE the upsert
+      // overwrites the previous snapshot: remote clients get a task_finished event
+      // (→ phone push) exactly once per task.
+      const prevStatus =
+        useBackgroundTasksStore.getState().sessions[session]?.[task.task_id]?.status;
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task);
+      if (prevStatus === "running" && task.status !== "running") {
+        const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
+        void commands.publishControlEvent("task_finished", session, conv?.name ?? "", {
+          task_id: task.task_id,
+          kind: task.kind,
+          status: task.status,
+          ...(task.label ? { label: task.label } : {}),
+        });
+      }
       // (1b) workflow: accumulate the per-phase agent activity from the wire's progress ticks
       // (the snapshot keeps only the latest; the live overview needs the running totals).
       useWorkflowLiveStore.getState().record(session, task);
