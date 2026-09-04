@@ -278,14 +278,14 @@ Alexandre **dogfoode** l'app de production (`/Applications/Tosse Code.app`, iden
 
 ## Branches & gouvernance
 
-- **`main`** : protégée. Tout passe par PR. PR doit : (1) check `test` vert (CI), (2) approuvée par `@Alex375` (code owner — `.github/CODEOWNERS`), (3) conversations résolues. Force-push & suppression interdits.
+- **`main`** : protégée. Tout passe par PR. PR doit : (1) check `test` vert (CI), (2) conversations résolues. **Aucune review humaine requise** (`required_approving_review_count = 0`, code-owner review OFF depuis sept. 2026) : Alexandre ET Armand mergent leurs propres PR dès que la CI est verte. Force-push & suppression interdits.
 - **`dev`** : branche de travail. Push libre. Pas de CI sur push dev.
 
-Flux : feature branch → `dev` → PR `dev → main` → CI → Alexandre approuve + merge.
+Flux : feature branch → `dev` → PR `dev → main` → CI verte → merge (Alexandre ou Armand).
 
-`enforce_admins=false` : Alexandre (admin) peut merger ses propres PR. Tout autre collaborateur gated derrière son approbation.
+`enforce_admins=false` : Alexandre (propriétaire) contourne au besoin même la CI / les conversations. Armand (`clousty8`, write) passe par le flux normal (PR + CI verte), mais **sans reviewer** — l'exigence de review a été retirée.
 
-Accès : `Alex375` (admin), `clousty8`/Armand (write — push dev + ouvrir PR ; ne peut PAS merger dans main sans approbation d'Alexandre ni produire de release).
+Accès : `Alex375` (propriétaire/admin), `clousty8`/Armand (write). ⚠️ **Le rôle « admin » ne se délègue PAS sur un repo perso** : tous les collaborateurs y ont un unique niveau `write`, seul le propriétaire est admin (les rôles granulaires admin/maintain/triage sont réservés aux repos d'Organisation). Armand peut désormais : push `dev`, ouvrir une PR, **merger dans `main` (sans reviewer)** et **produire une release**. La garantie « seuls Alexandre et Armand mergent dans main » repose sur le fait qu'ils sont les **deux seuls collaborateurs** (personne d'autre n'a d'accès write) — sur un repo perso on ne peut PAS restreindre le merge à une liste de personnes ; ajouter un 3ᵉ collaborateur lui donnerait aussi le droit de merger. Le verrou de **release**, lui, est étanche par handle (liste `ALLOWED` du job `authorize`), indépendamment du nombre de collaborateurs.
 
 ⚠️ Agents : **ne jamais `git push origin main` en direct** — committer sur `dev` ou une branche de feature et ouvrir une PR.
 
@@ -295,7 +295,7 @@ SemVer `MAJEUR.MINEUR.CORRECTIF`. En `0.y.z` : MINEUR pour toute nouveauté, COR
 
 **3 fichiers toujours synchronisés** : `src-tauri/tauri.conf.json` (source de vérité runtime), `package.json`, `src-tauri/Cargo.toml` + `Cargo.lock`. Bumper via `pnpm bump <patch|minor|major|X.Y.Z>` — ne jamais éditer à la main.
 
-**Release** : workflow `.github/workflows/release.yml`, 100 % manuel (`workflow_dispatch`), à lancer depuis `main`. Bundle macOS universel (Apple Silicon + Intel), publication directe (`releaseDraft: false`). Assets : `.dmg`, `.app.tar.gz` + `.sig`, `latest.json`. Seul `Alex375` peut déclencher (job `authorize`). Garde-fou anti-doublon : refus si version déjà releasée.
+**Release** : workflow `.github/workflows/release.yml`, 100 % manuel (`workflow_dispatch`), à lancer depuis `main`. Bundle macOS universel (Apple Silicon + Intel), publication directe (`releaseDraft: false`). Assets : `.dmg`, `.app.tar.gz` + `.sig`, `latest.json`. Seuls `Alex375` et `clousty8` (Armand) peuvent déclencher (liste `ALLOWED` du job `authorize`). Garde-fou anti-doublon : refus si version déjà releasée.
 
 **Notes de release / CHANGELOG** : le corps de la release est composé par `release.yml` (étape « Composer les notes de release ») = section `## vX.Y.Z` de `CHANGELOG.md` (racine) + marqueur `<!-- gh-only -->` + note d'installation Gatekeeper (`.github/release-install-note.md`). Le `CHANGELOG.md` est rempli par le skill `/release` au moment du bump (étape 3b : quelques puces courtes orientées utilisateur, déduites des commits `<dernier tag>..HEAD`, `## vX.Y.Z` avec le `v` obligatoire). Repli générique dans `release.yml` si la section manque → une release n'est jamais bloquée pour ça. L'app N'affiche QUE la partie AVANT `<!-- gh-only -->`, rendue en Markdown (`inAppReleaseNotes`, `src/store/updater.ts`) ; la note d'installation reste seulement sur la page GitHub (utile pour un `.dmg` téléchargé à la main).
 
