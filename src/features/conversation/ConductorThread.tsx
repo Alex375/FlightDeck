@@ -235,11 +235,15 @@ export function MsgUser({
  * inline inside the assistant round in clean output — a light note, not a full user bubble,
  * so it sits at its chronological place WITHOUT cutting the work fold (see coalesceCleanRounds).
  */
-function InlineUserMarker({ session, turnId }: { session: string; turnId: string }) {
+export function InlineUserMarker({ session, turnId }: { session: string; turnId: string }) {
   const turn = useTurn(session, turnId);
   // Read BEFORE the early returns below, so the hook order stays stable. Row-scoped reader:
   // one marker per injected message, and the answer is the same for the whole thread.
   const isCodex = useRowIsCodex(session);
+  // Same hook order rule: mount the cancel mutation before any early return. Clean output
+  // must offer the SAME drop-this-pending-message affordance as the expanded bubble
+  // (MsgUser) — a message injected mid-turn renders ONLY here.
+  const cancelQueued = useCancelQueuedMessage(session);
   const text = turn?.streamingText ?? "";
   const images = turn?.images;
   const hasImages = !!(images && images.length);
@@ -252,6 +256,10 @@ function InlineUserMarker({ session, turnId }: { session: string; turnId: string
   // Mirror MsgUser's affordance: while the message is still QUEUED (not yet delivered to the
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
+  // Droppable only while it is BOTH still pending and addressable on the wire (our uuid) —
+  // exact mirror of MsgUser/TurnRow: a turn restored from disk, typed remotely, or on Codex
+  // carries no uuid of ours, and nothing already running can be pulled back out of the queue.
+  const wireUuid = queued ? turn?.wireUuid : undefined;
   return (
     // Same `data-user-turn` anchor as a full user bubble: in clean output this IS the
     // message's place in the thread, so the minimap must be able to scroll to it.
@@ -266,6 +274,19 @@ function InlineUserMarker({ session, turnId }: { session: string; turnId: string
       >
         <Ico name="clock" className="sm" />
         {queued ? "pending" : "Message sent"}
+        {/* The same drop-this-pending-message control as the full bubble (MsgUser), so clean
+            output is not a dead end for a message you want to pull back. Offered only while
+            the wire uuid still addresses it in the binary's queue (see `onCancelQueued`). */}
+        {wireUuid ? (
+          <button
+            className={styles.injectedMsgDel}
+            title="Remove this pending message — it hasn't been read yet"
+            aria-label="Remove this pending message"
+            onClick={() => cancelQueued.mutate({ turnId, wireUuid })}
+          >
+            <Ico name="x" />
+          </button>
+        ) : null}
       </span>
       <div className={styles.injectedMsgBody}>
         {hasImages ? (

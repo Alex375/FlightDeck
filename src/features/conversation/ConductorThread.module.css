@@ -170,6 +170,37 @@
   width: 11px;
   height: 11px;
 }
+/* Drop-this-pending-message control for clean output — mirror of `.cv-queued-del` on the
+   full bubble. ALWAYS visible (not hover-only): a pending message is short-lived and the
+   whole point is to catch it before the agent reads it. Divider + real hit area so it reads
+   as its own target, not part of the status text. */
+.injectedMsgDel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin: -2px -4px -2px 3px;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--wf-wait);
+  border-radius: 0 5px 5px 0;
+  background: none;
+  cursor: pointer;
+  color: var(--wf-wait);
+  opacity: 0.7;
+  transition: opacity 0.12s ease, background-color 0.12s ease;
+}
+.injectedMsgDel:hover {
+  opacity: 1;
+  background: var(--wf-wait);
+  color: var(--wf-panel);
+}
+.injectedMsgDel:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--wf-wait);
+  outline-offset: 1px;
+}
 .injectedMsgBody {
   font-size: 13px;
   color: var(--wf-tx);
