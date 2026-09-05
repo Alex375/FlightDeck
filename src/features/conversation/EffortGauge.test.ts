@@ -51,10 +51,11 @@ describe("effortLevelsForModel", () => {
   });
 
   it("fable has the same effort tier as opus (xhigh + max)", () => {
-    // Fable 5 is the time-limited preview model; it shares Opus's effort levels.
+    // Fable is the time-limited preview family; it shares Opus's effort levels.
     expect(effortLevelsForModel("fable")).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    // The resolved id `claude-fable-5` maps to the same family.
+    // Both resolved ids (Fable 5 and Fable 5.1) map to the same family/ladder.
     expect(effortLevelsForModel("claude-fable-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(effortLevelsForModel("claude-fable-5-1")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(effortLevelsForModel("fable")).toContain("xhigh");
   });
 });
