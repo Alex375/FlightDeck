@@ -734,6 +734,12 @@
   flex-direction: column;
   gap: 8px;
 }
+/* OptionCardRail used INSIDE a group card (Behavior → Output style): the card and the
+   options share `--bg-elevated`, so the unselected options read as flat borderless rows.
+   Recess them to the app base so each reads as a distinct, selectable card. */
+.behaviorRail .opt {
+  background: var(--bg-app);
+}
 .opt {
   display: flex;
   flex-direction: column;

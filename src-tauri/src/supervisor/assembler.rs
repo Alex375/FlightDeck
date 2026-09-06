@@ -330,6 +330,9 @@ impl Assembler {
                 // ExitWorktree), the next turn's init carries the new cwd — the UI's
                 // worktree indicator follows along.
                 self.state.cwd = init.cwd.clone();
+                // Output style is re-emitted each turn like cwd/model; keep the state's
+                // copy in step so the UI shows the style the binary is actually running.
+                self.state.output_style = init.output_style.clone();
                 // Do NOT force busy here: `system/init` is emitted at the start of
                 // each turn (not at spawn). Marking busy on init is fine for turns,
                 // but busy is driven by user-send (set_busy) + message_start /

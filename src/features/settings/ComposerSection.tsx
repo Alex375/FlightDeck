@@ -30,11 +30,12 @@ import { ContextRing, Ico } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import {
-  LEFT_CHIPS,
+  ALL_CHIPS,
   RIGHT_CHIPS,
   SLOT_CAPACITY,
   appliesToBackend,
   chipById,
+  isCompactable,
   leftGroups,
   canUnhide,
   nativeWorstCase,
@@ -58,6 +59,7 @@ import {
   ExtensionsFace,
   GoalFace,
   ModelFace,
+  OutputStyleFace,
   PERMISSION_LABELS,
   PermissionFace,
   RemoteFace,
@@ -211,6 +213,7 @@ function BarArrangement() {
                       id={id}
                       icon={icon}
                       label={label}
+                      compact={compactLeft[id] === true}
                       onClick={() => {
                         if (justDragged.current) return;
                         setHidden(id, true);
@@ -305,20 +308,25 @@ function SortableRightChip({
   id,
   icon,
   label,
+  compact,
   onClick,
 }: {
   id: string;
   icon: string;
   label: string;
+  compact?: boolean;
   onClick: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
   // The chip's own face, wrapped so dnd-kit can drive it — the wrapper carries the drag
-  // listeners and the transform, the face inside is byte-for-byte the live one.
+  // listeners and the transform, the face inside is byte-for-byte the live one. `data-compact`
+  // mirrors the live bar's icon-only mode (the `.cv-comp-foot [data-compact] .wf-chip-t` rule
+  // hides the label) so a labelled right chip like Output style previews its compact state.
   return (
     <span
       ref={setNodeRef}
       className="cvset-drag"
+      data-compact={compact ? "" : undefined}
       style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }}
       title={`${label} — drag to reorder, click to hide`}
       onClick={onClick}
@@ -357,6 +365,9 @@ function chipFace(id: string, props: { icon?: string } & Record<string, unknown>
       return <CodexSpeedFace name="Speed" {...rest} />;
     case "codexOptions":
       return <CodexOptionsFace {...rest} />;
+    case "outputStyle":
+      // A representative non-default label so the chip reads as a real control here.
+      return <OutputStyleFace label="Concise" {...rest} />;
     case "artifacts":
       return <ArtifactsFace count={2} {...rest} />;
     case "extensions":
@@ -380,9 +391,13 @@ function chipFace(id: string, props: { icon?: string } & Record<string, unknown>
 function LeftControls() {
   const compactLeft = useComposerBar((s) => s.compactLeft);
   const setLeftCompact = useComposerBar((s) => s.setLeftCompact);
+  // Every chip that shows a text label: the whole left side plus the right-hand output-style
+  // chip (the only labelled right chip). The rest are already icon-only, so there is nothing
+  // to collapse.
+  const compactable = ALL_CHIPS.filter((c) => isCompactable(c.id));
   return (
-    <SettingsGroup title="Left-hand controls" icon="cog">
-      {LEFT_CHIPS.map((c) => (
+    <SettingsGroup title="Show as icon only" icon="cog">
+      {compactable.map((c) => (
         <ToggleRow
           key={c.id}
           title={c.label}

@@ -29,6 +29,7 @@ import {
 } from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
+import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -41,6 +42,9 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  // How CLAUDE itself behaves (not how we render it): its output style, what it is allowed
+  // to do without asking. Next to Conversation — both shape what a conversation is.
+  { id: "behavior", label: "Behavior", icon: "bot" },
   // Next to Conversation (both shape what a conversation is), its own tab for the same
   // reason as Composer: arranging two lists by drag is a task, not a row of switches.
   { id: "models", label: "Models", icon: "spark" },
@@ -161,7 +165,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 <TimingPrefs />
                 <FleetBannerPrefs />
                 <BackgroundTaskPrefs />
-                <PermissionPrefs />
                 <CaffeinatePrefs />
               </div>
             )}
@@ -171,6 +174,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
+
+            {section === "behavior" && (
+              <div>
+                <PageHead
+                  title="Behavior"
+                  subtitle="How Claude itself behaves — the writing style of its responses and what it may do without asking. These are global Claude settings; Codex has its own controls elsewhere."
+                />
+                <OutputStylePrefs />
+                <PermissionPrefs />
+              </div>
+            )}
 
             {section === "models" && <ModelsSection />}
 

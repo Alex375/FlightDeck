@@ -23,6 +23,7 @@ export type LeftChipId =
 
 /** Right-hand controls: tools for the conversation. Hideable and reorderable. */
 export type RightChipId =
+  | "outputStyle"
   | "artifacts"
   | "extensions"
   | "cleanOutput"
@@ -74,6 +75,7 @@ export const LEFT_CHIPS: readonly ChipDescriptor[] = [
 
 /** Right side, in DEFAULT order (the user's arrangement overrides it). */
 export const RIGHT_CHIPS: readonly ChipDescriptor[] = [
+  { id: "outputStyle", side: "right", label: "Output style", icon: "pencil", backend: "claude" },
   { id: "artifacts", side: "right", label: "Artifacts", icon: "artifact", backend: "claude",
     condition: "Only once this conversation has published an artifact" },
   { id: "extensions", side: "right", label: "Extensions", icon: "layers", backend: "both" },
@@ -108,6 +110,17 @@ export function chipById(id: string): ChipDescriptor | null {
 /** Whether a control can appear on a given backend. */
 export function appliesToBackend(chip: ChipDescriptor, backend: "claude" | "codex"): boolean {
   return chip.backend === "both" || chip.backend === backend;
+}
+
+/**
+ * Whether a control can be forced to icon-only ("compact"). It only means something for a
+ * chip that shows a TEXT LABEL to hide — every left-hand chip does, and among the right-hand
+ * ones only `outputStyle` does (the rest are already icon-only). So the compact toggle is
+ * offered for the left side plus `outputStyle`, and nowhere else.
+ */
+export function isCompactable(id: string): boolean {
+  const chip = chipById(id);
+  return !!chip && (chip.side === "left" || chip.id === "outputStyle");
 }
 
 // ---- Width budget -----------------------------------------------------------------

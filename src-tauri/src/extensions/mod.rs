@@ -956,6 +956,79 @@ pub fn set_claude_auto_update(enabled: bool) -> Result<(), String> {
     write_settings(&home, |text| apply_claude_auto_update(text, enabled))
 }
 
+/// The output style the CLI uses when `settings.json` names none. Absence of the
+/// `outputStyle` key IS this value, so we write nothing for it (and remove the key when
+/// the user picks it) rather than littering the file with `"outputStyle":"default"`.
+pub const DEFAULT_OUTPUT_STYLE: &str = "default";
+
+/// Read the user's persisted output style from `~/.claude/settings.json` `outputStyle`
+/// — a USER-GLOBAL setting (the CLI has no per-session output style, so one value serves
+/// the whole app). Absent file or absent key → [`DEFAULT_OUTPUT_STYLE`]. A present but
+/// unparseable file is a real error (surfaced to the UI, not silently defaulted): the CLI
+/// itself would refuse such a file, so hiding it would only mislead.
+pub fn read_output_style() -> Result<String, String> {
+    let home = home_dir().ok_or("home directory ($HOME) not found")?;
+    let path = home.join(".claude/settings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_OUTPUT_STYLE.to_string())
+        }
+        Err(e) => return Err(format!("unable to read settings.json: {e}")),
+    };
+    output_style_from_settings(&text)
+}
+
+/// Pure: read the `outputStyle` (top-level string) out of a settings.json document,
+/// falling back to [`DEFAULT_OUTPUT_STYLE`] when the key is absent, empty, or not a
+/// string. A malformed document is an `Err` (the file is genuinely broken); testable
+/// without the filesystem.
+fn output_style_from_settings(text: &str) -> Result<String, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
+    Ok(root
+        .get("outputStyle")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_OUTPUT_STYLE)
+        .to_string())
+}
+
+/// Set the user's global output style by writing `~/.claude/settings.json` `outputStyle`
+/// — the same top-level key Claude's own `/output-style` / `/config` writes. Picking
+/// [`DEFAULT_OUTPUT_STYLE`] (or an empty string) REMOVES the key, since absence IS the
+/// default. Same safety as [`set_plugin_enabled`]: fresh read, single-key change, atomic,
+/// order-preserving write.
+///
+/// A running session reads `settings.json` and re-emits `output_style` in each turn's
+/// `system/init`, so the app reflects the ACTIVE style live; whether the change bites an
+/// in-flight session or only its next (re)start is the CLI's call — the UI compares the
+/// live value against this persisted one and says which.
+pub fn set_output_style(style: &str) -> Result<(), String> {
+    let home = home_dir().ok_or("home directory ($HOME) not found")?;
+    write_settings(&home, |text| apply_output_style(text, style))
+}
+
+/// Pure transform: set `outputStyle = style` (top-level string), or REMOVE the key when
+/// `style` is [`DEFAULT_OUTPUT_STYLE`] or empty (absence == default). Preserves every
+/// other key and its order; testable without the filesystem.
+fn apply_output_style(text: &str, style: &str) -> Result<String, String> {
+    let mut root: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
+    let obj = root
+        .as_object_mut()
+        .ok_or("settings.json is not a JSON object")?;
+    if style.is_empty() || style == DEFAULT_OUTPUT_STYLE {
+        obj.remove("outputStyle");
+    } else {
+        obj.insert(
+            "outputStyle".to_string(),
+            serde_json::Value::String(style.to_string()),
+        );
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
+}
+
 /// Replace `path` atomically: write a sibling temp file, then rename over the
 /// target so a crash mid-write can never leave a truncated file. The temp name is
 /// unique per call (pid + a monotonic counter) so two concurrent writes to the same
@@ -1599,6 +1672,65 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert_eq!(v["enabledPlugins"]["x@y"], false);
         assert_eq!(v["language"], "french", "existing keys are kept");
+    }
+
+    #[test]
+    fn apply_output_style_sets_the_key_preserving_the_rest_and_order() {
+        let before = r#"{
+  "language": "french",
+  "enabledPlugins": { "a@m": true },
+  "voice": { "enabled": true }
+}"#;
+        let after = apply_output_style(before, "Concise").unwrap();
+        // Existing top-level order preserved; the new key lands at the end.
+        let lang = after.find("\"language\"").unwrap();
+        let plugins = after.find("\"enabledPlugins\"").unwrap();
+        let voice = after.find("\"voice\"").unwrap();
+        let style = after.find("\"outputStyle\"").unwrap();
+        assert!(lang < plugins && plugins < voice && voice < style, "order preserved");
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["outputStyle"], "Concise");
+        assert_eq!(v["language"], "french", "other keys untouched");
+        assert_eq!(v["enabledPlugins"]["a@m"], true);
+    }
+
+    #[test]
+    fn apply_output_style_default_or_empty_removes_the_key() {
+        // Absence IS the default → picking "default" drops the key rather than writing it.
+        let before = r#"{"outputStyle":"Concise","language":"french"}"#;
+        for style in ["default", ""] {
+            let after = apply_output_style(before, style).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+            assert!(v.get("outputStyle").is_none(), "{style:?} removes the key");
+            assert_eq!(v["language"], "french", "other keys survive the removal");
+        }
+        // Removing when already absent is a no-op that still round-trips.
+        let after = apply_output_style(r#"{"language":"french"}"#, "default").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(v.get("outputStyle").is_none());
+    }
+
+    #[test]
+    fn output_style_from_settings_defaults_when_absent_empty_or_nonstring() {
+        assert_eq!(output_style_from_settings("{}").unwrap(), "default");
+        assert_eq!(
+            output_style_from_settings(r#"{"language":"french"}"#).unwrap(),
+            "default"
+        );
+        assert_eq!(output_style_from_settings(r#"{"outputStyle":""}"#).unwrap(), "default");
+        assert_eq!(output_style_from_settings(r#"{"outputStyle":123}"#).unwrap(), "default");
+        // A real value round-trips verbatim (the CLI does not normalise casing).
+        assert_eq!(
+            output_style_from_settings(r#"{"outputStyle":"Explanatory"}"#).unwrap(),
+            "Explanatory"
+        );
+    }
+
+    #[test]
+    fn output_style_from_settings_errors_on_malformed_document() {
+        // A genuinely broken settings.json surfaces as an error, never a silent "default"
+        // — the CLI would refuse it too, so masking it would only mislead the user.
+        assert!(output_style_from_settings("{ not json").is_err());
     }
 
     #[test]

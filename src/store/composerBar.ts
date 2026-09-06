@@ -15,7 +15,7 @@
 // per-repo need is about custom BUTTONS, which is why `CustomButton.repoId` is reserved
 // in the stored shape (see composerLayout.ts) even though v1 never sets it.
 import { create } from "zustand";
-import { chipById, type CustomButton } from "../features/conversation/composerLayout";
+import { chipById, isCompactable, type CustomButton } from "../features/conversation/composerLayout";
 
 const STORAGE_KEY = "tosse:composer";
 
@@ -59,9 +59,10 @@ function load(): ComposerBarData {
     const compactLeft: Record<string, boolean> = {};
     if (parsed.compactLeft && typeof parsed.compactLeft === "object") {
       for (const [id, on] of Object.entries(parsed.compactLeft)) {
-        // Only left-hand chips can be forced compact; a stale id from an older version
-        // (or a right-hand one) is dropped rather than kept as dead weight.
-        if (on === true && chipById(id)?.side === "left") compactLeft[id] = true;
+        // Only chips that show a label can be forced compact (the left side + outputStyle);
+        // a stale id from an older version (or a plain icon-only right chip) is dropped
+        // rather than kept as dead weight.
+        if (on === true && isCompactable(id)) compactLeft[id] = true;
       }
     }
     const customs: CustomButton[] = [];
@@ -128,7 +129,7 @@ export const useComposerBar = create<ComposerBarState>((set) => {
     ...load(),
     setLeftCompact: (chipId, compact) =>
       set((s) => {
-        if (chipById(chipId)?.side !== "left") return s;
+        if (!isCompactable(chipId)) return s;
         const compactLeft = { ...s.compactLeft };
         if (compact) compactLeft[chipId] = true;
         else delete compactLeft[chipId];

@@ -50,6 +50,7 @@ import { EffortGauge, clampEffort, effortLevelsForModel, type EffortLevel } from
 import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
+import { OutputStyleChip } from "./OutputStyleChip";
 import { isGoalCommand, markGoalSeen } from "../../store/goalStore";
 import { parseGoalCommand } from "./goalCommand";
 import {
@@ -1056,6 +1057,11 @@ export const ConductorComposer = forwardRef<
         ))}
       </Menu>
     ),
+    // Output style — how Claude writes its responses (Default / Concise / …). A
+    // USER-GLOBAL Claude setting (not per-conversation): the chip reads and writes the one
+    // global value, so picking here changes every conversation. Claude only — the bar's
+    // backend filter keeps it off Codex, so no guard here.
+    outputStyle: <OutputStyleChip session={session} />,
     // Artifacts index — every artifact Claude published in THIS conversation, with its
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
@@ -1224,7 +1230,12 @@ export const ConductorComposer = forwardRef<
               applyConfig={applyConfig}
             />
           ) : (
-            <Fragment key={id}>{chipNodes[id as NativeChipId]}</Fragment>
+            // ChipSlot carries the icon-only ("compact") flag; it is display:contents, so
+            // the plain icon-only right chips are unaffected — only labelled ones (today
+            // just outputStyle) collapse to their icon when the user compacts them.
+            <ChipSlot key={id} compact={compactLeft[id] === true}>
+              {chipNodes[id as NativeChipId]}
+            </ChipSlot>
           );
         })}
         <ContextRing

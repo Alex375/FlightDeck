@@ -30,6 +30,12 @@ pub struct SessionStatePayload {
     pub model: Option<String>,
     /// Current permission mode (from `system/init` / the `set_permission_mode` ack).
     pub permission_mode: Option<String>,
+    /// The output style the RUNNING binary is using right now (from `system/init`,
+    /// re-emitted each turn). Output style is USER-GLOBAL — the CLI has no per-session
+    /// style — so this is the live reflection of the `outputStyle` we persist in
+    /// `settings.json`. `None` on old CLIs (field absent). Lets the UI show whether a
+    /// just-picked style is already active or still pending the session's next (re)start.
+    pub output_style: Option<String>,
     /// Current reasoning-effort level (`low`/`medium`/`high`/`xhigh`). NOT carried
     /// by `system/init` — sourced from the `get_settings` control read-back (and the
     /// spawn seed). `None` until the first read-back. Drives the effort gauge.
