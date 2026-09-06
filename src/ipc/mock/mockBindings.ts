@@ -88,6 +88,7 @@ import type {
   VoiceBridgeStatus,
   WakeStatus,
   WorkflowJournal,
+  WakeWordEvent,
   WorkflowJournalEvent,
   WorkflowPhase,
   WorkflowRun,
@@ -184,6 +185,10 @@ const terminalExitEvent = new MockEmitter<TerminalExitEvent>();
 // the AppControlHost can subscribe without crashing.
 const appControlRequestEvent = new MockEmitter<AppControlRequestEvent>();
 
+// No wake-word detector in the browser mock (no native capture / models) — never fires, but
+// must exist so <VoiceHost> can subscribe without crashing the whole app in `?demo=` mode.
+const wakeWordEvent = new MockEmitter<WakeWordEvent>();
+
 export const mockEvents = {
   sessionMessageEvent,
   sessionPermissionEvent,
@@ -206,6 +211,7 @@ export const mockEvents = {
   terminalOutputEvent,
   terminalExitEvent,
   appControlRequestEvent,
+  wakeWordEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
