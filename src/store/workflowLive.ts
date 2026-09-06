@@ -23,9 +23,13 @@ export interface WfLivePhase {
 export interface WfLive {
   /** Phases in the order they were first seen on the wire, each with its started agents. */
   phases: WfLivePhase[];
+  /** Epoch ms when the app FIRST saw this run running — the only start time we have (the wire
+   *  carries none). Approximate (the app is normally open when a run is launched), and used
+   *  solely to drive the live view's elapsed timer. Null before the run was ever recorded. */
+  startedAt: number | null;
 }
 
-const EMPTY: WfLive = { phases: [] };
+const EMPTY: WfLive = { phases: [], startedAt: null };
 
 /** Split a `task_progress` description ("<phase>: <label>") into phase + optional label. */
 export function parseWfProgress(progress: string): { phase: string; label: string | null } | null {
@@ -44,13 +48,35 @@ export function foldProgress(prev: WfLive, progress: string): WfLive {
   const { phase, label } = parsed;
   const idx = prev.phases.findIndex((p) => p.title === phase);
   if (idx < 0) {
-    return { phases: [...prev.phases, { title: phase, labels: label ? [label] : [] }] };
+    return {
+      phases: [...prev.phases, { title: phase, labels: label ? [label] : [] }],
+      startedAt: prev.startedAt,
+    };
   }
   const cur = prev.phases[idx];
   if (!label || cur.labels.includes(label)) return prev; // no new info
   const phases = prev.phases.slice();
   phases[idx] = { title: cur.title, labels: [...cur.labels, label] };
-  return { phases };
+  return { phases, startedAt: prev.startedAt };
+}
+
+/** One spawned agent label with the phase it belongs to. */
+export interface OrderedLabel {
+  label: string;
+  phase: string;
+}
+
+/** Flatten the accumulated activity into ONE spawn-ordered list of labels (phase order, then
+ *  within-phase first-seen order). This mirrors the order the run's journal lists its agents
+ *  (both are driven by spawn), so zipping the two by index is what lets the live view attach a
+ *  real label to each running agent — approximately, since the two are separate wire signals.
+ *  Phases with no label yet contribute nothing. */
+export function orderedLabels(live: WfLive): OrderedLabel[] {
+  const out: OrderedLabel[] = [];
+  for (const p of live.phases) {
+    for (const label of p.labels) out.push({ label, phase: p.title });
+  }
+  return out;
 }
 
 interface State {
@@ -78,11 +104,14 @@ export const useWorkflowLiveStore = create<State>((set) => ({
         delete next[task.task_id];
         return { runs: { ...s.runs, [session]: next } };
       }
-      if (!task.progress) return s;
       const map = cur ?? {};
-      const prev = map[task.task_id] ?? EMPTY;
-      const next = foldProgress(prev, task.progress);
-      if (next === prev) return s; // idempotent
+      const prev = map[task.task_id];
+      // Stamp the run's first-seen time ONCE (on task_started or the first progress tick),
+      // so the live view can show an elapsed timer — the wire carries no start timestamp.
+      // A run with no progress yet still gets an entry so the timer can start immediately.
+      const base: WfLive = prev ?? { phases: [], startedAt: Date.now() };
+      const next = task.progress ? foldProgress(base, task.progress) : base;
+      if (prev && next === prev) return s; // idempotent (entry already present, nothing new)
       return { runs: { ...s.runs, [session]: { ...map, [task.task_id]: next } } };
     }),
   drop: (session) =>
