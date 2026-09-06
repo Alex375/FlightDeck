@@ -322,6 +322,11 @@ pub struct InitMsg {
     pub model: Option<String>,
     #[serde(rename = "permissionMode")]
     pub permission_mode: Option<String>,
+    /// The active output style (`default`/`Concise`/`Proactive`/`Explanatory`/
+    /// `Learning`, or a custom one). Re-emitted each turn, so the UI reflects the
+    /// style the RUNNING binary is actually using — the ground truth against the
+    /// user-global `outputStyle` we persist in `settings.json`. Absent on old CLIs.
+    pub output_style: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
     pub claude_code_version: Option<String>,
