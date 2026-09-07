@@ -1330,3 +1330,12 @@
   .linkedStarted { animation: none; }
   .row[data-started] { animation: none; background: var(--ts-run-bg); }
 }
+
+/* The blockers named inside the "Start a blocked task?" dialog. Amber, like the CRM's own
+   list: they are the reason the click was stopped, so they have to be the thing read. */
+.confirmList {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--ts-hold-tx);
+}
+.confirmList li { margin-top: 2px; }
