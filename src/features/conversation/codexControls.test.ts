@@ -125,10 +125,43 @@ describe("buildCodexControls (wire payload)", () => {
 });
 
 describe("effortLevelsForModel is backend-aware", () => {
-  it("Codex models expose low/medium/high/xhigh (no max, no ultracode)", () => {
+  it("older Codex models expose low/medium/high/xhigh (no max, no ultracode)", () => {
     expect(effortLevelsForModel("gpt-5.5")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(effortLevelsForModel("gpt-5.4-mini")).toEqual(["low", "medium", "high", "xhigh"]);
   });
+
+  // The ladder is per MODEL, not per family: every value below is transcribed from
+  // `model/list`'s own `supportedReasoningEfforts` (codex-cli 0.144.4).
+  it("gives gpt-6-astra the full low→ultra ladder its model/list declares", () => {
+    expect(effortLevelsForModel("gpt-6-astra")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ]);
+  });
+
+  it("keeps ultra on gpt-5.6 sol/terra but NOT on luna, which does not declare it", () => {
+    expect(effortLevelsForModel("gpt-5.6-sol")).toContain("ultra");
+    expect(effortLevelsForModel("gpt-5.6-terra")).toContain("ultra");
+    expect(effortLevelsForModel("gpt-5.6-luna")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  it("falls back to the conservative floor for an unknown Codex model, never inventing max/ultra", () => {
+    // An effort the binary doesn't accept is silently dropped, so an unknown model must
+    // under-offer rather than claim a depth the turn would never run at.
+    const steps = effortLevelsForModel("gpt-7-nova");
+    expect(steps).toEqual(["low", "medium", "high", "xhigh"]);
+  });
+
   it("Claude models keep their own ladders", () => {
     expect(effortLevelsForModel("opus")).toContain("max");
     expect(effortLevelsForModel("haiku")).toEqual([]);

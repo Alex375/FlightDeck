@@ -86,8 +86,8 @@ export const DEFAULT_CODEX_PERSONALITY: CodexPersonality = "none";
 
 /** The default Codex reasoning effort. The available steps per model are data-driven
  *  (`effortLevelsForModel` / `VALID_EFFORTS`, from `model/list`): older gpt-5.x expose
- *  low/medium/high/xhigh, the gpt-5.6 family additionally `max` + the Codex-only `ultra`
- *  rung. Never "ultracode" — that app tier is Claude-only. */
+ *  low/medium/high/xhigh, while the top models (gpt-6-astra, gpt-5.6 sol/terra) add
+ *  `max` + the Codex-only `ultra` rung. Never "ultracode" — that app tier is Claude-only. */
 export const DEFAULT_CODEX_EFFORT = "xhigh";
 
 /** The per-conversation Codex control state held HERE (model + effort live on the conv

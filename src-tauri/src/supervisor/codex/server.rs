@@ -795,13 +795,13 @@ mod tests {
     /// PROBE: what context window does the server actually report PER MODEL? The context ring's
     /// denominator is `thread/tokenUsage/updated.tokenUsage.modelContextWindow`; a user reported
     /// it reads the SAME (~353k) for every model, doubting gpt-5.6 is really that small. This
-    /// runs a one-token turn for gpt-5.6-sol vs gpt-5.5 and prints the reported window (plus any
+    /// runs a one-token turn per model and prints the reported window (plus any
     /// model REROUTE / safety-buffer note), to tell a genuine bug from the wire's real value.
     /// Run: `cargo test --lib -- --ignored --nocapture live_probe_model_context_window`.
     #[tokio::test]
     #[ignore = "spawns a real codex app-server (network + ChatGPT auth + a sliver of quota)"]
     async fn live_probe_model_context_window() {
-        for model in ["gpt-5.6-sol", "gpt-5.5"] {
+        for model in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.5"] {
             let server = CodexServer::new();
             let cwd = std::env::temp_dir();
             let (thread_id, mut inbound) = match server.start_thread(&cwd, Some(model)).await {
