@@ -1149,9 +1149,25 @@ impl CodexCore {
         match env.item {
             // Assistant answer & reasoning: only the authoritative (completed) message is
             // emitted here; the live text arrived via deltas and the front reconciles by id.
-            ThreadItem::AgentMessage { id, text } => {
-                if completed && !text.is_empty() {
-                    self.emit_message(id, NormalizedBlock::Text { text }, item_turn.as_deref());
+            ThreadItem::AgentMessage { id, text, questions } => {
+                if completed {
+                    // A questions-only message (async delivery, 0.153.x) has an EMPTY `text`:
+                    // emitting only on non-empty text would drop the question entirely and the
+                    // user would sit in front of a turn that ended saying nothing. Append the
+                    // questions ONLY when there is no prose — a message that already words its
+                    // question in `text` must not have it restated underneath.
+                    let body = if text.is_empty() {
+                        questions_text(questions.as_deref())
+                    } else {
+                        text
+                    };
+                    if !body.is_empty() {
+                        self.emit_message(
+                            id,
+                            NormalizedBlock::Text { text: body },
+                            item_turn.as_deref(),
+                        );
+                    }
                 }
             }
             ThreadItem::Plan { id, text } => {
@@ -1227,7 +1243,7 @@ impl CodexCore {
                     self.emit_tool_result(&id, content, is_error);
                 }
             }
-            ThreadItem::WebSearch { id, query, action } => {
+            ThreadItem::WebSearch { id, query, action, results } => {
                 self.ensure_tool_use(
                     &id,
                     "WebSearch",
@@ -1237,8 +1253,13 @@ impl CodexCore {
                 if completed {
                     // The result TEXT is what `WebSearchDetail` parses for source chips, so
                     // fold the query + opened page / searched queries into it (URLs as
-                    // markdown links → they render as sources).
-                    self.emit_tool_result(&id, json!(web_search_result_text(&query, &action)), false);
+                    // markdown links → they render as sources). `results` (0.153.x) upgrades
+                    // those chips from "the page we opened" to the actual hits.
+                    self.emit_tool_result(
+                        &id,
+                        json!(web_search_result_text(&query, &action, results.as_ref())),
+                        false,
+                    );
                 }
             }
 
@@ -1320,6 +1341,20 @@ impl CodexCore {
                 if completed {
                     let is_error = success == Some(false) || status_is_error(status.as_deref());
                     self.emit_tool_result(&id, dynamic_tool_content(content_items.as_deref()), is_error);
+                }
+            }
+            // A client-supplied tool OUTPUT (app-server 0.153.x). No `item/started` precedes it
+            // and there is no matching call item, so the card is synthesized here and closed in
+            // the same breath — the output text is the payload worth showing.
+            ThreadItem::FunctionCallOutput { id, name, namespace, output } => {
+                let label = match namespace.as_deref().filter(|ns| !ns.is_empty()) {
+                    Some(ns) => format!("{ns}:{name}"),
+                    None if name.is_empty() => "functionCallOutput".to_string(),
+                    None => name.clone(),
+                };
+                self.ensure_tool_use(&id, &label, json!({}), item_turn.as_deref());
+                if completed {
+                    self.emit_tool_result(&id, function_call_output_content(&output), false);
                 }
             }
             // A multi-agent (collab) tool call → a generic `Collab:<tool>` card (kept as the
@@ -1777,16 +1812,121 @@ fn dynamic_tool_content(items: Option<&[Value]>) -> Value {
     json!(out)
 }
 
+/// Build the `Links: [{title,url}]` line `WebSearchDetail` turns into source chips, from a
+/// web-search `results` array (`[{title,url,domain,snippet}]`). Returns `None` when there is
+/// nothing usable, so the caller falls back to the query-only summary rather than emitting an
+/// empty `Links:` line that would render a chip-less, confusing header.
+fn search_result_links(results: Option<&Value>) -> Option<String> {
+    let items = results?.as_array()?;
+    let links: Vec<Value> = items
+        .iter()
+        .filter_map(|r| {
+            let url = r.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+            let title = r
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .or_else(|| r.get("domain").and_then(Value::as_str))
+                .unwrap_or(url);
+            Some(json!({ "title": title, "url": url }))
+        })
+        .collect();
+    if links.is_empty() {
+        return None;
+    }
+    Some(format!("Links: {}", json!(links)))
+}
+
+/// Render `agentMessage.questions` (`AsyncUserInputQuestion[]`) as markdown: each question's
+/// `title`, with its `options` as a bullet list. Used ONLY when the message carries no prose
+/// of its own — the rescue path for a questions-only message, which would otherwise render
+/// as nothing at all. Returns an empty string when there is nothing to show.
+fn questions_text(questions: Option<&[Value]>) -> String {
+    let Some(questions) = questions.filter(|q| !q.is_empty()) else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for q in questions {
+        let title = q.get("title").and_then(Value::as_str).unwrap_or("").trim();
+        if !title.is_empty() {
+            out.push(title.to_string());
+        }
+        for opt in q.get("options").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(o) = opt.as_str().map(str::trim).filter(|o| !o.is_empty()) {
+                out.push(format!("- {o}"));
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Render a `FunctionCallOutputBody` (`functionCallOutput.output`) as a tool_result value.
+///
+/// ⚠️ The body is EITHER a bare string OR an array of content items in **snake_case**
+/// (`input_text`, `input_image.image_url`, `input_audio.audio_url`, `encrypted_content`).
+/// That is NOT the camelCase shape [`dynamic_tool_content`] handles (`inputText`,
+/// `inputImage.imageUrl`) — reusing that helper here would fall through to the raw-JSON
+/// arm and dump serialized objects into the card. An unknown variant still renders its raw
+/// JSON rather than vanishing (never a silent drop).
+fn function_call_output_content(output: &Value) -> Value {
+    if let Some(text) = output.as_str() {
+        return json!(text);
+    }
+    let Some(items) = output.as_array().filter(|i| !i.is_empty()) else {
+        // Neither a string nor a non-empty array: show the raw payload rather than nothing.
+        return match output {
+            Value::Null => json!("(no output)"),
+            other => json!(other.to_string()),
+        };
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for it in items {
+        match it.get("type").and_then(Value::as_str) {
+            Some("input_text") => {
+                let text = it.get("text").and_then(Value::as_str).unwrap_or("");
+                out.push(json!({ "type": "text", "text": text }));
+            }
+            Some("input_image") => {
+                let url = it.get("image_url").and_then(Value::as_str).unwrap_or("");
+                match data_url_image_block(url) {
+                    Some(block) => out.push(block),
+                    None => out.push(json!({ "type": "text", "text": format!("[image] {url}") })),
+                }
+            }
+            Some("input_audio") => {
+                let url = it.get("audio_url").and_then(Value::as_str).unwrap_or("");
+                out.push(json!({ "type": "text", "text": format!("[audio] {url}") }));
+            }
+            // Encrypted reasoning/content the model round-trips: nothing readable to show,
+            // but its PRESENCE is worth a line so the card is never mysteriously empty.
+            Some("encrypted_content") => {
+                out.push(json!({ "type": "text", "text": "[encrypted content]" }));
+            }
+            _ => out.push(json!({ "type": "text", "text": it.to_string() })),
+        }
+    }
+    json!(out)
+}
+
 /// Build the `WebSearch` card's result TEXT from the query + its `WebSearchAction`. The
 /// front's `WebSearchDetail` parses this text for markdown links → source chips, so an
 /// opened/searched page is emitted as `[host](url)`. Enriches the bare-query card
 /// (`webSearch` gained `action` in 0.144.1).
-fn web_search_result_text(query: &str, action: &Value) -> String {
+pub(crate) fn web_search_result_text(query: &str, action: &Value, results: Option<&Value>) -> String {
     // Emit the SAME shape a Claude WebSearch result takes so it flows through the identical
     // `WebSearchDetail` renderer: a `Links: [{title,url}]` JSON array → favicon source chips,
-    // plus a text summary. Codex's item carries only the searched queries / opened URL (no
-    // result set), so a `search` yields a query summary (no chips) while `open_page` /
-    // `find_in_page` yield one source chip for the page the model actually visited.
+    // plus a text summary. A `search` used to yield only a query summary (no chips) because
+    // the item carried no result set — app-server 0.153.x added `results`, so when they ARE
+    // there the real pages become the chips (and the cold rollout path feeds this same helper
+    // its `Extension{kind:"web.search"}` results, keeping live and reloaded views identical).
+    if let Some(links) = search_result_links(results) {
+        let summary = web_search_result_text(query, action, None);
+        return if summary.is_empty() {
+            links
+        } else {
+            format!("{links}\n\n{summary}")
+        };
+    }
     let host = |url: &str| -> String {
         url.split_once("://")
             .map(|(_, rest)| rest)
@@ -3238,13 +3378,139 @@ mod tests {
             if blocks.iter().any(|b| matches!(b, NormalizedBlock::ToolUse { name, .. } if name == "Bash"))));
         let has_patch = items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { blocks, .. }
             if blocks.iter().any(|b| matches!(b, NormalizedBlock::ToolUse { name, .. } if name == "ApplyPatch"))));
+        let has_thinking = items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { blocks, .. }
+            if blocks.iter().any(|b| matches!(b, NormalizedBlock::Thinking { .. }))))
+            || items.iter().any(|i| matches!(i, ConversationItem::ThinkingDelta { .. }));
         let results = items.iter().filter(|i| matches!(i, ConversationItem::ToolResult { .. })).count();
         assert!(has_text, "the assistant's answer must render as Text");
+        assert!(
+            has_thinking,
+            "the reasoning must render as Thinking — never Text, or the raw chain leaks into \
+             the visible answer"
+        );
         assert!(has_bash, "the shell command must render as a Bash card");
         assert!(has_patch, "the file creation must render as an ApplyPatch card (kind-object decode)");
         assert!(results >= 2, "each tool card must be closed by a ToolResult (got {results})");
         assert!(items.iter().any(|i| matches!(i, ConversationItem::TurnResult { is_error: false, .. })));
         assert!(!c.state.busy, "the turn settled → busy cleared");
+    }
+
+    /// `functionCallOutput` (new in app-server 0.153.x) is a real tool OUTPUT, not a mystery
+    /// item: it must render its content under the tool's own name, not the generic
+    /// "Unmodelled Codex item" placeholder the `Unknown` arm would produce.
+    #[test]
+    fn function_call_output_renders_its_content_under_the_tool_name() {
+        let (mut c, sink) = core();
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"functionCallOutput","id":"f1","name":"lookup","namespace":"acme",
+                "output":[{"type":"input_text","text":"42"}]}}),
+        );
+        let items = items(&sink);
+        assert!(
+            has_tool_use(&items, "acme:lookup", "f1"),
+            "the card must be named after the tool, not the generic placeholder"
+        );
+        match tool_result(&items, "f1") {
+            Some(ConversationItem::ToolResult { content, is_error, .. }) => {
+                assert!(!is_error);
+                assert_eq!(
+                    content[0]["text"].as_str(),
+                    Some("42"),
+                    "the snake_case `input_text` body must be read (NOT the camelCase \
+                     `inputText` shape dynamicToolCall uses)"
+                );
+            }
+            _ => panic!("the output card must be closed by a result"),
+        }
+    }
+
+    /// A bare-string `output` is the other half of `FunctionCallOutputBody`.
+    #[test]
+    fn function_call_output_accepts_a_bare_string_body() {
+        let (mut c, sink) = core();
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"functionCallOutput","id":"f2","name":"ping","output":"pong"}}),
+        );
+        let items = items(&sink);
+        assert!(has_tool_use(&items, "ping", "f2"));
+        assert!(matches!(tool_result(&items, "f2"),
+            Some(ConversationItem::ToolResult { content, .. }) if content.as_str() == Some("pong")));
+    }
+
+    /// A live `webSearch` gained `results` in 0.153.x: the source chips must name the pages
+    /// actually found, not just echo the query — and must degrade to the query summary when
+    /// the field is absent (older binaries), never to an empty `Links:` header.
+    #[test]
+    fn web_search_results_become_source_links() {
+        let action = json!({ "type": "search", "query": "rust stable", "queries": null });
+        let results = json!([
+            { "title": "Announcing Rust 1.98.1", "url": "https://blog.rust-lang.org/x", "domain": "blog.rust-lang.org" },
+            { "title": "", "url": "https://doc.rust-lang.org/y", "domain": "doc.rust-lang.org" },
+            { "title": "no url", "snippet": "dropped" },
+        ]);
+        let text = web_search_result_text("rust stable", &action, Some(&results));
+        assert!(text.starts_with("Links: "), "{text}");
+        assert!(text.contains("https://blog.rust-lang.org/x"));
+        assert!(text.contains("Announcing Rust 1.98.1"));
+        // A title-less hit falls back to its domain; a url-less one is skipped entirely.
+        assert!(text.contains("doc.rust-lang.org"));
+        assert!(!text.contains("no url"));
+        // The query summary still follows the links.
+        assert!(text.contains("Search: rust stable"));
+
+        // No results (older binary) → the previous behaviour, and never a bare "Links:".
+        let plain = web_search_result_text("rust stable", &action, None);
+        assert_eq!(plain, "Search: rust stable");
+        let empty = web_search_result_text("rust stable", &action, Some(&json!([])));
+        assert_eq!(empty, "Search: rust stable");
+    }
+
+    /// An async-delivery `agentMessage` can carry its question in `questions` with an EMPTY
+    /// `text`. Emitting only on non-empty text dropped the whole message — the turn ended
+    /// showing nothing at all.
+    #[test]
+    fn a_questions_only_agent_message_is_not_dropped() {
+        let (mut c, sink) = core();
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"agentMessage","id":"m1","text":"","delivery":"async",
+                "questions":[{"title":"Which database?","options":["Postgres","SQLite"]}]}}),
+        );
+        let text = items(&sink).iter().find_map(|i| match i {
+            ConversationItem::AssistantMessage { blocks, .. } => blocks.iter().find_map(|b| match b {
+                NormalizedBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let text = text.expect("a questions-only message must still render");
+        assert!(text.contains("Which database?"));
+        assert!(text.contains("- Postgres") && text.contains("- SQLite"));
+    }
+
+    /// …but a message that already words its question in prose must NOT get it restated.
+    #[test]
+    fn questions_do_not_duplicate_a_message_that_has_text() {
+        let (mut c, sink) = core();
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"agentMessage","id":"m2","text":"Which database should I use?",
+                "questions":[{"title":"Which database?","options":["Postgres"]}]}}),
+        );
+        let text = items(&sink).iter().find_map(|i| match i {
+            ConversationItem::AssistantMessage { blocks, .. } => blocks.iter().find_map(|b| match b {
+                NormalizedBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("Which database should I use?"));
     }
 
     #[test]

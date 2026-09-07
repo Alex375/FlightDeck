@@ -1141,6 +1141,11 @@ mod tests {
     /// non-regression fixture the `replay_captured_turn_*` test replays through the actor
     /// (the Codex analogue of `capture_text.jsonl`). Re-run after a `codex` upgrade to
     /// refresh the recorded item shapes: `cargo test --lib -- --ignored capture_live_turn`.
+    ///
+    /// The turn pins `model` + `effort` + `summary` rather than inheriting the ambient
+    /// config: a capture at the default (low) effort emits NO `reasoning` item, which would
+    /// silently strip the reasoning path from the fixture the replay test guards — the
+    /// assertions at the end fail the capture instead of writing a thinner fixture.
     #[tokio::test]
     #[ignore = "spawns a real codex app-server; (re)writes the capture fixture"]
     async fn capture_live_turn_to_fixture() {
@@ -1153,6 +1158,9 @@ mod tests {
                 "turn/start",
                 serde_json::json!({
                     "threadId": thread_id,
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                    "summary": "detailed",
                     "input": [{"type":"text","text":"Think briefly, then run the shell command `echo hello from codex`, then create a file note.txt containing the single word: ok"}],
                 }),
             )
@@ -1187,16 +1195,40 @@ mod tests {
         }
         server.shutdown_all().await;
 
+        // Validate the capture's COVERAGE **BEFORE** writing: the replay test claims to
+        // exercise reasoning + a shell command + a file creation, and the model does not always
+        // perform every step. Asserting after the write would leave the degraded capture on
+        // disk — exactly how a "refresh the fixture" run silently narrowed it to no reasoning
+        // at all. Fail here and the committed fixture is untouched.
+        eprintln!(
+            "captured methods: {:?}",
+            lines
+                .iter()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let missing: Vec<&str> = [
+            r#""type":"agentMessage""#,
+            r#""type":"reasoning""#,
+            r#""type":"commandExecution""#,
+            r#""type":"fileChange""#,
+        ]
+        .into_iter()
+        .filter(|shape| !lines.iter().any(|l| l.contains(shape)))
+        .collect();
+        assert!(
+            missing.is_empty(),
+            "the captured turn is missing {missing:?} — the fixture was left UNCHANGED. \
+             Re-run the capture (the model may have skipped a step)."
+        );
+
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/supervisor/fixtures/capture_codex_turn.jsonl"
         );
         std::fs::write(path, lines.join("\n") + "\n").expect("write fixture");
         eprintln!("captured {} lines → {path}", lines.len());
-        assert!(
-            lines.iter().any(|l| l.contains("agentMessage")),
-            "expected at least one assistant-message notification"
-        );
     }
 
     /// Verify the native Codex remote-control wire end-to-end: enable brings the bridge up,

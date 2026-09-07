@@ -213,6 +213,12 @@ pub enum ThreadItem {
         id: String,
         #[serde(default)]
         text: String,
+        /// `AsyncUserInputQuestion[]` — questions the model poses to the user (added with
+        /// the async-delivery messages of app-server 0.153.x). Kept raw (tolerance rule 3).
+        /// Load-bearing: a questions-ONLY message carries an EMPTY `text`, and the actor
+        /// emits nothing for empty text — so without this the whole message disappears.
+        #[serde(default)]
+        questions: Option<Vec<Value>>,
     },
     /// The model's reasoning. `summary` is the human-facing reasoning summary; `content`
     /// is the raw chain (often redacted/empty). BOTH map to a `Thinking` block — NEVER
@@ -282,6 +288,11 @@ pub enum ThreadItem {
         query: String,
         #[serde(default)]
         action: Value,
+        /// The actual hits (`[{title,url,domain,snippet}]`), added in app-server 0.153.x.
+        /// Kept raw (tolerance rule 3); folded into the card's result so the source chips
+        /// name the pages found rather than only the query that was typed.
+        #[serde(default)]
+        results: Option<Value>,
     },
     /// A local image the model viewed (the `view_image` tool). Carries the file PATH
     /// (`LegacyAppPathString`), NOT bytes — the actor reads it and inlines a base64 image
@@ -325,6 +336,25 @@ pub enum ThreadItem {
         success: Option<bool>,
         #[serde(default)]
         duration_ms: Option<i64>,
+    },
+    /// A tool OUTPUT fed into the thread by the client (`turn/start.toolOutput`), added in
+    /// app-server 0.153.x → a tool card named `<namespace>:<name>` carrying the output.
+    /// We never send `toolOutput` ourselves, but a thread opened by another client (the
+    /// Codex CLI, the remote bridge) and then resumed here does contain these.
+    ///
+    /// ⚠️ `output` is a `FunctionCallOutputBody`: EITHER a bare string OR an array of
+    /// content items serialized in **snake_case** (`input_text` / `input_image.image_url`)
+    /// — NOT the camelCase (`inputText` / `inputImage.imageUrl`) that `DynamicToolCall`'s
+    /// `content_items` use. The two look interchangeable and are not; see
+    /// [`super::session::function_call_output_content`].
+    FunctionCallOutput {
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        namespace: Option<String>,
+        #[serde(default)]
+        output: Value,
     },
     /// A multi-agent (collab) tool call → a generic `Collab:<tool>` card here. The unified
     /// sub-agent bar + fleet integration (`agentsStates` / thread routing) is Phase 4.5,
