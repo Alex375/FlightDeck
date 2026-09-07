@@ -9,6 +9,16 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.0.0
+
+- New: **built-in voice agent** — talk to your agents in push-to-talk (Right ⌘), have the app read out your fleet's status, and browse folders or end the call by voice.
+- New: **"Ground Control" wake word** — wake the voice agent hands-free, with fully on-device detection (openWakeWord + VAD) that listens continuously.
+- New: **remote access from your phone** — pair the app from Settings and drive your conversations remotely (outbound relay, execution controls, answering pending requests).
+- New: **run a conversation on a remote server over SSH** — start it from the usual "+ new conversation" flow, pair your servers, browse their folders, and keep the session alive through network cuts (daemon-attach).
+- New: **pick Claude's output style** directly in the app.
+- New: **live workflow view** aligned with the finished view (3-column layout).
+- Improved: you can now **cancel a pending message** even in clean-output mode; refreshed model labels (Fable 5.1).
+
 ## v1.10.0
 
 - New: agents can now pilot the app itself. Each conversation gets a `flightdeck` MCP server — ask your agent to open the file it just wrote at the right line, switch views or panels, create conversations in other repos, message and read the other agents, or notify you. Toggle in Settings → Control (on by default; nothing destructive is ever exposed, and the usual permission prompts apply).
