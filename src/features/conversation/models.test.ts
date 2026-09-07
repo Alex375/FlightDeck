@@ -21,6 +21,7 @@ describe("backendOfModel", () => {
   });
 
   it("classifies the Codex model ids as codex (exact + resolved)", () => {
+    expect(backendOfModel("gpt-6-astra")).toBe("codex");
     expect(backendOfModel("gpt-5.5")).toBe("codex");
     expect(backendOfModel("gpt-5.4")).toBe("codex");
     expect(backendOfModel("gpt-5.4-mini")).toBe("codex");
@@ -44,6 +45,7 @@ describe("modelLabel", () => {
     expect(modelLabel("opus")).toBe("Opus 5");
     // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
     expect(modelLabel("fable")).toBe("Fable 5.1");
+    expect(modelLabel("gpt-6-astra")).toBe("GPT-6 Astra");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
   });
@@ -77,11 +79,25 @@ describe("modelFamily (menu highlight)", () => {
     expect(modelFamily("claude-opus-4-8[1m]")).toBe("claude-opus-4-8");
   });
   it("maps a Codex id (exact + longest-first) to its value", () => {
+    expect(modelFamily("gpt-6-astra")).toBe("gpt-6-astra");
     expect(modelFamily("gpt-5.5")).toBe("gpt-5.5");
     expect(modelFamily("gpt-5.4-mini")).toBe("gpt-5.4-mini");
   });
   it("returns null for an unknown id", () => {
     expect(modelFamily("mystery")).toBeNull();
+  });
+});
+
+describe("CODEX_MODELS mirrors what the binary actually serves", () => {
+  it("offers gpt-6-astra first (model/list's own order, and its isDefault model)", () => {
+    expect(CODEX_MODELS[0].value).toBe("gpt-6-astra");
+    expect(CODEX_MODELS[0].label).toBe("GPT-6 Astra");
+  });
+
+  it("does not offer gpt-5.4, which model/list no longer returns", () => {
+    // The static list is the picker's content while the dynamic one loads: a row the
+    // binary would reject turns a pick in that window into a failed turn.
+    expect(CODEX_MODELS.map((m) => m.value)).not.toContain("gpt-5.4");
   });
 });
 

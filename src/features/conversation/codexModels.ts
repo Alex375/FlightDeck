@@ -45,9 +45,9 @@ export function useCodexModels(enabled: boolean): CodexModelsData {
 
   const list = q.data ?? [];
   if (list.length === 0) {
-    // Loading / error / empty → verified static fallback. Per-model ladder (gpt-5.6
-    // gets max+ultra, older gpt-5.x low→xhigh) via effortLevelsForModel so the fallback
-    // never lies about a gpt-5.6 model's real steps.
+    // Loading / error / empty → verified static fallback. Per-model ladder via
+    // effortLevelsForModel (backed by its CODEX_EFFORTS table, transcribed from this
+    // very endpoint) so the fallback never lies about a model's real steps.
     const effortsById: Record<string, EffortLevel[]> = {};
     for (const m of CODEX_MODELS) effortsById[m.value] = effortLevelsForModel(m.value);
     // No tier data in the static fallback → no Fast chip until the dynamic list loads.

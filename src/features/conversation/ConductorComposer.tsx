@@ -907,7 +907,7 @@ export const ConductorComposer = forwardRef<
 
     ),
     // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
-    // code, Codex is low→xhigh, gpt-5.6 adds max+ultra; renders nothing when the model
+    // code, Codex is low→xhigh, its top models add max+ultra; renders nothing when the model
     // has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
     // turn's override.
     effort: (
@@ -918,7 +918,7 @@ export const ConductorComposer = forwardRef<
         efforts={
           backend === "codex"
             ? // Data-driven from the selected model; fall back to the per-model static
-              // ladder (gpt-5.6 → max+ultra, older gpt-5.x → low→xhigh) so a Codex conv
+              // ladder (CODEX_EFFORTS, keyed per model id) so a Codex conv
               // shows the right rungs even if its persisted model id isn't in the dynamic
               // list — and never Claude-only tiers.
               (codexEfforts[modelId] ?? effortLevelsForModel(modelId))

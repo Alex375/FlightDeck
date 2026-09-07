@@ -101,22 +101,31 @@ export const FACTORY_HIDDEN_MODELS: readonly string[] = CLAUDE_MODELS.map((m) =>
 // The real Codex models, as reported by `codex app-server`'s `model/list`. STATIC
 // fallback used while the dynamic list loads or on error — the live `model/list` (see
 // codexModels.ts) supersedes it and picks up each model's real `supportedReasoningEfforts`.
-// The gpt-5.6 family (sol/terra/luna) supports the deeper max+ultra effort rungs
-// (assigned via effortLevelsForModel in codexModels.ts). The ids are the true wire ids,
+// Per-model effort ladders live in CODEX_EFFORTS (EffortGauge), transcribed from the same
+// `model/list` response; they are per MODEL, not per family. The ids are the true wire ids,
 // so a pick takes effect at `thread/start` (see the Rust `codex_model` plumbing).
+//
+// Transcribed verbatim from codex-cli 0.144.4, newest-first — which is also the order
+// `model/list` itself returns. `gpt-5.4` is deliberately ABSENT: the binary no longer
+// offers it, and listing a model it would reject is how a pick during the dynamic list's
+// loading window turns into a failed turn.
 export const CODEX_MODELS: ModelOption[] = [
+  // GPT-6 Astra: the binary's own `isDefault` model, and the first to declare a 2× "Fast"
+  // service tier (the gpt-5.6 family is 1.5×). Effort ladder runs the full low→ultra.
+  { label: "GPT-6 Astra", value: "gpt-6-astra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Luna", value: "gpt-5.6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.5", value: "gpt-5.5", backend: "codex", provider: "OpenAI" },
-  { label: "GPT-5.4", value: "gpt-5.4", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
 ];
 
 /** The Codex backend's default model — seeds a Codex conversation so its persisted
  *  `model` is always a real Codex id (never a Claude alias the binary would reject).
- *  gpt-5.6-sol: the top current family (adds the max/ultra effort rungs) — the default pick. */
-export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+ *  gpt-6-astra: the model `model/list` itself flags `isDefault`, and the top of the
+ *  ladder (full low→ultra effort range). Only NEW conversations are seeded from here;
+ *  an existing one keeps the model persisted on its record. */
+export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
 
 export const ALL_MODELS: ModelOption[] = [...CLAUDE_MODELS, ...CODEX_MODELS];
 

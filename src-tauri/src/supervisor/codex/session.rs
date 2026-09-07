@@ -1885,7 +1885,7 @@ fn codex_model_label(id: Option<&str>) -> String {
 }
 
 /// Reasoning effort → English label, matching the Claude backend's `effort_label`
-/// ("Extra high") plus the deeper `max`/`ultra` rungs the gpt-5.6 family exposes.
+/// ("Extra high") plus the deeper `max`/`ultra` rungs the top Codex models expose.
 fn codex_effort_label(effort: Option<&str>) -> String {
     match effort {
         Some("low") => "Low",
@@ -2464,6 +2464,10 @@ mod tests {
 
     #[test]
     fn codex_model_label_mirrors_the_composer_picker() {
+        // Derived, not tabulated — which is why a new family costs nothing here. Pinned
+        // against the front's own catalogue label so the two can never read differently
+        // for the same id (the notice says "GPT-6 Astra", so must the picker).
+        assert_eq!(codex_model_label(Some("gpt-6-astra")), "GPT-6 Astra");
         assert_eq!(codex_model_label(Some("gpt-5.6-sol")), "GPT-5.6 Sol");
         assert_eq!(codex_model_label(Some("gpt-5.4-mini")), "GPT-5.4 Mini");
         assert_eq!(codex_model_label(Some("gpt-5.5")), "GPT-5.5");

@@ -11,7 +11,8 @@ import { backendOfModel, modelFamily, modelOption } from "./models";
  * spawn alias the runtime control swallowed), promoted to a real runtime level in
  * 2.1.187 — verified live (set it on Opus 4.8 / Sonnet 4.6, read back via
  * get_settings). `ultra` is a Codex-only pure-effort rung ABOVE `max`, reported by
- * gpt-5.6's `model/list` (do NOT confuse it with the Claude `ultracode` app tier).
+ * `model/list` for the top Codex models (do NOT confuse it with the Claude `ultracode`
+ * app tier).
  * "Ultra code" is NOT an effort value: it is xhigh + a separate `ultracode` flag,
  * handled by the composer. Which levels a model supports is per-model (see
  * effortLevelsForModel); Ultra code only on xhigh-capable Claude models.
@@ -22,13 +23,34 @@ export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra" 
 // agent meta) via subagentMeta.EFFORT_LABELS so they can never drift.
 const LABELS: Record<EffortLevel, string> = EFFORT_LABELS;
 // max/ultra sit between xhigh and ultracode: `max` is the top pure-effort rung for
-// Claude, `ultra` the deeper Codex-only rung above it (gpt-5.6); `ultracode` (xhigh +
+// Claude, `ultra` the deeper Codex-only rung above it; `ultracode` (xhigh +
 // workflows) stays the app's special top step. The ordering also drives clampEffort —
 // keeping max AFTER xhigh means clamping an xhigh request on a max-but-not-xhigh model
 // (e.g. legacy Sonnet 4.6) lands on `high`, never jumps UP to max; ultra ranks above max so a
 // Codex `ultra` clamps down to `max` on a Claude model, and `ultracode` clamps down to
-// `ultra` on a gpt-5.6 Codex model.
+// `ultra` on an ultra-capable Codex model.
 const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
+
+/**
+ * The effort steps each Codex model REALLY declares, transcribed verbatim from
+ * `model/list`'s `supportedReasoningEfforts` (codex-cli 0.144.4). This is only the
+ * STATIC fallback — `codexModels.ts` supersedes it per model with the live response.
+ *
+ * A table keyed by model id, NOT a family heuristic, because the ladder is per MODEL:
+ * `gpt-5.6-luna` stops at `max` while its sol/terra siblings go all the way to `ultra`.
+ * The old `m.includes("gpt-5.6")` shortcut both over-offered `ultra` on luna and
+ * under-offered `max`/`ultra` on any model from a new family (gpt-6-astra) — a break
+ * with no error to notice, since the CLI silently swallows an effort it doesn't accept.
+ * A model absent from this table falls through to the conservative floor below.
+ */
+const CODEX_EFFORTS: Record<string, EffortLevel[]> = {
+  "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+  "gpt-5.5": ["low", "medium", "high", "xhigh"],
+  "gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
+};
 
 /** Effort levels a model supports (mirrors the binary's per-model table — `yUe`
  *  gates `max`, `eve` gates `xhigh`; both verified live against 2.1.187). `[]` = no
@@ -37,11 +59,16 @@ const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", 
  *  if reality ever differs. NOTE: Sonnet 5 accepts `xhigh` (legacy Sonnet 4.6 had `max` but not `xhigh`). */
 export function effortLevelsForModel(model: string | null | undefined): EffortLevel[] {
   const m = (model || "").toLowerCase();
-  // Codex models: gpt-5.x top out at xhigh; the gpt-5.6 family (sol/terra/luna) adds the
-  // deeper `max` + `ultra` pure-effort rungs (reported by `model/list`). `ultra` is a
-  // Codex effort, NOT the Claude `ultracode` app tier.
+  // Codex models: the verified per-model ladder above, matched on the exact wire id and
+  // then through modelFamily (so a longer resolved id still lands on its catalogue entry).
+  // `ultra` is a Codex effort, NOT the Claude `ultracode` app tier.
   if (backendOfModel(model) === "codex") {
-    if (m.includes("gpt-5.6")) return ["low", "medium", "high", "xhigh", "max", "ultra"];
+    const known = CODEX_EFFORTS[m] ?? CODEX_EFFORTS[modelFamily(m) ?? ""];
+    if (known) return [...known];
+    // A Codex model we've never seen: offer only the rungs EVERY Codex model has
+    // declared so far. Under-offering costs the user a menu step they can reach once
+    // the live `model/list` lands; over-offering sends an effort the binary drops on
+    // the floor, leaving the gauge claiming a depth the turn never ran at.
     return ["low", "medium", "high", "xhigh"];
   }
   // Claude: the catalogue carries each model's OWN capability tokens, transcribed from
@@ -120,7 +147,7 @@ export function EffortGauge({
    *  container (e.g. a FlightDeck card). See {@link Menu}. */
   portal?: boolean;
   /** Explicit effort steps (Codex: the selected model's real `supportedReasoningEfforts`
-   *  from `model/list`, which for gpt-5.6 includes `max`/`ultra`). When omitted, derived
+   *  from `model/list`, which for the top models includes `max`/`ultra`). When omitted, derived
    *  from the model id (`stepsForModel`). Never gets an Ultra code (`ultracode`) step —
    *  that app tier is Claude-only. */
   efforts?: EffortLevel[];

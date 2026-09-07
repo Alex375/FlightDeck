@@ -477,13 +477,13 @@ describe("conversationsStore — backend (kind) branches", () => {
     const cx = createConversationInRepo("/tmp/r1", "codex");
     const codexConv = useConversationsStore.getState().conversations.find((c) => c.id === cx)!;
     expect(codexConv.kind).toBe("codex");
-    expect(codexConv.model).toBe("gpt-5.6-sol"); // DEFAULT_CODEX_MODEL
+    expect(codexConv.model).toBe("gpt-6-astra"); // FACTORY_DEFAULTS.codexModel
     expect(codexConv.effort).toBe("xhigh"); // DEFAULT_CODEX_EFFORT
     // Default (kind omitted) stays the pre-Codex Claude behaviour.
     const cl = createConversationInRepo("/tmp/r1");
     const claudeConv = useConversationsStore.getState().conversations.find((c) => c.id === cl)!;
     expect(claudeConv.kind).toBe("claude");
-    expect(claudeConv.model).not.toBe("gpt-5.6-sol");
+    expect(claudeConv.model).not.toBe("gpt-6-astra");
   });
 
   it("Codex model/effort changes persist but are NEVER pushed live (per-turn overrides)", () => {
