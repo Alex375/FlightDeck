@@ -41,7 +41,13 @@ describe("parseWfProgress", () => {
 });
 
 describe("foldProgress", () => {
-  const empty: WfLive = { phases: [] };
+  const empty: WfLive = { phases: [], startedAt: null };
+
+  it("carries startedAt through a change", () => {
+    const seeded: WfLive = { phases: [], startedAt: 1234 };
+    const s = foldProgress(seeded, "Research: a");
+    expect(s.startedAt).toBe(1234);
+  });
 
   it("accumulates agents per phase, in first-seen order, deduped", () => {
     let s = empty;
@@ -74,6 +80,19 @@ describe("useWorkflowLiveStore.record", () => {
     record("c", wfTask({ task_id: "w", progress: "Research: a" }));
     record("c", wfTask({ task_id: "w", kind: "bash", progress: "ignored" }));
     expect(useWorkflowLiveStore.getState().runs["c"]["w"].phases[0].labels).toEqual(["a"]);
+  });
+
+  it("stamps startedAt on first sight and keeps it stable across ticks", () => {
+    const { record } = useWorkflowLiveStore.getState();
+    // task_started arrives with no progress yet → an entry (with a start time) still appears,
+    // so the live view's run timer can start immediately.
+    record("c", wfTask({ task_id: "w" }));
+    const first = useWorkflowLiveStore.getState().runs["c"]?.["w"];
+    expect(first).toBeDefined();
+    expect(typeof first.startedAt).toBe("number");
+    record("c", wfTask({ task_id: "w", progress: "Research: a" }));
+    // A later tick must NOT reset the start time.
+    expect(useWorkflowLiveStore.getState().runs["c"]["w"].startedAt).toBe(first.startedAt);
   });
 
   it("purges the run's entry once it reaches a terminal status (bounds memory)", () => {

@@ -57,9 +57,10 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
  * newest-version-first inside a family — that IS the default picker order.
  */
 export const CLAUDE_MODELS: ModelOption[] = [
-  // Fable 5: preview model with its own rate-limit window (surfaced by the usage ring as
-  // a model-scoped cap). Same effort tier as Opus. Alias "fable" is sent verbatim.
-  { label: "Fable 5", value: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
+  // Fable 5.1: preview model with its own rate-limit window (surfaced by the usage ring
+  // as a model-scoped cap). Same effort tier as Opus. Alias "fable" is sent verbatim and
+  // the binary resolves it to the latest of the family (claude-fable-5-1 as of 2.1.260).
+  { label: "Fable 5.1", value: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Opus 5", value: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
   // Opus 4.8: the app's default (see DEFAULT_MODEL). Named in full because `opus` now
   // resolves to Opus 5. Verified live: a turn spawned with `--model claude-opus-4-8`
@@ -84,7 +85,7 @@ export const CLAUDE_MODELS: ModelOption[] = [
 ];
 
 /**
- * What the picker shows on a fresh install: Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5 —
+ * What the picker shows on a fresh install: Fable 5.1, Opus 4.8, Sonnet 5, Haiku 4.5 —
  * one current model per family, with Opus 4.8 as the default. Everything else (Opus 5
  * included, by explicit product decision) starts in Settings → Models' "Available"
  * list, one click away.

@@ -92,6 +92,16 @@ export interface DisplayPrefs {
    *  Only ever visible while a workflow runs. Read by {@link WorkflowPeek}. */
   workflowLiveCard: boolean;
 
+  /** In the workflow detail modal's LIVE view, break each phase open into the individual
+   *  agents running under it — real labels (matched to the run's spawn-ordered agents),
+   *  a running/done dot, and a one-line "doing X now" read from each agent's transcript —
+   *  the closest we get to Claude Code's own `/workflows` per-agent readout. ON by default.
+   *  Off → the live view falls back to the flat counts + opaque in-flight id list it showed
+   *  before. Only affects a RUNNING workflow (the finished run has the exact manifest view).
+   *  The agent↔label match is a spawn-order heuristic (the wire gives no live mapping), so
+   *  it is labelled approximate. Read by {@link WorkflowDetail}. */
+  workflowAgentDetail: boolean;
+
   /** Animate the Flight Deck's reply modal open and closed: the panel GROWS out of the card
    *  that was clicked and SHRINKS back into it, the way Finder's Quick Look previews a file —
    *  so the modal reads as that card enlarged rather than as a dialog from nowhere. ON by
@@ -273,6 +283,7 @@ const DEFAULTS: DisplayPrefs = {
   messageMinimap: true,
   minimapHoverMode: "summary",
   workflowLiveCard: true,
+  workflowAgentDetail: true,
   flightdeckModalZoom: true,
   panelAnimations: true,
   conversationAnimations: true,
@@ -343,6 +354,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
+        workflowAgentDetail: patch.workflowAgentDetail ?? s.workflowAgentDetail,
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
         panelAnimations: patch.panelAnimations ?? s.panelAnimations,
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,

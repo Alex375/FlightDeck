@@ -378,7 +378,7 @@
   color: var(--wf-tx-lo);
   cursor: pointer;
   text-align: left;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease, opacity 0.12s ease;
 }
 .phaseRow:hover {
   background: color-mix(in srgb, var(--wf-panel-3) 50%, transparent);
@@ -388,19 +388,68 @@
   background: color-mix(in srgb, var(--wf-accent) 12%, transparent);
   color: var(--wf-tx);
 }
-.phaseName {
+/* Upcoming phases recede; hovering one still lifts it back to full so it reads as clickable. */
+.phaseRow[data-state="todo"] {
+  opacity: 0.5;
+}
+.phaseRow[data-state="todo"]:hover {
+  opacity: 1;
+}
+.phaseDot {
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: 16px;
+  justify-content: center;
+}
+.phaseMain {
   flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.phaseName {
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 12.5px;
+  font-weight: 600;
+  color: var(--wf-tx);
 }
+.phaseDetail {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+}
+/* Per-phase "done/total" badge — neutral by default, green once complete, accent while current. */
 .phaseCount {
   flex: 0 0 auto;
   font-size: 10.5px;
-  color: var(--wf-tx-xlo);
   font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: var(--wf-tx-lo);
+  background: color-mix(in srgb, var(--wf-tx-xlo) 16%, transparent);
+}
+.phaseCount[data-state="done"] {
+  color: var(--wf-run);
+  background: color-mix(in srgb, var(--wf-run) 16%, transparent);
+}
+.phaseCount[data-state="cur"] {
+  color: var(--wf-accent);
+  background: color-mix(in srgb, var(--wf-accent) 16%, transparent);
+}
+/* A short honesty line under the live phase list (only while the run is mid-flight). */
+.colFootNote {
+  margin-top: 8px;
+  padding: 6px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--wf-tx-xlo);
 }
 
 /* ---- agent rows ----------------------------------------------------------- */
@@ -418,11 +467,15 @@
   text-align: left;
   transition: background 0.12s ease;
 }
-.agentRow:hover {
+.agentRow[data-clickable="true"]:hover {
   background: color-mix(in srgb, var(--wf-panel-3) 50%, transparent);
 }
 .agentRow.sel {
   background: color-mix(in srgb, var(--wf-accent) 12%, transparent);
+}
+/* A queued agent (no transcript yet) is shown but inert — no pointer, no hover lift. */
+.agentRow:disabled {
+  cursor: default;
 }
 .agentTop {
   display: flex;
@@ -438,6 +491,19 @@
   text-overflow: ellipsis;
   font-size: 12.5px;
   color: var(--wf-tx);
+}
+/* A settled agent's label recedes (like a done phase), so the eye lands on what's still working. */
+.agentLabel[data-done="true"] {
+  color: var(--wf-tx-lo);
+}
+/* The live "doing X" line under a running agent (mid-run only). */
+.agentAct {
+  font-size: 10.5px;
+  color: var(--wf-tx-xlo);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 21px;
 }
 .agentMeta {
   font-size: 10.5px;

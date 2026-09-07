@@ -29,6 +29,7 @@ import {
 } from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
+import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -41,6 +42,9 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
   { id: "conversation", label: "Conversation", icon: "chat" },
+  // How CLAUDE itself behaves (not how we render it): its output style, what it is allowed
+  // to do without asking. Next to Conversation — both shape what a conversation is.
+  { id: "behavior", label: "Behavior", icon: "bot" },
   // Next to Conversation (both shape what a conversation is), its own tab for the same
   // reason as Composer: arranging two lists by drag is a task, not a row of switches.
   { id: "models", label: "Models", icon: "spark" },
@@ -161,7 +165,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 <TimingPrefs />
                 <FleetBannerPrefs />
                 <BackgroundTaskPrefs />
-                <PermissionPrefs />
                 <CaffeinatePrefs />
               </div>
             )}
@@ -171,6 +174,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {section === "tosse" && <TosseSection />}
 
             {section === "conversation" && <ConversationSection />}
+
+            {section === "behavior" && (
+              <div>
+                <PageHead
+                  title="Behavior"
+                  subtitle="How Claude itself behaves — the writing style of its responses and what it may do without asking. These are global Claude settings; Codex has its own controls elsewhere."
+                />
+                <OutputStylePrefs />
+                <PermissionPrefs />
+              </div>
+            )}
 
             {section === "models" && <ModelsSection />}
 
@@ -289,6 +303,7 @@ function DisplayPrefs() {
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
+  const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
   const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
   const panelAnimations = useDisplay((s) => s.panelAnimations);
   const conversationAnimations = useDisplay((s) => s.conversationAnimations);
@@ -397,6 +412,24 @@ function DisplayPrefs() {
         checked={workflowLiveCard}
         onChange={(v) => set({ workflowLiveCard: v })}
         label="Show live workflow progress on cards"
+      />
+      <ToggleRow
+        title="Per-agent detail in the workflow view"
+        hint={
+          <>
+            In a running workflow's detail view, break each phase open into its individual{" "}
+            <strong>agents</strong> — their real labels, a running/done dot, and a one-line{" "}
+            <strong>“doing X now”</strong> read from each agent's transcript — the closest we get
+            to Claude Code's own <code>/workflows</code> readout. The wire gives no live
+            agent→label mapping, so labels are matched to the run <strong>by spawn order</strong>{" "}
+            (approximate, and stated as such); the exact mapping arrives with the end-of-run
+            report. Off → the flat launched/running/done counts and the opaque id list.{" "}
+            <strong>On by default.</strong>
+          </>
+        }
+        checked={workflowAgentDetail}
+        onChange={(v) => set({ workflowAgentDetail: v })}
+        label="Show each agent under its phase, live"
       />
       <ToggleRow
         title="Zoom when opening a card"

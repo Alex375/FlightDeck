@@ -1,5 +1,9 @@
-# Propriétaire de code par défaut : toute PR vers une branche protégée (main)
-# exige la revue/approbation d'Alexandre. Combiné à la protection de branche
-# (« require review from Code Owners »), c'est ce qui fait que seul @Alex375
-# valide les merges vers main.
+# CODEOWNERS — actuellement INERTE côté enforcement (depuis sept. 2026).
+#
+# La protection de `main` a « require review from Code Owners » DÉSACTIVÉE et
+# required_approving_review_count = 0 : aucune review humaine n'est requise pour
+# merger (Alexandre et Armand mergent leurs propres PR dès que la CI `test` est
+# verte). Ce fichier est conservé pour pouvoir REBASCULER l'exigence de revue
+# d'Alexandre en un geste : réactiver « require review from Code Owners » (+ un
+# nombre d'approbations ≥ 1) sur la protection de branche de `main`.
 * @Alex375

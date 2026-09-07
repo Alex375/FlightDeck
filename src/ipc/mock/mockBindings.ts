@@ -77,6 +77,7 @@ import type {
   TosseTaskDetail,
   SlashCommand,
   AppControlRequestEvent,
+  WakeWordEvent,
   TerminalExitEvent,
   TerminalOutputEvent,
   TickEvent,
@@ -183,6 +184,9 @@ const terminalExitEvent = new MockEmitter<TerminalExitEvent>();
 // No app-hosted MCP server in the browser mock — never fires, but must exist so
 // the AppControlHost can subscribe without crashing.
 const appControlRequestEvent = new MockEmitter<AppControlRequestEvent>();
+// No wake-word engine in the browser mock — never fires, but must exist so VoiceHost can
+// subscribe without crashing the whole app on boot.
+const wakeWordEvent = new MockEmitter<WakeWordEvent>();
 
 export const mockEvents = {
   sessionMessageEvent,
@@ -206,6 +210,7 @@ export const mockEvents = {
   terminalOutputEvent,
   terminalExitEvent,
   appControlRequestEvent,
+  wakeWordEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
@@ -563,6 +568,9 @@ function writeDemoSubtaskStatus(taskId: string, status: string): boolean {
 
 // ---- Commands (same shape as the generated facade) -------------------------
 
+/** Mock-only: the current global output style, so a set is reflected by the next get. */
+let mockOutputStyle = "default";
+
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
     return { ok: true, echo: msg, at_ms: Date.now() };
@@ -570,6 +578,17 @@ export const mockCommands = {
 
   async fetchSlashCommands(_cwd: string): Promise<Result<SlashCommand[], string>> {
     return ok(MOCK_COMMANDS);
+  },
+
+  // Global output style (settings.json `outputStyle`) — mocked so the composer chip and the
+  // Settings → Behavior card render in the browser mock (dev/Playwright) without a real
+  // settings.json. Kept in a module-level var so a set is reflected by the next get.
+  async getOutputStyle(): Promise<Result<string, string>> {
+    return ok(mockOutputStyle);
+  },
+  async setOutputStyle(style: string): Promise<Result<null, string>> {
+    mockOutputStyle = style;
+    return ok(null);
   },
 
   // Backend binary detection — stubbed "installed" for the browser mock (dev/Playwright)
@@ -615,6 +634,7 @@ export const mockCommands = {
       ],
       agents: [],
       warnings: [],
+      plugin_state_trusted: true,
     });
   },
   // ---- Extensions v2 (Codex) — toggles + live inventories, demo-shaped ----------
@@ -1884,7 +1904,7 @@ export const mockCommands = {
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------
   // Without these, the extensions manager calls `undefined(...)` in `?demo=` mode.
   async listExtensions(_repoPath: string): Promise<Result<ExtensionsSnapshot, string>> {
-    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [] });
+    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true });
   },
   async listPluginContents(_repoPath: string, _pluginId: string): Promise<Result<PluginContents, string>> {
     return ok({ skills: [], agents: [], mcp_servers: [] });

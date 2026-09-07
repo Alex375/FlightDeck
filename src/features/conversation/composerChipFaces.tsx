@@ -109,6 +109,17 @@ export function CodexOptionsFace(rest: BtnProps) {
   return <ChipBtn icon="cog" aria-label="Codex options" {...rest} />;
 }
 
+/** Output style — the assistant's writing manner (Default / Concise / …). A USER-GLOBAL
+ *  Claude setting, Claude only; the pencil marks "how it writes". The label is passed in
+ *  so the live chip and the Settings preview render the same face. */
+export function OutputStyleFace({ label, ...rest }: { label: string } & BtnProps) {
+  return (
+    <ChipBtn icon="pencil" {...rest}>
+      {label}
+    </ChipBtn>
+  );
+}
+
 /** Artifacts index — icon plus the count published in this conversation. */
 export function ArtifactsFace({ count, ...rest }: { count: number } & BtnProps) {
   return (

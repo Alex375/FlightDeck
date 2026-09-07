@@ -124,6 +124,26 @@ export function TaskLaunchProvider({
     };
   }, []);
 
+  // Mark the row as started, for the few seconds of `STARTED_MS`. Used whenever the window
+  // does NOT move — the window moving IS the confirmation everywhere else, so with it gone
+  // the row has to say it itself.
+  const markStarted = useCallback((taskId: string) => {
+    const running = startedTimers.current.get(taskId);
+    if (running) clearTimeout(running);
+    setStartedTaskIds((prev) => new Set(prev).add(taskId));
+    startedTimers.current.set(
+      taskId,
+      setTimeout(() => {
+        startedTimers.current.delete(taskId);
+        setStartedTaskIds((prev) => {
+          const next = new Set(prev);
+          next.delete(taskId);
+          return next;
+        });
+      }, STARTED_MS),
+    );
+  }, []);
+
   // Every successful launch ends here — the one-click path AND the dialog's — so the
   // "does the window move" decision is taken in ONE place, whichever route got there.
   const handOff = useCallback(
@@ -132,24 +152,9 @@ export function TaskLaunchProvider({
         onOpenConversation(convId);
         return;
       }
-      // Staying put. The window moving IS the confirmation everywhere else, so with it
-      // gone the row has to say it itself.
-      const running = startedTimers.current.get(taskId);
-      if (running) clearTimeout(running);
-      setStartedTaskIds((prev) => new Set(prev).add(taskId));
-      startedTimers.current.set(
-        taskId,
-        setTimeout(() => {
-          startedTimers.current.delete(taskId);
-          setStartedTaskIds((prev) => {
-            const next = new Set(prev);
-            next.delete(taskId);
-            return next;
-          });
-        }, STARTED_MS),
-      );
+      markStarted(taskId);
     },
-    [onOpenConversation, startStaysOnTasks],
+    [markStarted, onOpenConversation, startStaysOnTasks],
   );
 
   const launch = useCallback(
@@ -164,10 +169,13 @@ export function TaskLaunchProvider({
         return;
       }
       const repo = repos.find((r) => r.id === resolution.repoId);
-      // Cached answer only — probing a folder can spawn a short-lived `claude`, which
-      // belongs in the dialog (it can show that it is working), not in a click handler
-      // that is meant to be instant. Anything but a confirmed "available" opens the
-      // dialog, which probes and then says what it found.
+      // Cached answer only — PROBING the command catalogue spawns a short-lived `claude`,
+      // which belongs in the dialog (it can show that it is working), not in a click
+      // handler that is meant to be instant. Anything but a confirmed "available" opens the
+      // dialog, which probes and then says what it found. (Equipping the folder still runs
+      // inside the launch below: that one reads config files off disk, and only pays for a
+      // spawn in the one case where it found a dormant plugin to switch on — which is the
+      // work the click asked for, and the row shows it is busy while it happens.)
       const pickup = repo ? pickupSupportFromCache(repo.path) : "unknown";
       if (pickup !== "available") {
         openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup, extra });
@@ -176,15 +184,23 @@ export function TaskLaunchProvider({
       setBusyTaskId(task.id);
       void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
         .then((out) => {
-          // The conversation IS open, so this is not a failed launch — but if equipping it
-          // went wrong, the toast is the only place that can say so from here.
-          setError(activationProblem(out.plugin));
+          const problem = activationProblem(out.plugin);
+          setError(problem);
+          // ⚠️ A problem must stay READABLE. Handing the window over unmounts this
+          // provider — and the toast with it — so a launch with something to say does not
+          // navigate: it stays here, says it, and marks the row started like any launch
+          // that stays put. The conversation exists and is linked, so the row's own
+          // « Open » button leads to it once the message has been read.
+          if (problem) {
+            markStarted(task.id);
+            return;
+          }
           handOff(mode, task.id, out.convId);
         })
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
-    [handOff, links, openDialog, pins, repos],
+    [handOff, links, markStarted, openDialog, pins, repos],
   );
 
   const open = useCallback(
@@ -251,33 +267,48 @@ function TaskLaunchDialog({
   const linkProject = useLinkTosseProjectRepo();
 
   const [chosenRepoId, setChosenRepoId] = useState<string | null>(null);
+  // The user asked to pick another folder. A separate flag, NOT `chosenRepoId = null`:
+  // when the folder was pre-resolved (a project pin, or the caller's own resolution),
+  // clearing the choice falls straight back onto it and re-displays the same folder, so
+  // "Change" would do nothing at all — which is exactly when it is wanted (running one
+  // task in a different clone).
+  const [changing, setChanging] = useState(false);
   const [question, setQuestion] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The conversation this dialog has already opened. Set when a launch went through but
+  // something AROUND it did not, which keeps the dialog up to say so — and this is what
+  // stops the still-enabled button from launching a SECOND conversation on the same task.
+  const [launched, setLaunched] = useState<string | null>(null);
   const [pickup, setPickup] = useState<PickupSupport | null>(pending.pickup);
   const [probing, setProbing] = useState(false);
-  // The plugin that provides the TOSSE skills, as this folder's extensions report it:
-  // `undefined` while unknown (or unreadable — nothing is concluded from a scan that
-  // failed), `null` when none is installed. READ-ONLY here; switching it on is the launch's
-  // job, so cancelling this dialog never writes anything.
-  const [provider, setProvider] = useState<PickupPlugin | null | undefined>(undefined);
-  // Whether that scan is still out. Held apart from `provider` because "not yet known" and
+  // The plugin that provides the TOSSE skills, as this folder's extensions report it —
+  // carried WITH the path it was scanned for, so a folder changed since is never described
+  // by the previous one's answer. `undefined` while unknown (or unreadable — nothing is
+  // concluded from a scan that failed), `plugin: null` when none is installed. READ-ONLY
+  // here; switching it on is the launch's job, so cancelling this dialog never writes
+  // anything.
+  const [scan, setScan] = useState<{ path: string; plugin: PickupPlugin | null } | undefined>(
+    undefined,
+  );
+  // Whether that scan is still out. Held apart from the answer because "not yet known" and
   // "we looked and found none" must not share a value: the dialog stays silent on the first
   // and speaks on the second.
   const [scanning, setScanning] = useState(false);
-  // Installed but off — the launch will switch it on, which is why the dialog must NOT
-  // announce the written-instructions fallback in this case: it would describe a folder
-  // that stops being true the moment the button is pressed.
-  const dormant = provider && !provider.enabled ? provider : null;
 
   const resolution = useMemo(
     () => resolveTaskFolder(pins ?? [], links, pending.projectId, repos),
     [pins, links, pending.projectId, repos],
   );
-  const repoId = chosenRepoId ?? pending.repoId ?? resolution.repoId;
+  const repoId = chosenRepoId ?? (changing ? null : (pending.repoId ?? resolution.repoId));
   const repo = repos.find((r) => r.id === repoId) ?? null;
   const repoPath = repo?.path ?? null;
   const starting = pending.mode === "pickup";
+  const provider = scan && scan.path === repoPath ? scan.plugin : undefined;
+  // Installed but off — the launch will switch it on, which is why the dialog must NOT
+  // announce the written-instructions fallback in this case: it would describe a folder
+  // that stops being true the moment the button is pressed.
+  const dormant = provider && !provider.enabled ? provider : null;
 
   // Escape closes, like the app's other dialogs (the capture-phase guard in App.tsx
   // keeps macOS from leaving fullscreen either way).
@@ -323,20 +354,27 @@ function TaskLaunchDialog({
   // apart from "installed, dormant".
   useEffect(() => {
     if (!repoPath || (starting && pickup !== "absent")) {
-      setProvider(undefined);
+      setScan(undefined);
+      // ⚠️ Clear the in-flight flag too. Reaching this branch WHILE a scan is out (the
+      // folder was unregistered, or the catalogue came back) leaves the resolving promise
+      // unable to clear it — its `finally` is gated on the effect run that owned it, which
+      // has just been cleaned up. Stranded at true, `scanning` would suppress the fallback
+      // warning below for the rest of the dialog's life.
+      setScanning(false);
       return;
     }
     let alive = true;
+    const path = repoPath;
     setScanning(true);
-    findPickupPlugin(repoPath)
+    findPickupPlugin(path)
       .then((found) => {
-        if (alive) setProvider(found);
+        if (alive) setScan({ path, plugin: found });
       })
       // A scan that failed says nothing about what is installed, so it must not read as
       // "none". It is not swallowed either: the launch runs the same scan and reports the
       // failure through `activationProblem`.
       .catch(() => {
-        if (alive) setProvider(undefined);
+        if (alive) setScan(undefined);
       })
       .finally(() => {
         if (alive) setScanning(false);
@@ -347,6 +385,12 @@ function TaskLaunchDialog({
   }, [starting, repoPath, pickup]);
 
   async function go(overrideRepoId?: string) {
+    // One conversation per dialog, full stop. After a launch that opened one and then had
+    // something to report, the button is still there and still enabled — pressing it again
+    // must not create a second conversation, link it, send a second first message and write
+    // the plugin toggle again. Reaching the one already opened is what the footer offers
+    // instead (see `launched`).
+    if (launched) return;
     // `overrideRepoId`: a folder just adopted in the SAME click — React state has not been
     // applied yet, so reading `repoId` here would launch in the previous folder (or in
     // none). The explicit id is the only correct one at this point.
@@ -366,12 +410,18 @@ function TaskLaunchDialog({
           pinError = e instanceof Error ? e.message : String(e);
         }
       }
+      // Hand the scan we already have to the launch, so one launch reads the folder's
+      // config files ONCE. Only when it was made for THIS folder: `overrideRepoId` adopts a
+      // folder in the same click, and the answer on screen is still the previous one's —
+      // passing it would have the launch skip its scan and act on another folder's plugin.
+      const targetPath = repos.find((r) => r.id === targetRepoId)?.path ?? null;
       const out = await launchTaskConversation({
         task: pending.task,
         repoId: targetRepoId,
         mode: pending.mode,
         question,
         extra: pending.extra,
+        plugin: scan && scan.path === targetPath ? scan.plugin : undefined,
       });
       // Two things can go wrong AROUND a launch that itself succeeded: the folder was not
       // remembered, and the plugin was not switched on. Both are reported together —
@@ -384,7 +434,9 @@ function TaskLaunchDialog({
       ].filter((p): p is string => p != null);
       if (problems.length > 0) {
         // The conversation IS open; only what surrounds it failed. Keep the dialog up to
-        // say so rather than navigating away from the message.
+        // say so rather than navigating away from the message — and remember which
+        // conversation that was, so the footer leads to it instead of opening another.
+        setLaunched(out.convId);
         setError(problems.join("\n"));
         setSending(false);
         return;
@@ -432,8 +484,11 @@ function TaskLaunchDialog({
                 <button
                   type="button"
                   className={card.ghostBtn}
-                  disabled={busy}
-                  onClick={() => setChosenRepoId(null)}
+                  disabled={busy || launched !== null}
+                  onClick={() => {
+                    setChosenRepoId(null);
+                    setChanging(true);
+                  }}
                 >
                   Change
                 </button>
@@ -446,6 +501,7 @@ function TaskLaunchDialog({
                 busy={busy}
                 onChoose={(id) => {
                   setChosenRepoId(id);
+                  setChanging(false);
                   // "Start" has nothing else to ask, so one click goes all the way.
                   // "Discuss" only selects: the question field below is the point of it.
                   return starting ? go(id) : undefined;
@@ -537,16 +593,31 @@ function TaskLaunchDialog({
           {probing ? <span className={card.footNote}>Checking this folder's commands…</span> : null}
           <span className={card.footSpacer} />
           <button type="button" className={card.ghostBtn} disabled={sending} onClick={onClose}>
-            Cancel
+            {launched ? "Close" : "Cancel"}
           </button>
-          <button
-            type="button"
-            className={card.primaryBtn}
-            disabled={busy || !repoId}
-            onClick={() => void go()}
-          >
-            {sending ? "Opening…" : starting ? "Start" : "Discuss"}
-          </button>
+          {/* Once a conversation has been opened, the primary action is to GO TO IT — the
+              launch is done, and offering to run it again is offering to duplicate it. */}
+          {launched ? (
+            <button
+              type="button"
+              className={card.primaryBtn}
+              onClick={() => {
+                onClose();
+                onLaunched(launched);
+              }}
+            >
+              Open the conversation
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={card.primaryBtn}
+              disabled={busy || !repoId}
+              onClick={() => void go()}
+            >
+              {sending ? "Opening…" : starting ? "Start" : "Discuss"}
+            </button>
+          )}
         </div>
       </div>
     </div>

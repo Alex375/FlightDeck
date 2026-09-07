@@ -2435,6 +2435,31 @@ pub async fn set_plugin_enabled(plugin_id: String, enabled: bool) -> Result<(), 
         .map_err(|e| e.to_string())?
 }
 
+/// Read the user's persisted output style from `~/.claude/settings.json` `outputStyle`
+/// (USER-GLOBAL — the CLI has no per-session style). Absent → `"default"`; a broken
+/// settings.json errors rather than silently defaulting. The blocking IO runs off the
+/// async runtime. The live/active style (what the running binary uses) travels separately
+/// on `SessionStatePayload.output_style` from `system/init`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_output_style() -> Result<String, String> {
+    tokio::task::spawn_blocking(crate::extensions::read_output_style)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;
+/// `"default"` removes the key). USER-GLOBAL, atomic, order-preserving write. A live
+/// session reflects the change on its next turn's `system/init`; otherwise it lands on
+/// the next spawn. The blocking file IO runs off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_output_style(style: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::extensions::set_output_style(&style))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Everything a single plugin provides (skills / sub-agents / MCP servers) for the
 /// per-plugin explorer — scanned regardless of the plugin's enabled state so a
 /// disabled plugin stays browsable. `repo_path` selects the install relevant to the

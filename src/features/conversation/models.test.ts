@@ -42,12 +42,15 @@ describe("backendOfModel", () => {
 describe("modelLabel", () => {
   it("labels exact catalogue ids", () => {
     expect(modelLabel("opus")).toBe("Opus 5");
+    // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
+    expect(modelLabel("fable")).toBe("Fable 5.1");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
   });
 
   it("labels resolved Claude ids by family", () => {
     expect(modelLabel("claude-sonnet-5")).toBe("Sonnet 5");
+    expect(modelLabel("claude-fable-5-1")).toBe("Fable 5.1");
   });
 
   it("labels Opus 4.8 by its full name, never as Opus 5", () => {

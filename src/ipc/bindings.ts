@@ -1277,6 +1277,35 @@ async setPluginEnabled(pluginId: string, enabled: boolean) : Promise<Result<null
 }
 },
 /**
+ * Read the user's persisted output style from `~/.claude/settings.json` `outputStyle`
+ * (USER-GLOBAL — the CLI has no per-session style). Absent → `"default"`; a broken
+ * settings.json errors rather than silently defaulting. The blocking IO runs off the
+ * async runtime. The live/active style (what the running binary uses) travels separately
+ * on `SessionStatePayload.output_style` from `system/init`.
+ */
+async getOutputStyle() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_output_style") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;
+ * `"default"` removes the key). USER-GLOBAL, atomic, order-preserving write. A live
+ * session reflects the change on its next turn's `system/init`; otherwise it lands on
+ * the next spawn. The blocking file IO runs off the async runtime.
+ */
+async setOutputStyle(style: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_output_style", { style }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Everything a single plugin provides (skills / sub-agents / MCP servers) for the
  * per-plugin explorer — scanned regardless of the plugin's enabled state so a
  * disabled plugin stays browsable. `repo_path` selects the install relevant to the
@@ -2841,7 +2870,19 @@ export type ExtensionsSnapshot = { mcp_servers: McpServerInfo[]; plugins: Plugin
  * a corrupt `~/.claude.json` reads as an empty inventory, and a corrupt
  * `settings.json` would (wrongly) show every plugin as enabled. Empty = clean.
  */
-warnings: string[] }
+warnings: string[]; 
+/**
+ * Whether each plugin's `enabled` above is a READ value rather than a guess.
+ * 
+ * False when `~/.claude/settings.json` — the ONE file that holds
+ * `enabledPlugins` — could not be read: every plugin then falls back to the
+ * `.unwrap_or(true)` below and reads as ON whatever the user actually set.
+ * `warnings` alone cannot answer this (it also collects failures from files
+ * that say nothing about plugins), and a caller about to act on `enabled`
+ * needs "we read it" told apart from "we assumed it" — otherwise a corrupt
+ * config silently reports every plugin as already switched on.
+ */
+plugin_state_trusted: boolean }
 /**
  * A file's contents plus the guards the editor needs: `too_large` (skipped, over
  * [`MAX_FILE_BYTES`]) and `binary` (a NUL byte was found — not shown as text).
@@ -3700,6 +3741,14 @@ model: string | null;
  * Current permission mode (from `system/init` / the `set_permission_mode` ack).
  */
 permission_mode: string | null; 
+/**
+ * The output style the RUNNING binary is using right now (from `system/init`,
+ * re-emitted each turn). Output style is USER-GLOBAL — the CLI has no per-session
+ * style — so this is the live reflection of the `outputStyle` we persist in
+ * `settings.json`. `None` on old CLIs (field absent). Lets the UI show whether a
+ * just-picked style is already active or still pending the session's next (re)start.
+ */
+output_style: string | null; 
 /**
  * Current reasoning-effort level (`low`/`medium`/`high`/`xhigh`). NOT carried
  * by `system/init` — sourced from the `get_settings` control read-back (and the

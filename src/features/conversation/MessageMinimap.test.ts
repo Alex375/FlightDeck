@@ -186,6 +186,14 @@ describe("hoverRegime (cold on arrival, warm while reading)", () => {
     // crossed the column without settling arrives with nothing to inherit.
     expect(hoverRegime({ previewOpen: false, leftWarmAt: null, now: T })).toBe("cold");
   });
+
+  // The component measures this on a monotonic clock, so a stamp cannot legitimately sit in
+  // the future. Should one ever get there, "age <= 300" would hold for as long as it took the
+  // clock to catch up and pin the column warm — so the window is bounded on BOTH sides.
+  it("does not read a stamp from the future as 'still reading'", () => {
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T + 1, now: T })).toBe("cold");
+    expect(hoverRegime({ previewOpen: false, leftWarmAt: T + 60_000, now: T })).toBe("cold");
+  });
 });
 
 describe("hoverDelayMs", () => {

@@ -330,6 +330,9 @@ impl Assembler {
                 // ExitWorktree), the next turn's init carries the new cwd — the UI's
                 // worktree indicator follows along.
                 self.state.cwd = init.cwd.clone();
+                // Output style is re-emitted each turn like cwd/model; keep the state's
+                // copy in step so the UI shows the style the binary is actually running.
+                self.state.output_style = init.output_style.clone();
                 // Do NOT force busy here: `system/init` is emitted at the start of
                 // each turn (not at spawn). Marking busy on init is fine for turns,
                 // but busy is driven by user-send (set_busy) + message_start /
@@ -1259,7 +1262,7 @@ fn model_label(id: &str) -> String {
     } else if s.contains("haiku") {
         "Haiku 4.5".to_string()
     } else if s.contains("fable") {
-        "Fable 5".to_string()
+        "Fable 5.1".to_string()
     } else {
         id.to_string()
     }
@@ -2244,6 +2247,23 @@ mod tests {
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
         assert_eq!(detail["from"], serde_json::json!("Opus 5"));
         assert_eq!(detail["to"], serde_json::json!("Opus 4.8"));
+    }
+
+    /// The `fable` family now resolves to Fable 5.1 (binary 2.1.260); the label must
+    /// mirror the composer's catalogue, which reads "Fable 5.1".
+    #[test]
+    fn fable_family_is_labelled_5_1() {
+        let mut asm = seeded();
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "s", "uuid": "u", "cwd": "/x",
+            "model": "claude-fable-5-1", "permissionMode": "default",
+            "tools": ["Bash"], "slash_commands": []
+        }))
+        .unwrap();
+        let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
+        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["to"], serde_json::json!("Fable 5.1"));
     }
 
     /// A connection failure mid-turn must be VISIBLE: the CLI retries by itself, so

@@ -37,11 +37,15 @@ describe("loading a stored arrangement", () => {
     expect(useComposerBar.getState().hidden).toEqual(["cleanOutput"]);
   });
 
-  it("keeps compact flags only for left-hand chips", async () => {
+  it("keeps compact flags only for chips that show a label", async () => {
     const { useComposerBar } = await loadWith(
-      JSON.stringify({ compactLeft: { model: true, cleanOutput: true, ghost: true, effort: false } }),
+      JSON.stringify({
+        compactLeft: { model: true, outputStyle: true, cleanOutput: true, ghost: true, effort: false },
+      }),
     );
-    expect(useComposerBar.getState().compactLeft).toEqual({ model: true });
+    // model (left) and outputStyle (the one labelled right chip) survive; cleanOutput is an
+    // icon-only right chip, ghost is unknown, effort is false → all dropped.
+    expect(useComposerBar.getState().compactLeft).toEqual({ model: true, outputStyle: true });
   });
 
   it("drops custom buttons missing an id or an action", async () => {
@@ -97,10 +101,16 @@ describe("mutations", () => {
     expect(useComposerBar.getState().hidden).toEqual([]);
   });
 
-  it("refuses a compact flag on a right-hand chip", async () => {
+  it("refuses a compact flag on a plain icon-only right-hand chip", async () => {
     const { useComposerBar } = await loadWith(null);
     useComposerBar.getState().setLeftCompact("cleanOutput", true);
     expect(useComposerBar.getState().compactLeft).toEqual({});
+  });
+
+  it("accepts a compact flag on the labelled output-style right-hand chip", async () => {
+    const { useComposerBar } = await loadWith(null);
+    useComposerBar.getState().setLeftCompact("outputStyle", true);
+    expect(useComposerBar.getState().compactLeft).toEqual({ outputStyle: true });
   });
 
   it("scrubs a deleted button from the arrangement and the hidden list", async () => {

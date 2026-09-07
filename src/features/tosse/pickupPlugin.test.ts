@@ -22,8 +22,10 @@ const listExtensions = commands.listExtensions as unknown as ReturnType<typeof v
 const setPluginEnabled = commands.setPluginEnabled as unknown as ReturnType<typeof vi.fn>;
 const commandName = pickupCommandName as unknown as ReturnType<typeof vi.fn>;
 
-/** A snapshot where `tosse-workflow` ships the pickup skill, on or off. */
-function snapshot(enabled: boolean) {
+/** A snapshot where `tosse-workflow` ships the pickup skill, on or off. `trusted: false`
+ *  is the corrupt-`settings.json` case: the scan then reports EVERY plugin as enabled
+ *  whatever the user set, so that `enabled` is an assumption, not a reading. */
+function snapshot(enabled: boolean, trusted = true) {
   return {
     status: "ok" as const,
     data: {
@@ -31,7 +33,8 @@ function snapshot(enabled: boolean) {
       plugins: [{ id: "tosse-workflow@tosse-plugins", name: "tosse-workflow", enabled }],
       skills: [{ name: "tosse-workflow:pickup", source: "tosse-workflow@tosse-plugins" }],
       agents: [],
-      warnings: [],
+      warnings: trusted ? [] : ["/home/x/.claude/settings.json corrupt: expected value"],
+      plugin_state_trusted: trusted,
     },
   };
 }
@@ -58,7 +61,16 @@ describe("findPickupPlugin", () => {
       id: "tosse-workflow@tosse-plugins",
       name: "tosse-workflow",
       enabled: false,
+      enabledTrusted: true,
     });
+  });
+
+  // A corrupt `settings.json` makes the scan report every plugin as ON (it is the file that
+  // holds `enabledPlugins`, and its absence means "no overrides"). Carrying that flag is
+  // what keeps a fabricated `enabled: true` from reading like a state anyone chose.
+  it("marks the enabled state untrusted when the settings file could not be read", async () => {
+    listExtensions.mockResolvedValue(snapshot(true, false));
+    expect(await findPickupPlugin("/repo")).toMatchObject({ enabled: true, enabledTrusted: false });
   });
 });
 
@@ -89,6 +101,48 @@ describe("ensurePickupPlugin", () => {
     expect(setPluginEnabled).not.toHaveBeenCalled();
     expect(got).toEqual({ kind: "present", plugin: "tosse-workflow" });
     expect(activationProblem(got)).toBeNull();
+  });
+
+  // ⚠️ The hole this closes: a corrupt `settings.json` reports the plugin as already on, so
+  // the launch used to conclude "present", write nothing and say nothing — while the CLI
+  // read the same broken file and spawned a conversation with no TOSSE skills at all. An
+  // untrusted state is not acted on: the write is attempted, and the file that could not be
+  // parsed makes it fail loudly rather than silently.
+  it("does not take a fabricated 'already on' at face value", async () => {
+    listExtensions.mockResolvedValue(snapshot(true, false));
+    setPluginEnabled.mockResolvedValue({
+      status: "error",
+      error: "settings.json unreadable: expected value at line 3",
+    });
+
+    const got = await ensurePickupPlugin("/repo");
+
+    expect(setPluginEnabled).toHaveBeenCalledWith("tosse-workflow@tosse-plugins", true);
+    expect(got.kind).toBe("failed");
+    expect(activationProblem(got)).toContain("settings.json unreadable");
+  });
+
+  // The dialog scans this folder before the button is even pressed. Handing that answer in
+  // is what keeps ONE launch from reading the same config files twice.
+  it("uses the caller's scan instead of running its own", async () => {
+    const got = await ensurePickupPlugin("/repo", {
+      id: "tosse-workflow@tosse-plugins",
+      name: "tosse-workflow",
+      enabled: true,
+      enabledTrusted: true,
+    });
+
+    expect(listExtensions).not.toHaveBeenCalled();
+    expect(got).toEqual({ kind: "present", plugin: "tosse-workflow" });
+  });
+
+  // `null` is an ANSWER ("we looked, nothing provides it"), not the absence of one — it must
+  // not send the launch scanning again.
+  it("accepts a caller's 'none installed' without rescanning", async () => {
+    const got = await ensurePickupPlugin("/repo", null);
+
+    expect(listExtensions).not.toHaveBeenCalled();
+    expect(got).toEqual({ kind: "missing" });
   });
 
   it("reports a refused write instead of opening an unequipped conversation in silence", async () => {
@@ -133,7 +187,7 @@ describe("ensurePickupPlugin", () => {
   it("stays quiet when no plugin provides the skill", async () => {
     listExtensions.mockResolvedValue({
       status: "ok",
-      data: { mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [] },
+      data: { mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true },
     });
 
     const got = await ensurePickupPlugin("/repo");

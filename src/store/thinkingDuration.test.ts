@@ -156,6 +156,7 @@ function baseState(busy: boolean) {
     cwd: null,
     model: null,
     permission_mode: null,
+    output_style: null,
     effort: null,
     ultracode: false,
     activity: null,

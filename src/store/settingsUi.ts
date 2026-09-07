@@ -10,6 +10,7 @@ export type SettingsSection =
   | "accounts"
   | "tosse"
   | "conversation"
+  | "behavior"
   | "models"
   | "composer"
   | "reordering"
