@@ -6,7 +6,11 @@
 #
 # Ce que ça fait :
 #   1. Vérifie que la personne qui lance est autorisée (cf. job `authorize`).
-#   2. Compile l'app Tauri en bundle macOS universel (Apple Silicon + Intel).
+#   2. Compile l'app Tauri en bundle macOS Apple Silicon (aarch64). PAS d'Intel :
+#      le crate `ort` (ONNX Runtime du wake word) n'a pas de binaire prebuilt pour
+#      x86_64-apple-darwin (abandonné en amont dès la ligne 2.0.0-rc) → la moitié
+#      Intel d'un build universel échoue. La tranche aarch64 livrée est identique à
+#      celle d'un universel (lipo n'assemble que des Mach-O, il ne recompile pas).
 #   3. PUBLIE directement une release GitHub (version = tauri.conf.json),
 #      avec les artefacts installables (.dmg / .app) attachés. Rien à faire après.
 #
@@ -76,7 +80,8 @@ jobs:
       - name: Setup Rust (toolchain + cibles macOS)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          # aarch64 seul : pas de build Intel (cf. en-tête — `ort` sans prebuilt x86_64).
+          targets: aarch64-apple-darwin
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -219,7 +224,8 @@ jobs:
           # pour qu'une release mal signée reste un brouillon plutôt que d'être publiée.
           releaseDraft: true
           prerelease: ${{ inputs.prerelease }}
-          args: --target universal-apple-darwin
+          # aarch64 seul (pas universal) : `ort` (wake word) n'a pas de prebuilt Intel.
+          args: --target aarch64-apple-darwin
 
       # Anti-régression SILENCIEUSE : le fix TCC ne tient que si l'app PUBLIÉE porte la DR
       # attendue. La release vient d'être créée en BROUILLON ; on vérifie la signature, puis
