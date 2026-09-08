@@ -532,6 +532,15 @@
   font-size: 11px;
   cursor: pointer;
 }
+/* An `.act` reduced to its icon (the detail panel's footer). Square when it carries the
+   icon alone, and merely tighter when a count rides along — a fixed width would clip the
+   second digit. */
+.actIcon {
+  min-width: 22px;
+  justify-content: center;
+  padding: 0 5px;
+  gap: 4px;
+}
 .act:hover:not(:disabled) { color: var(--wf-tx-hi); border-color: var(--wf-tx-xlo); }
 .act:disabled { opacity: 0.5; cursor: default; }
 .act_go { color: #cfd8fb; border-color: #3a4470; background: #1b2036; }
