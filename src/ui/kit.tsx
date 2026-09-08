@@ -606,9 +606,20 @@ export function ChipBtn({
 }
 
 export interface Ctx {
+  /** Fill percentage — a real measurement ONLY when `windowKnown`; 0 otherwise. */
   pct: number;
+  /** Tokens currently in context, pre-formatted ("—" when `usedKnown` is false). */
   used: string;
+  /** The model's context window, pre-formatted ("—" when `windowKnown` is false). */
   max: string;
+  /** Whether `used` is a real count: the first root model call of a turn reports it,
+   *  and a reloaded transcript carries it. */
+  usedKnown: boolean;
+  /** Whether `max`/`pct` are real. Only the END of a turn reports the window
+   *  (`result.modelUsage`, Codex `modelContextWindow`), so this stays false through a
+   *  conversation's whole first turn — and after a reload until the next turn ends.
+   *  Nothing may draw a fill while it is false: there is no honest percentage yet. */
+  windowKnown: boolean;
 }
 
 /** Subscription plan (rate-limit) snapshot, surfaced from `rate_limit_event`.
@@ -958,101 +969,122 @@ function ContextUsageBody({
   usageBackend,
   onRefreshUsage,
 }: ContextUsageData) {
-  const warn = ctx.pct >= 70;
+  const warn = ctx.windowKnown && ctx.pct >= 70;
   const st = plan ? planStatus(plan.status) : null;
-  const hasForfait = !!(plan || usage || usageLoading || usageError);
+  // Nothing at all to show in the Plan section yet — say so instead of rendering an
+  // empty heading (the section itself always renders: see below).
+  const planEmpty = !plan && !usage && !usageLoading && !usageError;
   return (
     <div className="wf-pop-ctx" onClick={(e) => e.stopPropagation()}>
       <div className="wf-pop-h">Context window</div>
-      <div className="wf-pop-ctx-line wf-mono">
-        {ctx.used}/{ctx.max} tokens <span className={warn ? "warn" : "wf-pop-ctx-pct"}>({ctx.pct}%)</span>
-      </div>
-      <div className="wf-pop-bar">
-        <i className={warn ? "warn" : ""} style={{ width: ctx.pct + "%" }} />
-      </div>
-      {hasForfait ? (
+      {ctx.windowKnown ? (
         <>
-          <div className="wf-pop-sep" />
-          <div className="wf-pop-h wf-pop-h-row">
-            {/* Label the plan by backend so the user knows whether these are their Claude
-                (Max) or Codex (ChatGPT) figures — the two are distinct plans, never merged.
-                Coloured like the Extensions tabs (Claude coral, Codex green). */}
-            <span>
-              Plan
-              {usageBackend ? (
-                <>
-                  {" · "}
-                  <span style={{ color: usageBackend === "codex" ? "var(--wf-codex-accent)" : "var(--wf-accent)", fontWeight: 600 }}>
-                    {usageBackend === "codex" ? "Codex" : "Claude"}
-                  </span>
-                </>
-              ) : null}
-            </span>
-            {/* Freshness of the shown figures (replaces the manual refresh button —
-                the popover already refetches on open). Reflects the last SUCCESS, so a
-                rate-limited refresh doesn't fake-bump it. */}
-            {fmtAgo(usageUpdatedAt) ? (
-              <span className="wf-pop-updated">
-                {usageLoading ? "refreshing…" : `updated ${fmtAgo(usageUpdatedAt)}`}
-              </span>
-            ) : null}
+          <div className="wf-pop-ctx-line wf-mono">
+            {ctx.used}/{ctx.max} tokens <span className={warn ? "warn" : "wf-pop-ctx-pct"}>({ctx.pct}%)</span>
           </div>
-          {/* Real usage bars (precise %), when the endpoint reported them. */}
-          {usage?.five_hour ? (
-            <UsageRow
-              label="5h"
-              w={usage.five_hour}
-              fallbackReset={plan?.limitType === "five_hour" ? plan.resetsAt : null}
-            />
-          ) : null}
-          {usage?.seven_day ? (
-            <UsageRow
-              label="7d"
-              w={usage.seven_day}
-              fallbackReset={plan?.limitType === "seven_day" ? plan.resetsAt : null}
-            />
-          ) : null}
-          {/* Model-scoped caps (e.g. Fable's weekly allowance), listed after the two
-              account-wide windows. Rendered straight off the payload — no fallback reset,
-              since a scoped window that hasn't started reports none and the coarse `plan`
-              reset belongs to a different (account-wide) cap. */}
-          {(usage?.scoped ?? []).map((s) => (
-            <UsageRow
-              key={`${s.label}:${s.group ?? ""}`}
-              label={scopedUsageLabel(s)}
-              w={s.window}
-              fallbackReset={null}
-            />
-          ))}
-          {/* Coarse status pill (warning / rejected) — always informative. */}
-          {st && plan ? (
-            <div className="wf-pop-row">
-              <span>Status{!usage && planWindow(plan.limitType) ? ` · ${planWindow(plan.limitType)}` : ""}</span>
-              <span className="wf-pop-pill">
-                <i style={{ background: st.color }} />
-                {st.label}
-              </span>
-            </div>
-          ) : null}
-          {/* No precise %: keep the coarse reset line (from the stream). */}
-          {!usage && plan ? (
-            <div className="wf-pop-row">
-              <span>Reset</span>
-              <span className="wf-mono">{fmtReset(plan.resetsAt)}</span>
-            </div>
-          ) : null}
-          {/* A real error: actionable guidance (full card if no data, or a compact
-              non-destructive "stale" warning if bars are already shown above). Never
-              silent — a failed refresh after a prior success still surfaces here. */}
-          {usageError ? (
-            <UsageErrorCard error={usageError} loading={usageLoading} onRetry={onRefreshUsage} stale={!!usage} />
-          ) : null}
-          {!usage && !usageError && usageLoading ? (
-            <div className="wf-pop-sub">Loading usage…</div>
-          ) : null}
-          {plan?.usingOverage ? <div className="wf-pop-sub">Overage active</div> : null}
+          <div className="wf-pop-bar">
+            <i className={warn ? "warn" : ""} style={{ width: ctx.pct + "%" }} />
+          </div>
         </>
+      ) : (
+        // The window size is only reported at the END of a turn, so during the first
+        // turn (and after a reload, until the next turn ends) there is no honest
+        // percentage: show the token count we DO have and no bar — never a fake 0 %.
+        <div className="wf-pop-sub">
+          {ctx.usedKnown
+            ? `${ctx.used} tokens used — window size arrives at the end of the turn`
+            : "Waiting for the first turn"}
+        </div>
+      )}
+      {/* Plan usage is ACCOUNT-global: it has nothing to do with this conversation's
+          turn, so the section renders unconditionally — that is the whole point of
+          keeping the ring reachable before any context figure exists. */}
+      <div className="wf-pop-sep" />
+      <div className="wf-pop-h wf-pop-h-row">
+        {/* Label the plan by backend so the user knows whether these are their Claude
+            (Max) or Codex (ChatGPT) figures — the two are distinct plans, never merged.
+            Coloured like the Extensions tabs (Claude coral, Codex green). */}
+        <span>
+          Plan
+          {usageBackend ? (
+            <>
+              {" · "}
+              <span style={{ color: usageBackend === "codex" ? "var(--wf-codex-accent)" : "var(--wf-accent)", fontWeight: 600 }}>
+                {usageBackend === "codex" ? "Codex" : "Claude"}
+              </span>
+            </>
+          ) : null}
+        </span>
+        {/* Freshness of the shown figures (replaces the manual refresh button —
+            the popover already refetches on open). Reflects the last SUCCESS, so a
+            rate-limited refresh doesn't fake-bump it. */}
+        {fmtAgo(usageUpdatedAt) ? (
+          <span className="wf-pop-updated">
+            {usageLoading ? "refreshing…" : `updated ${fmtAgo(usageUpdatedAt)}`}
+          </span>
+        ) : null}
+      </div>
+      {/* Real usage bars (precise %), when the endpoint reported them. */}
+      {usage?.five_hour ? (
+        <UsageRow
+          label="5h"
+          w={usage.five_hour}
+          fallbackReset={plan?.limitType === "five_hour" ? plan.resetsAt : null}
+        />
       ) : null}
+      {usage?.seven_day ? (
+        <UsageRow
+          label="7d"
+          w={usage.seven_day}
+          fallbackReset={plan?.limitType === "seven_day" ? plan.resetsAt : null}
+        />
+      ) : null}
+      {/* Model-scoped caps (e.g. Fable's weekly allowance), listed after the two
+          account-wide windows. Rendered straight off the payload — no fallback reset,
+          since a scoped window that hasn't started reports none and the coarse `plan`
+          reset belongs to a different (account-wide) cap. */}
+      {(usage?.scoped ?? []).map((s) => (
+        <UsageRow
+          key={`${s.label}:${s.group ?? ""}`}
+          label={scopedUsageLabel(s)}
+          w={s.window}
+          fallbackReset={null}
+        />
+      ))}
+      {/* Coarse status pill (warning / rejected) — always informative. */}
+      {st && plan ? (
+        <div className="wf-pop-row">
+          <span>Status{!usage && planWindow(plan.limitType) ? ` · ${planWindow(plan.limitType)}` : ""}</span>
+          <span className="wf-pop-pill">
+            <i style={{ background: st.color }} />
+            {st.label}
+          </span>
+        </div>
+      ) : null}
+      {/* No precise %: keep the coarse reset line (from the stream). */}
+      {!usage && plan ? (
+        <div className="wf-pop-row">
+          <span>Reset</span>
+          <span className="wf-mono">{fmtReset(plan.resetsAt)}</span>
+        </div>
+      ) : null}
+      {/* A real error: actionable guidance (full card if no data, or a compact
+          non-destructive "stale" warning if bars are already shown above). Never
+          silent — a failed refresh after a prior success still surfaces here. */}
+      {usageError ? (
+        <UsageErrorCard error={usageError} loading={usageLoading} onRetry={onRefreshUsage} stale={!!usage} />
+      ) : null}
+      {!usage && !usageError && usageLoading ? (
+        <div className="wf-pop-sub">Loading usage…</div>
+      ) : null}
+      {planEmpty ? (
+        <div className="wf-pop-sub">
+          {usageBackend === "codex"
+            ? "No plan figures yet — Codex reports them during a turn."
+            : "No plan figures yet."}
+        </div>
+      ) : null}
+      {plan?.usingOverage ? <div className="wf-pop-sub">Overage active</div> : null}
       <div
         className="wf-pop-act"
         role="button"
@@ -1069,12 +1101,10 @@ function ContextUsageBody({
 
 export function ContextRing({
   label,
-  disabled,
   onOpenUsage,
   ...usage
 }: ContextUsageData & {
   label?: boolean;
-  disabled?: boolean;
   /** Fired when the popover opens — caller throttles (e.g. only if data is stale).
    *  The popover refetches on open, so there's no manual refresh button. */
   onOpenUsage?: () => void;
@@ -1083,36 +1113,43 @@ export function ContextRing({
   const sz = 16;
   const r = sz / 2 - 1.6;
   const c = 2 * Math.PI * r;
-  const warn = ctx.pct >= 70;
-  // No usage reported yet (fresh session, pre-first-turn) — quiet, non-interactive stub.
-  if (disabled) {
-    return (
-      <button className="wf-ring" disabled title="Context — waiting for the first turn">
-        <svg width={sz} height={sz} viewBox={"0 0 " + sz + " " + sz}>
-          <circle cx={sz / 2} cy={sz / 2} r={r} className="wf-ring-bg" />
-        </svg>
-      </button>
-    );
-  }
+  const warn = ctx.windowKnown && ctx.pct >= 70;
+  // The ring stays CLICKABLE even before the window is known: the popover it opens also
+  // carries the account-global plan usage (5h/7d), which has nothing to do with this
+  // conversation's turn. Disabling the trigger until the first turn ENDED — the window
+  // only arrives with `result` — hid the rate limits for the whole first turn (and, on a
+  // reloaded conversation, until the next turn ended). Only the ARC is withheld: with no
+  // window there is no honest percentage to draw.
   return (
     <Menu
       align="right"
       up
       onOpen={onOpenUsage}
       trigger={
-        <button className={"wf-ring" + (warn ? " warn" : "")} title={"Context " + ctx.used + " / " + ctx.max}>
+        <button
+          className={"wf-ring" + (warn ? " warn" : "") + (ctx.windowKnown ? "" : " pending")}
+          title={
+            ctx.windowKnown
+              ? "Context " + ctx.used + " / " + ctx.max
+              : "Context window not known until the turn ends — open for plan usage"
+          }
+        >
           <svg width={sz} height={sz} viewBox={"0 0 " + sz + " " + sz}>
             <circle cx={sz / 2} cy={sz / 2} r={r} className="wf-ring-bg" />
-            <circle
-              cx={sz / 2}
-              cy={sz / 2}
-              r={r}
-              className="wf-ring-fg"
-              style={{ strokeDasharray: c, strokeDashoffset: c * (1 - ctx.pct / 100) }}
-              transform={"rotate(-90 " + sz / 2 + " " + sz / 2 + ")"}
-            />
+            {ctx.windowKnown ? (
+              <circle
+                cx={sz / 2}
+                cy={sz / 2}
+                r={r}
+                className="wf-ring-fg"
+                style={{ strokeDasharray: c, strokeDashoffset: c * (1 - ctx.pct / 100) }}
+                transform={"rotate(-90 " + sz / 2 + " " + sz / 2 + ")"}
+              />
+            ) : null}
           </svg>
-          {label ? <span className="wf-mono wf-chip-t">{ctx.pct}%</span> : null}
+          {label ? (
+            <span className="wf-mono wf-chip-t">{ctx.windowKnown ? ctx.pct + "%" : "—"}</span>
+          ) : null}
         </button>
       }
     >

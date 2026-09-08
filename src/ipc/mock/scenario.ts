@@ -278,6 +278,15 @@ export function mockTaskOutput(taskId: string): string | null {
 const MODEL = "claude-opus-4-8[1m]";
 export const MOCK_SESSION_ID = "01HVMOCK-S3SSION-ID";
 
+// Visual-verification override for the context ring's pre-first-turn states, which the
+// mock cannot otherwise reach (it seeds a fully-known window): `?ctx=none` = nothing
+// reported yet (a conversation that never ran), `?ctx=nowindow` = tokens known but the
+// window not — a first turn in flight, or a conversation just reloaded from its
+// transcript (which carries no window). Baked into `baseState` so every emission
+// inherits it.
+const CTX_DEMO =
+  typeof location !== "undefined" ? new URLSearchParams(location.search).get("ctx") : null;
+
 const baseState: SessionStatePayload = {
   busy: false,
   session_id: MOCK_SESSION_ID,
@@ -291,8 +300,8 @@ const baseState: SessionStatePayload = {
   awaiting_permission: false,
     retry: null,
   ended: false,
-  context_tokens: 29756,
-  context_window: 1000000,
+  context_tokens: CTX_DEMO === "none" ? null : 29756,
+  context_window: CTX_DEMO === "none" || CTX_DEMO === "nowindow" ? null : 1000000,
   rate_limit: {
     status: "allowed",
     resets_at: Math.floor(Date.now() / 1000) + 2 * 3600 + 14 * 60,
@@ -302,6 +311,15 @@ const baseState: SessionStatePayload = {
 };
 
 export const idleState = (): SessionStatePayload => ({ ...baseState });
+
+/** What the mock seeds from "the transcript" on load. Default: nothing (the demo has no
+ *  transcript). `?ctx=nowindow` reproduces a RELOADED conversation — the transcript
+ *  carries the token count but never the window, so the ring must stay openable with no
+ *  percentage until the next turn ends. */
+export const demoContextFill = (): { context_tokens: number | null; context_window: number | null } => ({
+  context_tokens: CTX_DEMO === "nowindow" ? 29756 : null,
+  context_window: null,
+});
 
 // ---- Fixture content -------------------------------------------------------
 

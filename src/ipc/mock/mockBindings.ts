@@ -95,7 +95,7 @@ import type {
   WorktreeInfo,
   WorktreeStatus,
 } from "../bindings";
-import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
@@ -1319,8 +1319,9 @@ export const mockCommands = {
 
   async loadSessionContext(_sessionId: string): Promise<Result<ContextFill, string>> {
     // No transcript in the browser mock; the scenario's baseState already carries a
-    // context fill, so nothing to seed here.
-    return ok({ context_tokens: null, context_window: null });
+    // context fill, so there is nothing to seed here — except for the `?ctx=` overrides
+    // that reproduce the ring's pre-window states (see `demoContextFill`).
+    return ok(demoContextFill());
   },
 
   async loadSessionGoal(_sessionId: string): Promise<Result<GoalState | null, string>> {
