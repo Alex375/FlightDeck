@@ -30,7 +30,9 @@ const STORAGE_KEY = "tosse:models";
 export const FACTORY_DEFAULTS = {
   claudeModel: "claude-opus-4-8",
   claudeEffort: "xhigh" as EffortLevel,
-  codexModel: "gpt-5.6-sol",
+  // Kept in step with DEFAULT_CODEX_MODEL: this is the one a NEW Codex conversation is
+  // seeded from, that one is the safety fallback when a conv's model isn't a Codex id.
+  codexModel: "gpt-6-astra",
   codexEffort: "xhigh" as EffortLevel,
 } as const;
 

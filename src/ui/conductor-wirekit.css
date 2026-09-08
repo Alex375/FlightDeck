@@ -472,8 +472,11 @@
 /* ---- context ring ------------------------------------------ */
 .wf-ring { font:inherit; cursor:default; display:inline-flex; align-items:center; gap:6px; padding:4px 7px; border-radius:7px; border:1px solid transparent; background:transparent; color:var(--wf-tx-lo); }
 .wf-ring:hover, .wf-ring[data-open] { background:var(--wf-panel); border-color:var(--wf-line); }
-.wf-ring:disabled { opacity:.4; }
-.wf-ring:disabled:hover { background:transparent; border-color:transparent; }
+/* Window not known yet (first turn / freshly reloaded conversation): the ring draws no
+   arc, so it recedes — but it stays interactive, since its popover carries the plan
+   usage. Full opacity on hover/open so it never reads as disabled once approached. */
+.wf-ring.pending { opacity:.55; }
+.wf-ring.pending:hover, .wf-ring.pending[data-open] { opacity:1; }
 .wf-ring.warn { color:var(--wf-att); }
 .wf-ring-bg { fill:none; stroke:var(--wf-panel-3); stroke-width:2.6; }
 .wf-ring-fg { fill:none; stroke:var(--wf-tx-lo); stroke-width:2.6; stroke-linecap:round; transition:stroke-dashoffset .4s ease; }

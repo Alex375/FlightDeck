@@ -4,6 +4,7 @@ import {
   CLAUDE_MODELS,
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
+  RETIRED_CODEX_MODELS,
   backendOfModel,
   modelFamily,
   modelLabel,
@@ -21,6 +22,7 @@ describe("backendOfModel", () => {
   });
 
   it("classifies the Codex model ids as codex (exact + resolved)", () => {
+    expect(backendOfModel("gpt-6-astra")).toBe("codex");
     expect(backendOfModel("gpt-5.5")).toBe("codex");
     expect(backendOfModel("gpt-5.4")).toBe("codex");
     expect(backendOfModel("gpt-5.4-mini")).toBe("codex");
@@ -44,6 +46,7 @@ describe("modelLabel", () => {
     expect(modelLabel("opus")).toBe("Opus 5");
     // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
     expect(modelLabel("fable")).toBe("Fable 5.1");
+    expect(modelLabel("gpt-6-astra")).toBe("GPT-6 Astra");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
   });
@@ -77,11 +80,58 @@ describe("modelFamily (menu highlight)", () => {
     expect(modelFamily("claude-opus-4-8[1m]")).toBe("claude-opus-4-8");
   });
   it("maps a Codex id (exact + longest-first) to its value", () => {
+    expect(modelFamily("gpt-6-astra")).toBe("gpt-6-astra");
     expect(modelFamily("gpt-5.5")).toBe("gpt-5.5");
     expect(modelFamily("gpt-5.4-mini")).toBe("gpt-5.4-mini");
   });
   it("returns null for an unknown id", () => {
     expect(modelFamily("mystery")).toBeNull();
+  });
+});
+
+describe("CODEX_MODELS mirrors what the binary actually serves", () => {
+  it("offers gpt-6-astra first (model/list's own order, and its isDefault model)", () => {
+    expect(CODEX_MODELS[0].value).toBe("gpt-6-astra");
+    expect(CODEX_MODELS[0].label).toBe("GPT-6 Astra");
+  });
+
+  it("does not offer gpt-5.4, which model/list no longer returns", () => {
+    // The static list is the picker's content while the dynamic one loads: a row the
+    // binary would reject turns a pick in that window into a failed turn.
+    expect(CODEX_MODELS.map((m) => m.value)).not.toContain("gpt-5.4");
+  });
+});
+
+describe("retired Codex models", () => {
+  it("still resolve to a real label and family", () => {
+    // gpt-5.4 was pulled from the offered catalogue when the binary stopped serving it.
+    // Conversations pinned to it must keep reading as "GPT-5.4", not as the raw wire id.
+    expect(modelLabel("gpt-5.4")).toBe("GPT-5.4");
+    expect(modelFamily("gpt-5.4")).toBe("gpt-5.4");
+    expect(backendOfModel("gpt-5.4")).toBe("codex");
+  });
+
+  it("do not shadow a longer live id", () => {
+    expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
+    expect(modelFamily("gpt-5.4-mini")).toBe("gpt-5.4-mini");
+  });
+
+  it("are never OFFERED — not in the catalogue, not in the picker", () => {
+    const retired = RETIRED_CODEX_MODELS.map((m) => m.value);
+    expect(retired).toContain("gpt-5.4");
+    for (const v of retired) {
+      expect(CODEX_MODELS.map((m) => m.value)).not.toContain(v);
+      expect(ALL_MODELS.map((m) => m.value)).not.toContain(v);
+    }
+    // Even for the conversation RUNNING one: the picker must not offer an id the binary
+    // would reject, however the "never hide the running model" guard resolves.
+    const groups = modelsForPicker("codex", {
+      locked: true,
+      codexAvailable: true,
+      current: "gpt-5.4",
+    });
+    const offered = groups.flatMap((g) => g.models.map((m) => m.value));
+    expect(offered).not.toContain("gpt-5.4");
   });
 });
 

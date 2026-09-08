@@ -633,3 +633,74 @@ export const TASK_STATUS_CHOICES = [
   "Review",
   "Fait",
 ] as const;
+
+/**
+ * The status buttons the DETAIL PANEL offers, per status.
+ *
+ * This is the CRM's own ladder, lifted from its task detail panel's sticky footer
+ * (`apps/frontend/app/tasks/task-detail-panel.tsx`) so that reading a task here and reading
+ * it in the browser offer the same moves in the same order: Backlog → « À faire » →
+ * « En cours » → « Fait », plus the one shortcut a reviewed task gets (« Review » → « Fait »).
+ * Statuses the CRM offers nothing from — « En attente », « Fait », « Archivé » — get nothing
+ * here either; the status chip's menu above still reaches every status from any of them.
+ *
+ * ⚠️ These write the status DIRECTLY, and that is the point (decided with Alexandre,
+ * 2026-09-07, reversing the narrower 2026-08-07 call above). They are not a second way to
+ * run {@link TaskActions}' "Start": that one opens a conversation and hands the task to the
+ * `/pickup` skill, which writes « En cours » as a side effect of an agent picking the work
+ * up. Work happens away from Claude too — an email sent, a call made — and saying so must
+ * not require starting an agent. The two live side by side in the panel's footer, which is
+ * why the CRM's « Start » is spelled « Mark in progress » here: two buttons labelled
+ * « Start » one gap apart, doing different things, is the one arrangement that would make
+ * the distinction unreadable.
+ *
+ * ⚠️ Panel ONLY. The task ROW keeps {@link taskQuickAction}'s single « Done » — a button on
+ * every row for every status is what the 2026-08-07 decision refused, and this reversal was
+ * asked for the panel, where a task is read in full before it is moved.
+ *
+ * Subtasks need no special case: the ladder never routes through « Review » (the CRM closes
+ * a running task straight to « Fait »), so the repo rule — subtasks go directly to « Fait »,
+ * only parents pass through « Review » — is already what these buttons do.
+ */
+export interface TaskStatusAction {
+  label: string;
+  /** The status this button writes. */
+  next: string;
+  /** `plain` is the neutral button, `go` the blue one, `done` the green one — the CRM's
+   *  grey / blue / emerald, in this view's tokens. */
+  tone: "plain" | "go" | "done";
+  /** Ask first when the task still has unresolved blockers. Only the move that STARTS work
+   *  carries it: closing a blocked task is a legitimate way to end one. */
+  confirmWhenBlocked?: boolean;
+}
+
+export function taskStatusActions(status: string): TaskStatusAction[] {
+  switch (status) {
+    case "Backlog":
+      return [{ label: "Prioritize", next: "À faire", tone: "plain" }];
+    case "À faire":
+      return [
+        { label: "Mark in progress", next: "En cours", tone: "go", confirmWhenBlocked: true },
+      ];
+    case "En cours":
+      return [{ label: "Mark as Done", next: "Fait", tone: "done" }];
+    case "Review":
+      return [{ label: "Approve & Done", next: "Fait", tone: "done" }];
+    // « En attente », « Fait », « Archivé » and anything the CRM grows later: no button.
+    // The status chip's menu is the way out, as it is in the CRM.
+    default:
+      return [];
+  }
+}
+
+/**
+ * The blockers that are still IN THE WAY, out of everything the panel lists.
+ *
+ * The CRM gates its "Start" on a server-computed `isBlocked`, which our task payload does
+ * not carry; the relations do, and a resolved relation is history rather than a blocker —
+ * the panel already dims those. Computing it from the same list the user is looking at is
+ * what keeps the dialog and the "Blocked by" section from disagreeing.
+ */
+export function liveBlockers<T extends { resolved: boolean }>(blockedBy: readonly T[]): T[] {
+  return blockedBy.filter((b) => !b.resolved);
+}

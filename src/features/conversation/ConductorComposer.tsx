@@ -377,7 +377,7 @@ export const ConductorComposer = forwardRef<
 
   // Context fill (ring) — shared derivation keyed by stable id, reused by the
   // FlightDeck card's context bar (see useContextData).
-  const { ctx: ctxData, ready: ctxReady, plan: planData } = useContextData(session);
+  const { ctx: ctxData, plan: planData } = useContextData(session);
 
   // Real plan-usage % (account-global, NOT per-conversation) + the compact action.
   // The whole backend-aware wiring (usage source, Forfait label, open/refresh/compact)
@@ -385,8 +385,14 @@ export const ConductorComposer = forwardRef<
   // (CardContext) so the two surfaces can never drift. Claude's `/compact` rides the
   // composer's own send pipeline (optimistic bubble + scroll-to-bottom); `sendText` is
   // declared below — the closure only runs on click, well after initialization.
+  // `enabled` guards the AUTOMATIC (background) Claude fetch only — it exists so that
+  // merely selecting a never-spawned conversation can't read the OAuth credentials /
+  // pop the macOS Keychain. Keyed on `usedKnown` (has this conversation ever reported
+  // context tokens?) rather than the window: a first turn in flight, or a reloaded
+  // transcript, is unambiguously a conversation the user has already run. Opening the
+  // popover by hand still refetches while disabled — that path is a deliberate click.
   const usage = useBackendUsage(session, {
-    enabled: ctxReady,
+    enabled: ctxData.usedKnown,
     compactClaude: () => sendText("/compact"),
   });
 
@@ -907,7 +913,7 @@ export const ConductorComposer = forwardRef<
 
     ),
     // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
-    // code, Codex is low→xhigh, gpt-5.6 adds max+ultra; renders nothing when the model
+    // code, Codex is low→xhigh, its top models add max+ultra; renders nothing when the model
     // has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
     // turn's override.
     effort: (
@@ -918,7 +924,7 @@ export const ConductorComposer = forwardRef<
         efforts={
           backend === "codex"
             ? // Data-driven from the selected model; fall back to the per-model static
-              // ladder (gpt-5.6 → max+ultra, older gpt-5.x → low→xhigh) so a Codex conv
+              // ladder (CODEX_EFFORTS, keyed per model id) so a Codex conv
               // shows the right rungs even if its persisted model id isn't in the dynamic
               // list — and never Claude-only tiers.
               (codexEfforts[modelId] ?? effortLevelsForModel(modelId))
@@ -1241,7 +1247,6 @@ export const ConductorComposer = forwardRef<
         <ContextRing
           ctx={ctxData}
           plan={isCodex ? null : planData}
-          disabled={!ctxReady}
           onCompact={usage.onCompact}
           usage={usage.usage}
           usageLoading={usage.usageLoading}

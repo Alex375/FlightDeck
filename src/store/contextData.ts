@@ -22,29 +22,48 @@ export function fmtTokens(n: number): string {
 export interface ContextData {
   /** Tokens used / window, as the ring/bar consume it. */
   ctx: Ctx;
-  /** False until the first turn reports usage — render a quiet stub then. */
+  /** True only once the WINDOW is known, i.e. `ctx` carries a real percentage — the
+   *  gate for anything that draws a fill (the card meter, the ring's arc). It is NOT
+   *  a gate for opening the usage popover: plan figures are account-global and must
+   *  stay reachable during the first turn (see {@link contextFill}). */
   ready: boolean;
   /** Subscription rate-limit snapshot, or null when none reported. */
   plan: PlanInfo | null;
 }
 
 /**
+ * Derive the ring/bar fill from the raw core figures. Pure (tested directly) — the
+ * two figures arrive at DIFFERENT times and must be surfaced independently:
+ *  - `tokens` lands early: the first ROOT `message_start` of a turn reports the prompt
+ *    size, and a reloaded conversation gets it from the transcript;
+ *  - `window` lands LATE and only live: the end-of-turn `result.modelUsage` (Codex:
+ *    `modelContextWindow`) is the ONLY authoritative source — the model name does not
+ *    tell 200k from 1M, and the on-disk transcript carries nothing.
+ * So during a conversation's first turn — and after a reload, until the next turn ends
+ * — there is a real token count but no honest percentage. Both flags say so explicitly
+ * rather than letting a "—"/0 placeholder pass for a measurement.
+ */
+export function contextFill(tokens: number | null, window: number | null): Ctx {
+  const usedKnown = tokens != null;
+  const windowKnown = usedKnown && window != null && window > 0;
+  return {
+    pct: windowKnown ? Math.min(100, Math.round((tokens / window) * 100)) : 0,
+    used: usedKnown ? fmtTokens(tokens) : "—",
+    max: windowKnown ? fmtTokens(window) : "—",
+    usedKnown,
+    windowKnown,
+  };
+}
+
+/**
  * The context fill for a conversation (by stable id). Real usage from the last
  * model call's input tokens over the model's window — both surfaced by the core in
- * SessionStatePayload. Until the first turn reports usage, `ready` is false.
+ * SessionStatePayload.
  */
 export function useContextData(convId: string): ContextData {
   const state = useSessionState(convId);
-  const ctxTokens = state?.context_tokens ?? null;
-  const ctxWindow = state?.context_window ?? null;
-  const ready = ctxTokens != null && ctxWindow != null && ctxWindow > 0;
-  const ctx: Ctx = ready
-    ? {
-        pct: Math.min(100, Math.round((ctxTokens / ctxWindow) * 100)),
-        used: fmtTokens(ctxTokens),
-        max: fmtTokens(ctxWindow),
-      }
-    : { pct: 0, used: "—", max: "—" };
+  const ctx = contextFill(state?.context_tokens ?? null, state?.context_window ?? null);
+  const ready = ctx.windowKnown;
   // Percentage of plan usage is NOT in the stream — only what `rate_limit_event`
   // carries (coarse status + reset time).
   const plan: PlanInfo | null = state?.rate_limit

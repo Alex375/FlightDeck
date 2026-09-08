@@ -73,9 +73,12 @@ import {
   statusSections,
   taskStatusTone,
   taskQuickAction,
+  taskStatusActions,
+  liveBlockers,
   TASK_STATUS_CHOICES,
   type ProjectAction,
   type StatusSection,
+  type TaskStatusAction,
 } from "./tosseModel";
 import s from "./TosseView.module.css";
 
@@ -1036,6 +1039,80 @@ function ProjectCard({
 }
 
 /**
+ * The detail panel's status ladder — one click per step, the CRM's own buttons.
+ *
+ * Lives in the panel and NOT on the row (asked for explicitly, 2026-09-07): the panel is
+ * where a task is read in full before it is moved, and a row already carries Open / Discuss
+ * / Start. What each status offers is {@link taskStatusActions}' call, not this component's
+ * — the JSX here only knows how to paint a button and when to ask first.
+ *
+ * ⚠️ The write goes through the SAME `useSetTosseTaskStatus` the status chip's menu uses, so
+ * these buttons inherit its optimistic patch, its whole-board rollback and its error — which
+ * the panel already renders. A second write path would have been a second chance to swallow
+ * a refusal.
+ */
+function TaskStatusActions({
+  detail,
+  onWrite,
+}: {
+  detail: TosseTaskDetail;
+  onWrite: (status: string) => void;
+}) {
+  // The blocker dialog's subject: the action waiting on an answer, or null when none is.
+  // Held as the ACTION (not a boolean) so the dialog acts on the move it was opened for —
+  // there is one such button today, and a second would otherwise share one anonymous flag.
+  const [confirming, setConfirming] = useState<TaskStatusAction | null>(null);
+  const actions = taskStatusActions(detail.task.status);
+  const blockers = liveBlockers(detail.blockedBy);
+  if (actions.length === 0) return null;
+  return (
+    <>
+      {/* Same wrapper the launch buttons use, so the two groups sit at the SAME spacing
+          rather than at the footer's wider `gap` — one row of buttons, not two clusters. */}
+      <span className={s.detailActs}>
+        {actions.map((a) => (
+          <button
+            key={a.next}
+            className={`${s.act} ${a.tone === "plain" ? "" : s[`act_${a.tone}`]}`}
+            title={`Move this task to « ${a.next} »`}
+            onClick={() => {
+              if (a.confirmWhenBlocked && blockers.length > 0) setConfirming(a);
+              else onWrite(a.next);
+            }}
+          >
+            {a.tone === "done" ? <Ico name="check" className="sm" /> : null}
+            {a.label}
+          </button>
+        ))}
+      </span>
+      {/* The CRM asks before starting a blocked task rather than refusing — the blockers are
+          advice, and the human clicking is the one who knows whether they still hold. Naming
+          them is the whole point of the stop: "this is blocked" alone is not answerable. */}
+      <ConfirmDialog
+        open={confirming !== null}
+        title="Start a blocked task?"
+        confirmLabel="Start anyway"
+        onCancel={() => setConfirming(null)}
+        onConfirm={() => {
+          const a = confirming;
+          setConfirming(null);
+          if (a) onWrite(a.next);
+        }}
+      >
+        <div>
+          This task is blocked by:
+          <ul className={s.confirmList}>
+            {blockers.map((b) => (
+              <li key={b.id}>{b.title}</li>
+            ))}
+          </ul>
+        </div>
+      </ConfirmDialog>
+    </>
+  );
+}
+
+/**
  * The detail panel: the CRM's task panel, trimmed to what this app can act on.
  *
  * Exported because the conversation's side region shows the SAME panel — a task read from
@@ -1238,6 +1315,15 @@ export function TaskDetail({
       </div>
 
       <div className={s.detailFoot}>
+        {/* The status ladder FIRST — it is the panel's primary action (the CRM puts it at
+            the head of the same sticky footer), and it is what most visits to this panel
+            end with. The launch buttons follow: they open work, these close it. */}
+        {data ? (
+          <TaskStatusActions
+            detail={data}
+            onWrite={(status) => setTaskStatus.mutate({ taskId, status })}
+          />
+        ) : null}
         {/* The same two buttons as the row, with the panel's own payload: its long-form
             fields (description, notes, context) are already on screen, so "Discuss"
             pastes them into the prompt instead of making the agent fetch them back. */}

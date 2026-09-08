@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.1.0
+
+- New: **one-click status ladder** in the TOSSE task detail panel — move a task forward without leaving the app.
+- New: **GPT-6 Astra** available in the Codex model picker.
+- Fixed: the context ring in the composer stays clickable before the window size is known.
+- Fixed: Codex conversations reload correctly with the newest app-server (0.153.4).
+
 ## v2.0.0
 
 - New: **built-in voice agent** — talk to your agents in push-to-talk (Right ⌘), have the app read out your fleet's status, and browse folders or end the call by voice.

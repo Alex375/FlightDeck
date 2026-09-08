@@ -221,11 +221,18 @@ fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
                 }
             }
             Some("event_msg") if excerpt.is_none() => {
-                if payload.get("type").and_then(Value::as_str) == Some("user_message") {
-                    let text = message_text(payload);
-                    if !text.trim().is_empty() {
-                        excerpt = Some(history::flatten_truncate(&text, EXCERPT_CHARS));
-                    }
+                // Two dialects, mutually exclusive per file: `user_message` (≤0.144.x) and
+                // `item_completed{item.type:"UserMessage"}` (0.153.x, which stopped writing
+                // the former). Reading only the old one made every 0.153.x conversation
+                // excerpt-less — and since a row without an excerpt is dropped below, they
+                // VANISHED from the History panel entirely.
+                let text = match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") => message_text(payload),
+                    Some("item_completed") => completed_user_text(payload),
+                    _ => String::new(),
+                };
+                if !text.trim().is_empty() {
+                    excerpt = Some(history::flatten_truncate(&text, EXCERPT_CHARS));
                 }
             }
             _ => {}
@@ -362,6 +369,30 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                         }
                     }
                 }
+                // 0.153.x dialect (see the listing scanner): the prose moved into
+                // `item_completed`. Without this a 0.153.x conversation was indexed EMPTY —
+                // searchable by nothing at all.
+                Some("item_completed") => {
+                    let item = payload.get("item").unwrap_or(&Value::Null);
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("UserMessage") => {
+                            let text = content_text(item.get("content"));
+                            if !text.trim().is_empty() {
+                                if excerpt.is_empty() {
+                                    excerpt = history::flatten_truncate(&text, EXCERPT_CHARS);
+                                }
+                                history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
+                            }
+                        }
+                        Some("AgentMessage") => {
+                            let text = content_text(item.get("content"));
+                            if !text.is_empty() {
+                                history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -425,9 +456,19 @@ fn parse_rollout(path: &Path) -> Vec<ConversationItem> {
 /// `apply_patch` card can carry the structured per-file diffs; (2) walk in file order and
 /// emit the timeline.
 pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize) {
-    // Pass 1 — structured file changes, keyed by the apply_patch call_id.
+    // Pass 1 — structured file changes, keyed by the apply_patch call_id, plus the format
+    // probe below.
     let mut patch_changes: HashMap<String, (Vec<Value>, bool)> = HashMap::new();
     let mut skipped = 0usize;
+    // Which on-disk dialect is this rollout written in? app-server 0.153.x STOPPED writing
+    // the `user_message` / `agent_message` event_msg lines this parser reads its prose from,
+    // and writes `item_completed` events carrying the NORMALIZED item instead. Reading such a
+    // rollout the legacy way yields a conversation with ZERO user and ZERO assistant text —
+    // only opaque `exec` script cards (VERIFIED on a real 0.153.4 rollout: 4 items, 0 user,
+    // 0 assistant-text). The two dialects are mutually exclusive per file, so pick ONE:
+    // `item_completed` when present (it mirrors the live wire, so cold == live by
+    // construction), else the legacy response_item/event_msg path for every older rollout.
+    let mut has_completed_items = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -439,12 +480,16 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
         };
         if entry.get("type").and_then(Value::as_str) == Some("event_msg") {
             let p = entry.get("payload").unwrap_or(&Value::Null);
-            if p.get("type").and_then(Value::as_str) == Some("patch_apply_end") {
-                if let Some(call_id) = p.get("call_id").and_then(Value::as_str) {
-                    let changes = map_patch_changes(p.get("changes").unwrap_or(&Value::Null));
-                    let success = p.get("success").and_then(Value::as_bool).unwrap_or(true);
-                    patch_changes.insert(call_id.to_string(), (changes, success));
+            match p.get("type").and_then(Value::as_str) {
+                Some("patch_apply_end") => {
+                    if let Some(call_id) = p.get("call_id").and_then(Value::as_str) {
+                        let changes = map_patch_changes(p.get("changes").unwrap_or(&Value::Null));
+                        let success = p.get("success").and_then(Value::as_bool).unwrap_or(true);
+                        patch_changes.insert(call_id.to_string(), (changes, success));
+                    }
                 }
+                Some("item_completed") => has_completed_items = true,
+                _ => {}
             }
         }
     }
@@ -515,6 +560,22 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
             }
         }
         match entry.get("type").and_then(Value::as_str) {
+            // ── 0.153.x dialect: the whole timeline rides `item_completed`. Handled FIRST and
+            // exclusively — the `response_item` lines in the same file describe the very same
+            // tool calls, so letting both through would render every command twice.
+            Some("event_msg")
+                if has_completed_items
+                    && payload.get("type").and_then(Value::as_str) == Some("item_completed") =>
+            {
+                let before = items.len();
+                push_completed_item(
+                    payload.get("item").unwrap_or(&Value::Null),
+                    &mut msg_seq,
+                    &mut items,
+                );
+                stamp_turn(&mut items, before, current_turn.as_deref());
+            }
+            Some("response_item") if has_completed_items => {}
             Some("event_msg") => match payload.get("type").and_then(Value::as_str) {
                 Some("user_message") => {
                     let text = message_text(payload);
@@ -572,6 +633,230 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
     }
 
     (items, skipped)
+}
+
+/// Map ONE `event_msg`/`item_completed` item (app-server 0.153.x rollouts) to the timeline.
+///
+/// This is the COLD twin of the live actor's `on_item`, and the two must agree — but they do
+/// NOT read the same serialization. The live wire is camelCase with a camelCase tag
+/// (`commandExecution`, `aggregatedOutput`); on disk the tag is **PascalCase**
+/// (`CommandExecution`) with **snake_case** fields, `command` is an ARRAY of argv rather than
+/// a shell string, `cwd` is a `file://` URI (`PathUri`), and `changes` is a MAP keyed by path
+/// rather than an array. Every one of those is a place a copy-pasted live mapping would fail
+/// silently, so each is converted explicitly below.
+///
+/// Items arrive already COMPLETE (there is no `item_started` on disk), so each tool emits its
+/// card and its result together and nothing is left dangling in `open_tools`.
+fn push_completed_item(item: &Value, msg_seq: &mut u64, items: &mut Vec<ConversationItem>) {
+    let Some(kind) = item.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    // Tool ids come from the item itself so a card and its result pair up; a missing id still
+    // gets a unique synthetic one rather than colliding every card onto the same key.
+    let item_id = |seq: &mut u64| -> String {
+        match item.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => {
+                *seq += 1;
+                format!("cx-i{seq}")
+            }
+        }
+    };
+    match kind {
+        "UserMessage" => {
+            let text = content_text(item.get("content"));
+            // An empty turn is not a turn (mirrors the legacy `user_message` guard).
+            if !text.trim().is_empty() {
+                *msg_seq += 1;
+                items.push(ConversationItem::UserMessage {
+                    id: format!("cx-u{msg_seq}"),
+                    text,
+                    parent_tool_use_id: None,
+                    replay: false,
+                });
+            }
+        }
+        "AgentMessage" => {
+            let text = content_text(item.get("content"));
+            if !text.is_empty() {
+                *msg_seq += 1;
+                items.push(assistant_text(format!("cx-a{msg_seq}"), text));
+            }
+        }
+        // Reasoning → a Thinking block, NEVER Text (the live invariant: raw reasoning must not
+        // leak into the visible answer).
+        "Reasoning" => {
+            let text = item
+                .get("summary_text")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                *msg_seq += 1;
+                items.push(ConversationItem::AssistantMessage {
+                    id: format!("cx-r{msg_seq}"),
+                    blocks: vec![NormalizedBlock::Thinking { text }],
+                    parent_tool_use_id: None,
+                    turn_id: None,
+                });
+            }
+        }
+        "CommandExecution" => {
+            let id = item_id(msg_seq);
+            let command = argv_to_command(item.get("command"));
+            let cwd = item.get("cwd").and_then(Value::as_str).map(strip_file_uri);
+            let mut open = Vec::new();
+            push_tool_use(items, &mut open, &id, "Bash", json!({ "command": command, "cwd": cwd }));
+            let exit_code = item.get("exit_code").and_then(Value::as_i64);
+            let status = item.get("status").and_then(Value::as_str);
+            let is_error = status_is_error(status) || exit_code.is_some_and(|c| c != 0);
+            let output = item
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            push_tool_result(items, &mut open, &id, json!(output), is_error);
+        }
+        "FileChange" => {
+            let id = item_id(msg_seq);
+            // `changes` is the SAME path-keyed map `patch_apply_end` uses, so the existing
+            // normalizer produces the array-of-{path,kind,diff} the front renders.
+            let changes = map_patch_changes(item.get("changes").unwrap_or(&Value::Null));
+            let status = item.get("status").and_then(Value::as_str);
+            let is_error = status_is_error(status);
+            let mut open = Vec::new();
+            push_tool_use(items, &mut open, &id, "ApplyPatch", json!({ "changes": changes }));
+            push_tool_result(
+                items,
+                &mut open,
+                &id,
+                json!({ "status": status, "changes": changes }),
+                is_error,
+            );
+        }
+        // A built-in extension step. VERIFIED on disk: a web search is written as
+        // `Extension{kind:"web.search", query, action, results}` — NOT as the `web_search_call`
+        // response_item the legacy path reads — so without this arm a reloaded search showed a
+        // nameless "Extension" card instead of the WebSearch card it is live. Rendered through
+        // the SAME helper as the live item so both views carry the same source chips.
+        "Extension" => {
+            let id = item_id(msg_seq);
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+            let mut open = Vec::new();
+            if kind.starts_with("web.search") || item.get("query").is_some() {
+                let query = item.get("query").and_then(Value::as_str).unwrap_or("");
+                let action = item.get("action").cloned().unwrap_or(Value::Null);
+                push_tool_use(
+                    items,
+                    &mut open,
+                    &id,
+                    "WebSearch",
+                    json!({ "query": query, "action": action }),
+                );
+                let text = super::session::web_search_result_text(query, &action, item.get("results"));
+                push_tool_result(items, &mut open, &id, json!(text), false);
+            } else {
+                // Another extension kind → a card named after the KIND (more informative than
+                // the bare "Extension" tag), never a silent drop.
+                let name = if kind.is_empty() { "Extension" } else { kind };
+                push_tool_use(items, &mut open, &id, name, json!({}));
+                push_tool_result(items, &mut open, &id, json!(format!("Codex extension: {name}")), false);
+            }
+        }
+        // Any other (or FUTURE) item → a generic card named after its raw type, mirroring the
+        // live `ThreadItem::Unknown` arm. Never a silent drop.
+        other => {
+            let id = item_id(msg_seq);
+            let mut open = Vec::new();
+            push_tool_use(items, &mut open, &id, other, json!({}));
+            push_tool_result(items, &mut open, &id, json!(format!("Unmodelled Codex item: {other}")), false);
+        }
+    }
+}
+
+/// The user text of an `item_completed` payload, or empty when the completed item is not a
+/// `UserMessage`. Used by the disk-listing scanner, which needs the FIRST human prompt.
+fn completed_user_text(payload: &Value) -> String {
+    let item = payload.get("item").unwrap_or(&Value::Null);
+    if item.get("type").and_then(Value::as_str) != Some("UserMessage") {
+        return String::new();
+    }
+    content_text(item.get("content"))
+}
+
+/// Concatenate the `text` of a disk item's `content` array. Covers both spellings seen on
+/// disk: a user item's `{type:"text"}` parts and an assistant item's `{type:"Text"}` parts.
+fn content_text(content: Option<&Value>) -> String {
+    let Some(parts) = content.and_then(Value::as_array) else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter(|p| {
+            p.get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|t| t.eq_ignore_ascii_case("text"))
+        })
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Render an argv ARRAY (`["/bin/zsh","-lc","echo hi"]`) as the single shell string the live
+/// wire sends (`/bin/zsh -lc 'echo hi'`), so the same command reads identically live and cold.
+/// A plain string passes through (older/other shapes); anything else yields an empty command
+/// rather than a card showing raw JSON.
+fn argv_to_command(command: Option<&Value>) -> String {
+    match command {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(shell_quote)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Quote ONE argv element the way a shell would need it: bare when it holds nothing special,
+/// single-quoted otherwise — falling back to double quotes when it already contains a single
+/// quote (which cannot be escaped inside single quotes).
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@+,".contains(c));
+    if safe {
+        arg.to_string()
+    } else if arg.contains('\'') {
+        format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{arg}'")
+    }
+}
+
+/// `file:///a/b` → `/a/b`. 0.153.x writes a `PathUri` where the live wire sends a plain path;
+/// leaving the scheme on would show `file://…` in every command card and break any consumer
+/// treating it as a path. A non-URI value passes through untouched.
+fn strip_file_uri(cwd: &str) -> String {
+    cwd.strip_prefix("file://").unwrap_or(cwd).to_string()
+}
+
+/// A Codex status string that means the step FAILED or was DECLINED. Mirrors the live actor's
+/// helper of the same name so a cold-loaded card is marked in error exactly like its live twin.
+/// `declined` is load-bearing: it is a real variant of BOTH `CommandExecutionStatus` and
+/// `PatchApplyStatus` (verified in the 0.153 schema dump), so omitting it made a refused command
+/// or a refused patch reload GREEN — reading as if it had run.
+fn status_is_error(status: Option<&str>) -> bool {
+    matches!(status, Some(s) if s.eq_ignore_ascii_case("failed")
+        || s.eq_ignore_ascii_case("declined")
+        || s.eq_ignore_ascii_case("error"))
 }
 
 /// Map ONE `response_item` payload to the timeline (tools only — messages come from
@@ -946,6 +1231,159 @@ mod tests {
             if matches!(&blocks[0], NormalizedBlock::Text { text } if text == "Bonjour, je t'aide.")));
     }
 
+    /// Build ONE `item_completed` line of an app-server 0.153.x rollout.
+    fn completed(item: Value) -> String {
+        line(
+            "event_msg",
+            json!({ "type": "item_completed", "thread_id": "t1", "turn_id": "turn-1",
+                    "started_at_ms": 0, "completed_at_ms": 1, "item": item }),
+        )
+    }
+
+    /// app-server 0.153.x rollouts carry the timeline as `item_completed` events and STOPPED
+    /// emitting the `user_message` / `agent_message` lines the legacy path reads. Parsing one
+    /// the old way produced a conversation with no prose at all (verified on a real rollout:
+    /// 0 user, 0 assistant-text) — the whole conversation silently blank on reload.
+    #[test]
+    fn completed_items_render_the_whole_conversation_on_a_0_153_rollout() {
+        let content = [
+            line("session_meta", json!({ "id": "t1", "cwd": "/repo", "cli_version": "0.153.4" })),
+            // The same tool calls ALSO appear as response_items in these files; they must not
+            // render a second time alongside the item_completed cards.
+            line("response_item", json!({ "type": "message", "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Sure." }] })),
+            completed(json!({ "type": "UserMessage", "id": "u1",
+                "content": [{ "type": "text", "text": "run it", "text_elements": [] }] })),
+            completed(json!({ "type": "Reasoning", "id": "r1",
+                "summary_text": ["**Planning**"], "raw_content": [] })),
+            completed(json!({ "type": "AgentMessage", "id": "a1",
+                "content": [{ "type": "Text", "text": "Sure." }], "phase": "commentary" })),
+            line("response_item", json!({ "type": "custom_tool_call", "name": "exec", "call_id": "c9",
+                "input": "const r = await tools.exec_command({cmd:\"echo hi\"});" })),
+            completed(json!({ "type": "CommandExecution", "id": "exec-1",
+                "command": ["/bin/zsh", "-lc", "echo hi"], "cwd": "file:///repo",
+                "status": "completed", "exit_code": 0, "aggregated_output": "hi\n" })),
+            line("response_item", json!({ "type": "custom_tool_call_output", "call_id": "c9",
+                "output": "[{\"type\": \"input_text\", \"text\": \"hi\\n\"}]" })),
+            completed(json!({ "type": "FileChange", "id": "fc-1", "status": "completed",
+                "changes": { "/repo/note.txt": { "type": "add", "content": "ok\n" } } })),
+        ]
+        .join("\n");
+        let (items, skipped) = parse_rollout_str(&content);
+        assert_eq!(skipped, 0);
+
+        assert_eq!(
+            items.iter().filter(|i| matches!(i, ConversationItem::UserMessage { .. })).count(),
+            1,
+            "the user prompt must survive the reload"
+        );
+        assert!(is_user(&items[0], "run it"));
+        assert!(
+            items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { blocks, .. }
+                if matches!(&blocks[0], NormalizedBlock::Text { text } if text == "Sure."))),
+            "the assistant's answer must survive the reload"
+        );
+        assert!(
+            items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { blocks, .. }
+                if matches!(&blocks[0], NormalizedBlock::Thinking { text } if text == "**Planning**"))),
+            "reasoning renders as Thinking, never as Text"
+        );
+
+        // The command card: argv joined + shell-quoted like the live wire, cwd de-URI'd.
+        let (name, input) = tool_use(&items, "exec-1").expect("bash card");
+        assert_eq!(name, "Bash");
+        assert_eq!(input.get("command").and_then(Value::as_str), Some("/bin/zsh -lc 'echo hi'"));
+        assert_eq!(input.get("cwd").and_then(Value::as_str), Some("/repo"));
+        match tool_result(&items, "exec-1") {
+            Some(ConversationItem::ToolResult { content, is_error, .. }) => {
+                assert_eq!(content.as_str(), Some("hi\n"));
+                assert!(!is_error, "exit 0 is not an error");
+            }
+            _ => panic!("the command card must be closed by a result"),
+        }
+
+        // The patch card: the path-keyed map becomes the array-of-{path,kind,diff} the front reads.
+        let (name, input) = tool_use(&items, "fc-1").expect("patch card");
+        assert_eq!(name, "ApplyPatch");
+        let changes = input.get("changes").and_then(Value::as_array).expect("changes array");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].get("path").and_then(Value::as_str), Some("/repo/note.txt"));
+        assert_eq!(changes[0].get("kind").and_then(|k| k.get("type")).and_then(Value::as_str), Some("add"));
+
+        // Every assistant item carries its turn id — the boundary native rewind/fork cuts at
+        // (`thread/fork{lastTurnId}`). Losing it here breaks rewind with no visible error.
+        assert!(
+            items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { turn_id, .. }
+                if turn_id.as_deref() == Some("turn-1"))),
+            "assistant items must be stamped with their turn id"
+        );
+
+        // The response_item twins of the same calls must NOT have rendered a second card.
+        assert!(tool_use(&items, "c9").is_none(), "the response_item twin must not double-render");
+        let cards = items.iter().filter(|i| matches!(i, ConversationItem::AssistantMessage { blocks, .. }
+            if blocks.iter().any(|b| matches!(b, NormalizedBlock::ToolUse { .. })))).count();
+        let results = items.iter().filter(|i| matches!(i, ConversationItem::ToolResult { .. })).count();
+        assert_eq!((cards, results), (2, 2), "exactly one card + one result per tool");
+    }
+
+    /// On disk a web search is an `Extension{kind:"web.search"}` item — NOT the
+    /// `web_search_call` response_item the legacy path reads (VERIFIED against a real 0.153.4
+    /// rollout). It must reload as the same WebSearch card, with the found pages as the
+    /// source chips `WebSearchDetail` builds from the `Links:` line.
+    #[test]
+    fn a_web_search_reloads_as_a_websearch_card_with_its_sources() {
+        let content = completed(json!({ "type": "Extension", "kind": "web.search", "id": "ws1",
+            "query": "rust stable version",
+            "action": { "type": "search", "query": "rust stable version", "queries": null },
+            "results": [
+                { "type": "text_result", "title": "Announcing Rust 1.98.1", "domain": "blog.rust-lang.org",
+                  "url": "https://blog.rust-lang.org/2026/09/03/Rust-1.98.1/", "snippet": "…" }
+            ]}));
+        let (items, _) = parse_rollout_str(&content);
+        let (name, input) = tool_use(&items, "ws1").expect("a websearch card");
+        assert_eq!(name, "WebSearch", "a search must not reload as a nameless Extension card");
+        assert_eq!(input.get("query").and_then(Value::as_str), Some("rust stable version"));
+        match tool_result(&items, "ws1") {
+            Some(ConversationItem::ToolResult { content, .. }) => {
+                let text = content.as_str().unwrap_or_default();
+                assert!(text.contains("Links: "), "the result must carry the Links line: {text}");
+                assert!(text.contains("https://blog.rust-lang.org/2026/09/03/Rust-1.98.1/"));
+                assert!(text.contains("Announcing Rust 1.98.1"));
+            }
+            _ => panic!("the search card must be closed by a result"),
+        }
+    }
+
+    /// A FUTURE item type in a 0.153.x rollout must surface as a named card, never vanish —
+    /// the cold mirror of the live `ThreadItem::Unknown` arm.
+    #[test]
+    fn an_unmodelled_completed_item_still_renders_a_named_card() {
+        let content = [
+            completed(json!({ "type": "UserMessage", "id": "u1",
+                "content": [{ "type": "text", "text": "go" }] })),
+            completed(json!({ "type": "SomeFutureThing", "id": "z1", "whatever": 1 })),
+        ]
+        .join("\n");
+        let (items, _) = parse_rollout_str(&content);
+        let (name, _) = tool_use(&items, "z1").expect("a card for the unmodelled item");
+        assert_eq!(name, "SomeFutureThing");
+        assert!(tool_result(&items, "z1").is_some(), "and it must be closed, not left running");
+    }
+
+    /// A failing command must be marked in error on reload exactly as it is live — otherwise a
+    /// red step reloads as a green one.
+    #[test]
+    fn a_failed_completed_command_reloads_as_an_error() {
+        let content = completed(json!({ "type": "CommandExecution", "id": "e1",
+            "command": ["/bin/zsh", "-lc", "false"], "cwd": "file:///repo",
+            "status": "failed", "exit_code": 1, "aggregated_output": "boom\n" }));
+        let (items, _) = parse_rollout_str(&content);
+        assert!(matches!(
+            tool_result(&items, "e1"),
+            Some(ConversationItem::ToolResult { is_error: true, .. })
+        ));
+    }
+
     #[test]
     fn exec_command_becomes_a_bash_card_paired_by_call_id() {
         let content = [
@@ -1212,6 +1650,37 @@ mod tests {
         );
     }
 
+    /// A DECLINED command or patch (the user refused the approval) is an ERROR, not a success.
+    /// `declined` is a real variant of both `CommandExecutionStatus` and `PatchApplyStatus`; the
+    /// cold path used to check only failed/error, so a refused step reloaded GREEN — reading as
+    /// if it had run. Mirrors the live actor's `status_is_error`.
+    #[test]
+    fn declined_command_and_patch_reload_as_errors() {
+        let content = [
+            line("session_meta", json!({ "id": "t1", "cwd": "/repo", "cli_version": "0.153.4" })),
+            completed(json!({ "type": "CommandExecution", "id": "exec-d", "command": ["/bin/zsh", "-lc", "rm -rf /"],
+                "cwd": "file:///repo", "status": "declined", "aggregated_output": "" })),
+            completed(json!({ "type": "FileChange", "id": "fc-d", "status": "declined",
+                "changes": { "/repo/note.txt": { "type": "add", "content": "nope\n" } } })),
+        ]
+        .join("\n");
+        let (items, skipped) = parse_rollout_str(&content);
+        assert_eq!(skipped, 0);
+        // Cold ids are positional (`cx-r<n>`), so read the two results in order.
+        let errs: Vec<bool> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::ToolResult { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errs,
+            vec![true, true],
+            "a declined command and a declined patch must both reload as errors"
+        );
+    }
+
     /// PROBE (not a hermetic regression test): parse a REAL on-disk rollout end-to-end and
     /// assert it yields a sane, tool-inclusive timeline. Pass a thread id via
     /// `TOSSE_CODEX_PROBE_THREAD` (else it scans `~/.codex/sessions` for the newest rollout).
@@ -1366,6 +1835,42 @@ mod tests {
         assert_eq!(worktree.repo_root, "/Users/me/Repos/app", "worktree cwd rolls up to the repo");
         assert_eq!(worktree.git_branch, None);
         assert_eq!(worktree.excerpt, "Add a dark mode toggle");
+    }
+
+    /// A 0.153.x rollout writes its prose as `item_completed` and NO `user_message`. Since a
+    /// row without an excerpt is dropped as noise, reading only the old dialect made every
+    /// such conversation disappear from the History panel — and be indexed empty, so search
+    /// could not find it either.
+    #[test]
+    fn a_0_153_rollout_is_listed_and_indexed_from_its_completed_items() {
+        let base = std::env::temp_dir().join(format!("tosse-codex-153-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        write_rollout(
+            &base,
+            "11",
+            "rollout-2026-09-07T01-00-00-01a07cc2-8b0a-7d03-b858-9047103f8c07",
+            &[
+                line("session_meta", json!({ "id": "01a07cc2-8b0a-7d03-b858-9047103f8c07",
+                    "cwd": "/Users/me/Repos/app", "source": "vscode", "cli_version": "0.153.4" })),
+                completed(json!({ "type": "UserMessage", "id": "u1",
+                    "content": [{ "type": "text", "text": "Refresh the Codex streaming", "text_elements": [] }] })),
+                completed(json!({ "type": "AgentMessage", "id": "a1",
+                    "content": [{ "type": "Text", "text": "Auditing the wire now." }] })),
+            ],
+        );
+
+        let listed = list_codex_disk_conversations_in(&base);
+        assert_eq!(listed.len(), 1, "a 0.153.x conversation must still be listed: {listed:#?}");
+        assert_eq!(listed[0].excerpt, "Refresh the Codex streaming");
+        assert_eq!(listed[0].backend, "codex");
+
+        let index = build_codex_search_index_in(&base);
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(index.len(), 1, "a 0.153.x conversation must enter the search index");
+        assert_eq!(index[0].session_id, "01a07cc2-8b0a-7d03-b858-9047103f8c07");
+        // Searchable by BOTH sides of the conversation, exactly like the legacy dialect.
+        assert_eq!(history::score_index(&index, "streaming").len(), 1, "the user prompt is searchable");
+        assert_eq!(history::score_index(&index, "auditing").len(), 1, "the assistant's reply is searchable");
     }
 
     #[test]

@@ -101,27 +101,55 @@ export const FACTORY_HIDDEN_MODELS: readonly string[] = CLAUDE_MODELS.map((m) =>
 // The real Codex models, as reported by `codex app-server`'s `model/list`. STATIC
 // fallback used while the dynamic list loads or on error — the live `model/list` (see
 // codexModels.ts) supersedes it and picks up each model's real `supportedReasoningEfforts`.
-// The gpt-5.6 family (sol/terra/luna) supports the deeper max+ultra effort rungs
-// (assigned via effortLevelsForModel in codexModels.ts). The ids are the true wire ids,
+// Per-model effort ladders live in CODEX_EFFORTS (EffortGauge), transcribed from the same
+// `model/list` response; they are per MODEL, not per family. The ids are the true wire ids,
 // so a pick takes effect at `thread/start` (see the Rust `codex_model` plumbing).
+//
+// Transcribed verbatim from codex-cli 0.144.4, newest-first — which is also the order
+// `model/list` itself returns. `gpt-5.4` is deliberately ABSENT: the binary no longer
+// offers it, and listing a model it would reject is how a pick during the dynamic list's
+// loading window turns into a failed turn. It lives on in RETIRED_CODEX_MODELS below,
+// which the resolvers read but the picker never does — so a conversation still pinned to
+// it keeps its real name instead of showing the raw wire id.
 export const CODEX_MODELS: ModelOption[] = [
+  // GPT-6 Astra: the binary's own `isDefault` model, and the first to declare a 2× "Fast"
+  // service tier (the gpt-5.6 family is 1.5×). Effort ladder runs the full low→ultra.
+  { label: "GPT-6 Astra", value: "gpt-6-astra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Luna", value: "gpt-5.6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.5", value: "gpt-5.5", backend: "codex", provider: "OpenAI" },
-  { label: "GPT-5.4", value: "gpt-5.4", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
 ];
 
 /** The Codex backend's default model — seeds a Codex conversation so its persisted
  *  `model` is always a real Codex id (never a Claude alias the binary would reject).
- *  gpt-5.6-sol: the top current family (adds the max/ultra effort rungs) — the default pick. */
-export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+ *  gpt-6-astra: the model `model/list` itself flags `isDefault`, and the top of the
+ *  ladder (full low→ultra effort range). Only NEW conversations are seeded from here;
+ *  an existing one keeps the model persisted on its record. */
+export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
+
+/**
+ * Codex models the binary NO LONGER offers, kept for id→label resolution ONLY — never
+ * offered by the picker, never in `ALL_MODELS`, so a pick can't send an id the binary
+ * would reject. Dropping a retired id outright orphaned the conversations pinned to it:
+ * `modelLabel` fell through to the raw wire id and `modelFamily` returned null, so the
+ * composer highlighted no row. A retired row costs nothing and keeps those readable.
+ */
+export const RETIRED_CODEX_MODELS: ModelOption[] = [
+  { label: "GPT-5.4", value: "gpt-5.4", backend: "codex", provider: "OpenAI" },
+];
 
 export const ALL_MODELS: ModelOption[] = [...CLAUDE_MODELS, ...CODEX_MODELS];
 
+/** Every id the resolvers below can NAME — the offered catalogue plus the retired rows.
+ *  Deliberately NOT `ALL_MODELS`: that one is what the app may OFFER. */
+const RESOLVABLE_MODELS: ModelOption[] = [...ALL_MODELS, ...RETIRED_CODEX_MODELS];
+
 /** Longest-first so `gpt-5.4-mini` matches before `gpt-5.4` in substring checks. */
-const CODEX_BY_LEN = [...CODEX_MODELS].sort((a, b) => b.value.length - a.value.length);
+const CODEX_BY_LEN = [...CODEX_MODELS, ...RETIRED_CODEX_MODELS].sort(
+  (a, b) => b.value.length - a.value.length,
+);
 
 /** Same, for Claude: a resolved id contains BOTH a full model name and the family
  *  alias (`claude-opus-4-8[1m]` contains "claude-opus-4-8" AND "opus"), so the longest
@@ -139,7 +167,7 @@ const CLAUDE_BY_LEN = [...CLAUDE_MODELS].sort((a, b) => b.value.length - a.value
 export function backendOfModel(id?: string | null): BackendKind {
   if (!id) return "claude";
   const s = id.toLowerCase();
-  const exact = ALL_MODELS.find((m) => m.value === s);
+  const exact = RESOLVABLE_MODELS.find((m) => m.value === s);
   if (exact) return exact.backend;
   if (CODEX_BY_LEN.some((m) => s.includes(m.value)) || /\bgpt|codex|^o\d/.test(s)) return "codex";
   return "claude";
@@ -150,7 +178,7 @@ export function backendOfModel(id?: string | null): BackendKind {
 export function modelLabel(id?: string | null): string {
   if (!id) return "Model";
   const s = id.toLowerCase();
-  const exact = ALL_MODELS.find((m) => m.value === s);
+  const exact = RESOLVABLE_MODELS.find((m) => m.value === s);
   if (exact) return exact.label;
   const claude = CLAUDE_BY_LEN.find((m) => s.includes(m.value));
   if (claude) return claude.label;
@@ -164,7 +192,7 @@ export function modelLabel(id?: string | null): string {
 export function modelFamily(id?: string | null): string | null {
   if (!id) return null;
   const s = id.toLowerCase();
-  const exact = ALL_MODELS.find((m) => m.value === s);
+  const exact = RESOLVABLE_MODELS.find((m) => m.value === s);
   if (exact) return exact.value;
   const codex = CODEX_BY_LEN.find((m) => s.includes(m.value));
   if (codex) return codex.value;

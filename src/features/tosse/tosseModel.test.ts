@@ -26,6 +26,8 @@ import {
   STATUS_TONE,
   STATUSES_OFF_THE_BOARD,
   taskQuickAction,
+  taskStatusActions,
+  liveBlockers,
   TASK_STATUS_CHOICES,
   type BoardCaches,
 } from "./tosseModel";
@@ -225,6 +227,85 @@ describe("taskQuickAction", () => {
   // "Fait" heading that the briefing never sends.
   it("moves the task off the board", () => {
     expect(STATUSES_OFF_THE_BOARD).toContain(taskQuickAction("Review")?.next);
+  });
+});
+
+describe("taskStatusActions", () => {
+  // The CRM's own ladder (its task detail panel's sticky footer). Asserted VALUE by value,
+  // not by shape: these labels and destinations are the contract with a CRM the user reads
+  // in a browser one tab away, and a silent drift here would give the two screens different
+  // buttons for the same task.
+  it("mirrors the CRM's ladder", () => {
+    expect(taskStatusActions("Backlog")).toEqual([
+      { label: "Prioritize", next: "À faire", tone: "plain" },
+    ]);
+    expect(taskStatusActions("À faire")).toEqual([
+      { label: "Mark in progress", next: "En cours", tone: "go", confirmWhenBlocked: true },
+    ]);
+    expect(taskStatusActions("En cours")).toEqual([
+      { label: "Mark as Done", next: "Fait", tone: "done" },
+    ]);
+    expect(taskStatusActions("Review")).toEqual([
+      { label: "Approve & Done", next: "Fait", tone: "done" },
+    ]);
+  });
+
+  // The CRM offers no advancement from a parked or closed task either — the status chip's
+  // menu is the way out of those, here as there. An unknown status must fall through rather
+  // than throw, the day the CRM grows one.
+  it("offers nothing where the CRM offers nothing", () => {
+    for (const status of ["En attente", "Fait", "Archivé", "Something new"]) {
+      expect(taskStatusActions(status)).toEqual([]);
+    }
+  });
+
+  // Every button writes a status the chip's menu also offers: if the two disagreed, one of
+  // them would be writing a value the CRM does not have — and the menu is the documented way
+  // back after a mis-click, so it has to be able to undo anything a button does.
+  it("only writes statuses the menu itself offers", () => {
+    for (const status of TASK_STATUS_CHOICES) {
+      for (const action of taskStatusActions(status)) {
+        expect(TASK_STATUS_CHOICES).toContain(action.next);
+      }
+    }
+  });
+
+  // The repo rule — subtasks go straight to « Fait », only parents pass through « Review » —
+  // needs no special case here BECAUSE the ladder never routes through « Review »: a running
+  // task closes directly. This test is the tripwire on that reasoning, not decoration.
+  it("never routes a running task through Review", () => {
+    expect(taskStatusActions("En cours").map((a) => a.next)).not.toContain("Review");
+  });
+
+  // Only the move that STARTS work asks about blockers. Closing a blocked task is a
+  // legitimate way to end one, and a dialog there would be a stop with no answer to give.
+  it("asks about blockers only when starting", () => {
+    const asks = (s: string) => taskStatusActions(s).some((a) => a.confirmWhenBlocked);
+    expect(asks("À faire")).toBe(true);
+    for (const status of ["Backlog", "En cours", "Review"]) expect(asks(status)).toBe(false);
+  });
+
+  // The panel is the only surface that grew buttons (2026-09-07): the ROW still offers the
+  // single « Done » from « Review » and nothing else. Asserted together so a later change
+  // that generalises the row has to come here and say so.
+  it("is wider than what the row offers", () => {
+    expect(taskQuickAction("À faire")).toBeNull();
+    expect(taskStatusActions("À faire")).toHaveLength(1);
+  });
+});
+
+describe("liveBlockers", () => {
+  // A resolved relation is history: the panel keeps showing it dimmed, and it must NOT stop
+  // a click. Gating on the raw list would make a task blocked forever by something already
+  // dealt with.
+  it("drops the relations already resolved", () => {
+    const rows = [
+      { id: "a", resolved: false },
+      { id: "b", resolved: true },
+    ];
+    expect(liveBlockers(rows).map((b) => b.id)).toEqual(["a"]);
+    expect(liveBlockers([{ id: "b", resolved: true }])).toEqual([]);
+    expect(liveBlockers([])).toEqual([]);
   });
 });
 

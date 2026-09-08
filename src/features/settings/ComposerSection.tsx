@@ -228,7 +228,7 @@ function BarArrangement() {
                 off so the preview can't open its usage popover. */}
             <span className="cvset-ring" style={{ pointerEvents: "none" }}>
               <ContextRing
-                ctx={{ pct: 42, used: "84k", max: "200k" }}
+                ctx={{ pct: 42, used: "84k", max: "200k", usedKnown: true, windowKnown: true }}
                 plan={null}
                 usage={null}
                 usageLoading={false}
