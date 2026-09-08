@@ -644,7 +644,14 @@
    box at rest (a :focus-visible ring is an outside box-shadow, so it goes first) and would make
    this a scroll container for any sticky descendant. Same reasoning as .cv-motion-in below,
    which arms its clip for the flight only. */
-.cv-collapse > * { min-height:0; }
+/* A grid item's automatic minimum size is its MIN-CONTENT size in BOTH axes, so the body
+   must be released on the inline axis too — otherwise a card inside the fold (a diff, whose
+   inner box is `width:max-content`; a code block; a table) widens the item past the reading
+   column, the card visibly juts out to the right and the whole thread scrolls horizontally.
+   Clean output is where this bites: it is the mode that puts FULL cards inside the fold,
+   whereas the same card outside is a flex item of `.cv-aibody` (column) — capped, its
+   content clipping or scrolling on its own. */
+.cv-collapse > * { min-height:0; min-width:0; }
 .cv-collapse:not([data-open]) > *,
 .cv-collapse[data-settling] > * { overflow:hidden; }
 
@@ -683,7 +690,9 @@
 .cv-motion { display:grid; grid-template-rows:1fr; }
 /* The clip is armed only for the flight: a permanent `overflow:hidden` would quietly cut
    anything a row draws outside its box at rest (focus ring, badge, shadow). */
-.cv-motion-in { min-height:0; display:flex; flex-direction:column; }
+/* `min-width:0` for the same reason as `.cv-collapse > *`: a grid item must not grow to
+   its min-content width and push a travelling card out of the reading column. */
+.cv-motion-in { min-height:0; min-width:0; display:flex; flex-direction:column; }
 .cv-motion[data-motion] .cv-motion-in { overflow:hidden; }
 .cv-motion[data-motion="exit"] .cv-motion-in { justify-content:flex-end; }
 .cv-motion[data-motion="exit"] {
