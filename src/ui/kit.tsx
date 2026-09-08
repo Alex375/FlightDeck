@@ -98,6 +98,10 @@ const WF_PATHS: Record<string, string> = {
   reorder: "M7 8l3-3 3 3M10 5v6M17 14l-3 3-3-3M14 17v-6",
   // A six-dot drag handle — the affordance shown inside the Flight Deck drag ghost.
   grip: "M8 6h.01M14 6h.01M8 11h.01M14 11h.01M8 16h.01M14 16h.01",
+  /** Two overlapping people — the Claude ACCOUNT control (which subscription a
+   *  conversation runs on) and its Settings row. Reads as "several identities", which a
+   *  single-person glyph would not. */
+  users: "M9 5.5a2.75 2.75 0 1 1 0 5.5 2.75 2.75 0 0 1 0-5.5ZM3.5 17.5a5.5 5.5 0 0 1 11 0M14.5 6.2a2.6 2.6 0 0 1 0 4.9M16.5 17.5a4.6 4.6 0 0 0-2-3.8",
 };
 
 /** Every glyph the kit can draw, for the custom-button icon picker. Derived from the
@@ -863,6 +867,54 @@ function UsageRow({
   );
 }
 
+/** Every rate-limit window a plan-usage payload carries, as bars: the two account-wide
+ *  windows (5h / 7d) then any model-scoped cap.
+ *
+ *  Extracted so the ring popover (bottom-right of a conversation) and Settings → Accounts
+ *  render the SAME bars from one implementation — the account panel shows each account's
+ *  limits, and "the same figures as the ring" has to stay literally true as this evolves.
+ *  Renders nothing when the endpoint reported no window, so a caller can drop it in
+ *  unconditionally. `plan` is optional: it only supplies a fallback reset time from the
+ *  coarse stream status, which an account with no live session simply doesn't have. */
+export function PlanUsageBars({
+  usage,
+  plan,
+}: {
+  usage?: PlanUsageInfo | null;
+  plan?: PlanInfo | null;
+}) {
+  return (
+    <>
+      {usage?.five_hour ? (
+        <UsageRow
+          label="5h"
+          w={usage.five_hour}
+          fallbackReset={plan?.limitType === "five_hour" ? plan.resetsAt : null}
+        />
+      ) : null}
+      {usage?.seven_day ? (
+        <UsageRow
+          label="7d"
+          w={usage.seven_day}
+          fallbackReset={plan?.limitType === "seven_day" ? plan.resetsAt : null}
+        />
+      ) : null}
+      {/* Model-scoped caps (e.g. Fable's weekly allowance), listed after the two
+          account-wide windows. Rendered straight off the payload — no fallback reset,
+          since a scoped window that hasn't started reports none and the coarse `plan`
+          reset belongs to a different (account-wide) cap. */}
+      {(usage?.scoped ?? []).map((s) => (
+        <UsageRow
+          key={`${s.label}:${s.group ?? ""}`}
+          label={scopedUsageLabel(s)}
+          w={s.window}
+          fallbackReset={null}
+        />
+      ))}
+    </>
+  );
+}
+
 /** Map a rate-limit status to a label + colour token. */
 function planStatus(status: string | null): { label: string; color: string } {
   switch (status) {
@@ -1025,32 +1077,7 @@ function ContextUsageBody({
         ) : null}
       </div>
       {/* Real usage bars (precise %), when the endpoint reported them. */}
-      {usage?.five_hour ? (
-        <UsageRow
-          label="5h"
-          w={usage.five_hour}
-          fallbackReset={plan?.limitType === "five_hour" ? plan.resetsAt : null}
-        />
-      ) : null}
-      {usage?.seven_day ? (
-        <UsageRow
-          label="7d"
-          w={usage.seven_day}
-          fallbackReset={plan?.limitType === "seven_day" ? plan.resetsAt : null}
-        />
-      ) : null}
-      {/* Model-scoped caps (e.g. Fable's weekly allowance), listed after the two
-          account-wide windows. Rendered straight off the payload — no fallback reset,
-          since a scoped window that hasn't started reports none and the coarse `plan`
-          reset belongs to a different (account-wide) cap. */}
-      {(usage?.scoped ?? []).map((s) => (
-        <UsageRow
-          key={`${s.label}:${s.group ?? ""}`}
-          label={scopedUsageLabel(s)}
-          w={s.window}
-          fallbackReset={null}
-        />
-      ))}
+      <PlanUsageBars usage={usage} plan={plan} />
       {/* Coarse status pill (warning / rejected) — always informative. */}
       {st && plan ? (
         <div className="wf-pop-row">

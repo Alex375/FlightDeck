@@ -12,6 +12,7 @@ import type {
   ConversationRecord,
   GoalState,
   DiskConversation,
+  ClaudeAccountRecord,
   ClaudeAccountStatus,
   ClaudeCliStatus,
   ClaudeUpdateOutcome,
@@ -289,6 +290,22 @@ const mockRemote: RemoteStatus = {
 let mockCounter = 0;
 /** Distinguishes the wire uuids the mock hands back for successive sends. */
 let mockSentCounter = 0;
+
+/** The demo's EXTRA Claude accounts (the default one is not a row — it always exists).
+ *  Seeded with one so the multi-account surfaces are reachable in dev/Playwright without
+ *  going through the sign-in flow, and mutable so add / rename / remove actually do
+ *  something in the browser build. */
+const mockClaudeAccounts: ClaudeAccountRecord[] = [
+  {
+    id: "acct-b",
+    label: "Work account",
+    email: "demo-b@example.com",
+    org_name: "Demo Org",
+    subscription_type: "max",
+    sort_index: 1,
+    added_at: 0,
+  },
+];
 
 // ---- TOSSE briefing fixture ------------------------------------------------
 // Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
@@ -723,16 +740,21 @@ export const mockCommands = {
     return ok(null);
   },
   // ---- Accounts (Claude & Codex) — demo statuses ----------------------------------
-  async accountClaudeStatus(): Promise<Result<ClaudeAccountStatus, string>> {
+  // (see `mockClaudeAccounts` below the object for the mutable demo account list)
+  //
+  // Two Claude accounts in the demo, so the multi-account surfaces are exercisable in
+  // dev/Playwright: the composer's account chip only renders once a second one exists,
+  // and the auto-switch policy needs somewhere to switch to.
+  async accountClaudeStatus(accountId: string | null): Promise<Result<ClaudeAccountStatus, string>> {
     return ok({
       loggedIn: true,
       authMethod: "claude.ai",
-      email: "demo@example.com",
+      email: accountId ? "demo-b@example.com" : "demo@example.com",
       orgName: "Demo Org",
       subscriptionType: "max",
     });
   },
-  async accountClaudeLoginStart(): Promise<Result<string, string>> {
+  async accountClaudeLoginStart(_accountId: string | null): Promise<Result<string, string>> {
     return ok("https://claude.ai/oauth/demo");
   },
   async accountClaudeLoginCode(_code: string): Promise<Result<null, string>> {
@@ -741,7 +763,46 @@ export const mockCommands = {
   async accountClaudeLoginCancel(): Promise<Result<null, string>> {
     return ok(null);
   },
-  async accountClaudeLogout(): Promise<Result<null, string>> {
+  async accountClaudeLogout(_accountId: string | null): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async claudeAccountsList(): Promise<Result<ClaudeAccountRecord[], string>> {
+    return ok(mockClaudeAccounts);
+  },
+  async claudeAccountCreate(label: string): Promise<Result<ClaudeAccountRecord, string>> {
+    const rec: ClaudeAccountRecord = {
+      id: `acct-${mockClaudeAccounts.length + 2}`,
+      label: label.trim() || `Account ${mockClaudeAccounts.length + 2}`,
+      email: null,
+      org_name: null,
+      subscription_type: null,
+      sort_index: mockClaudeAccounts.length + 1,
+      added_at: Date.now(),
+    };
+    mockClaudeAccounts.push(rec);
+    return ok(rec);
+  },
+  async claudeAccountRename(accountId: string, label: string): Promise<Result<null, string>> {
+    const rec = mockClaudeAccounts.find((a) => a.id === accountId);
+    if (rec) rec.label = label;
+    return ok(null);
+  },
+  async claudeAccountCaptureIdentity(accountId: string): Promise<Result<ClaudeAccountRecord, string>> {
+    const rec = mockClaudeAccounts.find((a) => a.id === accountId);
+    if (!rec) return { status: "error", error: "this Claude account no longer exists" };
+    rec.email = "demo-b@example.com";
+    rec.subscription_type = "max";
+    return ok(rec);
+  },
+  async claudeAccountRemove(accountId: string): Promise<Result<string | null, string>> {
+    const i = mockClaudeAccounts.findIndex((a) => a.id === accountId);
+    if (i >= 0) mockClaudeAccounts.splice(i, 1);
+    return ok(null);
+  },
+  async setConversationClaudeAccount(
+    _convId: string,
+    _accountId: string | null,
+  ): Promise<Result<null, string>> {
     return ok(null);
   },
   async accountCodexStatus(): Promise<Result<CodexAccountStatus, string>> {
@@ -1032,11 +1093,10 @@ export const mockCommands = {
     model: string | null,
     effort: string | null,
     permissionMode: string | null,
-    ultracode: boolean,
     _backend: "claude" | "codex",
-    _allowBypassPermissions?: boolean,
-    _appControl?: boolean,
+    flags: { ultracode: boolean },
   ): Promise<Result<string, string>> {
+    const { ultracode } = flags;
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
     const rec = getRecord(session);
@@ -1383,18 +1443,22 @@ export const mockCommands = {
     return ok(hits);
   },
 
-  async getPlanUsage(): Promise<Result<PlanUsage, UsageError>> {
+  async getPlanUsage(accountId: string | null): Promise<Result<PlanUsage, UsageError>> {
     // No real OAuth endpoint in the browser; return plausible fills so the Plan
     // section of the context popover renders in dev/Playwright. Reset ~2h / ~3d out,
     // as ISO 8601 strings (matching the live endpoint shape).
     const iso = (offsetSec: number) => new Date(Date.now() + offsetSec * 1000).toISOString();
     // Build the ok-arm directly: `ok()` fixes the error type to string, but this
     // command's Result error is UsageError. The mock never takes the error path.
+    // Distinct fills per account, so the multi-account surfaces (per-card bars, the
+    // account chip's percentages, the auto-switch policy) show something to choose
+    // BETWEEN rather than the same number twice.
+    const busy = accountId === null;
     return {
       status: "ok",
       data: {
-        five_hour: { used_percentage: 42, resets_at: iso(2 * 3600) },
-        seven_day: { used_percentage: 67, resets_at: iso(3 * 86400) },
+        five_hour: { used_percentage: busy ? 42 : 8, resets_at: iso(2 * 3600) },
+        seven_day: { used_percentage: busy ? 67 : 14, resets_at: iso(3 * 86400) },
         // A model-scoped weekly cap, as the live endpoint reports it: named after the
         // model and — when the window has never started — with no reset at all.
         scoped: [
@@ -1412,7 +1476,8 @@ export const mockCommands = {
     // so the dev/Playwright build has something to drive (e.g. `?demo=background`).
     const demo =
       typeof location !== "undefined" && new URLSearchParams(location.search).has("demo");
-    if (!demo) return ok({ repos: [], conversations: [], active_id: null });
+    if (!demo)
+      return ok({ machines: [], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
     return ok({
       repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
@@ -1438,6 +1503,7 @@ export const mockCommands = {
           tosse_task_title: "Lot 2 — vue « Tâches TOSSE » + écriture",
           tosse_task_status: "En cours",
           backend: "claude",
+          claude_account_id: null,
         },
         // A Codex conversation so the mixed-fleet identity (backend badge, neutral avatar,
         // Codex picker icon) is exercisable in dev/Playwright. Renders live through the same
@@ -1462,6 +1528,7 @@ export const mockCommands = {
           tosse_task_title: "Lot 1 — connexion (OAuth) + onglet Réglages",
           tosse_task_status: "Review",
           backend: "codex",
+          claude_account_id: null,
         },
       ],
       active_id: "conv-demo",

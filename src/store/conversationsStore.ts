@@ -42,6 +42,7 @@ import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
+import { defaultAccountForNewConversation } from "./claudeAccounts";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
@@ -228,6 +229,36 @@ export interface Conversation {
    */
   tosseTaskTitle: string | null;
   tosseTaskStatus: string | null;
+  /**
+   * Which Claude account this conversation runs on — a `ClaudeAccountRecord.id`, or null
+   * for the default (un-scoped) account. PERSISTED, so it survives a relaunch, a resume,
+   * a fork and a rewind.
+   *
+   * It can only take effect at the next SPAWN: the CLI reads its credentials once at
+   * startup, so a live session keeps the account it started with until it is restarted.
+   * The composer says so rather than pretending the change already applied. Meaningless
+   * for a Codex conversation, which ignores it entirely.
+   */
+  claudeAccountId: string | null;
+  /**
+   * When this conversation was last moved to another account by the AUTO-switch (ms), or
+   * null if never. Live-only (not persisted): it exists to enforce the cooldown that stops
+   * two consecutive usage polls from bouncing a conversation between accounts, and a
+   * relaunch is already a fresh start for that concern. Optional: absent means "never
+   * switched", the state every conversation starts in.
+   */
+  lastAccountSwitchAt?: number | null;
+  /**
+   * The account the LIVE process was actually spawned with (`null` = the default one),
+   * or absent when nothing is running. Live-only, set at spawn beside `bypassAllowed`
+   * for the same reason: it is what the process can actually honour, as opposed to what
+   * the record now asks for.
+   *
+   * When it differs from {@link claudeAccountId}, the choice is PENDING — the composer
+   * says so rather than claiming an account the process is not using, and
+   * `ClaudeAccountApplyHost` restarts the session at the next safe boundary.
+   */
+  liveClaudeAccountId?: string | null;
 }
 
 /** A TOSSE task as a conversation remembers it — the denormalised trio, kept together
@@ -341,6 +372,7 @@ const convToRecord = (c: Conversation): ConversationRecord => ({
   tosse_task_id: c.tosseTaskId,
   tosse_task_title: c.tosseTaskTitle,
   tosse_task_status: c.tosseTaskStatus,
+  claude_account_id: c.claudeAccountId,
 });
 
 const recordToRepo = (r: RepoRecord): Repo => ({
@@ -372,6 +404,9 @@ const recordToConv = (c: ConversationRecord): Conversation => ({
   tosseTaskId: c.tosse_task_id,
   tosseTaskTitle: c.tosse_task_title,
   tosseTaskStatus: c.tosse_task_status,
+  claudeAccountId: c.claude_account_id,
+  // Live-only: a relaunch is a fresh start for the switch cooldown.
+  lastAccountSwitchAt: null,
 });
 
 // The one user-facing message for any persistence failure (deduped in the banner),
@@ -483,7 +518,15 @@ interface ConversationsState {
   /** Store Claude's session_id on the conversation for --resume (keyed by stable id). */
   noteSessionId: (id: string, sessionId: string) => void;
   /** Bind a conversation (by stable id) to its live Rust session handle. In-memory only. */
-  setHandle: (id: string, handle: string | null, bypassAllowed?: boolean) => void;
+  setHandle: (
+    id: string,
+    handle: string | null,
+    bypassAllowed?: boolean,
+    /** The Claude account the process was actually spawned with (`null` = the default
+     *  one). Live-only, and the thing `claudeAccountId` is compared against to know a
+     *  pending account change from an applied one. */
+    liveClaudeAccountId?: string | null,
+  ) => void;
   /** Set/clear the worktree the session moved into (EnterWorktree/ExitWorktree). In-memory only. */
   setLiveCwd: (id: string, cwd: string | null) => void;
   /** Repoint a conversation's working directory (e.g. into a freshly created worktree) and persist it. */
@@ -526,6 +569,15 @@ interface ConversationsState {
    * so (unlike model/effort/permission) there is NOTHING to push to the live stream.
    */
   setConvCleanOutput: (id: string, enabled: boolean) => void;
+  /** Point a Claude conversation at an account (`null` = the default one). Persisted, and
+   *  applied by STOPPING any live session so the next turn re-spawns on the new account —
+   *  a running process cannot change identity. `opts.auto` marks an automatic switch,
+   *  which arms the anti-oscillation cooldown; a manual pick never does. */
+  setConvClaudeAccount: (
+    id: string,
+    accountId: string | null,
+    opts?: { auto?: boolean },
+  ) => void;
   /**
    * Set (or clear with null) the conversation's persisted status reminder and
    * mirror it to the core. Idempotent: a no-op when the value is unchanged, so the
@@ -881,10 +933,19 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   // `bypassAllowed` is a property of the PROCESS just spawned (it carries the unlock
   // flag or it doesn't), so it is set here alongside the handle and cleared with it: a
   // conversation with no live process has nothing to allow.
-  setHandle: (id, handle, bypassAllowed = false) =>
+  setHandle: (id, handle, bypassAllowed = false, liveClaudeAccountId = null) =>
     set((s) => ({
       conversations: s.conversations.map((c) =>
-        c.id === id ? { ...c, handle, bypassAllowed: handle ? bypassAllowed : false } : c,
+        c.id === id
+          ? {
+              ...c,
+              handle,
+              bypassAllowed: handle ? bypassAllowed : false,
+              // Remember WHICH account the process actually started on. Cleared with the
+              // handle: with no process there is no live identity to be out of step with.
+              liveClaudeAccountId: handle ? liveClaudeAccountId : null,
+            }
+          : c,
       ),
     })),
 
@@ -995,6 +1056,32 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     );
   },
 
+  setConvClaudeAccount: (id, accountId, opts) => {
+    const conv = get().conversations.find((c) => c.id === id);
+    if (!conv || conv.kind !== "claude") return; // accounts are a Claude-side concept
+    if ((conv.claudeAccountId ?? null) === accountId) return; // idempotent
+    const updated: Conversation = {
+      ...conv,
+      claudeAccountId: accountId,
+      // Only an AUTOMATIC switch arms the cooldown. A manual pick is the user's explicit
+      // intent and must never be throttled — nor should it postpone a later auto-switch.
+      lastAccountSwitchAt: opts?.auto ? Date.now() : conv.lastAccountSwitchAt,
+    };
+    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+    syncToCore("upsertConversation(claudeAccount)", () =>
+      commands.upsertConversation(convToRecord(updated)),
+    );
+    // A LIVE process cannot change account — the CLI reads its credentials once at
+    // startup — so applying the choice means stopping it and letting the next turn
+    // re-spawn (lazily, with `--resume`, so the transcript continues untouched).
+    //
+    // That restart is deliberately NOT done here: this may be called mid-turn, and
+    // killing a running turn to change account is exactly what the feature must never do.
+    // `ClaudeAccountApplyHost` performs it at the next safe boundary instead, and until
+    // then `liveClaudeAccountId` keeps the composer honest about which account is really
+    // in use.
+  },
+
   setReminder: (id, reminder) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv || conv.pendingReminder === reminder) return; // idempotent: no churn
@@ -1101,6 +1188,9 @@ export function createConversationInRepo(
     tosseTaskId: null,
     tosseTaskTitle: null,
     tosseTaskStatus: null,
+    // Starts on the account chosen in Settings → Accounts (null = the default one, which
+    // is the whole of a single-account setup). Codex has no account concept.
+    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
   });
   return id;
 }
@@ -1149,6 +1239,9 @@ export function createConversationInWorktree(
     tosseTaskId: null,
     tosseTaskTitle: null,
     tosseTaskStatus: null,
+    // Starts on the account chosen in Settings → Accounts (null = the default one, which
+    // is the whole of a single-account setup). Codex has no account concept.
+    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
   });
   return id;
 }
@@ -1184,6 +1277,10 @@ export interface InheritedControls {
   ultracode: boolean;
   permissionMode: string | null;
   cleanOutput: boolean | null;
+  /** The Claude account the source runs on (`null` = the default one). Inherited for the
+   *  same reason as the model: a branch that silently jumped to another account would bill
+   *  the work to a subscription the user never picked for it. */
+  claudeAccountId: string | null;
 }
 
 /** Snapshot the controls a fork must carry over from its source conversation. Single
@@ -1196,6 +1293,7 @@ export function inheritedControls(source: Conversation): InheritedControls {
     ultracode: source.ultracode,
     permissionMode: source.permissionMode,
     cleanOutput: source.cleanOutput,
+    claudeAccountId: source.claudeAccountId,
   };
 }
 
@@ -1250,6 +1348,9 @@ export function reactivateDiskConversation(
     // null = inherit the global "clean output" default; the composer chip sets an
     // explicit per-conversation override.
     cleanOutput: null,
+    // No source to inherit from (a History-panel import), and a transcript records no
+    // account: start on the configured default, like a new conversation.
+    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
   };
   useConversationsStore.getState().addConversation({
     id,
@@ -1280,6 +1381,9 @@ export function reactivateDiskConversation(
     tosseTaskId: null,
     tosseTaskTitle: null,
     tosseTaskStatus: null,
+    // A FORK carries its source's account over; a History-panel import falls back to the
+    // configured default (see `controls` above).
+    claudeAccountId: kind === "claude" ? controls.claudeAccountId : null,
   });
   return id;
 }
@@ -1332,6 +1436,8 @@ export function materializeCodexBranch(
     tosseTaskId: null,
     tosseTaskTitle: null,
     tosseTaskStatus: null,
+    // Codex has no Claude account.
+    claudeAccountId: null,
   });
   return id;
 }
@@ -1466,17 +1572,18 @@ export async function ensureConversationSession(
     // Same spawn-time read for the app-control policy: whether THIS session
     // advertises the in-process "flightdeck" MCP server (Settings → Control).
     const appControl = agentServerEnabled();
+    // Which Claude account this process authenticates as. Read at spawn — the ONLY moment
+    // it can be applied, since the CLI reads its credentials once at startup.
+    const claudeAccountId = atSpawn.kind === "claude" ? (atSpawn.claudeAccountId ?? null) : null;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
       atSpawn.model,
       atSpawn.effort,
       atSpawn.permissionMode,
-      atSpawn.ultracode,
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
-      allowBypass,
-      appControl,
+      { ultracode: atSpawn.ultracode, allowBypassPermissions: allowBypass, appControl, claudeAccountId },
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1508,16 +1615,22 @@ export async function ensureConversationSession(
           atSpawn.model,
           atSpawn.effort,
           atSpawn.permissionMode,
-          atSpawn.ultracode,
           // Same backend on the fresh-worktree re-spawn.
           atSpawn.kind,
-          allowBypass,
-          appControl,
+          {
+            ultracode: atSpawn.ultracode,
+            allowBypassPermissions: allowBypass,
+            appControl,
+            // Same account too: a lost worktree must not silently change identity.
+            claudeAccountId,
+          },
         );
       }
     }
     if (res.status !== "ok") throw new Error(res.error);
-    useConversationsStore.getState().setHandle(convId, res.data, allowBypass);
+    useConversationsStore
+      .getState()
+      .setHandle(convId, res.data, allowBypass, claudeAccountId);
     return res.data;
   })();
   spawning.set(convId, promise);

@@ -17,6 +17,7 @@ export type {
   ConversationItem,
   ConversationRecord,
   DiskConversation,
+  ClaudeAccountRecord,
   ClaudeAccountStatus,
   CodexAccountStatus,
   CodexHooksSnapshot,

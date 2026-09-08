@@ -49,6 +49,7 @@ import {
 import { useComposerBar } from "../../store/composerBar";
 import { useDisplay } from "../../store/display";
 import {
+  AccountFace,
   ArtifactsFace,
   CleanOutputFace,
   CodexOptionsFace,
@@ -365,6 +366,10 @@ function chipFace(id: string, props: { icon?: string } & Record<string, unknown>
       return <CodexSpeedFace name="Speed" {...rest} />;
     case "codexOptions":
       return <CodexOptionsFace {...rest} />;
+    case "account":
+      // A representative label: the preview must read as a real control, and this chip
+      // only ever appears once a second account exists.
+      return <AccountFace label="Claude" {...rest} />;
     case "outputStyle":
       // A representative non-default label so the chip reads as a real control here.
       return <OutputStyleFace label="Concise" {...rest} />;

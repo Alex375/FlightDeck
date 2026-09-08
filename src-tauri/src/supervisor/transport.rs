@@ -92,6 +92,18 @@ pub struct SpawnConfig {
     /// the first spawn; the session actor fills it from the daemon's
     /// `fd_attach` handshake to reconnect after a drop without losing stream.
     pub attach: Option<AttachPoint>,
+    /// WHICH Claude account this session runs on. The default slot contributes no
+    /// environment at all, so a single-account setup spawns byte-for-byte as before.
+    ///
+    /// ⚠️ An account is chosen at SPAWN and cannot change under a live process: the CLI
+    /// reads its credentials once at startup. Switching accounts therefore means stopping
+    /// the session and re-spawning it with `--resume` — which is safe because the slot
+    /// scopes ONLY the credential store, leaving the transcript this resumes from exactly
+    /// where it was (see [`crate::accounts::slot`]).
+    ///
+    /// Ignored for REMOTE sessions: the daemon on the server owns its own `claude`
+    /// process and its own credentials.
+    pub claude_account: crate::accounts::AccountSlot,
 }
 
 /// Where to resume a remote attach stream: the daemon-side conversation, the
@@ -146,6 +158,8 @@ impl SpawnConfig {
             allow_bypass_permissions: false,
             remote: None,
             attach: None,
+            // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
+            claude_account: crate::accounts::AccountSlot::default_slot(),
         }
     }
 }
@@ -594,6 +608,9 @@ impl Transport {
                 // 2.1.224). Costs nothing when unused.
                 .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
                 .env_remove("NODE_OPTIONS");
+            // Scope the credential store to the chosen account. The default slot sets
+            // nothing, so this is a no-op for a single-account user.
+            cfg.claude_account.apply(&mut cmd);
             cmd
         };
 

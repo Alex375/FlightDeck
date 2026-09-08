@@ -163,6 +163,40 @@ pub struct ConversationRecord {
     /// the warning silently stops warning the moment the network is down.
     pub tosse_task_title: Option<String>,
     pub tosse_task_status: Option<String>,
+    /// Which Claude account this conversation runs on — a [`ClaudeAccountRecord::id`],
+    /// or `None` for the default (un-scoped) account. `None` is every pre-existing row and
+    /// stays the default for a single-account user, so nothing changes for them.
+    ///
+    /// Deliberately not a foreign key: the id names a credential store the CLI owns, so an
+    /// account signed out or removed behind our back must leave the conversation usable
+    /// (it degrades to the default account, visibly) rather than break the row. Codex
+    /// conversations ignore it entirely — accounts are a Claude-side concept.
+    pub claude_account_id: Option<String>,
+}
+
+/// One Claude account the user signed into from the app. Holds NO secret: the credentials
+/// live in the CLI's own store, isolated per account by
+/// [`crate::accounts::AccountSlot`]. What is persisted here is the non-sensitive identity
+/// captured at login, which is what lets the Accounts panel label each account reliably —
+/// the CLI's own `auth status` reads its email from a profile cache our accounts SHARE, so
+/// it cannot be trusted to name a specific one (see `accounts::status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ClaudeAccountRecord {
+    /// Stable app-minted id (a uuid), also the directory name of the account's isolated
+    /// credential store. The reserved value `"default"` is the CLI's own un-scoped store.
+    pub id: String,
+    /// What the user sees. Defaults to the email captured at login, and is editable so two
+    /// accounts on the same address (personal / org) stay tellable apart.
+    pub label: String,
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    /// `max` | `pro` | … as the CLI reported it at login.
+    pub subscription_type: Option<String>,
+    /// Manual display order (ascending). Also the tie-break the auto-switch policy uses
+    /// when two accounts have equal capacity, so the choice is deterministic.
+    pub sort_index: i64,
+    /// Unix ms timestamp the account was added.
+    pub added_at: i64,
 }
 
 /// The full persisted snapshot the UI hydrates from at boot.
@@ -172,6 +206,10 @@ pub struct PersistedState {
     /// repos are remote at boot.
     #[serde(default)]
     pub machines: Vec<MachineRecord>,
+    /// Claude accounts the user signed into, so the composer's account control and the
+    /// Accounts panel are populated at boot without a round-trip.
+    #[serde(default)]
+    pub claude_accounts: Vec<ClaudeAccountRecord>,
     pub repos: Vec<RepoRecord>,
     pub conversations: Vec<ConversationRecord>,
     /// Stable id of the conversation that was active when last persisted.

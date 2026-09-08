@@ -8,16 +8,21 @@
 // tab (a third connection, with its own flow but the same visual language).
 import { useEffect, useState } from "react";
 import { events } from "../../ipc/client";
+import type { UsageError } from "../../ipc/client";
 import {
   useClaudeAccount,
   useClaudeAccountActions,
+  useClaudeAccountAdmin,
+  useClaudeAccounts,
   useCodexAccount,
   useCodexAccountActions,
 } from "../../ipc/useAccounts";
 import { useBackendAvailabilityState } from "../../store/binaryAvailable";
 import { useAccountLoginStore } from "../../store/accountLogin";
-import { ClaudeMark, CodexMark } from "../../ui/kit";
-import { PageHead } from "./SettingsKit";
+import { DEFAULT_ACCOUNT_ID, useClaudeAccountPrefs } from "../../store/claudeAccounts";
+import { usePlanUsage } from "../../store/planUsage";
+import { ClaudeMark, CodexMark, PlanUsageBars } from "../../ui/kit";
+import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import {
   ConnectionCard,
   LogoutControl,
@@ -56,9 +61,164 @@ export function AccountsSection() {
   );
 }
 
+/** The Claude side of the panel: the default account, every extra account the user added,
+ *  a way to add one more, and the auto-switch policy. Each card carries that account's OWN
+ *  rate limits — the same 5h / 7d bars the context ring shows, rendered by the same
+ *  component, so "the limits of all my accounts in one place" is literally one glance. */
 function ClaudeAccountGroup() {
-  const status = useClaudeAccount(true);
-  const { loginStart, loginCode, loginCancel, logout } = useClaudeAccountActions();
+  const accounts = useClaudeAccounts(true);
+  const admin = useClaudeAccountAdmin();
+  const prefs = useClaudeAccountPrefs();
+  const rows = accounts.data ?? [];
+  const addErr = (admin.create.error as Error | null)?.message ?? null;
+  // A removal can succeed while still reporting a problem (the CLI logout failed but the
+  // row is gone). That warning is shown rather than dropped: the credential store may
+  // still hold a session the user believes they revoked.
+  const [removeWarning, setRemoveWarning] = useState<string | null>(null);
+
+  return (
+    <>
+      <ClaudeAccountCard accountId={null} label="Claude" />
+      {rows.map((a) => (
+        <ClaudeAccountCard
+          key={a.id}
+          accountId={a.id}
+          label={a.label}
+          email={a.email}
+          orgName={a.org_name}
+          subscriptionType={a.subscription_type}
+          onRename={(label) => admin.rename.mutate({ accountId: a.id, label })}
+          onRemove={() =>
+            admin.remove.mutate(a.id, {
+              onSuccess: (warning) => setRemoveWarning(warning ?? null),
+              onError: (e: unknown) =>
+                setRemoveWarning(e instanceof Error ? e.message : String(e)),
+            })
+          }
+          removing={admin.remove.isPending}
+        />
+      ))}
+      <SettingsGroup title="Claude accounts" icon="users">
+        <ToggleRow
+          title="Add another Claude account"
+          hint="Each account keeps its own credentials. Conversations, settings, plugins, skills and MCP servers stay shared — only the sign-in differs."
+          action={
+            <button
+              className={`${s.btn} ${s.connect}`}
+              disabled={admin.create.isPending}
+              onClick={() => admin.create.mutate("")}
+            >
+              {admin.create.isPending ? "Adding…" : "Add account"}
+            </button>
+          }
+        />
+        {addErr ? <div className={s.err}>{addErr}</div> : null}
+        {removeWarning ? (
+          <div className={s.err}>
+            The account was removed, but the sign-out did not complete cleanly: {removeWarning}
+          </div>
+        ) : null}
+        <ToggleRow
+          title="Default account for new conversations"
+          hint="Existing conversations keep the account they already run on."
+          control={
+            <select
+              className={s.codeInput}
+              value={prefs.defaultAccountId ?? DEFAULT_ACCOUNT_ID}
+              onChange={(e) =>
+                prefs.set({
+                  defaultAccountId:
+                    e.target.value === DEFAULT_ACCOUNT_ID ? null : e.target.value,
+                })
+              }
+            >
+              <option value={DEFAULT_ACCOUNT_ID}>Claude (default)</option>
+              {rows.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+          }
+        />
+        <AutoSwitchRows accountCount={rows.length + 1} />
+      </SettingsGroup>
+    </>
+  );
+}
+
+/** The auto-switch policy rows. The toggle is DISABLED — with the reason shown in the
+ *  hint, not in a `title` a disabled control never renders — while fewer than two accounts
+ *  exist: offering a switch with nowhere to switch to would be a setting the app cannot
+ *  honour. */
+function AutoSwitchRows({ accountCount }: { accountCount: number }) {
+  const prefs = useClaudeAccountPrefs();
+  const enoughAccounts = accountCount >= 2;
+  return (
+    <>
+      <ToggleRow
+        title="Auto-switch account near usage limit"
+        hint={
+          enoughAccounts
+            ? `When the account a conversation runs on passes ${prefs.switchAtPercent}% of its 5h or 7d window, move it to an account below ${prefs.targetBelowPercent}%. Only ever between turns, never mid-turn or while background tasks are running.`
+            : "Add a second Claude account to enable this — there is nowhere to switch to with only one."
+        }
+        checked={prefs.autoSwitch && enoughAccounts}
+        disabled={!enoughAccounts}
+        onChange={(next) => prefs.set({ autoSwitch: next })}
+      />
+      {prefs.autoSwitch && enoughAccounts ? (
+        <ToggleRow
+          title="Switch threshold"
+          hint={`Arms at ${prefs.switchAtPercent}% used; only switches to an account below ${prefs.targetBelowPercent}%. The gap between the two is what stops it bouncing back and forth.`}
+          control={
+            <input
+              className={s.codeInput}
+              type="number"
+              min={50}
+              max={99}
+              value={prefs.switchAtPercent}
+              onChange={(e) => {
+                const at = Number(e.target.value);
+                if (!Number.isFinite(at)) return;
+                // Keep the hysteresis gap as the user drags the trigger down: the ceiling
+                // follows rather than becoming invalid (and silently clamped later).
+                prefs.set({
+                  switchAtPercent: at,
+                  targetBelowPercent: Math.min(prefs.targetBelowPercent, at - 5),
+                });
+              }}
+            />
+          }
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** One account's card: sign-in flow, identity, and that account's own rate limits. */
+function ClaudeAccountCard({
+  accountId,
+  label,
+  email,
+  orgName,
+  subscriptionType,
+  onRename,
+  onRemove,
+  removing,
+}: {
+  /** `null` = the default, un-scoped account (the one that always exists). */
+  accountId: string | null;
+  label: string;
+  email?: string | null;
+  orgName?: string | null;
+  subscriptionType?: string | null;
+  onRename?: (label: string) => void;
+  onRemove?: () => void;
+  removing?: boolean;
+}) {
+  const status = useClaudeAccount(true, accountId);
+  const { loginStart, loginCode, loginCancel, logout } = useClaudeAccountActions(accountId);
   // The two-step login: null = idle; "code" = URL opened, waiting for the pasted code.
   const [step, setStep] = useState<"idle" | "code">("idle");
   const [code, setCode] = useState("");
@@ -101,35 +261,55 @@ function ClaudeAccountGroup() {
         ? "connected"
         : "disconnected";
 
-  const actions = logged ? (
-    <LogoutControl
-      pending={logout.isPending}
-      onConfirm={() => logout.mutate()}
-    />
-  ) : step === "idle" ? (
+  const actions = (
     <>
-      <span className={s.spacer} />
-      <button className={`${s.btn} ${s.connect}`} disabled={loginStart.isPending} onClick={startLogin}>
-        <ClaudeMark /> {loginStart.isPending ? "Opening…" : "Sign in"}
-      </button>
+      {logged ? (
+        <LogoutControl pending={logout.isPending} onConfirm={() => logout.mutate()} />
+      ) : step === "idle" ? (
+        <>
+          <span className={s.spacer} />
+          <button
+            className={`${s.btn} ${s.connect}`}
+            disabled={loginStart.isPending}
+            onClick={startLogin}
+          >
+            <ClaudeMark /> {loginStart.isPending ? "Opening…" : "Sign in"}
+          </button>
+        </>
+      ) : (
+        <span className={s.provider}>Signing in…</span>
+      )}
+      {/* Removing is only offered for an account the app added: the default one is the
+          CLI's own store and is not ours to delete. */}
+      {onRemove ? (
+        <button className={`${s.btn} ${s.danger}`} disabled={removing} onClick={onRemove}>
+          {removing ? "Removing…" : "Remove"}
+        </button>
+      ) : null}
     </>
-  ) : (
-    <span className={s.provider}>Signing in…</span>
   );
+
+  // The identity shown on an EXTRA account is the one captured at its own sign-in, not
+  // whatever `claude auth status` reports: that reads a profile cache all accounts share,
+  // so it names whichever signed in last. The default card has no such record and falls
+  // back to the live status, which is correct for it whenever it is the only account.
+  const shownEmail = accountId ? (email ?? null) : (status.data?.email ?? null);
+  const shownOrg = accountId ? (orgName ?? null) : (status.data?.orgName ?? null);
+  const shownPlan = accountId
+    ? (subscriptionType ?? status.data?.subscriptionType ?? null)
+    : (status.data?.subscriptionType ?? null);
 
   return (
     <ConnectionCard
       accent={BRAND.claude}
       mark={<ClaudeMark />}
-      name="Claude"
+      name={label}
       provider="Anthropic · claude.ai"
       state={state}
-      identity={status.data?.email}
+      identity={shownEmail}
       pills={[
-        status.data?.subscriptionType
-          ? { label: `Plan ${status.data.subscriptionType}`, plan: true }
-          : null,
-        status.data?.orgName ? { label: status.data.orgName } : null,
+        shownPlan ? { label: `Plan ${shownPlan}`, plan: true } : null,
+        shownOrg ? { label: shownOrg } : null,
       ].filter(Boolean) as { label: string; plan?: boolean }[]}
       invite={
         status.isError
@@ -138,6 +318,20 @@ function ClaudeAccountGroup() {
       }
       actions={actions}
     >
+      {logged ? <AccountUsage accountId={accountId} /> : null}
+      {onRename ? (
+        <div className={s.subRow}>
+          <span className={s.subLabel}>Name</span>
+          <input
+            className={s.codeInput}
+            defaultValue={label}
+            onBlur={(e) => {
+              const next = e.target.value.trim();
+              if (next && next !== label) onRename(next);
+            }}
+          />
+        </div>
+      ) : null}
       {step === "code" ? (
         <div className={s.subRow}>
           <span className={s.subLabel}>
@@ -171,6 +365,56 @@ function ClaudeAccountGroup() {
       {err ? <div className={s.err}>{err}</div> : null}
     </ConnectionCard>
   );
+}
+
+/** One account's rate limits, inside its card — the SAME bars as the context ring's
+ *  popover, from the same component, so the two can never drift apart.
+ *
+ *  The figures are per SUBSCRIPTION, so each account is a separate query keyed by its id.
+ *  A failure is stated, never left as an empty space that reads like "no limits": an
+ *  account whose usage cannot be read is also one the auto-switch will refuse to pick, and
+ *  the user needs to know which of the two they are looking at. */
+function AccountUsage({ accountId }: { accountId: string | null }) {
+  const usage = usePlanUsage({ accountId });
+  const err = usage.error;
+  const empty =
+    !!usage.data && !usage.data.five_hour && !usage.data.seven_day && !usage.data.scoped?.length;
+  return (
+    <div className={s.subRow} style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}>
+      <span className={s.subLabel}>Usage</span>
+      {usage.isPending ? (
+        <span className={s.provider}>Reading usage…</span>
+      ) : err ? (
+        <div className={s.err}>{usageErrorText(err)}</div>
+      ) : empty ? (
+        <span className={s.provider}>No usage window reported for this account.</span>
+      ) : (
+        <PlanUsageBars usage={usage.data} />
+      )}
+    </div>
+  );
+}
+
+/** A usage failure as one actionable sentence. Mirrors the ring popover's guidance, kept
+ *  short here because the card has no room for a full card — but never reduced to
+ *  "unavailable", which would leave the user with nothing to do about it. */
+function usageErrorText(e: UsageError): string {
+  switch (e.kind) {
+    case "no_token":
+      return "No credentials for this account yet — sign in above.";
+    case "keychain_denied":
+      return `macOS refused access to this account's Keychain item (${e.detail}). Retry and choose “Always Allow”.`;
+    case "unauthorized":
+      return `The stored credentials were rejected (HTTP ${e.status}) — sign this account in again.`;
+    case "rate_limited":
+      return `The usage endpoint is rate-limiting us${e.retry_after ? ` — retry in ${e.retry_after}s` : ""}.`;
+    case "http":
+      return `The usage endpoint answered HTTP ${e.status}.`;
+    case "network":
+      return `Could not reach the usage endpoint: ${e.detail}`;
+    case "parse":
+      return "The usage endpoint answered in an unexpected shape.";
+  }
 }
 
 function CodexAccountGroup() {

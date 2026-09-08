@@ -35,6 +35,7 @@ const conv = (over: Partial<Conversation> = {}): Conversation => ({
   tosseTaskId: null,
   tosseTaskTitle: null,
   tosseTaskStatus: null,
+  claudeAccountId: null,
   cleanOutput: null,
   kind: "claude",
   ...over,

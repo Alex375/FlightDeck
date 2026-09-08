@@ -21,14 +21,15 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    ConversationRecord, MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
+    ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
+    RepoTosseLink, TosseProjectRepo,
 };
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -60,6 +61,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v8,
     migrate_v9,
     migrate_v10,
+    migrate_v11,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -325,6 +327,38 @@ fn migrate_v10(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v11 — multiple Claude accounts. `claude_accounts` lists the accounts the user signed
+/// into from the app, and `conversations.claude_account_id` records which one a
+/// conversation runs on.
+///
+/// Deliberately NOT a foreign key (same discipline as the TOSSE ids in v6/v7): the row is
+/// a label for a credential store the CLI owns, so an account removed out from under us
+/// must DEGRADE the conversation (it falls back to the default account, visibly) rather
+/// than cascade-delete it or wedge the insert. No secret is ever stored here — only the
+/// non-sensitive identity metadata captured at login, which is what lets the Accounts
+/// panel label a slot without trusting the CLI's shared profile cache (see
+/// `accounts::status`). NULL `claude_account_id` = the default, un-scoped account, which
+/// is every pre-existing row: a single-account user sees no change at all.
+fn migrate_v11(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS claude_accounts (
+             id                TEXT PRIMARY KEY,
+             label             TEXT NOT NULL,
+             email             TEXT,
+             org_name          TEXT,
+             subscription_type TEXT,
+             sort_index        INTEGER NOT NULL DEFAULT 0,
+             added_at          INTEGER NOT NULL
+         );",
+    )?;
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "claude_account_id",
+        "ALTER TABLE conversations ADD COLUMN claude_account_id TEXT",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -457,7 +491,7 @@ impl Store {
             "SELECT id, name, repo_id, cwd, created_at, last_activity_at, session_id,
                     model, effort, ultracode, permission_mode, pending_reminder, clean_output,
                     COALESCE(backend, 'claude'),
-                    tosse_task_id, tosse_task_title, tosse_task_status
+                    tosse_task_id, tosse_task_title, tosse_task_status, claude_account_id
              FROM conversations ORDER BY created_at ASC",
         )?;
         let conversations = conv_stmt
@@ -481,6 +515,26 @@ impl Store {
                     tosse_task_id: row.get(14)?,
                     tosse_task_title: row.get(15)?,
                     tosse_task_status: row.get(16)?,
+                    // NULL (pre-v11 rows + every single-account setup) → the default account.
+                    claude_account_id: row.get(17)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut acc_stmt = conn.prepare(
+            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at
+             FROM claude_accounts ORDER BY sort_index ASC, added_at ASC",
+        )?;
+        let claude_accounts = acc_stmt
+            .query_map([], |row| {
+                Ok(ClaudeAccountRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    email: row.get(2)?,
+                    org_name: row.get(3)?,
+                    subscription_type: row.get(4)?,
+                    sort_index: row.get(5)?,
+                    added_at: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -495,6 +549,7 @@ impl Store {
 
         Ok(PersistedState {
             machines,
+            claude_accounts,
             repos,
             conversations,
             active_id,
@@ -697,8 +752,8 @@ impl Store {
             "INSERT INTO conversations
                  (id, name, repo_id, cwd, created_at, last_activity_at, session_id,
                   model, effort, ultracode, permission_mode, pending_reminder, clean_output, backend,
-                  tosse_task_id, tosse_task_title, tosse_task_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                  tosse_task_id, tosse_task_title, tosse_task_status, claude_account_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                  name              = excluded.name,
                  repo_id           = excluded.repo_id,
@@ -715,7 +770,8 @@ impl Store {
                  backend           = excluded.backend,
                  tosse_task_id     = excluded.tosse_task_id,
                  tosse_task_title  = excluded.tosse_task_title,
-                 tosse_task_status = excluded.tosse_task_status",
+                 tosse_task_status = excluded.tosse_task_status,
+                 claude_account_id = excluded.claude_account_id",
             params![
                 c.id,
                 c.name,
@@ -733,8 +789,90 @@ impl Store {
                 c.backend,
                 c.tosse_task_id,
                 c.tosse_task_title,
-                c.tosse_task_status
+                c.tosse_task_status,
+                c.claude_account_id
             ],
+        )?;
+        Ok(())
+    }
+
+    /// List the Claude accounts, in display order. The default (un-scoped) account is NOT
+    /// a row here — it always exists and needs no record; only accounts the user explicitly
+    /// added get one.
+    pub fn list_claude_accounts(&self) -> rusqlite::Result<Vec<ClaudeAccountRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at
+             FROM claude_accounts ORDER BY sort_index ASC, added_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ClaudeAccountRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    email: row.get(2)?,
+                    org_name: row.get(3)?,
+                    subscription_type: row.get(4)?,
+                    sort_index: row.get(5)?,
+                    added_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or update a Claude account (idempotent by id). Carries no secret — see
+    /// [`ClaudeAccountRecord`].
+    pub fn upsert_claude_account(&self, a: &ClaudeAccountRecord) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO claude_accounts
+                 (id, label, email, org_name, subscription_type, sort_index, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 label             = excluded.label,
+                 email             = excluded.email,
+                 org_name          = excluded.org_name,
+                 subscription_type = excluded.subscription_type,
+                 sort_index        = excluded.sort_index",
+            params![
+                a.id,
+                a.label,
+                a.email,
+                a.org_name,
+                a.subscription_type,
+                a.sort_index,
+                a.added_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a Claude account row and DETACH the conversations that referenced it, so
+    /// they fall back to the default account instead of pointing at a store that no longer
+    /// exists. Done in one transaction: a half-applied removal would leave conversations
+    /// naming a vanished account, which the spawner could not honour and the UI could not
+    /// explain. The credential store itself is cleared by `claude auth logout` before this
+    /// is called — the CLI stays its sole owner.
+    pub fn delete_claude_account(&self, id: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE conversations SET claude_account_id = NULL WHERE claude_account_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM claude_accounts WHERE id = ?1", params![id])?;
+        tx.commit()
+    }
+
+    /// Point one conversation at a Claude account (`None` = the default account).
+    pub fn set_conversation_claude_account(
+        &self,
+        conv_id: &str,
+        account_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE conversations SET claude_account_id = ?2 WHERE id = ?1",
+            params![conv_id, account_id],
         )?;
         Ok(())
     }
@@ -959,6 +1097,9 @@ mod tests {
             tosse_task_id: None,
             tosse_task_title: None,
             tosse_task_status: None,
+            // Default helper conversations run on the default Claude account — the state
+            // every pre-v11 row decodes to, and the whole of a single-account setup.
+            claude_account_id: None,
         }
     }
 
@@ -1096,6 +1237,103 @@ mod tests {
         c.clean_output = None;
         store.upsert_conversation(&c).unwrap();
         assert_eq!(store.load_state().unwrap().conversations[0].clean_output, None);
+    }
+
+    fn account(id: &str, sort_index: i64) -> ClaudeAccountRecord {
+        ClaudeAccountRecord {
+            id: id.into(),
+            label: format!("Account {id}"),
+            email: Some(format!("{id}@example.com")),
+            org_name: None,
+            subscription_type: Some("max".into()),
+            sort_index,
+            added_at: 7,
+        }
+    }
+
+    /// Accounts round-trip in display order, and a conversation's link to one survives an
+    /// ordinary re-upsert of that conversation (the trap the TOSSE link had to be shaped
+    /// around: a wholesale rewrite blanking a field the caller knows nothing about).
+    #[test]
+    fn claude_accounts_round_trip_and_survive_a_conversation_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        // A single-account setup has NO rows and no linked conversation: the default
+        // account needs no record, so nothing changes for a user who never adds one.
+        assert!(store.list_claude_accounts().unwrap().is_empty());
+
+        store.upsert_claude_account(&account("b", 2)).unwrap();
+        store.upsert_claude_account(&account("a", 1)).unwrap();
+        let listed = store.list_claude_accounts().unwrap();
+        assert_eq!(
+            listed.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"],
+            "accounts come back in display order, not insertion order"
+        );
+        assert_eq!(listed[0].email.as_deref(), Some("a@example.com"));
+
+        store.upsert_repo(&repo("r1")).unwrap();
+        let mut c = conv("c1", "r1", None);
+        c.claude_account_id = Some("b".into());
+        store.upsert_conversation(&c).unwrap();
+        let loaded = || store.load_state().unwrap().conversations.remove(0);
+        assert_eq!(loaded().claude_account_id.as_deref(), Some("b"));
+
+        // A rename must not disturb the link (or the other way round).
+        store.upsert_claude_account(&account("b", 5)).unwrap();
+        assert_eq!(loaded().claude_account_id.as_deref(), Some("b"));
+    }
+
+    /// Removing an account DETACHES the conversations that referenced it rather than
+    /// leaving them pointing at a credential store that no longer exists — which the
+    /// spawner would refuse, stranding the conversation with no way back.
+    #[test]
+    fn removing_an_account_detaches_its_conversations() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        store.upsert_claude_account(&account("b", 1)).unwrap();
+
+        let mut linked = conv("c1", "r1", None);
+        linked.claude_account_id = Some("b".into());
+        store.upsert_conversation(&linked).unwrap();
+        let mut other = conv("c2", "r1", None);
+        other.claude_account_id = Some("kept".into());
+        store.upsert_conversation(&other).unwrap();
+
+        store.delete_claude_account("b").unwrap();
+
+        assert!(store.list_claude_accounts().unwrap().is_empty());
+        let convs = store.load_state().unwrap().conversations;
+        let by_id = |id: &str| {
+            convs
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .claude_account_id
+                .clone()
+        };
+        assert_eq!(by_id("c1"), None, "the conversation falls back to the default account");
+        assert_eq!(
+            by_id("c2").as_deref(),
+            Some("kept"),
+            "a conversation on ANOTHER account must not be detached too"
+        );
+    }
+
+    /// Pointing a conversation at an account (and back to the default) is its own call, so
+    /// no other write path can change it by accident.
+    #[test]
+    fn set_conversation_claude_account_sets_and_clears() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+        let loaded = || store.load_state().unwrap().conversations.remove(0);
+        assert_eq!(loaded().claude_account_id, None);
+
+        store.set_conversation_claude_account("c1", Some("b")).unwrap();
+        assert_eq!(loaded().claude_account_id.as_deref(), Some("b"));
+
+        store.set_conversation_claude_account("c1", None).unwrap();
+        assert_eq!(loaded().claude_account_id, None);
     }
 
     #[test]

@@ -40,11 +40,12 @@ describe("slot capacity", () => {
 
 describe("worst case", () => {
   it("takes the max of the two backends, never their sum", () => {
-    // Claude: model, effort, permission + 7 right-hand chips (outputStyle, artifacts,
-    //   extensions, cleanOutput, remoteControl, goal, worktree), worktree counting double = 11.
+    // Claude: model, effort, permission + 8 right-hand chips (account, outputStyle,
+    //   artifacts, extensions, cleanOutput, remoteControl, goal, worktree), worktree
+    //   counting double = 12.
     // Codex:  model, effort, safety, speed, options + 4 right-hand chips = 10.
     // Summing them would eat the whole budget on a bar that can never show both.
-    expect(nativeWorstCase(none)).toBe(11);
+    expect(nativeWorstCase(none)).toBe(12);
   });
 
   it("charges the worktree control two slots, as measured", () => {
@@ -54,27 +55,27 @@ describe("worst case", () => {
   });
 
   it("counts a hidden right-hand chip as freed on both backends", () => {
-    // cleanOutput (1) + worktree (2) hidden: Claude 11→8, Codex 10→7, so the max is 8.
-    expect(nativeWorstCase(new Set(["cleanOutput", "worktree"]))).toBe(8);
+    // cleanOutput (1) + worktree (2) hidden: Claude 12→9, Codex 10→7, so the max is 9.
+    expect(nativeWorstCase(new Set(["cleanOutput", "worktree"]))).toBe(9);
   });
 
   it("frees only one slot for a chip that exists on a single backend", () => {
-    // `goal` is Claude-only: hiding it drops Claude to 10, but Codex still sits at 10,
-    // so the worst case — and therefore the budget — is unchanged.
-    expect(nativeWorstCase(new Set(["goal"]))).toBe(10);
+    // `goal` is Claude-only: hiding it drops Claude to 11, and Codex still sits at 10,
+    // so the worst case falls by exactly one rather than by one on each backend.
+    expect(nativeWorstCase(new Set(["goal"]))).toBe(11);
   });
 
   it("ignores attempts to hide a left-hand chip", () => {
     // The left side is never hideable; a stale id in storage must not buy free slots.
-    expect(nativeWorstCase(new Set(["model", "effort"]))).toBe(11);
+    expect(nativeWorstCase(new Set(["model", "effort"]))).toBe(12);
   });
 });
 
 describe("slot accounting", () => {
   it("adds custom buttons to the native worst case", () => {
-    // 11 native worst case + 3 buttons = 14; the 13-slot budget is already spent, so
+    // 12 native worst case + 3 buttons = 15; the 13-slot budget is already spent, so
     // remaining floors at 0 rather than going negative.
-    expect(usedSlots(none, 3)).toBe(14);
+    expect(usedSlots(none, 3)).toBe(15);
     expect(remainingSlots(none, 3)).toBe(0);
   });
 
@@ -83,9 +84,9 @@ describe("slot accounting", () => {
   });
 
   it("hiding chips buys room for custom buttons", () => {
-    // Hiding cleanOutput (1) + worktree (2) drops the worst case to 8, freeing 13−8 = 5.
+    // Hiding cleanOutput (1) + worktree (2) drops the worst case to 9, freeing 13−9 = 4.
     const hidden = new Set(["cleanOutput", "worktree"]);
-    expect(remainingSlots(hidden, 0)).toBe(5);
+    expect(remainingSlots(hidden, 0)).toBe(4);
   });
 });
 
@@ -156,13 +157,13 @@ describe("reordering within the visible subset", () => {
 describe("restoring a hidden control", () => {
   it("refuses when the freed slots have already been spent", () => {
     // The hole the budget had: hide chips, fill the freed slots with buttons, then
-    // un-hide — the cap was only ever checked when ADDING. Hiding these two leaves 9
-    // native slots, so 4 buttons saturate the 13.
+    // un-hide — the cap was only ever checked when ADDING. Hiding these two leaves 10
+    // native slots, so 3 buttons saturate the 13.
     const hidden = new Set(["cleanOutput", "extensions"]);
-    expect(remainingSlots(hidden, 4)).toBe(0);
-    expect(canUnhide("cleanOutput", hidden, 4)).toBe(false);
+    expect(remainingSlots(hidden, 3)).toBe(0);
+    expect(canUnhide("cleanOutput", hidden, 3)).toBe(false);
     // One button fewer and it fits again.
-    expect(canUnhide("cleanOutput", hidden, 3)).toBe(true);
+    expect(canUnhide("cleanOutput", hidden, 2)).toBe(true);
   });
 
   it("allows it while there is room", () => {
@@ -194,7 +195,7 @@ describe("descriptors", () => {
 
   it("documents the condition of every conditional control", () => {
     // Without the note, hiding something you never see reads as a broken setting.
-    for (const id of ["artifacts", "goal", "worktree", "effort", "codexSpeed"]) {
+    for (const id of ["account", "artifacts", "goal", "worktree", "effort", "codexSpeed"]) {
       expect(chipById(id)?.condition, id).toBeTruthy();
     }
   });
@@ -202,7 +203,7 @@ describe("descriptors", () => {
   it("splits backend-specific controls the way the budget assumes", () => {
     const claudeOnly = ALL_CHIPS.filter((c) => c.backend === "claude").map((c) => c.id);
     const codexOnly = ALL_CHIPS.filter((c) => c.backend === "codex").map((c) => c.id);
-    expect(claudeOnly).toEqual(["permission", "outputStyle", "artifacts", "goal"]);
+    expect(claudeOnly).toEqual(["permission", "account", "outputStyle", "artifacts", "goal"]);
     expect(codexOnly).toEqual(["codexSafety", "codexSpeed", "codexOptions"]);
     for (const c of LEFT_CHIPS) expect(appliesToBackend(c, "claude") || appliesToBackend(c, "codex")).toBe(true);
     for (const c of RIGHT_CHIPS) expect(c.side).toBe("right");

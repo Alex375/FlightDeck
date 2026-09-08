@@ -82,6 +82,13 @@ base64 = "0.22"
 # Already in the tree transitively; enabling `v4` (getrandom) is near-free.
 uuid = { version = "1", features = ["v4"] }
 
+# NFC normalisation for the Claude credential-store path. The CLI derives its Keychain
+# service name from `sha256(CLAUDE_SECURESTORAGE_CONFIG_DIR.normalize("NFC"))` — mirroring
+# that byte-for-byte is what lets us read a NON-ACTIVE account's usage. A home directory
+# whose name carries an accent can reach us in NFD (macOS filesystem APIs), which would
+# hash differently and silently break the lookup for that user only.
+unicode-normalization = "0.1"
+
 # Parse Codex's `~/.codex/config.toml` (declared MCP servers / plugins / marketplaces)
 # for the Extensions view. Read-only; secret-bearing tables (`[mcp_servers.*.env]`,
 # headers) are NEVER surfaced (whitelist parse), mirroring the Claude-side redaction.

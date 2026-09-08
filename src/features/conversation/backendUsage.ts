@@ -52,8 +52,14 @@ export function useBackendUsage(
   const isCodex = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === convId)?.kind === "codex",
   );
+  // WHICH account's figures this conversation's ring shows. With several accounts signed
+  // in, the un-scoped query would report the default account's quota next to a
+  // conversation running on another one — a plausible-looking wrong number.
+  const accountId = useConversationsStore(
+    (s) => s.conversations.find((c) => c.id === convId)?.claudeAccountId ?? null,
+  );
   const codexAvailable = useCodexAvailable();
-  const planUsage = usePlanUsage({ enabled: opts.enabled && !isCodex });
+  const planUsage = usePlanUsage({ enabled: opts.enabled && !isCodex, accountId });
   const codexPlan = useCodexPlanUsage();
   const send = useSendMessage(convId);
   const codexCompact = useCodexCompact(convId);

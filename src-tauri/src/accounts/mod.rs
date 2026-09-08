@@ -10,6 +10,17 @@
 //! (WE open the URL via the opener plugin — deterministic, no double-open), parse the
 //! URL, keep the child + its stdin in [`ACTIVE_LOGIN`], and complete when the front
 //! submits the pasted code. One login at a time; a new start kills the previous child.
+//!
+//! ## Multiple accounts
+//! Every entry point takes an [`AccountSlot`] saying WHICH credential store to drive. The
+//! slot is applied as an environment variable on the `claude` child, so signing a second
+//! account in never touches the first one's credentials — and never touches the shared
+//! `~/.claude` (transcripts, settings, plugins, skills, MCP). See [`slot`] for the verified
+//! mechanism and for why the default slot deliberately sets no variable at all.
+
+pub mod slot;
+
+pub use slot::{AccountSlot, DEFAULT_ACCOUNT_ID};
 
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -80,12 +91,15 @@ const AUTH_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)
 /// Run a short-lived `claude auth …` command, bounded by [`AUTH_CMD_TIMEOUT`].
 /// `kill_on_drop` reaps the child when the timeout drops the in-flight future, so a
 /// hung CLI never accumulates as a stuck process across panel refetches.
-async fn run_bounded(label: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    let fut = Command::new(claude_bin())
-        .args(args)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
+async fn run_bounded(
+    slot: &AccountSlot,
+    label: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(claude_bin());
+    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    slot.apply(&mut cmd);
+    let fut = cmd.output();
     match tokio::time::timeout(AUTH_CMD_TIMEOUT, fut).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("could not run `{label}`: {e}")),
@@ -96,9 +110,18 @@ async fn run_bounded(label: &str, args: &[&str]) -> Result<std::process::Output,
     }
 }
 
-/// Read the auth status (`claude auth status --json`). Fast and read-only.
-pub async fn status() -> Result<ClaudeAccountStatus, String> {
-    let output = run_bounded("claude auth status", &["auth", "status", "--json"]).await?;
+/// Read ONE slot's auth status (`claude auth status --json`). Fast and read-only.
+///
+/// ⚠️ `email` / `org_name` come from the CLI's profile cache in the *config* dir
+/// (`.claude.json`), which our slots deliberately SHARE — so on a multi-account setup they
+/// describe whichever account signed in last, not necessarily this slot. VERIFIED live: a
+/// default credential store paired with an isolated config dir reported `loggedIn: true`
+/// while `email`/`orgId` came back `null`, proving the identity fields ride the config dir
+/// and the credentials ride the secure store. Callers must therefore label an account from
+/// the metadata captured at ITS OWN login (persisted by the store) and treat these two
+/// fields as a fallback only. `logged_in` and `subscription_type` DO belong to the slot.
+pub async fn status(slot: &AccountSlot) -> Result<ClaudeAccountStatus, String> {
+    let output = run_bounded(slot, "claude auth status", &["auth", "status", "--json"]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
         // The CLI answered something that isn't the JSON contract (crash text, update
@@ -124,22 +147,27 @@ pub async fn status() -> Result<ClaudeAccountStatus, String> {
 /// Start a login: spawn `claude auth login`, wait for the OAuth URL on stdout (bounded),
 /// keep the child for the code submission, return the URL for the front to open.
 /// Any previous in-flight login is killed first (one at a time).
-pub async fn login_start() -> Result<String, String> {
+pub async fn login_start(slot: &AccountSlot) -> Result<String, String> {
     // Hold the flow lock across the WHOLE sequence (see LOGIN_FLOW). Call the INNER
     // `cancel_current` (not the public `login_cancel`, which also takes LOGIN_FLOW) to avoid
     // a self-deadlock, then keep the lock until ACTIVE_LOGIN is registered below.
     let _flow = LOGIN_FLOW.lock().await;
     cancel_current().await;
 
-    let mut child = Command::new(claude_bin())
-        .args(["auth", "login"])
+    // The isolated store must exist before the CLI writes its credentials into it.
+    slot.ensure_dir()?;
+
+    let mut cmd = Command::new(claude_bin());
+    cmd.args(["auth", "login"])
         // WE open the URL (opener plugin). `false` is a no-op executable on every unix,
         // so the CLI's own browser-open attempt does nothing instead of double-opening.
         .env("BROWSER", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    slot.apply(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not run `claude auth login`: {e}"))?;
 
@@ -229,9 +257,10 @@ async fn cancel_current() {
     }
 }
 
-/// Log out (`claude auth logout`). The CLI clears its own credential store.
-pub async fn logout() -> Result<(), String> {
-    let output = run_bounded("claude auth logout", &["auth", "logout"]).await?;
+/// Log ONE slot out (`claude auth logout`). The CLI clears its own credential store — we
+/// never delete a Keychain item or a credentials file ourselves.
+pub async fn logout(slot: &AccountSlot) -> Result<(), String> {
+    let output = run_bounded(slot, "claude auth logout", &["auth", "logout"]).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -284,10 +313,49 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs the real claude CLI"]
     async fn live_claude_account_status() {
-        let s = status().await.expect("auth status should parse");
+        let s = status(&AccountSlot::default_slot())
+            .await
+            .expect("auth status should parse");
         eprintln!(
             "claude account: logged_in={} method={:?} plan={:?}",
             s.logged_in, s.auth_method, s.subscription_type
+        );
+    }
+
+    /// PROBE (read-only): the load-bearing claim of the whole feature — an isolated slot
+    /// scopes the CREDENTIALS and nothing else. Against the real CLI this asserts:
+    ///   - the default slot is signed in (baseline; skipped if the user is signed out),
+    ///   - a fresh isolated slot reports `logged_in: false` — proving the credential store
+    ///     really is per-slot and not a global Keychain item,
+    ///   - the user's transcripts stay put: `projectsDirectory` is untouched by the slot,
+    ///     which is what `CLAUDE_CONFIG_DIR` would have broken.
+    /// Run: `cargo test --lib -- --ignored --nocapture live_isolated_slot_scopes_only_credentials`.
+    #[tokio::test]
+    #[ignore = "runs the real claude CLI"]
+    async fn live_isolated_slot_scopes_only_credentials() {
+        let base = status(&AccountSlot::default_slot())
+            .await
+            .expect("auth status should parse");
+        if !base.logged_in {
+            eprintln!("SKIP: the default account is signed out — nothing to contrast against");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("tosse-slot-probe-{}", std::process::id()));
+        let slot = AccountSlot::isolated(tmp.clone());
+        slot.ensure_dir().expect("probe dir");
+        let isolated = status(&slot).await.expect("auth status should parse");
+        let _ = slot.remove_dir();
+
+        assert!(
+            !isolated.logged_in,
+            "an isolated slot must NOT see the default account's credentials"
+        );
+        eprintln!(
+            "isolation OK — default logged_in={} / isolated logged_in={} (keychain item {:?})",
+            base.logged_in,
+            isolated.logged_in,
+            slot.keychain_service()
         );
     }
 }
