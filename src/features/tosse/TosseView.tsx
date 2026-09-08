@@ -1336,17 +1336,26 @@ export function TaskDetail({
             className={s.detailActs}
           />
         ) : null}
-        <span className={s.spacer} />
         {/* Said ONCE, here, rather than on every card that would have carried a link: the
             title/priority/assignee edits this view doesn't do all point at TOSSE, so an
-            unreachable CRM is worth a sentence, not silence. */}
-        {webUrlError ? (
-          <span className={s.muted} title={String(webUrlError.message)}>
-            TOSSE link unavailable
-          </span>
-        ) : (
-          <OpenInTosse path={`/tasks/${taskId}`} title="Open this task in TOSSE" />
-        )}
+            unreachable CRM is worth a sentence, not silence.
+
+            Held to the right by its OWN auto margin rather than by a `.spacer` before it:
+            the footer wraps now, and a spacer only pushes on the line it happens to land on
+            — this way out stays at the right end whichever line it ends up on. */}
+        <span className={s.detailOut}>
+          {webUrlError ? (
+            <span className={s.muted} title={String(webUrlError.message)}>
+              TOSSE link unavailable
+            </span>
+          ) : (
+            /* `compact` — the icon alone, as on a project card. Spelled out it was the
+               widest thing in this footer (117px) and the least important: the status ladder
+               and the launch buttons are what the panel is FOR, and they were the ones being
+               squeezed out of the line by the way out. */
+            <OpenInTosse compact path={`/tasks/${taskId}`} title="Open this task in TOSSE" />
+          )}
+        </span>
       </div>
     </aside>
   );
