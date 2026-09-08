@@ -313,6 +313,7 @@ function TaskActions({
   detail,
   className,
   onStatus,
+  compact,
 }: {
   task: TosseTask;
   projectId: string | null;
@@ -326,6 +327,13 @@ function TaskActions({
    *  one-click status control, and two of them would only disagree about which is the
    *  one to use. Absent → no quick-action button, exactly as before. */
   onStatus?: (status: string) => void;
+  /** Drop the word "Open", keeping its speech bubble (and the count, when there are
+   *  several). Asked for by the detail panel's footer ONLY: there these buttons stand
+   *  permanently beside a status ladder and a way out, in a panel a user can drag down to
+   *  380px, and the row was one button away from having to wrap. The task ROW keeps the
+   *  word — it only shows these on hover, against a title that gives up its width first,
+   *  so it has room to spell things out and no reason to be read as an icon puzzle. */
+  compact?: boolean;
 }) {
   const api = useTaskLaunch();
   const linked = useConversationsForTask(task.id);
@@ -345,7 +353,7 @@ function TaskActions({
           without being hovered for a tooltip. */}
       {api == null ? null : linked.length === 1 ? (
         <button
-          className={`${s.act} ${s.act_go}`}
+          className={`${s.act} ${s.act_go} ${compact ? s.actIcon : ""}`}
           title={`Open « ${linked[0].name} »`}
           onClick={(e) => {
             e.stopPropagation();
@@ -353,19 +361,22 @@ function TaskActions({
           }}
         >
           <Ico name="chat" className="sm" />
-          Open
+          {compact ? null : "Open"}
         </button>
       ) : linked.length > 1 ? (
         <Menu
           portal
           trigger={
             <button
-              className={`${s.act} ${s.act_go}`}
+              className={`${s.act} ${s.act_go} ${compact ? s.actIcon : ""}`}
               title={`${linked.length} conversations on this task`}
               onClick={(e) => e.stopPropagation()}
             >
+              {/* The COUNT survives `compact`, only the word goes: it is the whole reason
+                  this button differs from the single-conversation one, and reading it out
+                  of a tooltip would mean hovering every task to find where the agents are. */}
               <Ico name="chat" className="sm" />
-              Open {linked.length}
+              {compact ? linked.length : `Open ${linked.length}`}
             </button>
           }
         >
@@ -1334,19 +1345,29 @@ export function TaskDetail({
             projectName={data.projectName}
             detail={data}
             className={s.detailActs}
+            compact
           />
         ) : null}
-        <span className={s.spacer} />
         {/* Said ONCE, here, rather than on every card that would have carried a link: the
             title/priority/assignee edits this view doesn't do all point at TOSSE, so an
-            unreachable CRM is worth a sentence, not silence. */}
-        {webUrlError ? (
-          <span className={s.muted} title={String(webUrlError.message)}>
-            TOSSE link unavailable
-          </span>
-        ) : (
-          <OpenInTosse path={`/tasks/${taskId}`} title="Open this task in TOSSE" />
-        )}
+            unreachable CRM is worth a sentence, not silence.
+
+            Held to the right by its OWN auto margin rather than by a `.spacer` before it:
+            the footer wraps now, and a spacer only pushes on the line it happens to land on
+            — this way out stays at the right end whichever line it ends up on. */}
+        <span className={s.detailOut}>
+          {webUrlError ? (
+            <span className={s.muted} title={String(webUrlError.message)}>
+              TOSSE link unavailable
+            </span>
+          ) : (
+            /* `compact` — the icon alone, as on a project card. Spelled out it was the
+               widest thing in this footer (117px) and the least important: the status ladder
+               and the launch buttons are what the panel is FOR, and they were the ones being
+               squeezed out of the line by the way out. */
+            <OpenInTosse compact path={`/tasks/${taskId}`} title="Open this task in TOSSE" />
+          )}
+        </span>
       </div>
     </aside>
   );
