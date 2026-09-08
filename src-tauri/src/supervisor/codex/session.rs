@@ -1822,11 +1822,17 @@ fn search_result_links(results: Option<&Value>) -> Option<String> {
         .iter()
         .filter_map(|r| {
             let url = r.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+            // Both fallbacks are filtered on non-emptiness: an EMPTY `domain` would otherwise
+            // win over the `url` fallback and emit a label-less chip.
             let title = r
                 .get("title")
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty())
-                .or_else(|| r.get("domain").and_then(Value::as_str))
+                .or_else(|| {
+                    r.get("domain")
+                        .and_then(Value::as_str)
+                        .filter(|d| !d.is_empty())
+                })
                 .unwrap_or(url);
             Some(json!({ "title": title, "url": url }))
         })
@@ -1874,8 +1880,11 @@ fn function_call_output_content(output: &Value) -> Value {
     }
     let Some(items) = output.as_array().filter(|i| !i.is_empty()) else {
         // Neither a string nor a non-empty array: show the raw payload rather than nothing.
+        // An EMPTY array is "no output" just like `null` — serializing it would print the
+        // literal `[]` into the card, next to a null that reads properly.
         return match output {
             Value::Null => json!("(no output)"),
+            Value::Array(_) => json!("(no output)"),
             other => json!(other.to_string()),
         };
     };
@@ -3445,6 +3454,31 @@ mod tests {
             Some(ConversationItem::ToolResult { content, .. }) if content.as_str() == Some("pong")));
     }
 
+    /// An EMPTY `output` array is "no output", exactly like a `null` one. Serializing it
+    /// printed the literal `[]` into the card, right next to a null rendering readably.
+    #[test]
+    fn function_call_output_renders_an_empty_body_like_a_null_one() {
+        let (mut c, sink) = core();
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"functionCallOutput","id":"f3","name":"noop","output":[]}}),
+        );
+        c.on_notification(
+            "item/completed",
+            json!({"threadId":"t","turnId":"u","completedAtMs":0,"item":{
+                "type":"functionCallOutput","id":"f4","name":"noop","output":null}}),
+        );
+        let items = items(&sink);
+        for id in ["f3", "f4"] {
+            assert!(
+                matches!(tool_result(&items, id),
+                    Some(ConversationItem::ToolResult { content, .. }) if content.as_str() == Some("(no output)")),
+                "{id}: an empty body must read as \"(no output)\", never as a literal []"
+            );
+        }
+    }
+
     /// A live `webSearch` gained `results` in 0.153.x: the source chips must name the pages
     /// actually found, not just echo the query — and must degrade to the query summary when
     /// the field is absent (older binaries), never to an empty `Links:` header.
@@ -3471,6 +3505,18 @@ mod tests {
         assert_eq!(plain, "Search: rust stable");
         let empty = web_search_result_text("rust stable", &action, Some(&json!([])));
         assert_eq!(empty, "Search: rust stable");
+    }
+
+    /// A hit whose title AND domain are both EMPTY must fall back to the URL, not emit a
+    /// label-less chip: an empty `domain` used to win the `or_else` and shadow the url fallback.
+    #[test]
+    fn a_hit_with_no_title_and_no_domain_falls_back_to_its_url() {
+        let action = json!({ "type": "search", "query": "q", "queries": null });
+        let results = json!([{ "title": "", "url": "https://example.com/z", "domain": "" }]);
+        let text = web_search_result_text("q", &action, Some(&results));
+        let links = text.lines().next().unwrap().trim_start_matches("Links: ");
+        let parsed: Value = serde_json::from_str(links).expect("links is JSON");
+        assert_eq!(parsed[0]["title"], json!("https://example.com/z"));
     }
 
     /// An async-delivery `agentMessage` can carry its question in `questions` with an EMPTY

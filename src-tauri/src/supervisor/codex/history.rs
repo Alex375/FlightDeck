@@ -848,10 +848,15 @@ fn strip_file_uri(cwd: &str) -> String {
     cwd.strip_prefix("file://").unwrap_or(cwd).to_string()
 }
 
-/// A Codex status string that means the step FAILED. Mirrors the live actor's helper of the
-/// same name so a cold-loaded card is marked in error exactly like its live twin.
+/// A Codex status string that means the step FAILED or was DECLINED. Mirrors the live actor's
+/// helper of the same name so a cold-loaded card is marked in error exactly like its live twin.
+/// `declined` is load-bearing: it is a real variant of BOTH `CommandExecutionStatus` and
+/// `PatchApplyStatus` (verified in the 0.153 schema dump), so omitting it made a refused command
+/// or a refused patch reload GREEN — reading as if it had run.
 fn status_is_error(status: Option<&str>) -> bool {
-    matches!(status, Some(s) if s.eq_ignore_ascii_case("failed") || s.eq_ignore_ascii_case("error"))
+    matches!(status, Some(s) if s.eq_ignore_ascii_case("failed")
+        || s.eq_ignore_ascii_case("declined")
+        || s.eq_ignore_ascii_case("error"))
 }
 
 /// Map ONE `response_item` payload to the timeline (tools only — messages come from
@@ -1642,6 +1647,37 @@ mod tests {
         assert!(
             matches!(tool_result(&items, "p9"), Some(ConversationItem::ToolResult { is_error: true, .. })),
             "a failed patch (exit 1) must render as an error, not a clean success"
+        );
+    }
+
+    /// A DECLINED command or patch (the user refused the approval) is an ERROR, not a success.
+    /// `declined` is a real variant of both `CommandExecutionStatus` and `PatchApplyStatus`; the
+    /// cold path used to check only failed/error, so a refused step reloaded GREEN — reading as
+    /// if it had run. Mirrors the live actor's `status_is_error`.
+    #[test]
+    fn declined_command_and_patch_reload_as_errors() {
+        let content = [
+            line("session_meta", json!({ "id": "t1", "cwd": "/repo", "cli_version": "0.153.4" })),
+            completed(json!({ "type": "CommandExecution", "id": "exec-d", "command": ["/bin/zsh", "-lc", "rm -rf /"],
+                "cwd": "file:///repo", "status": "declined", "aggregated_output": "" })),
+            completed(json!({ "type": "FileChange", "id": "fc-d", "status": "declined",
+                "changes": { "/repo/note.txt": { "type": "add", "content": "nope\n" } } })),
+        ]
+        .join("\n");
+        let (items, skipped) = parse_rollout_str(&content);
+        assert_eq!(skipped, 0);
+        // Cold ids are positional (`cx-r<n>`), so read the two results in order.
+        let errs: Vec<bool> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::ToolResult { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errs,
+            vec![true, true],
+            "a declined command and a declined patch must both reload as errors"
         );
     }
 

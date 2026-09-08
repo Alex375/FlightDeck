@@ -4,6 +4,7 @@ import {
   CLAUDE_MODELS,
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
+  RETIRED_CODEX_MODELS,
   backendOfModel,
   modelFamily,
   modelLabel,
@@ -98,6 +99,39 @@ describe("CODEX_MODELS mirrors what the binary actually serves", () => {
     // The static list is the picker's content while the dynamic one loads: a row the
     // binary would reject turns a pick in that window into a failed turn.
     expect(CODEX_MODELS.map((m) => m.value)).not.toContain("gpt-5.4");
+  });
+});
+
+describe("retired Codex models", () => {
+  it("still resolve to a real label and family", () => {
+    // gpt-5.4 was pulled from the offered catalogue when the binary stopped serving it.
+    // Conversations pinned to it must keep reading as "GPT-5.4", not as the raw wire id.
+    expect(modelLabel("gpt-5.4")).toBe("GPT-5.4");
+    expect(modelFamily("gpt-5.4")).toBe("gpt-5.4");
+    expect(backendOfModel("gpt-5.4")).toBe("codex");
+  });
+
+  it("do not shadow a longer live id", () => {
+    expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
+    expect(modelFamily("gpt-5.4-mini")).toBe("gpt-5.4-mini");
+  });
+
+  it("are never OFFERED — not in the catalogue, not in the picker", () => {
+    const retired = RETIRED_CODEX_MODELS.map((m) => m.value);
+    expect(retired).toContain("gpt-5.4");
+    for (const v of retired) {
+      expect(CODEX_MODELS.map((m) => m.value)).not.toContain(v);
+      expect(ALL_MODELS.map((m) => m.value)).not.toContain(v);
+    }
+    // Even for the conversation RUNNING one: the picker must not offer an id the binary
+    // would reject, however the "never hide the running model" guard resolves.
+    const groups = modelsForPicker("codex", {
+      locked: true,
+      codexAvailable: true,
+      current: "gpt-5.4",
+    });
+    const offered = groups.flatMap((g) => g.models.map((m) => m.value));
+    expect(offered).not.toContain("gpt-5.4");
   });
 });
 
