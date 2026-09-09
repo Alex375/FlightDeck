@@ -12,6 +12,11 @@ export type SettingsSection =
   | "conversation"
   | "behavior"
   | "models"
+  /** Claude-specific settings: sub-agent routing, spend, and the instructions file.
+   *  Backend-specific ON PURPOSE — its whole content is Claude model names and Claude
+   *  file layout, so it is shown only while a Claude account is connected, and a Codex
+   *  twin would be its own tab rather than an abstraction over both. */
+  | "claudeCode"
   | "composer"
   | "reordering"
   | "shortcuts"

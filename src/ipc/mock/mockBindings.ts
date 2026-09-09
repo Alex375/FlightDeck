@@ -3,6 +3,7 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AgentRouting,
   Backend,
   BranchInfo,
   CommitFile,
@@ -94,6 +95,9 @@ import type {
   WorkflowRun,
   WorktreeInfo,
   WorktreeStatus,
+  ManagedMemory,
+  SpendReport,
+  SubagentRouting,
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
@@ -564,6 +568,90 @@ function writeDemoSubtaskStatus(taskId: string, status: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * A synthetic spend corpus with the same SHAPE as the real one: a handful of repos, a few
+ * models, workflow runs dominating the total, and one deliberate disagreement (Explore
+ * appearing on opus while it is configured for haiku) so the drift canary can be seen
+ * firing without waiting for it to happen for real.
+ *
+ * Deterministic — a chart that reshuffles on every reload cannot be reviewed.
+ */
+function mockSpendReport(): SpendReport {
+    const buckets: SpendReport["buckets"] = [];
+    const repos = [
+      ["/Users/demo/repos/tosse-code", "tosse-code"],
+      ["/Users/demo/repos/santecall", "santecall"],
+      ["/Users/demo/repos/Citadel", "Citadel"],
+    ];
+    // A cheap deterministic pseudo-random so the numbers look lived-in but never move.
+    let seed = 7;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    // Days run UP TO TODAY, not from a frozen start date. The dashboard's default window
+    // is the last 30 days and the drift canary looks at the last 7 — a fixture pinned to
+    // absolute dates silently ages out of both, so the demo would show an empty chart and
+    // no canary, which is precisely what a demo must not hide.
+    const today = new Date();
+    const day = (i: number) => {
+      const d = new Date(
+        Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (20 - i)),
+      );
+      return d.toISOString().slice(0, 10);
+    };
+    for (let i = 0; i < 21; i++) {
+      for (const [repo, label] of repos) {
+        // Workflow runs: the bulk of the spend, on the expensive models.
+        for (const model of ["claude-fable-5-1", "claude-opus-4-8"]) {
+          const turns = rand(60) + (model === "claude-fable-5-1" ? 30 : 5);
+          if (turns < 12) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            agent: "workflow-subagent",
+            model,
+            workflow: true,
+            turns,
+            input_tokens: turns * 40,
+            output_tokens: turns * (400 + rand(300)),
+            cache_read_tokens: turns * 9000,
+            cache_creation_tokens: turns * 1200,
+          });
+        }
+        // Foreground helpers: far fewer turns.
+        for (const [agent, model] of [
+          ["Explore", "claude-opus-4-8"], // ← disagrees with the configured haiku
+          ["general-purpose", "claude-sonnet-5"],
+        ]) {
+          const turns = rand(9);
+          if (turns < 2) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            agent,
+            model,
+            workflow: false,
+            turns,
+            input_tokens: turns * 30,
+            output_tokens: turns * (200 + rand(200)),
+            cache_read_tokens: turns * 7000,
+            cache_creation_tokens: turns * 900,
+          });
+        }
+      }
+    }
+    return {
+      buckets,
+      files_scanned: 931,
+      files_unreadable: 0,
+      lines_unparsed: 0,
+      warnings: [],
+    };
 }
 
 // ---- Commands (same shape as the generated facade) -------------------------
@@ -1900,6 +1988,118 @@ export const mockCommands = {
 
   async terminalClose(_id: string): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  // ---- Settings → Claude Code (routing / spend / instructions) — demo -------
+  // Shaped like the real thing, including the two states that are easy to get wrong and
+  // impossible to see otherwise: a built-in the baseline cannot reach (Plan), and an agent
+  // whose configured model disagrees with what the transcripts say it ran on (Explore,
+  // set to haiku, seen on opus) — which is what lights the drift canary.
+  async listSubagentRouting(_repoPath: string): Promise<Result<SubagentRouting, string>> {
+    const agents: AgentRouting[] = [
+      {
+        name: "Explore",
+        description: "Sweeps the codebase to locate something. Read-only.",
+        effective_model: "haiku",
+        effort: null,
+        origin: "user",
+        path: "/Users/demo/.claude/agents/Explore.md",
+        built_in: true,
+        shadows_built_in: true,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+      },
+      {
+        name: "Plan",
+        description: "Designs how a change should be made before any code is written.",
+        effective_model: null,
+        effort: null,
+        origin: "built_in",
+        path: null,
+        built_in: true,
+        shadows_built_in: false,
+        needs_file_to_steer: true,
+        overridden_by_force: false,
+      },
+      {
+        name: "general-purpose",
+        description: "The catch-all helper for multi-step work.",
+        effective_model: "sonnet",
+        effort: null,
+        origin: "built_in",
+        path: null,
+        built_in: true,
+        shadows_built_in: false,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+      },
+      {
+        name: "tosse-manager",
+        description: "CRM specialist. Never touches code.",
+        effective_model: "claude-opus-4-8",
+        effort: "high",
+        origin: "plugin",
+        path: "/Users/demo/.claude/plugins/tosse/agents/manager.md",
+        built_in: false,
+        shadows_built_in: false,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+      },
+    ];
+    return ok({
+      agents,
+      baseline: {
+        model: "sonnet",
+        forced_model: null,
+        unreachable_builtins: ["Explore", "Plan"],
+      },
+      user_agents_dir: "/Users/demo/.claude/agents",
+      project_agents_dir: "/Users/demo/repo/.claude/agents",
+      // The repo in the demo DOES ignore .claude/ — so the scope warning is visible.
+      project_dir_ignored: true,
+      repo_is_worktree: false,
+    });
+  },
+  async setSubagentModel(
+    _path: string,
+    _model: string | null,
+    _effort: string | null,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async createSubagentDefinition(
+    dir: string,
+    name: string,
+    _description: string,
+    _model: string | null,
+    _effort: string | null,
+    _body: string,
+  ): Promise<Result<string, string>> {
+    return ok(`${dir}/${name}.md`);
+  },
+  async setSubagentBaseline(
+    _model: string | null,
+    _forcedModel: string | null,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async subagentSpend(): Promise<Result<SpendReport, string>> {
+    return ok(mockSpendReport());
+  },
+  async readClaudeMemory(): Promise<Result<ManagedMemory, string>> {
+    return ok({
+      path: "/Users/demo/.claude/CLAUDE.md",
+      exists: true,
+      managed_text: null,
+      full_text: "# My instructions\n\nAlways write tests before the fix.\n",
+      marker_error: null,
+    });
+  },
+  async writeClaudeMemory(_text: string | null): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async fetchKnownAgents(_cwd: string): Promise<Result<string[], string>> {
+    return ok(["claude", "Explore", "general-purpose", "Plan", "statusline-setup"]);
   },
 
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------

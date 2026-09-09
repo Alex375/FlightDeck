@@ -1072,6 +1072,166 @@ pub async fn fetch_slash_commands(cwd: String) -> Result<Vec<SlashCommand>, Stri
 /// `claude --resume` does not re-stream past messages, so the live event path
 /// delivers nothing for an existing conversation. The UI calls this after
 /// re-spawning a session to replay its history into the store. An absent
+// ---- Settings → Claude Code: sub-agent routing, spend, instructions --------------
+
+/// The routing picture for one repository: every sub-agent we can name, the model it will
+/// actually run on, where that setting lives, and the two scope hazards (a git-ignored
+/// `.claude/agents/`, a worktree checkout). Disk-only and fast — the page renders from
+/// this before any process is spawned.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_subagent_routing(
+    repo_path: String,
+) -> Result<crate::extensions::routing::SubagentRouting, String> {
+    tokio::task::spawn_blocking(move || crate::extensions::routing::routing_for(&repo_path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rewrite an existing agent definition's `model:` / `effort:` and NOTHING else. The
+/// system prompt in the file's body is preserved to the byte — see
+/// [`crate::extensions::agent_edit`]. `None` removes the key.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_model(
+    path: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::agent_edit::write_agent_frontmatter(
+            std::path::Path::new(&path),
+            &[("model", model), ("effort", effort)],
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Create a NEW agent definition file. `body` is the agent's system prompt and is
+/// required: a file named after a built-in replaces that agent ENTIRELY, so the caller has
+/// to have shown the user what the replacement will run on. Refuses to overwrite.
+/// Returns the path written.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_subagent_definition(
+    dir: String,
+    name: String,
+    description: String,
+    model: Option<String>,
+    effort: Option<String>,
+    body: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        // The file name carries the agent name; the frontmatter `name:` is what the CLI
+        // dispatches on, and it is written verbatim (capitalisation included — verified:
+        // `name: Explore` overrides the built-in).
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        if safe.is_empty() {
+            return Err("an agent needs a name".to_string());
+        }
+        let path = std::path::Path::new(&dir).join(format!("{safe}.md"));
+        crate::extensions::agent_edit::create_agent_file(
+            &path,
+            &name,
+            &description,
+            model.as_deref(),
+            effort.as_deref(),
+            &body,
+        )?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set or clear the sub-agent model baseline (`CLAUDE_CODE_SUBAGENT_MODEL`) and its
+/// forcing variant. `None` clears. ⚠️ The forcing variant overrides every per-agent choice
+/// and every model a workflow asks for — the UI must never set it implicitly.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_baseline(
+    model: Option<String>,
+    forced_model: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::set_subagent_baseline(model.as_deref(), forced_model.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
+/// workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+#[tauri::command]
+#[specta::specta]
+pub async fn subagent_spend() -> Result<crate::agentspend::SpendReport, String> {
+    tokio::task::spawn_blocking(crate::agentspend::scan).await.map_err(|e| e.to_string())
+}
+
+/// Read `~/.claude/CLAUDE.md` — the whole file for preview, plus whatever currently sits
+/// inside the app's managed markers.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_claude_memory() -> Result<crate::memoryfile::ManagedMemory, String> {
+    tokio::task::spawn_blocking(crate::memoryfile::read_managed)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Write (or, with `None`, remove) the managed block in `~/.claude/CLAUDE.md`. Everything
+/// outside the markers is preserved byte for byte; a file with damaged markers is refused
+/// rather than repaired.
+#[tauri::command]
+#[specta::specta]
+pub async fn write_claude_memory(text: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::memoryfile::write_managed(text.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The sub-agent names the CLI itself reports for this directory — the drift canary's
+/// input. Same ephemeral-spawn shape as [`fetch_slash_commands`]: one `initialize`
+/// handshake, then the process is dropped. An empty list means "we could not ask", which
+/// the caller must NOT render as "the agent is gone".
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_known_agents(cwd: String) -> Result<Vec<String>, String> {
+    use crate::supervisor::control;
+    use crate::supervisor::protocol::CliMessage;
+    use crate::supervisor::transport::Transport;
+
+    let (mut transport, mut rx) =
+        Transport::spawn(SpawnConfig::new(PathBuf::from(cwd))).map_err(|e| e.to_string())?;
+    let request_id = "tosse-agents-fetch";
+    transport
+        .send_line(control::initialize_request(request_id, &[]))
+        .map_err(|e| e.to_string())?;
+
+    let agents = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some(msg) = rx.recv().await {
+            if let CliMessage::ControlResponse(v) = msg {
+                let echoed = v
+                    .get("response")
+                    .and_then(|r| r.get("request_id"))
+                    .and_then(|x| x.as_str());
+                if echoed == Some(request_id) {
+                    return control::parse_initialize_agents(&v).unwrap_or_default();
+                }
+            }
+        }
+        Vec::new()
+    })
+    .await
+    .unwrap_or_default();
+
+    transport.shutdown(false).await;
+    Ok(agents)
+}
+
 /// transcript yields an empty list (not an error). File IO runs off the async
 /// runtime via `spawn_blocking` so a large transcript never stalls it.
 #[tauri::command]

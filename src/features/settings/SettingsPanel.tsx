@@ -18,6 +18,8 @@ import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
+import { ClaudeCodeSection } from "./claudecode/ClaudeCodeSection";
+import { useClaudeAccount } from "../../ipc/useAccounts";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
@@ -35,7 +37,14 @@ import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
 // the rest of the rail stays on the shared icon set.
-const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: ReactNode }> = [
+const TABS: Array<{
+  id: SettingsSection;
+  label: string;
+  icon: string;
+  mark?: ReactNode;
+  /** Hidden until a Claude account is connected. */
+  needsClaude?: boolean;
+}> = [
   { id: "general", label: "General", icon: "cog" },
   { id: "accounts", label: "Accounts", icon: "key" },
   // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
@@ -48,6 +57,10 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // Next to Conversation (both shape what a conversation is), its own tab for the same
   // reason as Composer: arranging two lists by drag is a task, not a row of switches.
   { id: "models", label: "Models", icon: "spark" },
+  // Backend-specific by design, and only present while that backend is CONNECTED: the
+  // page is Claude model names and Claude file layout end to end, so an abstraction over
+  // both backends would have to speak in euphemisms. A Codex twin would be its own tab.
+  { id: "claudeCode", label: "Claude Code", icon: "bot", needsClaude: true },
   // Its own tab rather than a group under General: arranging the bar is a task with a
   // preview and a drag surface, not a row of switches.
   { id: "composer", label: "Composer", icon: "wand" },
@@ -63,6 +76,20 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const section = useSettingsUi((s) => s.section);
   const setSection = useSettingsUi((s) => s.setSection);
+  // The Claude tab appears on a POSITIVE "logged in" and does NOT disappear on a later
+  // failed read: a Keychain hiccup must not evaporate a tab the user is standing in.
+  // `claudeSeen` is the last-known-good latch (same discipline as the artifact header).
+  const claudeAccount = useClaudeAccount(open);
+  const [claudeSeen, setClaudeSeen] = useState(false);
+  useEffect(() => {
+    if (claudeAccount.data?.loggedIn) setClaudeSeen(true);
+  }, [claudeAccount.data?.loggedIn]);
+  const visibleTabs = TABS.filter((t) => !t.needsClaude || claudeSeen);
+  // Standing on a tab that just became unavailable (signed out) — fall back rather than
+  // render an empty pane.
+  useEffect(() => {
+    if (!visibleTabs.some((t) => t.id === section)) setSection("general");
+  }, [visibleTabs, section, setSection]);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   // App version, read from the bundle (tauri.conf.json — the runtime source of
@@ -129,7 +156,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
         <div className={styles.layout}>
           <nav className={styles.rail} aria-label="Settings sections">
             <div className={styles.railCap}>Settings</div>
-            {TABS.map((t) => (
+            {visibleTabs.map((t) => (
               <button
                 key={t.id}
                 type="button"
@@ -187,6 +214,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             )}
 
             {section === "models" && <ModelsSection />}
+            {section === "claudeCode" && <ClaudeCodeSection />}
 
             {section === "composer" && <ComposerSection />}
 

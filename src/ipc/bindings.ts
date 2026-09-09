@@ -639,6 +639,111 @@ async fetchSlashCommands(cwd: string) : Promise<Result<SlashCommand[], string>> 
  * `claude --resume` does not re-stream past messages, so the live event path
  * delivers nothing for an existing conversation. The UI calls this after
  * re-spawning a session to replay its history into the store. An absent
+ * The routing picture for one repository: every sub-agent we can name, the model it will
+ * actually run on, where that setting lives, and the two scope hazards (a git-ignored
+ * `.claude/agents/`, a worktree checkout). Disk-only and fast — the page renders from
+ * this before any process is spawned.
+ */
+async listSubagentRouting(repoPath: string) : Promise<Result<SubagentRouting, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_subagent_routing", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rewrite an existing agent definition's `model:` / `effort:` and NOTHING else. The
+ * system prompt in the file's body is preserved to the byte — see
+ * [`crate::extensions::agent_edit`]. `None` removes the key.
+ */
+async setSubagentModel(path: string, model: string | null, effort: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_model", { path, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a NEW agent definition file. `body` is the agent's system prompt and is
+ * required: a file named after a built-in replaces that agent ENTIRELY, so the caller has
+ * to have shown the user what the replacement will run on. Refuses to overwrite.
+ * Returns the path written.
+ */
+async createSubagentDefinition(dir: string, name: string, description: string, model: string | null, effort: string | null, body: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_subagent_definition", { dir, name, description, model, effort, body }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set or clear the sub-agent model baseline (`CLAUDE_CODE_SUBAGENT_MODEL`) and its
+ * forcing variant. `None` clears. ⚠️ The forcing variant overrides every per-agent choice
+ * and every model a workflow asks for — the UI must never set it implicitly.
+ */
+async setSubagentBaseline(model: string | null, forcedModel: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_baseline", { model, forcedModel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
+ * workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+ */
+async subagentSpend() : Promise<Result<SpendReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("subagent_spend") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read `~/.claude/CLAUDE.md` — the whole file for preview, plus whatever currently sits
+ * inside the app's managed markers.
+ */
+async readClaudeMemory() : Promise<Result<ManagedMemory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_claude_memory") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Write (or, with `None`, remove) the managed block in `~/.claude/CLAUDE.md`. Everything
+ * outside the markers is preserved byte for byte; a file with damaged markers is refused
+ * rather than repaired.
+ */
+async writeClaudeMemory(text: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("write_claude_memory", { text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The sub-agent names the CLI itself reports for this directory — the drift canary's
+ * input. Same ephemeral-spawn shape as [`fetch_slash_commands`]: one `initialize`
+ * handshake, then the process is dropped. An empty list means "we could not ask", which
+ * the caller must NOT render as "the agent is gone".
+ */
+async fetchKnownAgents(cwd: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_known_agents", { cwd }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * transcript yields an empty list (not an error). File IO runs off the async
  * runtime via `spawn_blocking` so a large transcript never stalls it.
  */
@@ -2176,12 +2281,59 @@ export type AccountLoginEvent = { backend: string; success: boolean; error: stri
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
-export type AgentInfo = { name: string; description: string | null; model: string | null; scope: ExtScope; source: string | null; 
+export type AgentInfo = { name: string; description: string | null; model: string | null; 
+/**
+ * The reasoning-effort level pinned in the definition's frontmatter, when it has one.
+ * Ignored by the CLI on models that declare no effort ladder (Haiku 4.5 and below),
+ * which is why the settings UI hides the control rather than offering a dead one.
+ */
+effort: string | null; scope: ExtScope; source: string | null; 
 /**
  * Absolute path to the agent's `.md` definition — the UI reads it to render a
  * clean markdown view of the sub-agent.
  */
 path: string }
+/**
+ * One row of the routing page.
+ */
+export type AgentRouting = { 
+/**
+ * The name the CLI dispatches on. For a built-in this is a contract with Anthropic
+ * that is nowhere documented — if it is ever renamed, an override silently stops
+ * applying, which is what the drift canary watches for.
+ */
+name: string; description: string | null; 
+/**
+ * The model this agent will run on, as far as we can tell, or `None` for "whatever
+ * the conversation is using".
+ */
+effective_model: string | null; 
+/**
+ * The effort pinned in the definition, when it has one.
+ */
+effort: string | null; origin: RoutingOrigin; 
+/**
+ * Path of the definition file, when there is one.
+ */
+path: string | null; 
+/**
+ * True when this agent is a CLI built-in (whether or not a file now shadows it).
+ */
+built_in: boolean; 
+/**
+ * True when a definition file shadows a built-in of the same name — the case where
+ * the file supplies the ENTIRE agent, system prompt included.
+ */
+shadows_built_in: boolean; 
+/**
+ * True for the built-ins the baseline env var cannot reach: steering them at all
+ * requires a definition file.
+ */
+needs_file_to_steer: boolean; 
+/**
+ * True when a forcing baseline is set, which overrides this row whatever it says.
+ */
+overridden_by_force: boolean }
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -3254,6 +3406,28 @@ identity_file: string | null;
  */
 added_at: number }
 /**
+ * What the instructions file looks like right now.
+ */
+export type ManagedMemory = { 
+/**
+ * Absolute path, shown in the UI so "where does this go" is never a mystery.
+ */
+path: string; exists: boolean; 
+/**
+ * The text currently inside the managed markers; `None` when the app has never
+ * written to this file.
+ */
+managed_text: string | null; 
+/**
+ * The whole file, so the panel can show a read-only preview without a second read.
+ */
+full_text: string | null; 
+/**
+ * Set when the markers are present but malformed — the UI must then offer a manual
+ * fix, never a write.
+ */
+marker_error: string | null }
+/**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
  * granularity the CLI exposes — there is no per-plugin auto-update). The count of
@@ -3642,6 +3816,31 @@ removed_prompt: string | null;
  */
 removed_lines: number }
 /**
+ * Where a sub-agent's current model setting comes from — the "origin" column, in terms a
+ * person can act on rather than file paths.
+ */
+export type RoutingOrigin = 
+/**
+ * A definition file in `~/.claude/agents/`.
+ */
+"user" | 
+/**
+ * A definition file in the repository's `.claude/agents/`.
+ */
+"project" | 
+/**
+ * Bound to this repository but kept out of what it shares.
+ */
+"local" | 
+/**
+ * Provided by an installed plugin.
+ */
+"plugin" | 
+/**
+ * A built-in with no definition file: it follows the baseline, or the conversation.
+ */
+"built_in"
+/**
  * A rate-limit window that applies to a NAMED subset of usage (today: a single model) rather
  * than the account as a whole. Kept separate from the two flat windows because its label is
  * data-driven — it comes from the payload, so a renamed or newly added scoped model shows up
@@ -3860,6 +4059,109 @@ description: string;
  * Hint for the command's arguments (e.g. `"<task_id>"`), empty when none.
  */
 argument_hint: string }
+/**
+ * One aggregated cell of the spend cube. Every number is a SUM over the turns that
+ * share the five key fields.
+ */
+export type SpendBucket = { 
+/**
+ * `YYYY-MM-DD`, from the turn's `timestamp` (UTC, as the CLI writes it).
+ */
+day: string; 
+/**
+ * Absolute path of the repository the work happened in — worktrees folded back onto
+ * their parent repo (see [`repo_root_for`]), so "this repo" means one row, not one
+ * row per branch.
+ */
+repo: string; 
+/**
+ * Last path segment of `repo`, for display.
+ */
+repo_label: string; 
+/**
+ * The sub-agent type: `Explore`, `general-purpose`, `workflow-subagent`, … or
+ * [`UNATTRIBUTED`].
+ */
+agent: string; 
+/**
+ * The model id EXACTLY as the transcript records it (`claude-haiku-4-5-20251001`),
+ * which is a full id where the app's catalogue uses aliases (`haiku`). The front
+ * normalizes; storing the raw id keeps this module honest about what it saw.
+ */
+model: string; 
+/**
+ * Whether the turn belongs to a workflow run — a transcript filed under a
+ * `subagents/workflows/wf_<id>` directory.
+ * 
+ * (Written without a trailing glob on purpose: this doc comment is transcribed into
+ * the generated TypeScript inside a block comment, and a literal `*` followed by `/`
+ * would close it early and break `bindings.ts`.)
+ */
+workflow: boolean; turns: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number }
+/**
+ * Everything the UI needs for the spend dashboard, in one payload.
+ */
+export type SpendReport = { buckets: SpendBucket[]; 
+/**
+ * Files opened and read to the end.
+ */
+files_scanned: number; 
+/**
+ * Files found but unreadable. Surfaced in the UI — a partial scan must never be
+ * mistaken for a small bill.
+ */
+files_unreadable: number; 
+/**
+ * Lines that looked like assistant turns but failed to parse. Same reasoning.
+ */
+lines_unparsed: number; 
+/**
+ * Human-readable notes about anything degraded (missing projects dir, …).
+ */
+warnings: string[] }
+/**
+ * What the two sub-agent env vars currently say, read straight from
+ * `~/.claude/settings.json`.
+ */
+export type SubagentBaseline = { 
+/**
+ * The model every sub-agent falls back to, or `None` when the app has never set one
+ * (the CLI then inherits the conversation's model).
+ */
+model: string | null; 
+/**
+ * Whether the forcing variant is set, and to what. Reported separately from `model`
+ * because the two behave differently enough that merging them would lie.
+ */
+forced_model: string | null; 
+/**
+ * ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
+ * both keep inheriting the conversation. Carried in the payload so the UI's
+ * explanation and the backend's behaviour can never drift apart.
+ */
+unreachable_builtins: string[] }
+/**
+ * Everything the routing section needs, in one read.
+ */
+export type SubagentRouting = { agents: AgentRouting[]; baseline: SubagentBaseline; 
+/**
+ * `~/.claude/agents` — where a global definition would be written.
+ */
+user_agents_dir: string; 
+/**
+ * `<repo>/.claude/agents` — where a project definition would be written.
+ */
+project_agents_dir: string; 
+/**
+ * Whether git would ignore the project directory. `None` = could not check, which the
+ * UI must render as "unknown", never as "fine".
+ */
+project_dir_ignored: boolean | null; 
+/**
+ * Whether the repository we are looking at is itself a worktree — a project-scoped
+ * setting written here would not exist in the main checkout, or in the next worktree.
+ */
+repo_is_worktree: boolean }
 /**
  * An integrated terminal's shell exited (EOF on the PTY). One-shot, keyed by id;
  * the front marks that terminal done and offers to restart it on re-open.
