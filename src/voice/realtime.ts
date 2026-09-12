@@ -26,7 +26,7 @@
 import { commands } from "../ipc/client";
 import { executeAppControlTool, type AppControlHelpers } from "../agent/appControl";
 import { agentRemoveConversationsEnabled } from "../store/appControl";
-import { useVoicePrefs } from "./voicePrefs";
+import { currentVadSettings, useVoicePrefs } from "./voicePrefs";
 import { useVoiceStore } from "./voiceStore";
 import {
   announcementText,
@@ -35,6 +35,7 @@ import {
   type FleetAnnouncement,
 } from "./announce";
 import { buildTurnDetection } from "./vad";
+import { useAppErrors } from "../store/appErrors";
 import { openVoiceMic } from "./mic";
 import { resolveInstructions } from "./instructions";
 
@@ -230,7 +231,7 @@ export function applyVadSettings(): void {
     type: "session.update",
     session: {
       type: "realtime",
-      audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
+      audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
     },
   });
 }
@@ -361,7 +362,7 @@ async function doStart(): Promise<void> {
           instructions: sessionInstructions(),
           tools,
           tool_choice: "auto",
-          audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
+          audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
         },
       });
       useVoiceStore.getState().setPhase("armed");
@@ -519,11 +520,24 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
       }
       break;
     }
-    case "error":
-      // Protocol-level errors are logged, not fatal — the connection state
-      // change handler decides when the session is actually dead.
+    case "error": {
+      // ⚠️ These used to be `console.error` and nothing else, which made a WHOLE
+      // CLASS of failure invisible: a `session.update` the server rejects is
+      // reported here and nowhere else, so turn-detection settings could be
+      // silently not applied while Settings showed them as set. Someone turning
+      // a slider that the server threw away has no way to find out.
+      // Not fatal — the connection-state handler decides when a session is dead —
+      // but never again silent.
+      const detail = ev.error as { message?: string; code?: string; param?: string } | undefined;
       console.error("voice: server error event", ev);
+      useAppErrors
+        .getState()
+        .pushError(
+          `The voice agent rejected a setting: ${detail?.message ?? "unknown error"}`,
+          [detail?.code, detail?.param].filter(Boolean).join(" · ") || null,
+        );
       break;
+    }
     default:
       break;
   }

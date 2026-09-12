@@ -1,26 +1,47 @@
-// Server-VAD (voice activity detection) tuning for the Realtime session.
-// Pure + tiny so it can be unit-tested without dragging in the WebRTC session
-// manager (realtime.ts pulls in the IPC client, stores and DOM).
+// Turn detection for the Realtime session — deciding when the user has finished
+// speaking, and when they have started (which cuts the agent off).
 //
-// We now configure turn detection EXPLICITLY instead of inheriting OpenAI's
-// defaults. The default threshold was over-sensitive: faint sounds registered
-// as speech, so the agent cut in / got interrupted too eagerly. Only the
-// `threshold` is user-tunable (the Settings slider); the rest is fixed and sane.
+// ⚠️ THE LESSON, paid for in an unusable session (Armand, 2026-09-12): he set the
+// threshold to its maximum, 0.90, and talking while emptying a dishwasher still
+// cut the agent off every ten seconds — and worse, the agent ANSWERED the noise.
+// Asked "shall I grant permission X?", it heard a clatter and replied "granting".
+// That is a consequential action taken on crockery.
 //
-// Turn detection stays OpenAI's job. Gating the audio ourselves before it leaves
-// the machine was considered and dropped: it would have put a threshold we can
-// explain on a bar the user can read, but at the cost of a second detector to
-// keep honest, a delay line so it does not clip the first syllable, and
-// hysteresis so it does not chop a sentence in two — a lot of machinery to
-// second-guess a detector that is doing the job.
+// A louder threshold cannot fix that, because loudness is not the problem. A
+// plate on a counter IS loud; `server_vad` is an amplitude gate and has no way to
+// know it carries no words. Pushing the threshold high enough to exclude dishes
+// also excludes the user.
+//
+// `semantic_vad` is a different question asked of a different model: it chunks on
+// whether the WORDS sound finished, so audio with no words in it is not a turn at
+// all. It is the right default for anyone who is not sitting still in a quiet
+// room, and it is now the default here. `eagerness` tunes how long it waits
+// before deciding you are done — "low" lets you pause mid-sentence without being
+// interrupted, which is what you want while doing something else with your hands.
+//
+// The loudness mode stays available, because it is the one that gives a number to
+// turn when someone wants one. It is no longer the default, and Settings says
+// what it is.
 
-/** The band the threshold is clamped to, and the range the Settings slider
- *  spans. Extremes are useless: ~0 fires on any hiss, ~1 never triggers. */
+/** How the session decides a turn has ended. */
+export type VadMode = "semantic" | "loudness";
+
+/** How eagerly `semantic_vad` decides the user has finished speaking. */
+export type VadEagerness = "low" | "medium" | "high";
+
+export const VAD_MODE_DEFAULT: VadMode = "semantic";
+/** Default for the semantic mode: wait, rather than cut in. The complaint that
+ *  drove this change was interruption, never sluggishness. */
+export const VAD_EAGERNESS_DEFAULT: VadEagerness = "low";
+
+/** The band the loudness threshold is clamped to, and the range its Settings
+ *  slider spans. Extremes are useless: ~0 fires on any hiss, ~1 never triggers. */
 export const VAD_THRESHOLD_MIN = 0.3;
 export const VAD_THRESHOLD_MAX = 0.9;
-/** Default amplitude gate — a notch LESS sensitive than OpenAI's 0.5 default,
- *  which was the "cuts in too early" complaint. */
+/** Default amplitude gate — a notch LESS sensitive than OpenAI's 0.5 default. */
 export const VAD_THRESHOLD_DEFAULT = 0.6;
+
+const EAGERNESS_VALUES: readonly VadEagerness[] = ["low", "medium", "high"];
 
 /** Clamp a threshold to the usable band, falling back to the default on NaN. */
 export function clampVadThreshold(v: number): number {
@@ -29,25 +50,45 @@ export function clampVadThreshold(v: number): number {
   return Math.min(VAD_THRESHOLD_MAX, Math.max(VAD_THRESHOLD_MIN, rounded));
 }
 
-/** Build the `turn_detection` block for a Realtime `session.update`.
+/** Coerce a stored value to a known mode (an older store, or a hand edit). */
+export function asVadMode(value: unknown): VadMode {
+  return value === "loudness" || value === "semantic" ? value : VAD_MODE_DEFAULT;
+}
+
+export function asVadEagerness(value: unknown): VadEagerness {
+  return EAGERNESS_VALUES.includes(value as VadEagerness)
+    ? (value as VadEagerness)
+    : VAD_EAGERNESS_DEFAULT;
+}
+
+export interface VadSettings {
+  mode: VadMode;
+  eagerness: VadEagerness;
+  threshold: number;
+}
+
+/**
+ * Build the `turn_detection` block for a Realtime `session.update`.
  *
- *  @param threshold how sure OpenAI's detector must be, 0..1 — higher = LESS
- *    sensitive (ignores background noise and stray sound); lower = picks up more.
+ * It travels at `session.audio.input.turn_detection` — see realtime.ts.
  *
- *  ⚠️ This is a CONFIDENCE from their speech detector, not an amplitude, and
- *  nothing local shares its scale. Settings once drew it as a handle on the live
- *  level meter, which could never line up and told users to calibrate it against
- *  a number it has no relationship to — see VadMeter.tsx.
+ * Barge-in stays ON in both modes: cutting the agent off by speaking is wanted
+ * behaviour. What changed is WHAT counts as speaking.
  */
-export function buildTurnDetection(threshold: number): Record<string, unknown> {
+export function buildTurnDetection(settings: VadSettings): Record<string, unknown> {
+  if (asVadMode(settings.mode) === "loudness") {
+    return {
+      type: "server_vad",
+      threshold: clampVadThreshold(settings.threshold),
+      prefix_padding_ms: 300,
+      silence_duration_ms: 500,
+      interrupt_response: true,
+      create_response: true,
+    };
+  }
   return {
-    type: "server_vad",
-    threshold: clampVadThreshold(threshold),
-    prefix_padding_ms: 300,
-    silence_duration_ms: 500,
-    // Barge-in stays ON: the user can always cut the agent off by speaking —
-    // a wanted behaviour they asked to keep. Raising the THRESHOLD is what
-    // stops stray sound from triggering it, without disabling interruption.
+    type: "semantic_vad",
+    eagerness: asVadEagerness(settings.eagerness),
     interrupt_response: true,
     create_response: true,
   };

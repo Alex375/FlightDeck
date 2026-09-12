@@ -47,9 +47,9 @@ describe("searchSettings", () => {
 
   it("narrows with every extra term instead of widening", () => {
     const broad = searchSettings("voice");
-    const narrow = searchSettings("voice threshold");
+    const narrow = searchSettings("loudness threshold");
     expect(narrow.length).toBeLessThan(broad.length);
-    expect(narrow[0]?.title).toBe("Voice detection threshold");
+    expect(narrow[0]?.title).toBe("Loudness threshold");
   });
 
   it("returns nothing for an empty query or a word nobody indexed", () => {

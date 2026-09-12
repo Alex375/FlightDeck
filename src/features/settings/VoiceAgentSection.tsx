@@ -17,7 +17,7 @@ import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { applyInstructions, applyVadSettings, applyVoiceSelection } from "../../voice/realtime";
 import { DEFAULT_VOICE_INSTRUCTIONS, isCustomInstructions } from "../../voice/instructions";
 import { VadMeter } from "../../voice/VadMeter";
-import { VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN } from "../../voice/vad";
+import { VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN, type VadEagerness } from "../../voice/vad";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -26,6 +26,8 @@ export function VoiceAgentSection() {
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
   const pttShortcut = useVoicePrefs((s) => s.pttShortcut);
   const vadThreshold = useVoicePrefs((s) => s.vadThreshold);
+  const vadMode = useVoicePrefs((s) => s.vadMode);
+  const vadEagerness = useVoicePrefs((s) => s.vadEagerness);
   const voice = useVoicePrefs((s) => s.voice);
   const instructions = useVoicePrefs((s) => s.instructions);
   const setPrefs = useVoicePrefs((s) => s.set);
@@ -390,38 +392,88 @@ export function VoiceAgentSection() {
           }
         />
         <ToggleRow
-          title="Voice detection threshold"
+          title="How it knows you have stopped"
           hint={
             <>
-              How sure OpenAI&rsquo;s speech detector must be that it is hearing you before the
-              agent starts listening. Higher means it takes more convincing, so it stops cutting
-              in on background noise and stray sound; lower means it picks up more, including
-              things you did not mean for it. You can always interrupt the agent by speaking.
+              <b>By meaning</b> asks whether what you said sounds finished, so a sound carrying
+              no words is not treated as your turn at all. This is the one to use if the room is
+              not silent &mdash; a loudness gate cannot tell a plate from a word at any setting,
+              and set to its strictest it still let a dishwasher cut the agent off.
               <br />
-              This is a confidence, not a loudness &mdash; there is no level to line it up
-              against, so find your setting by ear: nudge it up if the agent reacts to things you
-              did not say, down if it misses you.
+              <b>By loudness</b> is the older behaviour: anything above a level counts as you
+              speaking. It gives you a number to turn, and it will react to noise.
             </>
           }
           control={
-            <span className={styles.tokenRow}>
-              <input
-                type="range"
-                min={VAD_THRESHOLD_MIN}
-                max={VAD_THRESHOLD_MAX}
-                step={0.05}
-                value={vadThreshold}
+            <select
+              className={styles.mono}
+              value={vadMode}
+              onChange={(e) => {
+                setPrefs({ vadMode: e.target.value as "semantic" | "loudness" });
+                applyVadSettings();
+              }}
+              disabled={!configured}
+              aria-label="Turn detection mode"
+            >
+              <option value="semantic">By meaning (recommended)</option>
+              <option value="loudness">By loudness</option>
+            </select>
+          }
+        />
+        {vadMode === "semantic" ? (
+          <ToggleRow
+            title="How soon it decides you are done"
+            hint="Patient lets you pause mid-sentence, or think out loud, without being cut off — best when your hands are busy with something else. Quick replies sooner, at the cost of interrupting a pause."
+            control={
+              <select
+                className={styles.mono}
+                value={vadEagerness}
                 onChange={(e) => {
-                  setPrefs({ vadThreshold: Number(e.target.value) });
+                  setPrefs({ vadEagerness: e.target.value as VadEagerness });
                   applyVadSettings();
                 }}
                 disabled={!configured}
-                aria-label="Voice detection threshold"
-              />
-              <span className={styles.mono}>{vadThreshold.toFixed(2)}</span>
-            </span>
-          }
-        />
+                aria-label="How soon the agent decides you have finished speaking"
+              >
+                <option value="low">Patient (recommended)</option>
+                <option value="medium">Balanced</option>
+                <option value="high">Quick</option>
+              </select>
+            }
+          />
+        ) : (
+          <ToggleRow
+            title="Loudness threshold"
+            hint={
+              <>
+                How loud audio must be to count as you speaking. Higher takes more convincing;
+                lower picks up more, including things you did not mean for it.
+                <br />
+                It is an amplitude gate, so it cannot tell speech from any other loud sound. If
+                the agent reacts to your room rather than to you, the fix is the mode above, not
+                a higher number here.
+              </>
+            }
+            control={
+              <span className={styles.tokenRow}>
+                <input
+                  type="range"
+                  min={VAD_THRESHOLD_MIN}
+                  max={VAD_THRESHOLD_MAX}
+                  step={0.05}
+                  value={vadThreshold}
+                  onChange={(e) => {
+                    setPrefs({ vadThreshold: Number(e.target.value) });
+                    applyVadSettings();
+                  }}
+                  disabled={!configured}
+                  aria-label="Loudness threshold"
+                />
+                <span className={styles.mono}>{vadThreshold.toFixed(2)}</span>
+              </span>
+            }
+          />
+        )}
         <ToggleRow
           title="Microphone check"
           hint={
