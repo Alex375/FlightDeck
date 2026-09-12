@@ -29,10 +29,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::engine::{Detection, SAMPLE_RATE};
 
-/// How many capture pairs to keep before pruning the oldest. A false positive
-/// hunt needs a handful of examples, not an unbounded recording of someone's
-/// room: 40 pairs is ~11 MB at 4 s each.
-const MAX_CAPTURES: usize = 40;
+/// How many capture pairs to keep, budgeted SEPARATELY for the two kinds.
+///
+/// ⚠️ One shared budget does not work, and the first session with the gates on
+/// proved it: blocked candidates outnumbered real fires 38 to 2, so a single cap
+/// of 40 pruned away the fires — the rare, precious evidence — within minutes of
+/// them being written, crowded out by the plentiful evidence nobody needs a
+/// hundred copies of. Fires get their own budget so a busy stretch of blocked
+/// candidates can never evict one.
+const MAX_FIRES: usize = 40;
+const MAX_BLOCKED: usize = 60;
+/// The filename marker that tells the two apart (see `write_capture`).
+const BLOCKED_MARKER: &str = "-blocked-";
 
 /// Write one fire's WAV + JSON into `dir`, then prune the directory back to
 /// `MAX_CAPTURES` pairs. Returns the path of the WAV.
@@ -103,30 +111,39 @@ pub fn write_capture(
         return Err(format!("could not write {}: {e}", json_path.display()));
     }
 
-    prune(dir, MAX_CAPTURES)?;
+    prune(dir, MAX_FIRES, MAX_BLOCKED)?;
     Ok(wav_path)
 }
 
-/// Keep the `max` newest capture pairs, deleting older ones. Names start with
+/// Keep the newest `max_fires` fires AND the newest `max_blocked` blocked
+/// candidates, deleting older ones of each kind INDEPENDENTLY. Names start with
 /// epoch millis, so lexicographic order IS chronological order — no `stat` per
 /// file, and no dependence on a mtime the user may have touched.
-fn prune(dir: &Path, max: usize) -> Result<(), String> {
+fn prune(dir: &Path, max_fires: usize, max_blocked: usize) -> Result<(), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("could not list {}: {e}", dir.display()))?;
-    let mut stems: Vec<String> = Vec::new();
+    let mut fires: Vec<String> = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(stem) = name.strip_suffix(".wav") {
-            stems.push(stem.to_string());
+            if stem.contains(BLOCKED_MARKER) {
+                blocked.push(stem.to_string());
+            } else {
+                fires.push(stem.to_string());
+            }
         }
     }
-    if stems.len() <= max {
-        return Ok(());
-    }
-    stems.sort();
-    for stem in &stems[..stems.len() - max] {
-        let _ = std::fs::remove_file(dir.join(format!("{stem}.wav")));
-        let _ = std::fs::remove_file(dir.join(format!("{stem}.json")));
+    for (mut stems, max) in [(fires, max_fires), (blocked, max_blocked)] {
+        if stems.len() <= max {
+            continue;
+        }
+        stems.sort();
+        let excess = stems.len() - max;
+        for stem in &stems[..excess] {
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.wav")));
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.json")));
+        }
     }
     Ok(())
 }
@@ -241,6 +258,17 @@ mod tests {
         assert!((decoded[4] + 1.0).abs() < 1e-3, "-1.0 clamps instead of wrapping positive");
     }
 
+    fn wavs_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".wav"))
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn prunes_to_the_newest_captures() {
         let dir = tmp_dir("prune");
@@ -249,17 +277,36 @@ mod tests {
             std::fs::write(dir.join(format!("{i:013}-alexa-500.wav")), b"x").unwrap();
             std::fs::write(dir.join(format!("{i:013}-alexa-500.json")), b"{}").unwrap();
         }
-        prune(&dir, 2).expect("prune runs");
-        let left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".wav"))
-            .collect();
+        prune(&dir, 2, 2).expect("prune runs");
+        let left = wavs_in(&dir);
         assert_eq!(left.len(), 2, "only the newest pairs survive");
         assert!(left.iter().all(|n| n.starts_with("0000000000003") || n.starts_with("0000000000004")));
         // The JSON sidecar goes with its WAV — a lone report explains nothing.
         assert!(!dir.join("0000000000000-alexa-500.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reason the budgets are separate: blocked candidates outnumber real
+    /// fires by more than ten to one, so a shared cap prunes away exactly the
+    /// evidence worth keeping. A flood of blocked candidates must not cost a fire.
+    #[test]
+    fn a_flood_of_blocked_candidates_cannot_evict_a_fire() {
+        let dir = tmp_dir("budgets");
+        std::fs::create_dir_all(&dir).unwrap();
+        // One old fire, then a pile of newer blocked candidates.
+        std::fs::write(dir.join("0000000000001-gc-900.wav"), b"x").unwrap();
+        std::fs::write(dir.join("0000000000001-gc-900.json"), b"{}").unwrap();
+        for i in 10..40 {
+            std::fs::write(dir.join(format!("{i:013}-gc-700-blocked-patience.wav")), b"x").unwrap();
+            std::fs::write(dir.join(format!("{i:013}-gc-700-blocked-patience.json")), b"{}").unwrap();
+        }
+        prune(&dir, 5, 5).expect("prune runs");
+        let left = wavs_in(&dir);
+        assert!(
+            left.contains(&"0000000000001-gc-900.wav".to_string()),
+            "the fire survives the flood: {left:?}"
+        );
+        assert_eq!(left.iter().filter(|n| n.contains("-blocked-")).count(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
