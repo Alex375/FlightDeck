@@ -42,7 +42,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJCRTYxRTUyNkQ4RTA2OEYKUldTUEJvNXRVaDdtdTBaSFRjd3ZNOUJyQnNLZHVjTDJrRUNQanVRTmxldnBweHU2cTJhQXl2UysK",
       "endpoints": [
-        "https://github.com/Alex375/tosse-code/releases/latest/download/latest.json"
+        "https://github.com/Alex375/FlightDeck/releases/latest/download/latest.json"
       ]
     }
   }
