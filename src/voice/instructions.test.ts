@@ -52,6 +52,16 @@ describe("the default brief", () => {
     expect(brief).not.toMatch(/say goodbye/i);
   });
 
+  // The one sanctioned pleasantry, because pure silence can't be told apart from
+  // "didn't hear you". A fixed call sign, never a prefix to a real report.
+  it("allows exactly one acknowledgement, as a fixed verbatim", () => {
+    const brief = DEFAULT_VOICE_INSTRUCTIONS;
+    expect(brief).toContain("« Bien reçu. »");
+    expect(brief).toContain('"Roger."');
+    expect(brief).toContain("Never pair it with a report");
+    expect(brief).toContain("five reasons");
+  });
+
   it("still names the tools the agent must ground itself in", () => {
     for (const tool of [
       "list_conversations",
