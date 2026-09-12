@@ -28,8 +28,14 @@ import { executeAppControlTool, type AppControlHelpers } from "../agent/appContr
 import { agentRemoveConversationsEnabled } from "../store/appControl";
 import { useVoicePrefs } from "./voicePrefs";
 import { useVoiceStore } from "./voiceStore";
-import { announcementText, clearVoiceAnnouncements, type FleetAnnouncement } from "./announce";
+import {
+  announcementText,
+  clearVoiceAnnouncements,
+  pendingVoiceAnnouncements,
+  type FleetAnnouncement,
+} from "./announce";
 import { buildTurnDetection } from "./vad";
+import { resolveInstructions } from "./instructions";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
@@ -75,12 +81,12 @@ const END_CALL_TOOL = {
   parameters: { type: "object", properties: {}, required: [] },
 };
 
-const INSTRUCTIONS = `You are Flight Deck's voice agent — the cockpit voice for the fleet of coding agents (conversations) the user runs in the Flight Deck desktop app.
-Style: spoken and brief — one to three short sentences, unless the user asks you to read details. Match the user's spoken language (this user usually speaks French).
-Ground everything in the tools: list_conversations for the LIVE ones on the board, read_conversation before summarizing a reply, send_message to relay the user's answer (name the target conversation before sending when there could be any doubt). When the user refers to a past conversation that isn't on the active list, find it with search_past_conversations and bring it back with reopen_conversation. Never invent conversation ids or content.
-When a [Flight Deck event] message arrives, tell the user what happened in one or two sentences, then ask if they want to react — their microphone was just opened for the reply.
-Once the user has heard about a conversation and no longer needs it flagged, call acknowledge_conversation to clear its attention highlight. If they ask to clear a conversation off their board, call remove_conversation — it only takes it off the active list (the history is kept and it's undoable), so reassure them nothing is lost.
-When the user says they are done with you, say a short goodbye and call end_call. When they ask to work in a folder you don't know, orient yourself with browse_folders before asking them to spell out a path.`;
+/** The brief this session runs with: the user's own prompt when they wrote one,
+ *  the built-in default otherwise (see instructions.ts). Read at each use, never
+ *  cached — an edit in Settings applies to the NEXT `session.update` we send. */
+function sessionInstructions(): string {
+  return resolveInstructions(useVoicePrefs.getState().instructions);
+}
 
 interface LiveSession {
   pc: RTCPeerConnection;
@@ -228,6 +234,45 @@ export function applyVadSettings(): void {
   });
 }
 
+/** Push a freshly edited system prompt to the LIVE session. Instructions (unlike
+ *  the voice) CAN change mid-session, so an edit in Settings is felt on the very
+ *  next thing the agent says. No-op when nothing is connected — the next arm
+ *  reads the preference on `dc.onopen`. */
+export function applyInstructions(): void {
+  const s = session;
+  if (!s) return;
+  dcSend(s, {
+    type: "session.update",
+    session: { type: "realtime", instructions: sessionInstructions() },
+  });
+}
+
+/**
+ * Adopt a newly picked voice. It is fixed at MINT time (OpenAI will not swap a
+ * voice mid-call), so the only way to change it is a new session: re-arm right
+ * away when the armed session is idle — mic closed, nothing being spoken, no
+ * announcement waiting to be drained. Anything else is left alone and the next
+ * arm picks the voice up: cutting someone off mid-sentence for a cosmetic change
+ * would be the worse trade.
+ *
+ * Resolves to what actually happened, because all three outcomes are things the
+ * user should be told apart: it was applied now, it will apply later, or the
+ * re-arm failed and they are left with no session (the reason is on the chip).
+ */
+export type VoiceSelectionOutcome = "rearmed" | "next-session" | "rearm-failed";
+
+export async function applyVoiceSelection(): Promise<VoiceSelectionOutcome> {
+  const s = session;
+  if (!s) return "next-session";
+  const { phase, micOpen } = useVoiceStore.getState();
+  const idle =
+    phase === "armed" && !micOpen && s.activeResponses === 0 && pendingVoiceAnnouncements() === 0;
+  if (!idle) return "next-session";
+  teardownSession();
+  await armVoiceSession().catch(() => {});
+  return session !== null ? "rearmed" : "rearm-failed";
+}
+
 // ---- Session plumbing -------------------------------------------------------
 
 async function doStart(): Promise<void> {
@@ -239,7 +284,11 @@ async function doStart(): Promise<void> {
   let audioEl: HTMLAudioElement | null = null;
   try {
     // 1. Short-lived credential + the tool catalogue (single source: Rust).
-    const secretRes = await commands.voiceAgentClientSecret();
+    // The voice is fixed at mint time (OpenAI won't swap it mid-session); an
+    // empty preference means "the app default", which Rust owns.
+    const secretRes = await commands.voiceAgentClientSecret(
+      useVoicePrefs.getState().voice || null,
+    );
     if (secretRes.status !== "ok") throw new Error(secretRes.error);
     const secret = secretRes.data;
     const toolsRes = await commands.appControlTools("app");
@@ -309,7 +358,7 @@ async function doStart(): Promise<void> {
         type: "session.update",
         session: {
           type: "realtime",
-          instructions: INSTRUCTIONS,
+          instructions: sessionInstructions(),
           tools,
           tool_choice: "auto",
           audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },

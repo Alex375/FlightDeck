@@ -1999,11 +1999,13 @@ async clearVoiceAgentKey() : Promise<Result<VoiceAgentStatus, string>> {
 },
 /**
  * Mint a short-lived Realtime client secret for ONE voice session — the only
- * shape of the credential the webview ever sees.
+ * shape of the credential the webview ever sees. `voice` is the user's picked
+ * voice, sanitized against the Rust-side catalogue (unknown → the default), and
+ * fixed for the whole session: OpenAI will not swap a voice mid-call.
  */
-async voiceAgentClientSecret() : Promise<Result<ClientSecret, string>> {
+async voiceAgentClientSecret(voice: string | null) : Promise<Result<ClientSecret, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret") };
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret", { voice }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2419,7 +2421,13 @@ export type ClientSecret = { value: string;
 /**
  * Unix seconds, as reported by OpenAI.
  */
-expires_at: number; model: string }
+expires_at: number; model: string; 
+/**
+ * The voice this session will actually speak with — the sanitized answer to
+ * what was asked for, so the front never has to guess whether its stored
+ * preference survived.
+ */
+voice: string }
 /**
  * The signed-in Codex account, whitelisted from `account/read` (no tokens — the wire
  * response carries none, and we forward only these fields).
@@ -4165,7 +4173,16 @@ export type VoiceAgentStatus = { configured: boolean;
 /**
  * e.g. `"sk-…d4f2"` — never more than the tail of the key.
  */
-key_hint: string | null }
+key_hint: string | null; 
+/**
+ * The voices the picker can offer (the catalogue above — the front never
+ * hard-codes its own list).
+ */
+voices: VoiceOption[]; 
+/**
+ * The voice used when the user has not picked one.
+ */
+default_voice: string }
 /**
  * The live state of the voice bridge, as reported to the Settings UI. This is
  * the honest read-back: `running`/`error` reflect what the listener actually
@@ -4180,6 +4197,11 @@ url: string | null;
  * Why the server is not running although enabled (bind failure, …).
  */
 error: string | null }
+/**
+ * One entry of the voice picker (same shape as the wake-word phrase catalogue,
+ * so Settings renders both the same way).
+ */
+export type VoiceOption = { key: string; label: string }
 /**
  * One selectable wake phrase for the Settings picker.
  */

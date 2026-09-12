@@ -3,7 +3,7 @@
 // destructive "drop all", kept while the SQL model is still in flux). The active
 // section is shared state so deep-links (e.g. the update banner) can open it
 // straight onto a given tab.
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
 import { usePermissionPrefs } from "../../store/permissions";
@@ -29,7 +29,8 @@ import {
 } from "./ControlSection";
 import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
-import { OptionCardRail, PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
+import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
+import { searchSettings, type SettingEntry } from "./settingsSearch";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -56,9 +57,86 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   { id: "data", label: "Data", icon: "trash" },
 ];
 
+/** The two tabs that carry too many unrelated cards to stack them all. The ids
+ *  are mirrored by `settingsSearch.SETTINGS_SUBS` (a unit test keeps the search
+ *  index from pointing at a sub-tab that doesn't exist). */
+const GENERAL_SUBS = [
+  { id: "display", label: "Display", icon: "list" },
+  { id: "timing", label: "Durations", icon: "clock" },
+  { id: "alerts", label: "Alerts", icon: "bell" },
+  { id: "system", label: "System", icon: "cog" },
+] as const;
+
+const CONTROL_SUBS = [
+  { id: "agents", label: "In-app agents", icon: "wand" },
+  { id: "voice", label: "Voice agent", icon: "mic" },
+  { id: "remote", label: "Remote", icon: "globe" },
+  { id: "bridge", label: "Bridge", icon: "bell" },
+] as const;
+
+type GeneralSub = (typeof GENERAL_SUBS)[number]["id"];
+type ControlSub = (typeof CONTROL_SUBS)[number]["id"];
+
+/** The rail label of a section, for a search result's breadcrumb. */
+function tabLabel(section: SettingsSection): string {
+  return TABS.find((t) => t.id === section)?.label ?? section;
+}
+
+/** What the panel shows instead of a tab while the search box has text. */
+function SearchResults({
+  query,
+  onPick,
+}: {
+  query: string;
+  onPick: (entry: SettingEntry) => void;
+}) {
+  const results = useMemo(() => searchSettings(query), [query]);
+  if (results.length === 0) {
+    return (
+      <div>
+        <PageHead title="Search" subtitle={`Nothing matches “${query}”.`} />
+        <div className={styles.desc}>
+          Try a word from the setting&rsquo;s name (“zoom”, “wake”, “bypass”), or browse the tabs
+          on the left.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <PageHead
+        title="Search"
+        subtitle={`${results.length} setting${results.length > 1 ? "s" : ""} matching “${query}”.`}
+      />
+      <div className={styles.results}>
+        {results.map((r) => (
+          <button
+            key={`${r.section}/${r.sub ?? ""}/${r.title}`}
+            type="button"
+            className={styles.result}
+            onClick={() => onPick(r)}
+          >
+            <span className={styles.resultTitle}>{r.title}</span>
+            <span className={styles.resultPath}>
+              {tabLabel(r.section)} › {r.group}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const section = useSettingsUi((s) => s.section);
   const setSection = useSettingsUi((s) => s.setSection);
+  const subs = useSettingsUi((s) => s.subs);
+  const setSub = useSettingsUi((s) => s.setSub);
+  const revealSetting = useSettingsUi((s) => s.revealSetting);
+  const generalSub = (subs.general ?? "display") as GeneralSub;
+  const controlSub = (subs.control ?? "agents") as ControlSub;
+  const [query, setQuery] = useState("");
+  const searching = query.trim().length > 0;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   // App version, read from the bundle (tauri.conf.json — the runtime source of
@@ -81,12 +159,19 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) close();
+      if (e.key !== "Escape" || busy) return;
+      // One Escape, one layer: a search in progress is the innermost one, so it
+      // clears first and the panel stays open.
+      if (query.trim().length > 0) {
+        setQuery("");
+        return;
+      }
+      close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, busy]);
+  }, [open, busy, query]);
 
   if (!open) return null;
 
@@ -117,6 +202,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             <Ico name="cog" className="sm" />
           </span>
           <span className={styles.title}>Settings</span>
+          <span className={styles.searchBox}>
+            <Ico name="search" className="sm" />
+            <input
+              className={styles.searchInput}
+              type="search"
+              value={query}
+              placeholder="Search settings…"
+              onChange={(e) => setQuery(e.target.value)}
+              aria-label="Search settings"
+            />
+          </span>
           <button className={styles.close} onClick={close} title="Close" aria-label="Close">
             ✕
           </button>
@@ -130,8 +226,11 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 key={t.id}
                 type="button"
                 className={styles.railItem}
-                data-on={section === t.id ? "" : undefined}
-                onClick={() => setSection(t.id)}
+                data-on={!searching && section === t.id ? "" : undefined}
+                onClick={() => {
+                  setQuery("");
+                  setSection(t.id);
+                }}
               >
                 {t.mark ?? <Ico name={t.icon} className="sm" />}
                 <span>{t.label}</span>
@@ -140,7 +239,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
           </nav>
 
           <div className={styles.content}>
-            {section === "general" && (
+            {searching && (
+              <SearchResults
+                query={query}
+                onPick={(entry) => {
+                  setQuery("");
+                  revealSetting({ section: entry.section, sub: entry.sub, title: entry.title });
+                }}
+              />
+            )}
+
+            {!searching && section === "general" && (
               <div>
                 <PageHead title="General" subtitle="Appearance, fleet, and app alerts." />
 
@@ -157,26 +266,40 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   {version && <span className={styles.version}>v{version}</span>}
                 </div>
 
-                <DisplayPrefs />
-                <TimingPrefs />
-                <FleetBannerPrefs />
-                <BackgroundTaskPrefs />
-                <PermissionPrefs />
-                <CaffeinatePrefs />
+                <SubTabs
+                  tabs={GENERAL_SUBS}
+                  active={generalSub}
+                  onSelect={(id) => setSub("general", id)}
+                  ariaLabel="General settings"
+                />
+                {generalSub === "display" && <DisplayPrefs />}
+                {generalSub === "timing" && <TimingPrefs />}
+                {generalSub === "alerts" && (
+                  <>
+                    <FleetBannerPrefs />
+                    <BackgroundTaskPrefs />
+                  </>
+                )}
+                {generalSub === "system" && (
+                  <>
+                    <PermissionPrefs />
+                    <CaffeinatePrefs />
+                  </>
+                )}
               </div>
             )}
 
-            {section === "accounts" && <AccountsSection />}
+            {!searching && section === "accounts" && <AccountsSection />}
 
-            {section === "tosse" && <TosseSection />}
+            {!searching && section === "tosse" && <TosseSection />}
 
-            {section === "conversation" && <ConversationSection />}
+            {!searching && section === "conversation" && <ConversationSection />}
 
-            {section === "models" && <ModelsSection />}
+            {!searching && section === "models" && <ModelsSection />}
 
-            {section === "composer" && <ComposerSection />}
+            {!searching && section === "composer" && <ComposerSection />}
 
-            {section === "reordering" && (
+            {!searching && section === "reordering" && (
               <div>
                 <PageHead
                   title="Reordering"
@@ -186,29 +309,41 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               </div>
             )}
 
-            {section === "shortcuts" && <ShortcutsSection />}
+            {!searching && section === "shortcuts" && <ShortcutsSection />}
 
-            {section === "control" && (
+            {!searching && section === "control" && (
               <div className={styles.page}>
                 <PageHead
                   title="MCP Control"
                   subtitle="Let agents pilot the app — from inside a conversation, by voice, from your phone, or from an external client."
                 />
-                {/* Order: in-app control, the built-in voice agent, phone remote
-                    access, then the bridge for EXTERNAL clients (most niche last). */}
-                <AgentControlGroup />
-                <RemoteServersGroup />
-                <VoiceAgentSection />
-                <RemoteAccessGroup />
-                <VoiceBridgeGroup />
+                {/* Order: in-app control, the built-in voice agent, remote access
+                    (SSH hosts + phone), then the bridge for EXTERNAL clients (most
+                    niche last). One sub-page at a time — these are five unrelated
+                    systems and stacking them made the tab a scroll. */}
+                <SubTabs
+                  tabs={CONTROL_SUBS}
+                  active={controlSub}
+                  onSelect={(id) => setSub("control", id)}
+                  ariaLabel="Control settings"
+                />
+                {controlSub === "agents" && <AgentControlGroup />}
+                {controlSub === "voice" && <VoiceAgentSection />}
+                {controlSub === "remote" && (
+                  <>
+                    <RemoteServersGroup />
+                    <RemoteAccessGroup />
+                  </>
+                )}
+                {controlSub === "bridge" && <VoiceBridgeGroup />}
               </div>
             )}
 
-            {section === "notifications" && <NotificationsSection />}
+            {!searching && section === "notifications" && <NotificationsSection />}
 
             {/* Two updaters, one tab: the app itself, then the `claude` binary it drives.
                 One page heading covers both — each has its own titled card below. */}
-            {section === "updates" && (
+            {!searching && section === "updates" && (
               <div>
                 <PageHead
                   title="Updates"
@@ -219,7 +354,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               </div>
             )}
 
-            {section === "data" && (
+            {!searching && section === "data" && (
               <div>
                 <PageHead
                   title="Data"

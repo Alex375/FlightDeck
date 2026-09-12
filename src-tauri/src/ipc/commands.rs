@@ -3109,11 +3109,15 @@ pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, S
 }
 
 /// Mint a short-lived Realtime client secret for ONE voice session — the only
-/// shape of the credential the webview ever sees.
+/// shape of the credential the webview ever sees. `voice` is the user's picked
+/// voice, sanitized against the Rust-side catalogue (unknown → the default), and
+/// fixed for the whole session: OpenAI will not swap a voice mid-call.
 #[tauri::command]
 #[specta::specta]
-pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, String> {
-    crate::voice::mint_client_secret().await
+pub async fn voice_agent_client_secret(
+    voice: Option<String>,
+) -> Result<crate::voice::ClientSecret, String> {
+    crate::voice::mint_client_secret(voice).await
 }
 
 // ---------------------------------------------------------------------------

@@ -24,9 +24,11 @@ export interface FleetAnnouncement {
 
 /**
  * The line handed to the Realtime session as a user-role event message. Not
- * the SPOKEN text — the agent rephrases it (its instructions ask for one or
- * two spoken sentences) — so this stays structured and complete rather than
- * pretty.
+ * the SPOKEN text — the agent rephrases it, telegraphically (see
+ * instructions.ts) — so this stays structured and complete rather than pretty.
+ * The closing directive repeats the no-filler rule on purpose: the event line is
+ * the last thing in the context before the agent speaks, and that is exactly
+ * where a padded "c'est bon, je reviens vers toi" used to creep back in.
  */
 export function announcementText(a: FleetAnnouncement): string {
   const where = a.repository ? ` (repo ${a.repository})` : "";
@@ -36,11 +38,11 @@ export function announcementText(a: FleetAnnouncement): string {
         ? `is blocked on a permission prompt${a.tool ? ` for the ${a.tool} tool` : ""}`
         : "asked a question and is waiting for an answer";
     const detail = a.prompt ? `\nPrompt: ${a.prompt}` : "";
-    return `[Flight Deck event] The conversation "${a.title}"${where} ${what}.${detail}\nTell the user briefly and ask what to answer. conversation_id: ${a.conversationId}`;
+    return `[Flight Deck event] The conversation "${a.title}"${where} ${what}.${detail}\nSay what it is blocked on in ONE sentence, then the question it needs answered. No preamble, no filler. conversation_id: ${a.conversationId}`;
   }
   const how = a.outcome === "error" ? "finished its turn WITH AN ERROR" : "finished its turn";
   const detail = a.lastAssistantText ? `\nIts last reply: ${a.lastAssistantText}` : "";
-  return `[Flight Deck event] The conversation "${a.title}"${where} ${how}.${detail}\nSummarize that to the user in one or two spoken sentences and ask if they want to reply. conversation_id: ${a.conversationId}`;
+  return `[Flight Deck event] The conversation "${a.title}"${where} ${how}.${detail}\nSay it finished, then the substance of its reply in ONE sentence, then ask what to answer. No preamble, no filler, no "I'll get back to you". conversation_id: ${a.conversationId}`;
 }
 
 // ---- The queue --------------------------------------------------------------

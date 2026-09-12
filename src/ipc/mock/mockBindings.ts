@@ -267,6 +267,14 @@ const mockWake: WakeStatus = {
 const mockVoiceAgent: VoiceAgentStatus = {
   configured: false,
   key_hint: null,
+  // A couple of entries is enough to exercise the picker in the browser mock —
+  // the real catalogue lives Rust-side (`voice/mod.rs`).
+  voices: [
+    { key: "marin", label: "Marin — warm, recommended" },
+    { key: "cedar", label: "Cedar — calm, recommended" },
+    { key: "verse", label: "Verse — narrative" },
+  ],
+  default_voice: "marin",
 };
 
 // In-memory remote-access state for the browser mock (no real relay connection).
@@ -1531,7 +1539,7 @@ export const mockCommands = {
     return ok({ ...mockVoiceAgent });
   },
 
-  async voiceAgentClientSecret(): Promise<Result<ClientSecret, string>> {
+  async voiceAgentClientSecret(_voice: string | null): Promise<Result<ClientSecret, string>> {
     return err("the voice agent is not available in the browser mock");
   },
 

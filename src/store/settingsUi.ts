@@ -23,17 +23,50 @@ interface SettingsUiState {
   open: boolean;
   /** The section to show when (re)opened. Persists across opens. */
   section: SettingsSection;
+  /**
+   * The sub-tab within the current section (`null` = its first one). Sections
+   * that carry a lot of unrelated cards (General, MCP Control) split them behind
+   * a pill row instead of stacking them all; every other section ignores this.
+   * Remembered PER SECTION so leaving a tab and coming back lands where you were.
+   */
+  subs: Partial<Record<SettingsSection, string>>;
+  /**
+   * A row title to flash and scroll to, set when the user picks a search result.
+   * Matching is by the row's visible title (`ToggleRow`/`SettingsGroup` compare
+   * their own), so nothing has to thread ids through every settings row. Cleared
+   * by the row once it has flashed — and by any manual navigation, so a title
+   * that no longer exists can never leave a highlight armed forever.
+   */
+  highlight: string | null;
   /** Open the panel, optionally jumping straight to `section`. */
   openSettings: (section?: SettingsSection) => void;
   closeSettings: () => void;
   /** Switch the active section while the panel is open. */
   setSection: (section: SettingsSection) => void;
+  /** Switch the sub-tab of the section currently shown. */
+  setSub: (section: SettingsSection, sub: string) => void;
+  /** Jump to a setting found in search: its section, its sub-tab, and the row to flash. */
+  revealSetting: (target: { section: SettingsSection; sub?: string; title: string }) => void;
+  clearHighlight: () => void;
 }
 
 export const useSettingsUi = create<SettingsUiState>((set) => ({
   open: false,
   section: "general",
-  openSettings: (section) => set(section ? { open: true, section } : { open: true }),
-  closeSettings: () => set({ open: false }),
-  setSection: (section) => set({ section }),
+  subs: {},
+  highlight: null,
+  openSettings: (section) =>
+    set(section ? { open: true, section, highlight: null } : { open: true }),
+  closeSettings: () => set({ open: false, highlight: null }),
+  setSection: (section) => set({ section, highlight: null }),
+  setSub: (section, sub) =>
+    set((s) => ({ subs: { ...s.subs, [section]: sub }, highlight: null })),
+  revealSetting: ({ section, sub, title }) =>
+    set((s) => ({
+      open: true,
+      section,
+      subs: sub ? { ...s.subs, [section]: sub } : s.subs,
+      highlight: title,
+    })),
+  clearHighlight: () => set({ highlight: null }),
 }));

@@ -1001,3 +1001,165 @@
   font-size: 12px;
   color: var(--text-muted);
 }
+
+/* ---- Sub-tabs: one settings tab split into sub-pages ------------------- */
+.subTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 18px;
+}
+.subTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border: 1px solid var(--wf-line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-hover), color var(--transition-hover),
+    border-color var(--transition-hover);
+}
+.subTab :global(.wf-ico) {
+  color: var(--text-muted);
+  width: 13px;
+  height: 13px;
+  transition: color var(--transition-hover);
+}
+.subTab:hover {
+  background: #ffffff06;
+  color: var(--text-primary);
+}
+.subTab[data-on] {
+  background: linear-gradient(90deg, #2a1c15, #1a1512 80%);
+  border-color: #43301f;
+  color: var(--text-primary);
+}
+.subTab[data-on] :global(.wf-ico) {
+  color: var(--accent);
+}
+
+/* ---- Search: the box in the header, and its result list ---------------- */
+.searchBox {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+.searchBox:focus-within {
+  border-color: var(--accent);
+}
+.searchBox :global(.wf-ico) {
+  width: 13px;
+  height: 13px;
+  flex: none;
+}
+.searchInput {
+  width: 190px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+}
+.searchInput::placeholder {
+  color: var(--wf-tx-xlo);
+}
+
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.result {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--wf-line);
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-hover), border-color var(--transition-hover);
+}
+.result:hover {
+  background: #ffffff06;
+  border-color: var(--border-strong);
+}
+.resultTitle {
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  font-weight: 500;
+}
+.resultPath {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+/* The row (or card) a search result jumped to: a brief coral wash, then gone.
+   Long enough to catch the eye after the scroll, short enough not to linger. */
+.trow[data-hit],
+.group[data-hit] {
+  animation: settingHit 1.5s ease-out;
+  border-radius: 8px;
+}
+@keyframes settingHit {
+  0%,
+  55% {
+    background: #ff7a5922;
+    box-shadow: inset 0 0 0 1px #ff7a5955;
+  }
+  100% {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+/* Someone who asked for no motion gets the wash without the fade. */
+@media (prefers-reduced-motion: reduce) {
+  .trow[data-hit],
+  .group[data-hit] {
+    animation: none;
+    background: #ff7a5918;
+  }
+}
+
+/* The voice agent's editable brief: a monospace box big enough to read a
+   paragraph of it without scrolling, resizable when it isn't. */
+.promptBox {
+  display: block;
+  width: 100%;
+  min-height: 132px;
+  margin: 10px 0 8px;
+  padding: 9px 11px;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm, 6px);
+  resize: vertical;
+}
+.promptBox:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.promptBox::placeholder {
+  color: var(--wf-tx-xlo);
+}
+.promptBox:disabled {
+  opacity: 0.5;
+}

@@ -50,12 +50,60 @@ fn service_name_for(identifier: Option<&str>) -> String {
     }
 }
 
-/// Realtime session defaults. The model is OpenAI's GA speech-to-speech model;
-/// the voice is one of its natural presets. Deliberately constants for v1 — a
-/// picker can come later if the need shows up.
+/// Realtime session defaults. The model is OpenAI's GA speech-to-speech model.
 const REALTIME_MODEL: &str = "gpt-realtime";
-const REALTIME_VOICE: &str = "marin";
 const MINT_URL: &str = "https://api.openai.com/v1/realtime/client_secrets";
+
+/// The voices the GA Realtime model can speak with, in the order the picker
+/// shows them: the two purpose-built for `gpt-realtime` first (OpenAI's own
+/// recommendation), then the earlier presets. This list is the ONE place that
+/// decides what a valid voice is — the front passes a key, we sanitize it here,
+/// so a stale preference can never reach OpenAI as a 400.
+const VOICES: &[(&str, &str)] = &[
+    ("marin", "Marin — warm, recommended"),
+    ("cedar", "Cedar — calm, recommended"),
+    ("alloy", "Alloy — neutral"),
+    ("ash", "Ash — soft"),
+    ("ballad", "Ballad — expressive"),
+    ("coral", "Coral — bright"),
+    ("echo", "Echo — even"),
+    ("sage", "Sage — measured"),
+    ("shimmer", "Shimmer — light"),
+    ("verse", "Verse — narrative"),
+];
+
+/// The voice used when the user has never picked one (and the fallback for a
+/// key we do not know).
+const DEFAULT_VOICE: &str = "marin";
+
+/// One entry of the voice picker (same shape as the wake-word phrase catalogue,
+/// so Settings renders both the same way).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct VoiceOption {
+    pub key: String,
+    pub label: String,
+}
+
+fn voice_catalogue() -> Vec<VoiceOption> {
+    VOICES
+        .iter()
+        .map(|(key, label)| VoiceOption { key: key.to_string(), label: label.to_string() })
+        .collect()
+}
+
+/// Normalize a requested voice to a known key. An unknown / absent one falls
+/// back to the default rather than failing the session: the voice is cosmetic,
+/// and a mint that 400s would cost the user their whole voice session.
+fn sanitize_voice(requested: Option<&str>) -> &'static str {
+    let Some(want) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_VOICE;
+    };
+    VOICES
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(want))
+        .map(|(key, _)| *key)
+        .unwrap_or(DEFAULT_VOICE)
+}
 
 /// What the Settings card needs to render the voice-agent state: whether a key
 /// is stored, and a masked hint so the user can tell WHICH key without ever
@@ -65,6 +113,11 @@ pub struct VoiceAgentStatus {
     pub configured: bool,
     /// e.g. `"sk-…d4f2"` — never more than the tail of the key.
     pub key_hint: Option<String>,
+    /// The voices the picker can offer (the catalogue above — the front never
+    /// hard-codes its own list).
+    pub voices: Vec<VoiceOption>,
+    /// The voice used when the user has not picked one.
+    pub default_voice: String,
 }
 
 /// A short-lived Realtime client secret, safe to hand to the webview: it opens
@@ -75,6 +128,10 @@ pub struct ClientSecret {
     /// Unix seconds, as reported by OpenAI.
     pub expires_at: i64,
     pub model: String,
+    /// The voice this session will actually speak with — the sanitized answer to
+    /// what was asked for, so the front never has to guess whether its stored
+    /// preference survived.
+    pub voice: String,
 }
 
 /// Mask a key down to its identifying tail (`sk-…d4f2`).
@@ -183,16 +240,27 @@ fn read_key() -> Option<String> {
 
 /// The Settings read-back.
 pub fn status() -> VoiceAgentStatus {
-    match read_key() {
-        Some(key) => VoiceAgentStatus { configured: true, key_hint: Some(key_hint(&key)) },
-        None => VoiceAgentStatus { configured: false, key_hint: None },
+    let (configured, key_hint) = match read_key() {
+        Some(key) => (true, Some(key_hint(&key))),
+        None => (false, None),
+    };
+    VoiceAgentStatus {
+        configured,
+        key_hint,
+        voices: voice_catalogue(),
+        default_voice: DEFAULT_VOICE.to_string(),
     }
 }
 
 /// Mint a short-lived Realtime client secret for one voice session. The only
 /// place the long-lived key is used; errors carry a response snippet but NEVER
 /// the key itself.
-pub async fn mint_client_secret() -> Result<ClientSecret, String> {
+///
+/// ⚠️ The voice is fixed HERE, at mint time, for the whole session — the GA
+/// Realtime API will not swap it once the model has produced audio. Changing the
+/// preference therefore takes effect on the next session (the front re-arms an
+/// idle one so the change is felt immediately).
+pub async fn mint_client_secret(voice: Option<String>) -> Result<ClientSecret, String> {
     let Some(key) = read_key() else {
         return Err("no OpenAI key configured — add one in Settings → Control".to_string());
     };
@@ -206,7 +274,7 @@ pub async fn mint_client_secret() -> Result<ClientSecret, String> {
         "session": {
             "type": "realtime",
             "model": REALTIME_MODEL,
-            "audio": { "output": { "voice": REALTIME_VOICE } }
+            "audio": { "output": { "voice": sanitize_voice(voice.as_deref()) } }
         }
     });
     let resp = client
@@ -232,7 +300,12 @@ pub async fn mint_client_secret() -> Result<ClientSecret, String> {
         .ok_or_else(|| format!("no client secret in the OpenAI response: {}", snippet(&text)))?
         .to_string();
     let expires_at = parsed.get("expires_at").and_then(serde_json::Value::as_i64).unwrap_or(0);
-    Ok(ClientSecret { value, expires_at, model: REALTIME_MODEL.to_string() })
+    Ok(ClientSecret {
+        value,
+        expires_at,
+        model: REALTIME_MODEL.to_string(),
+        voice: sanitize_voice(voice.as_deref()).to_string(),
+    })
 }
 
 /// First ~300 chars of a response body for error details (mirrors `usage/`).
@@ -259,6 +332,26 @@ mod tests {
         let hint = key_hint("sk-proj-abcdefghijklmnopqrstuvwx-d4f2");
         assert_eq!(hint, "sk-…d4f2");
         assert!(!hint.contains("abcdef"));
+    }
+
+    /// A voice the catalogue doesn't know (stale preference, typo, a voice OpenAI
+    /// retired) degrades to the default instead of failing the whole session.
+    #[test]
+    fn unknown_voices_fall_back_to_the_default() {
+        assert_eq!(sanitize_voice(Some("cedar")), "cedar");
+        assert_eq!(sanitize_voice(Some("  Cedar  ")), "cedar");
+        assert_eq!(sanitize_voice(Some("nope")), DEFAULT_VOICE);
+        assert_eq!(sanitize_voice(Some("")), DEFAULT_VOICE);
+        assert_eq!(sanitize_voice(None), DEFAULT_VOICE);
+    }
+
+    /// The picker's catalogue must contain the default — otherwise Settings would
+    /// show a selection the user cannot reproduce.
+    #[test]
+    fn the_catalogue_holds_the_default_voice() {
+        let catalogue = voice_catalogue();
+        assert!(catalogue.iter().any(|v| v.key == DEFAULT_VOICE));
+        assert!(catalogue.iter().all(|v| !v.label.is_empty()));
     }
 
     /// Validation rejects only the never-a-key shapes; plausible keys pass and
