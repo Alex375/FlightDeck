@@ -410,6 +410,10 @@
   color: var(--wf-tx);
 }
 .cc-table tr:last-child td { border-bottom: 0; }
+/* Scoped to the table so it outranks `.cc-table th`'s left alignment — otherwise the
+   headers sit left while their numbers sit right, and every figure reads as belonging to
+   the column beside it. */
+.cc-table .cc-num { text-align: right; font-variant-numeric: tabular-nums; }
 .cc-num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ---- Instructions ------------------------------------------------------ */
@@ -524,13 +528,12 @@
 
 /* ---- Unsaved instructions ---------------------------------------------- */
 
-/* Proposed-but-unsaved text reads like a diff's added lines: a green tint and a green
-   gutter, so it is obvious at a glance that nothing has been written to the file yet. */
+/* A quiet cue that the box no longer matches the file. Deliberately restrained: the diff
+   underneath is what actually shows the change, and tinting the whole editing surface
+   green made every character look like an addition. */
 .cc-textarea[data-unsaved] {
   border-color: #2f6b4a;
   border-left-width: 3px;
-  background: #0f1a14;
-  color: #b9e6cc;
 }
 
 .cc-unsaved {
@@ -573,4 +576,141 @@
   font-weight: 500;
   letter-spacing: .3px;
   text-transform: uppercase;
+}
+
+/* ---- Per-folder rows (HTML, not SVG) ----------------------------------- */
+
+.cc-hplot { display: flex; flex-direction: column; gap: 6px; }
+
+.cc-hrow {
+  display: grid;
+  /* A fixed label column: folder names have no common length, so sizing to the longest
+     would starve the bars on every other row. */
+  grid-template-columns: 104px 1fr 62px;
+  gap: 10px;
+  align-items: center;
+}
+
+/* A hairline between the names and the bars. Its job is to say "the label ends HERE", so
+   a clipped name reads as clipped rather than as a name that runs under the chart. */
+.cc-hrow::before { display: none; }
+.cc-hplot { position: relative; }
+.cc-hplot::before {
+  content: "";
+  position: absolute;
+  left: 110px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--wf-line);
+  pointer-events: none;
+}
+
+.cc-hlabel {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: default;
+  /* Fade to nothing at the divider rather than cutting with an ellipsis: the point is that
+     the name continues, and the full name + path are one hover away. */
+  mask-image: linear-gradient(to right, #000 78%, transparent 100%);
+}
+.cc-hlabel:hover { color: var(--wf-tx-hi); }
+
+.cc-hbar { display: flex; gap: 2px; align-items: center; height: 14px; }
+.cc-hseg {
+  height: 100%;
+  min-width: 2px;
+  border-radius: 0;
+  cursor: default;
+}
+/* Round only the data end — the outer tip of the bar. */
+.cc-hseg[data-end] { border-radius: 0 4px 4px 0; }
+.cc-hseg:first-child { border-radius: 4px 0 0 4px; }
+.cc-hseg:first-child[data-end] { border-radius: 4px; }
+
+.cc-hvalue {
+  color: var(--wf-tx-hi);
+  font-size: 11px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A path can be long; let it wrap instead of stretching the tooltip off the window. */
+.cc-tip-path {
+  margin-top: 3px;
+  max-width: 260px;
+  color: var(--wf-tx-lo);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cc-tip { max-width: 280px; }
+
+/* ---- Diff of the managed block ----------------------------------------- */
+
+.cc-diff-wrap { margin: 8px 0 0; }
+
+.cc-unsaved {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin: 0 0 6px;
+  color: var(--wf-tx);
+  font-size: 11px;
+}
+.cc-unsaved svg { align-self: center; color: #c98500; }
+.cc-unsaved .cc-hint { margin: 0; }
+
+.cc-diff-add,
+.cc-diff-del {
+  padding: 0 5px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+}
+.cc-diff-add { background: #16301f; color: #7fc9a2; }
+.cc-diff-del { background: #351a1a; color: #e08b8b; }
+
+.cc-diff {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 0;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  background: var(--wf-bg-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.cc-diff-line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.cc-diff-same { color: var(--wf-tx-lo); }
+/* Added and removed lines are BOTH shown. Red is not an error here — it is what the file
+   would lose, kept on screen until the save that removes it. */
+.cc-diff-add.cc-diff-line,
+.cc-diff-line.cc-diff-add { background: #13271b; color: #9fe0c0; }
+.cc-diff-line.cc-diff-del { background: #2b1618; color: #e8a7a7; }
+
+.cc-diff-gap {
+  padding: 1px 10px;
+  color: var(--wf-tx-xlo);
+  letter-spacing: 2px;
 }

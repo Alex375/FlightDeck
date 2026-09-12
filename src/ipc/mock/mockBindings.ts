@@ -584,6 +584,9 @@ function mockSpendReport(): SpendReport {
       ["/Users/demo/repos/tosse-code", "tosse-code"],
       ["/Users/demo/repos/santecall", "santecall"],
       ["/Users/demo/repos/Citadel", "Citadel"],
+      // A deliberately long name: the label column is fixed, so this is the case that
+      // proves the fade and the hover-for-full-path actually work.
+      ["/Users/demo/repos/web_dentiste_middleware_api", "web_dentiste_middleware_api"],
     ];
     // A cheap deterministic pseudo-random so the numbers look lived-in but never move.
     let seed = 7;
@@ -2095,8 +2098,12 @@ export const mockCommands = {
     return ok({
       path: "/Users/demo/.claude/CLAUDE.md",
       exists: true,
-      managed_text: null,
-      full_text: "# My instructions\n\nAlways write tests before the fix.\n",
+      // A block already in the file, so the demo can show REMOVALS as well as additions —
+      // an empty block only ever produces green, which hides half of what the diff is for.
+      managed_text:
+        "## Choosing a model for a helper agent\n\nAn older version of the policy that the\nsuggested block would replace.\n",
+      full_text:
+        "# My instructions\n\nAlways write tests before the fix.\n\n<!-- flightdeck:managed:start -->\n## Choosing a model for a helper agent\n\nAn older version of the policy that the\nsuggested block would replace.\n<!-- flightdeck:managed:end -->\n",
       marker_error: null,
     });
   },

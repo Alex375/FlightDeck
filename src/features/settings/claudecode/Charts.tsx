@@ -409,19 +409,27 @@ export function StackedBarsOverTime({
   );
 }
 
+
 // ---- Horizontal stacked bars ----------------------------------------------
 
 export interface StackedBarRow {
   key: string;
   label: string;
+  /** Full identity behind the label — a repository's absolute path. Shown on hover, so a
+   *  truncated label never leaves the reader guessing which folder a row is. */
+  detail?: string;
   total: number;
   parts: Array<{ key: string; label: string; value: number }>;
 }
 
 /**
  * One bar per repository, split by model — answers "where does the money go" and "what is
- * it being spent on" in a single figure, instead of two charts showing the same totals
- * twice.
+ * it being spent on" in one figure instead of two charts showing the same totals twice.
+ *
+ * Laid out in HTML rather than SVG. Folder names vary wildly in length, and the fixes that
+ * matter for that — fading a label as it reaches its column, wrapping a long path in a
+ * tooltip — are one CSS property each in HTML and a mask plus hand-built text wrapping in
+ * SVG. Nothing here needs SVG's coordinate space: the bars are proportional widths.
  */
 export function StackedBarChart({
   rows,
@@ -434,103 +442,120 @@ export function StackedBarChart({
   title: string;
   emptyNote?: string;
 }) {
-  const [ref, width, node] = useElementWidth<HTMLElement>();
+  const [ref, , node] = useElementWidth<HTMLDivElement>();
   const [tip, setTip] = useState<TooltipState | null>(null);
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set());
+
+  const allSeries = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const row of rows) for (const p of row.parts) seen.set(p.key, p.label);
+    return [...seen].map(([key, label]) => ({ key, label }));
+  }, [rows]);
+
+  // Same filter as the daily chart: hiding the dominant model is how a small one becomes
+  // visible. Totals and bar widths follow what is shown.
+  const shown = useMemo(
+    () =>
+      rows
+        .map((r) => {
+          const parts = r.parts.filter((p) => !hidden.has(p.key));
+          return { ...r, parts, total: parts.reduce((n, p) => n + p.value, 0) };
+        })
+        .filter((r) => r.parts.length > 0)
+        .sort((a, b) => b.total - a.total),
+    [rows, hidden],
+  );
+
+  const toggle = (key: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next.size >= allSeries.length ? prev : next;
+    });
 
   if (rows.length === 0) return <EmptyChart title={title} note={emptyNote} />;
 
-  const labelW = 96;
-  const valueW = 64;
-  const barW = Math.max(0, width - labelW - valueW - 12);
-  const max = Math.max(1, ...rows.map((r) => r.total));
-  const rowH = 26;
-  const barH = 14;
-
-  const allSeries = new Map<string, string>();
-  for (const row of rows) for (const p of row.parts) allSeries.set(p.key, p.label);
+  const max = Math.max(1, ...shown.map((r) => r.total));
 
   return (
-    <figure className="cc-chart" ref={ref}>
+    <figure className="cc-chart">
       <figcaption className="cc-chart-title">{title}</figcaption>
-      <div className="cc-plot" style={{ height: rows.length * rowH + 4 }}>
-        {width > 0 && (
-          <svg width={width} height={rows.length * rowH + 4} role="img" aria-label={title}>
-            {rows.map((row, ri) => {
-              const y = ri * rowH + 4;
-              let cursor = 0;
-              return (
-                <g key={row.key}>
-                  <text x={0} y={y + barH - 2} className="cc-barlabel">
-                    {row.label}
-                  </text>
-                  {row.parts.map((part, pi) => {
-                    const raw = (part.value / max) * barW;
-                    // A 2px gap between adjacent segments, taken off the segment, so the
-                    // bar's total length still reads as the total.
-                    const isLast = pi === row.parts.length - 1;
-                    const w = Math.max(0, raw - (isLast ? 0 : 2));
-                    const x = labelW + cursor;
-                    cursor += raw;
-                    if (w <= 0) return null;
-                    return (
-                      <rect
-                        key={part.key}
-                        x={x}
-                        y={y}
-                        width={w}
-                        height={barH}
-                        // The outer end of the bar is the data end: round it, keep the
-                        // internal joins square so the stack reads as one length.
-                        rx={isLast ? 4 : 0}
-                        fill={hueForSeries(part.key)}
-                        onMouseEnter={(e) => {
-                          setTip({
-                            ...tooltipPosition(
-                              e.clientX,
-                              e.clientY,
-                              node.current?.getBoundingClientRect(),
-                            ),
-                            content: (
-                              <>
-                                <div className="cc-tip-head">{row.label}</div>
-                                <div className="cc-tip-row">
-                                  <span
-                                    className="cc-swatch"
-                                    style={{ background: hueForSeries(part.key) }}
-                                    aria-hidden
-                                  />
-                                  {part.label}
-                                  <b>{formatValue(part.value)}</b>
-                                </div>
-                                <div className="cc-tip-row cc-tip-total">
-                                  Total<b>{formatValue(row.total)}</b>
-                                </div>
-                              </>
-                            ),
-                          });
-                        }}
-                        onMouseLeave={() => setTip(null)}
-                      />
-                    );
-                  })}
-                  {/* Direct label on every bar: few rows, and it removes the need to
-                      read a value off an axis. */}
-                  <text
-                    x={width}
-                    y={y + barH - 2}
-                    textAnchor="end"
-                    className="cc-barvalue"
-                  >
-                    {formatValue(row.total)}
-                  </text>
-                </g>
-              );
-            })}
-          </svg>
-        )}
+      <div className="cc-plot cc-hplot" ref={ref}>
+        {shown.map((row) => (
+          <div className="cc-hrow" key={row.key}>
+            {/* The label fades out as it reaches the divider instead of sliding under the
+                bars. Names have no common length — some repos are one word, some are five
+                — so the column cannot simply be widened to fit the worst case. */}
+            <button
+              type="button"
+              className="cc-hlabel"
+              onMouseEnter={(e) =>
+                setTip({
+                  ...tooltipPosition(
+                    e.clientX,
+                    e.clientY,
+                    node.current?.getBoundingClientRect(),
+                  ),
+                  content: (
+                    <>
+                      <div className="cc-tip-head">{row.label}</div>
+                      {row.detail && <div className="cc-tip-path">{row.detail}</div>}
+                    </>
+                  ),
+                })
+              }
+              onMouseLeave={() => setTip(null)}
+            >
+              {row.label}
+            </button>
+            <div className="cc-hbar">
+              {row.parts.map((part, pi) => {
+                const pct = (part.value / max) * 100;
+                if (pct <= 0) return null;
+                return (
+                  <span
+                    key={part.key}
+                    className="cc-hseg"
+                    data-end={pi === row.parts.length - 1 ? "" : undefined}
+                    style={{ width: `${pct}%`, background: hueForSeries(part.key) }}
+                    onMouseEnter={(e) =>
+                      setTip({
+                        ...tooltipPosition(
+                          e.clientX,
+                          e.clientY,
+                          node.current?.getBoundingClientRect(),
+                        ),
+                        content: (
+                          <>
+                            <div className="cc-tip-head">{row.label}</div>
+                            <div className="cc-tip-row">
+                              <span
+                                className="cc-swatch"
+                                style={{ background: hueForSeries(part.key) }}
+                                aria-hidden
+                              />
+                              {part.label}
+                              <b>{formatValue(part.value)}</b>
+                            </div>
+                            <div className="cc-tip-row cc-tip-total">
+                              Total<b>{formatValue(row.total)}</b>
+                            </div>
+                          </>
+                        ),
+                      })
+                    }
+                    onMouseLeave={() => setTip(null)}
+                  />
+                );
+              })}
+            </div>
+            <span className="cc-hvalue">{formatValue(row.total)}</span>
+          </div>
+        ))}
         <Tooltip state={tip} />
       </div>
-      <ChartLegend series={[...allSeries].map(([key, label]) => ({ key, label }))} />
+      <ChartLegend series={allSeries} hidden={hidden} onToggle={toggle} />
     </figure>
   );
 }

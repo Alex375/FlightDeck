@@ -18,6 +18,7 @@ import { ConfirmDialog } from "../../../ui/ConfirmDialog";
 import { PageHead, SettingsGroup } from "../SettingsKit";
 import { StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
 import { copyFor, INSTRUCTION_BLOCKS } from "./agentCopy";
+import { countChanges, diffLines, withElisions } from "./lineDiff";
 import {
   applyFilter,
   dailyByModel,
@@ -652,6 +653,9 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
         rows={byRepo.map((r) => ({
           key: r.repo,
           label: r.label,
+          // The absolute path, surfaced on hover — a faded label must never leave the
+          // reader guessing which of two similarly-named folders a row is.
+          detail: r.repo,
           total: r.total,
           parts: r.parts,
         }))}
@@ -836,6 +840,10 @@ function InstructionsGroup() {
   // "Dirty" means the box differs from what is actually in the file — either the user
   // typed, or they clicked a suggested block and have not saved it yet.
   const dirty = draft !== null && draft.trim() !== (managed ?? "").trim();
+  // Computed against what is actually IN the file, so the red lines are real removals
+  // rather than a diff against the last thing typed.
+  const diff = useMemo(() => diffLines(managed ?? "", current), [managed, current]);
+  const changes = countChanges(diff);
 
   return (
     <SettingsGroup
@@ -897,9 +905,7 @@ function InstructionsGroup() {
         The managed block
         <textarea
           className="cc-textarea"
-          // Unsaved text is tinted like a diff's added lines. Without it the box looks
-          // identical whether the instructions are live in the file or merely proposed,
-          // which is the one thing the reader most needs to tell apart.
+          // A quiet cue that the box differs from the file; the diff below says how.
           data-unsaved={dirty ? "" : undefined}
           rows={10}
           value={current}
@@ -909,10 +915,31 @@ function InstructionsGroup() {
         />
       </label>
       {dirty && (
-        <p className="cc-unsaved">
-          <Ico name="alert" />
-          Not in your file yet — save to write it.
-        </p>
+        <div className="cc-diff-wrap">
+          <p className="cc-unsaved">
+            <Ico name="alert" />
+            Not saved yet
+            {changes.added > 0 && <span className="cc-diff-add">+{changes.added}</span>}
+            {changes.removed > 0 && <span className="cc-diff-del">−{changes.removed}</span>}
+            <span className="cc-hint">what saving would change:</span>
+          </p>
+          {/* A real diff, not just a tint. Green says what arrives; red keeps what would
+              LEAVE on screen until you save it away — the failure worth preventing is
+              quietly dropping a line from a file you also edit by hand. */}
+          <pre className="cc-diff">
+            {withElisions(diff).map((line, i) =>
+              line === null ? (
+                <span key={i} className="cc-diff-gap">
+                  ⋯
+                </span>
+              ) : (
+                <span key={i} className={`cc-diff-line cc-diff-${line.kind}`}>
+                  {line.kind === "add" ? "+" : line.kind === "del" ? "−" : " "} {line.text}
+                </span>
+              ),
+            )}
+          </pre>
+        </div>
       )}
       <div className="cc-actions">
         <button
