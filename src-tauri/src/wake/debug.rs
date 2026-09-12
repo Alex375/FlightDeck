@@ -55,11 +55,18 @@ pub fn write_capture(
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
 
+    // A suppressed candidate is named apart from a real fire: a directory listing
+    // has to make "this woke the app" and "a gate caught this" tellable at a glance,
+    // otherwise the captures that PROVE the gates work read as more false positives.
     let stem = format!(
-        "{}-{}-{:03}",
+        "{}-{}-{:03}{}",
         epoch_millis(),
         sanitize_stem(phrase),
-        (detection.score.clamp(0.0, 1.0) * 1000.0).round() as u32
+        (detection.score.clamp(0.0, 1.0) * 1000.0).round() as u32,
+        match detection.suppressed_by {
+            Some(gate) => format!("-blocked-{}", sanitize_stem(gate)),
+            None => String::new(),
+        }
     );
     let wav_path = dir.join(format!("{stem}.wav"));
     let json_path = dir.join(format!("{stem}.json"));
@@ -69,6 +76,8 @@ pub fn write_capture(
 
     let report = serde_json::json!({
         "phrase": phrase,
+        // null = it woke the app; otherwise the gate that stopped it.
+        "suppressed_by": detection.suppressed_by,
         "score": detection.score,
         "threshold": detection.threshold,
         "sensitivity": sensitivity,
@@ -179,6 +188,7 @@ mod tests {
 
     fn detection(score: f32, samples: usize) -> Detection {
         Detection {
+            suppressed_by: None,
             score,
             threshold: 0.6,
             trace: vec![StepTrace { score, vad: 0.9, rms: 0.05 }],
@@ -206,6 +216,7 @@ mod tests {
         assert_eq!(parsed["sample_rate"], SAMPLE_RATE);
         assert_eq!(parsed["audio_samples"], 1000);
         assert_eq!(parsed["trace"].as_array().unwrap().len(), 1);
+        assert!(parsed["suppressed_by"].is_null(), "a real fire is not suppressed");
         // The score rides in the NAME too, so a directory listing already ranks the
         // captures by how confident the misfire was.
         assert!(wav.file_name().unwrap().to_string_lossy().contains("-870"));
@@ -249,6 +260,22 @@ mod tests {
         assert!(left.iter().all(|n| n.starts_with("0000000000003") || n.starts_with("0000000000004")));
         // The JSON sidecar goes with its WAV — a lone report explains nothing.
         assert!(!dir.join("0000000000000-alexa-500.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A candidate a gate stopped is filed apart from one that woke the app.
+    #[test]
+    fn a_suppressed_candidate_is_named_and_reported_as_suppressed() {
+        let dir = tmp_dir("suppressed");
+        let mut d = detection(0.71, 800);
+        d.suppressed_by = Some("patience");
+        let wav = write_capture(&dir, "ground_control", 0.5, &d).expect("capture writes");
+        let name = wav.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.contains("-blocked-patience"), "legible from a listing: {name}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(wav.with_extension("json")).unwrap())
+                .unwrap();
+        assert_eq!(parsed["suppressed_by"], "patience");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

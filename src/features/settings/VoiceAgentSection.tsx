@@ -475,12 +475,15 @@ export function VoiceAgentSection() {
           title="Record false triggers"
           hint={
             <>
-              When the wake word fires, save what it heard: a short audio clip plus the
-              step-by-step confidence scores behind the trigger. Turn this on to investigate
-              triggers you did not ask for &mdash; the recordings are what a fix can be tested
-              against. Everything stays on this Mac and nothing is sent anywhere, but it does
-              write microphone audio to disk, so leave it off unless you are chasing a problem.
-              Only the last 40 triggers are kept.
+              Save what the wake word heard: a short audio clip plus the step-by-step
+              confidence scores behind it. Recordings marked <code>blocked</code> are
+              near-triggers a safeguard caught before they woke anything &mdash; they are
+              how you tell &ldquo;the safeguards are working&rdquo; from &ldquo;the
+              safeguards are swallowing me&rdquo;. Turn this on to investigate triggers you
+              did not ask for, or a phrase that stopped being heard. Everything stays on
+              this Mac and nothing is sent anywhere, but it does write microphone audio to
+              disk, so leave it off unless you are chasing a problem. Only the last 40 are
+              kept.
               {wake?.debug_capture && wake.debug_dir ? (
                 <div className={styles.tokenRow}>
                   <span className={styles.mono}>{wake.debug_dir}</span>

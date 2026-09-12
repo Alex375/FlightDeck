@@ -57,6 +57,26 @@ const VAD_CONTEXT: usize = 64;
 /// Suppress re-fires for this many steps after a detection (~1.2 s) and clear the
 /// embedding buffer, so one spoken phrase triggers exactly once.
 const REFIRE_COOLDOWN_STEPS: u32 = 15;
+/// Consecutive steps that must score above the threshold before we wake the app —
+/// openWakeWord's `patience`, which this engine was missing.
+///
+/// Sized from 25 recorded false positives against real utterances: a spoken phrase
+/// holds the threshold for 12-18 steps (the ~2 s classifier window slides through
+/// it slowly), while EVERY recorded false positive was a single 80 ms spike out of
+/// nowhere — 24 of 25 jumped straight from below 0.5 to over 0.6 and back. 3 sits
+/// in the middle of that gap and costs ~160 ms of extra latency.
+const PATIENCE_STEPS: u32 = 3;
+/// Trailing steps whose peak speech probability is required to be real (~1.3 s).
+const VAD_VETO_STEPS: usize = 16;
+/// Silero peak the trailing window must reach for a fire to count as speech.
+///
+/// ⚠️ Deliberately checked over the WINDOW, never on the firing step alone: the
+/// classifier scores ~2 s of context, so it fires as the phrase ENDS, on new audio
+/// that is already quiet. Measured, the firing step of a real utterance carries
+/// vad≈0.01 while the steps holding the phrase read ~1.0 — a per-step veto would
+/// reject every genuine detection. Across the 25 recorded false positives the
+/// window peak was below 0.2 in 23 of them (median 0.007).
+const VAD_VETO_MIN: f32 = 0.5;
 /// Detection steps of score history kept for diagnostics (~3.2 s). Dumped with
 /// every fire so a false positive shows its whole approach, not just the peak.
 const TRACE_STEPS: usize = 40;
@@ -79,8 +99,13 @@ pub struct StepTrace {
     pub rms: f32,
 }
 
-/// A fire, carrying everything needed to explain it after the fact.
+/// A candidate wake, carrying everything needed to explain it after the fact.
+/// `suppressed_by` is `None` for a real fire and names the gate otherwise —
+/// suppressed candidates are only produced while debug capture is on, so the
+/// normal path allocates nothing extra.
 pub struct Detection {
+    /// Which gate rejected this candidate, or `None` when it woke the app.
+    pub suppressed_by: Option<&'static str>,
     /// The score that crossed the threshold.
     pub score: f32,
     /// The threshold in force (derived from the user's sensitivity).
@@ -90,6 +115,13 @@ pub struct Detection {
     /// Raw 16 kHz mono audio around the fire — `Some` ONLY when debug capture is
     /// on. This is microphone audio: it is never retained without an opt-in.
     pub audio: Option<Vec<f32>>,
+}
+
+impl Detection {
+    /// Did this candidate actually wake the app?
+    pub fn fired(&self) -> bool {
+        self.suppressed_by.is_none()
+    }
 }
 
 /// The bundled models. `include_bytes!` embeds them in the binary — no resource
@@ -246,6 +278,8 @@ pub struct Engine {
     embeddings: std::collections::VecDeque<Vec<f32>>,
     /// Steps remaining in the post-detection cooldown.
     cooldown: u32,
+    /// Consecutive steps scored at or above the threshold (the patience counter).
+    consecutive: u32,
     /// Peak Silero probability observed since the last step (diagnostics).
     vad_peak: f32,
     /// Previous per-step VAD state, to log speech rising edges (diagnostics).
@@ -277,6 +311,7 @@ impl Engine {
             pending: 0,
             embeddings: std::collections::VecDeque::with_capacity(CLASSIFIER_EMBEDDINGS),
             cooldown: 0,
+            consecutive: 0,
             vad_peak: 0.0,
             was_speech: false,
             trace: std::collections::VecDeque::with_capacity(TRACE_STEPS),
@@ -402,17 +437,52 @@ impl Engine {
                 self.threshold
             );
         }
-        if score >= self.threshold {
-            self.cooldown = REFIRE_COOLDOWN_STEPS;
-            self.embeddings.clear();
-            return Some(Detection {
-                score,
-                threshold: self.threshold,
-                trace: self.trace.iter().copied().collect(),
-                audio: self.debug.then(|| self.debug_audio.iter().copied().collect()),
-            });
+        if score < self.threshold {
+            self.consecutive = 0;
+            return None;
         }
-        None
+        self.consecutive += 1;
+
+        // Two gates, both measured against the recorded false positives. Together
+        // they suppressed all 25 while leaving a real utterance (12-18 steps above
+        // threshold, VAD peak 0.62-1.00) a wide margin.
+        let suppressed_by = if self.consecutive < PATIENCE_STEPS {
+            Some("patience")
+        } else if self.vad_window_peak() < VAD_VETO_MIN {
+            Some("no_speech")
+        } else {
+            None
+        };
+
+        // A suppressed candidate is only WORTH reporting while debug capture is on —
+        // it is then dumped like a fire, tagged with the gate that stopped it, which
+        // is the only way to tell "the gates are working" from "the gates are eating
+        // real detections". With capture off, the normal path allocates nothing.
+        if suppressed_by.is_some() && !self.debug {
+            return None;
+        }
+        if suppressed_by.is_none() {
+            self.cooldown = REFIRE_COOLDOWN_STEPS;
+            self.consecutive = 0;
+            self.embeddings.clear();
+        }
+        Some(Detection {
+            suppressed_by,
+            score,
+            threshold: self.threshold,
+            trace: self.trace.iter().copied().collect(),
+            audio: self.debug.then(|| self.debug_audio.iter().copied().collect()),
+        })
+    }
+
+    /// Peak Silero probability across the trailing window the classifier scored.
+    fn vad_window_peak(&self) -> f32 {
+        self.trace
+            .iter()
+            .rev()
+            .take(VAD_VETO_STEPS)
+            .map(|t| t.vad)
+            .fold(0.0f32, f32::max)
     }
 
     /// True when every value is finite, else logs ONCE (latched) and returns false.
@@ -761,6 +831,60 @@ mod tests {
         eprintln!("[test] phrase={phrase} hits={hits} (see [wake] score= lines above for the trajectory)");
     }
 
+
+
+
+    /// Diagnostic (ignored): replay a WHOLE DIRECTORY of 16 kHz WAVs through the
+    /// engine and report how many fire. Point it at the debug-capture folder to
+    /// check a gate against the false positives it was sized on, or at a folder of
+    /// real utterances to prove the gate did not eat them:
+    ///
+    ///   WAKE_CORPUS=~/…/wake-debug WAKE_PHRASE=ground_control \
+    ///     cargo test --lib wake::engine::tests::replay_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn replay_corpus() {
+        let dir = std::env::var("WAKE_CORPUS").expect("set WAKE_CORPUS=/path/to/wavs");
+        let phrase = std::env::var("WAKE_PHRASE").unwrap_or_else(|_| DEFAULT_PHRASE.to_string());
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read corpus dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        paths.sort();
+
+        let mut fired = 0usize;
+        let mut suppressed: std::collections::BTreeMap<&str, usize> = Default::default();
+        for path in &paths {
+            let samples = parse_wav_i16(&std::fs::read(path).unwrap());
+            let mut audio = vec![0.0f32; SAMPLE_RATE as usize];
+            audio.extend_from_slice(&samples);
+            audio.extend(std::iter::repeat(0.0f32).take(SAMPLE_RATE as usize / 2));
+            // debug=true so SUPPRESSED candidates are reported too — otherwise a
+            // corpus that produces nothing cannot be told from one the gates caught.
+            let mut engine = Engine::new(&phrase, 0.5, true).expect("engine builds");
+            let mut outcome = String::from("no candidate");
+            for chunk in audio.chunks(CHUNK) {
+                if let Some(d) = engine.feed(chunk) {
+                    match d.suppressed_by {
+                        None => {
+                            fired += 1;
+                            outcome = format!("FIRED score={:.3}", d.score);
+                            break;
+                        }
+                        Some(gate) => {
+                            *suppressed.entry(gate).or_default() += 1;
+                            outcome = format!("blocked by {gate} (score {:.3})", d.score);
+                        }
+                    }
+                }
+            }
+            eprintln!("[corpus] {:<52} {outcome}", path.file_name().unwrap().to_string_lossy());
+        }
+        eprintln!();
+        eprintln!("[corpus] {} files: {fired} FIRED, suppressed {suppressed:?}", paths.len());
+    }
 
     /// Minimal PCM-16 WAV reader: locate the `data` subchunk, decode i16 LE → f32.
     fn parse_wav_i16(bytes: &[u8]) -> Vec<f32> {

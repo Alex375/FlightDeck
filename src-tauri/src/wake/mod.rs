@@ -348,17 +348,28 @@ fn run_worker(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 if let Some(detection) = engine.feed(&chunk) {
-                    eprintln!(
-                        "[wake] DETECTED phrase={} score={:.3} → firing event",
-                        engine.phrase(),
-                        detection.score
-                    );
+                    match detection.suppressed_by {
+                        None => eprintln!(
+                            "[wake] DETECTED phrase={} score={:.3} → firing event",
+                            engine.phrase(),
+                            detection.score
+                        ),
+                        // Only reachable while debug capture is on, and only ever
+                        // dumped — a suppressed candidate must never reach the app.
+                        Some(gate) => eprintln!(
+                            "[wake] suppressed phrase={} score={:.3} by {gate}",
+                            engine.phrase(),
+                            detection.score
+                        ),
+                    }
                     // Dump BEFORE firing: the callback hops into the webview and
                     // opens a microphone, and the evidence for a false positive is
                     // worth more than a few ms of trigger latency.
                     debug.record(engine.phrase(), sensitivity, &detection);
-                    if let Some(cb) = &on_detect {
-                        cb(engine.phrase(), detection.score);
+                    if detection.fired() {
+                        if let Some(cb) = &on_detect {
+                            cb(engine.phrase(), detection.score);
+                        }
                     }
                 }
             }
