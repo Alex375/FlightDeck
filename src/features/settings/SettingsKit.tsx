@@ -2,9 +2,10 @@
 // "group card", and a toggle row inside it. Every tab composes these so the whole
 // panel stays visually consistent (see SettingsPanel.module.css). All three import
 // the SAME CSS module as SettingsPanel.tsx, so the hashed class names line up.
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { Ico } from "../../ui/kit";
 import { Toggle } from "../../ui/Toggle";
+import { useSettingsUi } from "../../store/settingsUi";
 import styles from "./SettingsPanel.module.css";
 
 /** The heading at the top of a settings tab: a bold title + a muted one-liner. */
@@ -15,6 +16,67 @@ export function PageHead({ title, subtitle }: { title: string; subtitle?: ReactN
       {subtitle ? <div className={styles.pageSub}>{subtitle}</div> : null}
     </div>
   );
+}
+
+/**
+ * A pill row that splits ONE settings tab into sub-pages. Tabs that grew a long
+ * stack of unrelated cards (MCP Control: in-app agents, the voice agent, remote
+ * access, the bridge…) show one group at a time behind this instead of asking the
+ * user to scroll past everything else.
+ *
+ * The active sub-tab lives in the shared settings store (per section), so a
+ * search result can land straight on the right sub-page.
+ */
+export function SubTabs<T extends string>({
+  tabs,
+  active,
+  onSelect,
+  ariaLabel,
+}: {
+  tabs: ReadonlyArray<{ id: T; label: string; icon?: string }>;
+  active: T;
+  onSelect: (id: T) => void;
+  ariaLabel: string;
+}) {
+  return (
+    <div className={styles.subTabs} role="tablist" aria-label={ariaLabel}>
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          aria-selected={active === t.id}
+          className={styles.subTab}
+          data-on={active === t.id ? "" : undefined}
+          onClick={() => onSelect(t.id)}
+        >
+          {t.icon ? <Ico name={t.icon} className="sm" /> : null}
+          <span>{t.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Scroll to and flash the element when the settings search asked for THIS title.
+ * The match is on the visible title, deliberately: it keeps every existing row
+ * untouched (no ids to thread) at the cost of a rename silently un-matching —
+ * which degrades to "the search still lands you on the right tab", never to a
+ * wrong jump. The highlight is cleared once it has flashed so it can't re-fire.
+ */
+function useSearchHighlight<T extends HTMLElement>(title: string) {
+  const ref = useRef<T | null>(null);
+  const hit = useSettingsUi(
+    (s) => s.highlight !== null && s.highlight.toLowerCase() === title.toLowerCase(),
+  );
+  useEffect(() => {
+    if (!hit) return;
+    ref.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+    const timer = setTimeout(() => useSettingsUi.getState().clearHighlight(), 1600);
+    return () => clearTimeout(timer);
+  }, [hit]);
+  return { ref, hit };
 }
 
 /** A titled card grouping related settings. `icon` is a kit glyph name shown in coral
@@ -28,8 +90,9 @@ export function SettingsGroup({
   icon?: string;
   children: ReactNode;
 }) {
+  const { ref, hit } = useSearchHighlight<HTMLElement>(title);
   return (
-    <section className={styles.group}>
+    <section className={styles.group} ref={ref} data-hit={hit ? "" : undefined}>
       <div className={styles.groupHead}>
         {icon ? (
           <span className={styles.groupIco}>
@@ -71,8 +134,9 @@ export function ToggleRow({
   control?: ReactNode;
   disabled?: boolean;
 }) {
+  const { ref, hit } = useSearchHighlight<HTMLDivElement>(title);
   return (
-    <div className={styles.trow}>
+    <div className={styles.trow} ref={ref} data-hit={hit ? "" : undefined}>
       <div className={styles.ttext}>
         <div className={styles.ttitle}>{title}</div>
         {hint ? <div className={styles.thint}>{hint}</div> : null}
