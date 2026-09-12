@@ -69,15 +69,17 @@ function voiceToolAllowed(name: string): boolean {
 
 /** Session-local tool (NOT in the shared catalogue): ends the current voice
  *  EXCHANGE — closes the microphone; the armed session stays up for the next
- *  fleet event. */
+ *  fleet event. The mic closes the instant it is called and NO reply is
+ *  requested: the sign-off is silent by construction (see `runToolCall`). */
 const END_CALL_TOOL = {
   type: "function",
   name: "end_call",
   description:
-    "Close the microphone and end the current exchange. Call it when the user says they are " +
-    "done (« c'est bon », « merci, c'est tout », « raccroche », “that's all”). The voice " +
-    "session stays armed — you will still announce future fleet events. Say a brief goodbye " +
-    "in your response BEFORE calling it.",
+    "Close the microphone and end the current exchange. Call it whenever the user signs off — " +
+    "« c'est bon », « merci, c'est tout », « raccroche », « au revoir », « salut », « à plus », " +
+    "“that's all”, “bye”. Say NOTHING when you call it: closing the microphone is the " +
+    "acknowledgement, and a spoken goodbye is exactly the noise this agent must not make. The " +
+    "voice session stays armed — you will still announce future fleet events.",
   parameters: { type: "object", properties: {}, required: [] },
 };
 
@@ -108,8 +110,6 @@ interface LiveSession {
   /** One-shot listeners flushed on every `response.done` and on teardown; each
    *  waiter also self-removes on its own timeout (no stale resolvers). */
   responseWaiters: Array<() => void>;
-  /** `end_call` was invoked: close the MIC once the goodbye finishes playing. */
-  endPending: boolean;
 }
 
 let session: LiveSession | null = null;
@@ -345,7 +345,6 @@ async function doStart(): Promise<void> {
       idleTimer: null,
       activeResponses: 0,
       responseWaiters: [],
-      endPending: false,
     };
     // A rejected `ready` is normal teardown; never let it surface as unhandled.
     void ready.catch(() => {});
@@ -502,22 +501,11 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
       s.activeResponses += 1;
       break;
     case "output_audio_buffer.stopped":
-      if (s.endPending) {
-        s.endPending = false;
-        closeMic();
-        break;
-      }
       store.setPhase(restingPhase());
       break;
     case "response.done": {
       s.activeResponses = Math.max(0, s.activeResponses - 1);
-      // A goodbye that produced no audio at all still ends the exchange here.
-      if (s.endPending && store.phase !== "speaking") {
-        s.endPending = false;
-        closeMic();
-      } else if (store.phase !== "speaking") {
-        store.setPhase(restingPhase());
-      }
+      if (store.phase !== "speaking") store.setPhase(restingPhase());
       s.responseWaiters.slice().forEach((w) => w());
       break;
     }
@@ -550,21 +538,17 @@ async function runToolCall(
   rawArgs: string,
 ): Promise<void> {
   if (name === "end_call") {
-    // Let the model say its goodbye, then close the MIC when it finishes
-    // playing (handleEvent) — with a hard fallback so a silent goodbye can't
-    // leave the capture open. The armed session itself stays up.
-    s.endPending = true;
+    // Close the MIC immediately and ask for NO reply. The earlier version sent a
+    // `response.create` here and waited for the goodbye's audio to finish before
+    // closing — so the app itself commissioned the « à la prochaine » it was
+    // supposed to be free of, and held the microphone open for the length of it.
+    // The tool result still goes back (the model must see its call resolved), it
+    // just doesn't get a turn to speak. The armed session stays up.
     dcSend(s, {
       type: "conversation.item.create",
       item: { type: "function_call_output", call_id: callId, output: JSON.stringify({ ok: true }) },
     });
-    dcSend(s, { type: "response.create" });
-    setTimeout(() => {
-      if (session === s && s.endPending) {
-        s.endPending = false;
-        closeMic();
-      }
-    }, 15_000);
+    closeMic();
     return;
   }
   let output: unknown;

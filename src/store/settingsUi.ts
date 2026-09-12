@@ -9,13 +9,20 @@ export type SettingsSection =
   | "general"
   | "accounts"
   | "tosse"
+  // "conversation" now bundles the Markdown mode, the model picker and the composer bar
+  // behind its own sub-tabs (was three separate top-level tabs: conversation/models/composer).
   | "conversation"
   | "behavior"
-  | "models"
-  | "composer"
+  /** Claude-specific settings: sub-agent routing, spend, and the instructions file.
+   *  Backend-specific ON PURPOSE — its whole content is Claude model names and Claude
+   *  file layout, so it is shown only while a Claude account is connected, and a Codex
+   *  twin would be its own tab rather than an abstraction over both. */
+  | "claudeCode"
   | "reordering"
   | "shortcuts"
   | "control"
+  // "notifications" now bundles the OS channels, the fleet readout and the background-task
+  // alert behind its own sub-tabs (the last two moved out of the old General → Alerts).
   | "notifications"
   | "updates"
   | "data";
@@ -26,7 +33,8 @@ interface SettingsUiState {
   section: SettingsSection;
   /**
    * The sub-tab within the current section (`null` = its first one). Sections
-   * that carry a lot of unrelated cards (General, MCP Control) split them behind
+   * that carry a lot of unrelated cards (General, Conversation, MCP Control,
+   * Notifications) split them behind
    * a pill row instead of stacking them all; every other section ignores this.
    * Remembered PER SECTION so leaving a tab and coming back lands where you were.
    */

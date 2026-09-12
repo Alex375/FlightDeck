@@ -277,6 +277,34 @@ pub fn remote_url(repo_path: &str) -> Result<RemoteLookup, GitError> {
 ///   `crm_max` are one repository;
 /// - an explicit port (`ssh://git@github.com:22/o/r`, seen behind a bastion or a
 ///   proxy) — the same repository as the portless `git@github.com:o/r`.
+/// Would git ignore `relative_path` inside this repository?
+///
+/// `Some(true)` ignored · `Some(false)` tracked-or-trackable · `None` we could not tell
+/// (not a repository, git missing, an exit code we do not recognise). The tri-state is the
+/// point: this answer drives a WARNING about a setting that will not follow the user into a
+/// worktree or a colleague's clone, and "we could not check" must never be shown as "all
+/// good" — the same distinction `resolve_links` draws for the CRM.
+///
+/// ⚠️ `git check-ignore` reports "not ignored" with **exit code 1**, which is an ANSWER,
+/// not a failure — hence a direct spawn rather than [`run_git`], which treats every
+/// non-zero exit as an error.
+pub fn path_is_ignored(repo_path: &str, relative_path: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .env("LC_ALL", "C")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["check-ignore", "-q", "--no-index", "--"])
+        .arg(relative_path)
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        // 128 = not a repository; anything else is unexplained. Either way: no verdict.
+        _ => None,
+    }
+}
+
 pub fn normalize_remote_url(url: &str) -> Option<String> {
     let mut s = url.trim();
     if s.is_empty() {

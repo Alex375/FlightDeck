@@ -1,10 +1,12 @@
 pub mod accounts;
+pub mod agentspend;
 pub mod appmcp;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
 pub mod git;
 mod ipc;
+pub mod memoryfile;
 pub mod plugins;
 pub mod power;
 pub mod store;
@@ -18,7 +20,9 @@ pub mod wake;
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
     delete_conversation,
-    delete_repo, delete_to_trash, fetch_slash_commands,
+    create_subagent_definition, delete_repo, delete_to_trash, fetch_known_agents,
+    fetch_slash_commands, list_subagent_routing, read_claude_memory, set_subagent_baseline,
+    set_subagent_model, subagent_spend, write_claude_memory,
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
@@ -205,6 +209,14 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_set_project_status,
             tosse_create_task,
             fetch_slash_commands,
+            list_subagent_routing,
+            set_subagent_model,
+            create_subagent_definition,
+            set_subagent_baseline,
+            subagent_spend,
+            read_claude_memory,
+            write_claude_memory,
+            fetch_known_agents,
             load_session_history,
             load_session_context,
             load_session_goal,

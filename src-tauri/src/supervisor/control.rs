@@ -131,6 +131,29 @@ pub fn parse_initialize_commands(line: &Value) -> Option<Vec<SlashCommand>> {
     Some(slash_commands_from_array(arr))
 }
 
+/// Extract the sub-agent NAMES the CLI currently knows from a successful `initialize`
+/// control response — the same envelope that carries `commands`.
+///
+/// This is the drift canary's input. A built-in's name (`Explore`, `Plan`) is an
+/// undocumented contract: an agent definition file only overrides a built-in while the
+/// name still matches, and if Anthropic renames one the override stops applying with no
+/// error anywhere — the user simply goes back to paying full price. Comparing our
+/// configured names against this list is what turns that silence into a warning.
+///
+/// Tolerates both wire shapes seen for agent catalogues: bare strings (as `system/init`
+/// writes them) and `{name}` objects. Entries without a usable name are skipped.
+pub fn parse_initialize_agents(line: &Value) -> Option<Vec<String>> {
+    let arr = line.get("response")?.get("response")?.get("agents")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|a| match a {
+                Value::String(s) => Some(s.clone()),
+                other => other.get("name")?.as_str().map(str::to_string),
+            })
+            .collect(),
+    )
+}
+
 /// Map a raw `commands` array to [`SlashCommand`]s. Shared by the three surfaces
 /// that carry the SAME catalogue shape: the `initialize` response, the
 /// `reload_plugins` response (which returns a fresh catalogue after a hot-reload),

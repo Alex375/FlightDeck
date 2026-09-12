@@ -228,7 +228,7 @@ Design principles:
 Flight Deck ships as a signed **macOS** app through **GitHub Releases** — this is how you
 install and run it, no build required.
 
-1. Open the [**latest release**](https://github.com/Alex375/tosse-code/releases/latest) and
+1. Open the [**latest release**](https://github.com/Alex375/FlightDeck/releases/latest) and
    download the **`.dmg`** (universal — Apple Silicon &amp; Intel).
 2. Open the `.dmg` and drag **Flight Deck** into your **Applications** folder.
 3. The app is signed with a self-signed certificate but **not notarized**, so on first launch
@@ -268,8 +268,8 @@ and every two hours, then relaunches once you confirm. See
 ### Install
 
 ```bash
-git clone https://github.com/Alex375/tosse-code.git
-cd tosse-code
+git clone https://github.com/Alex375/FlightDeck.git
+cd FlightDeck
 pnpm install
 ```
 

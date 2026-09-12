@@ -45,13 +45,17 @@ import "./models-section.css";
  *  drop (dropping onto a row would be impossible when there are none). */
 type LaneId = "shown" | "available";
 
-export function ModelsSection() {
+// `embedded` = rendered inside the Conversation tab's "Models" sub-tab, which already
+// carries the tab-level PageHead, so this drops its own.
+export function ModelsSection({ embedded = false }: { embedded?: boolean }) {
   return (
     <div>
-      <PageHead
-        title="Models"
-        subtitle="Choose which models the picker offers and what a new conversation starts on."
-      />
+      {!embedded && (
+        <PageHead
+          title="Models"
+          subtitle="Choose which models the picker offers and what a new conversation starts on."
+        />
+      )}
       <ModelLists />
       <Defaults />
     </div>

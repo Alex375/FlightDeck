@@ -57,7 +57,9 @@ const AI_MSG = [
   "- [ ] IDE tools (`openDiff`, `getDiagnostics`)",
 ].join("\n");
 
-export function ConversationSection() {
+// `embedded` = rendered inside the Conversation tab's "Markdown" sub-tab, which already
+// carries the tab-level PageHead, so this drops its own (mirrors the Control sub-groups).
+export function ConversationSection({ embedded = false }: { embedded?: boolean }) {
   const mode = useDisplay((s) => s.markdownMode);
   const set = useDisplay((s) => s.set);
   // The preview is an illustration: make its whole subtree inert so its interactive bits
@@ -69,15 +71,17 @@ export function ConversationSection() {
 
   return (
     <div className="mdset">
-      <PageHead
-        title="Conversation"
-        subtitle={
-          <>
-            The Markdown rendering style, applied everywhere: conversations, sub-agents, and{" "}
-            <code>.md</code> file previews. Pick a mode — the preview shows the result.
-          </>
-        }
-      />
+      {!embedded && (
+        <PageHead
+          title="Conversation"
+          subtitle={
+            <>
+              The Markdown rendering style, applied everywhere: conversations, sub-agents, and{" "}
+              <code>.md</code> file previews. Pick a mode — the preview shows the result.
+            </>
+          }
+        />
+      )}
       <div className="mdset-body">
         <OptionCardRail
           className="mdset-rail"
