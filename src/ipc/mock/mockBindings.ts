@@ -2008,6 +2008,7 @@ export const mockCommands = {
         shadows_built_in: true,
         needs_file_to_steer: false,
         overridden_by_force: false,
+        configured_at_ms: Date.now() - 10 * 86_400_000,
       },
       {
         name: "Plan",
@@ -2020,6 +2021,8 @@ export const mockCommands = {
         shadows_built_in: false,
         needs_file_to_steer: true,
         overridden_by_force: false,
+        // A blind spot follows nothing, so nothing has been configured for it.
+        configured_at_ms: null,
       },
       {
         name: "general-purpose",
@@ -2032,6 +2035,7 @@ export const mockCommands = {
         shadows_built_in: false,
         needs_file_to_steer: false,
         overridden_by_force: false,
+        configured_at_ms: Date.now() - 30 * 86_400_000,
       },
       {
         name: "tosse-manager",
@@ -2044,6 +2048,7 @@ export const mockCommands = {
         shadows_built_in: false,
         needs_file_to_steer: false,
         overridden_by_force: false,
+        configured_at_ms: Date.now() - 30 * 86_400_000,
       },
     ];
     return ok({

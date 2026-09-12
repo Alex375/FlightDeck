@@ -20,10 +20,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { pricingKeyForTranscriptModel } from "./spend";
 
-/** The app's card surface — the gap colour between stacked marks, so segments read as
- *  separated rather than as a new blended hue. */
-const SURFACE = "#15151b";
-
 /**
  * The categorical slots, in fixed order. Validated as a SET for the dark surface; the
  * ordering is the colourblind-safety mechanism, not decoration — do not re-order to make a
@@ -126,34 +122,116 @@ function Tooltip({ state }: { state: TooltipState | null }) {
   );
 }
 
-/** Shared legend. Present whenever there are two or more series — identity must never rest
- *  on colour alone. */
-export function ChartLegend({ series }: { series: Array<{ key: string; label: string }> }) {
+/**
+ * Shared legend. Present whenever there are two or more series — identity must never rest
+ * on colour alone.
+ *
+ * When `onToggle` is given the entries become filter buttons: hiding the big series is the
+ * only way to see the small ones, because a model with a hundredth of the spend is a
+ * hairline next to one that dominates. The chart rescales to what is left.
+ */
+export function ChartLegend({
+  series,
+  hidden,
+  onToggle,
+}: {
+  series: Array<{ key: string; label: string }>;
+  hidden?: ReadonlySet<string>;
+  onToggle?: (key: string) => void;
+}) {
   if (series.length < 2) return null;
   return (
     <ul className="cc-legend">
-      {series.map((s) => (
-        <li key={s.key}>
-          <span className="cc-swatch" style={{ background: hueForSeries(s.key) }} aria-hidden />
-          {s.label}
-        </li>
-      ))}
+      {series.map((s) => {
+        const off = hidden?.has(s.key) ?? false;
+        const swatch = (
+          <>
+            <span
+              className="cc-swatch"
+              style={{ background: off ? "transparent" : hueForSeries(s.key) }}
+              data-off={off ? "" : undefined}
+              aria-hidden
+            />
+            {s.label}
+          </>
+        );
+        return (
+          <li key={s.key}>
+            {onToggle ? (
+              <button
+                type="button"
+                className="cc-legend-btn"
+                data-off={off ? "" : undefined}
+                aria-pressed={!off}
+                onClick={() => onToggle(s.key)}
+                title={off ? `Show ${s.label}` : `Hide ${s.label}`}
+              >
+                {swatch}
+              </button>
+            ) : (
+              swatch
+            )}
+          </li>
+        );
+      })}
     </ul>
   );
 }
 
-// ---- Stacked area over time ------------------------------------------------
+/**
+ * Place a tooltip near the cursor without letting it leave the figure.
+ *
+ * Flips to the left of the pointer when it would otherwise run past the right edge — the
+ * plain "cursor + 12px" placement puts the tooltip off-screen on the right-hand days,
+ * which is exactly where a month-long chart is most often read.
+ */
+function tooltipPosition(
+  clientX: number,
+  clientY: number,
+  box: DOMRect | undefined,
+): { x: number; y: number } {
+  const TIP_W = 172;
+  const OFFSET = 12;
+  if (!box) return { x: clientX + OFFSET, y: clientY - 8 };
+  const local = clientX - box.left;
+  const wouldOverflow = local + OFFSET + TIP_W > box.width;
+  const x = wouldOverflow
+    ? Math.max(0, local - OFFSET - TIP_W)
+    : local + OFFSET;
+  return { x, y: clientY - box.top - 8 };
+}
+
+// ---- Time series -----------------------------------------------------------
+
+/** Sunday-first, matching `Date.getUTCDay()`. */
+const WEEKDAY_INITIALS = ["S", "M", "T", "W", "T", "F", "S"] as const;
+
+/** `2026-09-07` → `Mon 7 Sep` — a tooltip heading someone can place without counting. */
+function longDay(day: string): string {
+  return new Date(`${day}T00:00:00Z`).toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    timeZone: "UTC",
+  });
+}
 
 /**
- * Spend per day, stacked by model — the "when did this happen" view.
+ * Spend per day, stacked by model.
  *
- * Days are continuous (see `continuousDays`), so a quiet week is drawn as a quiet week
- * rather than compressed out of existence.
+ * BARS, not an area. An area chart of daily totals reads as a mountain range: the eye
+ * follows the silhouette instead of comparing days, and picking out which peak is which
+ * day means counting along the axis. Discrete days are discrete quantities, so they get
+ * discrete marks — and a weekday initial under each one, with the date on Mondays, so the
+ * reader can place themselves without counting.
+ *
+ * Days are continuous (see `continuousDays`), so a quiet stretch reads as quiet rather
+ * than being compressed away.
  */
-export function StackedAreaChart({
+export function StackedBarsOverTime({
   days,
   series,
-  height = 168,
+  height = 186,
   formatValue,
   title,
 }: {
@@ -165,35 +243,37 @@ export function StackedAreaChart({
 }) {
   const [ref, width, node] = useElementWidth<HTMLElement>();
   const [tip, setTip] = useState<TooltipState | null>(null);
-  const [hoverDay, setHoverDay] = useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
+  // Which models the reader switched off in the legend. Hiding the dominant model is the
+  // only way to see a cheap one: at true scale a model with a hundredth of the spend is a
+  // hairline on the baseline.
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set());
 
-  const pad = { top: 8, right: 8, bottom: 18, left: 8 };
+  const shown = useMemo(() => series.filter((s) => !hidden.has(s.key)), [series, hidden]);
+  const totals = useMemo(
+    () => days.map((_, i) => shown.reduce((sum, s) => sum + (s.values[i] ?? 0), 0)),
+    [days, shown],
+  );
+
+  const pad = { top: 10, right: 4, bottom: 28, left: 4 };
   const plotW = Math.max(0, width - pad.left - pad.right);
   const plotH = height - pad.top - pad.bottom;
-
-  const totals = useMemo(
-    () => days.map((_, i) => series.reduce((sum, s) => sum + (s.values[i] ?? 0), 0)),
-    [days, series],
-  );
+  // Rescale to what is VISIBLE — that is what makes the toggles worth having.
   const max = Math.max(1, ...totals);
+
+  const toggle = (key: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      // Never let the reader empty the chart: an all-off state just looks broken.
+      return next.size >= series.length ? prev : next;
+    });
 
   if (days.length === 0) return <EmptyChart title={title} />;
 
-  const x = (i: number) => (days.length === 1 ? plotW / 2 : (i / (days.length - 1)) * plotW);
-  const y = (v: number) => plotH - (v / max) * plotH;
-
-  // Cumulative bands, bottom-up.
-  let running = days.map(() => 0);
-  const bands = series.map((s) => {
-    const lower = [...running];
-    const upper = running.map((base, i) => base + (s.values[i] ?? 0));
-    running = upper;
-    const top = upper.map((v, i) => `${x(i)},${y(v)}`).join(" L ");
-    const bottom = lower
-      .map((_, i) => `${x(days.length - 1 - i)},${y(lower[days.length - 1 - i]!)}`)
-      .join(" L ");
-    return { key: s.key, label: s.label, d: `M ${top} L ${bottom} Z` };
-  });
+  const slot = plotW / Math.max(1, days.length);
+  const barW = Math.max(2, Math.min(22, slot - 2)); // 2px gap between adjacent bars
 
   return (
     <figure className="cc-chart" ref={ref}>
@@ -202,92 +282,129 @@ export function StackedAreaChart({
         {width > 0 && (
           <svg width={width} height={height} role="img" aria-label={title}>
             <g transform={`translate(${pad.left},${pad.top})`}>
-              {/* Recessive baseline; no grid — the shapes carry the reading. */}
               <line x1={0} y1={plotH} x2={plotW} y2={plotH} className="cc-axis" />
-              {bands.map((b) => (
-                <path
-                  key={b.key}
-                  d={b.d}
-                  fill={hueForSeries(b.key)}
-                  // A 2px surface-coloured stroke IS the gap between stacked fills.
-                  stroke={SURFACE}
-                  strokeWidth={2}
-                  strokeLinejoin="round"
-                />
-              ))}
-              {hoverDay !== null && (
-                <line
-                  x1={x(hoverDay)}
-                  y1={0}
-                  x2={x(hoverDay)}
-                  y2={plotH}
-                  className="cc-crosshair"
-                />
-              )}
-              {/* One invisible hit column per day — a hit target far bigger than the mark. */}
               {days.map((day, i) => {
-                const w = days.length === 1 ? plotW : plotW / days.length;
+                const x = i * slot + (slot - barW) / 2;
+                let cursor = 0;
+                const segments = shown
+                  .map((s) => ({ s, v: s.values[i] ?? 0 }))
+                  .filter(({ v }) => v > 0);
                 return (
-                  <rect
-                    key={day}
-                    x={Math.max(0, x(i) - w / 2)}
-                    y={0}
-                    width={w}
-                    height={plotH}
-                    fill="transparent"
-                    onMouseEnter={(e) => {
-                      setHoverDay(i);
-                      const box = node.current?.getBoundingClientRect();
-                      setTip({
-                        x: e.clientX - (box?.left ?? 0) + 12,
-                        y: e.clientY - (box?.top ?? 0) - 8,
-                        content: (
-                          <>
-                            <div className="cc-tip-head">{day}</div>
-                            {series
-                              .map((s) => ({ s, v: s.values[i] ?? 0 }))
-                              .filter(({ v }) => v > 0)
-                              .sort((a, b) => b.v - a.v)
-                              .map(({ s, v }) => (
-                                <div key={s.key} className="cc-tip-row">
-                                  <span
-                                    className="cc-swatch"
-                                    style={{ background: hueForSeries(s.key) }}
-                                    aria-hidden
-                                  />
-                                  {s.label}
-                                  <b>{formatValue(v)}</b>
+                  <g key={day}>
+                    {hover === i && (
+                      <rect
+                        x={i * slot}
+                        y={-pad.top}
+                        width={slot}
+                        height={plotH + pad.top}
+                        className="cc-barhover"
+                      />
+                    )}
+                    {segments.map(({ s, v }, si) => {
+                      const h = (v / max) * plotH;
+                      const isTop = si === segments.length - 1;
+                      // 2px surface gap between stacked segments, taken off the segment so
+                      // the column's height still reads as the total.
+                      const drawn = Math.max(1, h - (isTop ? 0 : 2));
+                      const y = plotH - cursor - h;
+                      cursor += h;
+                      return (
+                        <rect
+                          key={s.key}
+                          x={x}
+                          y={y}
+                          width={barW}
+                          height={drawn}
+                          // Round the data end only — the top of the column.
+                          rx={isTop ? Math.min(4, barW / 2) : 0}
+                          fill={hueForSeries(s.key)}
+                        />
+                      );
+                    })}
+                    {/* Hit target is the whole slot, not the bar. */}
+                    <rect
+                      x={i * slot}
+                      y={-pad.top}
+                      width={slot}
+                      height={plotH + pad.top}
+                      fill="transparent"
+                      onMouseEnter={(e) => {
+                        setHover(i);
+                        setTip({
+                          ...tooltipPosition(
+                            e.clientX,
+                            e.clientY,
+                            node.current?.getBoundingClientRect(),
+                          ),
+                          content: (
+                            <>
+                              <div className="cc-tip-head">{longDay(day)}</div>
+                              {segments
+                                .slice()
+                                .sort((a, b) => b.v - a.v)
+                                .map(({ s, v }) => (
+                                  <div key={s.key} className="cc-tip-row">
+                                    <span
+                                      className="cc-swatch"
+                                      style={{ background: hueForSeries(s.key) }}
+                                      aria-hidden
+                                    />
+                                    {s.label}
+                                    <b>{formatValue(v)}</b>
+                                  </div>
+                                ))}
+                              {segments.length === 0 && (
+                                <div className="cc-tip-row">Nothing this day</div>
+                              )}
+                              {segments.length > 1 && (
+                                <div className="cc-tip-row cc-tip-total">
+                                  Total<b>{formatValue(totals[i] ?? 0)}</b>
                                 </div>
-                              ))}
-                            <div className="cc-tip-row cc-tip-total">
-                              Total<b>{formatValue(totals[i] ?? 0)}</b>
-                            </div>
-                          </>
-                        ),
-                      });
-                    }}
-                    onMouseLeave={() => {
-                      setHoverDay(null);
-                      setTip(null);
-                    }}
-                  />
+                              )}
+                            </>
+                          ),
+                        });
+                      }}
+                      onMouseLeave={() => {
+                        setHover(null);
+                        setTip(null);
+                      }}
+                    />
+                  </g>
                 );
               })}
             </g>
-            {/* Only the ends are labelled — never a number on every point. */}
-            <text x={pad.left} y={height - 4} className="cc-tick">
-              {days[0]}
-            </text>
-            {days.length > 1 && (
-              <text x={width - pad.right} y={height - 4} textAnchor="end" className="cc-tick">
-                {days[days.length - 1]}
-              </text>
-            )}
+            {days.map((day, i) => {
+              const d = new Date(`${day}T00:00:00Z`);
+              const isMonday = d.getUTCDay() === 1;
+              const isLast = i === days.length - 1;
+              const cx = pad.left + i * slot + slot / 2;
+              // When the days are packed tight, keep only the anchors rather than a smear
+              // of unreadable letters.
+              if (slot < 10 && !isMonday && !isLast) return null;
+              return (
+                <g key={day}>
+                  <text x={cx} y={height - 15} textAnchor="middle" className="cc-tick">
+                    {WEEKDAY_INITIALS[d.getUTCDay()]}
+                  </text>
+                  {(isMonday || isLast) && (
+                    <text
+                      x={cx}
+                      y={height - 3}
+                      textAnchor="middle"
+                      className="cc-tick cc-tick-date"
+                    >
+                      {day.slice(8)}/{day.slice(5, 7)}
+                    </text>
+                  )}
+                </g>
+              );
+            })}
           </svg>
         )}
         <Tooltip state={tip} />
       </div>
-      <ChartLegend series={series} />
+      <ChartLegend series={series} hidden={hidden} onToggle={toggle} />
     </figure>
   );
 }
@@ -367,10 +484,12 @@ export function StackedBarChart({
                         rx={isLast ? 4 : 0}
                         fill={hueForSeries(part.key)}
                         onMouseEnter={(e) => {
-                          const box = node.current?.getBoundingClientRect();
                           setTip({
-                            x: e.clientX - (box?.left ?? 0) + 12,
-                            y: e.clientY - (box?.top ?? 0) - 8,
+                            ...tooltipPosition(
+                              e.clientX,
+                              e.clientY,
+                              node.current?.getBoundingClientRect(),
+                            ),
                             content: (
                               <>
                                 <div className="cc-tip-head">{row.label}</div>

@@ -272,6 +272,46 @@ describe("the drift canary", () => {
     ).toEqual([]);
   });
 
+  it("ignores turns that ran BEFORE the setting was changed", () => {
+    // The bug this fixes: setting Code search to Haiku today made the banner fire
+    // immediately, because the whole week behind it ran on Opus — under the old setting.
+    // A warning at the exact moment you change something is how a canary loses its
+    // credibility.
+    const changedAt = Date.parse("2026-09-05T10:00:00Z");
+    const findings = findDrift(
+      [
+        bucket({ day: "2026-09-03", agent: "Explore", model: "claude-opus-4-8", turns: 500 }),
+        bucket({ day: "2026-09-05", agent: "Explore", model: "claude-opus-4-8", turns: 40 }),
+      ],
+      [{ name: "Explore", model: "haiku", configuredAtMs: changedAt }],
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("still fires for turns that ran after the change, and says since when", () => {
+    const changedAt = Date.parse("2026-09-05T10:00:00Z");
+    const findings = findDrift(
+      [
+        bucket({ day: "2026-09-04", agent: "Explore", model: "claude-opus-4-8", turns: 500 }),
+        bucket({ day: "2026-09-07", agent: "Explore", model: "claude-opus-4-8", turns: 6 }),
+      ],
+      [{ name: "Explore", model: "haiku", configuredAtMs: changedAt }],
+    );
+    expect(findings).toHaveLength(1);
+    // Only the turns after the change are counted — the 500 before it are not evidence.
+    expect(findings[0]!.turns).toBe(6);
+    expect(findings[0]!.since).toBe("2026-09-05");
+  });
+
+  it("falls back to the whole window when the change date is unknown", () => {
+    const findings = findDrift(
+      [bucket({ agent: "Explore", model: "claude-opus-4-8", turns: 3 })],
+      [{ name: "Explore", model: "haiku", configuredAtMs: null }],
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.since).toBeNull();
+  });
+
   it("ranks the worst offender first", () => {
     const findings = findDrift(
       [

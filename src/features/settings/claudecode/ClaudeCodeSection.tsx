@@ -16,11 +16,10 @@ import { EFFORT_LABELS } from "../../../agent/subagentMeta";
 import { Ico } from "../../../ui/kit";
 import { ConfirmDialog } from "../../../ui/ConfirmDialog";
 import { PageHead, SettingsGroup } from "../SettingsKit";
-import { StackedAreaChart, StackedBarChart, hueForSeries } from "./Charts";
+import { StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
 import { copyFor, INSTRUCTION_BLOCKS } from "./agentCopy";
 import {
   applyFilter,
-  costAtModel,
   dailyByModel,
   dayCutoff,
   formatCost,
@@ -105,7 +104,11 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
     });
     return findDrift(
       recent,
-      agents.map((a: AgentRouting) => ({ name: a.name, model: a.effective_model })),
+      agents.map((a: AgentRouting) => ({
+        name: a.name,
+        model: a.effective_model,
+        configuredAtMs: a.configured_at_ms,
+      })),
     );
   }, [spend.data, agents]);
 
@@ -131,9 +134,13 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
               ran on {drift[0]!.observedLabel}
             </b>
             <p>
-              {drift[0]!.turns} turn{drift[0]!.turns === 1 ? "" : "s"} in the last 7 days. Either
-              something else is choosing the model for it, or the name this setting hangs on has
-              changed in the Claude CLI — in both cases the setting below is not taking effect.
+              {drift[0]!.turns} turn{drift[0]!.turns === 1 ? "" : "s"}{" "}
+              {drift[0]!.since
+                ? `since you changed this on ${drift[0]!.since}`
+                : "in the last 7 days"}
+              . Either something else is choosing the model for it, or the name this setting
+              hangs on has changed in the Claude CLI — in both cases the setting below is not
+              taking effect.
             </p>
           </div>
         </div>
@@ -354,7 +361,7 @@ function AgentRow({
       {recommended && (
         <p className={offRecommendation ? "cc-rec cc-rec-off" : "cc-rec"}>
           {offRecommendation && <Ico name="alert" />}
-          Suggested: <b>{labelForCatalogueId(recommended.model)}</b> — {recommended.because}
+          Suggested: <b>{recommended.family}</b> — {recommended.because}
         </p>
       )}
       {forced && (
@@ -469,10 +476,6 @@ function TakeControl({
   );
 }
 
-function labelForCatalogueId(value: string): string {
-  return CLAUDE_MODELS.find((m) => m.value === value)?.label ?? value;
-}
-
 function ModelPicker({
   value,
   onChange,
@@ -539,15 +542,15 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
 
   const rows = useMemo(() => groupSpend(filtered, groupBy, card), [filtered, groupBy, card]);
   const total = rows.reduce((n, r) => n + (r.cost ?? 0), 0);
+  const totalOutput = rows.reduce((n, r) => n + r.outputTokens, 0);
   const anyUnpriced = rows.some((r) => r.cost === null);
-  const series = useMemo(() => dailyByModel(filtered, card, "cost"), [filtered, card]);
+  const series = useMemo(() => dailyByModel(filtered, card, "output"), [filtered, card]);
   const byRepo = useMemo(() => modelsByRepo(filtered, card), [filtered, card]);
   const wfShare = useMemo(() => {
     const wf = filtered.filter((b) => b.workflow);
     const wfCost = wf.reduce((n, b) => n + (costOr0(b, card) ?? 0), 0);
     return total > 0 ? wfCost / total : 0;
   }, [filtered, card, total]);
-  const asSonnet = costAtModel(filtered, "sonnet", card);
 
   return (
     <SettingsGroup
@@ -619,34 +622,29 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
         </label>
       </div>
 
+      {/* Tokens lead, money trails. A dollar figure in the first tile made a £200/month
+          subscription read as a $4 000 bill — and the disclaimer underneath could not undo
+          the impression the big number had already made. Volume is the honest headline;
+          the estimate is context, so it sits last and says what it is not. */}
       <div className="cc-tiles">
-        <Tile label="Estimated cost" value={anyUnpriced ? `${formatCost(total)}+` : formatCost(total)} />
+        <Tile label="Output tokens" value={formatTokens(totalOutput)} />
         <Tile
           label="Turns"
           value={rows.reduce((n, r) => n + r.turns, 0).toLocaleString("en-US")}
         />
         <Tile label="In workflow runs" value={`${Math.round(wfShare * 100)}%`} />
         <Tile
-          label="Same volume on Sonnet 5"
-          value={formatCost(asSonnet)}
-          note={
-            asSonnet !== null && total > 0 && asSonnet < total
-              ? `${Math.round((1 - asSonnet / total) * 100)}% less`
-              : undefined
-          }
+          label="At API rates"
+          value={anyUnpriced ? `${formatCost(total)}+` : formatCost(total)}
+          note="not your bill"
         />
       </div>
-      <p className="cc-hint">
-        The Sonnet figure prices <em>this same volume of tokens</em> at Sonnet's rates. A
-        different model would not produce exactly these tokens, so treat it as the weight of
-        one price tier against another rather than a forecast.
-      </p>
 
-      <StackedAreaChart
-        title="Spend per day"
+      <StackedBarsOverTime
+        title="Output tokens per day"
         days={series.days}
         series={series.series}
-        formatValue={formatCost}
+        formatValue={formatTokens}
       />
 
       <StackedBarChart
@@ -835,6 +833,9 @@ function InstructionsGroup() {
 
   const managed = memory.data?.managed_text ?? null;
   const current = draft ?? managed ?? "";
+  // "Dirty" means the box differs from what is actually in the file — either the user
+  // typed, or they clicked a suggested block and have not saved it yet.
+  const dirty = draft !== null && draft.trim() !== (managed ?? "").trim();
 
   return (
     <SettingsGroup
@@ -865,31 +866,41 @@ function InstructionsGroup() {
         <pre className="cc-preview">{memory.data?.full_text ?? "(empty)"}</pre>
       )}
 
-      {INSTRUCTION_BLOCKS.map((block) => {
-        const present = managed?.includes(block.body.slice(0, 40)) ?? false;
-        return (
-          <div key={block.id} className="cc-block">
-            <div className="cc-block-head">
-              <b>{block.title}</b>
-              {present && <span className="cc-badge">in your instructions</span>}
+      {/* A catalogue, not a single button: this list is meant to grow, and framing it as
+          "here is what we suggest" makes the one entry read as the first of several
+          rather than as the feature itself. */}
+      <h4 className="cc-blocks-head">Instructions we suggest adding</h4>
+      <div className="cc-blocks">
+        {INSTRUCTION_BLOCKS.map((block) => {
+          const present = managed?.includes(block.body.slice(0, 40)) ?? false;
+          return (
+            <div key={block.id} className="cc-block">
+              <div className="cc-block-head">
+                <b>{block.title}</b>
+                {present && <span className="cc-badge">in your instructions</span>}
+              </div>
+              <p className="cc-hint">{block.why}</p>
+              <button
+                type="button"
+                className="cc-btn"
+                disabled={!!memory.data?.marker_error || write.isPending}
+                onClick={() => setDraft(block.body)}
+              >
+                {present ? "Replace with the latest version" : "Add it"}
+              </button>
             </div>
-            <p className="cc-hint">{block.why}</p>
-            <button
-              type="button"
-              className="cc-btn"
-              disabled={!!memory.data?.marker_error || write.isPending}
-              onClick={() => setDraft(block.body)}
-            >
-              {present ? "Replace with the latest version" : "Add it"}
-            </button>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       <label className="cc-field">
         The managed block
         <textarea
           className="cc-textarea"
+          // Unsaved text is tinted like a diff's added lines. Without it the box looks
+          // identical whether the instructions are live in the file or merely proposed,
+          // which is the one thing the reader most needs to tell apart.
+          data-unsaved={dirty ? "" : undefined}
           rows={10}
           value={current}
           placeholder="Nothing yet. Add a block above, or write your own here."
@@ -897,6 +908,12 @@ function InstructionsGroup() {
           onChange={(e) => setDraft(e.target.value)}
         />
       </label>
+      {dirty && (
+        <p className="cc-unsaved">
+          <Ico name="alert" />
+          Not in your file yet — save to write it.
+        </p>
+      )}
       <div className="cc-actions">
         <button
           type="button"

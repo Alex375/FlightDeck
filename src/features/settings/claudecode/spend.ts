@@ -385,6 +385,14 @@ export interface DriftFinding {
   observedModel: string;
   observedLabel: string;
   turns: number;
+  /** The day the setting was last changed, when known — shown so the reader can see the
+   *  window the finding is drawn from. */
+  since: string | null;
+}
+
+/** `YYYY-MM-DD` for an epoch-millisecond stamp, in UTC — the clock the transcripts use. */
+export function dayOfMs(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 /**
@@ -396,16 +404,23 @@ export interface DriftFinding {
  */
 export function findDrift(
   buckets: SpendBucket[],
-  configured: Array<{ name: string; model: string | null }>,
+  configured: Array<{ name: string; model: string | null; configuredAtMs?: number | null }>,
 ): DriftFinding[] {
   const wanted = new Map(
     configured
-      .filter((c): c is { name: string; model: string } => !!c.model)
-      .map((c) => [c.name, c.model]),
+      .filter((c): c is typeof c & { model: string } => !!c.model)
+      .map((c) => [c.name, c]),
   );
   const seen = new Map<string, Map<string, number>>();
   for (const b of buckets) {
-    if (!wanted.has(b.agent)) continue;
+    const want = wanted.get(b.agent);
+    if (!want) continue;
+    // Only turns that ran AFTER the setting was last changed can say anything about it.
+    // Without this the canary fires the moment you pick a model, because the week behind
+    // you ran on the old one — a false alarm at exactly the moment it destroys trust.
+    // Strictly after the day of the change: a same-day turn may well predate it, and one
+    // day of silence costs far less than one wrong accusation.
+    if (want.configuredAtMs != null && b.day <= dayOfMs(want.configuredAtMs)) continue;
     let models = seen.get(b.agent);
     if (!models) {
       models = new Map();
@@ -415,17 +430,18 @@ export function findDrift(
   }
   const findings: DriftFinding[] = [];
   for (const [agent, models] of seen) {
-    const configuredModel = wanted.get(agent)!;
-    const target = catalogueIdForTranscriptModel(configuredModel) ?? configuredModel;
+    const want = wanted.get(agent)!;
+    const target = catalogueIdForTranscriptModel(want.model) ?? want.model;
     for (const [observed, turns] of models) {
       if ((catalogueIdForTranscriptModel(observed) ?? observed) === target) continue;
       findings.push({
         agent,
-        configuredModel,
-        configuredLabel: labelForTranscriptModel(configuredModel),
+        configuredModel: want.model,
+        configuredLabel: labelForTranscriptModel(want.model),
         observedModel: observed,
         observedLabel: labelForTranscriptModel(observed),
         turns,
+        since: want.configuredAtMs != null ? dayOfMs(want.configuredAtMs) : null,
       });
     }
   }

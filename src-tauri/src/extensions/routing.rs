@@ -69,6 +69,15 @@ pub struct AgentRouting {
     pub needs_file_to_steer: bool,
     /// True when a forcing baseline is set, which overrides this row whatever it says.
     pub overridden_by_force: bool,
+    /// When this setting last changed, in epoch milliseconds — the mtime of whatever file
+    /// holds it (the agent's own definition, or `settings.json` for a baseline-driven row).
+    ///
+    /// Load-bearing for the drift canary, not decoration. Without it the canary compares
+    /// today's setting against a week of transcripts that mostly PREDATE it, so it fires
+    /// every time you change a model — the one moment you are most sure the app is broken.
+    /// No new bookkeeping is needed: the file holding the setting already records when it
+    /// was written.
+    pub configured_at_ms: Option<i64>,
 }
 
 /// Everything the routing section needs, in one read.
@@ -118,6 +127,7 @@ pub fn resolve_routing(
     project_agents_dir: &str,
     project_dir_ignored: Option<bool>,
     repo_is_worktree: bool,
+    baseline_changed_at: Option<i64>,
 ) -> SubagentRouting {
     let forced = baseline.forced_model.is_some();
     let mut rows: Vec<AgentRouting> = Vec::new();
@@ -145,6 +155,7 @@ pub fn resolve_routing(
             // It has a file already, so it is steerable whatever the env var cannot reach.
             needs_file_to_steer: false,
             overridden_by_force: forced,
+            configured_at_ms: mtime_ms(Path::new(&agent.path)),
         });
     }
 
@@ -167,6 +178,9 @@ pub fn resolve_routing(
             shadows_built_in: false,
             needs_file_to_steer: blind,
             overridden_by_force: forced,
+            // A blind spot follows nothing, so nothing has been "configured" for it; the
+            // rest follow the baseline, and settings.json records when that last moved.
+            configured_at_ms: if blind { None } else { baseline_changed_at },
         });
     }
 
@@ -213,7 +227,15 @@ pub fn routing_for(repo_path: &str) -> SubagentRouting {
         &project_dir,
         ignored,
         is_worktree_path(repo_path),
+        super::home_dir().and_then(|h| mtime_ms(&h.join(".claude/settings.json"))),
     )
+}
+
+/// A file's last-modified time in epoch milliseconds; `None` when it cannot be read.
+fn mtime_ms(path: &Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(stamp.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -246,7 +268,7 @@ mod tests {
 
     #[test]
     fn built_ins_are_listed_even_with_nothing_on_disk() {
-        let r = resolve_routing(&[], &baseline(None, None), "/u", "/p", Some(false), false);
+        let r = resolve_routing(&[], &baseline(None, None), "/u", "/p", Some(false), false, None);
         assert_eq!(r.agents.len(), 3);
         assert_eq!(r.agents[0].name, "Explore", "the built-ins lead, in their own order");
         assert_eq!(r.agents[1].name, "Plan");
@@ -256,7 +278,7 @@ mod tests {
 
     #[test]
     fn the_baseline_reaches_general_purpose_but_not_explore_or_plan() {
-        let r = resolve_routing(&[], &baseline(Some("haiku"), None), "/u", "/p", None, false);
+        let r = resolve_routing(&[], &baseline(Some("haiku"), None), "/u", "/p", None, false, None);
         assert_eq!(row(&r, "general-purpose").effective_model.as_deref(), Some("haiku"));
         // The whole point: reporting "haiku" here would be the lie this page prevents.
         assert_eq!(row(&r, "Explore").effective_model, None);
@@ -269,7 +291,7 @@ mod tests {
     #[test]
     fn a_definition_file_shadows_the_built_in_and_wins_over_the_baseline() {
         let agents = [agent("Explore", Some("haiku"), ExtScope::User)];
-        let r = resolve_routing(&agents, &baseline(Some("sonnet"), None), "/u", "/p", None, false);
+        let r = resolve_routing(&agents, &baseline(Some("sonnet"), None), "/u", "/p", None, false, None);
         let explore = row(&r, "Explore");
         assert_eq!(explore.effective_model.as_deref(), Some("haiku"), "frontmatter beats env");
         assert_eq!(explore.origin, RoutingOrigin::User);
@@ -281,7 +303,7 @@ mod tests {
     #[test]
     fn a_definition_without_a_model_falls_through_to_the_baseline() {
         let agents = [agent("my-helper", None, ExtScope::Project)];
-        let r = resolve_routing(&agents, &baseline(Some("haiku"), None), "/u", "/p", None, false);
+        let r = resolve_routing(&agents, &baseline(Some("haiku"), None), "/u", "/p", None, false, None);
         assert_eq!(row(&r, "my-helper").effective_model.as_deref(), Some("haiku"));
         assert_eq!(row(&r, "my-helper").origin, RoutingOrigin::Project);
     }
@@ -289,7 +311,7 @@ mod tests {
     #[test]
     fn a_custom_agent_is_listed_after_the_built_ins() {
         let agents = [agent("aaa-custom", Some("opus"), ExtScope::User)];
-        let r = resolve_routing(&agents, &baseline(None, None), "/u", "/p", None, false);
+        let r = resolve_routing(&agents, &baseline(None, None), "/u", "/p", None, false, None);
         assert_eq!(r.agents.len(), 4);
         assert_eq!(
             r.agents.last().unwrap().name,
@@ -308,6 +330,7 @@ mod tests {
             "/p",
             None,
             false,
+            None,
         );
         assert!(r.agents.iter().all(|a| a.overridden_by_force));
         assert_eq!(r.baseline.forced_model.as_deref(), Some("haiku"));
@@ -316,13 +339,13 @@ mod tests {
     #[test]
     fn plugin_agents_are_reported_as_plugin_owned() {
         let agents = [agent("tosse-manager", Some("opus"), ExtScope::Plugin)];
-        let r = resolve_routing(&agents, &baseline(None, None), "/u", "/p", None, false);
+        let r = resolve_routing(&agents, &baseline(None, None), "/u", "/p", None, false, None);
         assert_eq!(row(&r, "tosse-manager").origin, RoutingOrigin::Plugin);
     }
 
     #[test]
     fn an_unknown_ignore_verdict_stays_unknown() {
-        let r = resolve_routing(&[], &baseline(None, None), "/u", "/p", None, false);
+        let r = resolve_routing(&[], &baseline(None, None), "/u", "/p", None, false, None);
         assert_eq!(r.project_dir_ignored, None, "\"could not check\" is not \"not ignored\"");
     }
 

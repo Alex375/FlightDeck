@@ -2333,7 +2333,18 @@ needs_file_to_steer: boolean;
 /**
  * True when a forcing baseline is set, which overrides this row whatever it says.
  */
-overridden_by_force: boolean }
+overridden_by_force: boolean; 
+/**
+ * When this setting last changed, in epoch milliseconds — the mtime of whatever file
+ * holds it (the agent's own definition, or `settings.json` for a baseline-driven row).
+ * 
+ * Load-bearing for the drift canary, not decoration. Without it the canary compares
+ * today's setting against a week of transcripts that mostly PREDATE it, so it fires
+ * every time you change a model — the one moment you are most sure the app is broken.
+ * No new bookkeeping is needed: the file holding the setting already records when it
+ * was written.
+ */
+configured_at_ms: number | null }
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so

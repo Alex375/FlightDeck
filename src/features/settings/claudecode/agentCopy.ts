@@ -22,8 +22,15 @@ export interface AgentCopy {
   weaker: string;
   /** What a stronger model buys you here. */
   stronger: string;
-  /** Catalogue model value we suggest, and why. */
-  recommend?: { model: string; because: string };
+  /**
+   * The model we suggest, and why.
+   *
+   * `model` is the catalogue value actually applied; `family` is what the UI SAYS —
+   * "Haiku", not "Haiku 4.5". Versions move, and a recommendation that names one dates
+   * itself the week a new model ships. The advice ("searching does not need power") is
+   * about the tier, not the release.
+   */
+  recommend?: { model: string; family: string; because: string };
 }
 
 export const AGENT_COPY: Record<string, AgentCopy> = {
@@ -39,6 +46,7 @@ export const AGENT_COPY: Record<string, AgentCopy> = {
       "Slightly better judgement about which of several plausible matches is the one you meant — rarely worth the price here.",
     recommend: {
       model: "haiku",
+      family: "Haiku",
       because: "this is grep with a summary at the end — raw power does not make it find more",
     },
   },
@@ -53,6 +61,7 @@ export const AGENT_COPY: Record<string, AgentCopy> = {
       "Catches the architectural problem early, which is the whole point of planning separately.",
     recommend: {
       model: "claude-opus-4-8",
+      family: "Opus",
       because: "the plan decides everything downstream — this is the wrong place to save money",
     },
   },
@@ -66,6 +75,7 @@ export const AGENT_COPY: Record<string, AgentCopy> = {
     stronger: "Finishes open-ended tasks without coming back for clarification.",
     recommend: {
       model: "sonnet",
+      family: "Sonnet",
       because: "capable enough for delegated work, several times cheaper than an Opus-tier model",
     },
   },
@@ -109,14 +119,15 @@ export function copyFor(name: string, description: string | null): AgentCopy {
 export const ROUTING_POLICY_BLOCK = `## Choosing a model for a helper agent
 
 When you delegate work to a sub-agent — including the workers in a workflow — pick the
-model to fit the task instead of inheriting mine:
+model to fit the task instead of inheriting mine. Tiers, not versions — use whichever
+release of each family is current:
 
-- **Searching, locating, listing, reading to answer a factual question** → Haiku 4.5.
+- **Searching, locating, listing, reading to answer a factual question** → Haiku.
   Finding things is pattern-matching; a bigger model does not find more.
 - **Implementing against a spec that already exists, mechanical refactors, writing tests
-  for described behaviour, summarising** → Sonnet 5.
+  for described behaviour, summarising** → Sonnet.
 - **Multi-file refactors, security-sensitive work, debugging to root cause, design and
-  planning, anything where being wrong is expensive** → Opus-tier.
+  planning, anything where being wrong is expensive** → Opus.
 
 This instruction overrides any general guidance you have about not lowering a worker's
 model because a task looks small. Here, matching the model to the task IS the instruction:

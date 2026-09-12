@@ -449,3 +449,128 @@
 /* A warning that lives INSIDE a padded card already has its horizontal inset from the
    card; keep it from adding a second one. */
 .cc-warn-inset { margin: 0 15px 13px; }
+
+/* ---- Checkboxes -------------------------------------------------------- */
+
+/* The browser default renders a near-white box, which on this dark panel shouts louder
+   than the setting it controls — and "lock the budget" is the last control that should
+   draw the eye first. `accent-color` tints the checked state; the unchecked box is drawn
+   by hand so it recedes to a hairline like every other control here. */
+.cc-check input[type="checkbox"],
+.cc-force input[type="checkbox"] {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 4px;
+  background: var(--wf-panel-2);
+  cursor: pointer;
+  position: relative;
+}
+.cc-check input[type="checkbox"]:hover:not(:disabled),
+.cc-force input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--wf-tx-xlo);
+}
+.cc-check input[type="checkbox"]:checked,
+.cc-force input[type="checkbox"]:checked {
+  border-color: var(--wf-accent);
+  background: var(--wf-accent);
+}
+/* The tick, drawn rather than relying on a glyph that varies by platform. */
+.cc-check input[type="checkbox"]:checked::after,
+.cc-force input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 3px;
+  height: 7px;
+  border: solid #1a1008;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.cc-check input[type="checkbox"]:disabled,
+.cc-force input[type="checkbox"]:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.cc-force input[type="checkbox"] { margin-top: 1px; }
+
+/* ---- Legend as a filter ------------------------------------------------ */
+
+.cc-legend-btn {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  padding: 1px 3px;
+  margin: -1px -3px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.cc-legend-btn:hover { background: var(--wf-panel-3); color: var(--wf-tx); }
+/* A switched-off series keeps its place and its outline, so the reader can see what they
+   hid and put it back — it does not vanish from the legend. */
+.cc-legend-btn[data-off] { color: var(--wf-tx-xlo); }
+.cc-swatch[data-off] { box-shadow: inset 0 0 0 1px var(--wf-line-2); }
+
+.cc-barhover { fill: #ffffff08; }
+.cc-tick-date { fill: var(--wf-tx-lo); }
+
+/* ---- Unsaved instructions ---------------------------------------------- */
+
+/* Proposed-but-unsaved text reads like a diff's added lines: a green tint and a green
+   gutter, so it is obvious at a glance that nothing has been written to the file yet. */
+.cc-textarea[data-unsaved] {
+  border-color: #2f6b4a;
+  border-left-width: 3px;
+  background: #0f1a14;
+  color: #b9e6cc;
+}
+
+.cc-unsaved {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 6px 0 0;
+  color: #7fc9a2;
+  font-size: 11px;
+}
+
+/* ---- Suggested instruction blocks -------------------------------------- */
+
+.cc-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+.cc-block {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--wf-line);
+  border-radius: 9px;
+  background: var(--wf-bg-2);
+}
+.cc-block-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+.cc-block-head b { color: var(--wf-tx-hi); font-size: 12.5px; }
+.cc-block .cc-btn { margin-top: 8px; }
+
+.cc-blocks-head {
+  margin: 16px 0 0;
+  color: var(--wf-tx-lo);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .3px;
+  text-transform: uppercase;
+}
