@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   VAD_EAGERNESS_DEFAULT,
+  VAD_INTERRUPT_DEFAULT,
   VAD_MODE_DEFAULT,
   VAD_THRESHOLD_DEFAULT,
   VAD_THRESHOLD_MAX,
@@ -16,6 +17,7 @@ const settings = (patch: Partial<VadSettings> = {}): VadSettings => ({
   mode: VAD_MODE_DEFAULT,
   eagerness: VAD_EAGERNESS_DEFAULT,
   threshold: VAD_THRESHOLD_DEFAULT,
+  interrupt: VAD_INTERRUPT_DEFAULT,
   ...patch,
 });
 
@@ -48,14 +50,24 @@ describe("buildTurnDetection", () => {
     expect(td).not.toHaveProperty("eagerness");
   });
 
-  // Barge-in is wanted behaviour in both modes — what changed is what counts as
-  // speaking, not whether the user may interrupt.
-  it("keeps barge-in and auto-response on in both modes", () => {
+  // The default has to be "the agent finishes its sentence": barge-in on every
+  // mode is what made the feature unusable, cutting the agent off every ten to
+  // thirty seconds with no relation to how loud the room was.
+  it("does not let the server interrupt the agent by default", () => {
     for (const mode of ["semantic", "loudness"] as const) {
       const td = buildTurnDetection(settings({ mode }));
-      expect(td.interrupt_response).toBe(true);
+      expect(td.interrupt_response).toBe(false);
+      // A turn taken over the agent is still ANSWERED — just afterwards.
       expect(td.create_response).toBe(true);
     }
+  });
+
+  it("hands the server barge-in only for the speech mode", () => {
+    expect(buildTurnDetection(settings({ interrupt: "speech" })).interrupt_response).toBe(true);
+    // The wake mode interrupts from the app, not the server — letting the server
+    // do it too would reinstate exactly the barge-in this mode exists to replace.
+    expect(buildTurnDetection(settings({ interrupt: "wake" })).interrupt_response).toBe(false);
+    expect(buildTurnDetection(settings({ interrupt: "never" })).interrupt_response).toBe(false);
   });
 
   // A stored value from an older build, or a hand-edited one, must not travel to
@@ -65,9 +77,11 @@ describe("buildTurnDetection", () => {
       mode: "whatever" as never,
       eagerness: "frantic" as never,
       threshold: 0.6,
+      interrupt: "always" as never,
     });
     expect(td.type).toBe("semantic_vad");
     expect(td.eagerness).toBe(VAD_EAGERNESS_DEFAULT);
+    expect(td.interrupt_response).toBe(false);
   });
 });
 

@@ -221,6 +221,27 @@ export function closeMic(): void {
   if (store.phase === "listening") store.setPhase("armed");
 }
 
+/**
+ * Stop the agent mid-sentence, now.
+ *
+ * Both halves are needed and they are not the same thing: `response.cancel` stops
+ * the model GENERATING, while `output_audio_buffer.clear` drops the audio already
+ * sent and sitting in the WebRTC playout buffer. Cancel alone leaves it talking
+ * through whatever it had queued, which reads as the interrupt not working.
+ *
+ * Used by the wake-word interrupt mode, where the app decides rather than the
+ * server: the wake detector is a far stricter judge of "the user meant to speak"
+ * than any turn detector — a specific phrase, two consecutive steps over 0.90,
+ * vetoed unless Silero agrees it was speech at all.
+ */
+export function interruptAgent(): void {
+  const s = session;
+  if (!s) return;
+  if (useVoiceStore.getState().phase !== "speaking") return;
+  dcSend(s, { type: "response.cancel" });
+  dcSend(s, { type: "output_audio_buffer.clear" });
+}
+
 /** Push the current VAD threshold to the LIVE session, so the Settings slider
  *  takes effect without re-arming. No-op when nothing is connected (the next
  *  arm reads the pref on `dc.onopen`). */

@@ -17,7 +17,12 @@ import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { applyInstructions, applyVadSettings, applyVoiceSelection } from "../../voice/realtime";
 import { DEFAULT_VOICE_INSTRUCTIONS, isCustomInstructions } from "../../voice/instructions";
 import { VadMeter } from "../../voice/VadMeter";
-import { VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN, type VadEagerness } from "../../voice/vad";
+import {
+  VAD_THRESHOLD_MAX,
+  VAD_THRESHOLD_MIN,
+  type VadEagerness,
+  type VadInterrupt,
+} from "../../voice/vad";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -28,6 +33,7 @@ export function VoiceAgentSection() {
   const vadThreshold = useVoicePrefs((s) => s.vadThreshold);
   const vadMode = useVoicePrefs((s) => s.vadMode);
   const vadEagerness = useVoicePrefs((s) => s.vadEagerness);
+  const vadInterrupt = useVoicePrefs((s) => s.vadInterrupt);
   const voice = useVoicePrefs((s) => s.voice);
   const instructions = useVoicePrefs((s) => s.instructions);
   const setPrefs = useVoicePrefs((s) => s.set);
@@ -389,6 +395,45 @@ export function VoiceAgentSection() {
               />
               <span className={styles.thintInline}>s</span>
             </span>
+          }
+        />
+        <ToggleRow
+          title="Cutting the agent off"
+          hint={
+            <>
+              <b>Let it finish</b> means nothing stops it mid-sentence. You can still speak over
+              it &mdash; what you say is answered once it is done, rather than over the top.
+              <br />
+              <b>By speaking</b> is the old behaviour, and the reason this setting exists: any
+              sound the detector took for speech stopped the agent, which in a room with a
+              dishwasher in it meant every ten to thirty seconds.
+              <br />
+              <b>With the wake word</b> makes the phrase your deliberate stop button. It is by far
+              the strictest judge available &mdash; a specific phrase, twice over, and only if
+              your microphone heard actual speech &mdash; so it does not fire on a room.
+              {vadInterrupt === "wake" && !wake?.enabled ? (
+                <div className={styles.dangerText}>
+                  &#9888;&#65039; The wake word is switched off below, so nothing can interrupt the
+                  agent right now.
+                </div>
+              ) : null}
+            </>
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={vadInterrupt}
+              onChange={(e) => {
+                setPrefs({ vadInterrupt: e.target.value as VadInterrupt });
+                applyVadSettings();
+              }}
+              disabled={!configured}
+              aria-label="What may interrupt the agent"
+            >
+              <option value="never">Let it finish (recommended)</option>
+              <option value="wake">With the wake word</option>
+              <option value="speech">By speaking</option>
+            </select>
           }
         />
         <ToggleRow

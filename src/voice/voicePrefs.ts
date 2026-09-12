@@ -7,12 +7,15 @@ import { create } from "zustand";
 import { DEFAULT_PTT, type PttShortcut } from "./pttShortcut";
 import {
   VAD_EAGERNESS_DEFAULT,
+  VAD_INTERRUPT_DEFAULT,
   VAD_MODE_DEFAULT,
   VAD_THRESHOLD_DEFAULT,
   asVadEagerness,
+  asVadInterrupt,
   asVadMode,
   clampVadThreshold,
   type VadEagerness,
+  type VadInterrupt,
   type VadMode,
   type VadSettings,
 } from "./vad";
@@ -34,6 +37,8 @@ export interface VoicePrefs {
   vadMode: VadMode;
   /** Semantic mode: how eagerly the model decides you have stopped talking. */
   vadEagerness: VadEagerness;
+  /** What may cut the agent off mid-sentence. Default: nothing. */
+  vadInterrupt: VadInterrupt;
   /** Loudness mode: amplitude threshold (0..1). Higher = LESS sensitive. Only
    *  consulted when `vadMode` is "loudness". */
   vadThreshold: number;
@@ -55,6 +60,7 @@ const DEFAULTS: VoicePrefs = {
   pttShortcut: DEFAULT_PTT,
   vadMode: VAD_MODE_DEFAULT,
   vadEagerness: VAD_EAGERNESS_DEFAULT,
+  vadInterrupt: VAD_INTERRUPT_DEFAULT,
   vadThreshold: VAD_THRESHOLD_DEFAULT,
   voice: "",
   instructions: "",
@@ -74,6 +80,7 @@ function load(): VoicePrefs {
       instructions: asText(merged.instructions),
       vadMode: asVadMode(merged.vadMode),
       vadEagerness: asVadEagerness(merged.vadEagerness),
+      vadInterrupt: asVadInterrupt(merged.vadInterrupt),
     };
   } catch {
     return DEFAULTS;
@@ -102,7 +109,12 @@ function asText(value: unknown): string {
  *  cannot drift apart. */
 export function currentVadSettings(): VadSettings {
   const s = useVoicePrefs.getState();
-  return { mode: asVadMode(s.vadMode), eagerness: asVadEagerness(s.vadEagerness), threshold: s.vadThreshold };
+  return {
+    mode: asVadMode(s.vadMode),
+    eagerness: asVadEagerness(s.vadEagerness),
+    threshold: s.vadThreshold,
+    interrupt: asVadInterrupt(s.vadInterrupt),
+  };
 }
 
 /** Clamp the auto-close guard to something sane (10 s – 5 min). */
@@ -126,6 +138,10 @@ export const useVoicePrefs = create<VoicePrefsState>((set) => ({
           patch.vadEagerness !== undefined
             ? asVadEagerness(patch.vadEagerness)
             : asVadEagerness(s.vadEagerness),
+        vadInterrupt:
+          patch.vadInterrupt !== undefined
+            ? asVadInterrupt(patch.vadInterrupt)
+            : asVadInterrupt(s.vadInterrupt),
         vadThreshold:
           patch.vadThreshold !== undefined
             ? clampVadThreshold(patch.vadThreshold)

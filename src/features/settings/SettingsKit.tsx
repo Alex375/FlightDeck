@@ -20,7 +20,7 @@ export function PageHead({ title, subtitle }: { title: string; subtitle?: ReactN
 
 /**
  * A pill row that splits ONE settings tab into sub-pages. Tabs that grew a long
- * stack of unrelated cards (MCP Control: in-app agents, the voice agent, remote
+ * stack of unrelated cards (Control: in-app agents, the voice agent, remote
  * access, the bridge…) show one group at a time behind this instead of asking the
  * user to scroll past everything else.
  *

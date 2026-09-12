@@ -29,6 +29,31 @@ export type VadMode = "semantic" | "loudness";
 /** How eagerly `semantic_vad` decides the user has finished speaking. */
 export type VadEagerness = "low" | "medium" | "high";
 
+/**
+ * What is allowed to cut the agent off mid-sentence.
+ *
+ * ⚠️ Barge-in was ON in every mode and it is the single most damaging thing this
+ * feature did. Armand, talking while emptying a dishwasher: the agent stopped
+ * every ten seconds on `server_vad`, and switching to `semantic_vad` made it
+ * WORSE — it cut out mid-sentence roughly every thirty, with no relation to how
+ * loud the room was.
+ *
+ * That pattern points away from the room and at the agent itself: its own voice
+ * comes out of the speakers and back into the open microphone. Acoustic echo
+ * cancellation is on, but it is imperfect on laptop speakers — and where an
+ * amplitude gate at 0.90 might reject a quiet echo, a SEMANTIC detector hears
+ * words, which is exactly what an echo of speech contains. Asking "did someone
+ * finish a sentence" of the agent's own sentence gets a yes.
+ *
+ * Whatever the source, the user's own verdict settles the default: an agent that
+ * never stops beats one that stops constantly, because a long answer you have to
+ * sit through costs seconds while an interruption costs the whole exchange. So
+ * "never" is the default, and interrupting is something you turn ON.
+ */
+export type VadInterrupt = "never" | "speech" | "wake";
+
+export const VAD_INTERRUPT_DEFAULT: VadInterrupt = "never";
+
 export const VAD_MODE_DEFAULT: VadMode = "semantic";
 /** Default for the semantic mode: wait, rather than cut in. The complaint that
  *  drove this change was interruption, never sluggishness. */
@@ -42,6 +67,7 @@ export const VAD_THRESHOLD_MAX = 0.9;
 export const VAD_THRESHOLD_DEFAULT = 0.6;
 
 const EAGERNESS_VALUES: readonly VadEagerness[] = ["low", "medium", "high"];
+const INTERRUPT_VALUES: readonly VadInterrupt[] = ["never", "speech", "wake"];
 
 /** Clamp a threshold to the usable band, falling back to the default on NaN. */
 export function clampVadThreshold(v: number): number {
@@ -61,10 +87,17 @@ export function asVadEagerness(value: unknown): VadEagerness {
     : VAD_EAGERNESS_DEFAULT;
 }
 
+export function asVadInterrupt(value: unknown): VadInterrupt {
+  return INTERRUPT_VALUES.includes(value as VadInterrupt)
+    ? (value as VadInterrupt)
+    : VAD_INTERRUPT_DEFAULT;
+}
+
 export interface VadSettings {
   mode: VadMode;
   eagerness: VadEagerness;
   threshold: number;
+  interrupt: VadInterrupt;
 }
 
 /**
@@ -72,24 +105,31 @@ export interface VadSettings {
  *
  * It travels at `session.audio.input.turn_detection` — see realtime.ts.
  *
- * Barge-in stays ON in both modes: cutting the agent off by speaking is wanted
- * behaviour. What changed is WHAT counts as speaking.
+ * `interrupt_response` is only handed to the server for the "speech" mode. The
+ * "wake" mode interrupts too, but on OUR terms: the wake detector is a far
+ * stricter judge than any turn detector (a specific phrase, two consecutive
+ * steps over 0.90, vetoed unless Silero agrees it was speech), so the app sends
+ * the cancel itself rather than letting the server decide — see realtime.ts.
+ *
+ * `create_response` stays on in every mode: a turn you took while the agent was
+ * talking is still answered, just after it finishes rather than over the top.
  */
 export function buildTurnDetection(settings: VadSettings): Record<string, unknown> {
+  const interruptOnSpeech = asVadInterrupt(settings.interrupt) === "speech";
   if (asVadMode(settings.mode) === "loudness") {
     return {
       type: "server_vad",
       threshold: clampVadThreshold(settings.threshold),
       prefix_padding_ms: 300,
       silence_duration_ms: 500,
-      interrupt_response: true,
+      interrupt_response: interruptOnSpeech,
       create_response: true,
     };
   }
   return {
     type: "semantic_vad",
     eagerness: asVadEagerness(settings.eagerness),
-    interrupt_response: true,
+    interrupt_response: interruptOnSpeech,
     create_response: true,
   };
 }

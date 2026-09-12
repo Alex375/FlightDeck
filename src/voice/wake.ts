@@ -13,8 +13,10 @@
 // lives in a single place with tests, not scattered through the session manager.
 // The action itself reuses realtime.ts's existing primitives (armVoiceSession +
 // openMic), inventing no new session machinery.
-import { armVoiceSession, openMic } from "./realtime";
+import { armVoiceSession, interruptAgent, openMic } from "./realtime";
 import { useVoiceStore, type VoicePhase } from "./voiceStore";
+import { useVoicePrefs } from "./voicePrefs";
+import { asVadInterrupt, type VadInterrupt } from "./vad";
 import { playChime } from "../notifications/sound";
 
 /** The inputs the wake gate reads — a plain record so it is trivially testable
@@ -30,6 +32,12 @@ export interface WakeGateState {
    *  phrase: the always-on microphone hears the agent's own text-to-speech, and
    *  its voice is not a wake word — reacting would re-open the mic over the reply. */
   phase: VoicePhase;
+  /** What the user allows to cut the agent off. In "wake" mode the phrase becomes
+   *  the deliberate interrupt, so it MUST be heard while the agent is speaking —
+   *  the one case where the rule above is suspended, and only because the wake
+   *  detector is strict enough to carry it (a specific phrase, two steps over
+   *  0.90, vetoed unless Silero heard speech). */
+  interrupt: VadInterrupt;
 }
 
 /**
@@ -39,8 +47,11 @@ export interface WakeGateState {
 export function shouldFireWake(s: WakeGateState): boolean {
   if (s.configured !== true) return false; // no key → the whole voice feature is locked
   if (!s.enabled) return false; // the user has not opted in
-  if (s.phase === "speaking") return false; // the agent is talking — its TTS is not a wake word
   if (s.phase === "error") return false; // a broken session won't accept a mic
+  // The agent is talking. Its own TTS reaches the always-on microphone, so the
+  // phrase is normally ignored here — EXCEPT when the user has made it their
+  // deliberate way to interrupt, which is the whole point of that mode.
+  if (s.phase === "speaking") return asVadInterrupt(s.interrupt) === "wake";
   return true;
 }
 
@@ -54,7 +65,11 @@ export function shouldFireWake(s: WakeGateState): boolean {
  */
 export async function wakeTrigger(enabled: boolean): Promise<void> {
   const { configured, phase } = useVoiceStore.getState();
-  if (!shouldFireWake({ configured, enabled, phase })) return;
+  const interrupt = asVadInterrupt(useVoicePrefs.getState().vadInterrupt);
+  if (!shouldFireWake({ configured, enabled, phase, interrupt })) return;
+  // Heard while the agent is talking: this is the interrupt, so cut it off before
+  // opening the mic — otherwise the reply plays over the user's next sentence.
+  if (phase === "speaking") interruptAgent();
   // A brief acknowledgement so the user knows the phrase landed and the mic is
   // opening — the earcon "OK Google" / "Dis Siri" play before they listen.
   playChime("done");
