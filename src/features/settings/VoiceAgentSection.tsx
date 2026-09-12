@@ -17,6 +17,7 @@ import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { applyInstructions, applyVadSettings, applyVoiceSelection } from "../../voice/realtime";
 import { DEFAULT_VOICE_INSTRUCTIONS, isCustomInstructions } from "../../voice/instructions";
 import { VadMeter } from "../../voice/VadMeter";
+import { VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN } from "../../voice/vad";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -392,17 +393,44 @@ export function VoiceAgentSection() {
           title="Voice detection threshold"
           hint={
             <>
-              How loud speech must be before the agent starts listening. Drag the handle right to
-              make it less sensitive — it then ignores background noise and faint sounds, so it
-              won&rsquo;t cut in or interrupt on stray sound. Drag left to pick up quieter speech.
-              You can still interrupt the agent by speaking.
-              <VadMeter
-                threshold={vadThreshold}
-                onThresholdChange={(v) => {
-                  setPrefs({ vadThreshold: v });
+              How sure OpenAI&rsquo;s speech detector must be that it is hearing you before the
+              agent starts listening. Higher means it takes more convincing, so it stops cutting
+              in on background noise and stray sound; lower means it picks up more, including
+              things you did not mean for it. You can always interrupt the agent by speaking.
+              <br />
+              This is a confidence, not a loudness &mdash; there is no level to line it up
+              against, so find your setting by ear: nudge it up if the agent reacts to things you
+              did not say, down if it misses you.
+            </>
+          }
+          control={
+            <span className={styles.tokenRow}>
+              <input
+                type="range"
+                min={VAD_THRESHOLD_MIN}
+                max={VAD_THRESHOLD_MAX}
+                step={0.05}
+                value={vadThreshold}
+                onChange={(e) => {
+                  setPrefs({ vadThreshold: Number(e.target.value) });
                   applyVadSettings();
                 }}
-                valueClassName={styles.mono}
+                disabled={!configured}
+                aria-label="Voice detection threshold"
+              />
+              <span className={styles.mono}>{vadThreshold.toFixed(2)}</span>
+            </span>
+          }
+        />
+        <ToggleRow
+          title="Microphone check"
+          hint={
+            <>
+              The level the agent actually receives, through the same microphone settings its
+              session uses. It answers &ldquo;is the right input selected and is it hearing
+              me&rdquo; &mdash; not &ldquo;where should the threshold go&rdquo;, which this bar
+              cannot tell you.
+              <VadMeter
                 buttonClassName={`${styles.btn} ${styles.ghost}`}
                 disabled={!configured}
               />

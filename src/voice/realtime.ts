@@ -35,6 +35,7 @@ import {
   type FleetAnnouncement,
 } from "./announce";
 import { buildTurnDetection } from "./vad";
+import { openVoiceMic } from "./mic";
 import { resolveInstructions } from "./instructions";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
@@ -175,7 +176,7 @@ export async function openMic(): Promise<boolean> {
   }
   let mic: MediaStream;
   try {
-    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic = await openVoiceMic();
   } catch (e) {
     const message =
       e instanceof DOMException && e.name === "NotAllowedError"

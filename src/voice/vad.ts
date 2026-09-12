@@ -5,11 +5,17 @@
 // We now configure turn detection EXPLICITLY instead of inheriting OpenAI's
 // defaults. The default threshold was over-sensitive: faint sounds registered
 // as speech, so the agent cut in / got interrupted too eagerly. Only the
-// amplitude `threshold` is user-tunable (the Settings slider); the rest is
-// fixed and sane.
+// `threshold` is user-tunable (the Settings slider); the rest is fixed and sane.
+//
+// Turn detection stays OpenAI's job. Gating the audio ourselves before it leaves
+// the machine was considered and dropped: it would have put a threshold we can
+// explain on a bar the user can read, but at the cost of a second detector to
+// keep honest, a delay line so it does not clip the first syllable, and
+// hysteresis so it does not chop a sentence in two — a lot of machinery to
+// second-guess a detector that is doing the job.
 
-/** The band the threshold is clamped to. Extremes are useless: ~0 fires on any
- *  hiss, ~1 never triggers. */
+/** The band the threshold is clamped to, and the range the Settings slider
+ *  spans. Extremes are useless: ~0 fires on any hiss, ~1 never triggers. */
 export const VAD_THRESHOLD_MIN = 0.3;
 export const VAD_THRESHOLD_MAX = 0.9;
 /** Default amplitude gate — a notch LESS sensitive than OpenAI's 0.5 default,
@@ -25,8 +31,13 @@ export function clampVadThreshold(v: number): number {
 
 /** Build the `turn_detection` block for a Realtime `session.update`.
  *
- *  @param threshold amplitude gate 0..1 — higher = LESS sensitive (ignores
- *    quiet sounds / background noise); lower = picks up fainter speech.
+ *  @param threshold how sure OpenAI's detector must be, 0..1 — higher = LESS
+ *    sensitive (ignores background noise and stray sound); lower = picks up more.
+ *
+ *  ⚠️ This is a CONFIDENCE from their speech detector, not an amplitude, and
+ *  nothing local shares its scale. Settings once drew it as a handle on the live
+ *  level meter, which could never line up and told users to calibrate it against
+ *  a number it has no relationship to — see VadMeter.tsx.
  */
 export function buildTurnDetection(threshold: number): Record<string, unknown> {
   return {
