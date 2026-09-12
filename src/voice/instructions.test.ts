@@ -40,6 +40,18 @@ describe("the default brief", () => {
     expect(DEFAULT_VOICE_INSTRUCTIONS.toLowerCase()).toContain("no preamble");
   });
 
+  // Radio discipline: a SHORT pleasantry is still a pleasantry, and spoken, it is
+  // time the user has to sit through. Greetings and sign-offs must get silence.
+  it("forbids greetings and spoken sign-offs outright", () => {
+    const brief = DEFAULT_VOICE_INSTRUCTIONS;
+    expect(brief).toContain("Never greet and never sign off");
+    expect(brief).toContain("au revoir");
+    expect(brief).toContain("à la prochaine");
+    expect(brief).toContain("end_call and stay silent");
+    // …and it must not ask for the goodbye it just banned.
+    expect(brief).not.toMatch(/say goodbye/i);
+  });
+
   it("still names the tools the agent must ground itself in", () => {
     for (const tool of [
       "list_conversations",
