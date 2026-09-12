@@ -60,12 +60,17 @@ const REFIRE_COOLDOWN_STEPS: u32 = 15;
 /// Consecutive steps that must score above the threshold before we wake the app —
 /// openWakeWord's `patience`, which this engine was missing.
 ///
-/// Sized from 25 recorded false positives against real utterances: a spoken phrase
-/// holds the threshold for 12-18 steps (the ~2 s classifier window slides through
-/// it slowly), while EVERY recorded false positive was a single 80 ms spike out of
-/// nowhere — 24 of 25 jumped straight from below 0.5 to over 0.6 and back. 3 sits
-/// in the middle of that gap and costs ~160 ms of extra latency.
-const PATIENCE_STEPS: u32 = 3;
+/// ⚠️ Read together with `threshold_for`: patience and the threshold were tuned as
+/// ONE pair, against 10 recorded real utterances and a confirmed false positive.
+/// Changing either alone undoes the other.
+///
+/// Why 2 and not more: the FIRST step of a real detection is a ramp-in — the
+/// classifier window is only part-way into the phrase, so it scores modestly
+/// (0.66-0.82 across the recordings) before pinning at ~1.00. Demanding three
+/// consecutive steps over a HIGH bar therefore fails on the ramp, not on the
+/// phrase: at threshold 0.90, patience 3 lost 4 of 10 genuine utterances while
+/// patience 2 lost none. Two steps over a high bar beats three over a low one.
+const PATIENCE_STEPS: u32 = 2;
 /// Trailing steps whose peak speech probability is required to be real (~1.3 s).
 const VAD_VETO_STEPS: usize = 16;
 /// Silero peak the trailing window must reach for a fire to count as speech.
@@ -156,10 +161,27 @@ fn classifier_bytes(phrase: &str) -> &'static [u8] {
 }
 
 /// Map the user's sensitivity slider (0 = strict, 1 = loose) to a probability
-/// threshold. Default 0.5 → 0.6, a sane starting point for openWakeWord.
+/// threshold. Default 0.5 → 0.90.
+///
+/// The band used to be 0.30-0.90 with 0.60 in the middle, which measurement showed
+/// was aimed at the wrong place entirely. Scores from this pipeline are bimodal —
+/// near 0 or near 1 — so nothing interesting happens below ~0.8, and the slider
+/// spent its whole upper half in a range no setting should ever use: a confirmed
+/// false positive peaked at 0.92, while non-speech spikes reached 0.98. Worse, the
+/// old band could not even REACH a threshold above 0.90, so the one region that
+/// separates real from false was unreachable by design.
+///
+/// 0.82-0.98 is that region. Every one of 10 recorded real utterances clears 0.90
+/// for at least two consecutive steps; the confirmed false positive touches 0.92
+/// exactly once.
+///
+/// ⚠️ Tuned on ONE confirmed false positive against ten real utterances, which
+/// places a boundary inside a 0.01 gap. It holds on that evidence and no more —
+/// the durable fix is retraining the classifier, which has never seen background
+/// noise or a real human voice.
 fn threshold_for(sensitivity: f32) -> f32 {
     let s = sensitivity.clamp(0.0, 1.0);
-    0.9 - 0.6 * s
+    0.98 - 0.16 * s
 }
 
 /// Run a single-input ONNX model and return `(output_shape, output_data)` of its
@@ -592,9 +614,20 @@ mod tests {
     fn threshold_maps_sensitivity_monotonically() {
         // Louder sensitivity → lower (looser) threshold, clamped to [0,1] input.
         assert!(threshold_for(0.0) > threshold_for(1.0));
-        assert!((threshold_for(0.5) - 0.6).abs() < 1e-5); // f32: 0.9 - 0.6*0.5
+        assert!((threshold_for(0.5) - 0.90).abs() < 1e-5);
         assert_eq!(threshold_for(-1.0), threshold_for(0.0)); // clamp
         assert_eq!(threshold_for(2.0), threshold_for(1.0)); // clamp
+    }
+
+    /// The whole slider must stay in the band where this pipeline's scores
+    /// actually separate. A confirmed false positive peaked at 0.92 and non-speech
+    /// spikes reached 0.98, so a reachable setting below ~0.8 is not a "loose"
+    /// option — it is one that cannot work, offered as though it could.
+    #[test]
+    fn the_sensitivity_band_stays_where_scores_separate() {
+        assert!(threshold_for(1.0) >= 0.80, "the loosest setting is still usable");
+        assert!(threshold_for(0.0) <= 0.99, "the strictest setting is still reachable");
+        assert!(threshold_for(0.0) > 0.92, "the strictest beats the confirmed false positive");
     }
 
     #[test]
