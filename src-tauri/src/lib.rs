@@ -702,7 +702,8 @@ pub fn run() {
                         eprintln!("[wake] failed to emit WakeWordEvent: {e}");
                     }
                 }));
-                let cfg = ipc::commands::load_wake_config(&app.state::<store::Store>());
+                let cfg =
+                    ipc::commands::load_wake_config(app.handle(), &app.state::<store::Store>());
                 if cfg.enabled {
                     let wake = wake.clone();
                     std::thread::spawn(move || {

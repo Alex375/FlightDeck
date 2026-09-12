@@ -43,11 +43,54 @@ const MEL_HOP: usize = 160;
 /// Trailing raw-audio window fed to the mel model each step — enough for ≥76
 /// frames of context (76 hops + a window's worth of slack), no more.
 const MEL_WINDOW_SAMPLES: usize = EMB_FRAMES * MEL_HOP + 640;
-/// Silero VAD frame size at 16 kHz.
+/// Silero VAD hop at 16 kHz — the amount of NEW audio per inference.
 const VAD_FRAME: usize = 512;
+/// Samples of the PREVIOUS hop that Silero expects prepended to each frame, so the
+/// tensor it actually scores is 576 long.
+///
+/// ⚠️ This is not optional padding: silero-vad 5.x does it inside its own wrapper,
+/// and the exported graph's sequence dimension is DYNAMIC — so feeding a bare 512
+/// is ACCEPTED by onnxruntime and then silently scores ~0 forever. Measured on 7 s
+/// of loud, clear speech (RMS 0.12): peak probability 0.003 at 512 versus 1.000 at
+/// 576. That is why the VAD never once reported speech.
+const VAD_CONTEXT: usize = 64;
 /// Suppress re-fires for this many steps after a detection (~1.2 s) and clear the
 /// embedding buffer, so one spoken phrase triggers exactly once.
 const REFIRE_COOLDOWN_STEPS: u32 = 15;
+/// Detection steps of score history kept for diagnostics (~3.2 s). Dumped with
+/// every fire so a false positive shows its whole approach, not just the peak.
+const TRACE_STEPS: usize = 40;
+/// Raw audio retained for a debug dump (4 s at 16 kHz) — comfortably more than
+/// the ~2 s the classifier looks at, so the clip holds the sound that fired it
+/// AND its lead-in. Only ever filled when debug capture is on.
+const DEBUG_AUDIO_SAMPLES: usize = SAMPLE_RATE as usize * 4;
+
+/// One detection step's diagnostics — the numbers that explain a fire.
+#[derive(Debug, Clone, Copy)]
+pub struct StepTrace {
+    /// The classifier's probability for this step.
+    pub score: f32,
+    /// Silero's PEAK speech probability over the audio that fed this step.
+    /// DIAGNOSTIC ONLY — the VAD gates nothing today (see `feed`).
+    pub vad: f32,
+    /// RMS of the trailing mel window, in [0, 1]. Near zero means the step scored
+    /// (near-)silence — which no spoken phrase can do, so a fire there points at
+    /// the model rather than at the threshold.
+    pub rms: f32,
+}
+
+/// A fire, carrying everything needed to explain it after the fact.
+pub struct Detection {
+    /// The score that crossed the threshold.
+    pub score: f32,
+    /// The threshold in force (derived from the user's sensitivity).
+    pub threshold: f32,
+    /// The last `TRACE_STEPS` steps, oldest first, ending with the firing step.
+    pub trace: Vec<StepTrace>,
+    /// Raw 16 kHz mono audio around the fire — `Some` ONLY when debug capture is
+    /// on. This is microphone audio: it is never retained without an opt-in.
+    pub audio: Option<Vec<f32>>,
+}
 
 /// The bundled models. `include_bytes!` embeds them in the binary — no resource
 /// path to resolve across dev / prod / the updater, no external asset host.
@@ -113,6 +156,9 @@ struct Vad {
     session: Session,
     state: Vec<f32>,
     buf: Vec<f32>,
+    /// The last `VAD_CONTEXT` samples of the previous hop, prepended to the next
+    /// frame. Zero-filled at the start, exactly as silero-vad's own wrapper does.
+    context: Vec<f32>,
     disabled: bool,
 }
 
@@ -122,36 +168,44 @@ impl Vad {
             session: build_session(VAD_MODEL)?,
             state: vec![0.0; 2 * 1 * 128],
             buf: Vec::with_capacity(VAD_FRAME * 2),
+            context: vec![0.0; VAD_CONTEXT],
             disabled: false,
         })
     }
 
-    /// Feed new audio; return true if speech is present in it. On any model error
-    /// the VAD latches off and reports speech (fail-open — never silence the
-    /// feature over a VAD glitch).
-    fn is_speech(&mut self, samples: &[f32]) -> bool {
+    /// Feed new audio; return the PEAK speech probability across the frames this
+    /// call completed (0.0 when it completed none — callers accumulate with `max`,
+    /// for which that is a no-op). Returning the probability rather than a boolean
+    /// is what lets it ride in the trace and, later, veto a fire. On any model
+    /// error the VAD latches off and reports certain speech (fail-open — never
+    /// silence the feature over a VAD glitch).
+    fn speech_prob(&mut self, samples: &[f32]) -> f32 {
         if self.disabled {
-            return true;
+            return 1.0;
         }
         self.buf.extend_from_slice(samples);
-        let mut speech = false;
+        let mut peak = 0.0f32;
         while self.buf.len() >= VAD_FRAME {
-            let frame: Vec<f32> = self.buf.drain(..VAD_FRAME).collect();
+            let hop: Vec<f32> = self.buf.drain(..VAD_FRAME).collect();
+            // context ++ hop = the 576 samples Silero scores; then carry this hop's
+            // tail forward. Skipping this is what made the VAD a constant ~0.
+            let mut frame = std::mem::take(&mut self.context);
+            frame.extend_from_slice(&hop);
+            self.context = hop[hop.len() - VAD_CONTEXT..].to_vec();
             match self.run_frame(&frame) {
-                Ok(p) if p >= 0.5 => speech = true,
-                Ok(_) => {}
+                Ok(p) => peak = peak.max(p),
                 Err(e) => {
                     eprintln!("[wake] Silero VAD disabled after error: {e}");
                     self.disabled = true;
-                    return true;
+                    return 1.0;
                 }
             }
         }
-        speech
+        peak
     }
 
     fn run_frame(&mut self, frame: &[f32]) -> Result<f32, String> {
-        let input = Tensor::from_array((vec![1i64, VAD_FRAME as i64], frame.to_vec()))
+        let input = Tensor::from_array((vec![1i64, frame.len() as i64], frame.to_vec()))
             .map_err(|e| e.to_string())?;
         let state = Tensor::from_array((vec![2i64, 1, 128], self.state.clone()))
             .map_err(|e| e.to_string())?;
@@ -182,23 +236,36 @@ pub struct Engine {
     vad: Vad,
     phrase: String,
     threshold: f32,
-    /// Rolling 16 kHz audio, capped to the mel window.
+    /// Rolling 16 kHz audio. Holds the next step's mel window PLUS everything
+    /// that has arrived past it: `feed` walks a per-step window end through this
+    /// buffer, so several steps drained from one callback see DIFFERENT audio.
     audio: Vec<f32>,
-    /// Samples accumulated since the last detection step.
+    /// Samples accumulated past the last step's window end.
     pending: usize,
     /// The last `CLASSIFIER_EMBEDDINGS` embeddings (flattened, 96 each).
     embeddings: std::collections::VecDeque<Vec<f32>>,
     /// Steps remaining in the post-detection cooldown.
     cooldown: u32,
-    /// Previous VAD state, to log speech rising edges (diagnostics).
+    /// Peak Silero probability observed since the last step (diagnostics).
+    vad_peak: f32,
+    /// Previous per-step VAD state, to log speech rising edges (diagnostics).
     was_speech: bool,
+    /// Rolling per-step diagnostics, capped at `TRACE_STEPS`.
+    trace: std::collections::VecDeque<StepTrace>,
+    /// Whether to retain raw audio for a debug dump. OFF keeps `debug_audio`
+    /// permanently empty — a user who did not opt in never has mic audio buffered.
+    debug: bool,
+    debug_audio: std::collections::VecDeque<f32>,
+    /// Latches after the first non-finite feature frame, so a dead input logs once
+    /// instead of every 80 ms.
+    warned_non_finite: bool,
 }
 
 impl Engine {
     /// Build the engine for one phrase + sensitivity. Loads all four models
     /// (VAD + the three openWakeWord stages) — a few tens of ms, done once when
-    /// the detector arms.
-    pub fn new(phrase: &str, sensitivity: f32) -> Result<Self, String> {
+    /// the detector arms. `debug` turns on raw-audio retention for fire dumps.
+    pub fn new(phrase: &str, sensitivity: f32, debug: bool) -> Result<Self, String> {
         Ok(Self {
             mel: build_session(MEL_MODEL)?,
             embedding: build_session(EMBEDDING_MODEL)?,
@@ -206,11 +273,20 @@ impl Engine {
             vad: Vad::new()?,
             phrase: phrase.to_string(),
             threshold: threshold_for(sensitivity),
-            audio: Vec::with_capacity(MEL_WINDOW_SAMPLES + CHUNK),
+            audio: Vec::with_capacity(MEL_WINDOW_SAMPLES + 2 * CHUNK),
             pending: 0,
             embeddings: std::collections::VecDeque::with_capacity(CLASSIFIER_EMBEDDINGS),
             cooldown: 0,
+            vad_peak: 0.0,
             was_speech: false,
+            trace: std::collections::VecDeque::with_capacity(TRACE_STEPS),
+            debug,
+            debug_audio: std::collections::VecDeque::with_capacity(if debug {
+                DEBUG_AUDIO_SAMPLES
+            } else {
+                0
+            }),
+            warned_non_finite: false,
         })
     }
 
@@ -219,54 +295,90 @@ impl Engine {
         &self.phrase
     }
 
-    /// Feed freshly-captured 16 kHz mono audio. Returns `Some(score)` the moment
-    /// the configured phrase is detected (at most once per spoken phrase, thanks
-    /// to the cooldown). `None` otherwise.
-    pub fn feed(&mut self, samples: &[f32]) -> Option<f32> {
-        // VAD is computed for diagnostics only — it no longer GATES the pipeline.
+    /// Test-only view of the rolling score history, so a test can compare the
+    /// trajectories of two engines fed the SAME audio in different callback sizes.
+    #[cfg(test)]
+    fn trace_scores(&self) -> Vec<f32> {
+        self.trace.iter().map(|t| t.score).collect()
+    }
+
+    /// Feed freshly-captured 16 kHz mono audio. Returns `Some(detection)` the
+    /// moment the configured phrase is detected (at most once per spoken phrase,
+    /// thanks to the cooldown). `None` otherwise.
+    pub fn feed(&mut self, samples: &[f32]) -> Option<Detection> {
+        // VAD is computed for diagnostics only — it does NOT gate the pipeline.
         // openWakeWord needs a CONTINUOUS rolling window of embeddings (~2 s); a
         // hard VAD gate that ran the stack only during speech (and cleared the
         // embedding buffer on silence) mis-anchored that window and starved the
         // classifier of the 16 consecutive embeddings it needs — so a short
-        // utterance never fired. Run the stack every step; VAD-based CPU savings
-        // can come back later WITHOUT breaking the rolling window.
-        let speech = self.vad.is_speech(samples);
-        if speech && !self.was_speech {
-            eprintln!("[wake] VAD: speech");
-        }
-        self.was_speech = speech;
+        // utterance never fired. Run the stack every step.
+        //
+        // Reading this probability as a FIRE-TIME VETO would not touch the rolling
+        // window, and is the next move against false positives. ⚠️ When that lands,
+        // veto on the peak across the TRAILING WINDOW, never on the firing step's
+        // own 80 ms: the classifier scores ~2 s of context, so it typically fires
+        // one or two steps AFTER the phrase ends, on new audio that is already
+        // silent. Measured on a `say "Alexa"` clip: the step that scores 1.000
+        // carries vad=0.01, while the steps holding the phrase itself read ~1.0.
+        // A naive per-step veto would therefore reject every real detection.
+        self.vad_peak = self.vad_peak.max(self.vad.speech_prob(samples));
+
         self.audio.extend_from_slice(samples);
         self.pending += samples.len();
-        // Cap the rolling buffer.
-        if self.audio.len() > MEL_WINDOW_SAMPLES {
-            let drop = self.audio.len() - MEL_WINDOW_SAMPLES;
-            self.audio.drain(..drop);
+        if self.debug {
+            for &s in samples {
+                if self.debug_audio.len() == DEBUG_AUDIO_SAMPLES {
+                    self.debug_audio.pop_front();
+                }
+                self.debug_audio.push_back(s);
+            }
         }
 
-        let mut hit: Option<f32> = None;
+        let mut hit: Option<Detection> = None;
         while self.pending >= CHUNK {
             self.pending -= CHUNK;
-            if let Some(score) = self.step() {
-                hit = Some(score);
+            // Where THIS step's window ends. Each iteration advances it by exactly
+            // CHUNK, so a callback carrying several chunks yields several DISTINCT
+            // embeddings. Slicing the buffer's tail instead (what this used to do)
+            // handed every step of such a callback the SAME audio, stuffing the
+            // rolling window with duplicate embeddings and corrupting the very
+            // temporal pattern the classifier is trained on.
+            let end = self.audio.len() - self.pending;
+            if let Some(detection) = self.step(end) {
+                hit = Some(detection);
             }
+        }
+
+        // Trim to what the next step still needs: one mel window ending at the
+        // last step's end, plus the unconsumed tail past it.
+        let keep = MEL_WINDOW_SAMPLES + self.pending;
+        if self.audio.len() > keep {
+            let drop = self.audio.len() - keep;
+            self.audio.drain(..drop);
         }
         hit
     }
 
-    /// One 80 ms detection step: append the newest embedding to a CONTINUOUS
-    /// rolling window of the last 16, and (once the window is full) classify.
-    /// Runs every step — the rolling window must never be gated/cleared on silence
-    /// or the classifier loses the context it was trained on. The cooldown after a
-    /// hit is the only thing that pauses it.
-    fn step(&mut self) -> Option<f32> {
+    /// One 80 ms detection step over the window ENDING at `end`: append the newest
+    /// embedding to a CONTINUOUS rolling window of the last 16, and (once the
+    /// window is full) classify. Runs every step — the rolling window must never be
+    /// gated/cleared on silence or the classifier loses the context it was trained
+    /// on. The cooldown after a hit is the only thing that pauses it.
+    fn step(&mut self, end: usize) -> Option<Detection> {
+        // Take (and reset) this step's VAD peak whatever happens next, so a cooldown
+        // or an unprimed buffer cannot leak one step's speech into the following one.
+        let vad = std::mem::replace(&mut self.vad_peak, 0.0);
+        let speech = vad >= 0.5;
+        if speech && !self.was_speech {
+            eprintln!("[wake] VAD: speech");
+        }
+        self.was_speech = speech;
+
         if self.cooldown > 0 {
             self.cooldown -= 1;
             return None;
         }
-        let embedding = match self.newest_embedding() {
-            Some(e) => e,
-            None => return None, // audio buffer not primed yet
-        };
+        let (embedding, rms) = self.newest_embedding(end)?; // None = buffer not primed
         if self.embeddings.len() == CLASSIFIER_EMBEDDINGS {
             self.embeddings.pop_front();
         }
@@ -276,33 +388,70 @@ impl Engine {
         }
 
         let score = self.classify()?;
+        if self.trace.len() == TRACE_STEPS {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(StepTrace { score, vad, rms });
         // The pipeline runs continuously now, so only log a score worth noticing —
         // ambient/silence sits near 0 (no spam), a near-miss or a hit is visible.
+        // `vad` and `rms` ride along: they are what tells a real utterance apart
+        // from a fire on room tone, straight from the console.
         if score > 0.3 {
-            eprintln!("[wake] score={score:.3} (threshold {:.3})", self.threshold);
+            eprintln!(
+                "[wake] score={score:.3} (threshold {:.3}) vad={vad:.2} rms={rms:.4}",
+                self.threshold
+            );
         }
         if score >= self.threshold {
             self.cooldown = REFIRE_COOLDOWN_STEPS;
             self.embeddings.clear();
-            return Some(score);
+            return Some(Detection {
+                score,
+                threshold: self.threshold,
+                trace: self.trace.iter().copied().collect(),
+                audio: self.debug.then(|| self.debug_audio.iter().copied().collect()),
+            });
         }
         None
     }
 
-    /// Compute the melspectrogram over the trailing window and turn its newest 76
-    /// frames into one 96-dim embedding.
-    fn newest_embedding(&mut self) -> Option<Vec<f32>> {
-        if self.audio.len() < MEL_WINDOW_SAMPLES {
+    /// True when every value is finite, else logs ONCE (latched) and returns false.
+    ///
+    /// A muted or dead input device delivers EXACT zeros, and a log-mel of zeros can
+    /// come back -inf/NaN. A non-finite feature does not merely make the classifier
+    /// wrong — its output becomes meaningless and can read as a confident hit, which
+    /// is one way "it fires on silence" happens. Drop the step instead of scoring
+    /// garbage, and say so rather than failing quietly.
+    fn check_finite(&mut self, values: &[f32], stage: &str) -> bool {
+        if values.iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        if !self.warned_non_finite {
+            self.warned_non_finite = true;
+            eprintln!(
+                "[wake] {stage} produced non-finite values — those steps are dropped. \
+                 The input device is most likely muted or dead; detection resumes on \
+                 its own once real audio comes back."
+            );
+        }
+        false
+    }
+
+    /// Compute the melspectrogram over the window ENDING at `end` and turn its
+    /// newest 76 frames into one 96-dim embedding. Also returns that window's RMS —
+    /// the cheap, honest answer to "did this step fire on silence?".
+    fn newest_embedding(&mut self, end: usize) -> Option<(Vec<f32>, f32)> {
+        if end < MEL_WINDOW_SAMPLES || end > self.audio.len() {
             return None; // buffer not primed yet
         }
+        let raw = &self.audio[end - MEL_WINDOW_SAMPLES..end];
+        let rms = (raw.iter().map(|s| s * s).sum::<f32>() / raw.len() as f32).sqrt();
         // openWakeWord's melspectrogram model was trained on int16-SCALE audio
         // (raw sample values, ~±32768), NOT normalized [-1,1]. The rest of the
         // pipeline (and Silero VAD) works in [-1,1], so scale up only here.
-        let window: Vec<f32> = self.audio[self.audio.len() - MEL_WINDOW_SAMPLES..]
-            .iter()
-            .map(|&s| s * 32768.0)
-            .collect();
-        let (shape, mut mel) = match run_single(&mut self.mel, vec![1, window.len() as i64], window) {
+        let window: Vec<f32> = raw.iter().map(|&s| s * 32768.0).collect();
+        let mel_out = run_single(&mut self.mel, vec![1, window.len() as i64], window);
+        let (_, mut mel) = match mel_out {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[wake] melspectrogram inference failed: {e}");
@@ -319,16 +468,20 @@ impl Engine {
         if frames < EMB_FRAMES {
             return None;
         }
-        let _ = shape;
         // Newest 76 frames → embedding input [1, 76, 32, 1].
         let start = (frames - EMB_FRAMES) * MEL_BINS;
         let win = mel[start..start + EMB_FRAMES * MEL_BINS].to_vec();
-        match run_single(
+        if !self.check_finite(&win, "melspectrogram") {
+            return None;
+        }
+        let emb_out = run_single(
             &mut self.embedding,
             vec![1, EMB_FRAMES as i64, MEL_BINS as i64, 1],
             win,
-        ) {
-            Ok((_, emb)) => Some(emb),
+        );
+        match emb_out {
+            Ok((_, emb)) if self.check_finite(&emb, "embedding") => Some((emb, rms)),
+            Ok(_) => None,
             Err(e) => {
                 eprintln!("[wake] embedding inference failed: {e}");
                 None
@@ -343,12 +496,16 @@ impl Engine {
             flat.extend_from_slice(e);
         }
         let feat = flat.len() / CLASSIFIER_EMBEDDINGS;
-        match run_single(
+        let out = run_single(
             &mut self.classifier,
             vec![1, CLASSIFIER_EMBEDDINGS as i64, feat as i64],
             flat,
-        ) {
-            Ok((_, out)) => out.first().copied(),
+        );
+        match out {
+            Ok((_, values)) => {
+                let score = values.first().copied()?;
+                self.check_finite(&[score], "classifier").then_some(score)
+            }
             Err(e) => {
                 eprintln!("[wake] classifier inference failed: {e}");
                 None
@@ -426,7 +583,8 @@ mod tests {
     /// stretch never false-fires. (Real detection accuracy is a mic test.)
     #[test]
     fn engine_loads_and_survives_silence() {
-        let mut engine = Engine::new(DEFAULT_PHRASE, 0.5).expect("engine builds from bundled models");
+        let mut engine =
+            Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds from bundled models");
         let silence = vec![0.0f32; CHUNK];
         let mut fired = false;
         for _ in 0..25 {
@@ -435,6 +593,140 @@ mod tests {
             }
         }
         assert!(!fired, "silence must never trigger the wake word");
+    }
+
+    /// ~0.6 s of 16 kHz mono speech ("Alexa", macOS `say`). Committed so the VAD
+    /// contract is checked headlessly, on CI, without a microphone.
+    const SPEECH_WAV: &[u8] = include_bytes!("fixtures/say_alexa_16k.wav");
+
+    /// Silero must actually SAY "speech" when it hears speech.
+    ///
+    /// This is the regression guard for the frame-contract bug: the model's
+    /// sequence dimension is dynamic, so a wrongly-sized frame is accepted and
+    /// scores ~0 rather than erroring. The VAD then never crosses any threshold —
+    /// it silently reports silence over clear speech, which is indistinguishable
+    /// from "the VAD is disabled" and cannot be noticed from the outside.
+    #[test]
+    fn silero_separates_speech_from_silence() {
+        let speech = parse_wav_i16(SPEECH_WAV);
+        let mut on_speech = Vad::new().expect("VAD builds");
+        let mut peak = 0.0f32;
+        for chunk in speech.chunks(VAD_FRAME) {
+            peak = peak.max(on_speech.speech_prob(chunk));
+        }
+        assert!(peak > 0.5, "speech must read as speech, got {peak:.4}");
+
+        let mut on_silence = Vad::new().expect("VAD builds");
+        let quiet = on_silence.speech_prob(&vec![0.0f32; VAD_FRAME * 8]);
+        assert!(quiet < 0.5, "silence must not read as speech, got {quiet:.4}");
+    }
+
+    /// Deterministic pseudo-noise (xorshift), so the "must not fire" tests are
+    /// reproducible and need no `rand` dependency.
+    fn pseudo_noise(n: usize, amplitude: f32) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 8_388_608.0 - 1.0) * amplitude
+            })
+            .collect()
+    }
+
+    /// EVERY bundled phrase — not just the default — must stay silent on sounds
+    /// that contain no speech at all. The old test covered `alexa` only, which is
+    /// the one phrase trained on openWakeWord's full negative corpus; the custom
+    /// `ground_control` classifier never saw room tone or broadband noise in
+    /// training, and "it fires on background noise / on nothing" is exactly the
+    /// complaint this pins down.
+    #[test]
+    fn no_bundled_phrase_fires_on_silence_or_noise() {
+        let cases: [(&str, Vec<f32>); 3] = [
+            ("digital silence", vec![0.0f32; SAMPLE_RATE as usize * 3]),
+            ("room tone", pseudo_noise(SAMPLE_RATE as usize * 3, 0.002)),
+            ("broadband noise", pseudo_noise(SAMPLE_RATE as usize * 3, 0.2)),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (key, _) in PHRASES {
+            for (label, audio) in &cases {
+                let mut engine = Engine::new(key, 0.5, false).expect("engine builds");
+                for chunk in audio.chunks(CHUNK) {
+                    if let Some(d) = engine.feed(chunk) {
+                        failures.push(format!("{key} fired on {label} (score {:.3})", d.score));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "non-speech must never wake the app: {failures:?}");
+    }
+
+    /// The engine used to slice the buffer's TAIL for every step, so a callback
+    /// carrying several 80 ms chunks fed the rolling window the SAME embedding
+    /// repeated — a different (and wrong) trajectory than the identical audio
+    /// arriving in small callbacks. Both must now agree exactly.
+    #[test]
+    fn callback_size_does_not_change_the_score_trajectory() {
+        let audio = pseudo_noise(SAMPLE_RATE as usize * 3, 0.05);
+        let mut small = Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds");
+        for chunk in audio.chunks(160) {
+            small.feed(chunk); // ~10 ms callbacks, the CoreAudio-sized case
+        }
+        let mut big = Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds");
+        for chunk in audio.chunks(CHUNK * 4) {
+            big.feed(chunk); // 320 ms callbacks, several steps drained at once
+        }
+        let small_scores = small.trace_scores();
+        assert!(!small_scores.is_empty(), "the run must produce scored steps");
+        assert_eq!(
+            small_scores,
+            big.trace_scores(),
+            "callback size must not change what the classifier sees"
+        );
+    }
+
+    /// A muted or dead input device delivers values the mel stage turns non-finite.
+    /// Those steps must be DROPPED, never scored: a NaN through the classifier can
+    /// come back as a confident hit.
+    #[test]
+    fn non_finite_audio_is_dropped_never_scored() {
+        let mut engine = Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds");
+        let bad = vec![f32::NAN; CHUNK];
+        for _ in 0..40 {
+            assert!(engine.feed(&bad).is_none(), "NaN audio must never wake the app");
+        }
+    }
+
+    /// Debug capture is an OPT-IN that retains microphone audio: with it off a
+    /// detection must carry no audio at all, and with it on the clip must be there
+    /// for the dump to write.
+    #[test]
+    fn debug_capture_only_retains_audio_when_asked() {
+        let off = Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds");
+        assert_eq!(off.debug_audio.len(), 0);
+        let mut on = Engine::new(DEFAULT_PHRASE, 0.5, true).expect("engine builds");
+        let mut off = off;
+        let audio = pseudo_noise(SAMPLE_RATE as usize, 0.05);
+        for chunk in audio.chunks(CHUNK) {
+            on.feed(chunk);
+            off.feed(chunk);
+        }
+        assert_eq!(on.debug_audio.len(), audio.len(), "every sample is retained");
+        assert_eq!(off.debug_audio.len(), 0, "nothing is retained without the opt-in");
+    }
+
+    /// The debug ring buffer must stay bounded — an always-on listener cannot grow
+    /// a buffer for as long as the app is up.
+    #[test]
+    fn debug_capture_ring_buffer_is_bounded() {
+        let mut engine = Engine::new(DEFAULT_PHRASE, 0.5, true).expect("engine builds");
+        let audio = pseudo_noise(DEBUG_AUDIO_SAMPLES + SAMPLE_RATE as usize * 2, 0.05);
+        for chunk in audio.chunks(CHUNK) {
+            engine.feed(chunk);
+        }
+        assert_eq!(engine.debug_audio.len(), DEBUG_AUDIO_SAMPLES);
     }
 
     /// Diagnostic (ignored): feed a 16 kHz mono WAV at $WAKE_WAV through the engine
@@ -459,7 +751,7 @@ mod tests {
         let mut audio = vec![0.0f32; SAMPLE_RATE as usize];
         audio.extend_from_slice(&samples);
         audio.extend(std::iter::repeat(0.0f32).take(SAMPLE_RATE as usize / 2));
-        let mut engine = Engine::new(&phrase, 0.5).expect("engine builds");
+        let mut engine = Engine::new(&phrase, 0.5, false).expect("engine builds");
         let mut hits = 0;
         for chunk in audio.chunks(CHUNK) {
             if engine.feed(chunk).is_some() {
@@ -468,6 +760,7 @@ mod tests {
         }
         eprintln!("[test] phrase={phrase} hits={hits} (see [wake] score= lines above for the trajectory)");
     }
+
 
     /// Minimal PCM-16 WAV reader: locate the `data` subchunk, decode i16 LE → f32.
     fn parse_wav_i16(bytes: &[u8]) -> Vec<f32> {

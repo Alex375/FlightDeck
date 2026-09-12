@@ -2051,9 +2051,9 @@ async wakeWordStatus() : Promise<WakeStatus> {
  * open), so run off the async thread. Returns the honest post-apply status — a
  * mic/model failure comes back as `running:false` + `error`, never a lying switch.
  */
-async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null) : Promise<Result<WakeStatus, string>> {
+async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null, debugCapture: boolean | null) : Promise<Result<WakeStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity, debugCapture }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4249,7 +4249,22 @@ error: string | null;
 /**
  * The phrases the user can choose from (bundled classifiers).
  */
-phrases: WakePhrase[] }
+phrases: WakePhrase[]; 
+/**
+ * Debug capture is on (every fire writes a WAV + score trajectory).
+ */
+debug_capture: boolean; 
+/**
+ * Where captures are written, so Settings can show and reveal the folder.
+ */
+debug_dir: string | null; 
+/**
+ * Why the LAST capture did not get written. Separate from `error`, which is
+ * about the detector itself: a failed dump must not read as a dead detector,
+ * but it must not vanish either — the user is reproducing false positives
+ * expecting evidence, and silence would let them do it for nothing.
+ */
+debug_error: string | null }
 /**
  * The wake word was heard by the on-device detector (`crate::wake`). The front
  * reacts like a spoken push-to-talk — arm the voice session and open the mic (see

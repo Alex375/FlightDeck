@@ -5,6 +5,7 @@
 // the rest of the app never touches the module. Key handling is honest: save
 // verifies by read-back Rust-side, and the UI only ever shows the masked hint.
 import { useCallback, useEffect, useState } from "react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { commands, type VoiceAgentStatus, type WakeStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
 import { useWakeStore } from "../../voice/wakeStore";
@@ -62,7 +63,12 @@ export function VoiceAgentSection() {
   }, []);
 
   const applyWake = useCallback(
-    async (patch: { enabled?: boolean; phrase?: string; sensitivity?: number }) => {
+    async (patch: {
+      enabled?: boolean;
+      phrase?: string;
+      sensitivity?: number;
+      debugCapture?: boolean;
+    }) => {
       setWakeBusy(true);
       setError(null);
       try {
@@ -70,6 +76,7 @@ export function VoiceAgentSection() {
           patch.enabled ?? null,
           patch.phrase ?? null,
           patch.sensitivity ?? null,
+          patch.debugCapture ?? null,
         );
         if (res.status === "ok") {
           setWake(res.data);
@@ -339,6 +346,47 @@ export function VoiceAgentSection() {
             </span>
           </span>
         }
+      />
+      <ToggleRow
+        title="Record false triggers"
+        hint={
+          <>
+            When the wake word fires, save what it heard: a short audio clip plus the
+            step-by-step confidence scores behind the trigger. Turn this on to investigate
+            triggers you did not ask for &mdash; the recordings are what a fix can be tested
+            against. Everything stays on this Mac and nothing is sent anywhere, but it does
+            write microphone audio to disk, so leave it off unless you are chasing a problem.
+            Only the last 40 triggers are kept.
+            {wake?.debug_capture && wake.debug_dir ? (
+              <div className={styles.tokenRow}>
+                <span className={styles.mono}>{wake.debug_dir}</span>
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.ghost}`}
+                  onClick={() => {
+                    // A reveal that quietly does nothing would be its own small lie —
+                    // say so instead.
+                    void revealItemInDir(wake.debug_dir as string).catch((e: unknown) =>
+                      setError(
+                        `could not open the recordings folder: ${
+                          e instanceof Error ? e.message : String(e)
+                        }`,
+                      ),
+                    );
+                  }}
+                >
+                  Show in Finder
+                </button>
+              </div>
+            ) : null}
+            {wake?.debug_error ? (
+              <div className={styles.dangerText}>&#9888;&#65039; {wake.debug_error}</div>
+            ) : null}
+          </>
+        }
+        checked={!!wake?.debug_capture}
+        onChange={(next) => void applyWake({ debugCapture: next })}
+        disabled={!configured || !wake || !wake.enabled || wakeBusy}
       />
     </SettingsGroup>
   );
