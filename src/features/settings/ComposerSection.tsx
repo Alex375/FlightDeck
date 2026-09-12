@@ -77,13 +77,17 @@ import "./composer-section.css";
 
 type PreviewBackend = "claude" | "codex";
 
-export function ComposerSection() {
+// `embedded` = rendered inside the Conversation tab's "Composer" sub-tab, which already
+// carries the tab-level PageHead, so this drops its own.
+export function ComposerSection({ embedded = false }: { embedded?: boolean }) {
   return (
     <div>
-      <PageHead
-        title="Composer"
-        subtitle="Arrange the bar under the message box: collapse controls to their icon, hide or reorder the right-hand ones, and add your own buttons."
-      />
+      {!embedded && (
+        <PageHead
+          title="Composer"
+          subtitle="Arrange the bar under the message box: collapse controls to their icon, hide or reorder the right-hand ones, and add your own buttons."
+        />
+      )}
       <BarArrangement />
       <LeftControls />
       <CustomButtons />

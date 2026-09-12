@@ -31,30 +31,29 @@ export interface SettingEntry {
 /** The sub-tabs of the sections that split their cards (kept here so the search
  *  and the panel agree on the ids — the test cross-checks the index against it). */
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
-  general: ["display", "timing", "alerts", "system"],
+  general: ["display", "timing", "system"],
+  conversation: ["markdown", "models", "composer"],
   control: ["agents", "voice", "remote", "bridge"],
+  notifications: ["channels", "fleet", "background"],
 };
 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- General ------------------------------------------------------------
-  { title: "Interface zoom", section: "general", sub: "display", group: "Display", keywords: "scale text size bigger smaller zoom police taille" },
-  { title: "Clean output (default)", section: "general", sub: "display", group: "Display", keywords: "fold work block hide tools sortie propre repli" },
-  { title: "Background task notifications", section: "general", sub: "display", group: "Display", keywords: "task-notification messages thread" },
-  { title: "Preview of the last sent message", section: "general", sub: "display", group: "Display", keywords: "pin last message apercu dernier message" },
-  { title: "Message minimap", section: "general", sub: "display", group: "Display", keywords: "scrollbar map jump navigation" },
-  { title: "Live workflow on the Flight Deck card", section: "general", sub: "display", group: "Display", keywords: "workflow card phases" },
-  { title: "Zoom when opening a card", section: "general", sub: "display", group: "Display", keywords: "animation modal flight deck" },
-  { title: "Slide side panels open", section: "general", sub: "display", group: "Display", keywords: "animation panel editor terminal" },
-  { title: "Animate the conversation", section: "general", sub: "display", group: "Display", keywords: "animation motion thread" },
-  { title: "Message controls", section: "general", sub: "display", group: "Display", keywords: "rewind fork hover controls rembobiner" },
-  { title: "Clickable filename on Read/Write rows", section: "general", sub: "display", group: "Display", keywords: "file mention path link chemin cliquable" },
+  { title: "Interface zoom", section: "general", sub: "display", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "Clean output (default)", section: "general", sub: "display", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
+  { title: "Background task notifications", section: "general", sub: "display", group: "Thread", keywords: "task-notification messages thread display affichage" },
+  { title: "Preview of the last sent message", section: "general", sub: "display", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
+  { title: "Message minimap", section: "general", sub: "display", group: "Thread", keywords: "scrollbar map jump navigation display affichage" },
+  { title: "Live workflow on the Flight Deck card", section: "general", sub: "display", group: "Appearance", keywords: "workflow card phases display affichage" },
+  { title: "Zoom when opening a card", section: "general", sub: "display", group: "Motion", keywords: "animation motion modal flight deck display affichage mouvement" },
+  { title: "Slide side panels open", section: "general", sub: "display", group: "Motion", keywords: "animation motion panel editor terminal display affichage mouvement" },
+  { title: "Animate the conversation", section: "general", sub: "display", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
+  { title: "Message controls", section: "general", sub: "display", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
+  { title: "Clickable filename on Read/Write rows", section: "general", sub: "display", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
   { title: "Turn duration", section: "general", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
   { title: "Model time", section: "general", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
   { title: "Thinking time", section: "general", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
   { title: "Tool time", section: "general", sub: "timing", group: "Durations & timing", keywords: "bash read edit duration outils" },
-  { title: "Show in the Flight Deck", section: "general", sub: "alerts", group: "Fleet banner", keywords: "fleet readout counters banner" },
-  { title: "Show in the Conversation", section: "general", sub: "alerts", group: "Fleet banner", keywords: "fleet readout sidebar counters" },
-  { title: "Alert for background shell commands", section: "general", sub: "alerts", group: "Background tasks", keywords: "bash monitor background notification" },
   { title: "Allow Bypass permissions mode", section: "general", sub: "system", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
   { title: "Keep the Mac awake", section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },
 
@@ -66,12 +65,12 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Warn before deleting a linked conversation", section: "tosse", group: "In the app", keywords: "delete confirm task suppression" },
   { title: "Client logos from the web", section: "tosse", group: "In the app", keywords: "favicon google privacy logo client" },
 
-  // ---- Conversation / Models / Composer -----------------------------------
-  { title: "Conversation", section: "conversation", group: "Conversation", keywords: "markdown mode titles thread rendering" },
-  { title: "Shown in the picker", section: "models", group: "The picker", keywords: "model list claude codex modele" },
-  { title: "New conversations", section: "models", group: "New conversations", keywords: "default model effort defaut" },
-  { title: "The bar", section: "composer", group: "The bar", keywords: "composer controls layout barre" },
-  { title: "Your buttons", section: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
+  // ---- Conversation (Markdown / Models / Composer sub-tabs) ---------------
+  { title: "Markdown rendering", section: "conversation", sub: "markdown", group: "Markdown", keywords: "markdown mode warm classic minimal thread rendering conversation rendu" },
+  { title: "Shown in the picker", section: "conversation", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
+  { title: "New conversations", section: "conversation", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
+  { title: "The bar", section: "conversation", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
+  { title: "Your buttons", section: "conversation", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 
   // ---- Shortcuts / Reordering ---------------------------------------------
   { title: "Keyboard shortcuts", section: "shortcuts", group: "Keyboard shortcuts", keywords: "keys chords raccourcis clavier" },
@@ -100,9 +99,12 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Access token", section: "control", sub: "bridge", group: "Voice bridge", keywords: "bearer secret bridge jeton" },
 
   // ---- Notifications / Updates / Data -------------------------------------
-  { title: "System notification", section: "notifications", group: "Channels", keywords: "os notification banner alerte" },
-  { title: "Sound", section: "notifications", group: "Channels", keywords: "chime audio son" },
-  { title: "Dock bounce", section: "notifications", group: "Channels", keywords: "dock icon attention rebond" },
+  { title: "System notification", section: "notifications", sub: "channels", group: "Channels", keywords: "os notification banner alerte" },
+  { title: "Sound", section: "notifications", sub: "channels", group: "Channels", keywords: "chime audio son" },
+  { title: "Dock bounce", section: "notifications", sub: "channels", group: "Channels", keywords: "dock icon attention rebond" },
+  { title: "Show in the Flight Deck", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout counters banner alerts alertes" },
+  { title: "Show in the Conversation", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout sidebar counters alerts alertes" },
+  { title: "Alert for background shell commands", section: "notifications", sub: "background", group: "Background tasks", keywords: "bash monitor background notification alerts alertes" },
   { title: "Flight Deck", section: "updates", group: "Flight Deck", keywords: "app update version mise a jour" },
   { title: "Claude Code CLI", section: "updates", group: "Claude Code CLI", keywords: "binary update version cli" },
   { title: "Automatic updates", section: "updates", group: "Claude Code CLI", keywords: "auto update cli" },

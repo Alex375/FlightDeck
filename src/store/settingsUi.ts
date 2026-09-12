@@ -9,12 +9,14 @@ export type SettingsSection =
   | "general"
   | "accounts"
   | "tosse"
+  // "conversation" now bundles the Markdown mode, the model picker and the composer bar
+  // behind its own sub-tabs (was three separate top-level tabs: conversation/models/composer).
   | "conversation"
-  | "models"
-  | "composer"
   | "reordering"
   | "shortcuts"
   | "control"
+  // "notifications" now bundles the OS channels, the fleet readout and the background-task
+  // alert behind its own sub-tabs (the last two moved out of the old General → Alerts).
   | "notifications"
   | "updates"
   | "data";

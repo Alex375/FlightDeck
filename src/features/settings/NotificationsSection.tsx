@@ -6,7 +6,9 @@ import { testSound } from "../../notifications/notify";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
-export function NotificationsSection() {
+// `embedded` = rendered inside the Notifications tab's "Channels" sub-tab, which already
+// carries the tab-level PageHead, so this drops its own.
+export function NotificationsSection({ embedded = false }: { embedded?: boolean }) {
   const systemNotification = useNotifications((s) => s.systemNotification);
   const sound = useNotifications((s) => s.sound);
   const dockBounce = useNotifications((s) => s.dockBounce);
@@ -14,10 +16,12 @@ export function NotificationsSection() {
 
   return (
     <div>
-      <PageHead
-        title="Notifications"
-        subtitle="When an agent finishes its turn or needs your attention (permission, question). Nothing fires if you're already looking at the conversation in question."
-      />
+      {!embedded && (
+        <PageHead
+          title="Notifications"
+          subtitle="When an agent finishes its turn or needs your attention (permission, question). Nothing fires if you're already looking at the conversation in question."
+        />
+      )}
 
       <SettingsGroup title="Channels" icon="bell">
         <ToggleRow

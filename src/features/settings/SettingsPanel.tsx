@@ -41,30 +41,33 @@ const TABS: Array<{ id: SettingsSection; label: string; icon: string; mark?: Rea
   // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
   // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
+  // Everything that shapes a conversation — Markdown rendering, the model picker, and the
+  // composer bar — behind this tab's sub-tabs (was three separate top-level tabs).
   { id: "conversation", label: "Conversation", icon: "chat" },
-  // Next to Conversation (both shape what a conversation is), its own tab for the same
-  // reason as Composer: arranging two lists by drag is a task, not a row of switches.
-  { id: "models", label: "Models", icon: "spark" },
-  // Its own tab rather than a group under General: arranging the bar is a task with a
-  // preview and a drag surface, not a row of switches.
-  { id: "composer", label: "Composer", icon: "wand" },
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
   { id: "control", label: "MCP Control", icon: "wand" },
+  // OS channels + the fleet readout + background-task alerts, behind this tab's sub-tabs
+  // (the last two moved out of the old General → Alerts).
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
   { id: "data", label: "Data", icon: "trash" },
 ];
 
-/** The two tabs that carry too many unrelated cards to stack them all. The ids
- *  are mirrored by `settingsSearch.SETTINGS_SUBS` (a unit test keeps the search
- *  index from pointing at a sub-tab that doesn't exist). */
+/** The tabs that split their cards behind a pill row instead of stacking them all. The
+ *  ids are mirrored by `settingsSearch.SETTINGS_SUBS` (a unit test keeps the search index
+ *  from pointing at a sub-tab that doesn't exist). */
 const GENERAL_SUBS = [
   { id: "display", label: "Display", icon: "list" },
   { id: "timing", label: "Durations", icon: "clock" },
-  { id: "alerts", label: "Alerts", icon: "bell" },
   { id: "system", label: "System", icon: "cog" },
+] as const;
+
+const CONVERSATION_SUBS = [
+  { id: "markdown", label: "Markdown", icon: "chat" },
+  { id: "models", label: "Models", icon: "spark" },
+  { id: "composer", label: "Composer", icon: "wand" },
 ] as const;
 
 const CONTROL_SUBS = [
@@ -74,8 +77,16 @@ const CONTROL_SUBS = [
   { id: "bridge", label: "Bridge", icon: "bell" },
 ] as const;
 
+const NOTIFICATIONS_SUBS = [
+  { id: "channels", label: "Channels", icon: "bell" },
+  { id: "fleet", label: "Fleet", icon: "grid" },
+  { id: "background", label: "Background", icon: "term" },
+] as const;
+
 type GeneralSub = (typeof GENERAL_SUBS)[number]["id"];
+type ConversationSub = (typeof CONVERSATION_SUBS)[number]["id"];
 type ControlSub = (typeof CONTROL_SUBS)[number]["id"];
+type NotificationsSub = (typeof NOTIFICATIONS_SUBS)[number]["id"];
 
 /** The rail label of a section, for a search result's breadcrumb. */
 function tabLabel(section: SettingsSection): string {
@@ -134,7 +145,9 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const setSub = useSettingsUi((s) => s.setSub);
   const revealSetting = useSettingsUi((s) => s.revealSetting);
   const generalSub = (subs.general ?? "display") as GeneralSub;
+  const conversationSub = (subs.conversation ?? "markdown") as ConversationSub;
   const controlSub = (subs.control ?? "agents") as ControlSub;
+  const notificationsSub = (subs.notifications ?? "channels") as NotificationsSub;
   const [query, setQuery] = useState("");
   const searching = query.trim().length > 0;
   const [confirming, setConfirming] = useState(false);
@@ -274,12 +287,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 />
                 {generalSub === "display" && <DisplayPrefs />}
                 {generalSub === "timing" && <TimingPrefs />}
-                {generalSub === "alerts" && (
-                  <>
-                    <FleetBannerPrefs />
-                    <BackgroundTaskPrefs />
-                  </>
-                )}
                 {generalSub === "system" && (
                   <>
                     <PermissionPrefs />
@@ -293,11 +300,27 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {!searching && section === "tosse" && <TosseSection />}
 
-            {!searching && section === "conversation" && <ConversationSection />}
-
-            {!searching && section === "models" && <ModelsSection />}
-
-            {!searching && section === "composer" && <ComposerSection />}
+            {!searching && section === "conversation" && (
+              <div className={styles.page}>
+                <PageHead
+                  title="Conversation"
+                  subtitle="How the thread renders, which models the picker offers, and the composer bar."
+                />
+                {/* One sub-page at a time. Markdown rendering, the model picker and the
+                    composer bar were three separate top-level tabs — bundled here because
+                    each shapes what a conversation is; the drag surfaces (model lists,
+                    composer bar) keep their own sub-page. */}
+                <SubTabs
+                  tabs={CONVERSATION_SUBS}
+                  active={conversationSub}
+                  onSelect={(id) => setSub("conversation", id)}
+                  ariaLabel="Conversation settings"
+                />
+                {conversationSub === "markdown" && <ConversationSection embedded />}
+                {conversationSub === "models" && <ModelsSection embedded />}
+                {conversationSub === "composer" && <ComposerSection embedded />}
+              </div>
+            )}
 
             {!searching && section === "reordering" && (
               <div>
@@ -339,7 +362,26 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               </div>
             )}
 
-            {!searching && section === "notifications" && <NotificationsSection />}
+            {!searching && section === "notifications" && (
+              <div className={styles.page}>
+                <PageHead
+                  title="Notifications"
+                  subtitle="When and how the app signals you — the OS channels, the fleet readout, and the background-task alert."
+                />
+                {/* The fleet readout and the background-task alert moved here from the old
+                    General → Alerts, next to the OS channels: all of it is "how the app
+                    signals you", and it was split across two places before. */}
+                <SubTabs
+                  tabs={NOTIFICATIONS_SUBS}
+                  active={notificationsSub}
+                  onSelect={(id) => setSub("notifications", id)}
+                  ariaLabel="Notifications settings"
+                />
+                {notificationsSub === "channels" && <NotificationsSection embedded />}
+                {notificationsSub === "fleet" && <FleetBannerPrefs />}
+                {notificationsSub === "background" && <BackgroundTaskPrefs />}
+              </div>
+            )}
 
             {/* Two updaters, one tab: the app itself, then the `claude` binary it drives.
                 One page heading covers both — each has its own titled card below. */}
@@ -412,10 +454,12 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
   },
 ];
 
-/** Display prefs in the General tab. Today: the GLOBAL DEFAULT for "clean output" — fold
- *  each round's work behind a "Work" block so only the final message stays in
- *  clear. This is the default applied to conversations that haven't set their own choice;
- *  each conversation's composer chip can override it (per-conversation, persisted). */
+/** The "Display" sub-tab of the General tab, split into three cards so a wall of a dozen
+ *  unrelated switches reads as three intents: Appearance (the app's global look and what
+ *  the Flight Deck card shows), Thread (how the conversation itself reads), and Motion (the
+ *  optional animations, each of which the system's "reduce motion" always overrides). Every
+ *  toggle here is a GLOBAL default — e.g. "clean output" folds each round's work behind a
+ *  "Work" block, and a conversation's composer chip can still override its own. */
 function DisplayPrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const cleanOutput = useDisplay((s) => s.cleanOutput);
@@ -431,188 +475,196 @@ function DisplayPrefs() {
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
   return (
-    <SettingsGroup title="Display" icon="list">
-      <ToggleRow
-        title="Interface zoom"
-        hint={
-          <>
-            Scales the <strong>whole app</strong> — conversation, Flight Deck, editor and
-            terminal — like a browser's zoom. <strong>100% by default.</strong> Also on{" "}
-            <strong>⌘+</strong> / <strong>⌘−</strong>, and <strong>⌘0</strong> to come back
-            to 100%.
-          </>
-        }
-        control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
-      />
-      <ToggleRow
-        title="Clean output (default)"
-        hint={
-          <>
-            Shows only the final message of each response; tools, thinking, and intermediate
-            steps are folded behind a "Work" block that expands on demand.{" "}
-            <strong>Default</strong> setting: each conversation can override it via its
-            "Clean output" button.
-          </>
-        }
-        checked={cleanOutput}
-        onChange={(v) => set({ cleanOutput: v })}
-        label="Clean output by default"
-      />
-      <ToggleRow
-        title="Background task notifications"
-        hint={
-          <>
-            Shows <code>&lt;task-notification&gt;</code> messages (injected by the CLI when a
-            background task or sub-agent finishes) in the thread. <strong>Off by
-            default</strong>: they clutter the conversation, especially on reload or when importing
-            from history.
-          </>
-        }
-        checked={showTaskNotifications}
-        onChange={(v) => set({ showTaskNotifications: v })}
-        label="Show background task notifications"
-      />
-      <ToggleRow
-        title="Preview of the last sent message"
-        hint={
-          <>
-            Pins a <strong>floating</strong> preview of the last message you sent to the top of the
-            conversation (the message itself if short, otherwise a brief summary) — the same one
-            shown on the Flight Deck. Clicking it <strong>scrolls</strong> to the message.{" "}
-            <strong>On by default.</strong>
-          </>
-        }
-        checked={showLastMessagePreview}
-        onChange={(v) => set({ showLastMessagePreview: v })}
-        label="Preview of the last sent message"
-      />
-      <ToggleRow
-        title="Message minimap"
-        hint={
-          <>
-            Adds a compact block of thin marks at the <strong>right edge</strong> of the
-            conversation — one per message you sent. <strong>Hovering</strong> one previews that
-            message, <strong>clicking</strong> it scrolls to it, and the mark of the message
-            you're reading stays lit. The whole conversation always fits: on a long thread the
-            marks tighten instead of scrolling. <strong>On by default</strong>; hidden below two
-            messages.
-          </>
-        }
-        checked={messageMinimap}
-        onChange={(v) => set({ messageMinimap: v })}
-        label="Show the message minimap"
-      />
-      {messageMinimap ? (
-        <div className={styles.modeBlock}>
-          <div className={styles.ttitle}>Minimap hover</div>
-          <OptionCardRail
-            options={MINIMAP_HOVER_MODES}
-            selected={minimapHoverMode}
-            onSelect={(id) => set({ minimapHoverMode: id })}
-            ariaLabel="Message minimap hover preview"
-          />
-          <div className={styles.note}>
-            Summaries are the ones already generated when each message was sent, and are kept
-            from one run to the next. Messages that never got one — short messages and slash
-            commands, where the text is already its own summary — show their first line.
+    <>
+      <SettingsGroup title="Appearance" icon="eye">
+        <ToggleRow
+          title="Interface zoom"
+          hint={
+            <>
+              Scales the <strong>whole app</strong> — conversation, Flight Deck, editor and
+              terminal — like a browser's zoom. <strong>100% by default.</strong> Also on{" "}
+              <strong>⌘+</strong> / <strong>⌘−</strong>, and <strong>⌘0</strong> to come back
+              to 100%.
+            </>
+          }
+          control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+        />
+        <ToggleRow
+          title="Live workflow on the Flight Deck card"
+          hint={
+            <>
+              While a <strong>workflow</strong> is running, shows its live progress on the card:
+              current phase, <strong>how many of its agents are working</strong>, and how far along
+              the run is — read from the run's own journal, so the counts are exact. The wire
+              reports a whole run as a single task, so without this the card only shows the
+              generic background-task chip. <strong>On by default.</strong>
+            </>
+          }
+          checked={workflowLiveCard}
+          onChange={(v) => set({ workflowLiveCard: v })}
+          label="Show live workflow progress on cards"
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Thread" icon="chat">
+        <ToggleRow
+          title="Clean output (default)"
+          hint={
+            <>
+              Shows only the final message of each response; tools, thinking, and intermediate
+              steps are folded behind a "Work" block that expands on demand.{" "}
+              <strong>Default</strong> setting: each conversation can override it via its
+              "Clean output" button.
+            </>
+          }
+          checked={cleanOutput}
+          onChange={(v) => set({ cleanOutput: v })}
+          label="Clean output by default"
+        />
+        <ToggleRow
+          title="Background task notifications"
+          hint={
+            <>
+              Shows <code>&lt;task-notification&gt;</code> messages (injected by the CLI when a
+              background task or sub-agent finishes) in the thread. <strong>Off by
+              default</strong>: they clutter the conversation, especially on reload or when importing
+              from history.
+            </>
+          }
+          checked={showTaskNotifications}
+          onChange={(v) => set({ showTaskNotifications: v })}
+          label="Show background task notifications"
+        />
+        <ToggleRow
+          title="Preview of the last sent message"
+          hint={
+            <>
+              Pins a <strong>floating</strong> preview of the last message you sent to the top of the
+              conversation (the message itself if short, otherwise a brief summary) — the same one
+              shown on the Flight Deck. Clicking it <strong>scrolls</strong> to the message.{" "}
+              <strong>On by default.</strong>
+            </>
+          }
+          checked={showLastMessagePreview}
+          onChange={(v) => set({ showLastMessagePreview: v })}
+          label="Preview of the last sent message"
+        />
+        <ToggleRow
+          title="Message minimap"
+          hint={
+            <>
+              Adds a compact block of thin marks at the <strong>right edge</strong> of the
+              conversation — one per message you sent. <strong>Hovering</strong> one previews that
+              message, <strong>clicking</strong> it scrolls to it, and the mark of the message
+              you're reading stays lit. The whole conversation always fits: on a long thread the
+              marks tighten instead of scrolling. <strong>On by default</strong>; hidden below two
+              messages.
+            </>
+          }
+          checked={messageMinimap}
+          onChange={(v) => set({ messageMinimap: v })}
+          label="Show the message minimap"
+        />
+        {messageMinimap ? (
+          <div className={styles.modeBlock}>
+            <div className={styles.ttitle}>Minimap hover</div>
+            <OptionCardRail
+              options={MINIMAP_HOVER_MODES}
+              selected={minimapHoverMode}
+              onSelect={(id) => set({ minimapHoverMode: id })}
+              ariaLabel="Message minimap hover preview"
+            />
+            <div className={styles.note}>
+              Summaries are the ones already generated when each message was sent, and are kept
+              from one run to the next. Messages that never got one — short messages and slash
+              commands, where the text is already its own summary — show their first line.
+            </div>
           </div>
-        </div>
-      ) : null}
-      <ToggleRow
-        title="Live workflow on the Flight Deck card"
-        hint={
-          <>
-            While a <strong>workflow</strong> is running, shows its live progress on the card:
-            current phase, <strong>how many of its agents are working</strong>, and how far along
-            the run is — read from the run's own journal, so the counts are exact. The wire
-            reports a whole run as a single task, so without this the card only shows the
-            generic background-task chip. <strong>On by default.</strong>
-          </>
-        }
-        checked={workflowLiveCard}
-        onChange={(v) => set({ workflowLiveCard: v })}
-        label="Show live workflow progress on cards"
-      />
-      <ToggleRow
-        title="Zoom when opening a card"
-        hint={
-          <>
-            On the Flight Deck, opening a card makes the conversation{" "}
-            <strong>grow out of that card</strong> and shrink back into it when closed — like
-            Finder's Quick Look. <strong>On by default</strong> (about a fifth of a second).
-            Off → the conversation appears and disappears instantly. Your system's{" "}
-            <strong>"reduce motion"</strong> setting always wins over this.
-          </>
-        }
-        checked={flightdeckModalZoom}
-        onChange={(v) => set({ flightdeckModalZoom: v })}
-        label="Zoom the conversation out of its card"
-      />
-      <ToggleRow
-        title="Slide side panels open"
-        hint={
-          <>
-            A side panel <strong>pushes its way in</strong> from the edge and the view beside
-            it gives way over the same fraction of a second, instead of the layout jumping in
-            one frame. Covers the conversation's <strong>editor, terminal, artifact viewer</strong>{" "}
-            and task panel, and the <strong>Tasks</strong> view's panel.{" "}
-            <strong>On by default</strong> (about a fifth of a second). The panel's contents
-            are held at their final size while it travels, so nothing inside re-lays-out on the
-            way. Off → panels appear and disappear instantly. Your system's{" "}
-            <strong>"reduce motion"</strong> setting always wins over this.
-          </>
-        }
-        checked={panelAnimations}
-        onChange={(v) => set({ panelAnimations: v })}
-        label="Animate side panels opening and closing"
-      />
-      <ToggleRow
-        title="Animate the conversation"
-        hint={
-          <>
-            A tool section or work block <strong>opens and closes as a movement</strong> rather
-            than a cut, and in <strong>clean output</strong> a finished step{" "}
-            <strong>slides up into the work block</strong> instead of being swapped between the
-            two in one frame. <strong>On by default</strong> (about a tenth of a second).
-            Unlike the side panels, this one plays on <strong>every turn</strong>, right where
-            you are reading. Off → the thread jumps between states as it did before. Your
-            system's <strong>"reduce motion"</strong> setting always wins over this.
-          </>
-        }
-        checked={conversationAnimations}
-        onChange={(v) => set({ conversationAnimations: v })}
-        label="Animate work folding and unfolding"
-      />
-      <ToggleRow
-        title="Message controls"
-        hint={
-          <>
-            Shows controls on hover over messages (yours and Claude's):
-            <strong> "resume from here"</strong> (rewinds the conversation to that point) and
-            <strong> "fork"</strong> (branches a new conversation from that point).{" "}
-            <strong>On by default.</strong>
-          </>
-        }
-        checked={messageControls}
-        onChange={(v) => set({ messageControls: v })}
-        label="Show message controls"
-      />
-      <ToggleRow
-        title="Clickable filename on Read/Write rows"
-        hint={
-          <>
-            On a <strong>Read/Write/Edit</strong> row, makes the filename{" "}
-            <strong>open the file</strong> instead of just expanding the row.{" "}
-            <strong>On by default.</strong> Off → the row only expands; the file stays one click
-            away from the filename above its snippet. Paths elsewhere (text, links, snippet
-            headers) are always clickable.
-          </>
-        }
-        checked={clickableFileMentions}
-        onChange={(v) => set({ clickableFileMentions: v })}
-        label="Make the filename on Read/Write rows clickable"
-      />
-    </SettingsGroup>
+        ) : null}
+        <ToggleRow
+          title="Message controls"
+          hint={
+            <>
+              Shows controls on hover over messages (yours and Claude's):
+              <strong> "resume from here"</strong> (rewinds the conversation to that point) and
+              <strong> "fork"</strong> (branches a new conversation from that point).{" "}
+              <strong>On by default.</strong>
+            </>
+          }
+          checked={messageControls}
+          onChange={(v) => set({ messageControls: v })}
+          label="Show message controls"
+        />
+        <ToggleRow
+          title="Clickable filename on Read/Write rows"
+          hint={
+            <>
+              On a <strong>Read/Write/Edit</strong> row, makes the filename{" "}
+              <strong>open the file</strong> instead of just expanding the row.{" "}
+              <strong>On by default.</strong> Off → the row only expands; the file stays one click
+              away from the filename above its snippet. Paths elsewhere (text, links, snippet
+              headers) are always clickable.
+            </>
+          }
+          checked={clickableFileMentions}
+          onChange={(v) => set({ clickableFileMentions: v })}
+          label="Make the filename on Read/Write rows clickable"
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Motion" icon="play">
+        <ToggleRow
+          title="Zoom when opening a card"
+          hint={
+            <>
+              On the Flight Deck, opening a card makes the conversation{" "}
+              <strong>grow out of that card</strong> and shrink back into it when closed — like
+              Finder's Quick Look. <strong>On by default</strong> (about a fifth of a second).
+              Off → the conversation appears and disappears instantly. Your system's{" "}
+              <strong>"reduce motion"</strong> setting always wins over this.
+            </>
+          }
+          checked={flightdeckModalZoom}
+          onChange={(v) => set({ flightdeckModalZoom: v })}
+          label="Zoom the conversation out of its card"
+        />
+        <ToggleRow
+          title="Slide side panels open"
+          hint={
+            <>
+              A side panel <strong>pushes its way in</strong> from the edge and the view beside
+              it gives way over the same fraction of a second, instead of the layout jumping in
+              one frame. Covers the conversation's <strong>editor, terminal, artifact viewer</strong>{" "}
+              and task panel, and the <strong>Tasks</strong> view's panel.{" "}
+              <strong>On by default</strong> (about a fifth of a second). The panel's contents
+              are held at their final size while it travels, so nothing inside re-lays-out on the
+              way. Off → panels appear and disappear instantly. Your system's{" "}
+              <strong>"reduce motion"</strong> setting always wins over this.
+            </>
+          }
+          checked={panelAnimations}
+          onChange={(v) => set({ panelAnimations: v })}
+          label="Animate side panels opening and closing"
+        />
+        <ToggleRow
+          title="Animate the conversation"
+          hint={
+            <>
+              A tool section or work block <strong>opens and closes as a movement</strong> rather
+              than a cut, and in <strong>clean output</strong> a finished step{" "}
+              <strong>slides up into the work block</strong> instead of being swapped between the
+              two in one frame. <strong>On by default</strong> (about a tenth of a second).
+              Unlike the side panels, this one plays on <strong>every turn</strong>, right where
+              you are reading. Off → the thread jumps between states as it did before. Your
+              system's <strong>"reduce motion"</strong> setting always wins over this.
+            </>
+          }
+          checked={conversationAnimations}
+          onChange={(v) => set({ conversationAnimations: v })}
+          label="Animate work folding and unfolding"
+        />
+      </SettingsGroup>
+    </>
   );
 }
 
