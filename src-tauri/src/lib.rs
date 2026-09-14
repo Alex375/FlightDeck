@@ -35,7 +35,10 @@ use ipc::commands::{
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
     cancel_queued_message, list_session_models, rewind_files,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
-    account_claude_logout, account_claude_status, account_codex_login_cancel,
+    account_claude_login_in_flight, account_claude_logout, account_claude_status,
+    claude_account_capture_identity,
+    claude_account_create, claude_account_remove, claude_account_rename, claude_accounts_list,
+    set_conversation_claude_account, account_codex_login_cancel,
     account_codex_login_start, account_codex_logout, account_codex_status,
     claude_available, claude_cli_status, claude_cli_update, set_claude_cli_auto_update,
     codex_available, codex_archive, codex_compact, codex_fork, codex_list_extensions,
@@ -144,6 +147,7 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         tosse_task_id: None,
         tosse_task_title: None,
         tosse_task_status: None,
+        claude_account_id: None,
     };
     if let Err(e) = store.upsert_conversation(&conv) {
         eprintln!("[seed] failed to upsert remote demo conversation: {e}");
@@ -186,6 +190,13 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             account_claude_login_code,
             account_claude_login_cancel,
             account_claude_logout,
+            account_claude_login_in_flight,
+            claude_accounts_list,
+            claude_account_create,
+            claude_account_rename,
+            claude_account_capture_identity,
+            claude_account_remove,
+            set_conversation_claude_account,
             account_codex_status,
             account_codex_login_start,
             account_codex_login_cancel,

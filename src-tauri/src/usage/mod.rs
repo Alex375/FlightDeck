@@ -133,12 +133,32 @@ pub enum UsageError {
     Network { detail: String },
     /// Response received but unparseable into the expected shape (carries body).
     Parse { body: String },
+    /// The usage was asked for a Claude account the app no longer knows (removed). A
+    /// permanent, locally-known cause: typed on its own so the UI says so and STOPS polling,
+    /// instead of presenting it as a network blip and retrying forever.
+    UnknownAccount { account_id: String },
 }
 
-/// Fetch the real usage percentages. Reads the token off-thread (file/Keychain are
-/// blocking), then queries the endpoint. Returns a typed [`UsageError`] on failure.
+/// Fetch the DEFAULT account's usage percentages — the un-scoped credential store, i.e.
+/// the behaviour that existed before multi-account support.
 pub async fn fetch_plan_usage() -> Result<PlanUsage, UsageError> {
-    let token = tokio::task::spawn_blocking(read_oauth_token)
+    fetch_plan_usage_for(&crate::accounts::AccountSlot::default_slot()).await
+}
+
+/// Fetch ONE account's real usage percentages. Reads that slot's token off-thread
+/// (file/Keychain are blocking), then queries the endpoint. Returns a typed [`UsageError`]
+/// on failure.
+///
+/// Scoping by slot is what lets the Accounts panel show every account's rate limits at
+/// once: a non-active account has no live session, so `control_request/get_usage` cannot
+/// answer for it and this HTTP path is the ONLY source. The slot decides both the
+/// credentials file consulted and the Keychain item read — see
+/// [`crate::accounts::AccountSlot::keychain_service`].
+pub async fn fetch_plan_usage_for(
+    slot: &crate::accounts::AccountSlot,
+) -> Result<PlanUsage, UsageError> {
+    let slot = slot.clone();
+    let token = tokio::task::spawn_blocking(move || read_oauth_token_for(&slot))
         .await
         .map_err(|e| UsageError::Network {
             detail: format!("token read task failed: {e}"),
@@ -225,21 +245,27 @@ const EXPIRY_SKEW_MS: i64 = 60_000;
 /// Resolve the OAuth access token: config file first *when valid* (no Keychain prompt),
 /// then the macOS Keychain (cause-aware error). Returns a typed [`UsageError`] when no
 /// usable token is found.
-fn read_oauth_token() -> Result<String, UsageError> {
-    let file_creds = read_credentials_file().and_then(|blob| {
-        parse_credentials(&blob).or_else(|| {
-            // The file is PRESENT but carries no usable token (truncated mid-write, a
-            // renamed field, …). That is a real failure, NOT the normal "absent" state —
-            // surface it loudly before falling back to the Keychain (the "never silently
-            // equate broken with missing" policy), so a corrupt file doesn't masquerade
-            // as a misleading NoToken/KeychainDenied.
-            eprintln!(
-                "[usage] ~/.claude/.credentials.json is present but has no usable accessToken; falling back to Keychain"
-            );
-            None
-        })
-    });
-    resolve_token(file_creds, now_unix_ms(), read_keychain_token)
+fn read_oauth_token_for(slot: &crate::accounts::AccountSlot) -> Result<String, UsageError> {
+    let creds_path = slot.credentials_file();
+    let file_creds = creds_path
+        .as_deref()
+        .and_then(read_credentials_file)
+        .and_then(|blob| {
+            parse_credentials(&blob).or_else(|| {
+                // The file is PRESENT but carries no usable token (truncated mid-write, a
+                // renamed field, …). That is a real failure, NOT the normal "absent" state —
+                // surface it loudly before falling back to the Keychain (the "never silently
+                // equate broken with missing" policy), so a corrupt file doesn't masquerade
+                // as a misleading NoToken/KeychainDenied.
+                eprintln!(
+                    "[usage] {} is present but has no usable accessToken; falling back to Keychain",
+                    creds_path.as_deref().unwrap_or(std::path::Path::new("?")).display()
+                );
+                None
+            })
+        });
+    let service = slot.keychain_service();
+    resolve_token(file_creds, now_unix_ms(), || read_keychain_token(&service))
 }
 
 /// Pure token-selection policy (I/O injected → unit-testable). Prefer a **non-expired**
@@ -258,7 +284,7 @@ fn resolve_token(
             return Ok(creds.access_token.clone());
         }
         eprintln!(
-            "[usage] ~/.claude/.credentials.json token is expired; consulting the Keychain for a fresher one"
+            "[usage] the credentials file token is expired; consulting the Keychain for a fresher one"
         );
     }
     match keychain() {
@@ -280,16 +306,12 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-/// Read `~/.claude/.credentials.json` if present. An ABSENT file → `None` silently (the
+/// Read the slot's `.credentials.json` if present. An ABSENT file → `None` silently (the
 /// common case on macOS, where the token lives in the Keychain); a present-but-unreadable
 /// file (permissions/IO) is a real failure → logged before `None`, never silently equated
 /// with "absent".
-fn read_credentials_file() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::Path::new(&home)
-        .join(".claude")
-        .join(".credentials.json");
-    match std::fs::read_to_string(&path) {
+fn read_credentials_file(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
         Ok(blob) => Some(blob),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -304,15 +326,13 @@ fn read_credentials_file() -> Option<String> {
 /// cause so the UI can guide the user. macOS `security` exits with the OSStatus
 /// truncated to 8 bits: 44 = item-not-found (errSecItemNotFound −25300), 36/51/128 =
 /// interaction-not-allowed / authFailed / userCancelled (access denied).
+/// `service` is the slot's item name (`Claude Code-credentials` for the default account,
+/// `Claude Code-<sha8>-credentials` for an isolated one) — see
+/// [`crate::accounts::AccountSlot::keychain_service`].
 #[cfg(target_os = "macos")]
-fn read_keychain_token() -> Result<String, UsageError> {
+fn read_keychain_token(service: &str) -> Result<String, UsageError> {
     let out = std::process::Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", service, "-w"])
         .output()
         .map_err(|e| UsageError::KeychainDenied {
             detail: format!("failed to run /usr/bin/security: {e}"),
@@ -336,7 +356,7 @@ fn read_keychain_token() -> Result<String, UsageError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_keychain_token() -> Result<String, UsageError> {
+fn read_keychain_token(_service: &str) -> Result<String, UsageError> {
     // No Keychain off macOS; the file is the only source and it was absent.
     Err(UsageError::NoToken)
 }

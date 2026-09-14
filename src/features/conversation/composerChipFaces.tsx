@@ -120,6 +120,26 @@ export function OutputStyleFace({ label, ...rest }: { label: string } & BtnProps
   );
 }
 
+/** Claude account — which subscription this conversation's turns are billed against.
+ *  Icon-only by default; `pending` marks a choice that has not reached the process yet
+ *  (a live session cannot change identity), shown as the accent border the other
+ *  "armed but not yet applied" chips use. */
+export function AccountFace({
+  label,
+  pending,
+  ...rest
+}: { label: string; pending?: boolean } & BtnProps) {
+  return (
+    <ChipBtn
+      icon="users"
+      style={pending ? { borderColor: "var(--wf-accent)", color: "var(--wf-accent)" } : undefined}
+      {...rest}
+    >
+      {label}
+    </ChipBtn>
+  );
+}
+
 /** Artifacts index — icon plus the count published in this conversation. */
 export function ArtifactsFace({ count, ...rest }: { count: number } & BtnProps) {
   return (

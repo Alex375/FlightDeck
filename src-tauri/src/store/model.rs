@@ -163,6 +163,115 @@ pub struct ConversationRecord {
     /// the warning silently stops warning the moment the network is down.
     pub tosse_task_title: Option<String>,
     pub tosse_task_status: Option<String>,
+    /// Which Claude account this conversation runs on — a [`ClaudeAccountRecord::id`],
+    /// or `None` for the default (un-scoped) account. `None` is every pre-existing row and
+    /// stays the default for a single-account user, so nothing changes for them.
+    ///
+    /// Deliberately not a foreign key: the id names a credential store the CLI owns, so an
+    /// account signed out or removed behind our back must leave the conversation usable
+    /// (it degrades to the default account, visibly) rather than break the row. Codex
+    /// conversations ignore it entirely — accounts are a Claude-side concept.
+    pub claude_account_id: Option<String>,
+}
+
+/// One Claude account the user signed into from the app. Holds NO secret: the credentials
+/// live in the CLI's own store, isolated per account by
+/// [`crate::accounts::AccountSlot`]. What is persisted here is the non-sensitive identity
+/// captured at login, which is what lets the Accounts panel label each account reliably —
+/// the CLI's own `auth status` reads its email from a profile cache our accounts SHARE, so
+/// it cannot be trusted to name a specific one (see `accounts::status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ClaudeAccountRecord {
+    /// Stable app-minted id (a uuid), also the directory name of the account's isolated
+    /// credential store. The reserved value `"default"` is the CLI's own un-scoped store.
+    pub id: String,
+    /// What the user sees. Defaults to the email captured at login, and is editable so two
+    /// accounts on the same address (personal / org) stay tellable apart.
+    pub label: String,
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    /// `max` | `pro` | … as the CLI reported it at login.
+    pub subscription_type: Option<String>,
+    /// Manual display order (ascending). Also the tie-break the auto-switch policy uses
+    /// when two accounts have equal capacity, so the choice is deterministic.
+    pub sort_index: i64,
+    /// Unix ms timestamp the account was added.
+    pub added_at: i64,
+    /// `true` while `label` is still the placeholder minted at creation, `false` once the
+    /// user has named the account. Recorded as a FACT so the identity captured after
+    /// sign-in replaces only a placeholder — guessing from the text ("starts with
+    /// `Account `") would silently overwrite a real name like "Account manager".
+    pub label_is_generated: bool,
+}
+
+impl ClaudeAccountRecord {
+    /// Fold an identity read from `claude auth status` right after THIS account signed in
+    /// into the record. The email replaces the label only while the label is still the
+    /// generated placeholder; a name the user chose is theirs to keep. Pure, so the rule is
+    /// unit-tested rather than living inside an IPC command.
+    pub fn apply_captured_identity(
+        &mut self,
+        email: Option<String>,
+        org_name: Option<String>,
+        subscription_type: Option<String>,
+    ) {
+        if self.label_is_generated {
+            if let Some(e) = email.as_deref().filter(|e| !e.trim().is_empty()) {
+                self.label = e.to_string();
+                // Still not something the user typed — a later capture (another sign-in)
+                // may refresh it again.
+            }
+        }
+        self.email = email;
+        self.org_name = org_name;
+        self.subscription_type = subscription_type;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(label: &str, generated: bool) -> ClaudeAccountRecord {
+        ClaudeAccountRecord {
+            id: "a".into(),
+            label: label.into(),
+            email: None,
+            org_name: None,
+            subscription_type: None,
+            sort_index: 1,
+            added_at: 0,
+            label_is_generated: generated,
+        }
+    }
+
+    #[test]
+    fn a_generated_label_is_replaced_by_the_captured_email() {
+        let mut r = record("Account 2", true);
+        r.apply_captured_identity(Some("a@b.c".into()), Some("Org".into()), Some("max".into()));
+        assert_eq!(r.label, "a@b.c");
+        assert_eq!(r.email.as_deref(), Some("a@b.c"));
+        assert_eq!(r.subscription_type.as_deref(), Some("max"));
+    }
+
+    /// The regression the flag exists for: a user-chosen name that merely LOOKS like a
+    /// placeholder must survive a sign-in.
+    #[test]
+    fn a_user_chosen_label_is_kept_even_if_it_looks_generated() {
+        let mut r = record("Account manager", false);
+        r.apply_captured_identity(Some("a@b.c".into()), None, None);
+        assert_eq!(r.label, "Account manager");
+        assert_eq!(r.email.as_deref(), Some("a@b.c"), "the identity is still recorded");
+    }
+
+    #[test]
+    fn no_email_leaves_a_generated_label_in_place() {
+        let mut r = record("Account 2", true);
+        r.apply_captured_identity(None, None, None);
+        assert_eq!(r.label, "Account 2");
+        r.apply_captured_identity(Some("   ".into()), None, None);
+        assert_eq!(r.label, "Account 2", "a blank email is not an identity");
+    }
 }
 
 /// The full persisted snapshot the UI hydrates from at boot.
@@ -172,6 +281,10 @@ pub struct PersistedState {
     /// repos are remote at boot.
     #[serde(default)]
     pub machines: Vec<MachineRecord>,
+    /// Claude accounts the user signed into, so the composer's account control and the
+    /// Accounts panel are populated at boot without a round-trip.
+    #[serde(default)]
+    pub claude_accounts: Vec<ClaudeAccountRecord>,
     pub repos: Vec<RepoRecord>,
     pub conversations: Vec<ConversationRecord>,
     /// Stable id of the conversation that was active when last persisted.

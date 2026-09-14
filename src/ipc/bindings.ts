@@ -25,10 +25,16 @@ async ping(msg: string) : Promise<Pong> {
  * to THIS session: its agent gains the app-piloting tools (open files, create/message
  * conversations, …). Claude-only (Codex has no SDK-server channel) and, like the
  * bypass unlock, decided at spawn — the `initialize` handshake advertises it once.
+ * 
+ * `claude_account_id` (inside [`SpawnFlags`]) picks WHICH Claude account the process runs
+ * on — `None` is the CLI's own, un-scoped credential store, i.e. the unchanged
+ * single-account behaviour. Like the two flags above it can only be decided at spawn: the
+ * CLI reads its credentials once at startup, so changing account means re-spawning with
+ * `--resume` (safe — the account scopes only the credential store, never the transcript).
  */
-async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean, appControl: boolean) : Promise<Result<string, string>> {
+async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, backend: Backend, flags: SpawnFlags) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions, appControl }) };
+    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, backend, flags }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -267,24 +273,26 @@ async codexMarketplaceUpgrade(name: string | null) : Promise<Result<null, string
 }
 },
 /**
- * The signed-in Claude account (`claude auth status --json`), whitelisted.
+ * One Claude account's auth status (`claude auth status --json`), whitelisted.
+ * `account_id: None` reads the default, un-scoped account.
  */
-async accountClaudeStatus() : Promise<Result<ClaudeAccountStatus, string>> {
+async accountClaudeStatus(accountId: string | null) : Promise<Result<ClaudeAccountStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_status") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_status", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Start a Claude login: spawns `claude auth login`, returns the OAuth URL to open.
- * The flow completes when the user pastes the authorization code
- * ([`account_claude_login_code`]) — or is dropped by [`account_claude_login_cancel`].
+ * Start a Claude login for ONE account: spawns `claude auth login` scoped to its
+ * credential store, returns the OAuth URL to open. The flow completes when the user pastes
+ * the authorization code ([`account_claude_login_code`]) — or is dropped by
+ * [`account_claude_login_cancel`].
  */
-async accountClaudeLoginStart() : Promise<Result<string, string>> {
+async accountClaudeLoginStart(accountId: string | null) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_start") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_start", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -292,10 +300,14 @@ async accountClaudeLoginStart() : Promise<Result<string, string>> {
 },
 /**
  * Submit the authorization code the user pasted; completes the in-flight Claude login.
+ * 
+ * `account_id` must name the account the flow was STARTED for. There is one global
+ * in-flight login but one card per account, so a code pasted into a superseded card would
+ * otherwise be redeemed into another account's credential store.
  */
-async accountClaudeLoginCode(code: string) : Promise<Result<null, string>> {
+async accountClaudeLoginCode(accountId: string | null, code: string) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { code }) };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { accountId, code }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -313,11 +325,124 @@ async accountClaudeLoginCancel() : Promise<Result<null, string>> {
 }
 },
 /**
- * Log out of the Claude account (`claude auth logout`).
+ * Log ONE Claude account out (`claude auth logout`). The account row (if any) is kept, so
+ * it stays listed as a signed-out slot the user can sign back into; removing it entirely
+ * is [`claude_account_remove`].
  */
-async accountClaudeLogout() : Promise<Result<null, string>> {
+async accountClaudeLogout(accountId: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_logout") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_logout", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Which account has a sign-in in flight (`null` = none). Lets a card whose flow was
+ * superseded close its code box instead of offering an input that targets another
+ * account's login.
+ */
+async accountClaudeLoginInFlight() : Promise<Result<ClaudeLoginInFlight | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_in_flight") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The Claude accounts the user added, in display order. The default account is NOT in
+ * this list — it always exists and the UI renders it from `account_claude_status(None)`.
+ */
+async claudeAccountsList() : Promise<Result<ClaudeAccountRecord[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_accounts_list") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Register a NEW Claude account: mints its id, creates its isolated credential store and
+ * persists the row. Signing in is a separate step (`account_claude_login_start` with this
+ * id) — an account exists as an empty, signed-out slot until then, which is exactly what
+ * the UI shows.
+ */
+async claudeAccountCreate(label: string) : Promise<Result<ClaudeAccountRecord, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_create", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rename an account. The label is what tells two accounts apart in the composer, so it is
+ * user-owned rather than derived from an email the CLI's shared profile cache can't be
+ * trusted for (see `accounts::status`).
+ */
+async claudeAccountRename(accountId: string, label: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_rename", { accountId, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
+ * non-sensitive metadata (never a token).
+ * 
+ * ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
+ * `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
+ * SHARES — so the answer is only reliably about THIS account in the moment just after its
+ * own login wrote that cache. Persisting it here is what lets the Accounts panel keep
+ * labelling each account correctly afterwards. Best-effort by design: a failure leaves the
+ * user-chosen label in place rather than blocking a successful sign-in.
+ */
+async claudeAccountCaptureIdentity(accountId: string) : Promise<Result<ClaudeAccountRecord, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_capture_identity", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove an account: sign its credential store out through the CLI, drop its directory,
+ * then delete the row (which detaches the conversations that used it, so they fall back to
+ * the default account rather than pointing at nothing).
+ * 
+ * ⚠️ The sign-out is NOT best-effort, and the order matters. On macOS the credentials live
+ * in a Keychain item whose name is derived from the slot's DIRECTORY PATH, and that path
+ * contains the account id we are about to delete — so once the row and the directory are
+ * gone, the item can no longer be addressed by us or by the CLI: the OAuth tokens would
+ * stay in the Keychain, valid and unrevokable. A failed `claude auth logout` (an
+ * unresolvable `claude` binary, a non-zero exit, the 15 s timeout) therefore ABORTS the
+ * removal with the row intact, so the user can retry — rather than silently orphaning a
+ * live credential.
+ * 
+ * `force` is the escape hatch for an account whose CLI sign-out can never succeed. It
+ * proceeds anyway and RETURNS the exact Keychain item name, so the user can revoke it by
+ * hand in Keychain Access instead of being left with no way at all.
+ */
+async claudeAccountRemove(accountId: string, force: boolean) : Promise<Result<string | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_remove", { accountId, force }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Point one conversation at a Claude account (`None` = the default account). Persisted, so
+ * it survives a relaunch, a resume, a fork and a rewind. It takes effect at the
+ * conversation's NEXT spawn — the caller is responsible for restarting the session if one
+ * is live, and for telling the user so (a live process cannot change identity).
+ */
+async setConversationClaudeAccount(convId: string, accountId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_conversation_claude_account", { convId, accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -975,9 +1100,9 @@ async readTaskOutputFile(path: string) : Promise<Result<string | null, string>> 
  * endpoint is itself rate-limited, so the caller throttles (poll + on-open + manual).
  * Errors are typed ([`UsageError`]) so the UI can show a tailored next step.
  */
-async getPlanUsage() : Promise<Result<PlanUsage, UsageError>> {
+async getPlanUsage(accountId: string | null) : Promise<Result<PlanUsage, UsageError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_plan_usage") };
+    return { status: "ok", data: await TAURI_INVOKE("get_plan_usage", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2521,6 +2646,45 @@ ahead: number | null;
  */
 behind: number | null }
 /**
+ * One Claude account the user signed into from the app. Holds NO secret: the credentials
+ * live in the CLI's own store, isolated per account by
+ * [`crate::accounts::AccountSlot`]. What is persisted here is the non-sensitive identity
+ * captured at login, which is what lets the Accounts panel label each account reliably —
+ * the CLI's own `auth status` reads its email from a profile cache our accounts SHARE, so
+ * it cannot be trusted to name a specific one (see `accounts::status`).
+ */
+export type ClaudeAccountRecord = { 
+/**
+ * Stable app-minted id (a uuid), also the directory name of the account's isolated
+ * credential store. The reserved value `"default"` is the CLI's own un-scoped store.
+ */
+id: string; 
+/**
+ * What the user sees. Defaults to the email captured at login, and is editable so two
+ * accounts on the same address (personal / org) stay tellable apart.
+ */
+label: string; email: string | null; org_name: string | null; 
+/**
+ * `max` | `pro` | … as the CLI reported it at login.
+ */
+subscription_type: string | null; 
+/**
+ * Manual display order (ascending). Also the tie-break the auto-switch policy uses
+ * when two accounts have equal capacity, so the choice is deterministic.
+ */
+sort_index: number; 
+/**
+ * Unix ms timestamp the account was added.
+ */
+added_at: number; 
+/**
+ * `true` while `label` is still the placeholder minted at creation, `false` once the
+ * user has named the account. Recorded as a FACT so the identity captured after
+ * sign-in replaces only a placeholder — guessing from the text ("starts with
+ * `Account `") would silently overwrite a real name like "Account manager".
+ */
+label_is_generated: boolean }
+/**
  * The signed-in Claude account, whitelisted from `claude auth status --json` (no
  * tokens — that output carries none; we forward only these fields).
  */
@@ -2585,6 +2749,17 @@ channel: string | null;
  * default. `None` = configs read cleanly (or were simply absent — the normal case).
  */
 config_warning: string | null }
+/**
+ * The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
+ * serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
+ * "nothing is signing in" (`None`) would both reach the front as `null` — exactly the
+ * distinction a superseded card needs to close its code box.
+ */
+export type ClaudeLoginInFlight = { 
+/**
+ * The account the flow was started for; `null` = the default account.
+ */
+accountId: string | null }
 /**
  * Result of running `claude update`.
  */
@@ -2960,7 +3135,18 @@ tosse_task_id: string | null;
  * warning is a function of precisely that status. Storing the id only would mean
  * the warning silently stops warning the moment the network is down.
  */
-tosse_task_title: string | null; tosse_task_status: string | null }
+tosse_task_title: string | null; tosse_task_status: string | null; 
+/**
+ * Which Claude account this conversation runs on — a [`ClaudeAccountRecord::id`],
+ * or `None` for the default (un-scoped) account. `None` is every pre-existing row and
+ * stays the default for a single-account user, so nothing changes for them.
+ * 
+ * Deliberately not a foreign key: the id names a credential store the CLI owns, so an
+ * account signed out or removed behind our back must leave the conversation usable
+ * (it degrades to the default account, visibly) rather than break the row. Codex
+ * conversations ignore it entirely — accounts are a Claude-side concept.
+ */
+claude_account_id: string | null }
 /**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
@@ -3617,7 +3803,12 @@ export type PersistedState = {
  * Remote servers the user has paired, so the UI can list them and mark which
  * repos are remote at boot.
  */
-machines?: MachineRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
+machines?: MachineRecord[]; 
+/**
+ * Claude accounts the user signed into, so the composer's account control and the
+ * Accounts panel are populated at boot without a round-trip.
+ */
+claude_accounts?: ClaudeAccountRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
 /**
  * Stable id of the conversation that was active when last persisted.
  */
@@ -4079,6 +4270,31 @@ description: string;
  */
 argument_hint: string }
 /**
+ * Spawn-time choices that can only be applied when the process starts, bundled into one
+ * argument. They travel together because they share that property — and because specta
+ * caps a command at 10 parameters, which [`spawn_session`] had already reached.
+ */
+export type SpawnFlags = { 
+/**
+ * The xhigh + orchestration tier. Not a spawn flag of its own: the session
+ * re-enables it over the control channel right after `initialize`.
+ */
+ultracode: boolean; 
+/**
+ * UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
+ * it on (Settings → General → Permissions).
+ */
+allowBypassPermissions: boolean; 
+/**
+ * Advertise the in-process "flightdeck" MCP server to this session (Settings →
+ * Control), giving its agent the app-piloting tools.
+ */
+appControl: boolean; 
+/**
+ * Which Claude account to authenticate as; `None` = the default, un-scoped store.
+ */
+claudeAccountId: string | null }
+/**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
  */
@@ -4519,7 +4735,13 @@ export type UsageError =
 /**
  * Response received but unparseable into the expected shape (carries body).
  */
-{ kind: "parse"; body: string }
+{ kind: "parse"; body: string } | 
+/**
+ * The usage was asked for a Claude account the app no longer knows (removed). A
+ * permanent, locally-known cause: typed on its own so the UI says so and STOPS polling,
+ * instead of presenting it as a network blip and retrying forever.
+ */
+{ kind: "unknown_account"; account_id: string }
 /**
  * One rate-limit window's real fill: `used_percentage` (0–100) + optional reset as a
  * raw timestamp string (ISO 8601, or epoch-seconds digits for the alternate shape) —

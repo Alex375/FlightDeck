@@ -67,6 +67,7 @@ const sourceConv = (over: Partial<Conversation> = {}): Conversation => ({
   tosseTaskId: null,
   tosseTaskTitle: null,
   tosseTaskStatus: null,
+  claudeAccountId: null,
   ...over,
 });
 
@@ -98,6 +99,14 @@ describe("fork — the branch inherits the source conversation's controls", () =
     expect(branch.cleanOutput).toBe(true);
     expect(branch.kind).toBe("claude");
     expect(branch.sessionId).toBe("forked-session"); // the copied transcript is its resume key
+  });
+
+  it("a Claude fork keeps the source's Claude ACCOUNT", async () => {
+    // Same hazard as the model: a branch that silently jumped back to the default account
+    // would bill the continued work to a subscription the user never picked for it.
+    seed(sourceConv({ claudeAccountId: "acct-b" }));
+    const newId = await forkConversation("c1", "m-3", false, null, null);
+    expect(convById(newId!).claudeAccountId).toBe("acct-b");
   });
 
   it("a Claude fork carries the ultracode tier over too", async () => {

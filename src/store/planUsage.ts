@@ -15,6 +15,13 @@ import type { PlanUsage, UsageError } from "../ipc/client";
 
 export const PLAN_USAGE_KEY = ["plan-usage"] as const;
 
+/** Per-account query key. Usage is per SUBSCRIPTION, so two accounts must never share a
+ *  cache entry — one would show the other's figures, and the auto-switch would then act
+ *  on a number that belongs to the account it is trying to leave. `null` = the default
+ *  (un-scoped) account. */
+export const planUsageKey = (accountId: string | null) =>
+  [...PLAN_USAGE_KEY, accountId ?? "default"] as const;
+
 /** How fresh a value stays before an on-open access refetches it. Exported so the
  *  popover's on-open handler throttles against the same window. */
 export const PLAN_USAGE_STALE_MS = 60_000;
@@ -37,7 +44,9 @@ function isTerminal(err: UsageError): boolean {
     err.kind === "no_token" ||
     err.kind === "keychain_denied" ||
     err.kind === "unauthorized" ||
-    err.kind === "parse"
+    err.kind === "parse" ||
+    // A removed account will not come back by polling — stop instead of retrying forever.
+    err.kind === "unknown_account"
   );
 }
 
@@ -54,14 +63,15 @@ function asUsageError(e: unknown): UsageError {
  *  reachable (the ring popover is live), so merely selecting a never-spawned conversation
  *  doesn't read the OAuth credentials / pop the macOS Keychain prompt before the user has
  *  done anything. A manual `refetch()` still works while disabled. Defaults to `true`. */
-export function usePlanUsage(opts?: { enabled?: boolean }) {
+export function usePlanUsage(opts?: { enabled?: boolean; accountId?: string | null }) {
+  const accountId = opts?.accountId ?? null;
   return useQuery<PlanUsage, UsageError>({
-    queryKey: PLAN_USAGE_KEY,
+    queryKey: planUsageKey(accountId),
     enabled: opts?.enabled ?? true,
     queryFn: async (): Promise<PlanUsage> => {
       let res;
       try {
-        res = await commands.getPlanUsage();
+        res = await commands.getPlanUsage(accountId);
       } catch (e) {
         // Transport-level failure (not our typed Result) → normalize, never crash.
         throw asUsageError(e);

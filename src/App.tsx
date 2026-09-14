@@ -13,6 +13,8 @@ import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { AutoAccountSwitchHost } from "./features/settings/AutoAccountSwitchHost";
+import { ClaudeAccountApplyHost } from "./features/settings/ClaudeAccountApplyHost";
 import { ZoomHost } from "./ui/ZoomHost";
 import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
@@ -328,6 +330,13 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): watches each Claude account's usage and, when the opt-in is
+          on, moves a conversation off an account nearing its limit — at a turn boundary
+          only. Renders (and fetches) nothing until a second account exists. */}
+      <AutoAccountSwitchHost />
+      {/* Idem (render-null): applies a pending Claude account change to a live session by
+          restarting it — never mid-turn. Always on: a manual pick needs it too. */}
+      <ClaudeAccountApplyHost />
       {/* Idem (render-null): executes the app-control tool calls bridged from the
           app-hosted MCP servers (agents piloting the app). Mounted HERE so it can
           drive the view, like the keyboard shortcuts. */}

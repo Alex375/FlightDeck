@@ -4,9 +4,23 @@
 // official login/logout flows. Query keys share the `["account-status"]` prefix so
 // the global `account_login` / `account/updated` invalidation refreshes both.
 
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
-import type { ClaudeAccountStatus, CodexAccountStatus, CodexLoginStart, Result } from "./client";
+import type {
+  ClaudeAccountRecord,
+  ClaudeAccountStatus,
+  ClaudeLoginInFlight,
+  CodexAccountStatus,
+  CodexLoginStart,
+  Result,
+} from "./client";
+import {
+  DEFAULT_ACCOUNT_ID,
+  toAccountSummary,
+  useClaudeAccountList,
+} from "../store/claudeAccounts";
+import { detachClaudeAccount } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
@@ -21,15 +35,98 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
 export const accountStatusKey = (backend: "claude" | "codex" | "tosse") =>
   ["account-status", backend] as const;
 
-/** The signed-in Claude account (`claude auth status --json`). Refetches on window
- *  focus — returning from the browser after an OAuth round-trip refreshes the panel. */
-export function useClaudeAccount(enabled: boolean) {
+/** Query key for ONE Claude account's status. Nested under the Claude prefix so the
+ *  existing `account_login` invalidation refreshes every account at once. */
+export const claudeAccountStatusKey = (accountId: string | null) =>
+  [...accountStatusKey("claude"), accountId ?? DEFAULT_ACCOUNT_ID] as const;
+
+/** Query key for the persisted list of extra Claude accounts. */
+export const claudeAccountsKey = ["claude-accounts"] as const;
+
+/** One Claude account's status (`claude auth status --json`, scoped to its credential
+ *  store). `accountId: null` is the default, un-scoped account. Refetches on window
+ *  focus — returning from the browser after an OAuth round-trip refreshes the panel.
+ *
+ *  ⚠️ Do NOT read `email`/`orgName` off this to LABEL an account: those come from a
+ *  profile cache the accounts share, so they describe whichever signed in last (see the
+ *  core's `accounts::status`). The label lives on the persisted record instead. */
+export function useClaudeAccount(enabled: boolean, accountId: string | null = null) {
   return useQuery<ClaudeAccountStatus>({
-    queryKey: accountStatusKey("claude"),
+    queryKey: claudeAccountStatusKey(accountId),
     enabled,
-    queryFn: () => unwrap(commands.accountClaudeStatus()),
+    queryFn: () => unwrap(commands.accountClaudeStatus(accountId)),
     staleTime: 30_000,
   });
+}
+
+/** The extra Claude accounts the user registered (the default one is not in this list —
+ *  it always exists). Mirrored into `useClaudeAccountList` so code outside React can read
+ *  it without a round-trip. */
+export function useClaudeAccounts(enabled = true) {
+  const query = useQuery<ClaudeAccountRecord[]>({
+    queryKey: claudeAccountsKey,
+    enabled,
+    queryFn: () => unwrap(commands.claudeAccountsList()),
+    staleTime: 30_000,
+  });
+  const accounts = query.data;
+  useEffect(() => {
+    if (!accounts) return;
+    useClaudeAccountList.getState().setAccounts(accounts.map(toAccountSummary));
+  }, [accounts]);
+  return query;
+}
+
+/** The in-flight Claude sign-in (`null` = none). Polled only while a card shows its code
+ *  box, so a flow superseded by another card's "Sign in" closes instead of offering an
+ *  input that would submit into someone else's login. */
+export function useClaudeLoginInFlight(enabled: boolean) {
+  return useQuery<ClaudeLoginInFlight | null>({
+    queryKey: ["claude-login-in-flight"],
+    enabled,
+    queryFn: () => unwrap(commands.accountClaudeLoginInFlight()),
+    refetchInterval: enabled ? 1_000 : false,
+  });
+}
+
+/** Add / rename / remove a Claude account. Every mutation refreshes the list AND the
+ *  statuses, since adding or removing one changes what the panel must render. */
+export function useClaudeAccountAdmin() {
+  const qc = useQueryClient();
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: claudeAccountsKey });
+    void qc.invalidateQueries({ queryKey: accountStatusKey("claude") });
+  };
+  const create = useMutation({
+    mutationFn: (label: string): Promise<ClaudeAccountRecord> =>
+      unwrap(commands.claudeAccountCreate(label)),
+    onSuccess: refresh,
+  });
+  const rename = useMutation({
+    mutationFn: (v: { accountId: string; label: string }): Promise<null> =>
+      unwrap(commands.claudeAccountRename(v.accountId, v.label)),
+    // Re-read either way: on failure the list must snap the field back to the stored name.
+    onSettled: refresh,
+  });
+  const remove = useMutation({
+    mutationFn: (v: { accountId: string; force: boolean }): Promise<string | null> =>
+      unwrap(commands.claudeAccountRemove(v.accountId, v.force)),
+    onSuccess: (_warning, v) => {
+      // The core detached the conversations in SQLite; mirror it in memory NOW. Without
+      // this the in-memory copies keep the dead id, the composer shows an account that no
+      // longer exists, and every spawn is refused until a relaunch.
+      detachClaudeAccount(v.accountId);
+    },
+    // `onSettled`, not `onSuccess`: re-read the list whether or not the removal went
+    // through — a refused removal must show the account still there.
+    onSettled: refresh,
+  });
+  const captureIdentity = useMutation({
+    mutationFn: (accountId: string): Promise<ClaudeAccountRecord> =>
+      unwrap(commands.claudeAccountCaptureIdentity(accountId)),
+    onSuccess: refresh,
+  });
+  return { create, rename, remove, captureIdentity };
 }
 
 /** The signed-in Codex account (`account/read` on a transient app-server). */
@@ -47,21 +144,42 @@ export function useCodexAccount(enabled: boolean) {
  * `claude auth login` and returns the OAuth URL (the caller opens it and shows a
  * code input); `loginCode` submits the pasted authorization code and completes it.
  */
-export function useClaudeAccountActions() {
+export function useClaudeAccountActions(accountId: string | null = null) {
   const qc = useQueryClient();
+  // Invalidate the WHOLE Claude prefix, not just this account's key: signing one account
+  // in or out can change what every card shows (which one is the default, whether a
+  // switch target exists), and the extra refetches are two cheap CLI calls.
   const refresh = () => qc.invalidateQueries({ queryKey: accountStatusKey("claude") });
   const loginStart = useMutation({
-    mutationFn: (): Promise<string> => unwrap(commands.accountClaudeLoginStart()),
+    mutationFn: (): Promise<string> => unwrap(commands.accountClaudeLoginStart(accountId)),
   });
   const loginCode = useMutation({
-    mutationFn: (code: string): Promise<null> => unwrap(commands.accountClaudeLoginCode(code)),
-    onSuccess: refresh,
+    // The code is bound to the account whose card it was typed into: the core refuses it
+    // if the in-flight login belongs to another account.
+    mutationFn: async (code: string): Promise<string | null> => {
+      await unwrap(commands.accountClaudeLoginCode(accountId, code));
+      // Capture the identity while the CLI's profile cache still describes THIS account
+      // (see the core's `accounts::status`). A failure does NOT undo the sign-in, which
+      // really succeeded — but it is returned as a warning to show on the card, never
+      // dropped: without it the account keeps a placeholder name nobody chose.
+      if (!accountId) return null;
+      try {
+        await unwrap(commands.claudeAccountCaptureIdentity(accountId));
+        return null;
+      } catch (e) {
+        return `Signed in, but this account's identity could not be read (${e instanceof Error ? e.message : String(e)}). Rename it below.`;
+      }
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: claudeAccountsKey });
+      refresh();
+    },
   });
   const loginCancel = useMutation({
     mutationFn: (): Promise<null> => unwrap(commands.accountClaudeLoginCancel()),
   });
   const logout = useMutation({
-    mutationFn: (): Promise<null> => unwrap(commands.accountClaudeLogout()),
+    mutationFn: (): Promise<null> => unwrap(commands.accountClaudeLogout(accountId)),
     onSuccess: refresh,
   });
   return { loginStart, loginCode, loginCancel, logout };
