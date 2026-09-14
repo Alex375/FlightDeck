@@ -938,6 +938,22 @@ export const mockCommands = {
   async claudeDefaultIdentity(): Promise<Result<MockIdentity | null, string>> {
     return ok(mockDefaultIdentity);
   },
+  async claudeAccountIdentity(
+    accountId: string | null,
+  ): Promise<Result<MockIdentity, UsageError>> {
+    // Like the core: an account is known by its own token, so a signed-out one has no
+    // identity to read.
+    if (accountId === null) {
+      return { status: "ok", data: { email: "demo@example.com", orgName: "Demo Org", subscriptionType: "max" } };
+    }
+    const rec = mockClaudeAccounts.find((a) => a.id === accountId);
+    if (!rec) return { status: "error", error: { kind: "unknown_account", account_id: accountId } };
+    if (!rec.email) return { status: "error", error: { kind: "no_token" } };
+    return {
+      status: "ok",
+      data: { email: rec.email, orgName: rec.org_name, subscriptionType: rec.subscription_type },
+    };
+  },
   async claudeAccountRemove(
     accountId: string,
     _force: boolean,

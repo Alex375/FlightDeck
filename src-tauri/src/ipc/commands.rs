@@ -709,6 +709,28 @@ pub async fn claude_default_identity(
     Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
 }
 
+/// One Claude account's identity — address, organization, plan — read with ITS OWN token
+/// (see `usage::profile`). This is what the UI names every account by: unlike
+/// `claude auth status`, whose profile cache all accounts share, it cannot answer with
+/// another account's address. `account_id: None` = the default account.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_identity(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<crate::usage::profile::AccountProfile, UsageError> {
+    let slot = claude_slot(&app, account_id.as_deref()).map_err(|detail| {
+        // Same typing as the usage command: a removed account is permanent, not a blip.
+        match account_id.clone() {
+            Some(id) if detail.starts_with("unknown Claude account") => {
+                UsageError::UnknownAccount { account_id: id }
+            }
+            _ => UsageError::Network { detail },
+        }
+    })?;
+    crate::usage::profile::fetch_profile_for(&slot).await
+}
+
 /// Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
 /// non-sensitive metadata (never a token). `account_id: None` captures the DEFAULT account.
 ///

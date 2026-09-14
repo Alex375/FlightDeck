@@ -412,6 +412,20 @@ async claudeDefaultIdentity() : Promise<Result<ClaudeIdentity | null, string>> {
 }
 },
 /**
+ * One Claude account's identity — address, organization, plan — read with ITS OWN token
+ * (see `usage::profile`). This is what the UI names every account by: unlike
+ * `claude auth status`, whose profile cache all accounts share, it cannot answer with
+ * another account's address. `account_id: None` = the default account.
+ */
+async claudeAccountIdentity(accountId: string | null) : Promise<Result<AccountProfile, UsageError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_identity", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Remove an account: sign its credential store out through the CLI, drop its directory,
  * then delete the row (which detaches the conversations that used it, so they fall back to
  * the default account rather than pointing at nothing).
@@ -2408,6 +2422,15 @@ workflowJournalEvent: "workflow-journal-event"
  * false and a reason is known.
  */
 export type AccountLoginEvent = { backend: string; success: boolean; error: string | null }
+/**
+ * The non-sensitive identity of one account, as the API reports it for that account's token.
+ */
+export type AccountProfile = { email: string | null; orgName: string | null; 
+/**
+ * `max` | `pro` | `team` | `enterprise`, mapped exactly as the CLI maps
+ * `organization.organization_type`. `None` for a type the CLI does not name either.
+ */
+subscriptionType: string | null }
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */

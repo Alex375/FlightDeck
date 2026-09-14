@@ -5,9 +5,11 @@
 // the global `account_login` / `account/updated` invalidation refreshes both.
 
 import { useEffect } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
 import type {
+  AccountProfile,
+  UsageError,
   ClaudeAccountRecord,
   ClaudeAccountStatus,
   ClaudeIdentity,
@@ -124,6 +126,53 @@ export function useClaudeAccountAdmin() {
   return { create, remove, captureIdentity };
 }
 
+/** Query key prefix for account identities — invalidating it refreshes every account's. */
+export const claudeIdentityPrefix = ["claude-identity"] as const;
+/** Query key for ONE account's identity (`null` = the default account). */
+export const claudeIdentityKey = (accountId: string | null) =>
+  [...claudeIdentityPrefix, accountId ?? DEFAULT_ACCOUNT_ID] as const;
+
+/** An address changes only on a sign-in, which invalidates it explicitly — so it can stay
+ *  fresh for a long time without re-reading every account's token. */
+const IDENTITY_STALE_MS = 10 * 60_000;
+
+function identityQuery(accountId: string | null, enabled: boolean) {
+  return {
+    queryKey: claudeIdentityKey(accountId),
+    enabled,
+    queryFn: async (): Promise<AccountProfile> => {
+      const res = await commands.claudeAccountIdentity(accountId);
+      if (res.status === "error") throw res.error;
+      return res.data;
+    },
+    staleTime: IDENTITY_STALE_MS,
+    // A signed-out account (no token) or a revoked one will not heal on a retry.
+    retry: false,
+  };
+}
+
+/** One account's identity — address, organization, plan — read with ITS OWN token. This is
+ *  what names an account everywhere: unlike `claude auth status` it cannot answer with the
+ *  address of another account. */
+export function useClaudeAccountIdentity(accountId: string | null, enabled = true) {
+  return useQuery<AccountProfile, UsageError>(identityQuery(accountId, enabled));
+}
+
+/** The display NAME of several accounts at once — always their address when one is known:
+ *  the live identity first, then the address captured at sign-in, and only then the
+ *  fallback ("Claude", or a generated label) for an account whose address cannot be read. */
+export function useClaudeAccountNames(
+  accounts: { id: string | null; capturedEmail?: string | null; fallback: string }[],
+): Record<string, string> {
+  const results = useQueries({ queries: accounts.map((a) => identityQuery(a.id, true)) });
+  const names: Record<string, string> = {};
+  accounts.forEach((a, i) => {
+    names[a.id ?? DEFAULT_ACCOUNT_ID] =
+      results[i]?.data?.email ?? a.capturedEmail ?? a.fallback;
+  });
+  return names;
+}
+
 /** Query key for the DEFAULT account's captured identity. */
 export const claudeDefaultIdentityKey = ["claude-default-identity"] as const;
 
@@ -184,6 +233,8 @@ export function useClaudeAccountActions(accountId: string | null = null) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: claudeAccountsKey });
       void qc.invalidateQueries({ queryKey: claudeDefaultIdentityKey });
+      // A sign-in is the one moment an address can change.
+      void qc.invalidateQueries({ queryKey: claudeIdentityPrefix });
       refresh();
     },
   });

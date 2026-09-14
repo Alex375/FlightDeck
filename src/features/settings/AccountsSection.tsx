@@ -16,6 +16,8 @@ import {
   useClaudeAccount,
   useClaudeAccountActions,
   useClaudeAccountAdmin,
+  useClaudeAccountIdentity,
+  useClaudeAccountNames,
   useClaudeAccounts,
   useClaudeDefaultIdentity,
   useClaudeLoginInFlight,
@@ -24,13 +26,20 @@ import {
 } from "../../ipc/useAccounts";
 import { useBackendAvailabilityState } from "../../store/binaryAvailable";
 import { useAccountLoginStore } from "../../store/accountLogin";
-import { peakUsagePercent, useClaudeAccountPrefs } from "../../store/claudeAccounts";
+import {
+  DEFAULT_ACCOUNT_ID,
+  peakUsagePercent,
+  useClaudeAccountPrefs,
+} from "../../store/claudeAccounts";
 import { planUsageKey, usePlanUsage } from "../../store/planUsage";
 import { ClaudeMark, CodexMark, Menu, MenuItem } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import { OpenUrlFallback, useAuthUrlOpener } from "./ConnectionCard";
 import a from "./AccountsSection.module.css";
+
+/** The key `useClaudeAccountNames` files the default account under. */
+const DEFAULT_ACCOUNT_KEY = DEFAULT_ACCOUNT_ID;
 
 /** Usage at or above this reads as "nearly full" — the same line the context ring draws. */
 const WARN_PERCENT = 80;
@@ -75,6 +84,11 @@ function ClaudeAccounts() {
   // captured at its OWN sign-in; absent until it was signed in from the app.
   const defaultIdentity = useClaudeDefaultIdentity(true).data ?? null;
   const defaultEmail = defaultIdentity?.email ?? null;
+  // Every account's display name — its address, read with its own token.
+  const names = useClaudeAccountNames([
+    { id: null, capturedEmail: defaultEmail, fallback: "Claude" },
+    ...rows.map((r) => ({ id: r.id, capturedEmail: r.email, fallback: r.label })),
+  ]);
 
   const remove = (accountId: string, force: boolean) =>
     admin.remove.mutate(
@@ -153,12 +167,12 @@ function ClaudeAccounts() {
           </div>
         ) : null}
       </section>
-      {/* Accounts are named by their address everywhere — the label is only the fallback
-          until one is captured. */}
+      {/* Accounts are named by their address everywhere — read with each account's own
+          token; the label is only the fallback while no address can be read. */}
       <Switching
         options={[
-          { id: null, label: defaultEmail ?? "Claude" },
-          ...rows.map((r) => ({ id: r.id, label: r.email ?? r.label })),
+          { id: null, label: names[DEFAULT_ACCOUNT_KEY] },
+          ...rows.map((r) => ({ id: r.id, label: names[r.id] })),
         ]}
       />
     </>
@@ -268,18 +282,23 @@ function ClaudeTile({
   const logged = status.data?.loggedIn === true;
   const signingIn = step === "code";
 
-  // An account IS its address. The captured one wins; the live `claude auth status` only
-  // fills in when it can be trusted (the default account, alone), because that profile cache
-  // is shared and would otherwise name whichever account signed in last.
-  const shownEmail = capturedEmail ?? (hideSharedIdentity ? null : (status.data?.email ?? null));
-  const shownOrg = orgName ?? (hideSharedIdentity ? null : (status.data?.orgName ?? null));
-  const shownPlan = subscriptionType ?? status.data?.subscriptionType ?? null;
-  // The heading is the address once there is one; the fallback name only stands in until
-  // then (a signed-out slot, or one signed in outside the app).
+  // An account IS its address, read with THIS account's own token — never from
+  // `claude auth status`, whose profile cache every account shares. The address captured at
+  // sign-in, then the live status (only when it can be trusted: the default account, alone),
+  // are fallbacks for when the profile cannot be read.
+  const identity = useClaudeAccountIdentity(accountId, logged);
+  const shownEmail =
+    identity.data?.email ??
+    capturedEmail ??
+    (hideSharedIdentity ? null : (status.data?.email ?? null));
+  const shownOrg =
+    identity.data?.orgName ?? orgName ?? (hideSharedIdentity ? null : (status.data?.orgName ?? null));
+  const shownPlan =
+    identity.data?.subscriptionType ?? subscriptionType ?? status.data?.subscriptionType ?? null;
   const title = logged ? (shownEmail ?? fallbackName) : fallbackName;
   const subLine = logged
     ? [shownPlan ? `${capitalize(shownPlan)} plan` : null, shownOrg].filter(Boolean).join(" · ") ||
-      (shownEmail ? "Connected" : "Connected — sign in from here to show its address")
+      "Connected"
     : status.isLoading
       ? "Checking…"
       : "Not connected";

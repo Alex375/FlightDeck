@@ -59,6 +59,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 
+/// Who an account is (address, organization, plan), read with that account's own token.
+pub mod profile;
+
 /// Internal usage endpoint the CLI's `/usage` hits with the OAuth bearer token.
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 

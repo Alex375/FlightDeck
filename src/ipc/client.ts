@@ -7,6 +7,7 @@ export { commands, events, isTauri } from "./provider";
 
 export type {
   AccountLoginEvent,
+  AccountProfile,
   AgentInfo,
   BackgroundTask,
   BackgroundTaskKind,
