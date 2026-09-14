@@ -17,6 +17,7 @@ import {
   useClaudeAccountActions,
   useClaudeAccountAdmin,
   useClaudeAccounts,
+  useClaudeDefaultIdentity,
   useClaudeLoginInFlight,
   useCodexAccount,
   useCodexAccountActions,
@@ -69,9 +70,11 @@ function ClaudeAccounts() {
   const [removal, setRemoval] = useState<
     { accountId: string; kind: "refused" | "warning"; message: string } | null
   >(null);
-  const [renameErr, setRenameErr] = useState<{ accountId: string; message: string } | null>(
-    null,
-  );
+  // The default account's address cannot be read live once a second account exists (the CLI's
+  // profile cache is shared, so it would name whichever signed in last). This is the one
+  // captured at its OWN sign-in; absent until it was signed in from the app.
+  const defaultIdentity = useClaudeDefaultIdentity(true).data ?? null;
+  const defaultEmail = defaultIdentity?.email ?? null;
 
   const remove = (accountId: string, force: boolean) =>
     admin.remove.mutate(
@@ -96,7 +99,10 @@ function ClaudeAccounts() {
               signed in LAST as the email/org, so the default tile must not show them. */}
           <ClaudeTile
             accountId={null}
-            label="Claude"
+            capturedEmail={defaultEmail}
+            orgName={defaultIdentity?.orgName ?? null}
+            subscriptionType={defaultIdentity?.subscriptionType ?? null}
+            fallbackName="Claude"
             hideSharedIdentity={rows.length > 0}
             isDefault={prefs.defaultAccountId === null}
             canMakeDefault={rows.length > 0}
@@ -106,24 +112,13 @@ function ClaudeAccounts() {
             <ClaudeTile
               key={r.id}
               accountId={r.id}
-              label={r.label}
-              email={r.email}
+              capturedEmail={r.email}
               orgName={r.org_name}
               subscriptionType={r.subscription_type}
+              fallbackName={r.label}
               isDefault={prefs.defaultAccountId === r.id}
               canMakeDefault
               onMakeDefault={() => prefs.set({ defaultAccountId: r.id })}
-              onRename={(label) =>
-                admin.rename.mutate(
-                  { accountId: r.id, label },
-                  {
-                    onSuccess: () => setRenameErr(null),
-                    onError: (e: unknown) =>
-                      setRenameErr({ accountId: r.id, message: errText(e) }),
-                  },
-                )
-              }
-              renameError={renameErr?.accountId === r.id ? renameErr.message : null}
               onRemove={() => remove(r.id, false)}
               removing={admin.remove.isPending && admin.remove.variables?.accountId === r.id}
               removal={
@@ -158,7 +153,14 @@ function ClaudeAccounts() {
           </div>
         ) : null}
       </section>
-      <Switching rows={rows.map((r) => ({ id: r.id, label: r.label }))} />
+      {/* Accounts are named by their address everywhere — the label is only the fallback
+          until one is captured. */}
+      <Switching
+        options={[
+          { id: null, label: defaultEmail ?? "Claude" },
+          ...rows.map((r) => ({ id: r.id, label: r.email ?? r.label })),
+        ]}
+      />
     </>
   );
 }
@@ -168,26 +170,28 @@ function ClaudeAccounts() {
  *  ⋯ menu; the two destructive ones ask first. */
 function ClaudeTile({
   accountId,
-  label,
-  email,
+  capturedEmail,
   orgName,
   subscriptionType,
+  fallbackName,
   hideSharedIdentity,
   isDefault,
   canMakeDefault,
   onMakeDefault,
-  onRename,
-  renameError,
   onRemove,
   removing,
   removal,
 }: {
   /** `null` = the default, un-scoped account (the one that always exists). */
   accountId: string | null;
-  label: string;
-  email?: string | null;
+  /** The address captured at THIS account's own sign-in — what names the account. `null`
+   *  until it was signed in from the app (or while it is signed out). */
+  capturedEmail?: string | null;
   orgName?: string | null;
   subscriptionType?: string | null;
+  /** Shown only until an address is known: the generated label, or "Claude" for the default
+   *  account. An account is identified by its address, never by a name nobody chose. */
+  fallbackName: string;
   /** Suppress the email/org read from `claude auth status` (default tile only): with several
    *  accounts that shared profile cache names another account. */
   hideSharedIdentity?: boolean;
@@ -195,8 +199,6 @@ function ClaudeTile({
   /** "Make default" only means something once there is a choice. */
   canMakeDefault: boolean;
   onMakeDefault: () => void;
-  onRename?: (label: string) => void;
-  renameError?: string | null;
   onRemove?: () => void;
   removing?: boolean;
   removal?: {
@@ -211,7 +213,6 @@ function ClaudeTile({
   const [step, setStep] = useState<"idle" | "code">("idle");
   const [code, setCode] = useState("");
   const [identityWarning, setIdentityWarning] = useState<string | null>(null);
-  const [renaming, setRenaming] = useState(false);
   const [confirm, setConfirm] = useState<"signout" | "remove" | null>(null);
   const opener = useAuthUrlOpener();
 
@@ -267,24 +268,24 @@ function ClaudeTile({
   const logged = status.data?.loggedIn === true;
   const signingIn = step === "code";
 
-  // The identity shown on an ADDED account is the one captured at its own sign-in, not
-  // whatever `claude auth status` reports (a profile cache every account shares).
-  const shownEmail = accountId ? (email ?? null) : hideSharedIdentity ? null : (status.data?.email ?? null);
-  const shownOrg = accountId ? (orgName ?? null) : hideSharedIdentity ? null : (status.data?.orgName ?? null);
-  const shownPlan = accountId
-    ? (subscriptionType ?? status.data?.subscriptionType ?? null)
-    : (status.data?.subscriptionType ?? null);
+  // An account IS its address. The captured one wins; the live `claude auth status` only
+  // fills in when it can be trusted (the default account, alone), because that profile cache
+  // is shared and would otherwise name whichever account signed in last.
+  const shownEmail = capturedEmail ?? (hideSharedIdentity ? null : (status.data?.email ?? null));
+  const shownOrg = orgName ?? (hideSharedIdentity ? null : (status.data?.orgName ?? null));
+  const shownPlan = subscriptionType ?? status.data?.subscriptionType ?? null;
+  // The heading is the address once there is one; the fallback name only stands in until
+  // then (a signed-out slot, or one signed in outside the app).
+  const title = logged ? (shownEmail ?? fallbackName) : fallbackName;
   const subLine = logged
-    ? [shownEmail, shownPlan ? `${capitalize(shownPlan)}${shownEmail ? "" : " plan"}` : null, shownOrg]
-        .filter(Boolean)
-        .join(" · ") || "Connected"
+    ? [shownPlan ? `${capitalize(shownPlan)} plan` : null, shownOrg].filter(Boolean).join(" · ") ||
+      (shownEmail ? "Connected" : "Connected — sign in from here to show its address")
     : status.isLoading
       ? "Checking…"
       : "Not connected";
 
-  const notices =
-    !!identityWarning || superseded || !!removal || !!renameError || !!err || status.isError;
-  const hasMenu = logged || !!onRemove || !!onRename;
+  const notices = !!identityWarning || superseded || !!removal || !!err || status.isError;
+  const hasMenu = logged || !!onRemove;
 
   return (
     <div className={a.tile} data-span={signingIn || notices ? "" : undefined}>
@@ -293,20 +294,10 @@ function ClaudeTile({
           <ClaudeMark />
         </span>
         <div className={a.who}>
-          {renaming && onRename ? (
-            <RenameField
-              label={label}
-              onDone={(next) => {
-                setRenaming(false);
-                if (next && next !== label) onRename(next);
-              }}
-            />
-          ) : (
-            <div className={a.name}>
-              <span className={a.nameText}>{label}</span>
-              {isDefault && canMakeDefault ? <span className={a.tag}>Default</span> : null}
-            </div>
-          )}
+          <div className={a.name} title={title}>
+            <span className={a.nameText}>{title}</span>
+            {isDefault && canMakeDefault ? <span className={a.tag}>Default</span> : null}
+          </div>
           <div className={a.sub}>{subLine}</div>
         </div>
         {signingIn ? (
@@ -327,12 +318,11 @@ function ClaudeTile({
             portal
             align="right"
             trigger={
-              <button type="button" className={a.kebab} aria-label={`Actions for ${label}`}>
+              <button type="button" className={a.kebab} aria-label={`Actions for ${title}`}>
                 ⋯
               </button>
             }
           >
-            {onRename ? <MenuItem onClick={() => setRenaming(true)}>Rename</MenuItem> : null}
             {canMakeDefault && !isDefault ? (
               <MenuItem onClick={onMakeDefault}>Make default</MenuItem>
             ) : null}
@@ -422,7 +412,6 @@ function ClaudeTile({
           This sign-in was replaced by one started for another account. Click “Sign in” again.
         </p>
       ) : null}
-      {renameError ? <p className={a.err}>Could not rename this account: {renameError}</p> : null}
       {removal ? (
         <div className={removal.kind === "refused" ? a.err : a.warn}>
           {removal.message}
@@ -442,7 +431,7 @@ function ClaudeTile({
 
       <ConfirmDialog
         open={confirm === "signout"}
-        title={`Sign out of ${label}?`}
+        title={`Sign out of ${title}?`}
         confirmLabel="Sign out"
         danger
         busy={logout.isPending}
@@ -453,7 +442,7 @@ function ClaudeTile({
       </ConfirmDialog>
       <ConfirmDialog
         open={confirm === "remove"}
-        title={`Remove ${label}?`}
+        title={`Remove ${title}?`}
         confirmLabel="Remove"
         danger
         busy={removing}
@@ -467,31 +456,6 @@ function ClaudeTile({
         account.
       </ConfirmDialog>
     </div>
-  );
-}
-
-/** Inline rename: commits on Enter or blur, Escape restores the stored name. A blank entry
- *  is not a name, so it restores too. */
-function RenameField({ label, onDone }: { label: string; onDone: (next: string | null) => void }) {
-  const [draft, setDraft] = useState(label);
-  return (
-    <input
-      className={a.input}
-      style={{ height: 26, width: "100%" }}
-      aria-label="Account name"
-      value={draft}
-      autoFocus
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={() => onDone(draft.trim() || null)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") onDone(draft.trim() || null);
-        if (e.key === "Escape") {
-          // Own the key: the Settings panel closes on a bare Escape.
-          e.stopPropagation();
-          onDone(null);
-        }
-      }}
-    />
   );
 }
 
@@ -569,9 +533,8 @@ function Ring({ label, pct, resetsAt }: { label: string; pct: number; resetsAt: 
 /** Where new conversations start, and the auto-switch policy — with the band that shows, for
  *  each account, how close it is to the thresholds. The auto-switch toggle is DISABLED, with
  *  the reason in its visible hint, while there is nowhere to switch to. */
-function Switching({ rows }: { rows: { id: string; label: string }[] }) {
+function Switching({ options }: { options: { id: string | null; label: string }[] }) {
   const prefs = useClaudeAccountPrefs();
-  const options = [{ id: null as string | null, label: "Claude" }, ...rows];
   const enough = options.length >= 2;
   // A stale default (its account removed) degrades to the default account, visibly.
   const selected = options.some((o) => o.id === prefs.defaultAccountId) ? prefs.defaultAccountId : null;
@@ -662,6 +625,7 @@ function ThresholdBand({ accounts }: { accounts: { id: string | null; label: str
             className={a.account}
             style={{ left: `${m.pct}%` }}
             data-over={m.pct >= at ? "" : undefined}
+            data-edge={m.pct < 18 ? "start" : m.pct > 82 ? "end" : undefined}
             title={m.labels.join(", ")}
           >
             {m.labels.length === 1 ? m.labels[0] : `${m.labels.length} accounts`} · {m.pct}%
@@ -849,10 +813,13 @@ function CodexAccount() {
   const cancelLogin = () => loginCancel.mutate(undefined, { onSettled: () => setWaiting(false) });
 
   const logged = status.data?.loggedIn === true;
+  // Codex reads its own account, not a cache shared with anything else, so its address is
+  // always trustworthy — it names the tile like the Claude ones.
+  const codexTitle = (logged && status.data?.email) || "Codex";
   const subLine = logged
-    ? [status.data?.email, status.data?.planType ? `ChatGPT ${capitalize(status.data.planType)}` : null]
-        .filter(Boolean)
-        .join(" · ") || "Connected"
+    ? status.data?.planType
+      ? `ChatGPT ${capitalize(status.data.planType)}`
+      : "Connected"
     : status.isLoading
       ? "Checking…"
       : "Not connected";
@@ -869,8 +836,8 @@ function CodexAccount() {
             <CodexMark />
           </span>
           <div className={a.who}>
-            <div className={a.name}>
-              <span className={a.nameText}>Codex</span>
+            <div className={a.name} title={codexTitle}>
+              <span className={a.nameText}>{codexTitle}</span>
             </div>
             <div className={a.sub}>{subLine}</div>
           </div>

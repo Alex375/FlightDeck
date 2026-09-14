@@ -19,6 +19,7 @@ export type {
   DiskConversation,
   ClaudeAccountRecord,
   ClaudeAccountStatus,
+  ClaudeIdentity,
   ClaudeLoginInFlight,
   CodexAccountStatus,
   CodexHooksSnapshot,

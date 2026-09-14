@@ -602,6 +602,16 @@
 .account[data-over]::before {
   border-color: var(--wf-att);
 }
+/* An address is long: centred on a marker near either end it would hang outside the card,
+   so the label anchors to the edge it is close to while the dot stays on its value. */
+.account[data-edge="start"] {
+  transform: none;
+  align-items: flex-start;
+}
+.account[data-edge="end"] {
+  transform: translateX(-100%);
+  align-items: flex-end;
+}
 .legend {
   display: flex;
   justify-content: space-between;

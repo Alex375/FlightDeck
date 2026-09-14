@@ -10,6 +10,7 @@ import { commands } from "./client";
 import type {
   ClaudeAccountRecord,
   ClaudeAccountStatus,
+  ClaudeIdentity,
   ClaudeLoginInFlight,
   CodexAccountStatus,
   CodexLoginStart,
@@ -102,12 +103,6 @@ export function useClaudeAccountAdmin() {
       unwrap(commands.claudeAccountCreate(label)),
     onSuccess: refresh,
   });
-  const rename = useMutation({
-    mutationFn: (v: { accountId: string; label: string }): Promise<null> =>
-      unwrap(commands.claudeAccountRename(v.accountId, v.label)),
-    // Re-read either way: on failure the list must snap the field back to the stored name.
-    onSettled: refresh,
-  });
   const remove = useMutation({
     mutationFn: (v: { accountId: string; force: boolean }): Promise<string | null> =>
       unwrap(commands.claudeAccountRemove(v.accountId, v.force)),
@@ -122,11 +117,27 @@ export function useClaudeAccountAdmin() {
     onSettled: refresh,
   });
   const captureIdentity = useMutation({
-    mutationFn: (accountId: string): Promise<ClaudeAccountRecord> =>
+    mutationFn: (accountId: string | null): Promise<null> =>
       unwrap(commands.claudeAccountCaptureIdentity(accountId)),
     onSuccess: refresh,
   });
-  return { create, rename, remove, captureIdentity };
+  return { create, remove, captureIdentity };
+}
+
+/** Query key for the DEFAULT account's captured identity. */
+export const claudeDefaultIdentityKey = ["claude-default-identity"] as const;
+
+/** The default account's identity as captured at its own sign-in. It is NOT read live:
+ *  `claude auth status` answers from a profile cache every account shares, so with a second
+ *  account signed in it would name that one instead. `null` = never captured (the account was
+ *  signed in outside the app), which the UI must not dress up as an address. */
+export function useClaudeDefaultIdentity(enabled = true) {
+  return useQuery<ClaudeIdentity | null>({
+    queryKey: claudeDefaultIdentityKey,
+    enabled,
+    queryFn: () => unwrap(commands.claudeDefaultIdentity()),
+    staleTime: 30_000,
+  });
 }
 
 /** The signed-in Codex account (`account/read` on a transient app-server). */
@@ -158,20 +169,21 @@ export function useClaudeAccountActions(accountId: string | null = null) {
     // if the in-flight login belongs to another account.
     mutationFn: async (code: string): Promise<string | null> => {
       await unwrap(commands.accountClaudeLoginCode(accountId, code));
-      // Capture the identity while the CLI's profile cache still describes THIS account
-      // (see the core's `accounts::status`). A failure does NOT undo the sign-in, which
-      // really succeeded — but it is returned as a warning to show on the card, never
-      // dropped: without it the account keeps a placeholder name nobody chose.
-      if (!accountId) return null;
+      // Capture the identity while the CLI's profile cache still describes THIS account (see
+      // the core's `accounts::status`) — for the default account too, whose address cannot be
+      // read live once a second account exists. A failure does NOT undo the sign-in, which
+      // really succeeded, but it is returned as a warning rather than dropped: without the
+      // capture the account has no address to show.
       try {
         await unwrap(commands.claudeAccountCaptureIdentity(accountId));
         return null;
       } catch (e) {
-        return `Signed in, but this account's identity could not be read (${e instanceof Error ? e.message : String(e)}). Rename it below.`;
+        return `Signed in, but this account's address could not be read (${e instanceof Error ? e.message : String(e)}).`;
       }
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: claudeAccountsKey });
+      void qc.invalidateQueries({ queryKey: claudeDefaultIdentityKey });
       refresh();
     },
   });

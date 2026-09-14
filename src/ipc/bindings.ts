@@ -377,32 +377,35 @@ async claudeAccountCreate(label: string) : Promise<Result<ClaudeAccountRecord, s
 }
 },
 /**
- * Rename an account. The label is what tells two accounts apart in the composer, so it is
- * user-owned rather than derived from an email the CLI's shared profile cache can't be
- * trusted for (see `accounts::status`).
+ * Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
+ * non-sensitive metadata (never a token). `account_id: None` captures the DEFAULT account.
+ * 
+ * ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
+ * `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
+ * SHARES — so the answer is only reliably about THIS account in the moment just after its
+ * own login wrote that cache. Persisting it here is what lets the Accounts panel keep naming
+ * each account by its address afterwards. Best-effort by design: a failure leaves the
+ * previous identity in place rather than blocking a successful sign-in.
  */
-async claudeAccountRename(accountId: string, label: string) : Promise<Result<null, string>> {
+async claudeAccountCaptureIdentity(accountId: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("claude_account_rename", { accountId, label }) };
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_capture_identity", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
- * non-sensitive metadata (never a token).
+ * The DEFAULT account's identity as captured at ITS OWN sign-in, or `null` if it was never
+ * captured (it was signed in outside the app, or before this existed).
  * 
- * ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
- * `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
- * SHARES — so the answer is only reliably about THIS account in the moment just after its
- * own login wrote that cache. Persisting it here is what lets the Accounts panel keep
- * labelling each account correctly afterwards. Best-effort by design: a failure leaves the
- * user-chosen label in place rather than blocking a successful sign-in.
+ * ⚠️ It cannot be read live once a second account exists: `claude auth status` answers from
+ * a profile cache every account SHARES, so it would name whichever account signed in last.
+ * The UI shows this stored value instead of a plausible-looking wrong address.
  */
-async claudeAccountCaptureIdentity(accountId: string) : Promise<Result<ClaudeAccountRecord, string>> {
+async claudeDefaultIdentity() : Promise<Result<ClaudeIdentity | null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("claude_account_capture_identity", { accountId }) };
+    return { status: "ok", data: await TAURI_INVOKE("claude_default_identity") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2749,6 +2752,10 @@ channel: string | null;
  * default. `None` = configs read cleanly (or were simply absent — the normal case).
  */
 config_warning: string | null }
+/**
+ * The non-sensitive identity of a Claude account — never a token.
+ */
+export type ClaudeIdentity = { email: string | null; orgName: string | null; subscriptionType: string | null }
 /**
  * The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
  * serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
