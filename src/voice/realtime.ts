@@ -36,6 +36,13 @@ import {
 } from "./announce";
 import { buildTurnDetection } from "./vad";
 import { useAppErrors } from "../store/appErrors";
+import {
+  SETTING_EVENT_PREFIX,
+  SETTING_REJECTED_NOTE,
+  UNEXPECTED_ERROR_MESSAGE,
+  classifyServerError,
+  type RealtimeErrorPayload,
+} from "./serverErrors";
 import { openVoiceMic } from "./mic";
 import { resolveInstructions } from "./instructions";
 
@@ -112,6 +119,28 @@ interface LiveSession {
   /** One-shot listeners flushed on every `response.done` and on teardown; each
    *  waiter also self-removes on its own timeout (no stale resolvers). */
   responseWaiters: Array<() => void>;
+  /** Event ids of the setting updates we sent, so a server error that echoes one
+   *  is known to be about a SETTING — and nothing else is ever blamed on one.
+   *  Bounded: only the most recent few can still be answered. */
+  settingEvents: Set<string>;
+}
+
+/** How many recent setting-update ids to remember. The server answers within a
+ *  round trip; anything older cannot come back. */
+const SETTING_EVENTS_KEPT = 16;
+let settingEventSeq = 0;
+
+/** Send a `session.update` tagged so a refusal can be traced back to it. */
+function sendSettingUpdate(s: LiveSession, session: Record<string, unknown>): void {
+  const eventId = `${SETTING_EVENT_PREFIX}${++settingEventSeq}`;
+  s.settingEvents.add(eventId);
+  while (s.settingEvents.size > SETTING_EVENTS_KEPT) {
+    const oldest = s.settingEvents.values().next().value;
+    if (oldest === undefined) break;
+    s.settingEvents.delete(oldest);
+  }
+  useVoiceStore.getState().setSettingsNote(null);
+  dcSend(s, { type: "session.update", event_id: eventId, session });
 }
 
 let session: LiveSession | null = null;
@@ -248,12 +277,9 @@ export function interruptAgent(): void {
 export function applyVadSettings(): void {
   const s = session;
   if (!s) return;
-  dcSend(s, {
-    type: "session.update",
-    session: {
-      type: "realtime",
-      audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
-    },
+  sendSettingUpdate(s, {
+    type: "realtime",
+    audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
   });
 }
 
@@ -264,10 +290,7 @@ export function applyVadSettings(): void {
 export function applyInstructions(): void {
   const s = session;
   if (!s) return;
-  dcSend(s, {
-    type: "session.update",
-    session: { type: "realtime", instructions: sessionInstructions() },
-  });
+  sendSettingUpdate(s, { type: "realtime", instructions: sessionInstructions() });
 }
 
 /**
@@ -368,6 +391,7 @@ async function doStart(): Promise<void> {
       idleTimer: null,
       activeResponses: 0,
       responseWaiters: [],
+      settingEvents: new Set(),
     };
     // A rejected `ready` is normal teardown; never let it surface as unhandled.
     void ready.catch(() => {});
@@ -542,21 +566,21 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
       break;
     }
     case "error": {
-      // ⚠️ These used to be `console.error` and nothing else, which made a WHOLE
-      // CLASS of failure invisible: a `session.update` the server rejects is
-      // reported here and nowhere else, so turn-detection settings could be
-      // silently not applied while Settings showed them as set. Someone turning
-      // a slider that the server threw away has no way to find out.
-      // Not fatal — the connection-state handler decides when a session is dead —
-      // but never again silent.
-      const detail = ev.error as { message?: string; code?: string; param?: string } | undefined;
+      // Not fatal — the connection-state handler decides when a session is dead.
+      // Sorted by what CAUSED the error (see serverErrors.ts): the technical text
+      // always goes to the log, and never to the screen.
+      const error = ev.error as RealtimeErrorPayload | undefined;
+      const outcome = classifyServerError(error, s.settingEvents);
+      if (outcome.kind === "benign") {
+        console.warn("voice: absorbed server race", ev);
+        break;
+      }
       console.error("voice: server error event", ev);
-      useAppErrors
-        .getState()
-        .pushError(
-          `The voice agent rejected a setting: ${detail?.message ?? "unknown error"}`,
-          [detail?.code, detail?.param].filter(Boolean).join(" · ") || null,
-        );
+      if (outcome.kind === "setting-rejected") {
+        useVoiceStore.getState().setSettingsNote(SETTING_REJECTED_NOTE);
+      } else {
+        useAppErrors.getState().pushError(UNEXPECTED_ERROR_MESSAGE);
+      }
       break;
     }
     default:
@@ -597,12 +621,34 @@ async function runToolCall(
     output = { error: e instanceof Error ? e.message : String(e) };
   }
   if (session !== s) return; // the session ended while the tool ran
+  // The output goes in FIRST, before any wait: a response that starts from here
+  // on — ours or one the server creates from the user speaking — then carries it.
   dcSend(s, {
     type: "conversation.item.create",
     item: { type: "function_call_output", call_id: callId, output: JSON.stringify(output ?? null) },
   });
-  dcSend(s, { type: "response.create" });
+  await requestResponse(s);
   armIdleTimer(s);
+}
+
+/**
+ * Ask the model to speak — once the server is free to.
+ *
+ * ⚠️ This used to fire `response.create` the moment a tool finished, and a tool
+ * call is reported by `response.output_item.done` while the response CONTAINING
+ * it is still open (`response.done` follows). App-control tools run locally in
+ * milliseconds, so the request routinely landed first and was refused with
+ * "Conversation already has an active response in progress". The refusal was the
+ * only trace: the agent performed the action and never said so. Waiting for quiet
+ * is the same bounded wait announcements already use.
+ */
+async function requestResponse(s: LiveSession): Promise<void> {
+  const quietBy = Date.now() + 30_000;
+  while (session === s && s.activeResponses > 0 && Date.now() < quietBy) {
+    await waitEvent(s, 5_000);
+  }
+  if (session !== s) return;
+  dcSend(s, { type: "response.create" });
 }
 
 /**

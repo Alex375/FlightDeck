@@ -34,6 +34,7 @@ export function VoiceAgentSection() {
   const vadMode = useVoicePrefs((s) => s.vadMode);
   const vadEagerness = useVoicePrefs((s) => s.vadEagerness);
   const vadInterrupt = useVoicePrefs((s) => s.vadInterrupt);
+  const settingsNote = useVoiceStore((s) => s.settingsNote);
   const voice = useVoicePrefs((s) => s.voice);
   const instructions = useVoicePrefs((s) => s.instructions);
   const setPrefs = useVoicePrefs((s) => s.set);
@@ -358,6 +359,7 @@ export function VoiceAgentSection() {
       </SettingsGroup>
 
       <SettingsGroup title="Microphone" icon="mic">
+        {settingsNote ? <div className={styles.note}>{settingsNote}</div> : null}
         <ToggleRow
           title="Push-to-talk key"
           hint="Opens / closes the microphone (arms the session first if needed). A lone modifier works as a tap — press and release it by itself. Click Change, then press the key you want; Escape cancels."
