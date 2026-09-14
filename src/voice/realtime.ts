@@ -51,11 +51,17 @@ const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 /** The tool subset the voice agent gets — conversation piloting + showing
  *  things on screen. `wait_for_events` excluded (events are PUSHED as spoken
  *  announcements), `whoami` excluded (a voice caller has no own conversation),
- *  `notify_user` excluded (it IS the notification). */
+ *  `notify_user` excluded (it IS the notification).
+ *  `get_pending_request` + `answer_request` included so the voice agent can READ
+ *  a question (AskUserQuestion) and answer it by voice — a dictated answer rides
+ *  in as the question's "Other" choice. Answering a QUESTION needs no opt-in;
+ *  the executor keeps real permission prompts behind Settings → Control. */
 const VOICE_TOOL_NAMES = new Set([
   "list_conversations",
   "read_conversation",
   "send_message",
+  "get_pending_request",
+  "answer_request",
   "create_conversation",
   "browse_folders",
   "focus_conversation",

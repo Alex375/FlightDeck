@@ -62,6 +62,16 @@ describe("the default brief", () => {
     expect(brief).toContain("five reasons");
   });
 
+  it("separates questions from permissions and says how to answer a question", () => {
+    const brief = DEFAULT_VOICE_INSTRUCTIONS;
+    expect(brief).toContain("Questions are NOT permissions");
+    expect(brief).toContain("get_pending_request");
+    expect(brief).toContain("answer_request");
+    expect(brief).toContain('"Other"');
+    // The specific failure mode: answering a blocked question with a queued message.
+    expect(brief).toContain("NEVER answer a pending question with send_message");
+  });
+
   it("still names the tools the agent must ground itself in", () => {
     for (const tool of [
       "list_conversations",

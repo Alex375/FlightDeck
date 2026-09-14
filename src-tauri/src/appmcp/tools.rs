@@ -219,9 +219,11 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         ToolSpec {
             name: "get_pending_request",
             description: "Full detail of the conversation's pending requests waiting on the \
-                human: permission prompts (tool + input), questionnaires (questions + options \
-                in `input`), plan approvals (plan markdown in `input`). Read-only. Answer with \
-                answer_request.",
+                human. `kind` tells them apart: 'questions' — the agent asked the USER a \
+                question (AskUserQuestion); the questions + their options are in `input` (this \
+                is NOT a permission prompt — do not treat it as one). 'permission' — a tool \
+                (Bash/Edit/…) waiting to run (tool + input). 'plan' — a plan approval (markdown \
+                in `input`). Read-only. Answer with answer_request.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
@@ -230,10 +232,13 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "answer_request",
-            description: "Answer ONE pending request (from get_pending_request): allow or deny \
-                a permission prompt / plan approval; questionnaires answer with behavior \
-                'allow' plus `updated_input` carrying the chosen options. Gated by an explicit \
-                desktop opt-in (Settings → Control), off by default.",
+            description: "Answer ONE pending request (from get_pending_request). A QUESTION \
+                (kind 'questions'): behavior 'allow' plus `answers` — your answer per question, \
+                keyed by the question text; a free-text answer (not one of the listed options) \
+                is accepted as that question's 'Other' choice. Answering a question needs no \
+                opt-in. A permission prompt / plan approval (kind 'permission'/'plan'): behavior \
+                'allow' or 'deny' — gated by an explicit desktop opt-in (Settings → Control), \
+                off by default.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
@@ -241,11 +246,16 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     "request_id": { "type": "string",
                         "description": "The pending request to answer (from get_pending_request)." },
                     "behavior": { "type": "string", "enum": ["allow", "deny"],
-                        "description": "Allow or deny the request." },
+                        "description": "Allow or deny the request. Use 'allow' to submit a question's answer." },
+                    "answers": { "type": "object",
+                        "description": "For a QUESTION: your answer per question, keyed by the \
+                        question text (see get_pending_request). Pass an option's label to pick \
+                        it, or any other text to answer freely (it becomes the 'Other' choice). \
+                        Unanswered questions may be omitted." },
                     "message": { "type": "string",
                         "description": "Optional reason shown to the agent on deny." },
-                    "updated_input": { "description": "Optional rewritten tool input on allow \
-                        (questionnaire answers ride here, mirroring the desktop card)." },
+                    "updated_input": { "description": "Advanced: a fully rewritten tool input on \
+                        allow. Prefer `answers` for questions." },
                 }),
                 &["conversation_id", "request_id", "behavior"],
             ),

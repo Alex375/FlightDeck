@@ -56,7 +56,7 @@ import {
   dispatchAgentNotification,
   peekInterrupt,
 } from "../notifications/notify";
-import { queueVoiceAnnouncement } from "../voice/announce";
+import { queueVoiceAnnouncement, attentionFields } from "../voice/announce";
 import { useVoiceStore } from "../voice/voiceStore";
 import {
   SETTLE_MS,
@@ -196,6 +196,11 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // "turn_completed: success" for work the user halted themselves.
   const meta = kind === "done" ? lastTurnResultMeta(entry) : null;
   const pending = entry.pendingPermissions[0] ?? null;
+  // An AskUserQuestion is itself a pending `can_use_tool`, so classify on the
+  // TOOL, not on "is anything pending" — otherwise a question reads as a
+  // permission prompt ("asks permission to use the AskUserQuestion tool"). Shared
+  // so the OS ping and the spoken announcement can never disagree.
+  const attention = attentionFields(pending);
   if (kind === "done" && peekInterrupt(convId)) {
     dispatchAgentNotification({
       kind,
@@ -219,9 +224,9 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
             repository: repo ? repoName(repo.path) : null,
           }
         : {
-            reason: pending ? "permission" : "question",
-            ...(pending ? { tool: pending.tool_name } : {}),
-            prompt: clipForEvent(pending?.title ?? pending?.description ?? null),
+            reason: attention.reason,
+            ...(attention.tool ? { tool: attention.tool } : {}),
+            prompt: clipForEvent(attention.prompt),
             repository: repo ? repoName(repo.path) : null,
           },
     )
@@ -248,9 +253,9 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
             kind: "needs_attention",
             conversationId: convId,
             title: conv.name,
-            reason: pending ? "permission" : "question",
-            tool: pending?.tool_name ?? null,
-            prompt: clipForEvent(pending?.title ?? pending?.description ?? null),
+            reason: attention.reason,
+            tool: attention.tool,
+            prompt: clipForEvent(attention.prompt),
             repository: repo ? repoName(repo.path) : null,
           },
     );
