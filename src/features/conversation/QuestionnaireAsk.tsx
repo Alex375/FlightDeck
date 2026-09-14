@@ -17,43 +17,13 @@ import { ToolResultBody } from "./ToolResultBody";
 // `{ ...input, answers: { [question]: "label1, label2" } }` — exactly the shape
 // the CLI reads (Other replaced by its text; unanswered questions omitted).
 
-const OTHER = "Other";
-
-interface QOption {
-  label: string;
-  description?: string;
-}
-interface Question {
-  question: string;
-  header: string;
-  multiSelect: boolean;
-  options: QOption[];
-}
-
-export function asObject(v: JsonValue): Record<string, JsonValue> {
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, JsonValue>) : {};
-}
-
-export function parseQuestions(input: JsonValue): Question[] {
-  const raw = asObject(input).questions;
-  if (!Array.isArray(raw)) return [];
-  return raw.map((q, i) => {
-    const o = asObject(q);
-    const opts = Array.isArray(o.options) ? o.options : [];
-    return {
-      question: typeof o.question === "string" ? o.question : `Question ${i + 1}`,
-      header: typeof o.header === "string" && o.header ? o.header : `Q${i + 1}`,
-      multiSelect: o.multiSelect === true,
-      options: opts.map((op) => {
-        const oo = asObject(op);
-        return {
-          label: typeof oo.label === "string" ? oo.label : String(op),
-          description: typeof oo.description === "string" ? oo.description : undefined,
-        };
-      }),
-    };
-  });
-}
+// The questionnaire shape + answer coercion are framework-free and shared with
+// the app-control executor and the event hub — see `./questionnaire`. Re-exported
+// here so existing importers (and this component) keep a single import site.
+import { OTHER, asObject, parseQuestions } from "./questionnaire";
+import type { Question } from "./questionnaire";
+export { asObject, parseQuestions } from "./questionnaire";
+export type { QOption, Question } from "./questionnaire";
 
 export function QuestionnaireAsk({
   session,
@@ -306,10 +276,7 @@ function AskShell({ session, children }: { session: string; children: ReactNode 
   );
 }
 
-/** Number of questions in an AskUserQuestion tool input (0 if malformed). */
-export function questionCount(input: JsonValue): number {
-  return parseQuestions(input).length;
-}
+export { questionCount } from "./questionnaire";
 
 // The CLI returns the chosen answers in the tool_result as a single string of
 // `"<question>"="<answer>"` pairs. The WRAPPING sentence has changed across

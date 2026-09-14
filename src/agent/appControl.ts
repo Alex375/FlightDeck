@@ -31,6 +31,7 @@ import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
+import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
   runningBashCountsByConv,
   runningCountsByConv,
@@ -349,18 +350,20 @@ function getPendingRequest(args: Record<string, unknown>, session: string | null
   };
 }
 
-/** Answer ONE pending request (allow/deny; questionnaires answer via
- *  `updated_input`, mirroring the desktop cards). Gated by the explicit
- *  Settings → Control opt-in — answering a SPECIFIC visible request is not
- *  privilege-raising (unlike changing the permission MODE, which stays banned),
- *  but it hands real control to the token holder, so it is off by default. */
+/** Answer ONE pending request (allow/deny).
+ *
+ *  A QUESTION (the `AskUserQuestion` tool) is NOT a permission prompt — it does
+ *  not gate a tool run, it just collects the user's choice — so answering one is
+ *  never privilege-raising and needs NO opt-in: the answer rides in as the
+ *  questionnaire's `updated_input.answers` (a free-text answer becomes the
+ *  question's "Other" choice), built here from the pending request's own input so
+ *  the caller supplies only the answer text, not the whole questionnaire blob.
+ *
+ *  A permission prompt / plan approval DOES decide what runs, so it stays behind
+ *  the explicit Settings → Control opt-in (answering a specific visible request
+ *  is not privilege-raising like changing the permission MODE, but it hands real
+ *  control to whoever holds the pairing token — off by default). */
 async function answerRequest(args: Record<string, unknown>, session: string | null) {
-  if (!remoteAnswersEnabled()) {
-    throw new Error(
-      "answering requests is turned off — enable it in Settings → Control " +
-        '("Answer permission requests remotely")',
-    );
-  }
   const conv = resolveTarget(args, session);
   const requestId = typeof args.request_id === "string" ? args.request_id.trim() : "";
   if (!requestId) throw new Error("answer_request: 'request_id' is required (see get_pending_request)");
@@ -373,17 +376,48 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
       `no pending request '${requestId}' — it may have been answered or withdrawn (see get_pending_request)`,
     );
   }
+  const isQuestion = pending.tool_name === "AskUserQuestion";
+  if (!isQuestion && !remoteAnswersEnabled()) {
+    throw new Error(
+      "answering permission requests is turned off — enable it in Settings → Control " +
+        '("Answer permission requests remotely"). Questions (AskUserQuestion) can always be answered.',
+    );
+  }
   // Mirror useAnswerPermission: fail loudly when the process died with the card
   // up — silently dismissing is indistinguishable from a delivered answer.
   if (!conv.handle) throw new Error("the session ended before the answer could be sent");
-  const decision: PermissionDecision =
-    behavior === "allow"
-      ? { behavior: "allow", updated_input: (args.updated_input ?? null) as JsonValue | null }
-      : {
-          behavior: "deny",
-          message:
-            typeof args.message === "string" && args.message.trim() ? args.message.trim() : "Rejected.",
-        };
+
+  let decision: PermissionDecision;
+  let answers: Record<string, string> | undefined;
+  if (behavior === "deny") {
+    decision = {
+      behavior: "deny",
+      message:
+        typeof args.message === "string" && args.message.trim() ? args.message.trim() : "Rejected.",
+    };
+  } else if (isQuestion) {
+    // If the caller already built a full updated_input with answers, respect it;
+    // otherwise coerce the loose `answers` payload onto the real questions.
+    const direct = asObject((args.updated_input ?? null) as JsonValue);
+    if (Object.keys(asObject(direct.answers)).length > 0) {
+      decision = { behavior: "allow", updated_input: args.updated_input as JsonValue };
+    } else {
+      const built = questionnaireUpdatedInput(pending.input, args.answers ?? null);
+      if (Object.keys(built.answers).length === 0) {
+        throw new Error(
+          built.unmatched.length
+            ? `answer_request: none of your answers matched this question (${built.unmatched.join("; ")}) — ` +
+              "key them by the question text from get_pending_request"
+            : "answer_request: provide 'answers' for the question (see get_pending_request) — " +
+              "a free-text answer is accepted as the 'Other' choice",
+        );
+      }
+      answers = built.answers;
+      decision = { behavior: "allow", updated_input: built.updatedInput as JsonValue };
+    }
+  } else {
+    decision = { behavior: "allow", updated_input: (args.updated_input ?? null) as JsonValue | null };
+  }
   useConversationStore.getState().removePermission(conv.id, requestId);
   const res = await commands.answerPermission(conv.handle, requestId, decision);
   if (res.status === "error") throw new Error(res.error);
@@ -392,7 +426,7 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
     request_id: requestId,
     behavior,
   });
-  return { conversation_id: conv.id, request_id: requestId, behavior };
+  return { conversation_id: conv.id, request_id: requestId, behavior, ...(answers ? { answers } : {}) };
 }
 
 function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
