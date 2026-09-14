@@ -9,6 +9,14 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.2.0
+
+- New: **multiple Claude accounts** — add several accounts, pick one per conversation or let the app switch automatically; each account is named by its own address.
+- New: **redesigned Settings** — regrouped panel with sub-tabs and search, Accounts shown as tiles, and a new Claude Code tab (sub-agent routing, spend dashboard, instructions).
+- New: **terser Ground Control** — radio-style voice agent with an editable brief, a voice picker, and questions from agents read aloud and answerable by voice.
+- Improved: the wake word is much more reliable — fewer false triggers, and it only wakes on confirmed speech.
+- Fixed: the open conversation stays visible in the sidebar, and TOSSE panel buttons no longer wrap.
+
 ## v2.1.0
 
 - New: **one-click status ladder** in the TOSSE task detail panel — move a task forward without leaving the app.
