@@ -89,9 +89,17 @@
 /* Whole-row attention tint + left accent bar (see agent/status.ts `rowAttention`).
    `need input` is the loudest (orange), then review (blue), then error (red).
    Placed after :hover/.on so the tint wins when an agent needs the user. */
-.cv-sess-row[data-attn="input"]  { background:var(--wf-att-bg);  box-shadow:inset 3px 0 0 var(--wf-att); }
-.cv-sess-row[data-attn="review"] { background:var(--wf-wait-bg); box-shadow:inset 3px 0 0 var(--wf-wait); }
-.cv-sess-row[data-attn="error"]  { background:var(--wf-err-bg);  box-shadow:inset 3px 0 0 var(--wf-err); }
+.cv-sess-row[data-attn="input"]  { --cv-attn:var(--wf-att);  --cv-attn-bg:var(--wf-att-bg); }
+.cv-sess-row[data-attn="review"] { --cv-attn:var(--wf-wait); --cv-attn-bg:var(--wf-wait-bg); }
+.cv-sess-row[data-attn="error"]  { --cv-attn:var(--wf-err);  --cv-attn-bg:var(--wf-err-bg); }
+.cv-sess-row[data-attn] { background:var(--cv-attn-bg); box-shadow:inset 3px 0 0 var(--cv-attn); }
+/* The open conversation must stay identifiable even while it carries a status: the tint
+   above replaces `.on`'s background, so the selected row gets a deeper wash of its own
+   status colour plus a thin ring in it — still that status, but visibly "the one open". */
+.cv-sess-row.on[data-attn] {
+  background:color-mix(in srgb, var(--cv-attn) 20%, var(--cv-attn-bg));
+  box-shadow:inset 3px 0 0 var(--cv-attn), inset 0 0 0 1px color-mix(in srgb, var(--cv-attn) 55%, transparent);
+}
 .cv-sess-row[data-attn]:hover { filter:brightness(1.12); }
 .cv-sess { flex:1; min-width:0; display:flex; align-items:center; gap:10px; padding:9px 10px; border:0; background:transparent; font:inherit; color:inherit; text-align:left; cursor:pointer; }
 /* Conversation name — sits at the NORMAL text weight/colour so it reads one clear rung
