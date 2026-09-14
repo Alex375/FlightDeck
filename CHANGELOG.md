@@ -15,7 +15,8 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 - New: **redesigned Settings** — regrouped panel with sub-tabs and search, Accounts shown as tiles, and a new Claude Code tab (sub-agent routing, spend dashboard, instructions).
 - New: **terser Ground Control** — radio-style voice agent with an editable brief, a voice picker, and questions from agents read aloud and answerable by voice.
 - Improved: the wake word is much more reliable — fewer false triggers, and it only wakes on confirmed speech.
-- Fixed: the open conversation stays visible in the sidebar, and TOSSE panel buttons no longer wrap.
+- Changed: Ground Control no longer lets background noise cut it off — interrupting it is off by default, and it now detects the end of your turn by meaning rather than loudness.
+- Fixed: the open conversation stays visible in the sidebar, TOSSE panel buttons no longer wrap, and wide cards in clean output no longer make the thread scroll sideways.
 
 ## v2.1.0
 

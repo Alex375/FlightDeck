@@ -26,6 +26,18 @@ describe("the settings index", () => {
     const keys = SETTINGS_INDEX.map((e) => `${e.section}/${e.sub ?? ""}/${e.title}`);
     expect(new Set(keys).size).toBe(keys.length);
   });
+
+  // `flash` redirects the highlight to the card a label sits in — it must name a card
+  // the index itself knows in that same tab, or the redirect flashes nothing either.
+  it("only redirects a highlight to a card indexed in the same tab", () => {
+    for (const entry of SETTINGS_INDEX) {
+      if (!entry.flash) continue;
+      const target = SETTINGS_INDEX.find(
+        (e) => e.title === entry.flash && e.section === entry.section && e.sub === entry.sub,
+      );
+      expect(target, `${entry.title}: flash target "${entry.flash}" is not indexed`).toBeDefined();
+    }
+  });
 });
 
 describe("searchSettings", () => {

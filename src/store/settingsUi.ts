@@ -59,7 +59,14 @@ interface SettingsUiState {
   clearHighlight: () => void;
 }
 
-export const useSettingsUi = create<SettingsUiState>((set) => ({
+/** How long a search highlight may wait for a row to claim it. A row that matches flashes
+ *  and clears it itself; this only disarms a title no mounted row carries (a page heading,
+ *  a tile, a row hidden by another setting) — otherwise that row would flash out of the
+ *  blue the moment it appeared later. */
+const HIGHLIGHT_ARM_MS = 2500;
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+
+export const useSettingsUi = create<SettingsUiState>((set, get) => ({
   open: false,
   section: "general",
   subs: {},
@@ -70,12 +77,18 @@ export const useSettingsUi = create<SettingsUiState>((set) => ({
   setSection: (section) => set({ section, highlight: null }),
   setSub: (section, sub) =>
     set((s) => ({ subs: { ...s.subs, [section]: sub }, highlight: null })),
-  revealSetting: ({ section, sub, title }) =>
+  revealSetting: ({ section, sub, title }) => {
     set((s) => ({
       open: true,
       section,
       subs: sub ? { ...s.subs, [section]: sub } : s.subs,
       highlight: title,
-    })),
+    }));
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => {
+      highlightTimer = null;
+      if (get().highlight === title) set({ highlight: null });
+    }, HIGHLIGHT_ARM_MS);
+  },
   clearHighlight: () => set({ highlight: null }),
 }));

@@ -33,7 +33,7 @@ import { VoiceAgentSection } from "./VoiceAgentSection";
 import { ComposerSection } from "./ComposerSection";
 import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
-import { searchSettings, type SettingEntry } from "./settingsSearch";
+import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -113,12 +113,23 @@ function tabLabel(section: SettingsSection): string {
 /** What the panel shows instead of a tab while the search box has text. */
 function SearchResults({
   query,
+  sections,
   onPick,
 }: {
   query: string;
+  /** The tabs currently in the rail — a result in a hidden tab (Claude Code while no
+   *  Claude account is signed in) would bounce the user back to General. */
+  sections: ReadonlySet<SettingsSection>;
   onPick: (entry: SettingEntry) => void;
 }) {
-  const results = useMemo(() => searchSettings(query), [query]);
+  const results = useMemo(
+    () =>
+      searchSettings(
+        query,
+        SETTINGS_INDEX.filter((e) => sections.has(e.section)),
+      ),
+    [query, sections],
+  );
   if (results.length === 0) {
     return (
       <div>
@@ -158,15 +169,25 @@ function SearchResults({
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const section = useSettingsUi((s) => s.section);
   const setSection = useSettingsUi((s) => s.setSection);
-  // The Claude tab appears on a POSITIVE "logged in" and does NOT disappear on a later
-  // failed read: a Keychain hiccup must not evaporate a tab the user is standing in.
-  // `claudeSeen` is the last-known-good latch (same discipline as the artifact header).
+  // The Claude tab follows the last SUCCESSFUL status read: it appears on a positive
+  // "logged in", goes away on a successful "signed out", and does NOT disappear on a
+  // failed read — a Keychain hiccup must not evaporate a tab the user is standing in
+  // (react-query keeps the last good `data` through an error).
+  // `claudeSeen` is that last-known-good latch (same discipline as the artifact header).
   const claudeAccount = useClaudeAccount(open);
   const [claudeSeen, setClaudeSeen] = useState(false);
+  const claudeLoggedIn = claudeAccount.data?.loggedIn;
   useEffect(() => {
-    if (claudeAccount.data?.loggedIn) setClaudeSeen(true);
-  }, [claudeAccount.data?.loggedIn]);
-  const visibleTabs = TABS.filter((t) => !t.needsClaude || claudeSeen);
+    if (claudeLoggedIn !== undefined) setClaudeSeen(claudeLoggedIn);
+  }, [claudeLoggedIn]);
+  const visibleTabs = useMemo(
+    () => TABS.filter((t) => !t.needsClaude || claudeSeen),
+    [claudeSeen],
+  );
+  const visibleSections = useMemo(
+    () => new Set<SettingsSection>(visibleTabs.map((t) => t.id)),
+    [visibleTabs],
+  );
   // Standing on a tab that just became unavailable (signed out) — fall back rather than
   // render an empty pane.
   useEffect(() => {
@@ -286,9 +307,14 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {searching && (
               <SearchResults
                 query={query}
+                sections={visibleSections}
                 onPick={(entry) => {
                   setQuery("");
-                  revealSetting({ section: entry.section, sub: entry.sub, title: entry.title });
+                  revealSetting({
+                    section: entry.section,
+                    sub: entry.sub,
+                    title: entry.flash ?? entry.title,
+                  });
                 }}
               />
             )}

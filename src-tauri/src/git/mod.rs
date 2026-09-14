@@ -259,24 +259,6 @@ pub fn remote_url(repo_path: &str) -> Result<RemoteLookup, GitError> {
     }
 }
 
-/// Reduce a git remote URL to a comparison key, so the SAME repository written in
-/// different notations compares equal. `None` for anything that carries no
-/// identity (empty, or a URL with no path part).
-///
-/// This is the ONE place that decides whether two URLs mean the same repository —
-/// the app never compares remote strings anywhere else, and never matches on the
-/// repository NAME (verified against production data: `CRM_max` is named "TOSSE"
-/// in the CRM, `landing_page` is "landing-page-josty" — a name match would both
-/// miss real pairs and invent false ones).
-///
-/// Every transformation below exists because both forms occur in the real data:
-/// - scp-style SSH (`git@github.com:Alex375/CRM_max.git`) vs HTTPS
-///   (`https://github.com/Alex375/CRM_max`) — the local clones use both;
-/// - a trailing `.git`, present on clone URLs and absent from the CRM's;
-/// - case: GitHub treats owner/repo case-insensitively, so `CRM_max` and
-///   `crm_max` are one repository;
-/// - an explicit port (`ssh://git@github.com:22/o/r`, seen behind a bastion or a
-///   proxy) — the same repository as the portless `git@github.com:o/r`.
 /// Would git ignore `relative_path` inside this repository?
 ///
 /// `Some(true)` ignored · `Some(false)` tracked-or-trackable · `None` we could not tell
@@ -305,6 +287,24 @@ pub fn path_is_ignored(repo_path: &str, relative_path: &str) -> Option<bool> {
     }
 }
 
+/// Reduce a git remote URL to a comparison key, so the SAME repository written in
+/// different notations compares equal. `None` for anything that carries no
+/// identity (empty, or a URL with no path part).
+///
+/// This is the ONE place that decides whether two URLs mean the same repository —
+/// the app never compares remote strings anywhere else, and never matches on the
+/// repository NAME (verified against production data: `CRM_max` is named "TOSSE"
+/// in the CRM, `landing_page` is "landing-page-josty" — a name match would both
+/// miss real pairs and invent false ones).
+///
+/// Every transformation below exists because both forms occur in the real data:
+/// - scp-style SSH (`git@github.com:Alex375/CRM_max.git`) vs HTTPS
+///   (`https://github.com/Alex375/CRM_max`) — the local clones use both;
+/// - a trailing `.git`, present on clone URLs and absent from the CRM's;
+/// - case: GitHub treats owner/repo case-insensitively, so `CRM_max` and
+///   `crm_max` are one repository;
+/// - an explicit port (`ssh://git@github.com:22/o/r`, seen behind a bastion or a
+///   proxy) — the same repository as the portless `git@github.com:o/r`.
 pub fn normalize_remote_url(url: &str) -> Option<String> {
     let mut s = url.trim();
     if s.is_empty() {
