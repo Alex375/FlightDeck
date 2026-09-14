@@ -25,10 +25,16 @@ async ping(msg: string) : Promise<Pong> {
  * to THIS session: its agent gains the app-piloting tools (open files, create/message
  * conversations, …). Claude-only (Codex has no SDK-server channel) and, like the
  * bypass unlock, decided at spawn — the `initialize` handshake advertises it once.
+ * 
+ * `claude_account_id` (inside [`SpawnFlags`]) picks WHICH Claude account the process runs
+ * on — `None` is the CLI's own, un-scoped credential store, i.e. the unchanged
+ * single-account behaviour. Like the two flags above it can only be decided at spawn: the
+ * CLI reads its credentials once at startup, so changing account means re-spawning with
+ * `--resume` (safe — the account scopes only the credential store, never the transcript).
  */
-async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, ultracode: boolean, backend: Backend, allowBypassPermissions: boolean, appControl: boolean) : Promise<Result<string, string>> {
+async spawnSession(repoPath: string, resume: string | null, model: string | null, effort: string | null, permissionMode: string | null, backend: Backend, flags: SpawnFlags) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, ultracode, backend, allowBypassPermissions, appControl }) };
+    return { status: "ok", data: await TAURI_INVOKE("spawn_session", { repoPath, resume, model, effort, permissionMode, backend, flags }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -267,24 +273,26 @@ async codexMarketplaceUpgrade(name: string | null) : Promise<Result<null, string
 }
 },
 /**
- * The signed-in Claude account (`claude auth status --json`), whitelisted.
+ * One Claude account's auth status (`claude auth status --json`), whitelisted.
+ * `account_id: None` reads the default, un-scoped account.
  */
-async accountClaudeStatus() : Promise<Result<ClaudeAccountStatus, string>> {
+async accountClaudeStatus(accountId: string | null) : Promise<Result<ClaudeAccountStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_status") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_status", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Start a Claude login: spawns `claude auth login`, returns the OAuth URL to open.
- * The flow completes when the user pastes the authorization code
- * ([`account_claude_login_code`]) — or is dropped by [`account_claude_login_cancel`].
+ * Start a Claude login for ONE account: spawns `claude auth login` scoped to its
+ * credential store, returns the OAuth URL to open. The flow completes when the user pastes
+ * the authorization code ([`account_claude_login_code`]) — or is dropped by
+ * [`account_claude_login_cancel`].
  */
-async accountClaudeLoginStart() : Promise<Result<string, string>> {
+async accountClaudeLoginStart(accountId: string | null) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_start") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_start", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -292,10 +300,14 @@ async accountClaudeLoginStart() : Promise<Result<string, string>> {
 },
 /**
  * Submit the authorization code the user pasted; completes the in-flight Claude login.
+ * 
+ * `account_id` must name the account the flow was STARTED for. There is one global
+ * in-flight login but one card per account, so a code pasted into a superseded card would
+ * otherwise be redeemed into another account's credential store.
  */
-async accountClaudeLoginCode(code: string) : Promise<Result<null, string>> {
+async accountClaudeLoginCode(accountId: string | null, code: string) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { code }) };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { accountId, code }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -313,11 +325,141 @@ async accountClaudeLoginCancel() : Promise<Result<null, string>> {
 }
 },
 /**
- * Log out of the Claude account (`claude auth logout`).
+ * Log ONE Claude account out (`claude auth logout`). The account row (if any) is kept, so
+ * it stays listed as a signed-out slot the user can sign back into; removing it entirely
+ * is [`claude_account_remove`].
  */
-async accountClaudeLogout() : Promise<Result<null, string>> {
+async accountClaudeLogout(accountId: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_logout") };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_logout", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Which account has a sign-in in flight (`null` = none). Lets a card whose flow was
+ * superseded close its code box instead of offering an input that targets another
+ * account's login.
+ */
+async accountClaudeLoginInFlight() : Promise<Result<ClaudeLoginInFlight | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_in_flight") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The Claude accounts the user added, in display order. The default account is NOT in
+ * this list — it always exists and the UI renders it from `account_claude_status(None)`.
+ */
+async claudeAccountsList() : Promise<Result<ClaudeAccountRecord[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_accounts_list") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Register a NEW Claude account: mints its id, creates its isolated credential store and
+ * persists the row. Signing in is a separate step (`account_claude_login_start` with this
+ * id) — an account exists as an empty, signed-out slot until then, which is exactly what
+ * the UI shows.
+ */
+async claudeAccountCreate(label: string) : Promise<Result<ClaudeAccountRecord, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_create", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
+ * non-sensitive metadata (never a token). `account_id: None` captures the DEFAULT account.
+ * 
+ * ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
+ * `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
+ * SHARES — so the answer is only reliably about THIS account in the moment just after its
+ * own login wrote that cache. Persisting it here is what lets the Accounts panel keep naming
+ * each account by its address afterwards. Best-effort by design: a failure leaves the
+ * previous identity in place rather than blocking a successful sign-in.
+ */
+async claudeAccountCaptureIdentity(accountId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_capture_identity", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The DEFAULT account's identity as captured at ITS OWN sign-in, or `null` if it was never
+ * captured (it was signed in outside the app, or before this existed).
+ * 
+ * ⚠️ It cannot be read live once a second account exists: `claude auth status` answers from
+ * a profile cache every account SHARES, so it would name whichever account signed in last.
+ * The UI shows this stored value instead of a plausible-looking wrong address.
+ */
+async claudeDefaultIdentity() : Promise<Result<ClaudeIdentity | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_default_identity") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * One Claude account's identity — address, organization, plan — read with ITS OWN token
+ * (see `usage::profile`). This is what the UI names every account by: unlike
+ * `claude auth status`, whose profile cache all accounts share, it cannot answer with
+ * another account's address. `account_id: None` = the default account.
+ */
+async claudeAccountIdentity(accountId: string | null) : Promise<Result<AccountProfile, UsageError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_identity", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove an account: sign its credential store out through the CLI, drop its directory,
+ * then delete the row (which detaches the conversations that used it, so they fall back to
+ * the default account rather than pointing at nothing).
+ * 
+ * ⚠️ The sign-out is NOT best-effort, and the order matters. On macOS the credentials live
+ * in a Keychain item whose name is derived from the slot's DIRECTORY PATH, and that path
+ * contains the account id we are about to delete — so once the row and the directory are
+ * gone, the item can no longer be addressed by us or by the CLI: the OAuth tokens would
+ * stay in the Keychain, valid and unrevokable. A failed `claude auth logout` (an
+ * unresolvable `claude` binary, a non-zero exit, the 15 s timeout) therefore ABORTS the
+ * removal with the row intact, so the user can retry — rather than silently orphaning a
+ * live credential.
+ * 
+ * `force` is the escape hatch for an account whose CLI sign-out can never succeed. It
+ * proceeds anyway and RETURNS the exact Keychain item name, so the user can revoke it by
+ * hand in Keychain Access instead of being left with no way at all.
+ */
+async claudeAccountRemove(accountId: string, force: boolean) : Promise<Result<string | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_remove", { accountId, force }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Point one conversation at a Claude account (`None` = the default account). Persisted, so
+ * it survives a relaunch, a resume, a fork and a rewind. It takes effect at the
+ * conversation's NEXT spawn — the caller is responsible for restarting the session if one
+ * is live, and for telling the user so (a live process cannot change identity).
+ */
+async setConversationClaudeAccount(convId: string, accountId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_conversation_claude_account", { convId, accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -639,6 +781,111 @@ async fetchSlashCommands(cwd: string) : Promise<Result<SlashCommand[], string>> 
  * `claude --resume` does not re-stream past messages, so the live event path
  * delivers nothing for an existing conversation. The UI calls this after
  * re-spawning a session to replay its history into the store. An absent
+ * The routing picture for one repository: every sub-agent we can name, the model it will
+ * actually run on, where that setting lives, and the two scope hazards (a git-ignored
+ * `.claude/agents/`, a worktree checkout). Disk-only and fast — the page renders from
+ * this before any process is spawned.
+ */
+async listSubagentRouting(repoPath: string) : Promise<Result<SubagentRouting, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_subagent_routing", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rewrite an existing agent definition's `model:` / `effort:` and NOTHING else. The
+ * system prompt in the file's body is preserved to the byte — see
+ * [`crate::extensions::agent_edit`]. `None` removes the key.
+ */
+async setSubagentModel(path: string, model: string | null, effort: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_model", { path, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a NEW agent definition file. `body` is the agent's system prompt and is
+ * required: a file named after a built-in replaces that agent ENTIRELY, so the caller has
+ * to have shown the user what the replacement will run on. Refuses to overwrite.
+ * Returns the path written.
+ */
+async createSubagentDefinition(dir: string, name: string, description: string, model: string | null, effort: string | null, body: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_subagent_definition", { dir, name, description, model, effort, body }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set or clear the sub-agent model baseline (`CLAUDE_CODE_SUBAGENT_MODEL`) and its
+ * forcing variant. `None` clears. ⚠️ The forcing variant overrides every per-agent choice
+ * and every model a workflow asks for — the UI must never set it implicitly.
+ */
+async setSubagentBaseline(model: string | null, forcedModel: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_baseline", { model, forcedModel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
+ * workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+ */
+async subagentSpend() : Promise<Result<SpendReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("subagent_spend") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read `~/.claude/CLAUDE.md` — the whole file for preview, plus whatever currently sits
+ * inside the app's managed markers.
+ */
+async readClaudeMemory() : Promise<Result<ManagedMemory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_claude_memory") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Write (or, with `None`, remove) the managed block in `~/.claude/CLAUDE.md`. Everything
+ * outside the markers is preserved byte for byte; a file with damaged markers is refused
+ * rather than repaired.
+ */
+async writeClaudeMemory(text: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("write_claude_memory", { text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The sub-agent names the CLI itself reports for this directory — the drift canary's
+ * input. Same ephemeral-spawn shape as [`fetch_slash_commands`]: one `initialize`
+ * handshake, then the process is dropped. An empty list means "we could not ask", which
+ * the caller must NOT render as "the agent is gone".
+ */
+async fetchKnownAgents(cwd: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_known_agents", { cwd }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * transcript yields an empty list (not an error). File IO runs off the async
  * runtime via `spawn_blocking` so a large transcript never stalls it.
  */
@@ -870,9 +1117,9 @@ async readTaskOutputFile(path: string) : Promise<Result<string | null, string>> 
  * endpoint is itself rate-limited, so the caller throttles (poll + on-open + manual).
  * Errors are typed ([`UsageError`]) so the UI can show a tailored next step.
  */
-async getPlanUsage() : Promise<Result<PlanUsage, UsageError>> {
+async getPlanUsage(accountId: string | null) : Promise<Result<PlanUsage, UsageError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_plan_usage") };
+    return { status: "ok", data: await TAURI_INVOKE("get_plan_usage", { accountId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2028,11 +2275,13 @@ async clearVoiceAgentKey() : Promise<Result<VoiceAgentStatus, string>> {
 },
 /**
  * Mint a short-lived Realtime client secret for ONE voice session — the only
- * shape of the credential the webview ever sees.
+ * shape of the credential the webview ever sees. `voice` is the user's picked
+ * voice, sanitized against the Rust-side catalogue (unknown → the default), and
+ * fixed for the whole session: OpenAI will not swap a voice mid-call.
  */
-async voiceAgentClientSecret() : Promise<Result<ClientSecret, string>> {
+async voiceAgentClientSecret(voice: string | null) : Promise<Result<ClientSecret, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret") };
+    return { status: "ok", data: await TAURI_INVOKE("voice_agent_client_secret", { voice }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2051,9 +2300,9 @@ async wakeWordStatus() : Promise<WakeStatus> {
  * open), so run off the async thread. Returns the honest post-apply status — a
  * mic/model failure comes back as `running:false` + `error`, never a lying switch.
  */
-async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null) : Promise<Result<WakeStatus, string>> {
+async setWakeWordConfig(enabled: boolean | null, phrase: string | null, sensitivity: number | null, debugCapture: boolean | null) : Promise<Result<WakeStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_wake_word_config", { enabled, phrase, sensitivity, debugCapture }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2174,14 +2423,90 @@ workflowJournalEvent: "workflow-journal-event"
  */
 export type AccountLoginEvent = { backend: string; success: boolean; error: string | null }
 /**
+ * The non-sensitive identity of one account, as the API reports it for that account's token.
+ */
+export type AccountProfile = { email: string | null; orgName: string | null; 
+/**
+ * `max` | `pro` | `team` | `enterprise`, mapped exactly as the CLI maps
+ * `organization.organization_type`. `None` for a type the CLI does not name either.
+ */
+subscriptionType: string | null }
+/**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
-export type AgentInfo = { name: string; description: string | null; model: string | null; scope: ExtScope; source: string | null; 
+export type AgentInfo = { name: string; description: string | null; model: string | null; 
+/**
+ * The reasoning-effort level pinned in the definition's frontmatter, when it has one.
+ * Ignored by the CLI on models that declare no effort ladder (Haiku 4.5 and below),
+ * which is why the settings UI hides the control rather than offering a dead one.
+ */
+effort: string | null; scope: ExtScope; source: string | null; 
 /**
  * Absolute path to the agent's `.md` definition — the UI reads it to render a
  * clean markdown view of the sub-agent.
  */
 path: string }
+/**
+ * One row of the routing page.
+ */
+export type AgentRouting = { 
+/**
+ * The name the CLI dispatches on. For a built-in this is a contract with Anthropic
+ * that is nowhere documented — if it is ever renamed, an override silently stops
+ * applying, which is what the drift canary watches for.
+ */
+name: string; description: string | null; 
+/**
+ * The model this agent will run on, as far as we can tell, or `None` for "whatever
+ * the conversation is using".
+ */
+effective_model: string | null; 
+/**
+ * The `model:` written in the agent's OWN definition file, verbatim (`inherit`
+ * included), or `None` when the file has no such key or there is no file.
+ * 
+ * Distinct from `effective_model` on purpose: that one falls back to the baseline, and
+ * an edit that round-trips it (changing only the effort, say) would pin the baseline's
+ * model into the file — silently detaching the agent from every later baseline change.
+ */
+defined_model: string | null; 
+/**
+ * The effort pinned in the definition, when it has one.
+ */
+effort: string | null; origin: RoutingOrigin; 
+/**
+ * Path of the definition file, when there is one.
+ */
+path: string | null; 
+/**
+ * True when this agent is a CLI built-in (whether or not a file now shadows it).
+ */
+built_in: boolean; 
+/**
+ * True when a definition file shadows a built-in of the same name — the case where
+ * the file supplies the ENTIRE agent, system prompt included.
+ */
+shadows_built_in: boolean; 
+/**
+ * True for the built-ins the baseline env var cannot reach: steering them at all
+ * requires a definition file.
+ */
+needs_file_to_steer: boolean; 
+/**
+ * True when a forcing baseline is set, which overrides this row whatever it says.
+ */
+overridden_by_force: boolean; 
+/**
+ * When this setting last changed, in epoch milliseconds — the mtime of whatever file
+ * holds it (the agent's own definition, or `settings.json` for a baseline-driven row).
+ * 
+ * Load-bearing for the drift canary, not decoration. Without it the canary compares
+ * today's setting against a week of transcripts that mostly PREDATE it, so it fires
+ * every time you change a model — the one moment you are most sure the app is broken.
+ * No new bookkeeping is needed: the file holding the setting already records when it
+ * was written.
+ */
+configured_at_ms: number | null }
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -2356,6 +2681,45 @@ ahead: number | null;
  */
 behind: number | null }
 /**
+ * One Claude account the user signed into from the app. Holds NO secret: the credentials
+ * live in the CLI's own store, isolated per account by
+ * [`crate::accounts::AccountSlot`]. What is persisted here is the non-sensitive identity
+ * captured at login, which is what lets the Accounts panel label each account reliably —
+ * the CLI's own `auth status` reads its email from a profile cache our accounts SHARE, so
+ * it cannot be trusted to name a specific one (see `accounts::status`).
+ */
+export type ClaudeAccountRecord = { 
+/**
+ * Stable app-minted id (a uuid), also the directory name of the account's isolated
+ * credential store. The reserved value `"default"` is the CLI's own un-scoped store.
+ */
+id: string; 
+/**
+ * What the user sees. Defaults to the email captured at login, and is editable so two
+ * accounts on the same address (personal / org) stay tellable apart.
+ */
+label: string; email: string | null; org_name: string | null; 
+/**
+ * `max` | `pro` | … as the CLI reported it at login.
+ */
+subscription_type: string | null; 
+/**
+ * Manual display order (ascending). Also the tie-break the auto-switch policy uses
+ * when two accounts have equal capacity, so the choice is deterministic.
+ */
+sort_index: number; 
+/**
+ * Unix ms timestamp the account was added.
+ */
+added_at: number; 
+/**
+ * `true` while `label` is still the placeholder minted at creation, `false` once the
+ * user has named the account. Recorded as a FACT so the identity captured after
+ * sign-in replaces only a placeholder — guessing from the text ("starts with
+ * `Account `") would silently overwrite a real name like "Account manager".
+ */
+label_is_generated: boolean }
+/**
  * The signed-in Claude account, whitelisted from `claude auth status --json` (no
  * tokens — that output carries none; we forward only these fields).
  */
@@ -2421,6 +2785,21 @@ channel: string | null;
  */
 config_warning: string | null }
 /**
+ * The non-sensitive identity of a Claude account — never a token.
+ */
+export type ClaudeIdentity = { email: string | null; orgName: string | null; subscriptionType: string | null }
+/**
+ * The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
+ * serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
+ * "nothing is signing in" (`None`) would both reach the front as `null` — exactly the
+ * distinction a superseded card needs to close its code box.
+ */
+export type ClaudeLoginInFlight = { 
+/**
+ * The account the flow was started for; `null` = the default account.
+ */
+accountId: string | null }
+/**
  * Result of running `claude update`.
  */
 export type ClaudeUpdateOutcome = { 
@@ -2448,7 +2827,13 @@ export type ClientSecret = { value: string;
 /**
  * Unix seconds, as reported by OpenAI.
  */
-expires_at: number; model: string }
+expires_at: number; model: string; 
+/**
+ * The voice this session will actually speak with — the sanitized answer to
+ * what was asked for, so the front never has to guess whether its stored
+ * preference survived.
+ */
+voice: string }
 /**
  * The signed-in Codex account, whitelisted from `account/read` (no tokens — the wire
  * response carries none, and we forward only these fields).
@@ -2789,7 +3174,18 @@ tosse_task_id: string | null;
  * warning is a function of precisely that status. Storing the id only would mean
  * the warning silently stops warning the moment the network is down.
  */
-tosse_task_title: string | null; tosse_task_status: string | null }
+tosse_task_title: string | null; tosse_task_status: string | null; 
+/**
+ * Which Claude account this conversation runs on — a [`ClaudeAccountRecord::id`],
+ * or `None` for the default (un-scoped) account. `None` is every pre-existing row and
+ * stays the default for a single-account user, so nothing changes for them.
+ * 
+ * Deliberately not a foreign key: the id names a credential store the CLI owns, so an
+ * account signed out or removed behind our back must leave the conversation usable
+ * (it degrades to the default account, visibly) rather than break the row. Codex
+ * conversations ignore it entirely — accounts are a Claude-side concept.
+ */
+claude_account_id: string | null }
 /**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
@@ -3254,6 +3650,28 @@ identity_file: string | null;
  */
 added_at: number }
 /**
+ * What the instructions file looks like right now.
+ */
+export type ManagedMemory = { 
+/**
+ * Absolute path, shown in the UI so "where does this go" is never a mystery.
+ */
+path: string; exists: boolean; 
+/**
+ * The text currently inside the managed markers; `None` when the app has never
+ * written to this file.
+ */
+managed_text: string | null; 
+/**
+ * The whole file, so the panel can show a read-only preview without a second read.
+ */
+full_text: string | null; 
+/**
+ * Set when the markers are present but malformed — the UI must then offer a manual
+ * fix, never a write.
+ */
+marker_error: string | null }
+/**
  * One marketplace registered with Claude Code (`~/.claude/plugins/known_marketplaces.json`),
  * with its resolved auto-update state. Auto-update is a PER-MARKETPLACE flag (the only
  * granularity the CLI exposes — there is no per-plugin auto-update). The count of
@@ -3424,7 +3842,12 @@ export type PersistedState = {
  * Remote servers the user has paired, so the UI can list them and mark which
  * repos are remote at boot.
  */
-machines?: MachineRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
+machines?: MachineRecord[]; 
+/**
+ * Claude accounts the user signed into, so the composer's account control and the
+ * Accounts panel are populated at boot without a round-trip.
+ */
+claude_accounts?: ClaudeAccountRecord[]; repos: RepoRecord[]; conversations: ConversationRecord[]; 
 /**
  * Stable id of the conversation that was active when last persisted.
  */
@@ -3641,6 +4064,31 @@ removed_prompt: string | null;
  * a no-op (the conversation already ended there), and the file is left untouched.
  */
 removed_lines: number }
+/**
+ * Where a sub-agent's current model setting comes from — the "origin" column, in terms a
+ * person can act on rather than file paths.
+ */
+export type RoutingOrigin = 
+/**
+ * A definition file in `~/.claude/agents/`.
+ */
+"user" | 
+/**
+ * A definition file in the repository's `.claude/agents/`.
+ */
+"project" | 
+/**
+ * Bound to this repository but kept out of what it shares.
+ */
+"local" | 
+/**
+ * Provided by an installed plugin.
+ */
+"plugin" | 
+/**
+ * A built-in with no definition file: it follows the baseline, or the conversation.
+ */
+"built_in"
 /**
  * A rate-limit window that applies to a NAMED subset of usage (today: a single model) rather
  * than the account as a whole. Kept separate from the two flat windows because its label is
@@ -3860,6 +4308,140 @@ description: string;
  * Hint for the command's arguments (e.g. `"<task_id>"`), empty when none.
  */
 argument_hint: string }
+/**
+ * Spawn-time choices that can only be applied when the process starts, bundled into one
+ * argument. They travel together because they share that property — and because specta
+ * caps a command at 10 parameters, which [`spawn_session`] had already reached.
+ */
+export type SpawnFlags = { 
+/**
+ * The xhigh + orchestration tier. Not a spawn flag of its own: the session
+ * re-enables it over the control channel right after `initialize`.
+ */
+ultracode: boolean; 
+/**
+ * UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
+ * it on (Settings → General → Permissions).
+ */
+allowBypassPermissions: boolean; 
+/**
+ * Advertise the in-process "flightdeck" MCP server to this session (Settings →
+ * Control), giving its agent the app-piloting tools.
+ */
+appControl: boolean; 
+/**
+ * Which Claude account to authenticate as; `None` = the default, un-scoped store.
+ */
+claudeAccountId: string | null }
+/**
+ * One aggregated cell of the spend cube. Every number is a SUM over the turns that
+ * share the five key fields.
+ */
+export type SpendBucket = { 
+/**
+ * `YYYY-MM-DD`, from the turn's `timestamp` (UTC, as the CLI writes it).
+ */
+day: string; 
+/**
+ * Absolute path of the repository the work happened in — worktrees folded back onto
+ * their parent repo (see [`repo_root_for`]), so "this repo" means one row, not one
+ * row per branch.
+ */
+repo: string; 
+/**
+ * Last path segment of `repo`, for display.
+ */
+repo_label: string; 
+/**
+ * The sub-agent type: `Explore`, `general-purpose`, `workflow-subagent`, … or
+ * [`UNATTRIBUTED`].
+ */
+agent: string; 
+/**
+ * The model id EXACTLY as the transcript records it (`claude-haiku-4-5-20251001`),
+ * which is a full id where the app's catalogue uses aliases (`haiku`). The front
+ * normalizes; storing the raw id keeps this module honest about what it saw.
+ */
+model: string; 
+/**
+ * Whether the turn belongs to a workflow run — a transcript filed under a
+ * `subagents/workflows/wf_<id>` directory.
+ * 
+ * (Written without a trailing glob on purpose: this doc comment is transcribed into
+ * the generated TypeScript inside a block comment, and a literal `*` followed by `/`
+ * would close it early and break `bindings.ts`.)
+ */
+workflow: boolean; turns: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number }
+/**
+ * Everything the UI needs for the spend dashboard, in one payload.
+ */
+export type SpendReport = { buckets: SpendBucket[]; 
+/**
+ * Files opened and read to the end.
+ */
+files_scanned: number; 
+/**
+ * Files found but unreadable. Surfaced in the UI — a partial scan must never be
+ * mistaken for a small bill.
+ */
+files_unreadable: number; 
+/**
+ * Lines that looked like assistant turns but failed to parse. Same reasoning.
+ */
+lines_unparsed: number; 
+/**
+ * Human-readable notes about anything degraded (missing projects dir, …).
+ */
+warnings: string[] }
+/**
+ * What the two sub-agent env vars currently say, read straight from
+ * `~/.claude/settings.json`.
+ */
+export type SubagentBaseline = { 
+/**
+ * The model every sub-agent falls back to, or `None` when the app has never set one
+ * (the CLI then inherits the conversation's model).
+ */
+model: string | null; 
+/**
+ * Whether the forcing variant is set, and to what. Reported separately from `model`
+ * because the two behave differently enough that merging them would lie.
+ */
+forced_model: string | null; 
+/**
+ * ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
+ * both keep inheriting the conversation. Carried in the payload so the UI's
+ * explanation and the backend's behaviour can never drift apart.
+ */
+unreachable_builtins: string[]; 
+/**
+ * Set when `settings.json` exists but could not be read or parsed. `model` and
+ * `forced_model` are then UNKNOWN, not absent — the UI must say so and refuse to
+ * offer a change, instead of rendering "No baseline" over a file it never read.
+ */
+error: string | null }
+/**
+ * Everything the routing section needs, in one read.
+ */
+export type SubagentRouting = { agents: AgentRouting[]; baseline: SubagentBaseline; 
+/**
+ * `~/.claude/agents` — where a global definition would be written.
+ */
+user_agents_dir: string; 
+/**
+ * `<repo>/.claude/agents` — where a project definition would be written.
+ */
+project_agents_dir: string; 
+/**
+ * Whether git would ignore the project directory. `None` = could not check, which the
+ * UI must render as "unknown", never as "fine".
+ */
+project_dir_ignored: boolean | null; 
+/**
+ * Whether the repository we are looking at is itself a worktree — a project-scoped
+ * setting written here would not exist in the main checkout, or in the next worktree.
+ */
+repo_is_worktree: boolean }
 /**
  * An integrated terminal's shell exited (EOF on the PTY). One-shot, keyed by id;
  * the front marks that terminal done and offers to restart it on re-open.
@@ -4179,9 +4761,17 @@ export type UsageError =
  */
 { kind: "keychain_denied"; detail: string } | 
 /**
- * Endpoint rejected the token (HTTP 401/403): expired or revoked.
+ * Endpoint rejected a token that is NOT known to be expired (HTTP 401/403): revoked,
+ * or signed out. Terminal until the user signs in again.
  */
 { kind: "unauthorized"; status: number } | 
+/**
+ * The stored access token is past its `expiresAt`. NOT terminal: the refresh token is
+ * normally still valid, but only a running `claude` refreshes it (this module stays
+ * read-only), so usage returns once a conversation runs on the account. `detail` is a
+ * plain-English explanation, ready to show.
+ */
+{ kind: "token_expired"; detail: string } | 
 /**
  * The usage endpoint is itself rate-limited (HTTP 429). `retry_after` = seconds
  * from the `Retry-After` header when present. Do NOT hammer it — back off.
@@ -4198,7 +4788,13 @@ export type UsageError =
 /**
  * Response received but unparseable into the expected shape (carries body).
  */
-{ kind: "parse"; body: string }
+{ kind: "parse"; body: string } | 
+/**
+ * The usage was asked for a Claude account the app no longer knows (removed). A
+ * permanent, locally-known cause: typed on its own so the UI says so and STOPS polling,
+ * instead of presenting it as a network blip and retrying forever.
+ */
+{ kind: "unknown_account"; account_id: string }
 /**
  * One rate-limit window's real fill: `used_percentage` (0–100) + optional reset as a
  * raw timestamp string (ISO 8601, or epoch-seconds digits for the alternate shape) —
@@ -4214,7 +4810,16 @@ export type VoiceAgentStatus = { configured: boolean;
 /**
  * e.g. `"sk-…d4f2"` — never more than the tail of the key.
  */
-key_hint: string | null }
+key_hint: string | null; 
+/**
+ * The voices the picker can offer (the catalogue above — the front never
+ * hard-codes its own list).
+ */
+voices: VoiceOption[]; 
+/**
+ * The voice used when the user has not picked one.
+ */
+default_voice: string }
 /**
  * The live state of the voice bridge, as reported to the Settings UI. This is
  * the honest read-back: `running`/`error` reflect what the listener actually
@@ -4229,6 +4834,11 @@ url: string | null;
  * Why the server is not running although enabled (bind failure, …).
  */
 error: string | null }
+/**
+ * One entry of the voice picker (same shape as the wake-word phrase catalogue,
+ * so Settings renders both the same way).
+ */
+export type VoiceOption = { key: string; label: string }
 /**
  * One selectable wake phrase for the Settings picker.
  */
@@ -4249,7 +4859,22 @@ error: string | null;
 /**
  * The phrases the user can choose from (bundled classifiers).
  */
-phrases: WakePhrase[] }
+phrases: WakePhrase[]; 
+/**
+ * Debug capture is on (every fire writes a WAV + score trajectory).
+ */
+debug_capture: boolean; 
+/**
+ * Where captures are written, so Settings can show and reveal the folder.
+ */
+debug_dir: string | null; 
+/**
+ * Why the LAST capture did not get written. Separate from `error`, which is
+ * about the detector itself: a failed dump must not read as a dead detector,
+ * but it must not vanish either — the user is reproducing false positives
+ * expecting evidence, and silence would let them do it for nothing.
+ */
+debug_error: string | null }
 /**
  * The wake word was heard by the on-device detector (`crate::wake`). The front
  * reacts like a spoken push-to-talk — arm the voice session and open the mic (see

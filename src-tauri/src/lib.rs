@@ -1,10 +1,12 @@
 pub mod accounts;
+pub mod agentspend;
 pub mod appmcp;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
 pub mod git;
 mod ipc;
+pub mod memoryfile;
 pub mod plugins;
 pub mod power;
 pub mod store;
@@ -18,7 +20,9 @@ pub mod wake;
 use ipc::commands::{
     answer_permission, app_control_respond, copy_entry, create_dir, create_file, create_worktree,
     delete_conversation,
-    delete_repo, delete_to_trash, fetch_slash_commands,
+    create_subagent_definition, delete_repo, delete_to_trash, fetch_known_agents,
+    fetch_slash_commands, list_subagent_routing, read_claude_memory, set_subagent_baseline,
+    set_subagent_model, subagent_spend, write_claude_memory,
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
@@ -31,7 +35,11 @@ use ipc::commands::{
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
     cancel_queued_message, list_session_models, rewind_files,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
-    account_claude_logout, account_claude_status, account_codex_login_cancel,
+    account_claude_login_in_flight, account_claude_logout, account_claude_status,
+    claude_account_capture_identity,
+    claude_account_create, claude_account_identity, claude_account_remove, claude_accounts_list,
+    claude_default_identity,
+    set_conversation_claude_account, account_codex_login_cancel,
     account_codex_login_start, account_codex_logout, account_codex_status,
     claude_available, claude_cli_status, claude_cli_update, set_claude_cli_auto_update,
     codex_available, codex_archive, codex_compact, codex_fork, codex_list_extensions,
@@ -140,6 +148,7 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         tosse_task_id: None,
         tosse_task_title: None,
         tosse_task_status: None,
+        claude_account_id: None,
     };
     if let Err(e) = store.upsert_conversation(&conv) {
         eprintln!("[seed] failed to upsert remote demo conversation: {e}");
@@ -182,6 +191,14 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             account_claude_login_code,
             account_claude_login_cancel,
             account_claude_logout,
+            account_claude_login_in_flight,
+            claude_accounts_list,
+            claude_account_create,
+            claude_account_capture_identity,
+            claude_default_identity,
+            claude_account_identity,
+            claude_account_remove,
+            set_conversation_claude_account,
             account_codex_status,
             account_codex_login_start,
             account_codex_login_cancel,
@@ -205,6 +222,14 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_set_project_status,
             tosse_create_task,
             fetch_slash_commands,
+            list_subagent_routing,
+            set_subagent_model,
+            create_subagent_definition,
+            set_subagent_baseline,
+            subagent_spend,
+            read_claude_memory,
+            write_claude_memory,
+            fetch_known_agents,
             load_session_history,
             load_session_context,
             load_session_goal,
@@ -702,7 +727,8 @@ pub fn run() {
                         eprintln!("[wake] failed to emit WakeWordEvent: {e}");
                     }
                 }));
-                let cfg = ipc::commands::load_wake_config(&app.state::<store::Store>());
+                let cfg =
+                    ipc::commands::load_wake_config(app.handle(), &app.state::<store::Store>());
                 if cfg.enabled {
                     let wake = wake.clone();
                     std::thread::spawn(move || {

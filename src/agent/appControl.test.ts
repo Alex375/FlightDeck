@@ -17,6 +17,8 @@ vi.mock("../ipc/client", () => {
       loadSessionGoal: vi.fn(() => ok(null)),
       pathExists: vi.fn(() => Promise.resolve(true)),
       readDir: vi.fn(() => ok([])),
+      answerPermission: vi.fn(() => ok()),
+      publishControlEvent: vi.fn(() => Promise.resolve()),
     },
   };
 });
@@ -46,7 +48,42 @@ import { notifyFromAgent } from "../notifications/notify";
 import { executeAppControlTool, type AppControlHelpers } from "./appControl";
 import { useConversationsStore, type Conversation } from "../store/conversationsStore";
 import { useConversationStore } from "../store/conversationStore";
+import { useAppControlPrefs } from "../store/appControl";
 import type { Turn } from "../store/types";
+import type { PermissionRequestPayload } from "../ipc/client";
+
+/** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
+function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
+  return {
+    request_id: "req-1",
+    tool_name: "Bash",
+    tool_use_id: "tu-1",
+    input: {},
+    title: null,
+    description: null,
+    suggestions: null,
+    blocked_path: null,
+    decision_reason: null,
+    agent_id: null,
+    ...over,
+  };
+}
+
+function seedPending(convId: string, request: PermissionRequestPayload) {
+  useConversationStore.getState().ensureSession(convId);
+  useConversationStore.getState().enqueuePermission(convId, request);
+}
+
+const ASK_INPUT = {
+  questions: [
+    {
+      question: "Which database?",
+      header: "DB",
+      multiSelect: false,
+      options: [{ label: "Postgres" }, { label: "SQLite" }, { label: "Other" }],
+    },
+  ],
+};
 
 const conv = (over: Partial<Conversation> = {}): Conversation => ({
   id: "c1",
@@ -67,6 +104,7 @@ const conv = (over: Partial<Conversation> = {}): Conversation => ({
   tosseTaskId: null,
   tosseTaskTitle: null,
   tosseTaskStatus: null,
+  claudeAccountId: null,
   cleanOutput: null,
   kind: "claude",
   ...over,
@@ -118,6 +156,7 @@ const helpers = (tosseAvailable = true): AppControlHelpers & { views: string[] }
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationStore.setState({ sessions: {} });
+  useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
   seed(conv());
 });
 
@@ -331,5 +370,93 @@ describe("appControl — UI actions", () => {
   it("notify_user forwards to the agent-notification path", async () => {
     await executeAppControlTool("notify_user", { message: "look here", critical: true }, null, helpers());
     expect(notifyFromAgent).toHaveBeenCalledWith("look here", true);
+  });
+});
+
+describe("answer_request — questions vs permissions", () => {
+  it("answers a QUESTION without the permission opt-in, shipping the answer as updated_input.answers", async () => {
+    seed(conv({ handle: "session-7" }));
+    seedPending("c1", perm({ request_id: "q1", tool_name: "AskUserQuestion", input: ASK_INPUT }));
+    // remoteAnswers is OFF (beforeEach) — a question must still go through.
+    const out = (await executeAppControlTool(
+      "answer_request",
+      { conversation_id: "c1", request_id: "q1", behavior: "allow", answers: { "Which database?": "SQLite" } },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.behavior).toBe("allow");
+    expect(out.answers).toEqual({ "Which database?": "SQLite" });
+    expect(vi.mocked(commands.answerPermission)).toHaveBeenCalledWith("session-7", "q1", {
+      behavior: "allow",
+      updated_input: { ...ASK_INPUT, answers: { "Which database?": "SQLite" } },
+    });
+    // The card is cleared optimistically.
+    expect(useConversationStore.getState().sessions.c1?.pendingPermissions).toHaveLength(0);
+  });
+
+  it("accepts a dictated free-text answer (the 'Other' choice) for a single-question ask", async () => {
+    seed(conv({ handle: "session-7" }));
+    seedPending("c1", perm({ request_id: "q1", tool_name: "AskUserQuestion", input: ASK_INPUT }));
+    await executeAppControlTool(
+      "answer_request",
+      { conversation_id: "c1", request_id: "q1", behavior: "allow", answers: "MongoDB on Atlas" },
+      "session-7",
+      helpers(),
+    );
+    expect(vi.mocked(commands.answerPermission)).toHaveBeenCalledWith("session-7", "q1", {
+      behavior: "allow",
+      updated_input: { ...ASK_INPUT, answers: { "Which database?": "MongoDB on Atlas" } },
+    });
+  });
+
+  it("refuses a question answer that matched nothing, without sending (no silent loss)", async () => {
+    seed(conv({ handle: "session-7" }));
+    const twoQ = {
+      questions: [
+        { question: "Which database?", header: "DB", multiSelect: false, options: [{ label: "Postgres" }] },
+        { question: "Which cache?", header: "Cache", multiSelect: false, options: [{ label: "Redis" }] },
+      ],
+    };
+    seedPending("c1", perm({ request_id: "q1", tool_name: "AskUserQuestion", input: twoQ }));
+    await expect(
+      executeAppControlTool(
+        "answer_request",
+        { conversation_id: "c1", request_id: "q1", behavior: "allow", answers: { "Which colour?": "blue" } },
+        "session-7",
+        helpers(),
+      ),
+    ).rejects.toThrow(/matched/);
+    expect(vi.mocked(commands.answerPermission)).not.toHaveBeenCalled();
+  });
+
+  it("keeps a real permission prompt gated behind the opt-in", async () => {
+    seed(conv({ handle: "session-7" }));
+    seedPending("c1", perm({ request_id: "p1", tool_name: "Bash" }));
+    await expect(
+      executeAppControlTool(
+        "answer_request",
+        { conversation_id: "c1", request_id: "p1", behavior: "allow" },
+        "session-7",
+        helpers(),
+      ),
+    ).rejects.toThrow(/Settings → Control/);
+    expect(vi.mocked(commands.answerPermission)).not.toHaveBeenCalled();
+  });
+
+  it("allows a permission once the opt-in is on", async () => {
+    useAppControlPrefs.getState().set({ remoteAnswers: true });
+    seed(conv({ handle: "session-7" }));
+    seedPending("c1", perm({ request_id: "p1", tool_name: "Bash" }));
+    const out = (await executeAppControlTool(
+      "answer_request",
+      { conversation_id: "c1", request_id: "p1", behavior: "deny", message: "no" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.behavior).toBe("deny");
+    expect(vi.mocked(commands.answerPermission)).toHaveBeenCalledWith("session-7", "p1", {
+      behavior: "deny",
+      message: "no",
+    });
   });
 });

@@ -32,6 +32,7 @@ function codexConv(over: Partial<Conversation> = {}): Conversation {
     tosseTaskId: null,
     tosseTaskTitle: null,
     tosseTaskStatus: null,
+    claudeAccountId: null,
     ...over,
   };
 }

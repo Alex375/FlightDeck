@@ -3,6 +3,7 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AgentRouting,
   Backend,
   BranchInfo,
   CommitFile,
@@ -12,6 +13,7 @@ import type {
   ConversationRecord,
   GoalState,
   DiskConversation,
+  ClaudeAccountRecord,
   ClaudeAccountStatus,
   ClaudeCliStatus,
   ClaudeUpdateOutcome,
@@ -94,6 +96,9 @@ import type {
   WorkflowRun,
   WorktreeInfo,
   WorktreeStatus,
+  ManagedMemory,
+  SpendReport,
+  SubagentRouting,
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
@@ -261,6 +266,9 @@ const mockWake: WakeStatus = {
   sensitivity: 0.5,
   running: false,
   error: null,
+  debug_capture: false,
+  debug_dir: null,
+  debug_error: null,
   phrases: [
     { key: "alexa", label: "Alexa" },
     { key: "hey_jarvis", label: "Hey Jarvis" },
@@ -272,6 +280,14 @@ const mockWake: WakeStatus = {
 const mockVoiceAgent: VoiceAgentStatus = {
   configured: false,
   key_hint: null,
+  // A couple of entries is enough to exercise the picker in the browser mock —
+  // the real catalogue lives Rust-side (`voice/mod.rs`).
+  voices: [
+    { key: "marin", label: "Marin — warm, recommended" },
+    { key: "cedar", label: "Cedar — calm, recommended" },
+    { key: "verse", label: "Verse — narrative" },
+  ],
+  default_voice: "marin",
 };
 
 // In-memory remote-access state for the browser mock (no real relay connection).
@@ -289,6 +305,40 @@ const mockRemote: RemoteStatus = {
 let mockCounter = 0;
 /** Distinguishes the wire uuids the mock hands back for successive sends. */
 let mockSentCounter = 0;
+
+/** The demo's EXTRA Claude accounts (the default one is not a row — it always exists).
+ *  Seeded with one so the multi-account surfaces are reachable in dev/Playwright without
+ *  going through the sign-in flow, and mutable so add / rename / remove actually do
+ *  something in the browser build. */
+type MockIdentity = {
+  email: string | null;
+  orgName: string | null;
+  subscriptionType: string | null;
+};
+
+/** The DEFAULT account's captured identity — what the app stores after signing that account
+ *  in itself. Seeded so the demo names it by its address rather than the fallback. */
+let mockDefaultIdentity: MockIdentity | null = {
+  email: "demo@example.com",
+  orgName: "Demo Org",
+  subscriptionType: "max",
+};
+
+/** The demo's in-flight Claude sign-in, mirroring the core's single global login. */
+let mockLoginInFlight: { accountId: string | null } | null = null;
+
+const mockClaudeAccounts: ClaudeAccountRecord[] = [
+  {
+    id: "acct-b",
+    label: "Work account",
+    email: "demo-b@example.com",
+    org_name: "Demo Org",
+    subscription_type: "max",
+    sort_index: 1,
+    added_at: 0,
+    label_is_generated: false,
+  },
+];
 
 // ---- TOSSE briefing fixture ------------------------------------------------
 // Shaped like `GET /api/v1/briefing/morning`: active projects with their client and open
@@ -566,6 +616,93 @@ function writeDemoSubtaskStatus(taskId: string, status: string): boolean {
   return false;
 }
 
+/**
+ * A synthetic spend corpus with the same SHAPE as the real one: a handful of repos, a few
+ * models, workflow runs dominating the total, and one deliberate disagreement (Explore
+ * appearing on opus while it is configured for haiku) so the drift canary can be seen
+ * firing without waiting for it to happen for real.
+ *
+ * Deterministic — a chart that reshuffles on every reload cannot be reviewed.
+ */
+function mockSpendReport(): SpendReport {
+    const buckets: SpendReport["buckets"] = [];
+    const repos = [
+      ["/Users/demo/repos/tosse-code", "tosse-code"],
+      ["/Users/demo/repos/santecall", "santecall"],
+      ["/Users/demo/repos/Citadel", "Citadel"],
+      // A deliberately long name: the label column is fixed, so this is the case that
+      // proves the fade and the hover-for-full-path actually work.
+      ["/Users/demo/repos/web_dentiste_middleware_api", "web_dentiste_middleware_api"],
+    ];
+    // A cheap deterministic pseudo-random so the numbers look lived-in but never move.
+    let seed = 7;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    // Days run UP TO TODAY, not from a frozen start date. The dashboard's default window
+    // is the last 30 days and the drift canary looks at the last 7 — a fixture pinned to
+    // absolute dates silently ages out of both, so the demo would show an empty chart and
+    // no canary, which is precisely what a demo must not hide.
+    const today = new Date();
+    const day = (i: number) => {
+      const d = new Date(
+        Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (20 - i)),
+      );
+      return d.toISOString().slice(0, 10);
+    };
+    for (let i = 0; i < 21; i++) {
+      for (const [repo, label] of repos) {
+        // Workflow runs: the bulk of the spend, on the expensive models.
+        for (const model of ["claude-fable-5-1", "claude-opus-4-8"]) {
+          const turns = rand(60) + (model === "claude-fable-5-1" ? 30 : 5);
+          if (turns < 12) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            agent: "workflow-subagent",
+            model,
+            workflow: true,
+            turns,
+            input_tokens: turns * 40,
+            output_tokens: turns * (400 + rand(300)),
+            cache_read_tokens: turns * 9000,
+            cache_creation_tokens: turns * 1200,
+          });
+        }
+        // Foreground helpers: far fewer turns.
+        for (const [agent, model] of [
+          ["Explore", "claude-opus-4-8"], // ← disagrees with the configured haiku
+          ["general-purpose", "claude-sonnet-5"],
+        ]) {
+          const turns = rand(9);
+          if (turns < 2) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            agent,
+            model,
+            workflow: false,
+            turns,
+            input_tokens: turns * 30,
+            output_tokens: turns * (200 + rand(200)),
+            cache_read_tokens: turns * 7000,
+            cache_creation_tokens: turns * 900,
+          });
+        }
+      }
+    }
+    return {
+      buckets,
+      files_scanned: 931,
+      files_unreadable: 0,
+      lines_unparsed: 0,
+      warnings: [],
+    };
+}
+
 // ---- Commands (same shape as the generated facade) -------------------------
 
 /** Mock-only: the current global output style, so a set is reflected by the next get. */
@@ -723,25 +860,115 @@ export const mockCommands = {
     return ok(null);
   },
   // ---- Accounts (Claude & Codex) — demo statuses ----------------------------------
-  async accountClaudeStatus(): Promise<Result<ClaudeAccountStatus, string>> {
+  // (see `mockClaudeAccounts` below the object for the mutable demo account list)
+  //
+  // Two Claude accounts in the demo, so the multi-account surfaces are exercisable in
+  // dev/Playwright: the composer's account chip only renders once a second one exists,
+  // and the auto-switch policy needs somewhere to switch to.
+  async accountClaudeStatus(accountId: string | null): Promise<Result<ClaudeAccountStatus, string>> {
+    // An added account is signed in only once its identity was captured (i.e. after the
+    // sign-in flow completed), so "Add account" yields a signed-out tile whose flow can be
+    // exercised in dev/Playwright — as it is in the app.
+    const added = accountId ? mockClaudeAccounts.find((a) => a.id === accountId) : null;
+    const loggedIn = accountId === null || !!added?.email;
     return ok({
-      loggedIn: true,
-      authMethod: "claude.ai",
-      email: "demo@example.com",
+      loggedIn,
+      authMethod: loggedIn ? "claude.ai" : "none",
+      email: accountId ? (added?.email ?? null) : "demo@example.com",
       orgName: "Demo Org",
       subscriptionType: "max",
     });
   },
-  async accountClaudeLoginStart(): Promise<Result<string, string>> {
+  async accountClaudeLoginStart(accountId: string | null): Promise<Result<string, string>> {
+    mockLoginInFlight = { accountId };
     return ok("https://claude.ai/oauth/demo");
   },
-  async accountClaudeLoginCode(_code: string): Promise<Result<null, string>> {
+  async accountClaudeLoginCode(
+    accountId: string | null,
+    _code: string,
+  ): Promise<Result<null, string>> {
+    // Mirror the core's binding of the code to its account.
+    if (!mockLoginInFlight) return { status: "error", error: "no Claude sign-in in progress" };
+    if (mockLoginInFlight.accountId !== accountId) {
+      return { status: "error", error: "this sign-in was superseded by one for another account" };
+    }
+    mockLoginInFlight = null;
     return ok(null);
   },
   async accountClaudeLoginCancel(): Promise<Result<null, string>> {
+    mockLoginInFlight = null;
     return ok(null);
   },
-  async accountClaudeLogout(): Promise<Result<null, string>> {
+  async accountClaudeLoginInFlight(): Promise<Result<{ accountId: string | null } | null, string>> {
+    return ok(mockLoginInFlight ? { accountId: mockLoginInFlight.accountId } : null);
+  },
+  async accountClaudeLogout(_accountId: string | null): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async claudeAccountsList(): Promise<Result<ClaudeAccountRecord[], string>> {
+    return ok(mockClaudeAccounts);
+  },
+  async claudeAccountCreate(label: string): Promise<Result<ClaudeAccountRecord, string>> {
+    const rec: ClaudeAccountRecord = {
+      id: `acct-${mockClaudeAccounts.length + 2}`,
+      label: label.trim() || `Account ${mockClaudeAccounts.length + 2}`,
+      email: null,
+      org_name: null,
+      subscription_type: null,
+      sort_index: mockClaudeAccounts.length + 1,
+      added_at: Date.now(),
+      label_is_generated: !label.trim(),
+    };
+    mockClaudeAccounts.push(rec);
+    return ok(rec);
+  },
+  async claudeAccountCaptureIdentity(accountId: string | null): Promise<Result<null, string>> {
+    if (accountId === null) {
+      mockDefaultIdentity = {
+        email: "demo@example.com",
+        orgName: "Demo Org",
+        subscriptionType: "max",
+      };
+      return ok(null);
+    }
+    const rec = mockClaudeAccounts.find((a) => a.id === accountId);
+    if (!rec) return { status: "error", error: "this Claude account no longer exists" };
+    rec.email = `demo-${rec.id}@example.com`;
+    rec.subscription_type = "max";
+    if (rec.label_is_generated) rec.label = rec.email;
+    return ok(null);
+  },
+  async claudeDefaultIdentity(): Promise<Result<MockIdentity | null, string>> {
+    return ok(mockDefaultIdentity);
+  },
+  async claudeAccountIdentity(
+    accountId: string | null,
+  ): Promise<Result<MockIdentity, UsageError>> {
+    // Like the core: an account is known by its own token, so a signed-out one has no
+    // identity to read.
+    if (accountId === null) {
+      return { status: "ok", data: { email: "demo@example.com", orgName: "Demo Org", subscriptionType: "max" } };
+    }
+    const rec = mockClaudeAccounts.find((a) => a.id === accountId);
+    if (!rec) return { status: "error", error: { kind: "unknown_account", account_id: accountId } };
+    if (!rec.email) return { status: "error", error: { kind: "no_token" } };
+    return {
+      status: "ok",
+      data: { email: rec.email, orgName: rec.org_name, subscriptionType: rec.subscription_type },
+    };
+  },
+  async claudeAccountRemove(
+    accountId: string,
+    _force: boolean,
+  ): Promise<Result<string | null, string>> {
+    const i = mockClaudeAccounts.findIndex((a) => a.id === accountId);
+    if (i >= 0) mockClaudeAccounts.splice(i, 1);
+    return ok(null);
+  },
+  async setConversationClaudeAccount(
+    _convId: string,
+    _accountId: string | null,
+  ): Promise<Result<null, string>> {
     return ok(null);
   },
   async accountCodexStatus(): Promise<Result<CodexAccountStatus, string>> {
@@ -1032,11 +1259,10 @@ export const mockCommands = {
     model: string | null,
     effort: string | null,
     permissionMode: string | null,
-    ultracode: boolean,
     _backend: "claude" | "codex",
-    _allowBypassPermissions?: boolean,
-    _appControl?: boolean,
+    flags: { ultracode: boolean },
   ): Promise<Result<string, string>> {
+    const { ultracode } = flags;
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
     const rec = getRecord(session);
@@ -1383,18 +1609,22 @@ export const mockCommands = {
     return ok(hits);
   },
 
-  async getPlanUsage(): Promise<Result<PlanUsage, UsageError>> {
+  async getPlanUsage(accountId: string | null): Promise<Result<PlanUsage, UsageError>> {
     // No real OAuth endpoint in the browser; return plausible fills so the Plan
     // section of the context popover renders in dev/Playwright. Reset ~2h / ~3d out,
     // as ISO 8601 strings (matching the live endpoint shape).
     const iso = (offsetSec: number) => new Date(Date.now() + offsetSec * 1000).toISOString();
     // Build the ok-arm directly: `ok()` fixes the error type to string, but this
     // command's Result error is UsageError. The mock never takes the error path.
+    // Distinct fills per account, so the multi-account surfaces (per-card bars, the
+    // account chip's percentages, the auto-switch policy) show something to choose
+    // BETWEEN rather than the same number twice.
+    const busy = accountId === null;
     return {
       status: "ok",
       data: {
-        five_hour: { used_percentage: 42, resets_at: iso(2 * 3600) },
-        seven_day: { used_percentage: 67, resets_at: iso(3 * 86400) },
+        five_hour: { used_percentage: busy ? 42 : 8, resets_at: iso(2 * 3600) },
+        seven_day: { used_percentage: busy ? 67 : 14, resets_at: iso(3 * 86400) },
         // A model-scoped weekly cap, as the live endpoint reports it: named after the
         // model and — when the window has never started — with no reset at all.
         scoped: [
@@ -1412,7 +1642,8 @@ export const mockCommands = {
     // so the dev/Playwright build has something to drive (e.g. `?demo=background`).
     const demo =
       typeof location !== "undefined" && new URLSearchParams(location.search).has("demo");
-    if (!demo) return ok({ repos: [], conversations: [], active_id: null });
+    if (!demo)
+      return ok({ machines: [], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
     return ok({
       repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
@@ -1438,6 +1669,7 @@ export const mockCommands = {
           tosse_task_title: "Lot 2 — vue « Tâches TOSSE » + écriture",
           tosse_task_status: "En cours",
           backend: "claude",
+          claude_account_id: null,
         },
         // A Codex conversation so the mixed-fleet identity (backend badge, neutral avatar,
         // Codex picker icon) is exercisable in dev/Playwright. Renders live through the same
@@ -1462,6 +1694,7 @@ export const mockCommands = {
           tosse_task_title: "Lot 1 — connexion (OAuth) + onglet Réglages",
           tosse_task_status: "Review",
           backend: "codex",
+          claude_account_id: null,
         },
       ],
       active_id: "conv-demo",
@@ -1552,7 +1785,7 @@ export const mockCommands = {
     return ok({ ...mockVoiceAgent });
   },
 
-  async voiceAgentClientSecret(): Promise<Result<ClientSecret, string>> {
+  async voiceAgentClientSecret(_voice: string | null): Promise<Result<ClientSecret, string>> {
     return err("the voice agent is not available in the browser mock");
   },
 
@@ -1568,10 +1801,19 @@ export const mockCommands = {
     enabled: boolean | null,
     phrase: string | null,
     sensitivity: number | null,
+    debugCapture: boolean | null,
   ): Promise<Result<WakeStatus, string>> {
     if (enabled !== null) mockWake.enabled = enabled;
     if (phrase !== null) mockWake.phrase = phrase;
     if (sensitivity !== null) mockWake.sensitivity = Math.min(1, Math.max(0, sensitivity));
+    if (debugCapture !== null) {
+      // Mirrors the core: no capture directory means the opt-in cannot be honoured,
+      // and the mock says so rather than showing a switch that would never write.
+      mockWake.debug_capture = false;
+      mockWake.debug_error = debugCapture
+        ? "the browser mock has no capture directory — recordings cannot be written"
+        : null;
+    }
     // The mock has no capture backend, so "running" can never be true.
     mockWake.running = false;
     mockWake.error = mockWake.enabled
@@ -1900,6 +2142,132 @@ export const mockCommands = {
 
   async terminalClose(_id: string): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  // ---- Settings → Claude Code (routing / spend / instructions) — demo -------
+  // Shaped like the real thing, including the two states that are easy to get wrong and
+  // impossible to see otherwise: a built-in the baseline cannot reach (Plan), and an agent
+  // whose configured model disagrees with what the transcripts say it ran on (Explore,
+  // set to haiku, seen on opus) — which is what lights the drift canary.
+  async listSubagentRouting(_repoPath: string): Promise<Result<SubagentRouting, string>> {
+    const agents: AgentRouting[] = [
+      {
+        name: "Explore",
+        description: "Sweeps the codebase to locate something. Read-only.",
+        effective_model: "haiku",
+        defined_model: "haiku",
+        effort: null,
+        origin: "user",
+        path: "/Users/demo/.claude/agents/Explore.md",
+        built_in: true,
+        shadows_built_in: true,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+        configured_at_ms: Date.now() - 10 * 86_400_000,
+      },
+      {
+        name: "Plan",
+        description: "Designs how a change should be made before any code is written.",
+        effective_model: null,
+        defined_model: null,
+        effort: null,
+        origin: "built_in",
+        path: null,
+        built_in: true,
+        shadows_built_in: false,
+        needs_file_to_steer: true,
+        overridden_by_force: false,
+        // A blind spot follows nothing, so nothing has been configured for it.
+        configured_at_ms: null,
+      },
+      {
+        name: "general-purpose",
+        description: "The catch-all helper for multi-step work.",
+        effective_model: "sonnet",
+        defined_model: null,
+        effort: null,
+        origin: "built_in",
+        path: null,
+        built_in: true,
+        shadows_built_in: false,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+        configured_at_ms: Date.now() - 30 * 86_400_000,
+      },
+      {
+        name: "tosse-manager",
+        description: "CRM specialist. Never touches code.",
+        effective_model: "claude-opus-4-8",
+        defined_model: "claude-opus-4-8",
+        effort: "high",
+        origin: "plugin",
+        path: "/Users/demo/.claude/plugins/tosse/agents/manager.md",
+        built_in: false,
+        shadows_built_in: false,
+        needs_file_to_steer: false,
+        overridden_by_force: false,
+        configured_at_ms: Date.now() - 30 * 86_400_000,
+      },
+    ];
+    return ok({
+      agents,
+      baseline: {
+        model: "sonnet",
+        forced_model: null,
+        unreachable_builtins: ["Explore", "Plan"],
+        error: null,
+      },
+      user_agents_dir: "/Users/demo/.claude/agents",
+      project_agents_dir: "/Users/demo/repo/.claude/agents",
+      // The repo in the demo DOES ignore .claude/ — so the scope warning is visible.
+      project_dir_ignored: true,
+      repo_is_worktree: false,
+    });
+  },
+  async setSubagentModel(
+    _path: string,
+    _model: string | null,
+    _effort: string | null,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async createSubagentDefinition(
+    dir: string,
+    name: string,
+    _description: string,
+    _model: string | null,
+    _effort: string | null,
+    _body: string,
+  ): Promise<Result<string, string>> {
+    return ok(`${dir}/${name}.md`);
+  },
+  async setSubagentBaseline(
+    _model: string | null,
+    _forcedModel: string | null,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async subagentSpend(): Promise<Result<SpendReport, string>> {
+    return ok(mockSpendReport());
+  },
+  async readClaudeMemory(): Promise<Result<ManagedMemory, string>> {
+    return ok({
+      path: "/Users/demo/.claude/CLAUDE.md",
+      exists: true,
+      // A block already in the file, so the demo can show REMOVALS as well as additions —
+      // an empty block only ever produces green, which hides half of what the diff is for.
+      managed_text:
+        "## Choosing a model for a helper agent\n\nAn older version of the policy that the\nsuggested block would replace.\n",
+      full_text:
+        "# My instructions\n\nAlways write tests before the fix.\n\n<!-- flightdeck:managed:start -->\n## Choosing a model for a helper agent\n\nAn older version of the policy that the\nsuggested block would replace.\n<!-- flightdeck:managed:end -->\n",
+      marker_error: null,
+    });
+  },
+  async writeClaudeMemory(_text: string | null): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async fetchKnownAgents(_cwd: string): Promise<Result<string[], string>> {
+    return ok(["claude", "Explore", "general-purpose", "Plan", "statusline-setup"]);
   },
 
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------

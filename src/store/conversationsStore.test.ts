@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Stub the IPC surface: the store's setters persist via `upsertConversation` and
 // push live changes via set*; both return an ok Result. We assert what gets called.
@@ -21,6 +21,7 @@ vi.mock("../ipc/client", () => {
       loadSessionGoal: vi.fn(() => ok(null)),
       deleteConversation: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
+      setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
     },
@@ -34,9 +35,11 @@ import { useAppControlPrefs } from "./appControl";
 import {
   acknowledgeConversation,
   createConversationInRepo,
+  createConversationInWorktree,
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
   demoteBypassConversations,
+  detachClaudeAccount,
   ensureConversationSession,
   loadConversationHistory,
   reactivateDiskConversation,
@@ -48,6 +51,12 @@ import {
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
+import {
+  clearManualAccountPicks,
+  manualAccountPick,
+  useClaudeAccountList,
+  useClaudeAccountPrefs,
+} from "./claudeAccounts";
 
 const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   id: "c1",
@@ -68,6 +77,7 @@ const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   tosseTaskId: null,
   tosseTaskTitle: null,
   tosseTaskStatus: null,
+  claudeAccountId: null,
   cleanOutput: null,
   kind: "claude",
   ...over,
@@ -154,6 +164,169 @@ describe("conversationsStore — per-conversation controls", () => {
   });
 });
 
+describe("conversationsStore — Claude account selection", () => {
+  it("persists the choice and, critically, does NOT kill a live session", () => {
+    // The load-bearing guarantee: a running process cannot change identity, but changing
+    // the account must never interrupt a turn either. So the setter only WRITES; the
+    // restart is `ClaudeAccountApplyHost`'s job, at a safe boundary.
+    seed(baseConv({ handle: "session-7", liveClaudeAccountId: null }));
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b");
+    expect(conv0().claudeAccountId).toBe("acct-b");
+    // Persisted through the DEDICATED command — the core's sole writer of that column —
+    // never the wholesale upsert that a stale copy could replay.
+    expect(commands.setConversationClaudeAccount).toHaveBeenCalledWith("c1", "acct-b");
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
+    expect(commands.stopSession).not.toHaveBeenCalled();
+    // The live identity is untouched, so the composer can still say which account is
+    // ACTUALLY in use rather than claiming the new one.
+    expect(conv0().liveClaudeAccountId).toBeNull();
+  });
+
+  it("is idempotent and leaves Codex conversations alone", () => {
+    useConversationsStore.getState().setConvClaudeAccount("c1", null); // already null
+    expect(commands.setConversationClaudeAccount).not.toHaveBeenCalled();
+
+    seed(baseConv({ kind: "codex" }));
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b");
+    expect(conv0().claudeAccountId).toBeNull();
+    expect(commands.setConversationClaudeAccount).not.toHaveBeenCalled();
+  });
+
+  it("removing an account detaches its conversations in memory and clears the default", () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }],
+      conversations: [
+        baseConv({ id: "c1", claudeAccountId: "gone" }),
+        baseConv({ id: "c2", claudeAccountId: "kept" }),
+      ],
+      activeId: "c1",
+    });
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "gone" });
+
+    detachClaudeAccount("gone");
+
+    const byId = (id: string) =>
+      useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+    expect(byId("c1").claudeAccountId).toBeNull();
+    expect(byId("c2").claudeAccountId).toBe("kept");
+    expect(useClaudeAccountPrefs.getState().defaultAccountId).toBeNull();
+  });
+
+  it("a new Claude conversation starts on the configured default account", () => {
+    useClaudeAccountList.getState().setAccounts([{ id: "acct-b", label: "B", sortIndex: 1 }]);
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "acct-b" });
+    try {
+      const id = createConversationInRepo("/tmp/r1");
+      const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+      expect(conv.claudeAccountId).toBe("acct-b");
+    } finally {
+      useClaudeAccountPrefs.getState().set({ defaultAccountId: null });
+    }
+  });
+
+  it("only an AUTOMATIC switch arms the anti-oscillation cooldown", () => {
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b");
+    expect(conv0().lastAccountSwitchAt ?? null).toBeNull();
+
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-c", { auto: true });
+    expect(conv0().lastAccountSwitchAt).toBeGreaterThan(0);
+  });
+
+  it("clearing the handle forgets the live account", () => {
+    seed(baseConv({ handle: "session-7", liveClaudeAccountId: "acct-b" }));
+    useConversationsStore.getState().setHandle("c1", null);
+    expect(conv0().liveClaudeAccountId ?? null).toBeNull();
+  });
+});
+
+describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
+  // The core refuses any non-default account on a remote repo (the SSH launcher does not
+  // carry it), so a conversation seeded with the preferred default could never send.
+  const remoteRepo = { id: "rr", path: "/srv/app", addedAt: 1, machineId: "m1" };
+
+  beforeEach(() => {
+    useClaudeAccountList.getState().setAccounts([{ id: "acct-b", label: "B", sortIndex: 1 }]);
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "acct-b" });
+    clearManualAccountPicks();
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }, remoteRepo],
+      conversations: [],
+      activeId: null,
+    });
+  });
+  afterEach(() => {
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: null });
+  });
+
+  const byId = (id: string) =>
+    useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+
+  it("a new conversation in a remote repo starts on the default account", () => {
+    expect(byId(createConversationInRepo("/srv/app")).claudeAccountId).toBeNull();
+    // …while a local one still honours the preference.
+    expect(byId(createConversationInRepo("/tmp/r1")).claudeAccountId).toBe("acct-b");
+  });
+
+  it("a new worktree conversation of a remote repo starts on the default account", () => {
+    expect(byId(createConversationInWorktree("rr", "/srv/app/.claude/worktrees/x")).claudeAccountId).toBeNull();
+    expect(byId(createConversationInWorktree("r1", "/tmp/r1/wt")).claudeAccountId).toBe("acct-b");
+  });
+
+  it("a reactivated or forked conversation in a remote repo runs on the default account", () => {
+    const disk: DiskConversation = {
+      session_id: "s-remote",
+      cwd: "/srv/app",
+      repo_root: "/srv/app",
+      git_branch: null,
+      title: null,
+      excerpt: "hi",
+      mtime_ms: 100,
+      backend: "claude",
+    };
+    expect(byId(reactivateDiskConversation(disk)).claudeAccountId).toBeNull();
+    // A fork inheriting a non-default account from its source must not carry it either.
+    const forked = reactivateDiskConversation(
+      { ...disk, session_id: "s-fork" },
+      {
+        model: "opus",
+        effort: "xhigh",
+        ultracode: false,
+        permissionMode: "default",
+        cleanOutput: null,
+        claudeAccountId: "acct-b",
+      },
+    );
+    expect(byId(forked).claudeAccountId).toBeNull();
+  });
+
+  it("refuses a non-default account on a remote conversation, but allows the way back", () => {
+    useConversationsStore.setState({
+      repos: [remoteRepo],
+      conversations: [baseConv({ id: "c1", repoId: "rr", claudeAccountId: "acct-b" })],
+    });
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-c", { auto: true });
+    expect(byId("c1").claudeAccountId).toBe("acct-b");
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(byId("c1").claudeAccountId).toBeNull();
+  });
+});
+
+describe("conversationsStore — manual account picks pin the conversation", () => {
+  beforeEach(() => clearManualAccountPicks());
+
+  it("a USER pick is recorded, an automatic switch is not", () => {
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b", { auto: true });
+    expect(manualAccountPick("c1")).toBeUndefined();
+
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(manualAccountPick("c1")).toBeNull();
+    // Re-stating the current account is a deliberate choice too.
+    clearManualAccountPicks();
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(manualAccountPick("c1")).toBeNull();
+  });
+});
+
 describe("conversationsStore — bypass-permissions unlock", () => {
   beforeEach(() => {
     usePermissionPrefs.setState({ allowBypassPermissions: false });
@@ -162,18 +335,18 @@ describe("conversationsStore — bypass-permissions unlock", () => {
   it("passes the app-wide opt-in to the spawn and remembers it on the conversation", async () => {
     usePermissionPrefs.setState({ allowBypassPermissions: true });
     await ensureConversationSession("c1");
-    // Second-to-last positional arg of spawnSession (the trailing one is the
-    // app-control flag) — the process gets the unlock flag…
-    const args = vi.mocked(commands.spawnSession).mock.calls[0];
-    expect(args[args.length - 2]).toBe(true);
+    // The spawn-time flags ride the trailing `SpawnFlags` argument — the process gets
+    // the unlock flag…
+    const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+    expect(flags).toMatchObject({ allowBypassPermissions: true });
     // …and the conversation records that THIS live session can honour bypass.
     expect(conv0().bypassAllowed).toBe(true);
   });
 
   it("spawns WITHOUT the flag while the opt-in is off", async () => {
     await ensureConversationSession("c1");
-    const args = vi.mocked(commands.spawnSession).mock.calls[0];
-    expect(args[args.length - 2]).toBe(false);
+    const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+    expect(flags).toMatchObject({ allowBypassPermissions: false });
     expect(conv0().bypassAllowed).toBe(false);
   });
 
@@ -557,20 +730,23 @@ describe("conversationsStore — controls applied at spawn", () => {
     );
     const handle = await ensureConversationSession("c1");
     expect(handle).toBe("session-1");
-    // (cwd, resume, model, effort, permissionMode, ultracode, backend,
-    // allowBypassPermissions, appControl) — the conversation's own controls + its
-    // backend + the app-wide bypass opt-in + the app-control policy (default ON),
-    // NOT the old hardcoded defaults.
+    // (cwd, resume, model, effort, permissionMode, backend, flags) — the conversation's
+    // own controls + its backend, then the spawn-only flags: ultracode, the app-wide
+    // bypass opt-in, the app-control policy (default ON) and the Claude account (null =
+    // the default one). NOT the old hardcoded defaults.
     expect(commands.spawnSession).toHaveBeenCalledWith(
       "/tmp/r1",
       null,
       "sonnet",
       "high",
       "plan",
-      false,
       "claude",
-      false,
-      true,
+      {
+        ultracode: false,
+        allowBypassPermissions: false,
+        appControl: true,
+        claudeAccountId: null,
+      },
     );
   });
 
@@ -578,11 +754,25 @@ describe("conversationsStore — controls applied at spawn", () => {
     useAppControlPrefs.setState({ agentServer: false });
     try {
       await ensureConversationSession("c1");
-      const args = vi.mocked(commands.spawnSession).mock.calls[0];
-      expect(args[args.length - 1]).toBe(false);
+      const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+      expect(flags).toMatchObject({ appControl: false });
     } finally {
       useAppControlPrefs.setState({ agentServer: true });
     }
+  });
+
+  it("spawns on the conversation's Claude account", async () => {
+    // The account can only be applied at spawn (the CLI reads its credentials once at
+    // startup), so a conversation pointed at another account must carry it HERE — not
+    // silently authenticate as the default one and bill the wrong subscription.
+    useConversationsStore.setState((s) => ({
+      conversations: s.conversations.map((c) =>
+        c.id === "c1" ? { ...c, claudeAccountId: "acct-b" } : c,
+      ),
+    }));
+    await ensureConversationSession("c1");
+    const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+    expect(flags).toMatchObject({ claudeAccountId: "acct-b" });
   });
 });
 

@@ -10,5 +10,6 @@ pub mod model;
 
 pub use db::Store;
 pub use model::{
-    ConversationRecord, MachineRecord, PersistedState, RepoRecord, TosseProjectRepo,
+    ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
+    TosseProjectRepo,
 };

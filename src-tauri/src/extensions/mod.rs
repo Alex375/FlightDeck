@@ -27,6 +27,9 @@
 //! surfaced. The redaction happens here, at the boundary, so no secret can reach
 //! the IPC layer or the UI.
 
+pub mod agent_edit;
+pub mod routing;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -147,6 +150,10 @@ pub struct AgentInfo {
     pub name: String,
     pub description: Option<String>,
     pub model: Option<String>,
+    /// The reasoning-effort level pinned in the definition's frontmatter, when it has one.
+    /// Ignored by the CLI on models that declare no effort ladder (Haiku 4.5 and below),
+    /// which is why the settings UI hides the control rather than offering a dead one.
+    pub effort: Option<String>,
     pub scope: ExtScope,
     pub source: Option<String>,
     /// Absolute path to the agent's `.md` definition — the UI reads it to render a
@@ -254,6 +261,9 @@ struct SettingsJson {
     /// `autoUpdate` flag (mirrored into `known_marketplaces.json` by the CLI).
     #[serde(default, rename = "extraKnownMarketplaces")]
     extra_known_marketplaces: BTreeMap<String, ExtraMarketplace>,
+    // No `env` here on purpose: the sub-agent baseline reads it from a raw `Value` (see
+    // `baseline_from_settings`), so a drifted field elsewhere in this struct can never make
+    // the baseline read as "not set".
 }
 
 /// One `extraKnownMarketplaces[name]` entry — only the fields we read.
@@ -938,6 +948,158 @@ fn apply_claude_auto_update(text: &str, enabled: bool) -> Result<String, String>
     serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
 }
 
+/// The env var the CLI reads to pick a sub-agent's model when nothing closer to the call
+/// site says otherwise. Level 3 of the resolution order (below a spawn-time `model` and a
+/// definition's `model:` frontmatter, above "inherit the conversation").
+const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
+/// The blunt variant: it reaches the two built-ins the plain one cannot, but it does so by
+/// OVERRIDING levels 1 and 2 — every per-agent choice and every model a workflow asks for.
+/// Never on by default; the UI greys out the per-agent rows while it is set, because that
+/// is precisely what it does to them.
+const SUBAGENT_MODEL_FORCE_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
+
+/// What the two sub-agent env vars currently say, read straight from
+/// `~/.claude/settings.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct SubagentBaseline {
+    /// The model every sub-agent falls back to, or `None` when the app has never set one
+    /// (the CLI then inherits the conversation's model).
+    pub model: Option<String>,
+    /// Whether the forcing variant is set, and to what. Reported separately from `model`
+    /// because the two behave differently enough that merging them would lie.
+    pub forced_model: Option<String>,
+    /// ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
+    /// both keep inheriting the conversation. Carried in the payload so the UI's
+    /// explanation and the backend's behaviour can never drift apart.
+    pub unreachable_builtins: Vec<String>,
+    /// Set when `settings.json` exists but could not be read or parsed. `model` and
+    /// `forced_model` are then UNKNOWN, not absent — the UI must say so and refuse to
+    /// offer a change, instead of rendering "No baseline" over a file it never read.
+    pub error: Option<String>,
+}
+
+/// The built-in sub-agents `CLAUDE_CODE_SUBAGENT_MODEL` does NOT reach.
+pub const BASELINE_BLIND_SPOTS: [&str; 2] = ["Explore", "Plan"];
+
+/// Read the sub-agent baseline out of `~/.claude/settings.json`. Absent file or absent
+/// keys → an empty baseline, which is the honest reading of "nothing is set". A file that
+/// exists but cannot be read or parsed → the `error` field, never a silent empty baseline.
+pub fn subagent_baseline() -> SubagentBaseline {
+    let Some(home) = home_dir() else {
+        return baseline_from_settings(Err("could not resolve the home directory".to_string()));
+    };
+    let path = home.join(".claude/settings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} unreadable: {e}", path.display())),
+    };
+    baseline_from_settings(text)
+}
+
+/// Pure core of [`subagent_baseline`]: `Ok(None)` = no settings file.
+///
+/// Parsed as a raw `serde_json::Value` and NOT as the strictly-typed [`SettingsJson`]: a
+/// drifted field the baseline has nothing to do with (a new `enabledPlugins` value shape, a
+/// hand-edited `mcpServers`) would otherwise fail the whole parse and read as "no baseline".
+fn baseline_from_settings(text: Result<Option<String>, String>) -> SubagentBaseline {
+    let mut out = SubagentBaseline {
+        unreachable_builtins: BASELINE_BLIND_SPOTS.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let text = match text {
+        Ok(Some(t)) => t,
+        Ok(None) => return out,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    let root: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            out.error = Some(format!("settings.json is not valid JSON: {e}"));
+            return out;
+        }
+    };
+    let Some(obj) = root.as_object() else {
+        out.error = Some("settings.json is not a JSON object".to_string());
+        return out;
+    };
+    let env = match obj.get("env") {
+        None | Some(Value::Null) => return out,
+        Some(Value::Object(env)) => env,
+        Some(_) => {
+            out.error = Some("settings.json has an `env` that is not an object".to_string());
+            return out;
+        }
+    };
+    let read = |key: &str| -> Result<Option<String>, String> {
+        match env.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            // The CLI reads env values as strings; a number or a bool here is something it
+            // will not honour the way the page would claim.
+            Some(_) => Err(format!("`env.{key}` in settings.json is not a string")),
+        }
+    };
+    match (read(SUBAGENT_MODEL_ENV), read(SUBAGENT_MODEL_FORCE_ENV)) {
+        (Ok(model), Ok(forced)) => {
+            out.model = model;
+            out.forced_model = forced;
+        }
+        (Err(e), _) | (_, Err(e)) => out.error = Some(e),
+    }
+    out
+}
+
+/// Pure transform: set or clear the two sub-agent env vars in a settings.json document.
+/// `None` removes a key (and prunes an emptied `env`), matching how the CLI reads absence
+/// as "not configured". Order-preserving, so a hand-edited settings.json keeps its shape.
+fn apply_subagent_baseline(
+    text: &str,
+    model: Option<&str>,
+    forced_model: Option<&str>,
+) -> Result<String, String> {
+    let mut root: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
+    let obj = root.as_object_mut().ok_or("settings.json is not a JSON object")?;
+    if (model.is_some() || forced_model.is_some())
+        && !obj.get("env").map(|v| v.is_object()).unwrap_or(false)
+    {
+        obj.insert("env".to_string(), serde_json::json!({}));
+    }
+    if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+        for (key, value) in
+            [(SUBAGENT_MODEL_ENV, model), (SUBAGENT_MODEL_FORCE_ENV, forced_model)]
+        {
+            match value {
+                Some(v) => {
+                    env.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+                }
+                None => {
+                    env.remove(key);
+                }
+            }
+        }
+        if env.is_empty() {
+            obj.remove("env");
+        }
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
+}
+
+/// Set (or clear) the sub-agent model baseline. Goes through the shared [`write_settings`]
+/// spine, so it inherits the same atomic write and the same `SETTINGS_WRITE_LOCK` that
+/// keeps two concurrent toggles from losing each other's edit.
+pub fn set_subagent_baseline(
+    model: Option<&str>,
+    forced_model: Option<&str>,
+) -> Result<(), String> {
+    let home = home_dir().ok_or("could not resolve home directory")?;
+    write_settings(&home, |text| apply_subagent_baseline(text, model, forced_model))
+}
+
 /// Flip the Claude CLI's background auto-updater by writing `env.DISABLE_AUTOUPDATER` in
 /// `~/.claude/settings.json` (atomic, order-preserving — the shared [`write_settings`] spine,
 /// so the same anti-race discipline as the plugin/marketplace toggles). `enabled == true`
@@ -1413,6 +1575,7 @@ fn agent_from_md(path: &Path, scope: ExtScope, source: Option<&str>) -> Option<A
         name,
         description: front.description,
         model: front.model,
+        effort: front.effort,
         scope,
         source: source.map(str::to_string),
         path: path.to_string_lossy().into_owned(),
@@ -1446,6 +1609,7 @@ struct FrontMatter {
     name: Option<String>,
     description: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
 }
 
 /// Minimal YAML-frontmatter extractor for skill/agent markdown — enough for the
@@ -1499,6 +1663,7 @@ fn parse_frontmatter(content: &str) -> FrontMatter {
             "name" => fm.name = Some(value),
             "description" => fm.description = Some(value),
             "model" => fm.model = Some(value),
+            "effort" => fm.effort = Some(value),
             _ => {}
         }
     }
@@ -1535,6 +1700,96 @@ fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_reads_the_effort_key() {
+        let fm = parse_frontmatter("---\nname: Explore\nmodel: haiku\neffort: low\n---\nbody\n");
+        assert_eq!(fm.model.as_deref(), Some("haiku"));
+        assert_eq!(fm.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn baseline_sets_both_env_vars_and_creates_env() {
+        let out = apply_subagent_baseline("{}", Some("haiku"), None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
+        assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE").is_none());
+    }
+
+    #[test]
+    fn baseline_clearing_both_prunes_an_emptied_env() {
+        let src = r#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku"}}"#;
+        let out = apply_subagent_baseline(src, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("env").is_none(), "an env left empty is removed, as the CLI reads absence");
+    }
+
+    #[test]
+    fn baseline_leaves_every_other_key_alone() {
+        // The one that matters: clearing our keys must not take an unrelated env var — or
+        // any unrelated setting — with it.
+        let src = r#"{"env":{"DISABLE_AUTOUPDATER":"1","CLAUDE_CODE_SUBAGENT_MODEL":"haiku"},"enabledPlugins":{"a@b":true}}"#;
+        let out = apply_subagent_baseline(src, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["DISABLE_AUTOUPDATER"], "1");
+        assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+        assert_eq!(v["enabledPlugins"]["a@b"], true);
+    }
+
+    #[test]
+    fn baseline_force_is_written_separately_from_the_plain_variant() {
+        let out = apply_subagent_baseline("{}", Some("haiku"), Some("haiku")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"], "haiku");
+        // …and dropping the force alone leaves the plain one standing.
+        let back = apply_subagent_baseline(&out, Some("haiku"), None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
+        assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE").is_none());
+    }
+
+    #[test]
+    fn baseline_refuses_a_settings_file_it_cannot_parse() {
+        assert!(apply_subagent_baseline("not json", Some("haiku"), None).is_err());
+        assert!(apply_subagent_baseline("[1,2]", Some("haiku"), None).is_err());
+    }
+
+    #[test]
+    fn baseline_reads_env_despite_unrelated_field_drift() {
+        // `enabledPlugins` holding a non-bool would fail the strictly-typed SettingsJson
+        // parse and used to read as "No baseline".
+        let src = r#"{"enabledPlugins":{"a@b":"yes"},"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"sonnet"}}"#;
+        let b = baseline_from_settings(Ok(Some(src.to_string())));
+        assert_eq!(b.error, None);
+        assert_eq!(b.model.as_deref(), Some("haiku"));
+        assert_eq!(b.forced_model.as_deref(), Some("sonnet"));
+        assert_eq!(b.unreachable_builtins, vec!["Explore", "Plan"]);
+    }
+
+    #[test]
+    fn baseline_absent_file_or_keys_is_empty_not_an_error() {
+        let none = baseline_from_settings(Ok(None));
+        assert_eq!((none.model, none.forced_model, none.error), (None, None, None));
+        let no_env = baseline_from_settings(Ok(Some("{}".to_string())));
+        assert_eq!(no_env.error, None);
+        assert_eq!(no_env.model, None);
+    }
+
+    #[test]
+    fn baseline_surfaces_an_unreadable_or_corrupt_settings_file() {
+        let io = baseline_from_settings(Err("settings.json unreadable: denied".to_string()));
+        assert!(io.error.unwrap().contains("denied"));
+        let corrupt = baseline_from_settings(Ok(Some("{ not json".to_string())));
+        assert!(corrupt.error.unwrap().contains("not valid JSON"));
+        assert_eq!(corrupt.model, None);
+        let not_object = baseline_from_settings(Ok(Some("[1]".to_string())));
+        assert!(not_object.error.is_some());
+        let bad_value = baseline_from_settings(Ok(Some(
+            r#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":3}}"#.to_string(),
+        )));
+        assert!(bad_value.error.unwrap().contains("not a string"));
+    }
 
     #[test]
     fn frontmatter_reads_flat_keys() {

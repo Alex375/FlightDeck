@@ -10,6 +10,28 @@
 //! (WE open the URL via the opener plugin — deterministic, no double-open), parse the
 //! URL, keep the child + its stdin in [`ACTIVE_LOGIN`], and complete when the front
 //! submits the pasted code. One login at a time; a new start kills the previous child.
+//!
+//! ## Multiple accounts
+//! Every entry point takes an [`AccountSlot`] saying WHICH credential store to drive. The
+//! slot is applied as an environment variable on the `claude` child, so signing a second
+//! account in never touches the first one's credentials, nor the shared transcripts,
+//! settings, plugins, skills or MCP servers. It is NOT a full isolation, though: the CLI's
+//! login and logout both rewrite the account profile cache in the shared `~/.claude.json`
+//! (`oauthAccount` and a few model/usage caches), for every account at once. See [`slot`]
+//! for the verified mechanism, that shared-state effect and why it is tolerable, and why the
+//! default slot never gives the variable a value.
+//!
+//! ## Removal vs. sign-in vs. spawn
+//! Removing an account deletes the directory its Keychain item name is derived from, so it
+//! must never interleave with anything that is about to USE that slot: a sign-in (which
+//! would recreate the directory and write credentials nobody can address afterwards) or a
+//! session spawn (which would run on an account whose row is gone). [`account_use_guard`] /
+//! [`account_removal_guard`] serialize the two sides, and [`sign_in_busy_for`] tells the
+//! removal about a sign-in that is already past its start (awaiting or redeeming the code).
+
+pub mod slot;
+
+pub use slot::{AccountSlot, DEFAULT_ACCOUNT_ID};
 
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -34,6 +56,12 @@ pub struct ClaudeAccountStatus {
 
 /// The one in-flight `claude auth login` child (its stdin receives the pasted code).
 struct ActiveLogin {
+    /// WHICH account this login was started for (`None` = the default slot). The pasted
+    /// code MUST be matched against it: there is a single global in-flight login, but the
+    /// UI now shows one card per account, so without this check a code authorised for
+    /// account A could be written to account B's child — exchanging A's grant into B's
+    /// credential store and then labelling A with B's identity.
+    account_id: Option<String>,
     child: Child,
     stdin: ChildStdin,
     /// The child's stdout reader, HELD (never read again) for the child's whole lifetime.
@@ -54,6 +82,81 @@ static ACTIVE_LOGIN: Mutex<Option<ActiveLogin>> = Mutex::const_new(None);
 /// confusingly. Mirrors the Codex sibling's `LOGIN_FLOW` (its acute reason is a callback-port
 /// race; here it's the child/URL mismatch, but the fix is the same).
 static LOGIN_FLOW: Mutex<()> = Mutex::const_new(());
+
+/// The account-lifecycle lock: SHARED by everything that resolves an account slot and then
+/// puts it to use (session spawn, sign-in start, identity capture), EXCLUSIVE for removal.
+/// Without it, removal's "no session / no sign-in on this account" check and its row delete
+/// leave a window in which a spawn or a sign-in resolves the still-present row and then runs
+/// on an account that is being deleted.
+///
+/// Lock order (never take them the other way round — none of the later locks is ever held
+/// while acquiring an earlier one):
+/// `ACCOUNT_LIFECYCLE` → `LOGIN_FLOW` → `ACTIVE_LOGIN` → `REDEEMING`.
+/// Removal takes `ACCOUNT_LIFECYCLE` (write) then only `ACTIVE_LOGIN` → `REDEEMING` (via
+/// [`sign_in_busy_for`]); a sign-in start takes it (read) then `LOGIN_FLOW` → `ACTIVE_LOGIN`.
+static ACCOUNT_LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Hold while resolving an account slot AND putting it to use (spawning on it, starting its
+/// sign-in, persisting its identity), so a concurrent removal waits until the use is visible
+/// to its checks (a registered session, an in-flight login). Several uses run concurrently.
+/// ⚠️ Not re-entrant: never acquire it twice in one call chain (a queued removal would
+/// deadlock the second acquisition).
+pub async fn account_use_guard() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    ACCOUNT_LIFECYCLE.read().await
+}
+
+/// Hold across an account removal's whole check → sign-out → delete sequence (see
+/// [`ACCOUNT_LIFECYCLE`]).
+pub async fn account_removal_guard() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    ACCOUNT_LIFECYCLE.write().await
+}
+
+/// The accounts whose pasted code is being REDEEMED right now (`None` entry = the default
+/// slot). [`login_submit_code`] takes the login out of [`ACTIVE_LOGIN`] before waiting up to
+/// 90 s for the CLI to exchange the code and write the credentials — so without this, that
+/// most critical stretch would look like "no sign-in in flight" to a removal. A list, not a
+/// single slot: a new sign-in can start (and be submitted) while an older redemption is
+/// still settling.
+static REDEEMING: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+
+/// RAII entry in [`REDEEMING`], removed on every exit path of the redemption.
+struct RedeemingMark(Option<String>);
+
+impl RedeemingMark {
+    fn set(account_id: Option<String>) -> Self {
+        REDEEMING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(account_id.clone());
+        Self(account_id)
+    }
+}
+
+impl Drop for RedeemingMark {
+    fn drop(&mut self) {
+        let mut redeeming = REDEEMING.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = redeeming.iter().position(|id| *id == self.0) {
+            redeeming.swap_remove(idx);
+        }
+    }
+}
+
+/// Whether a sign-in for `account_id` (`None` = the default slot) is past its start: waiting
+/// for the pasted code, or redeeming it. Callers that must not race it (removal) hold
+/// [`account_removal_guard`], which already excludes a sign-in that is still STARTING.
+pub async fn sign_in_busy_for(account_id: Option<&str>) -> bool {
+    let active = ACTIVE_LOGIN.lock().await;
+    if active
+        .as_ref()
+        .is_some_and(|a| a.account_id.as_deref() == account_id)
+    {
+        return true;
+    }
+    // Read REDEEMING while still holding ACTIVE_LOGIN: `login_submit_code` moves a login from
+    // one to the other under that same lock, so no interleaving can see it in neither.
+    let redeeming = REDEEMING.lock().unwrap_or_else(|p| p.into_inner());
+    redeeming.iter().any(|id| id.as_deref() == account_id)
+}
 
 /// The `claude` binary, resolved like the session spawner (PATH, then well-known
 /// locations) so a Finder-launched bundle's minimal PATH still finds it.
@@ -80,12 +183,15 @@ const AUTH_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)
 /// Run a short-lived `claude auth …` command, bounded by [`AUTH_CMD_TIMEOUT`].
 /// `kill_on_drop` reaps the child when the timeout drops the in-flight future, so a
 /// hung CLI never accumulates as a stuck process across panel refetches.
-async fn run_bounded(label: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    let fut = Command::new(claude_bin())
-        .args(args)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
+async fn run_bounded(
+    slot: &AccountSlot,
+    label: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(claude_bin());
+    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    slot.apply(&mut cmd);
+    let fut = cmd.output();
     match tokio::time::timeout(AUTH_CMD_TIMEOUT, fut).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("could not run `{label}`: {e}")),
@@ -96,9 +202,18 @@ async fn run_bounded(label: &str, args: &[&str]) -> Result<std::process::Output,
     }
 }
 
-/// Read the auth status (`claude auth status --json`). Fast and read-only.
-pub async fn status() -> Result<ClaudeAccountStatus, String> {
-    let output = run_bounded("claude auth status", &["auth", "status", "--json"]).await?;
+/// Read ONE slot's auth status (`claude auth status --json`). Fast and read-only.
+///
+/// ⚠️ `email` / `org_name` come from the CLI's profile cache in the *config* dir
+/// (`.claude.json`), which our slots deliberately SHARE — so on a multi-account setup they
+/// describe whichever account signed in last, not necessarily this slot. VERIFIED live: a
+/// default credential store paired with an isolated config dir reported `loggedIn: true`
+/// while `email`/`orgId` came back `null`, proving the identity fields ride the config dir
+/// and the credentials ride the secure store. Callers must therefore label an account from
+/// the metadata captured at ITS OWN login (persisted by the store) and treat these two
+/// fields as a fallback only. `logged_in` and `subscription_type` DO belong to the slot.
+pub async fn status(slot: &AccountSlot) -> Result<ClaudeAccountStatus, String> {
+    let output = run_bounded(slot, "claude auth status", &["auth", "status", "--json"]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
         // The CLI answered something that isn't the JSON contract (crash text, update
@@ -124,22 +239,32 @@ pub async fn status() -> Result<ClaudeAccountStatus, String> {
 /// Start a login: spawn `claude auth login`, wait for the OAuth URL on stdout (bounded),
 /// keep the child for the code submission, return the URL for the front to open.
 /// Any previous in-flight login is killed first (one at a time).
-pub async fn login_start() -> Result<String, String> {
+/// `account_id` identifies the account this flow belongs to (`None` = the default slot);
+/// [`login_submit_code`] refuses a code submitted for any other one.
+pub async fn login_start(
+    slot: &AccountSlot,
+    account_id: Option<String>,
+) -> Result<String, String> {
     // Hold the flow lock across the WHOLE sequence (see LOGIN_FLOW). Call the INNER
     // `cancel_current` (not the public `login_cancel`, which also takes LOGIN_FLOW) to avoid
     // a self-deadlock, then keep the lock until ACTIVE_LOGIN is registered below.
     let _flow = LOGIN_FLOW.lock().await;
     cancel_current().await;
 
-    let mut child = Command::new(claude_bin())
-        .args(["auth", "login"])
+    // The isolated store must exist before the CLI writes its credentials into it.
+    slot.ensure_dir()?;
+
+    let mut cmd = Command::new(claude_bin());
+    cmd.args(["auth", "login"])
         // WE open the URL (opener plugin). `false` is a no-op executable on every unix,
         // so the CLI's own browser-open attempt does nothing instead of double-opening.
         .env("BROWSER", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    slot.apply(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not run `claude auth login`: {e}"))?;
 
@@ -175,21 +300,59 @@ pub async fn login_start() -> Result<String, String> {
         }
     };
 
-    *ACTIVE_LOGIN.lock().await = Some(ActiveLogin { child, stdin, _stdout: reader });
+    *ACTIVE_LOGIN.lock().await = Some(ActiveLogin {
+        account_id,
+        child,
+        stdin,
+        _stdout: reader,
+    });
     Ok(url)
+}
+
+/// Which account the in-flight login belongs to: `Some(None)` = the default slot,
+/// `Some(Some(id))` = that account, `None` = no login in flight. The front polls this to
+/// close the code box on a card whose flow was superseded, instead of leaving an input
+/// that would submit into someone else's login.
+pub async fn login_in_flight() -> Option<Option<String>> {
+    ACTIVE_LOGIN
+        .lock()
+        .await
+        .as_ref()
+        .map(|a| a.account_id.clone())
 }
 
 /// Submit the authorization code the user pasted. Consumes the in-flight login: writes
 /// the code to the child's stdin and waits for it to exit (bounded). Success = exit 0,
 /// re-checked by the caller via [`status`]. The code NEVER appears in any error text.
-pub async fn login_submit_code(code: &str) -> Result<(), String> {
+pub async fn login_submit_code(account_id: Option<&str>, code: &str) -> Result<(), String> {
     let code = code.trim();
     if code.is_empty() {
         return Err("the authorization code is empty".into());
     }
-    let Some(mut active) = ACTIVE_LOGIN.lock().await.take() else {
-        return Err("no Claude sign-in in progress — start \"Sign in\" again".into());
-    };
+    // Take the login only once it is confirmed to be THIS account's, so a mismatched
+    // submission leaves the real flow intact and retryable instead of consuming it.
+    let mut guard = ACTIVE_LOGIN.lock().await;
+    match guard.as_ref() {
+        None => {
+            return Err("no Claude sign-in in progress — start \"Sign in\" again".into());
+        }
+        // A different account's login is in flight: starting one kills the previous child,
+        // so the flow this code belongs to is already gone. Say so instead of writing the
+        // code into the wrong credential store.
+        Some(active) if active.account_id.as_deref() != account_id => {
+            return Err(
+                "this sign-in was superseded by one for another account — start \"Sign in\" \
+                 again for this account"
+                    .into(),
+            );
+        }
+        Some(_) => {}
+    }
+    let mut active = guard.take().expect("checked as Some above");
+    // Registered BEFORE releasing ACTIVE_LOGIN, so `sign_in_busy_for` never sees a gap
+    // between "awaiting the code" and "redeeming it". Cleared when this function returns.
+    let _redeeming = RedeemingMark::set(active.account_id.clone());
+    drop(guard);
     if let Err(e) = active.stdin.write_all(format!("{code}\n").as_bytes()).await {
         let _ = active.child.kill().await;
         return Err(format!("could not send the code: {e}"));
@@ -229,9 +392,10 @@ async fn cancel_current() {
     }
 }
 
-/// Log out (`claude auth logout`). The CLI clears its own credential store.
-pub async fn logout() -> Result<(), String> {
-    let output = run_bounded("claude auth logout", &["auth", "logout"]).await?;
+/// Log ONE slot out (`claude auth logout`). The CLI clears its own credential store — we
+/// never delete a Keychain item or a credentials file ourselves.
+pub async fn logout(slot: &AccountSlot) -> Result<(), String> {
+    let output = run_bounded(slot, "claude auth logout", &["auth", "logout"]).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -264,15 +428,58 @@ mod tests {
     /// input is rejected immediately with an actionable message.
     #[tokio::test]
     async fn submit_code_rejects_an_empty_code() {
-        let err = login_submit_code("   \n").await.expect_err("empty code must fail");
+        let err = login_submit_code(None, "   \n")
+            .await
+            .expect_err("empty code must fail");
         assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// A code may only be submitted to the login it was authorised for. There is ONE
+    /// global in-flight login but one card per account, so without this guard a code
+    /// pasted into account A's still-visible box would be written to account B's child —
+    /// redeeming A's grant into B's credential store and then labelling A with B's
+    /// identity. The mismatched attempt must also LEAVE the real flow intact.
+    #[tokio::test]
+    async fn submit_code_refuses_a_login_started_for_another_account() {
+        // Stand in for an in-flight login belonging to "acct-b" without spawning the CLI.
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stand-in child");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        *ACTIVE_LOGIN.lock().await = Some(ActiveLogin {
+            account_id: Some("acct-b".into()),
+            child,
+            stdin,
+            _stdout: BufReader::new(stdout).lines(),
+        });
+
+        for wrong in [None, Some("acct-c")] {
+            let err = login_submit_code(wrong, "code-for-b")
+                .await
+                .expect_err("a mismatched account must be refused");
+            assert!(err.contains("superseded"), "unexpected error: {err}");
+            assert!(!err.contains("code-for-b"), "code leaked into error: {err}");
+        }
+        // The real flow is untouched, so the right card can still complete it.
+        assert_eq!(login_in_flight().await, Some(Some("acct-b".into())));
+        // …and a removal of acct-b must see it as busy, while other accounts stay removable.
+        assert!(sign_in_busy_for(Some("acct-b")).await);
+        assert!(!sign_in_busy_for(Some("acct-c")).await);
+
+        login_cancel().await;
+        assert_eq!(login_in_flight().await, None);
+        assert!(!sign_in_busy_for(Some("acct-b")).await);
     }
 
     /// Submitting a code with no login in flight tells the user to restart the flow —
     /// and the pasted code NEVER leaks into the error text (module contract).
     #[tokio::test]
     async fn submit_code_without_a_login_in_flight_says_restart() {
-        let err = login_submit_code("sk-test-not-a-real-code")
+        let err = login_submit_code(None, "sk-test-not-a-real-code")
             .await
             .expect_err("no in-flight login must fail");
         assert!(err.contains("no Claude sign-in in progress"), "unexpected error: {err}");
@@ -284,10 +491,49 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs the real claude CLI"]
     async fn live_claude_account_status() {
-        let s = status().await.expect("auth status should parse");
+        let s = status(&AccountSlot::default_slot())
+            .await
+            .expect("auth status should parse");
         eprintln!(
             "claude account: logged_in={} method={:?} plan={:?}",
             s.logged_in, s.auth_method, s.subscription_type
+        );
+    }
+
+    /// PROBE (read-only): the load-bearing claim of the whole feature — an isolated slot
+    /// scopes the CREDENTIALS and nothing else. Against the real CLI this asserts:
+    ///   - the default slot is signed in (baseline; skipped if the user is signed out),
+    ///   - a fresh isolated slot reports `logged_in: false` — proving the credential store
+    ///     really is per-slot and not a global Keychain item,
+    ///   - the user's transcripts stay put: `projectsDirectory` is untouched by the slot,
+    ///     which is what `CLAUDE_CONFIG_DIR` would have broken.
+    /// Run: `cargo test --lib -- --ignored --nocapture live_isolated_slot_scopes_only_credentials`.
+    #[tokio::test]
+    #[ignore = "runs the real claude CLI"]
+    async fn live_isolated_slot_scopes_only_credentials() {
+        let base = status(&AccountSlot::default_slot())
+            .await
+            .expect("auth status should parse");
+        if !base.logged_in {
+            eprintln!("SKIP: the default account is signed out — nothing to contrast against");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("tosse-slot-probe-{}", std::process::id()));
+        let slot = AccountSlot::isolated(tmp.clone());
+        slot.ensure_dir().expect("probe dir");
+        let isolated = status(&slot).await.expect("auth status should parse");
+        let _ = slot.remove_dir();
+
+        assert!(
+            !isolated.logged_in,
+            "an isolated slot must NOT see the default account's credentials"
+        );
+        eprintln!(
+            "isolation OK — default logged_in={} / isolated logged_in={} (keychain item {:?})",
+            base.logged_in,
+            isolated.logged_in,
+            slot.keychain_service()
         );
     }
 }

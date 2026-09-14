@@ -51,6 +51,7 @@ import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
 import { OutputStyleChip } from "./OutputStyleChip";
+import { AccountChip } from "./AccountChip";
 import { isGoalCommand, markGoalSeen } from "../../store/goalStore";
 import { parseGoalCommand } from "./goalCommand";
 import {
@@ -1067,6 +1068,10 @@ export const ConductorComposer = forwardRef<
     // USER-GLOBAL Claude setting (not per-conversation): the chip reads and writes the one
     // global value, so picking here changes every conversation. Claude only — the bar's
     // backend filter keeps it off Codex, so no guard here.
+    // Claude account — which subscription this conversation's turns are billed against.
+    // Renders nothing while only one account exists, so a single-account setup is
+    // untouched. Separate from the model picker on purpose (what answers ≠ who pays).
+    account: <AccountChip session={session} />,
     outputStyle: <OutputStyleChip session={session} />,
     // Artifacts index — every artifact Claude published in THIS conversation, with its
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).

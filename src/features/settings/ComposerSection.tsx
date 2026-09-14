@@ -49,6 +49,7 @@ import {
 import { useComposerBar } from "../../store/composerBar";
 import { useDisplay } from "../../store/display";
 import {
+  AccountFace,
   ArtifactsFace,
   CleanOutputFace,
   CodexOptionsFace,
@@ -79,13 +80,17 @@ import "./composer-section.css";
 
 type PreviewBackend = "claude" | "codex";
 
-export function ComposerSection() {
+// `embedded` = rendered inside the Conversation tab's "Composer" sub-tab, which already
+// carries the tab-level PageHead, so this drops its own.
+export function ComposerSection({ embedded = false }: { embedded?: boolean }) {
   return (
     <div>
-      <PageHead
-        title="Composer"
-        subtitle="Arrange the bar under the message box: collapse controls to their icon, hide or reorder the right-hand ones, and add your own buttons."
-      />
+      {!embedded && (
+        <PageHead
+          title="Composer"
+          subtitle="Arrange the bar under the message box: collapse controls to their icon, hide or reorder the right-hand ones, and add your own buttons."
+        />
+      )}
       <BarArrangement />
       <LeftControls />
       <CustomButtons />
@@ -365,6 +370,10 @@ function chipFace(id: string, props: { icon?: string } & Record<string, unknown>
       return <CodexSpeedFace name="Speed" {...rest} />;
     case "codexOptions":
       return <CodexOptionsFace {...rest} />;
+    case "account":
+      // A representative label: the preview must read as a real control, and this chip
+      // only ever appears once a second account exists. Accounts are named by address.
+      return <AccountFace label="you@example.com" {...rest} />;
     case "outputStyle":
       // A representative non-default label so the chip reads as a real control here.
       return <OutputStyleFace label="Concise" {...rest} />;

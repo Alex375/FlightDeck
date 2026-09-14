@@ -13,8 +13,10 @@
 //! not a switch that lies (mirroring the voice-bridge honest-toggle rule).
 
 mod capture;
+mod debug;
 mod engine;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -39,11 +41,25 @@ pub struct WakeConfig {
     pub enabled: bool,
     pub phrase: String,
     pub sensitivity: f32,
+    /// Write a WAV + score trajectory for every fire (see `debug`). OFF by
+    /// default: it records microphone audio to disk, so it only ever runs on an
+    /// explicit opt-in, and it exists to make false positives reproducible.
+    pub debug_capture: bool,
+    /// Where those captures go. Supplied by the IPC layer (which owns the app
+    /// data dir) so this module stays free of Tauri types, exactly like
+    /// `on_detect`. `None` while debug capture is off.
+    pub debug_dir: Option<PathBuf>,
 }
 
 impl Default for WakeConfig {
     fn default() -> Self {
-        Self { enabled: false, phrase: DEFAULT_PHRASE.to_string(), sensitivity: 0.5 }
+        Self {
+            enabled: false,
+            phrase: DEFAULT_PHRASE.to_string(),
+            sensitivity: 0.5,
+            debug_capture: false,
+            debug_dir: None,
+        }
     }
 }
 
@@ -67,6 +83,15 @@ pub struct WakeStatus {
     pub error: Option<String>,
     /// The phrases the user can choose from (bundled classifiers).
     pub phrases: Vec<WakePhrase>,
+    /// Debug capture is on (every fire writes a WAV + score trajectory).
+    pub debug_capture: bool,
+    /// Where captures are written, so Settings can show and reveal the folder.
+    pub debug_dir: Option<String>,
+    /// Why the LAST capture did not get written. Separate from `error`, which is
+    /// about the detector itself: a failed dump must not read as a dead detector,
+    /// but it must not vanish either — the user is reproducing false positives
+    /// expecting evidence, and silence would let them do it for nothing.
+    pub debug_error: Option<String>,
 }
 
 fn phrase_catalogue() -> Vec<WakePhrase> {
@@ -91,8 +116,13 @@ struct Inner {
     phrase: String,
     sensitivity: f32,
     enabled: bool,
+    debug_capture: bool,
+    debug_dir: Option<PathBuf>,
     running: bool,
     error: Option<String>,
+    /// Shared with the worker thread, which is where captures are actually
+    /// written — `status()` reads whatever the last attempt left here.
+    debug_error: Arc<Mutex<Option<String>>>,
     stop: Option<Arc<AtomicBool>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -117,8 +147,11 @@ impl WakeController {
                 phrase: DEFAULT_PHRASE.to_string(),
                 sensitivity: 0.5,
                 enabled: false,
+                debug_capture: false,
+                debug_dir: None,
                 running: false,
                 error: None,
+                debug_error: Arc::new(Mutex::new(None)),
                 stop: None,
                 handle: None,
             }),
@@ -140,12 +173,33 @@ impl WakeController {
         self.stop_worker();
 
         let (phrase, sensitivity) = sanitize(&config.phrase, config.sensitivity);
+        // Prove the capture directory is usable NOW rather than at the first fire.
+        // A switch that reads "on" but cannot write is exactly the silent failure
+        // this feature exists to eliminate: the user would go on reproducing false
+        // positives, waiting for evidence that was never being written. Creating it
+        // eagerly also means Settings can always reveal the folder, empty or not.
+        let (debug_capture, debug_reason) =
+            match (config.debug_capture, config.debug_dir.as_deref()) {
+                (false, _) => (false, None),
+                (true, None) => (
+                    false,
+                    Some("no capture directory is available — captures cannot be written".into()),
+                ),
+                (true, Some(dir)) => match std::fs::create_dir_all(dir) {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(format!("could not create {}: {e}", dir.display()))),
+                },
+            };
+        let debug_error = Arc::new(Mutex::new(debug_reason));
         {
             let mut inner = self.inner.lock().unwrap();
             inner.phrase = phrase.clone();
             inner.sensitivity = sensitivity;
             inner.enabled = config.enabled;
+            inner.debug_capture = debug_capture;
+            inner.debug_dir = config.debug_dir.clone();
             inner.error = None;
+            inner.debug_error = debug_error.clone();
             inner.running = false;
         }
         if !config.enabled {
@@ -157,9 +211,16 @@ impl WakeController {
         let (report_tx, report_rx) = mpsc::channel::<Result<(), String>>();
         let stop_worker = stop.clone();
         let phrase_worker = phrase.clone();
+        let debug = DebugSink {
+            enabled: debug_capture,
+            dir: config.debug_dir.clone(),
+            last_error: debug_error,
+        };
         let handle = std::thread::Builder::new()
             .name("wake-detector".into())
-            .spawn(move || run_worker(phrase_worker, sensitivity, on_detect, stop_worker, report_tx))
+            .spawn(move || {
+                run_worker(phrase_worker, sensitivity, on_detect, debug, stop_worker, report_tx)
+            })
             .ok();
 
         {
@@ -206,6 +267,9 @@ impl WakeController {
 
     pub fn status(&self) -> WakeStatus {
         let inner = self.inner.lock().unwrap();
+        // Read the shared capture error into a local FIRST: its guard is a
+        // temporary that would otherwise outlive `inner` at the end of the block.
+        let debug_error = inner.debug_error.lock().unwrap().clone();
         WakeStatus {
             enabled: inner.enabled,
             phrase: inner.phrase.clone(),
@@ -213,6 +277,39 @@ impl WakeController {
             running: inner.running,
             error: inner.error.clone(),
             phrases: phrase_catalogue(),
+            debug_capture: inner.debug_capture,
+            debug_dir: inner.debug_dir.as_ref().map(|p| p.display().to_string()),
+            debug_error,
+        }
+    }
+}
+
+/// Everything the worker needs to dump a fire, kept together so `run_worker`'s
+/// signature stays readable.
+struct DebugSink {
+    enabled: bool,
+    dir: Option<PathBuf>,
+    /// Where a failed capture is recorded for `status()` to surface.
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+impl DebugSink {
+    /// Dump one detection, recording success or failure for Settings to read.
+    /// Never propagates: a capture problem must not take the detector down.
+    fn record(&self, phrase: &str, sensitivity: f32, detection: &engine::Detection) {
+        if !self.enabled {
+            return;
+        }
+        let Some(dir) = self.dir.as_deref() else { return };
+        match debug::write_capture(dir, phrase, sensitivity, detection) {
+            Ok(path) => {
+                eprintln!("[wake] debug capture written: {}", path.display());
+                *self.last_error.lock().unwrap() = None;
+            }
+            Err(e) => {
+                eprintln!("[wake] debug capture FAILED: {e}");
+                *self.last_error.lock().unwrap() = Some(e);
+            }
         }
     }
 }
@@ -224,12 +321,13 @@ fn run_worker(
     phrase: String,
     sensitivity: f32,
     on_detect: Option<Arc<DetectFn>>,
+    debug: DebugSink,
     stop: Arc<AtomicBool>,
     report: mpsc::Sender<Result<(), String>>,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
     let setup = (|| {
-        let engine = Engine::new(&phrase, sensitivity)?;
+        let engine = Engine::new(&phrase, sensitivity, debug.enabled)?;
         let capture = Capture::start(tx)?;
         Ok::<_, String>((engine, capture))
     })();
@@ -249,10 +347,29 @@ fn run_worker(
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
-                if let Some(score) = engine.feed(&chunk) {
-                    eprintln!("[wake] DETECTED phrase={} score={score:.3} → firing event", engine.phrase());
-                    if let Some(cb) = &on_detect {
-                        cb(engine.phrase(), score);
+                if let Some(detection) = engine.feed(&chunk) {
+                    match detection.suppressed_by {
+                        None => eprintln!(
+                            "[wake] DETECTED phrase={} score={:.3} → firing event",
+                            engine.phrase(),
+                            detection.score
+                        ),
+                        // Only reachable while debug capture is on, and only ever
+                        // dumped — a suppressed candidate must never reach the app.
+                        Some(gate) => eprintln!(
+                            "[wake] suppressed phrase={} score={:.3} by {gate}",
+                            engine.phrase(),
+                            detection.score
+                        ),
+                    }
+                    // Dump BEFORE firing: the callback hops into the webview and
+                    // opens a microphone, and the evidence for a false positive is
+                    // worth more than a few ms of trigger latency.
+                    debug.record(engine.phrase(), sensitivity, &detection);
+                    if detection.fired() {
+                        if let Some(cb) = &on_detect {
+                            cb(engine.phrase(), detection.score);
+                        }
                     }
                 }
             }
@@ -280,11 +397,73 @@ mod tests {
     #[test]
     fn disabled_apply_reports_not_running_without_error() {
         let ctrl = WakeController::new();
-        let st = ctrl.apply(WakeConfig { enabled: false, phrase: "alexa".into(), sensitivity: 0.5 });
+        let st = ctrl.apply(WakeConfig {
+            enabled: false,
+            phrase: "alexa".into(),
+            sensitivity: 0.5,
+            ..WakeConfig::default()
+        });
         assert!(!st.enabled);
         assert!(!st.running);
         assert!(st.error.is_none());
         assert_eq!(st.phrase, "alexa");
         assert!(st.phrases.iter().any(|p| p.key == "alexa"));
+    }
+
+    /// Asking for captures with nowhere to put them must SAY so. Reporting
+    /// `debug_capture: true` there would be a switch that lies: the user would
+    /// keep reproducing false positives waiting for files that never appear.
+    #[test]
+    fn debug_capture_without_a_directory_is_refused_and_explained() {
+        let ctrl = WakeController::new();
+        let st = ctrl.apply(WakeConfig {
+            enabled: false,
+            debug_capture: true,
+            debug_dir: None,
+            ..WakeConfig::default()
+        });
+        assert!(!st.debug_capture, "it is not on — there is nowhere to write");
+        assert!(
+            st.debug_error.as_deref().unwrap_or_default().contains("directory"),
+            "and the reason is legible: {:?}",
+            st.debug_error
+        );
+    }
+
+    /// With a directory, the opt-in takes effect and the folder is reported back
+    /// so Settings can show (and reveal) where the captures land.
+    #[test]
+    fn debug_capture_with_a_directory_is_accepted_and_reported() {
+        let ctrl = WakeController::new();
+        let dir = std::env::temp_dir().join("wake-debug-accepted");
+        let st = ctrl.apply(WakeConfig {
+            enabled: false,
+            debug_capture: true,
+            debug_dir: Some(dir.clone()),
+            ..WakeConfig::default()
+        });
+        assert!(st.debug_capture);
+        assert_eq!(st.debug_dir.as_deref(), Some(dir.display().to_string().as_str()));
+        assert!(st.debug_error.is_none());
+        assert!(dir.is_dir(), "the folder exists up front, so Settings can reveal it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A capture directory that cannot be created must turn the opt-in back OFF and
+    /// say why — never report `debug_capture: true` over a folder it cannot write.
+    #[test]
+    fn an_unusable_capture_directory_turns_the_opt_in_back_off() {
+        let blocker = std::env::temp_dir().join("wake-debug-blocker-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let ctrl = WakeController::new();
+        let st = ctrl.apply(WakeConfig {
+            enabled: false,
+            debug_capture: true,
+            debug_dir: Some(blocker.join("nested")), // a file cannot hold a folder
+            ..WakeConfig::default()
+        });
+        assert!(!st.debug_capture);
+        assert!(st.debug_error.is_some(), "the failure is reported, not swallowed");
+        let _ = std::fs::remove_file(&blocker);
     }
 }

@@ -89,9 +89,17 @@
 /* Whole-row attention tint + left accent bar (see agent/status.ts `rowAttention`).
    `need input` is the loudest (orange), then review (blue), then error (red).
    Placed after :hover/.on so the tint wins when an agent needs the user. */
-.cv-sess-row[data-attn="input"]  { background:var(--wf-att-bg);  box-shadow:inset 3px 0 0 var(--wf-att); }
-.cv-sess-row[data-attn="review"] { background:var(--wf-wait-bg); box-shadow:inset 3px 0 0 var(--wf-wait); }
-.cv-sess-row[data-attn="error"]  { background:var(--wf-err-bg);  box-shadow:inset 3px 0 0 var(--wf-err); }
+.cv-sess-row[data-attn="input"]  { --cv-attn:var(--wf-att);  --cv-attn-bg:var(--wf-att-bg); }
+.cv-sess-row[data-attn="review"] { --cv-attn:var(--wf-wait); --cv-attn-bg:var(--wf-wait-bg); }
+.cv-sess-row[data-attn="error"]  { --cv-attn:var(--wf-err);  --cv-attn-bg:var(--wf-err-bg); }
+.cv-sess-row[data-attn] { background:var(--cv-attn-bg); box-shadow:inset 3px 0 0 var(--cv-attn); }
+/* The open conversation must stay identifiable even while it carries a status: the tint
+   above replaces `.on`'s background, so the selected row gets a deeper wash of its own
+   status colour plus a thin ring in it — still that status, but visibly "the one open". */
+.cv-sess-row.on[data-attn] {
+  background:color-mix(in srgb, var(--cv-attn) 20%, var(--cv-attn-bg));
+  box-shadow:inset 3px 0 0 var(--cv-attn), inset 0 0 0 1px color-mix(in srgb, var(--cv-attn) 55%, transparent);
+}
 .cv-sess-row[data-attn]:hover { filter:brightness(1.12); }
 .cv-sess { flex:1; min-width:0; display:flex; align-items:center; gap:10px; padding:9px 10px; border:0; background:transparent; font:inherit; color:inherit; text-align:left; cursor:pointer; }
 /* Conversation name — sits at the NORMAL text weight/colour so it reads one clear rung
@@ -644,7 +652,14 @@
    box at rest (a :focus-visible ring is an outside box-shadow, so it goes first) and would make
    this a scroll container for any sticky descendant. Same reasoning as .cv-motion-in below,
    which arms its clip for the flight only. */
-.cv-collapse > * { min-height:0; }
+/* A grid item's automatic minimum size is its MIN-CONTENT size in BOTH axes, so the body
+   must be released on the inline axis too — otherwise a card inside the fold (a diff, whose
+   inner box is `width:max-content`; a code block; a table) widens the item past the reading
+   column, the card visibly juts out to the right and the whole thread scrolls horizontally.
+   Clean output is where this bites: it is the mode that puts FULL cards inside the fold,
+   whereas the same card outside is a flex item of `.cv-aibody` (column) — capped, its
+   content clipping or scrolling on its own. */
+.cv-collapse > * { min-height:0; min-width:0; }
 .cv-collapse:not([data-open]) > *,
 .cv-collapse[data-settling] > * { overflow:hidden; }
 
@@ -683,7 +698,9 @@
 .cv-motion { display:grid; grid-template-rows:1fr; }
 /* The clip is armed only for the flight: a permanent `overflow:hidden` would quietly cut
    anything a row draws outside its box at rest (focus ring, badge, shadow). */
-.cv-motion-in { min-height:0; display:flex; flex-direction:column; }
+/* `min-width:0` for the same reason as `.cv-collapse > *`: a grid item must not grow to
+   its min-content width and push a travelling card out of the reading column. */
+.cv-motion-in { min-height:0; min-width:0; display:flex; flex-direction:column; }
 .cv-motion[data-motion] .cv-motion-in { overflow:hidden; }
 .cv-motion[data-motion="exit"] .cv-motion-in { justify-content:flex-end; }
 .cv-motion[data-motion="exit"] {

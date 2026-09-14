@@ -23,6 +23,7 @@ export type LeftChipId =
 
 /** Right-hand controls: tools for the conversation. Hideable and reorderable. */
 export type RightChipId =
+  | "account"
   | "outputStyle"
   | "artifacts"
   | "extensions"
@@ -75,6 +76,11 @@ export const LEFT_CHIPS: readonly ChipDescriptor[] = [
 
 /** Right side, in DEFAULT order (the user's arrangement overrides it). */
 export const RIGHT_CHIPS: readonly ChipDescriptor[] = [
+  // The Claude ACCOUNT this conversation runs on. Deliberately its own control rather than
+  // a section of the model picker: the model is what answers, the account is who pays for
+  // it — folding them together would make one look like a variant of the other.
+  { id: "account", side: "right", label: "Claude account", icon: "users", backend: "claude",
+    condition: "Only when more than one Claude account is signed in" },
   { id: "outputStyle", side: "right", label: "Output style", icon: "pencil", backend: "claude" },
   { id: "artifacts", side: "right", label: "Artifacts", icon: "artifact", backend: "claude",
     condition: "Only once this conversation has published an artifact" },

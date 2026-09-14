@@ -1,16 +1,28 @@
-// "Voice agent" card of the Control tab: the in-app voice assistant (OpenAI
-// Realtime). Strictly optional — the whole card revolves around whether an
-// OpenAI key is stored (Keychain, via the Rust `voice` module): without one,
-// the talk/announcement features stay locked with the reason spelled out, and
-// the rest of the app never touches the module. Key handling is honest: save
+// "Voice agent" cards of the Control tab: the in-app voice assistant (OpenAI
+// Realtime). Strictly optional — everything revolves around whether an OpenAI
+// key is stored (Keychain, via the Rust `voice` module): without one, the
+// talk/announcement features stay locked with the reason spelled out, and the
+// rest of the app never touches the module. Key handling is honest: save
 // verifies by read-back Rust-side, and the UI only ever shows the masked hint.
+//
+// Three cards rather than one long stack: what the agent IS (key, voice, brief),
+// the MICROPHONE (how you talk to it), and the WAKE WORD (how it starts
+// listening on its own).
 import { useCallback, useEffect, useState } from "react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { commands, type VoiceAgentStatus, type WakeStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
 import { useWakeStore } from "../../voice/wakeStore";
 import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
-import { applyVadSettings } from "../../voice/realtime";
+import { applyInstructions, applyVadSettings, applyVoiceSelection } from "../../voice/realtime";
+import { DEFAULT_VOICE_INSTRUCTIONS, isCustomInstructions } from "../../voice/instructions";
 import { VadMeter } from "../../voice/VadMeter";
+import {
+  VAD_THRESHOLD_MAX,
+  VAD_THRESHOLD_MIN,
+  type VadEagerness,
+  type VadInterrupt,
+} from "../../voice/vad";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -19,6 +31,12 @@ export function VoiceAgentSection() {
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
   const pttShortcut = useVoicePrefs((s) => s.pttShortcut);
   const vadThreshold = useVoicePrefs((s) => s.vadThreshold);
+  const vadMode = useVoicePrefs((s) => s.vadMode);
+  const vadEagerness = useVoicePrefs((s) => s.vadEagerness);
+  const vadInterrupt = useVoicePrefs((s) => s.vadInterrupt);
+  const settingsNote = useVoiceStore((s) => s.settingsNote);
+  const voice = useVoicePrefs((s) => s.voice);
+  const instructions = useVoicePrefs((s) => s.instructions);
   const setPrefs = useVoicePrefs((s) => s.set);
 
   const [status, setStatus] = useState<VoiceAgentStatus | null>(null);
@@ -28,6 +46,13 @@ export function VoiceAgentSection() {
   const [closeDraft, setCloseDraft] = useState<string | null>(null);
   const [wake, setWake] = useState<WakeStatus | null>(null);
   const [wakeBusy, setWakeBusy] = useState(false);
+  // What happened to the last voice change: a live session can only adopt a new
+  // voice by re-arming (it is fixed at mint time), and that is only safe while
+  // it is idle. Saying which of the two happened beats a silent "maybe".
+  const [voiceNote, setVoiceNote] = useState<string | null>(null);
+  // The prompt box is a draft until it loses focus: committing on every keystroke
+  // would push a session.update per character.
+  const [promptDraft, setPromptDraft] = useState<string | null>(null);
 
   // Every status learned here also lands in the SHARED voiceStore mirror, so
   // the title-bar chip (and ⌘⇧V / the announcement gate) update immediately —
@@ -62,7 +87,12 @@ export function VoiceAgentSection() {
   }, []);
 
   const applyWake = useCallback(
-    async (patch: { enabled?: boolean; phrase?: string; sensitivity?: number }) => {
+    async (patch: {
+      enabled?: boolean;
+      phrase?: string;
+      sensitivity?: number;
+      debugCapture?: boolean;
+    }) => {
       setWakeBusy(true);
       setError(null);
       try {
@@ -70,6 +100,7 @@ export function VoiceAgentSection() {
           patch.enabled ?? null,
           patch.phrase ?? null,
           patch.sensitivity ?? null,
+          patch.debugCapture ?? null,
         );
         if (res.status === "ok") {
           setWake(res.data);
@@ -113,6 +144,30 @@ export function VoiceAgentSection() {
       setBusy(false);
     }
   }, [publish]);
+
+  /** Store the picked voice, then tell the truth about when it will be heard. */
+  const pickVoice = useCallback(async (next: string) => {
+    setPrefs({ voice: next });
+    setVoiceNote(null);
+    const outcome = await applyVoiceSelection();
+    setVoiceNote(
+      outcome === "rearmed"
+        ? "Applied — the voice session was re-armed."
+        : outcome === "rearm-failed"
+          ? "The session could not be re-armed with the new voice — it is off now; the reason is on the voice button."
+          : "Applies to the next voice session (the voice is fixed when a session starts).",
+    );
+  }, [setPrefs]);
+
+  /** Commit the prompt draft and push it to a live session (instructions, unlike
+   *  the voice, change mid-session). */
+  const commitPrompt = useCallback(() => {
+    if (promptDraft === null) return;
+    const next = promptDraft;
+    setPromptDraft(null);
+    setPrefs({ instructions: next });
+    applyInstructions();
+  }, [promptDraft, setPrefs]);
 
   // Shortcut recorder: while recording, the NEXT clean key gesture becomes the
   // push-to-talk shortcut — a lone modifier tap (captured on its keyup, only if
@@ -164,182 +219,430 @@ export function VoiceAgentSection() {
   }, [closeDraft, setPrefs]);
 
   const configured = !!status?.configured;
+  const customPrompt = isCustomInstructions(instructions);
 
   return (
-    <SettingsGroup title="Voice agent" icon="mic">
-      <ToggleRow
-        title="OpenAI API key"
-        hint={
-          <>
-            The voice agent runs on OpenAI Realtime (speech in, speech out, billed by OpenAI
-            per audio minute). The key is stored in the macOS Keychain and never leaves this
-            Mac — sessions use short-lived tokens. Flight Deck works fully without one; only
-            the voice features need it.
-            {error ? <div className={styles.dangerText}>⚠️ {error}</div> : null}
-          </>
-        }
-        control={
-          configured ? (
+    <>
+      <SettingsGroup title="Voice agent" icon="mic">
+        <ToggleRow
+          title="OpenAI API key"
+          hint={
+            <>
+              The voice agent runs on OpenAI Realtime (speech in, speech out, billed by OpenAI
+              per audio minute). The key is stored in the macOS Keychain and never leaves this
+              Mac — sessions use short-lived tokens. Flight Deck works fully without one; only
+              the voice features need it.
+              {error ? <div className={styles.dangerText}>⚠️ {error}</div> : null}
+            </>
+          }
+          control={
+            configured ? (
+              <span className={styles.tokenRow}>
+                <span className={styles.mono}>{status?.key_hint ?? "configured"}</span>
+                <button
+                  className={`${styles.btn} ${styles.ghost}`}
+                  onClick={() => void removeKey()}
+                  disabled={busy}
+                >
+                  Remove
+                </button>
+              </span>
+            ) : (
+              <span className={styles.tokenRow}>
+                <input
+                  className={styles.keyInput}
+                  type="password"
+                  placeholder="sk-…"
+                  value={keyDraft}
+                  onChange={(e) => setKeyDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void saveKey();
+                  }}
+                  disabled={busy}
+                  aria-label="OpenAI API key"
+                />
+                <button
+                  className={`${styles.btn} ${styles.primary}`}
+                  onClick={() => void saveKey()}
+                  disabled={busy || !keyDraft.trim()}
+                >
+                  {busy ? "Saving…" : "Save"}
+                </button>
+              </span>
+            )
+          }
+        />
+        <ToggleRow
+          title="Voice"
+          hint={
+            <>
+              Which OpenAI voice the agent speaks with. It is chosen when a session starts, so a
+              change lands on the next one — unless the session is idle right now, in which case
+              it is re-armed immediately.
+              {voiceNote ? <div className={styles.thintInline}>{voiceNote}</div> : null}
+            </>
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={voice || status?.default_voice || ""}
+              onChange={(e) => void pickVoice(e.target.value)}
+              disabled={!configured || !status}
+              aria-label="Voice"
+            >
+              {(status?.voices ?? []).map((v) => (
+                <option key={v.key} value={v.key}>
+                  {v.label}
+                </option>
+              ))}
+            </select>
+          }
+        />
+        <ToggleRow
+          title="What the agent is told"
+          hint={
+            <>
+              The agent&rsquo;s brief: how it speaks and how it uses the app. It ships
+              deliberately terse — one fact per sentence, no « c&rsquo;est bon, je reviens vers
+              toi ». Rewrite it to make it chattier, more formal, or to pin it to one language.
+              An empty box means the built-in brief, so clearing it is the reset. Edits reach a
+              live session right away.
+              <textarea
+                className={styles.promptBox}
+                value={promptDraft ?? instructions}
+                placeholder={DEFAULT_VOICE_INSTRUCTIONS}
+                onChange={(e) => setPromptDraft(e.target.value)}
+                onBlur={commitPrompt}
+                disabled={!configured}
+                spellCheck={false}
+                aria-label="Voice agent instructions"
+              />
+              <span className={styles.tokenRow}>
+                <button
+                  className={`${styles.btn} ${styles.ghost}`}
+                  onClick={() => {
+                    setPromptDraft(null);
+                    setPrefs({ instructions: "" });
+                    applyInstructions();
+                  }}
+                  disabled={!configured || (!customPrompt && promptDraft === null)}
+                >
+                  Reset to the default brief
+                </button>
+                <button
+                  className={`${styles.btn} ${styles.ghost}`}
+                  onClick={() => setPromptDraft(DEFAULT_VOICE_INSTRUCTIONS)}
+                  disabled={!configured}
+                  title="Copy the built-in brief into the box so you can edit it"
+                >
+                  Start from the default
+                </button>
+                <span className={styles.thintInline}>
+                  {promptDraft !== null
+                    ? "Unsaved — click outside the box to apply"
+                    : customPrompt
+                      ? "Custom brief"
+                      : "Built-in brief"}
+                </span>
+              </span>
+            </>
+          }
+        />
+        <ToggleRow
+          title="Voice session & announcements"
+          hint={
+            configured
+              ? "Arm the voice session with the headset button in the title bar. While armed, fleet events (a turn finished, an agent waits on you) are announced aloud and the microphone opens for your reply; the mic button (or the key below) opens and closes the mic at any time. Telling the agent you're done closes the mic — the session stays armed."
+              : "Add an OpenAI key above to enable the voice agent."
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Microphone" icon="mic">
+        {settingsNote ? <div className={styles.note}>{settingsNote}</div> : null}
+        <ToggleRow
+          title="Push-to-talk key"
+          hint="Opens / closes the microphone (arms the session first if needed). A lone modifier works as a tap — press and release it by itself. Click Change, then press the key you want; Escape cancels."
+          control={
             <span className={styles.tokenRow}>
-              <span className={styles.mono}>{status?.key_hint ?? "configured"}</span>
+              <span className={styles.mono}>
+                {recording ? "Press a key…" : describePtt(pttShortcut)}
+              </span>
               <button
                 className={`${styles.btn} ${styles.ghost}`}
-                onClick={() => void removeKey()}
-                disabled={busy}
+                onClick={() => setRecording((r) => !r)}
+                disabled={!configured}
               >
-                Remove
+                {recording ? "Cancel" : "Change"}
               </button>
             </span>
-          ) : (
+          }
+        />
+        <ToggleRow
+          title="Close the mic after silence"
+          hint="The microphone closes by itself after this many seconds without speech — the cost and privacy guard. The armed session stays up (it exchanges no audio while the mic is closed)."
+          control={
             <span className={styles.tokenRow}>
               <input
-                className={styles.keyInput}
-                type="password"
-                placeholder="sk-…"
-                value={keyDraft}
-                onChange={(e) => setKeyDraft(e.target.value)}
+                className={styles.portInput}
+                inputMode="numeric"
+                value={closeDraft ?? String(autoCloseSeconds)}
+                onChange={(e) => setCloseDraft(e.target.value.replace(/[^0-9]/g, ""))}
+                onBlur={commitAutoClose}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void saveKey();
+                  if (e.key === "Enter") commitAutoClose();
                 }}
-                disabled={busy}
-                aria-label="OpenAI API key"
+                disabled={!configured}
+                aria-label="Seconds of silence before hanging up"
               />
-              <button
-                className={`${styles.btn} ${styles.primary}`}
-                onClick={() => void saveKey()}
-                disabled={busy || !keyDraft.trim()}
-              >
-                {busy ? "Saving…" : "Save"}
-              </button>
+              <span className={styles.thintInline}>s</span>
             </span>
-          )
-        }
-      />
-      <ToggleRow
-        title="Voice session & announcements"
-        hint={
-          configured
-            ? "Arm the voice session with the headset button in the title bar. While armed, fleet events (a turn finished, an agent waits on you) are announced aloud and the microphone opens for your reply; the mic button (or the key below) opens and closes the mic at any time. Telling the agent you're done closes the mic — the session stays armed."
-            : "Add an OpenAI key above to enable the voice agent."
-        }
-      />
-      <ToggleRow
-        title="Push-to-talk key"
-        hint="Opens / closes the microphone (arms the session first if needed). A lone modifier works as a tap — press and release it by itself. Click Change, then press the key you want; Escape cancels."
-        control={
-          <span className={styles.tokenRow}>
-            <span className={styles.mono}>{recording ? "Press a key…" : describePtt(pttShortcut)}</span>
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => setRecording((r) => !r)}
-              disabled={!configured}
-            >
-              {recording ? "Cancel" : "Change"}
-            </button>
-          </span>
-        }
-      />
-      <ToggleRow
-        title="Close the mic after silence"
-        hint="The microphone closes by itself after this many seconds without speech — the cost and privacy guard. The armed session stays up (it exchanges no audio while the mic is closed)."
-        control={
-          <span className={styles.tokenRow}>
-            <input
-              className={styles.portInput}
-              inputMode="numeric"
-              value={closeDraft ?? String(autoCloseSeconds)}
-              onChange={(e) => setCloseDraft(e.target.value.replace(/[^0-9]/g, ""))}
-              onBlur={commitAutoClose}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") commitAutoClose();
-              }}
-              disabled={!configured}
-              aria-label="Seconds of silence before hanging up"
-            />
-            <span className={styles.thintInline}>s</span>
-          </span>
-        }
-      />
-      <ToggleRow
-        title="Voice detection threshold"
-        hint={
-          <>
-            How loud speech must be before the agent starts listening. Drag the handle right to
-            make it less sensitive — it then ignores background noise and faint sounds, so it
-            won&rsquo;t cut in or interrupt on stray sound. Drag left to pick up quieter speech.
-            You can still interrupt the agent by speaking.
-            <VadMeter
-              threshold={vadThreshold}
-              onThresholdChange={(v) => {
-                setPrefs({ vadThreshold: v });
+          }
+        />
+        <ToggleRow
+          title="Cutting the agent off"
+          hint={
+            <>
+              <b>Let it finish</b> means nothing stops it mid-sentence. You can still speak over
+              it &mdash; what you say is answered once it is done, rather than over the top.
+              <br />
+              <b>By speaking</b> is the old behaviour, and the reason this setting exists: any
+              sound the detector took for speech stopped the agent, which in a room with a
+              dishwasher in it meant every ten to thirty seconds.
+              <br />
+              <b>With the wake word</b> makes the phrase your deliberate stop button. It is by far
+              the strictest judge available &mdash; a specific phrase, twice over, and only if
+              your microphone heard actual speech &mdash; so it does not fire on a room.
+              {vadInterrupt === "wake" && !wake?.enabled ? (
+                <div className={styles.dangerText}>
+                  &#9888;&#65039; The wake word is switched off below, so nothing can interrupt the
+                  agent right now.
+                </div>
+              ) : null}
+            </>
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={vadInterrupt}
+              onChange={(e) => {
+                setPrefs({ vadInterrupt: e.target.value as VadInterrupt });
                 applyVadSettings();
               }}
-              valueClassName={styles.mono}
-              buttonClassName={`${styles.btn} ${styles.ghost}`}
               disabled={!configured}
-            />
-          </>
-        }
-      />
-      <ToggleRow
-        title="Wake word"
-        hint={
-          configured ? (
+              aria-label="What may interrupt the agent"
+            >
+              <option value="never">Let it finish (recommended)</option>
+              <option value="wake">With the wake word</option>
+              <option value="speech">By speaking</option>
+            </select>
+          }
+        />
+        <ToggleRow
+          title="How it knows you have stopped"
+          hint={
             <>
-              Say the wake word to open the microphone hands-free (like “OK Google”). It runs
-              fully on-device — the audio never leaves this Mac, nothing is sent anywhere. Off by
-              default; while on, the microphone listens continuously (the macOS mic indicator stays
-              lit).
-              {wake?.error ? <div className={styles.dangerText}>⚠️ {wake.error}</div> : null}
+              <b>By meaning</b> asks whether what you said sounds finished, so a sound carrying
+              no words is not treated as your turn at all. This is the one to use if the room is
+              not silent &mdash; a loudness gate cannot tell a plate from a word at any setting,
+              and set to its strictest it still let a dishwasher cut the agent off.
+              <br />
+              <b>By loudness</b> is the older behaviour: anything above a level counts as you
+              speaking. It gives you a number to turn, and it will react to noise.
             </>
-          ) : (
-            "Add an OpenAI key above first — the wake word opens the voice agent."
-          )
-        }
-        checked={!!wake?.enabled}
-        onChange={(next) => void applyWake({ enabled: next })}
-        disabled={!configured || !wake || wakeBusy}
-      />
-      <ToggleRow
-        title="Wake phrase"
-        hint="What you say to trigger it. “Alexa” is the most robust to a French accent; switch to “Hey Jarvis” if an Amazon Echo nearby keeps waking."
-        control={
-          <select
-            className={styles.mono}
-            value={wake?.phrase ?? "alexa"}
-            onChange={(e) => void applyWake({ phrase: e.target.value })}
-            disabled={!configured || !wake || !wake.enabled || wakeBusy}
-            aria-label="Wake phrase"
-          >
-            {(wake?.phrases ?? []).map((p) => (
-              <option key={p.key} value={p.key}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        }
-      />
-      <ToggleRow
-        title="Sensitivity"
-        hint="Higher catches the phrase more easily but risks false triggers; lower is stricter. A false trigger is harmless — it just opens the mic, which closes itself on silence."
-        control={
-          <span className={styles.tokenRow}>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={wake?.sensitivity ?? 0.5}
-              onChange={(e) => void applyWake({ sensitivity: Number(e.target.value) })}
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={vadMode}
+              onChange={(e) => {
+                setPrefs({ vadMode: e.target.value as "semantic" | "loudness" });
+                applyVadSettings();
+              }}
+              disabled={!configured}
+              aria-label="Turn detection mode"
+            >
+              <option value="semantic">By meaning (recommended)</option>
+              <option value="loudness">By loudness</option>
+            </select>
+          }
+        />
+        {vadMode === "semantic" ? (
+          <ToggleRow
+            title="How soon it decides you are done"
+            hint="Patient lets you pause mid-sentence, or think out loud, without being cut off — best when your hands are busy with something else. Quick replies sooner, at the cost of interrupting a pause."
+            control={
+              <select
+                className={styles.mono}
+                value={vadEagerness}
+                onChange={(e) => {
+                  setPrefs({ vadEagerness: e.target.value as VadEagerness });
+                  applyVadSettings();
+                }}
+                disabled={!configured}
+                aria-label="How soon the agent decides you have finished speaking"
+              >
+                <option value="low">Patient (recommended)</option>
+                <option value="medium">Balanced</option>
+                <option value="high">Quick</option>
+              </select>
+            }
+          />
+        ) : (
+          <ToggleRow
+            title="Loudness threshold"
+            hint={
+              <>
+                How loud audio must be to count as you speaking. Higher takes more convincing;
+                lower picks up more, including things you did not mean for it.
+                <br />
+                It is an amplitude gate, so it cannot tell speech from any other loud sound. If
+                the agent reacts to your room rather than to you, the fix is the mode above, not
+                a higher number here.
+              </>
+            }
+            control={
+              <span className={styles.tokenRow}>
+                <input
+                  type="range"
+                  min={VAD_THRESHOLD_MIN}
+                  max={VAD_THRESHOLD_MAX}
+                  step={0.05}
+                  value={vadThreshold}
+                  onChange={(e) => {
+                    setPrefs({ vadThreshold: Number(e.target.value) });
+                    applyVadSettings();
+                  }}
+                  disabled={!configured}
+                  aria-label="Loudness threshold"
+                />
+                <span className={styles.mono}>{vadThreshold.toFixed(2)}</span>
+              </span>
+            }
+          />
+        )}
+        <ToggleRow
+          title="Microphone check"
+          hint={
+            <>
+              The level the agent actually receives, through the same microphone settings its
+              session uses. It answers &ldquo;is the right input selected and is it hearing
+              me&rdquo; &mdash; not &ldquo;where should the threshold go&rdquo;, which this bar
+              cannot tell you.
+              <VadMeter
+                buttonClassName={`${styles.btn} ${styles.ghost}`}
+                disabled={!configured}
+              />
+            </>
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Wake word" icon="spark">
+        <ToggleRow
+          title="Listen for the wake word"
+          hint={
+            configured ? (
+              <>
+                Say the wake word to open the microphone hands-free (like “OK Google”). It runs
+                fully on-device — the audio never leaves this Mac, nothing is sent anywhere. Off by
+                default; while on, the microphone listens continuously (the macOS mic indicator stays
+                lit).
+                {wake?.error ? <div className={styles.dangerText}>⚠️ {wake.error}</div> : null}
+              </>
+            ) : (
+              "Add an OpenAI key above first — the wake word opens the voice agent."
+            )
+          }
+          checked={!!wake?.enabled}
+          onChange={(next) => void applyWake({ enabled: next })}
+          disabled={!configured || !wake || wakeBusy}
+        />
+        <ToggleRow
+          title="Wake phrase"
+          hint="What you say to trigger it. “Alexa” is the most robust to a French accent; switch to “Hey Jarvis” if an Amazon Echo nearby keeps waking."
+          control={
+            <select
+              className={styles.mono}
+              value={wake?.phrase ?? "alexa"}
+              onChange={(e) => void applyWake({ phrase: e.target.value })}
               disabled={!configured || !wake || !wake.enabled || wakeBusy}
-              aria-label="Wake word sensitivity"
-            />
-            <span className={styles.thintInline}>
-              {Math.round((wake?.sensitivity ?? 0.5) * 100)}%
+              aria-label="Wake phrase"
+            >
+              {(wake?.phrases ?? []).map((p) => (
+                <option key={p.key} value={p.key}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          }
+        />
+        <ToggleRow
+          title="Sensitivity"
+          hint="Higher catches the phrase more easily but risks false triggers; lower is stricter. A false trigger is harmless — it just opens the mic, which closes itself on silence."
+          control={
+            <span className={styles.tokenRow}>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={wake?.sensitivity ?? 0.5}
+                onChange={(e) => void applyWake({ sensitivity: Number(e.target.value) })}
+                disabled={!configured || !wake || !wake.enabled || wakeBusy}
+                aria-label="Wake word sensitivity"
+              />
+              <span className={styles.thintInline}>
+                {Math.round((wake?.sensitivity ?? 0.5) * 100)}%
+              </span>
             </span>
-          </span>
-        }
-      />
-    </SettingsGroup>
+          }
+        />
+        <ToggleRow
+          title="Record false triggers"
+          hint={
+            <>
+              Save what the wake word heard: a short audio clip plus the step-by-step
+              confidence scores behind it. Recordings marked <code>blocked</code> are
+              near-triggers a safeguard caught before they woke anything &mdash; they are
+              how you tell &ldquo;the safeguards are working&rdquo; from &ldquo;the
+              safeguards are swallowing me&rdquo;. Turn this on to investigate triggers you
+              did not ask for, or a phrase that stopped being heard. Everything stays on
+              this Mac and nothing is sent anywhere, but it does write microphone audio to
+              disk, so leave it off unless you are chasing a problem. Only the last 40 are
+              kept.
+              {wake?.debug_capture && wake.debug_dir ? (
+                <div className={styles.tokenRow}>
+                  <span className={styles.mono}>{wake.debug_dir}</span>
+                  <button
+                    type="button"
+                    className={`${styles.btn} ${styles.ghost}`}
+                    onClick={() => {
+                      // A reveal that quietly does nothing would be its own small lie —
+                      // say so instead.
+                      void revealItemInDir(wake.debug_dir as string).catch((e: unknown) =>
+                        setError(
+                          `could not open the recordings folder: ${
+                            e instanceof Error ? e.message : String(e)
+                          }`,
+                        ),
+                      );
+                    }}
+                  >
+                    Show in Finder
+                  </button>
+                </div>
+              ) : null}
+              {wake?.debug_error ? (
+                <div className={styles.dangerText}>&#9888;&#65039; {wake.debug_error}</div>
+              ) : null}
+            </>
+          }
+          checked={!!wake?.debug_capture}
+          onChange={(next) => void applyWake({ debugCapture: next })}
+          disabled={!configured || !wake || !wake.enabled || wakeBusy}
+        />
+      </SettingsGroup>
+    </>
   );
 }

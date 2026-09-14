@@ -26,21 +26,42 @@
 import { commands } from "../ipc/client";
 import { executeAppControlTool, type AppControlHelpers } from "../agent/appControl";
 import { agentRemoveConversationsEnabled } from "../store/appControl";
-import { useVoicePrefs } from "./voicePrefs";
+import { currentVadSettings, useVoicePrefs } from "./voicePrefs";
 import { useVoiceStore } from "./voiceStore";
-import { announcementText, clearVoiceAnnouncements, type FleetAnnouncement } from "./announce";
+import {
+  announcementText,
+  clearVoiceAnnouncements,
+  pendingVoiceAnnouncements,
+  type FleetAnnouncement,
+} from "./announce";
 import { buildTurnDetection } from "./vad";
+import { useAppErrors } from "../store/appErrors";
+import {
+  SETTING_EVENT_PREFIX,
+  SETTING_REJECTED_NOTE,
+  UNEXPECTED_ERROR_MESSAGE,
+  classifyServerError,
+  type RealtimeErrorPayload,
+} from "./serverErrors";
+import { openVoiceMic } from "./mic";
+import { resolveInstructions } from "./instructions";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
 /** The tool subset the voice agent gets — conversation piloting + showing
  *  things on screen. `wait_for_events` excluded (events are PUSHED as spoken
  *  announcements), `whoami` excluded (a voice caller has no own conversation),
- *  `notify_user` excluded (it IS the notification). */
+ *  `notify_user` excluded (it IS the notification).
+ *  `get_pending_request` + `answer_request` included so the voice agent can READ
+ *  a question (AskUserQuestion) and answer it by voice — a dictated answer rides
+ *  in as the question's "Other" choice. Answering a QUESTION needs no opt-in;
+ *  the executor keeps real permission prompts behind Settings → Control. */
 const VOICE_TOOL_NAMES = new Set([
   "list_conversations",
   "read_conversation",
   "send_message",
+  "get_pending_request",
+  "answer_request",
   "create_conversation",
   "browse_folders",
   "focus_conversation",
@@ -63,24 +84,26 @@ function voiceToolAllowed(name: string): boolean {
 
 /** Session-local tool (NOT in the shared catalogue): ends the current voice
  *  EXCHANGE — closes the microphone; the armed session stays up for the next
- *  fleet event. */
+ *  fleet event. The mic closes the instant it is called and NO reply is
+ *  requested: the sign-off is silent by construction (see `runToolCall`). */
 const END_CALL_TOOL = {
   type: "function",
   name: "end_call",
   description:
-    "Close the microphone and end the current exchange. Call it when the user says they are " +
-    "done (« c'est bon », « merci, c'est tout », « raccroche », “that's all”). The voice " +
-    "session stays armed — you will still announce future fleet events. Say a brief goodbye " +
-    "in your response BEFORE calling it.",
+    "Close the microphone and end the current exchange. Call it whenever the user signs off — " +
+    "« c'est bon », « merci, c'est tout », « raccroche », « au revoir », « salut », « à plus », " +
+    "“that's all”, “bye”. Say NOTHING when you call it: closing the microphone is the " +
+    "acknowledgement, and a spoken goodbye is exactly the noise this agent must not make. The " +
+    "voice session stays armed — you will still announce future fleet events.",
   parameters: { type: "object", properties: {}, required: [] },
 };
 
-const INSTRUCTIONS = `You are Flight Deck's voice agent — the cockpit voice for the fleet of coding agents (conversations) the user runs in the Flight Deck desktop app.
-Style: spoken and brief — one to three short sentences, unless the user asks you to read details. Match the user's spoken language (this user usually speaks French).
-Ground everything in the tools: list_conversations for the LIVE ones on the board, read_conversation before summarizing a reply, send_message to relay the user's answer (name the target conversation before sending when there could be any doubt). When the user refers to a past conversation that isn't on the active list, find it with search_past_conversations and bring it back with reopen_conversation. Never invent conversation ids or content.
-When a [Flight Deck event] message arrives, tell the user what happened in one or two sentences, then ask if they want to react — their microphone was just opened for the reply.
-Once the user has heard about a conversation and no longer needs it flagged, call acknowledge_conversation to clear its attention highlight. If they ask to clear a conversation off their board, call remove_conversation — it only takes it off the active list (the history is kept and it's undoable), so reassure them nothing is lost.
-When the user says they are done with you, say a short goodbye and call end_call. When they ask to work in a folder you don't know, orient yourself with browse_folders before asking them to spell out a path.`;
+/** The brief this session runs with: the user's own prompt when they wrote one,
+ *  the built-in default otherwise (see instructions.ts). Read at each use, never
+ *  cached — an edit in Settings applies to the NEXT `session.update` we send. */
+function sessionInstructions(): string {
+  return resolveInstructions(useVoicePrefs.getState().instructions);
+}
 
 interface LiveSession {
   pc: RTCPeerConnection;
@@ -102,8 +125,28 @@ interface LiveSession {
   /** One-shot listeners flushed on every `response.done` and on teardown; each
    *  waiter also self-removes on its own timeout (no stale resolvers). */
   responseWaiters: Array<() => void>;
-  /** `end_call` was invoked: close the MIC once the goodbye finishes playing. */
-  endPending: boolean;
+  /** Event ids of the setting updates we sent, so a server error that echoes one
+   *  is known to be about a SETTING — and nothing else is ever blamed on one.
+   *  Bounded: only the most recent few can still be answered. */
+  settingEvents: Set<string>;
+}
+
+/** How many recent setting-update ids to remember. The server answers within a
+ *  round trip; anything older cannot come back. */
+const SETTING_EVENTS_KEPT = 16;
+let settingEventSeq = 0;
+
+/** Send a `session.update` tagged so a refusal can be traced back to it. */
+function sendSettingUpdate(s: LiveSession, session: Record<string, unknown>): void {
+  const eventId = `${SETTING_EVENT_PREFIX}${++settingEventSeq}`;
+  s.settingEvents.add(eventId);
+  while (s.settingEvents.size > SETTING_EVENTS_KEPT) {
+    const oldest = s.settingEvents.values().next().value;
+    if (oldest === undefined) break;
+    s.settingEvents.delete(oldest);
+  }
+  useVoiceStore.getState().setSettingsNote(null);
+  dcSend(s, { type: "session.update", event_id: eventId, session });
 }
 
 let session: LiveSession | null = null;
@@ -169,7 +212,7 @@ export async function openMic(): Promise<boolean> {
   }
   let mic: MediaStream;
   try {
-    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic = await openVoiceMic();
   } catch (e) {
     const message =
       e instanceof DOMException && e.name === "NotAllowedError"
@@ -213,19 +256,73 @@ export function closeMic(): void {
   if (store.phase === "listening") store.setPhase("armed");
 }
 
+/**
+ * Stop the agent mid-sentence, now.
+ *
+ * Both halves are needed and they are not the same thing: `response.cancel` stops
+ * the model GENERATING, while `output_audio_buffer.clear` drops the audio already
+ * sent and sitting in the WebRTC playout buffer. Cancel alone leaves it talking
+ * through whatever it had queued, which reads as the interrupt not working.
+ *
+ * Used by the wake-word interrupt mode, where the app decides rather than the
+ * server: the wake detector is a far stricter judge of "the user meant to speak"
+ * than any turn detector — a specific phrase, two consecutive steps over 0.90,
+ * vetoed unless Silero agrees it was speech at all.
+ */
+export function interruptAgent(): void {
+  const s = session;
+  if (!s) return;
+  if (useVoiceStore.getState().phase !== "speaking") return;
+  dcSend(s, { type: "response.cancel" });
+  dcSend(s, { type: "output_audio_buffer.clear" });
+}
+
 /** Push the current VAD threshold to the LIVE session, so the Settings slider
  *  takes effect without re-arming. No-op when nothing is connected (the next
  *  arm reads the pref on `dc.onopen`). */
 export function applyVadSettings(): void {
   const s = session;
   if (!s) return;
-  dcSend(s, {
-    type: "session.update",
-    session: {
-      type: "realtime",
-      audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
-    },
+  sendSettingUpdate(s, {
+    type: "realtime",
+    audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
   });
+}
+
+/** Push a freshly edited system prompt to the LIVE session. Instructions (unlike
+ *  the voice) CAN change mid-session, so an edit in Settings is felt on the very
+ *  next thing the agent says. No-op when nothing is connected — the next arm
+ *  reads the preference on `dc.onopen`. */
+export function applyInstructions(): void {
+  const s = session;
+  if (!s) return;
+  sendSettingUpdate(s, { type: "realtime", instructions: sessionInstructions() });
+}
+
+/**
+ * Adopt a newly picked voice. It is fixed at MINT time (OpenAI will not swap a
+ * voice mid-call), so the only way to change it is a new session: re-arm right
+ * away when the armed session is idle — mic closed, nothing being spoken, no
+ * announcement waiting to be drained. Anything else is left alone and the next
+ * arm picks the voice up: cutting someone off mid-sentence for a cosmetic change
+ * would be the worse trade.
+ *
+ * Resolves to what actually happened, because all three outcomes are things the
+ * user should be told apart: it was applied now, it will apply later, or the
+ * re-arm failed and they are left with no session (the reason is on the chip).
+ */
+export type VoiceSelectionOutcome = "rearmed" | "next-session" | "rearm-failed";
+
+export async function applyVoiceSelection(): Promise<VoiceSelectionOutcome> {
+  const s = session;
+  if (!s) return "next-session";
+  const { phase, micOpen } = useVoiceStore.getState();
+  const idle =
+    phase === "armed" && !micOpen && s.activeResponses === 0 && pendingVoiceAnnouncements() === 0;
+  if (!idle) return "next-session";
+  teardownSession();
+  await armVoiceSession().catch(() => {});
+  return session !== null ? "rearmed" : "rearm-failed";
 }
 
 // ---- Session plumbing -------------------------------------------------------
@@ -239,7 +336,11 @@ async function doStart(): Promise<void> {
   let audioEl: HTMLAudioElement | null = null;
   try {
     // 1. Short-lived credential + the tool catalogue (single source: Rust).
-    const secretRes = await commands.voiceAgentClientSecret();
+    // The voice is fixed at mint time (OpenAI won't swap it mid-session); an
+    // empty preference means "the app default", which Rust owns.
+    const secretRes = await commands.voiceAgentClientSecret(
+      useVoicePrefs.getState().voice || null,
+    );
     if (secretRes.status !== "ok") throw new Error(secretRes.error);
     const secret = secretRes.data;
     const toolsRes = await commands.appControlTools("app");
@@ -296,7 +397,7 @@ async function doStart(): Promise<void> {
       idleTimer: null,
       activeResponses: 0,
       responseWaiters: [],
-      endPending: false,
+      settingEvents: new Set(),
     };
     // A rejected `ready` is normal teardown; never let it surface as unhandled.
     void ready.catch(() => {});
@@ -309,10 +410,10 @@ async function doStart(): Promise<void> {
         type: "session.update",
         session: {
           type: "realtime",
-          instructions: INSTRUCTIONS,
+          instructions: sessionInstructions(),
           tools,
           tool_choice: "auto",
-          audio: { input: { turn_detection: buildTurnDetection(useVoicePrefs.getState().vadThreshold) } },
+          audio: { input: { turn_detection: buildTurnDetection(currentVadSettings()) } },
         },
       });
       useVoiceStore.getState().setPhase("armed");
@@ -453,22 +554,11 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
       s.activeResponses += 1;
       break;
     case "output_audio_buffer.stopped":
-      if (s.endPending) {
-        s.endPending = false;
-        closeMic();
-        break;
-      }
       store.setPhase(restingPhase());
       break;
     case "response.done": {
       s.activeResponses = Math.max(0, s.activeResponses - 1);
-      // A goodbye that produced no audio at all still ends the exchange here.
-      if (s.endPending && store.phase !== "speaking") {
-        s.endPending = false;
-        closeMic();
-      } else if (store.phase !== "speaking") {
-        store.setPhase(restingPhase());
-      }
+      if (store.phase !== "speaking") store.setPhase(restingPhase());
       s.responseWaiters.slice().forEach((w) => w());
       break;
     }
@@ -481,11 +571,24 @@ function handleEvent(s: LiveSession, ev: { type?: string } & Record<string, unkn
       }
       break;
     }
-    case "error":
-      // Protocol-level errors are logged, not fatal — the connection state
-      // change handler decides when the session is actually dead.
+    case "error": {
+      // Not fatal — the connection-state handler decides when a session is dead.
+      // Sorted by what CAUSED the error (see serverErrors.ts): the technical text
+      // always goes to the log, and never to the screen.
+      const error = ev.error as RealtimeErrorPayload | undefined;
+      const outcome = classifyServerError(error, s.settingEvents);
+      if (outcome.kind === "benign") {
+        console.warn("voice: absorbed server race", ev);
+        break;
+      }
       console.error("voice: server error event", ev);
+      if (outcome.kind === "setting-rejected") {
+        useVoiceStore.getState().setSettingsNote(SETTING_REJECTED_NOTE);
+      } else {
+        useAppErrors.getState().pushError(UNEXPECTED_ERROR_MESSAGE);
+      }
       break;
+    }
     default:
       break;
   }
@@ -501,21 +604,17 @@ async function runToolCall(
   rawArgs: string,
 ): Promise<void> {
   if (name === "end_call") {
-    // Let the model say its goodbye, then close the MIC when it finishes
-    // playing (handleEvent) — with a hard fallback so a silent goodbye can't
-    // leave the capture open. The armed session itself stays up.
-    s.endPending = true;
+    // Close the MIC immediately and ask for NO reply. The earlier version sent a
+    // `response.create` here and waited for the goodbye's audio to finish before
+    // closing — so the app itself commissioned the « à la prochaine » it was
+    // supposed to be free of, and held the microphone open for the length of it.
+    // The tool result still goes back (the model must see its call resolved), it
+    // just doesn't get a turn to speak. The armed session stays up.
     dcSend(s, {
       type: "conversation.item.create",
       item: { type: "function_call_output", call_id: callId, output: JSON.stringify({ ok: true }) },
     });
-    dcSend(s, { type: "response.create" });
-    setTimeout(() => {
-      if (session === s && s.endPending) {
-        s.endPending = false;
-        closeMic();
-      }
-    }, 15_000);
+    closeMic();
     return;
   }
   let output: unknown;
@@ -528,12 +627,34 @@ async function runToolCall(
     output = { error: e instanceof Error ? e.message : String(e) };
   }
   if (session !== s) return; // the session ended while the tool ran
+  // The output goes in FIRST, before any wait: a response that starts from here
+  // on — ours or one the server creates from the user speaking — then carries it.
   dcSend(s, {
     type: "conversation.item.create",
     item: { type: "function_call_output", call_id: callId, output: JSON.stringify(output ?? null) },
   });
-  dcSend(s, { type: "response.create" });
+  await requestResponse(s);
   armIdleTimer(s);
+}
+
+/**
+ * Ask the model to speak — once the server is free to.
+ *
+ * ⚠️ This used to fire `response.create` the moment a tool finished, and a tool
+ * call is reported by `response.output_item.done` while the response CONTAINING
+ * it is still open (`response.done` follows). App-control tools run locally in
+ * milliseconds, so the request routinely landed first and was refused with
+ * "Conversation already has an active response in progress". The refusal was the
+ * only trace: the agent performed the action and never said so. Waiting for quiet
+ * is the same bounded wait announcements already use.
+ */
+async function requestResponse(s: LiveSession): Promise<void> {
+  const quietBy = Date.now() + 30_000;
+  while (session === s && s.activeResponses > 0 && Date.now() < quietBy) {
+    await waitEvent(s, 5_000);
+  }
+  if (session !== s) return;
+  dcSend(s, { type: "response.create" });
 }
 
 /**

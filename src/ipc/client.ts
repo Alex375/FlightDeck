@@ -7,6 +7,7 @@ export { commands, events, isTauri } from "./provider";
 
 export type {
   AccountLoginEvent,
+  AccountProfile,
   AgentInfo,
   BackgroundTask,
   BackgroundTaskKind,
@@ -17,7 +18,10 @@ export type {
   ConversationItem,
   ConversationRecord,
   DiskConversation,
+  ClaudeAccountRecord,
   ClaudeAccountStatus,
+  ClaudeIdentity,
+  ClaudeLoginInFlight,
   CodexAccountStatus,
   CodexHooksSnapshot,
   CodexLoginStart,

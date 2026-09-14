@@ -512,9 +512,17 @@
   border-color: var(--ts-archived-line);
   opacity: 0.8;
 }
+/* ⚠️ `flex: 0 0 auto` + `nowrap` are load-bearing, not decoration. These buttons sit in
+   flex rows (the task row, the detail panel's footer) where a flex item's default
+   `flex-shrink: 1` lets the row squeeze them below their own text: at that point the label
+   wraps onto two or three lines and spills out of the fixed 22px height. A button keeps its
+   width; when a row runs out of room it is the ROW that gives (the footer wraps, see
+   `.detailFoot`), never the label. */
 .act {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
+  white-space: nowrap;
   height: 22px;
   padding: 0 9px;
   border-radius: var(--wf-r);
@@ -523,6 +531,15 @@
   color: var(--wf-tx-lo);
   font-size: 11px;
   cursor: pointer;
+}
+/* An `.act` reduced to its icon (the detail panel's footer). Square when it carries the
+   icon alone, and merely tighter when a count rides along — a fixed width would clip the
+   second digit. */
+.actIcon {
+  min-width: 22px;
+  justify-content: center;
+  padding: 0 5px;
+  gap: 4px;
 }
 .act:hover:not(:disabled) { color: var(--wf-tx-hi); border-color: var(--wf-tx-xlo); }
 .act:disabled { opacity: 0.5; cursor: default; }
@@ -815,6 +832,10 @@
 .detailActs {
   display: inline-flex;
   align-items: center;
+  /* Doesn't shrink either: the footer wraps a whole GROUP onto the next line rather than
+     narrowing this box under buttons that no longer give (see `.act`), which would only
+     have moved the overflow one level down. */
+  flex: 0 0 auto;
   gap: 6px;
 }
 
@@ -1027,14 +1048,28 @@
   color: var(--wf-tx-lo);
   margin-bottom: 8px;
 }
+/* Wraps rather than crushes. The panel is resizable down to 380px and is also hosted by the
+   conversation's side region, which is narrower still — and its buttons now refuse to shrink
+   (see `.act`). So when the row runs out of width, the LINE breaks: a second row of whole
+   buttons, never a row of broken labels. The row-gap is tighter than the column gap on
+   purpose, so a wrapped footer still reads as one block. */
 .detailFoot {
   margin-top: auto;
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   border-top: 1px solid var(--wf-line);
   padding: 14px 22px;
   flex: 0 0 auto;
+}
+/* The footer's right-hand end — the way out to the CRM, or the sentence that replaces it
+   when the CRM is unreachable. Its own auto margin (not a spacer element) is what keeps it
+   at the right end of whichever line it lands on once the footer wraps. */
+.detailOut {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
 }
 
 /* ---- "open in TOSSE" -------------------------------------------------- */
@@ -1045,6 +1080,9 @@
 .openIcon {
   display: inline-flex;
   align-items: center;
+  /* Same guard as `.act`: squeezed, « Open in TOSSE » broke onto two lines. */
+  flex: 0 0 auto;
+  white-space: nowrap;
   gap: 6px;
   height: 22px;
   border-radius: var(--wf-r);

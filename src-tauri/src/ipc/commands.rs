@@ -35,6 +35,15 @@ pub struct Pong {
 struct LiveSession {
     backend: Backend,
     handle: SessionHandle,
+    /// Which Claude account this process authenticated as (`None` = the default,
+    /// un-scoped account). Recorded at spawn because it can never change afterwards, and
+    /// because a control request that reports *subscription* figures is only meaningful
+    /// for the account that served it.
+    claude_account_id: Option<String>,
+    /// The process runs on a REMOTE (SSH) server. Its `claude` authenticates with the
+    /// SERVER's own credential store, whatever account the Mac-side record says, so its
+    /// `get_usage` answers for an account this Mac does not hold — never offer it for one.
+    is_remote: bool,
 }
 
 /// Tauri managed state: the registry of live sessions, keyed by our own id.
@@ -58,8 +67,23 @@ impl Sessions {
         self.inner.lock().unwrap().get(id).map(|s| s.handle.clone())
     }
 
-    fn insert(&self, id: String, backend: Backend, handle: SessionHandle) {
-        self.inner.lock().unwrap().insert(id, LiveSession { backend, handle });
+    fn insert(
+        &self,
+        id: String,
+        backend: Backend,
+        handle: SessionHandle,
+        claude_account_id: Option<String>,
+        is_remote: bool,
+    ) {
+        self.inner.lock().unwrap().insert(
+            id,
+            LiveSession {
+                backend,
+                handle,
+                claude_account_id,
+                is_remote,
+            },
+        );
     }
 
     fn remove(&self, id: &str) -> Option<SessionHandle> {
@@ -74,19 +98,32 @@ impl Sessions {
         self.inner.lock().unwrap().values().map(|s| s.handle.clone()).collect()
     }
 
-    /// Snapshot the live CLAUDE handles, in a DETERMINISTIC (session-id) order. A
-    /// control request only the Claude CLI answers must never be aimed at whatever
-    /// handle the `HashMap` happens to yield first: with a Codex conversation open too,
-    /// the pick — and therefore the outcome — would change from one app run to the next.
-    /// The order is for reproducibility, not ranking: every Claude session reports the
-    /// same account-wide answer.
-    fn claude_handles(&self) -> Vec<SessionHandle> {
+    /// Snapshot the live CLAUDE handles running on ONE account, in a DETERMINISTIC
+    /// (session-id) order. A control request only the Claude CLI answers must never be
+    /// aimed at whatever handle the `HashMap` happens to yield first: with a Codex
+    /// conversation open too, the pick — and therefore the outcome — would change from one
+    /// app run to the next.
+    ///
+    /// ⚠️ The account filter is load-bearing, not cosmetic. `get_usage` reports the
+    /// SUBSCRIPTION figures of the account that served it, so with two accounts signed in,
+    /// asking an arbitrary Claude session would answer the ring with another account's
+    /// quota — a wrong number that looks entirely plausible, and one the auto-switch would
+    /// then act on. Within one account the order is for reproducibility, not ranking:
+    /// those sessions do all report the same answer.
+    ///
+    /// ⚠️ REMOTE (SSH) sessions are excluded for EVERY account, the default one included.
+    /// They are recorded with no account (the launcher cannot carry one), so without this
+    /// they would match `None` and the default account's ring would show the SERVER
+    /// account's quota — the same plausible-but-wrong number the account filter prevents.
+    fn claude_handles_for(&self, account_id: Option<&str>) -> Vec<SessionHandle> {
         let mut claude: Vec<SessionHandle> = self
             .inner
             .lock()
             .unwrap()
             .values()
             .filter(|s| matches!(s.backend, Backend::Claude))
+            .filter(|s| !s.is_remote)
+            .filter(|s| s.claude_account_id.as_deref() == account_id)
             .map(|s| s.handle.clone())
             .collect();
         claude.sort_by(|a, b| a.id.cmp(&b.id));
@@ -115,6 +152,33 @@ fn unknown_session() -> String {
     "unknown session".to_string()
 }
 
+/// Now, as Unix milliseconds. Used to stamp records the store persists.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn-time choices that can only be applied when the process starts, bundled into one
+/// argument. They travel together because they share that property — and because specta
+/// caps a command at 10 parameters, which [`spawn_session`] had already reached.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnFlags {
+    /// The xhigh + orchestration tier. Not a spawn flag of its own: the session
+    /// re-enables it over the control channel right after `initialize`.
+    pub ultracode: bool,
+    /// UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
+    /// it on (Settings → General → Permissions).
+    pub allow_bypass_permissions: bool,
+    /// Advertise the in-process "flightdeck" MCP server to this session (Settings →
+    /// Control), giving its agent the app-piloting tools.
+    pub app_control: bool,
+    /// Which Claude account to authenticate as; `None` = the default, un-scoped store.
+    pub claude_account_id: Option<String>,
+}
+
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
 /// controls (model / effort / permission mode / ultracode) at spawn so the live
 /// stream starts in EXACTLY the state the UI shows — never the old hardcoded
@@ -130,6 +194,12 @@ fn unknown_session() -> String {
 /// to THIS session: its agent gains the app-piloting tools (open files, create/message
 /// conversations, …). Claude-only (Codex has no SDK-server channel) and, like the
 /// bypass unlock, decided at spawn — the `initialize` handshake advertises it once.
+///
+/// `claude_account_id` (inside [`SpawnFlags`]) picks WHICH Claude account the process runs
+/// on — `None` is the CLI's own, un-scoped credential store, i.e. the unchanged
+/// single-account behaviour. Like the two flags above it can only be decided at spawn: the
+/// CLI reads its credentials once at startup, so changing account means re-spawning with
+/// `--resume` (safe — the account scopes only the credential store, never the transcript).
 #[tauri::command]
 #[specta::specta]
 pub async fn spawn_session(
@@ -139,11 +209,15 @@ pub async fn spawn_session(
     model: Option<String>,
     effort: Option<String>,
     permission_mode: Option<String>,
-    ultracode: bool,
     backend: Backend,
-    allow_bypass_permissions: bool,
-    app_control: bool,
+    flags: SpawnFlags,
 ) -> Result<String, String> {
+    let SpawnFlags {
+        ultracode,
+        allow_bypass_permissions,
+        app_control,
+        claude_account_id,
+    } = flags;
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -160,6 +234,19 @@ pub async fn spawn_session(
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
+    // Held from resolving the account slot until the session is REGISTERED below, so a
+    // concurrent account removal either runs before we resolve (→ "unknown account" here)
+    // or sees this session in the registry and refuses. Nothing below awaits, so a queued
+    // removal waits only for this synchronous spawn. See `accounts::ACCOUNT_LIFECYCLE`.
+    let _account_use = crate::accounts::account_use_guard().await;
+    // Which Claude account this process authenticates as. An id naming an account the
+    // user has since removed must NOT silently fall back to another identity: resolving
+    // is fallible and the error names the id, so the UI can say why the session refused
+    // to start instead of quietly burning the wrong account's quota. The composer remedy
+    // is added here, where it is the right advice (the helper stays context-neutral).
+    cfg.claude_account = claude_slot(&app, claude_account_id.as_deref()).map_err(|e| {
+        format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
+    })?;
     // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
@@ -189,9 +276,22 @@ pub async fn spawn_session(
     // Route this session to its remote server when the repo is remote. Claude-only for
     // now: the Codex backend has its own local-only transport, so a "remote" Codex
     // conversation would silently run on THIS Mac — refuse it loudly instead.
+    let is_remote = remote_machine.is_some();
     if let Some(machine) = remote_machine {
         if matches!(backend, Backend::Codex) {
             return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
+        }
+        // The slot is an environment variable on a LOCAL child; `build_remote_command`
+        // exports nothing of the sort, so the daemon's `claude` authenticates with the
+        // SERVER's own credential store. Accepting an account here would run the session
+        // on one identity while the UI (and `claude_handles_for`, and the usage ring)
+        // claimed another — refuse it instead of quietly lying about which plan is paying.
+        if claude_account_id.is_some() {
+            return Err(
+                "Remote (SSH) conversations run on the server's own Claude account — \
+                 set this conversation back to the default account."
+                    .to_string(),
+            );
         }
         // A dedicated known_hosts under the app data dir, so pinning a server's host
         // key never touches the user's ~/.ssh/known_hosts.
@@ -259,7 +359,22 @@ pub async fn spawn_session(
         }
     }
     .map_err(|e| e.to_string())?;
-    sessions.insert(id.clone(), backend, handle);
+    // Remember WHICH account this process authenticated as, so a later `get_usage` is only
+    // ever aimed at a session that can answer for the account being asked about. Codex
+    // sessions have no Claude account: record `None` and let the backend filter do the rest.
+    // A remote session is flagged as such: it authenticates on the SERVER, so it answers for
+    // no account of this Mac, the default one included (see `claude_handles_for`).
+    sessions.insert(
+        id.clone(),
+        backend,
+        handle,
+        match backend {
+            // A remote session is refused above unless its account is None.
+            Backend::Claude if !is_remote => claude_account_id,
+            _ => None,
+        },
+        is_remote,
+    );
     Ok(id)
 }
 
@@ -489,28 +604,383 @@ pub async fn codex_marketplace_upgrade(name: Option<String>) -> Result<(), Strin
 // ── Accounts (Claude & Codex) — status / login / logout in-app. The credential stores
 // stay OWNED by the CLIs (`claude auth`, `codex app-server account/*`): the app never
 // reads/writes `~/.claude/.credentials.json`, the Keychain item, or `~/.codex/auth.json`.
+//
+// Claude supports SEVERAL accounts. Each one is a `crate::accounts::AccountSlot` — an
+// isolated credential store, scoped by an environment variable on the `claude` child, that
+// leaves the shared `~/.claude` (transcripts, settings, plugins, skills, MCP) untouched.
+// `account_id: None` everywhere below means the CLI's own un-scoped store: the account the
+// user already had, whose behaviour is unchanged.
 
-/// The signed-in Claude account (`claude auth status --json`), whitelisted.
-#[tauri::command]
-#[specta::specta]
-pub async fn account_claude_status() -> Result<crate::accounts::ClaudeAccountStatus, String> {
-    crate::accounts::status().await
+/// Resolve an optional account id to the slot to drive. A `Some(id)` naming an account
+/// that no longer exists is an ERROR, never a silent fall back to the default: quietly
+/// switching identity would spend the wrong subscription's quota with nothing shown.
+fn claude_slot(
+    app: &tauri::AppHandle,
+    account_id: Option<&str>,
+) -> Result<crate::accounts::AccountSlot, String> {
+    let Some(id) = account_id else {
+        return Ok(crate::accounts::AccountSlot::default_slot());
+    };
+    if id == crate::accounts::DEFAULT_ACCOUNT_ID {
+        return Ok(crate::accounts::AccountSlot::default_slot());
+    }
+    let known = app
+        .state::<Store>()
+        .list_claude_accounts()
+        .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
+    if !known.iter().any(|a| a.id == id) {
+        // Context-NEUTRAL and naming the id: this helper also backs the Settings-side
+        // status / login / logout / capture commands, where composer wording would be
+        // nonsense. Each caller appends its own remedy.
+        return Err(format!("unknown Claude account {id}"));
+    }
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir available: {e}"))?;
+    crate::accounts::AccountSlot::for_account(&data_dir, id)
 }
 
-/// Start a Claude login: spawns `claude auth login`, returns the OAuth URL to open.
-/// The flow completes when the user pastes the authorization code
-/// ([`account_claude_login_code`]) — or is dropped by [`account_claude_login_cancel`].
+/// The Claude accounts the user added, in display order. The default account is NOT in
+/// this list — it always exists and the UI renders it from `account_claude_status(None)`.
 #[tauri::command]
 #[specta::specta]
-pub async fn account_claude_login_start() -> Result<String, String> {
-    crate::accounts::login_start().await
+pub async fn claude_accounts_list(
+    store: tauri::State<'_, Store>,
+) -> Result<Vec<crate::store::ClaudeAccountRecord>, String> {
+    store
+        .list_claude_accounts()
+        .map_err(|e| format!("could not read the Claude accounts: {e}"))
+}
+
+/// Register a NEW Claude account: mints its id, creates its isolated credential store and
+/// persists the row. Signing in is a separate step (`account_claude_login_start` with this
+/// id) — an account exists as an empty, signed-out slot until then, which is exactly what
+/// the UI shows.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_create(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<crate::store::ClaudeAccountRecord, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir available: {e}"))?;
+    let store = app.state::<Store>();
+    let existing = store
+        .list_claude_accounts()
+        .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let slot = crate::accounts::AccountSlot::for_account(&data_dir, &id)?;
+    slot.ensure_dir()?;
+    let label = label.trim();
+    let record = crate::store::ClaudeAccountRecord {
+        id,
+        label: if label.is_empty() {
+            // `+ 2`: the default account always exists and has no row, so the first ADDED
+            // account is the user's second one ("Account 2").
+            format!("Account {}", existing.len() + 2)
+        } else {
+            label.to_string()
+        },
+        email: None,
+        org_name: None,
+        subscription_type: None,
+        sort_index: existing.iter().map(|a| a.sort_index).max().unwrap_or(0) + 1,
+        added_at: now_ms(),
+        // Only a placeholder may later be replaced by the captured email.
+        label_is_generated: label.is_empty(),
+    };
+    store
+        .upsert_claude_account(&record)
+        .map_err(|e| format!("could not save the Claude account: {e}"))?;
+    Ok(record)
+}
+
+/// Where the DEFAULT account's captured identity is stored. It has no row of its own (it is
+/// the CLI's store, not one the app created), so it lives as one `meta` entry.
+const DEFAULT_IDENTITY_KEY: &str = "claude_default_identity";
+
+/// The non-sensitive identity of a Claude account — never a token.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeIdentity {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub subscription_type: Option<String>,
+}
+
+/// The DEFAULT account's identity as captured at ITS OWN sign-in, or `null` if it was never
+/// captured (it was signed in outside the app, or before this existed).
+///
+/// ⚠️ It cannot be read live once a second account exists: `claude auth status` answers from
+/// a profile cache every account SHARES, so it would name whichever account signed in last.
+/// The UI shows this stored value instead of a plausible-looking wrong address.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_default_identity(
+    store: tauri::State<'_, Store>,
+) -> Result<Option<ClaudeIdentity>, String> {
+    let raw = store
+        .get_config(DEFAULT_IDENTITY_KEY)
+        .map_err(|e| format!("could not read the default account's identity: {e}"))?;
+    // A stored value that no longer parses is a real failure, not "never captured": folding
+    // it into `None` would silently drop the identity and relabel the account as unknown.
+    raw.map(|s| {
+        serde_json::from_str(&s).map_err(|e| {
+            format!(
+                "the default account's saved identity is corrupt ({e}) — sign the default \
+                 account in again to capture it afresh"
+            )
+        })
+    })
+    .transpose()
+}
+
+/// One Claude account's identity — address, organization, plan — read with ITS OWN token
+/// (see `usage::profile`). This is what the UI names every account by: unlike
+/// `claude auth status`, whose profile cache all accounts share, it cannot answer with
+/// another account's address. `account_id: None` = the default account.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_identity(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<crate::usage::profile::AccountProfile, UsageError> {
+    let slot = claude_slot(&app, account_id.as_deref()).map_err(|detail| {
+        // Same typing as the usage command: a removed account is permanent, not a blip.
+        match account_id.clone() {
+            Some(id) if detail.starts_with("unknown Claude account") => {
+                UsageError::UnknownAccount { account_id: id }
+            }
+            _ => UsageError::Network { detail },
+        }
+    })?;
+    crate::usage::profile::fetch_profile_for(&slot).await
+}
+
+/// Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
+/// non-sensitive metadata (never a token). `account_id: None` captures the DEFAULT account.
+///
+/// ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
+/// `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
+/// SHARES — so the answer is only reliably about THIS account in the moment just after its
+/// own login wrote that cache. Persisting it here is what lets the Accounts panel keep naming
+/// each account by its address afterwards. Best-effort by design: a failure leaves the
+/// previous identity in place rather than blocking a successful sign-in.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_capture_identity(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<(), String> {
+    // Held until the row is written: `upsert_claude_account` after a concurrent removal's
+    // delete would RESURRECT the removed account. See `accounts::ACCOUNT_LIFECYCLE`.
+    let _account_use = crate::accounts::account_use_guard().await;
+    let slot = claude_slot(&app, account_id.as_deref())?;
+    let status = crate::accounts::status(&slot).await?;
+    let store = app.state::<Store>();
+
+    // The default account keeps its identity in `meta`: it has no row, and creating one would
+    // make it show up among the accounts the user added.
+    let Some(account_id) = account_id.filter(|id| id != crate::accounts::DEFAULT_ACCOUNT_ID) else {
+        let identity = ClaudeIdentity {
+            email: status.email,
+            org_name: status.org_name,
+            subscription_type: status.subscription_type,
+        };
+        let json = serde_json::to_string(&identity)
+            .map_err(|e| format!("could not encode the default account's identity: {e}"))?;
+        return store
+            .set_config(DEFAULT_IDENTITY_KEY, &json)
+            .map_err(|e| format!("could not save the default account's identity: {e}"));
+    };
+
+    let mut accounts = store
+        .list_claude_accounts()
+        .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
+    let Some(record) = accounts.iter_mut().find(|a| a.id == account_id) else {
+        return Err("this Claude account no longer exists".into());
+    };
+    // The label follows the captured address while it is still the generated placeholder (a
+    // recorded fact, not a guess from its text) — see `apply_captured_identity`. The UI names
+    // accounts by `email`; the label is only the fallback until one is captured.
+    record.apply_captured_identity(status.email, status.org_name, status.subscription_type);
+    let record = record.clone();
+    store
+        .upsert_claude_account(&record)
+        .map_err(|e| format!("could not save the Claude account: {e}"))?;
+    Ok(())
+}
+
+/// Remove an account: sign its credential store out through the CLI, drop its directory,
+/// then delete the row (which detaches the conversations that used it, so they fall back to
+/// the default account rather than pointing at nothing).
+///
+/// ⚠️ The sign-out is NOT best-effort, and the order matters. On macOS the credentials live
+/// in a Keychain item whose name is derived from the slot's DIRECTORY PATH, and that path
+/// contains the account id we are about to delete — so once the row and the directory are
+/// gone, the item can no longer be addressed by us or by the CLI: the OAuth tokens would
+/// stay in the Keychain, valid and unrevokable. A failed `claude auth logout` (an
+/// unresolvable `claude` binary, a non-zero exit, the 15 s timeout) therefore ABORTS the
+/// removal with the row intact, so the user can retry — rather than silently orphaning a
+/// live credential.
+///
+/// `force` is the escape hatch for an account whose CLI sign-out can never succeed. It
+/// proceeds anyway and RETURNS the exact Keychain item name, so the user can revoke it by
+/// hand in Keychain Access instead of being left with no way at all.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_remove(
+    app: tauri::AppHandle,
+    account_id: String,
+    force: bool,
+) -> Result<Option<String>, String> {
+    // EXCLUSIVE for the whole check → sign-out → delete sequence. Every path that resolves a
+    // slot and then uses it (spawn, sign-in start, identity capture) holds the shared side
+    // until its use is visible — a registered session, an in-flight login, a written row — so
+    // the checks below cannot be invalidated before the row is gone.
+    // Lock order: ACCOUNT_LIFECYCLE (here) → ACTIVE_LOGIN → REDEEMING (in `sign_in_busy_for`);
+    // the `Sessions` std mutex is only taken briefly, never across an await.
+    let _removal = crate::accounts::account_removal_guard().await;
+    let slot = claude_slot(&app, Some(&account_id))?;
+
+    // A sign-in for this account — waiting for the pasted code, or redeeming it — would
+    // write credentials into the directory we are about to delete (recreating it), under a
+    // Keychain item nobody could address once the row is gone. Refuse; the user finishes or
+    // cancels the sign-in first.
+    if crate::accounts::sign_in_busy_for(Some(&account_id)).await {
+        return Err(
+            "a sign-in is in progress for this account — finish or cancel it before removing \
+             the account"
+                .into(),
+        );
+    }
+
+    // A live session authenticated as this account would keep running against credentials
+    // we are removing, and its handle records an id about to vanish. Refuse rather than
+    // leave that inconsistency behind.
+    if !app
+        .state::<Sessions>()
+        .claude_handles_for(Some(&account_id))
+        .is_empty()
+    {
+        return Err(
+            "a conversation is still running on this account — stop it before removing the \
+             account"
+                .into(),
+        );
+    }
+
+    let mut warning = None;
+    if let Err(e) = crate::accounts::logout(&slot).await {
+        if !force {
+            return Err(format!(
+                "could not sign this account out ({e}). The account was kept so you can retry \
+                 — removing it now would leave its credentials in the Keychain with no way to \
+                 revoke them."
+            ));
+        }
+        warning = Some(format!(
+            "signed out failed ({e}) — its credentials may remain in the Keychain under the \
+             item \"{}\"; remove it in Keychain Access to revoke them.",
+            slot.keychain_service()
+        ));
+    }
+
+    // Only now is it safe to drop the path the item name is derived from.
+    if let Err(e) = slot.remove_dir() {
+        warning = Some(match warning {
+            Some(w) => format!("{w} · {e}"),
+            None => e,
+        });
+    }
+    app.state::<Store>()
+        .delete_claude_account(&account_id)
+        .map_err(|e| format!("could not remove the Claude account: {e}"))?;
+    Ok(warning)
+}
+
+/// Point one conversation at a Claude account (`None` = the default account). Persisted, so
+/// it survives a relaunch, a resume, a fork and a rewind. It takes effect at the
+/// conversation's NEXT spawn — the caller is responsible for restarting the session if one
+/// is live, and for telling the user so (a live process cannot change identity).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_conversation_claude_account(
+    store: tauri::State<'_, Store>,
+    conv_id: String,
+    account_id: Option<String>,
+) -> Result<(), String> {
+    store
+        .set_conversation_claude_account(&conv_id, account_id.as_deref())
+        .map_err(|e| format!("could not save the conversation's Claude account: {e}"))
+}
+
+/// One Claude account's auth status (`claude auth status --json`), whitelisted.
+/// `account_id: None` reads the default, un-scoped account.
+#[tauri::command]
+#[specta::specta]
+pub async fn account_claude_status(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<crate::accounts::ClaudeAccountStatus, String> {
+    crate::accounts::status(&claude_slot(&app, account_id.as_deref())?).await
+}
+
+/// Start a Claude login for ONE account: spawns `claude auth login` scoped to its
+/// credential store, returns the OAuth URL to open. The flow completes when the user pastes
+/// the authorization code ([`account_claude_login_code`]) — or is dropped by
+/// [`account_claude_login_cancel`].
+#[tauri::command]
+#[specta::specta]
+pub async fn account_claude_login_start(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<String, String> {
+    // Held until the login is registered (`login_start` returns only then), so a removal
+    // either ran first (→ "unknown account") or sees this sign-in and refuses. The wait for
+    // the pasted code happens AFTER this returns, guarded by `sign_in_busy_for` instead.
+    let _account_use = crate::accounts::account_use_guard().await;
+    let slot = claude_slot(&app, account_id.as_deref())?;
+    crate::accounts::login_start(&slot, account_id).await
 }
 
 /// Submit the authorization code the user pasted; completes the in-flight Claude login.
+///
+/// `account_id` must name the account the flow was STARTED for. There is one global
+/// in-flight login but one card per account, so a code pasted into a superseded card would
+/// otherwise be redeemed into another account's credential store.
 #[tauri::command]
 #[specta::specta]
-pub async fn account_claude_login_code(code: String) -> Result<(), String> {
-    crate::accounts::login_submit_code(&code).await
+pub async fn account_claude_login_code(
+    account_id: Option<String>,
+    code: String,
+) -> Result<(), String> {
+    crate::accounts::login_submit_code(account_id.as_deref(), &code).await
+}
+
+/// The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
+/// serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
+/// "nothing is signing in" (`None`) would both reach the front as `null` — exactly the
+/// distinction a superseded card needs to close its code box.
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeLoginInFlight {
+    /// The account the flow was started for; `null` = the default account.
+    pub account_id: Option<String>,
+}
+
+/// Which account has a sign-in in flight (`null` = none). Lets a card whose flow was
+/// superseded close its code box instead of offering an input that targets another
+/// account's login.
+#[tauri::command]
+#[specta::specta]
+pub async fn account_claude_login_in_flight() -> Result<Option<ClaudeLoginInFlight>, String> {
+    Ok(crate::accounts::login_in_flight()
+        .await
+        .map(|account_id| ClaudeLoginInFlight { account_id }))
 }
 
 /// Abort the in-flight Claude login (kills the CLI child). Safe when none is running.
@@ -521,11 +991,16 @@ pub async fn account_claude_login_cancel() -> Result<(), String> {
     Ok(())
 }
 
-/// Log out of the Claude account (`claude auth logout`).
+/// Log ONE Claude account out (`claude auth logout`). The account row (if any) is kept, so
+/// it stays listed as a signed-out slot the user can sign back into; removing it entirely
+/// is [`claude_account_remove`].
 #[tauri::command]
 #[specta::specta]
-pub async fn account_claude_logout() -> Result<(), String> {
-    crate::accounts::logout().await
+pub async fn account_claude_logout(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<(), String> {
+    crate::accounts::logout(&claude_slot(&app, account_id.as_deref())?).await
 }
 
 /// The signed-in Codex account (`account/read` on a transient app-server), whitelisted.
@@ -1072,6 +1547,166 @@ pub async fn fetch_slash_commands(cwd: String) -> Result<Vec<SlashCommand>, Stri
 /// `claude --resume` does not re-stream past messages, so the live event path
 /// delivers nothing for an existing conversation. The UI calls this after
 /// re-spawning a session to replay its history into the store. An absent
+// ---- Settings → Claude Code: sub-agent routing, spend, instructions --------------
+
+/// The routing picture for one repository: every sub-agent we can name, the model it will
+/// actually run on, where that setting lives, and the two scope hazards (a git-ignored
+/// `.claude/agents/`, a worktree checkout). Disk-only and fast — the page renders from
+/// this before any process is spawned.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_subagent_routing(
+    repo_path: String,
+) -> Result<crate::extensions::routing::SubagentRouting, String> {
+    tokio::task::spawn_blocking(move || crate::extensions::routing::routing_for(&repo_path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rewrite an existing agent definition's `model:` / `effort:` and NOTHING else. The
+/// system prompt in the file's body is preserved to the byte — see
+/// [`crate::extensions::agent_edit`]. `None` removes the key.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_model(
+    path: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::agent_edit::write_agent_frontmatter(
+            std::path::Path::new(&path),
+            &[("model", model), ("effort", effort)],
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Create a NEW agent definition file. `body` is the agent's system prompt and is
+/// required: a file named after a built-in replaces that agent ENTIRELY, so the caller has
+/// to have shown the user what the replacement will run on. Refuses to overwrite.
+/// Returns the path written.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_subagent_definition(
+    dir: String,
+    name: String,
+    description: String,
+    model: Option<String>,
+    effort: Option<String>,
+    body: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        // The file name carries the agent name; the frontmatter `name:` is what the CLI
+        // dispatches on, and it is written verbatim (capitalisation included — verified:
+        // `name: Explore` overrides the built-in).
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        if safe.is_empty() {
+            return Err("an agent needs a name".to_string());
+        }
+        let path = std::path::Path::new(&dir).join(format!("{safe}.md"));
+        crate::extensions::agent_edit::create_agent_file(
+            &path,
+            &name,
+            &description,
+            model.as_deref(),
+            effort.as_deref(),
+            &body,
+        )?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set or clear the sub-agent model baseline (`CLAUDE_CODE_SUBAGENT_MODEL`) and its
+/// forcing variant. `None` clears. ⚠️ The forcing variant overrides every per-agent choice
+/// and every model a workflow asks for — the UI must never set it implicitly.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_baseline(
+    model: Option<String>,
+    forced_model: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::set_subagent_baseline(model.as_deref(), forced_model.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
+/// workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+#[tauri::command]
+#[specta::specta]
+pub async fn subagent_spend() -> Result<crate::agentspend::SpendReport, String> {
+    tokio::task::spawn_blocking(crate::agentspend::scan).await.map_err(|e| e.to_string())
+}
+
+/// Read `~/.claude/CLAUDE.md` — the whole file for preview, plus whatever currently sits
+/// inside the app's managed markers.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_claude_memory() -> Result<crate::memoryfile::ManagedMemory, String> {
+    tokio::task::spawn_blocking(crate::memoryfile::read_managed)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Write (or, with `None`, remove) the managed block in `~/.claude/CLAUDE.md`. Everything
+/// outside the markers is preserved byte for byte; a file with damaged markers is refused
+/// rather than repaired.
+#[tauri::command]
+#[specta::specta]
+pub async fn write_claude_memory(text: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::memoryfile::write_managed(text.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The sub-agent names the CLI itself reports for this directory — the drift canary's
+/// input. Same ephemeral-spawn shape as [`fetch_slash_commands`]: one `initialize`
+/// handshake, then the process is dropped. An empty list means "we could not ask", which
+/// the caller must NOT render as "the agent is gone".
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_known_agents(cwd: String) -> Result<Vec<String>, String> {
+    use crate::supervisor::control;
+    use crate::supervisor::protocol::CliMessage;
+    use crate::supervisor::transport::Transport;
+
+    let (mut transport, mut rx) =
+        Transport::spawn(SpawnConfig::new(PathBuf::from(cwd))).map_err(|e| e.to_string())?;
+    let request_id = "tosse-agents-fetch";
+    transport
+        .send_line(control::initialize_request(request_id, &[]))
+        .map_err(|e| e.to_string())?;
+
+    let agents = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some(msg) = rx.recv().await {
+            if let CliMessage::ControlResponse(v) = msg {
+                let echoed = v
+                    .get("response")
+                    .and_then(|r| r.get("request_id"))
+                    .and_then(|x| x.as_str());
+                if echoed == Some(request_id) {
+                    return control::parse_initialize_agents(&v).unwrap_or_default();
+                }
+            }
+        }
+        Vec::new()
+    })
+    .await
+    .unwrap_or_default();
+
+    transport.shutdown(false).await;
+    Ok(agents)
+}
+
 /// transcript yields an empty list (not an error). File IO runs off the async
 /// runtime via `spawn_blocking` so a large transcript never stalls it.
 #[tauri::command]
@@ -1402,7 +2037,11 @@ const LIVE_USAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15
 /// Errors are typed ([`UsageError`]) so the UI can show a tailored next step.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<PlanUsage, UsageError> {
+pub async fn get_plan_usage(
+    app: tauri::AppHandle,
+    sessions: tauri::State<'_, Sessions>,
+    account_id: Option<String>,
+) -> Result<PlanUsage, UsageError> {
     // Prefer a LIVE session's `get_usage` control request: same numbers, but with no
     // OAuth token and no Keychain read — which is precisely what makes it immune to the
     // stale `~/.claude/.credentials.json` that shadows a fresh Keychain token and 401s
@@ -1422,7 +2061,10 @@ pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<Plan
     // `get_usage` "Experimental — the response shape may change", so a drift there must
     // degrade to the endpoint instead of blanking the meter.
     let deadline = tokio::time::Instant::now() + LIVE_USAGE_BUDGET;
-    for handle in sessions.claude_handles() {
+    // Only sessions running on THIS account can answer for it — see `claude_handles_for`.
+    // An account with no live session simply has no fast path and goes straight to HTTP,
+    // which is the normal case for every account other than the one being worked in.
+    for handle in sessions.claude_handles_for(account_id.as_deref()) {
         // Err = the budget ran out, the session is gone, or the CLI refused/garbled the
         // query. None = a payload we can't read (the documented "experimental shape may
         // drift" case). Either way another live Claude session may still answer.
@@ -1432,7 +2074,20 @@ pub async fn get_plan_usage(sessions: tauri::State<'_, Sessions>) -> Result<Plan
             }
         }
     }
-    crate::usage::fetch_plan_usage().await
+    // HTTP fallback, scoped to the same account: it reads that slot's credentials file /
+    // Keychain item, so it answers for the account asked about and never for another.
+    let slot = claude_slot(&app, account_id.as_deref()).map_err(|detail| {
+        // An unknown account is a permanent, local cause — never a network blip, which the
+        // front would retry forever. The one other way `claude_slot` fails (the store could
+        // not be read) stays a transient `Network`.
+        match account_id.clone() {
+            Some(id) if detail.starts_with("unknown Claude account") => {
+                UsageError::UnknownAccount { account_id: id }
+            }
+            _ => UsageError::Network { detail },
+        }
+    })?;
+    crate::usage::fetch_plan_usage_for(&slot).await
 }
 
 /// Hold or release the app-wide macOS keep-awake assertion. The FRONT owns the policy
@@ -3134,11 +3789,15 @@ pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, S
 }
 
 /// Mint a short-lived Realtime client secret for ONE voice session — the only
-/// shape of the credential the webview ever sees.
+/// shape of the credential the webview ever sees. `voice` is the user's picked
+/// voice, sanitized against the Rust-side catalogue (unknown → the default), and
+/// fixed for the whole session: OpenAI will not swap a voice mid-call.
 #[tauri::command]
 #[specta::specta]
-pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, String> {
-    crate::voice::mint_client_secret().await
+pub async fn voice_agent_client_secret(
+    voice: Option<String>,
+) -> Result<crate::voice::ClientSecret, String> {
+    crate::voice::mint_client_secret(voice).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3149,11 +3808,19 @@ pub async fn voice_agent_client_secret() -> Result<crate::voice::ClientSecret, S
 const WAKE_ENABLED_KEY: &str = "wake_word_enabled";
 const WAKE_PHRASE_KEY: &str = "wake_word_phrase";
 const WAKE_SENSITIVITY_KEY: &str = "wake_word_sensitivity";
+const WAKE_DEBUG_CAPTURE_KEY: &str = "wake_word_debug_capture";
+
+/// Where wake-word debug captures are written. The `wake` module deliberately
+/// knows nothing of Tauri, so the app data dir is resolved here and handed to it
+/// (same arrangement as the detection callback).
+pub fn wake_debug_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("wake-debug"))
+}
 
 /// Load the persisted wake-word config (best-effort; unset/garbled → defaults),
 /// sanitized so an unknown phrase or out-of-range sensitivity can never reach the
 /// detector. Read at startup so the detector can arm with the app.
-pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
+pub fn load_wake_config(app: &tauri::AppHandle, store: &Store) -> crate::wake::WakeConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
     let default = crate::wake::WakeConfig::default();
     let phrase = read(WAKE_PHRASE_KEY).unwrap_or(default.phrase);
@@ -3165,6 +3832,8 @@ pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
         enabled: read(WAKE_ENABLED_KEY).as_deref() == Some("1"),
         phrase,
         sensitivity,
+        debug_capture: read(WAKE_DEBUG_CAPTURE_KEY).as_deref() == Some("1"),
+        debug_dir: wake_debug_dir(app),
     }
 }
 
@@ -3189,11 +3858,12 @@ pub async fn set_wake_word_config(
     enabled: Option<bool>,
     phrase: Option<String>,
     sensitivity: Option<f32>,
+    debug_capture: Option<bool>,
 ) -> Result<crate::wake::WakeStatus, String> {
     // Scope the store guard so it is dropped before the `.await` (it is not Send).
     let cfg = {
         let store = app.state::<Store>();
-        let mut cfg = load_wake_config(&store);
+        let mut cfg = load_wake_config(&app, &store);
         if let Some(enabled) = enabled {
             cfg.enabled = enabled;
         }
@@ -3203,6 +3873,9 @@ pub async fn set_wake_word_config(
         if let Some(sensitivity) = sensitivity {
             cfg.sensitivity = sensitivity;
         }
+        if let Some(debug_capture) = debug_capture {
+            cfg.debug_capture = debug_capture;
+        }
         let (phrase, sensitivity) = crate::wake::sanitize(&cfg.phrase, cfg.sensitivity);
         cfg.phrase = phrase;
         cfg.sensitivity = sensitivity;
@@ -3210,6 +3883,12 @@ pub async fn set_wake_word_config(
             .set_config(WAKE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
             .and_then(|_| store.set_config(WAKE_PHRASE_KEY, &cfg.phrase))
             .and_then(|_| store.set_config(WAKE_SENSITIVITY_KEY, &cfg.sensitivity.to_string()))
+            .and_then(|_| {
+                store.set_config(
+                    WAKE_DEBUG_CAPTURE_KEY,
+                    if cfg.debug_capture { "1" } else { "0" },
+                )
+            })
             .map_err(|e| e.to_string())?;
         cfg
     };
@@ -3378,24 +4057,89 @@ mod tests {
             SessionHandle::from_channel(id.to_string(), tx)
         }
         let sessions = Sessions::new();
-        sessions.insert("session-2".into(), Backend::Codex, handle("session-2"));
-        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"));
-        sessions.insert("session-3".into(), Backend::Claude, handle("session-3"));
+        sessions.insert("session-2".into(), Backend::Codex, handle("session-2"), None, false);
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, false);
+        sessions.insert("session-3".into(), Backend::Claude, handle("session-3"), None, false);
 
-        let ids: Vec<String> = sessions.claude_handles().into_iter().map(|h| h.id).collect();
+        let ids: Vec<String> =
+            sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
         assert_eq!(ids, ["session-1", "session-3"], "Claude sessions only, in a stable order");
         assert_eq!(sessions.handles().len(), 3, "the neutral snapshot still sees every session");
         assert!(sessions.get("session-2").is_some(), "lookup by id stays backend-blind");
 
         assert_eq!(sessions.remove("session-1").map(|h| h.id).as_deref(), Some("session-1"));
-        let left: Vec<String> = sessions.claude_handles().into_iter().map(|h| h.id).collect();
+        let left: Vec<String> =
+            sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
         assert_eq!(left, ["session-3"], "an evicted session is no longer offered");
 
         sessions.remove("session-3");
         assert!(
-            sessions.claude_handles().is_empty(),
+            sessions.claude_handles_for(None).is_empty(),
             "a Codex-only fleet has nobody to ask — the HTTP fallback must stay reachable"
         );
+    }
+
+    /// A `get_usage` answer belongs to the ACCOUNT that served it. With two accounts
+    /// signed in, aiming the fast path at any Claude session would report another
+    /// account's subscription figures — a plausible-looking wrong number that the ring
+    /// would show and the auto-switch would then act on. So the registry filters by
+    /// account, and an account with no live session yields nothing (→ the HTTP path,
+    /// which is scoped to that account's own credentials).
+    #[test]
+    fn claude_handles_are_scoped_to_one_account() {
+        fn handle(id: &str) -> SessionHandle {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            SessionHandle::from_channel(id.to_string(), tx)
+        }
+        let sessions = Sessions::new();
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, false);
+        sessions.insert(
+            "session-2".into(),
+            Backend::Claude,
+            handle("session-2"),
+            Some("acct-b".into()),
+            false,
+        );
+
+        let default: Vec<String> =
+            sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
+        assert_eq!(default, ["session-1"], "the default account must not see acct-b's session");
+
+        let b: Vec<String> = sessions
+            .claude_handles_for(Some("acct-b"))
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(b, ["session-2"], "acct-b must not see the default account's session");
+
+        assert!(
+            sessions.claude_handles_for(Some("acct-c")).is_empty(),
+            "an account with no live session has no fast path — never another account's"
+        );
+    }
+
+    /// A REMOTE (SSH) session authenticates with the SERVER's credential store. It is
+    /// recorded with no account, so without an explicit exclusion it matched `None` and the
+    /// default account's usage ring asked it — showing the server account's quota as ours.
+    #[test]
+    fn remote_sessions_answer_for_no_local_account() {
+        fn handle(id: &str) -> SessionHandle {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            SessionHandle::from_channel(id.to_string(), tx)
+        }
+        let sessions = Sessions::new();
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, true);
+
+        assert!(
+            sessions.claude_handles_for(None).is_empty(),
+            "a remote session must not answer for the default account"
+        );
+        assert!(sessions.get("session-1").is_some(), "it is still a live, addressable session");
+
+        sessions.insert("session-2".into(), Backend::Claude, handle("session-2"), None, false);
+        let default: Vec<String> =
+            sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
+        assert_eq!(default, ["session-2"], "only the LOCAL default-account session is asked");
     }
 
     /// The resume invocation is BACKEND-AWARE: Claude uses `--resume`, Codex uses the
