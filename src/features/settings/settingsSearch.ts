@@ -61,14 +61,16 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
 
   // ---- Accounts / TOSSE ---------------------------------------------------
   { title: "Accounts", section: "accounts", group: "Accounts", keywords: "claude codex openai login sign in connexion compte" },
-  // Multiple Claude accounts. Each card shows that account's own rate limits, so the limit
-  // words land on the card title — a per-card "Usage" line has no row to flash.
-  { title: "Claude accounts", section: "accounts", group: "Claude accounts", keywords: "multiple accounts several rate limits usage quota 5h 7d weekly plusieurs comptes limites utilisation forfait" },
+  // Multiple Claude accounts: a grid of account tiles (each with its own rate-limit rings),
+  // then the Switching group. Tiles are not rows, so only the Switching entries flash; the
+  // tile entries still land on the right tab.
+  { title: "Claude accounts", section: "accounts", group: "Claude accounts", keywords: "multiple accounts several rate limits usage quota 5h 7d weekly rings plusieurs comptes limites utilisation forfait" },
   { title: "Add another Claude account", section: "accounts", group: "Claude accounts", keywords: "new second account sign in ajouter compte" },
-  { title: "Default account for new conversations", section: "accounts", group: "Claude accounts", keywords: "default account compte par defaut nouvelle conversation" },
-  { title: "Auto-switch account near usage limit", section: "accounts", group: "Claude accounts", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
-  { title: "Switch when an account reaches", section: "accounts", group: "Claude accounts", keywords: "threshold trigger percent seuil declenchement pourcentage" },
-  { title: "Only switch to an account below", section: "accounts", group: "Claude accounts", keywords: "ceiling hysteresis target oscillation plafond cible" },
+  { title: "Switching", section: "accounts", group: "Switching", keywords: "switch accounts default auto bascule changement compte" },
+  { title: "Default account for new conversations", section: "accounts", group: "Switching", keywords: "default account compte par defaut nouvelle conversation" },
+  { title: "Auto-switch account near usage limit", section: "accounts", group: "Switching", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
+  { title: "Switch at", section: "accounts", group: "Switching", keywords: "threshold trigger percent seuil declenchement pourcentage auto-switch" },
+  { title: "Target below", section: "accounts", group: "Switching", keywords: "ceiling hysteresis target oscillation plafond cible auto-switch" },
   { title: "TOSSE mark on repositories", section: "tosse", group: "In the app", keywords: "badge repo crm" },
   { title: "TOSSE tasks view", section: "tosse", group: "In the app", keywords: "tasks board kanban taches" },
   { title: "Stay on the tasks view when you press Start", section: "tosse", group: "In the app", keywords: "pickup start navigation" },

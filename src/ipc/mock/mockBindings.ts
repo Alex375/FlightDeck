@@ -849,10 +849,15 @@ export const mockCommands = {
   // dev/Playwright: the composer's account chip only renders once a second one exists,
   // and the auto-switch policy needs somewhere to switch to.
   async accountClaudeStatus(accountId: string | null): Promise<Result<ClaudeAccountStatus, string>> {
+    // An added account is signed in only once its identity was captured (i.e. after the
+    // sign-in flow completed), so "Add account" yields a signed-out tile whose flow can be
+    // exercised in dev/Playwright — as it is in the app.
+    const added = accountId ? mockClaudeAccounts.find((a) => a.id === accountId) : null;
+    const loggedIn = accountId === null || !!added?.email;
     return ok({
-      loggedIn: true,
-      authMethod: "claude.ai",
-      email: accountId ? "demo-b@example.com" : "demo@example.com",
+      loggedIn,
+      authMethod: loggedIn ? "claude.ai" : "none",
+      email: accountId ? (added?.email ?? null) : "demo@example.com",
       orgName: "Demo Org",
       subscriptionType: "max",
     });
