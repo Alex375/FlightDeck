@@ -3715,11 +3715,19 @@ pub async fn voice_agent_client_secret(
 const WAKE_ENABLED_KEY: &str = "wake_word_enabled";
 const WAKE_PHRASE_KEY: &str = "wake_word_phrase";
 const WAKE_SENSITIVITY_KEY: &str = "wake_word_sensitivity";
+const WAKE_DEBUG_CAPTURE_KEY: &str = "wake_word_debug_capture";
+
+/// Where wake-word debug captures are written. The `wake` module deliberately
+/// knows nothing of Tauri, so the app data dir is resolved here and handed to it
+/// (same arrangement as the detection callback).
+pub fn wake_debug_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("wake-debug"))
+}
 
 /// Load the persisted wake-word config (best-effort; unset/garbled → defaults),
 /// sanitized so an unknown phrase or out-of-range sensitivity can never reach the
 /// detector. Read at startup so the detector can arm with the app.
-pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
+pub fn load_wake_config(app: &tauri::AppHandle, store: &Store) -> crate::wake::WakeConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
     let default = crate::wake::WakeConfig::default();
     let phrase = read(WAKE_PHRASE_KEY).unwrap_or(default.phrase);
@@ -3731,6 +3739,8 @@ pub fn load_wake_config(store: &Store) -> crate::wake::WakeConfig {
         enabled: read(WAKE_ENABLED_KEY).as_deref() == Some("1"),
         phrase,
         sensitivity,
+        debug_capture: read(WAKE_DEBUG_CAPTURE_KEY).as_deref() == Some("1"),
+        debug_dir: wake_debug_dir(app),
     }
 }
 
@@ -3755,11 +3765,12 @@ pub async fn set_wake_word_config(
     enabled: Option<bool>,
     phrase: Option<String>,
     sensitivity: Option<f32>,
+    debug_capture: Option<bool>,
 ) -> Result<crate::wake::WakeStatus, String> {
     // Scope the store guard so it is dropped before the `.await` (it is not Send).
     let cfg = {
         let store = app.state::<Store>();
-        let mut cfg = load_wake_config(&store);
+        let mut cfg = load_wake_config(&app, &store);
         if let Some(enabled) = enabled {
             cfg.enabled = enabled;
         }
@@ -3769,6 +3780,9 @@ pub async fn set_wake_word_config(
         if let Some(sensitivity) = sensitivity {
             cfg.sensitivity = sensitivity;
         }
+        if let Some(debug_capture) = debug_capture {
+            cfg.debug_capture = debug_capture;
+        }
         let (phrase, sensitivity) = crate::wake::sanitize(&cfg.phrase, cfg.sensitivity);
         cfg.phrase = phrase;
         cfg.sensitivity = sensitivity;
@@ -3776,6 +3790,12 @@ pub async fn set_wake_word_config(
             .set_config(WAKE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
             .and_then(|_| store.set_config(WAKE_PHRASE_KEY, &cfg.phrase))
             .and_then(|_| store.set_config(WAKE_SENSITIVITY_KEY, &cfg.sensitivity.to_string()))
+            .and_then(|_| {
+                store.set_config(
+                    WAKE_DEBUG_CAPTURE_KEY,
+                    if cfg.debug_capture { "1" } else { "0" },
+                )
+            })
             .map_err(|e| e.to_string())?;
         cfg
     };

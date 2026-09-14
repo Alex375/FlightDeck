@@ -93,7 +93,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Repositories", section: "reordering", group: "Conversation order", keywords: "drag drop manual order depots" },
   { title: "Share order between the two views", section: "reordering", group: "Shared order", keywords: "sidebar flight deck sync" },
 
-  // ---- MCP Control --------------------------------------------------------
+  // ---- Control ------------------------------------------------------------
   { title: "Let agents pilot the app", section: "control", sub: "agents", group: "Agent control of the app", keywords: "mcp flightdeck server in-process tools" },
   { title: "Let agents remove conversations from the list", section: "control", sub: "agents", group: "Agent control of the app", keywords: "remove_conversation policy delete" },
   { title: "OpenAI API key", section: "control", sub: "voice", group: "Voice agent", keywords: "openai key realtime cle voix vocal" },
@@ -102,7 +102,11 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Voice session & announcements", section: "control", sub: "voice", group: "Voice agent", keywords: "announce fleet events spoken" },
   { title: "Push-to-talk key", section: "control", sub: "voice", group: "Microphone", keywords: "ptt shortcut mic key micro raccourci" },
   { title: "Close the mic after silence", section: "control", sub: "voice", group: "Microphone", keywords: "auto close silence timeout micro" },
-  { title: "Voice detection threshold", section: "control", sub: "voice", group: "Microphone", keywords: "vad sensitivity noise seuil bruit" },
+  { title: "Cutting the agent off", section: "control", sub: "voice", group: "Microphone", keywords: "interrupt barge-in stop mid-sentence wake word interruption couper interrompre" },
+  { title: "How it knows you have stopped", section: "control", sub: "voice", group: "Microphone", keywords: "vad turn detection semantic loudness threshold interruption seuil bruit coupure" },
+  { title: "How soon it decides you are done", section: "control", sub: "voice", group: "Microphone", keywords: "eagerness patient quick pause vad semantic" },
+  { title: "Loudness threshold", section: "control", sub: "voice", group: "Microphone", keywords: "vad sensitivity noise seuil bruit amplitude" },
+  { title: "Microphone check", section: "control", sub: "voice", group: "Microphone", keywords: "level meter test mic niveau micro jauge" },
   { title: "Wake word", section: "control", sub: "voice", group: "Wake word", keywords: "alexa jarvis hands-free mot de reveil" },
   { title: "Wake phrase", section: "control", sub: "voice", group: "Wake word", keywords: "alexa jarvis phrase" },
   { title: "Sensitivity", section: "control", sub: "voice", group: "Wake word", keywords: "wake false trigger sensibilite" },

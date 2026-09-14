@@ -33,7 +33,7 @@ interface SettingsUiState {
   section: SettingsSection;
   /**
    * The sub-tab within the current section (`null` = its first one). Sections
-   * that carry a lot of unrelated cards (General, Conversation, MCP Control,
+   * that carry a lot of unrelated cards (General, Conversation, Control,
    * Notifications) split them behind
    * a pill row instead of stacking them all; every other section ignores this.
    * Remembered PER SECTION so leaving a tab and coming back lands where you were.

@@ -266,6 +266,9 @@ const mockWake: WakeStatus = {
   sensitivity: 0.5,
   running: false,
   error: null,
+  debug_capture: false,
+  debug_dir: null,
+  debug_error: null,
   phrases: [
     { key: "alexa", label: "Alexa" },
     { key: "hey_jarvis", label: "Hey Jarvis" },
@@ -1758,10 +1761,19 @@ export const mockCommands = {
     enabled: boolean | null,
     phrase: string | null,
     sensitivity: number | null,
+    debugCapture: boolean | null,
   ): Promise<Result<WakeStatus, string>> {
     if (enabled !== null) mockWake.enabled = enabled;
     if (phrase !== null) mockWake.phrase = phrase;
     if (sensitivity !== null) mockWake.sensitivity = Math.min(1, Math.max(0, sensitivity));
+    if (debugCapture !== null) {
+      // Mirrors the core: no capture directory means the opt-in cannot be honoured,
+      // and the mock says so rather than showing a switch that would never write.
+      mockWake.debug_capture = false;
+      mockWake.debug_error = debugCapture
+        ? "the browser mock has no capture directory — recordings cannot be written"
+        : null;
+    }
     // The mock has no capture backend, so "running" can never be true.
     mockWake.running = false;
     mockWake.error = mockWake.enabled

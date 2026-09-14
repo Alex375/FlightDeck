@@ -64,7 +64,7 @@ const TABS: Array<{
   { id: "reordering", label: "Reordering", icon: "reorder" },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
-  { id: "control", label: "MCP Control", icon: "wand" },
+  { id: "control", label: "Control", icon: "wand" },
   // OS channels + the fleet readout + background-task alerts, behind this tab's sub-tabs
   // (the last two moved out of the old General → Alerts).
   { id: "notifications", label: "Notifications", icon: "bell" },
@@ -378,7 +378,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             {!searching && section === "control" && (
               <div className={styles.page}>
                 <PageHead
-                  title="MCP Control"
+                  title="Control"
                   subtitle="Let agents pilot the app — from inside a conversation, by voice, from your phone, or from an external client."
                 />
                 {/* Order: in-app control, the built-in voice agent, remote access

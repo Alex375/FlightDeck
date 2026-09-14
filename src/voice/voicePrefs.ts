@@ -5,7 +5,20 @@
 // opts in here. The KEY itself is never in this store.
 import { create } from "zustand";
 import { DEFAULT_PTT, type PttShortcut } from "./pttShortcut";
-import { VAD_THRESHOLD_DEFAULT, clampVadThreshold } from "./vad";
+import {
+  VAD_EAGERNESS_DEFAULT,
+  VAD_INTERRUPT_DEFAULT,
+  VAD_MODE_DEFAULT,
+  VAD_THRESHOLD_DEFAULT,
+  asVadEagerness,
+  asVadInterrupt,
+  asVadMode,
+  clampVadThreshold,
+  type VadEagerness,
+  type VadInterrupt,
+  type VadMode,
+  type VadSettings,
+} from "./vad";
 
 const STORAGE_KEY = "tosse:voice";
 
@@ -18,10 +31,16 @@ export interface VoicePrefs {
    *  Settings, matched by VoiceHost's listener (see pttShortcut.ts). It toggles
    *  the mic, arming the session first when pressed from cold. */
   pttShortcut: PttShortcut;
-  /** Server-VAD amplitude threshold (0..1): how loud incoming audio must be to
-   *  count as speech. Higher = LESS sensitive (ignores background noise and
-   *  faint sounds); lower = picks up quieter speech. The Settings slider tunes
-   *  it; it's pushed to the live session via `applyVadSettings`. See vad.ts. */
+  /** How the session decides a turn ended: "semantic" (does it sound FINISHED)
+   *  or "loudness" (is it LOUD enough). Semantic by default — a loudness gate
+   *  cannot tell a plate from a word, at any threshold. See vad.ts. */
+  vadMode: VadMode;
+  /** Semantic mode: how eagerly the model decides you have stopped talking. */
+  vadEagerness: VadEagerness;
+  /** What may cut the agent off mid-sentence. Default: nothing. */
+  vadInterrupt: VadInterrupt;
+  /** Loudness mode: amplitude threshold (0..1). Higher = LESS sensitive. Only
+   *  consulted when `vadMode` is "loudness". */
   vadThreshold: number;
   /** The OpenAI voice the agent speaks with, by catalogue key (`"marin"`,
    *  `"cedar"`, …). EMPTY = "whatever the app's default is" — the catalogue and
@@ -39,6 +58,9 @@ export interface VoicePrefs {
 const DEFAULTS: VoicePrefs = {
   autoCloseSeconds: 25,
   pttShortcut: DEFAULT_PTT,
+  vadMode: VAD_MODE_DEFAULT,
+  vadEagerness: VAD_EAGERNESS_DEFAULT,
+  vadInterrupt: VAD_INTERRUPT_DEFAULT,
   vadThreshold: VAD_THRESHOLD_DEFAULT,
   voice: "",
   instructions: "",
@@ -52,7 +74,14 @@ function load(): VoicePrefs {
     const merged = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<VoicePrefs>) };
     // …and keep the same "empty means default" coercion the setter applies, so a
     // hand-edited or older store can't feed a null into the mint call.
-    return { ...merged, voice: asText(merged.voice).trim(), instructions: asText(merged.instructions) };
+    return {
+      ...merged,
+      voice: asText(merged.voice).trim(),
+      instructions: asText(merged.instructions),
+      vadMode: asVadMode(merged.vadMode),
+      vadEagerness: asVadEagerness(merged.vadEagerness),
+      vadInterrupt: asVadInterrupt(merged.vadInterrupt),
+    };
   } catch {
     return DEFAULTS;
   }
@@ -75,6 +104,19 @@ function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+/** The turn-detection settings as `vad.ts` wants them — the one place that maps
+ *  the stored prefs onto the wire shape, so the two call sites in realtime.ts
+ *  cannot drift apart. */
+export function currentVadSettings(): VadSettings {
+  const s = useVoicePrefs.getState();
+  return {
+    mode: asVadMode(s.vadMode),
+    eagerness: asVadEagerness(s.vadEagerness),
+    threshold: s.vadThreshold,
+    interrupt: asVadInterrupt(s.vadInterrupt),
+  };
+}
+
 /** Clamp the auto-close guard to something sane (10 s – 5 min). */
 export function clampAutoClose(seconds: number): number {
   if (!Number.isFinite(seconds)) return DEFAULTS.autoCloseSeconds;
@@ -91,6 +133,15 @@ export const useVoicePrefs = create<VoicePrefsState>((set) => ({
             ? clampAutoClose(patch.autoCloseSeconds)
             : s.autoCloseSeconds,
         pttShortcut: patch.pttShortcut ?? s.pttShortcut,
+        vadMode: patch.vadMode !== undefined ? asVadMode(patch.vadMode) : asVadMode(s.vadMode),
+        vadEagerness:
+          patch.vadEagerness !== undefined
+            ? asVadEagerness(patch.vadEagerness)
+            : asVadEagerness(s.vadEagerness),
+        vadInterrupt:
+          patch.vadInterrupt !== undefined
+            ? asVadInterrupt(patch.vadInterrupt)
+            : asVadInterrupt(s.vadInterrupt),
         vadThreshold:
           patch.vadThreshold !== undefined
             ? clampVadThreshold(patch.vadThreshold)

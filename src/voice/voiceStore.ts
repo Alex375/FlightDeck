@@ -37,6 +37,11 @@ interface VoiceState {
    */
   configured: boolean | null;
   keyHint: string | null;
+  /** Plain-words note for the voice settings, set when the live session refused
+   *  a change (it still applies on the next start). Cleared on the next change
+   *  and when a session starts. Never carries server wording. */
+  settingsNote: string | null;
+  setSettingsNote: (note: string | null) => void;
   setPhase: (phase: VoicePhase) => void;
   setMode: (mode: boolean) => void;
   setMicOpen: (micOpen: boolean) => void;
@@ -52,8 +57,16 @@ export const useVoiceStore = create<VoiceState>((set) => ({
   error: null,
   configured: null,
   keyHint: null,
+  settingsNote: null,
+  setSettingsNote: (settingsNote) => set({ settingsNote }),
   setPhase: (phase) =>
-    set(phase === "off" ? { phase, mode: false, micOpen: false } : { phase, error: null }),
+    set(
+      phase === "off"
+        ? { phase, mode: false, micOpen: false, settingsNote: null }
+        : phase === "connecting"
+          ? { phase, error: null, settingsNote: null }
+          : { phase, error: null },
+    ),
   setMode: (mode) => set(mode ? { mode } : { mode, micOpen: false }),
   setMicOpen: (micOpen) => set({ micOpen }),
   setConfigured: (status) =>

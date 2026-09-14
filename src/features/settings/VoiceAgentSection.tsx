@@ -9,6 +9,7 @@
 // the MICROPHONE (how you talk to it), and the WAKE WORD (how it starts
 // listening on its own).
 import { useCallback, useEffect, useState } from "react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { commands, type VoiceAgentStatus, type WakeStatus } from "../../ipc/client";
 import { useVoiceStore } from "../../voice/voiceStore";
 import { useWakeStore } from "../../voice/wakeStore";
@@ -16,6 +17,12 @@ import { clampAutoClose, useVoicePrefs } from "../../voice/voicePrefs";
 import { applyInstructions, applyVadSettings, applyVoiceSelection } from "../../voice/realtime";
 import { DEFAULT_VOICE_INSTRUCTIONS, isCustomInstructions } from "../../voice/instructions";
 import { VadMeter } from "../../voice/VadMeter";
+import {
+  VAD_THRESHOLD_MAX,
+  VAD_THRESHOLD_MIN,
+  type VadEagerness,
+  type VadInterrupt,
+} from "../../voice/vad";
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -24,6 +31,10 @@ export function VoiceAgentSection() {
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
   const pttShortcut = useVoicePrefs((s) => s.pttShortcut);
   const vadThreshold = useVoicePrefs((s) => s.vadThreshold);
+  const vadMode = useVoicePrefs((s) => s.vadMode);
+  const vadEagerness = useVoicePrefs((s) => s.vadEagerness);
+  const vadInterrupt = useVoicePrefs((s) => s.vadInterrupt);
+  const settingsNote = useVoiceStore((s) => s.settingsNote);
   const voice = useVoicePrefs((s) => s.voice);
   const instructions = useVoicePrefs((s) => s.instructions);
   const setPrefs = useVoicePrefs((s) => s.set);
@@ -76,7 +87,12 @@ export function VoiceAgentSection() {
   }, []);
 
   const applyWake = useCallback(
-    async (patch: { enabled?: boolean; phrase?: string; sensitivity?: number }) => {
+    async (patch: {
+      enabled?: boolean;
+      phrase?: string;
+      sensitivity?: number;
+      debugCapture?: boolean;
+    }) => {
       setWakeBusy(true);
       setError(null);
       try {
@@ -84,6 +100,7 @@ export function VoiceAgentSection() {
           patch.enabled ?? null,
           patch.phrase ?? null,
           patch.sensitivity ?? null,
+          patch.debugCapture ?? null,
         );
         if (res.status === "ok") {
           setWake(res.data);
@@ -342,6 +359,7 @@ export function VoiceAgentSection() {
       </SettingsGroup>
 
       <SettingsGroup title="Microphone" icon="mic">
+        {settingsNote ? <div className={styles.note}>{settingsNote}</div> : null}
         <ToggleRow
           title="Push-to-talk key"
           hint="Opens / closes the microphone (arms the session first if needed). A lone modifier works as a tap — press and release it by itself. Click Change, then press the key you want; Escape cancels."
@@ -382,20 +400,136 @@ export function VoiceAgentSection() {
           }
         />
         <ToggleRow
-          title="Voice detection threshold"
+          title="Cutting the agent off"
           hint={
             <>
-              How loud speech must be before the agent starts listening. Drag the handle right to
-              make it less sensitive — it then ignores background noise and faint sounds, so it
-              won&rsquo;t cut in or interrupt on stray sound. Drag left to pick up quieter speech.
-              You can still interrupt the agent by speaking.
-              <VadMeter
-                threshold={vadThreshold}
-                onThresholdChange={(v) => {
-                  setPrefs({ vadThreshold: v });
+              <b>Let it finish</b> means nothing stops it mid-sentence. You can still speak over
+              it &mdash; what you say is answered once it is done, rather than over the top.
+              <br />
+              <b>By speaking</b> is the old behaviour, and the reason this setting exists: any
+              sound the detector took for speech stopped the agent, which in a room with a
+              dishwasher in it meant every ten to thirty seconds.
+              <br />
+              <b>With the wake word</b> makes the phrase your deliberate stop button. It is by far
+              the strictest judge available &mdash; a specific phrase, twice over, and only if
+              your microphone heard actual speech &mdash; so it does not fire on a room.
+              {vadInterrupt === "wake" && !wake?.enabled ? (
+                <div className={styles.dangerText}>
+                  &#9888;&#65039; The wake word is switched off below, so nothing can interrupt the
+                  agent right now.
+                </div>
+              ) : null}
+            </>
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={vadInterrupt}
+              onChange={(e) => {
+                setPrefs({ vadInterrupt: e.target.value as VadInterrupt });
+                applyVadSettings();
+              }}
+              disabled={!configured}
+              aria-label="What may interrupt the agent"
+            >
+              <option value="never">Let it finish (recommended)</option>
+              <option value="wake">With the wake word</option>
+              <option value="speech">By speaking</option>
+            </select>
+          }
+        />
+        <ToggleRow
+          title="How it knows you have stopped"
+          hint={
+            <>
+              <b>By meaning</b> asks whether what you said sounds finished, so a sound carrying
+              no words is not treated as your turn at all. This is the one to use if the room is
+              not silent &mdash; a loudness gate cannot tell a plate from a word at any setting,
+              and set to its strictest it still let a dishwasher cut the agent off.
+              <br />
+              <b>By loudness</b> is the older behaviour: anything above a level counts as you
+              speaking. It gives you a number to turn, and it will react to noise.
+            </>
+          }
+          control={
+            <select
+              className={styles.mono}
+              value={vadMode}
+              onChange={(e) => {
+                setPrefs({ vadMode: e.target.value as "semantic" | "loudness" });
+                applyVadSettings();
+              }}
+              disabled={!configured}
+              aria-label="Turn detection mode"
+            >
+              <option value="semantic">By meaning (recommended)</option>
+              <option value="loudness">By loudness</option>
+            </select>
+          }
+        />
+        {vadMode === "semantic" ? (
+          <ToggleRow
+            title="How soon it decides you are done"
+            hint="Patient lets you pause mid-sentence, or think out loud, without being cut off — best when your hands are busy with something else. Quick replies sooner, at the cost of interrupting a pause."
+            control={
+              <select
+                className={styles.mono}
+                value={vadEagerness}
+                onChange={(e) => {
+                  setPrefs({ vadEagerness: e.target.value as VadEagerness });
                   applyVadSettings();
                 }}
-                valueClassName={styles.mono}
+                disabled={!configured}
+                aria-label="How soon the agent decides you have finished speaking"
+              >
+                <option value="low">Patient (recommended)</option>
+                <option value="medium">Balanced</option>
+                <option value="high">Quick</option>
+              </select>
+            }
+          />
+        ) : (
+          <ToggleRow
+            title="Loudness threshold"
+            hint={
+              <>
+                How loud audio must be to count as you speaking. Higher takes more convincing;
+                lower picks up more, including things you did not mean for it.
+                <br />
+                It is an amplitude gate, so it cannot tell speech from any other loud sound. If
+                the agent reacts to your room rather than to you, the fix is the mode above, not
+                a higher number here.
+              </>
+            }
+            control={
+              <span className={styles.tokenRow}>
+                <input
+                  type="range"
+                  min={VAD_THRESHOLD_MIN}
+                  max={VAD_THRESHOLD_MAX}
+                  step={0.05}
+                  value={vadThreshold}
+                  onChange={(e) => {
+                    setPrefs({ vadThreshold: Number(e.target.value) });
+                    applyVadSettings();
+                  }}
+                  disabled={!configured}
+                  aria-label="Loudness threshold"
+                />
+                <span className={styles.mono}>{vadThreshold.toFixed(2)}</span>
+              </span>
+            }
+          />
+        )}
+        <ToggleRow
+          title="Microphone check"
+          hint={
+            <>
+              The level the agent actually receives, through the same microphone settings its
+              session uses. It answers &ldquo;is the right input selected and is it hearing
+              me&rdquo; &mdash; not &ldquo;where should the threshold go&rdquo;, which this bar
+              cannot tell you.
+              <VadMeter
                 buttonClassName={`${styles.btn} ${styles.ghost}`}
                 disabled={!configured}
               />
@@ -463,6 +597,50 @@ export function VoiceAgentSection() {
               </span>
             </span>
           }
+        />
+        <ToggleRow
+          title="Record false triggers"
+          hint={
+            <>
+              Save what the wake word heard: a short audio clip plus the step-by-step
+              confidence scores behind it. Recordings marked <code>blocked</code> are
+              near-triggers a safeguard caught before they woke anything &mdash; they are
+              how you tell &ldquo;the safeguards are working&rdquo; from &ldquo;the
+              safeguards are swallowing me&rdquo;. Turn this on to investigate triggers you
+              did not ask for, or a phrase that stopped being heard. Everything stays on
+              this Mac and nothing is sent anywhere, but it does write microphone audio to
+              disk, so leave it off unless you are chasing a problem. Only the last 40 are
+              kept.
+              {wake?.debug_capture && wake.debug_dir ? (
+                <div className={styles.tokenRow}>
+                  <span className={styles.mono}>{wake.debug_dir}</span>
+                  <button
+                    type="button"
+                    className={`${styles.btn} ${styles.ghost}`}
+                    onClick={() => {
+                      // A reveal that quietly does nothing would be its own small lie —
+                      // say so instead.
+                      void revealItemInDir(wake.debug_dir as string).catch((e: unknown) =>
+                        setError(
+                          `could not open the recordings folder: ${
+                            e instanceof Error ? e.message : String(e)
+                          }`,
+                        ),
+                      );
+                    }}
+                  >
+                    Show in Finder
+                  </button>
+                </div>
+              ) : null}
+              {wake?.debug_error ? (
+                <div className={styles.dangerText}>&#9888;&#65039; {wake.debug_error}</div>
+              ) : null}
+            </>
+          }
+          checked={!!wake?.debug_capture}
+          onChange={(next) => void applyWake({ debugCapture: next })}
+          disabled={!configured || !wake || !wake.enabled || wakeBusy}
         />
       </SettingsGroup>
     </>
