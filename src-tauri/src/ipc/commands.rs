@@ -40,6 +40,10 @@ struct LiveSession {
     /// because a control request that reports *subscription* figures is only meaningful
     /// for the account that served it.
     claude_account_id: Option<String>,
+    /// The process runs on a REMOTE (SSH) server. Its `claude` authenticates with the
+    /// SERVER's own credential store, whatever account the Mac-side record says, so its
+    /// `get_usage` answers for an account this Mac does not hold — never offer it for one.
+    is_remote: bool,
 }
 
 /// Tauri managed state: the registry of live sessions, keyed by our own id.
@@ -69,6 +73,7 @@ impl Sessions {
         backend: Backend,
         handle: SessionHandle,
         claude_account_id: Option<String>,
+        is_remote: bool,
     ) {
         self.inner.lock().unwrap().insert(
             id,
@@ -76,6 +81,7 @@ impl Sessions {
                 backend,
                 handle,
                 claude_account_id,
+                is_remote,
             },
         );
     }
@@ -104,6 +110,11 @@ impl Sessions {
     /// quota — a wrong number that looks entirely plausible, and one the auto-switch would
     /// then act on. Within one account the order is for reproducibility, not ranking:
     /// those sessions do all report the same answer.
+    ///
+    /// ⚠️ REMOTE (SSH) sessions are excluded for EVERY account, the default one included.
+    /// They are recorded with no account (the launcher cannot carry one), so without this
+    /// they would match `None` and the default account's ring would show the SERVER
+    /// account's quota — the same plausible-but-wrong number the account filter prevents.
     fn claude_handles_for(&self, account_id: Option<&str>) -> Vec<SessionHandle> {
         let mut claude: Vec<SessionHandle> = self
             .inner
@@ -111,6 +122,7 @@ impl Sessions {
             .unwrap()
             .values()
             .filter(|s| matches!(s.backend, Backend::Claude))
+            .filter(|s| !s.is_remote)
             .filter(|s| s.claude_account_id.as_deref() == account_id)
             .map(|s| s.handle.clone())
             .collect();
@@ -222,6 +234,11 @@ pub async fn spawn_session(
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
+    // Held from resolving the account slot until the session is REGISTERED below, so a
+    // concurrent account removal either runs before we resolve (→ "unknown account" here)
+    // or sees this session in the registry and refuses. Nothing below awaits, so a queued
+    // removal waits only for this synchronous spawn. See `accounts::ACCOUNT_LIFECYCLE`.
+    let _account_use = crate::accounts::account_use_guard().await;
     // Which Claude account this process authenticates as. An id naming an account the
     // user has since removed must NOT silently fall back to another identity: resolving
     // is fallible and the error names the id, so the UI can say why the session refused
@@ -345,16 +362,18 @@ pub async fn spawn_session(
     // Remember WHICH account this process authenticated as, so a later `get_usage` is only
     // ever aimed at a session that can answer for the account being asked about. Codex
     // sessions have no Claude account: record `None` and let the backend filter do the rest.
+    // A remote session is flagged as such: it authenticates on the SERVER, so it answers for
+    // no account of this Mac, the default one included (see `claude_handles_for`).
     sessions.insert(
         id.clone(),
         backend,
         handle,
         match backend {
-            // A remote session is refused above unless its account is None, so this
-            // records what the process is REALLY authenticated as in every case.
+            // A remote session is refused above unless its account is None.
             Backend::Claude if !is_remote => claude_account_id,
             _ => None,
         },
+        is_remote,
     );
     Ok(id)
 }
@@ -706,7 +725,17 @@ pub async fn claude_default_identity(
     let raw = store
         .get_config(DEFAULT_IDENTITY_KEY)
         .map_err(|e| format!("could not read the default account's identity: {e}"))?;
-    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+    // A stored value that no longer parses is a real failure, not "never captured": folding
+    // it into `None` would silently drop the identity and relabel the account as unknown.
+    raw.map(|s| {
+        serde_json::from_str(&s).map_err(|e| {
+            format!(
+                "the default account's saved identity is corrupt ({e}) — sign the default \
+                 account in again to capture it afresh"
+            )
+        })
+    })
+    .transpose()
 }
 
 /// One Claude account's identity — address, organization, plan — read with ITS OWN token
@@ -746,6 +775,9 @@ pub async fn claude_account_capture_identity(
     app: tauri::AppHandle,
     account_id: Option<String>,
 ) -> Result<(), String> {
+    // Held until the row is written: `upsert_claude_account` after a concurrent removal's
+    // delete would RESURRECT the removed account. See `accounts::ACCOUNT_LIFECYCLE`.
+    let _account_use = crate::accounts::account_use_guard().await;
     let slot = claude_slot(&app, account_id.as_deref())?;
     let status = crate::accounts::status(&slot).await?;
     let store = app.state::<Store>();
@@ -805,17 +837,34 @@ pub async fn claude_account_remove(
     account_id: String,
     force: bool,
 ) -> Result<Option<String>, String> {
+    // EXCLUSIVE for the whole check → sign-out → delete sequence. Every path that resolves a
+    // slot and then uses it (spawn, sign-in start, identity capture) holds the shared side
+    // until its use is visible — a registered session, an in-flight login, a written row — so
+    // the checks below cannot be invalidated before the row is gone.
+    // Lock order: ACCOUNT_LIFECYCLE (here) → ACTIVE_LOGIN → REDEEMING (in `sign_in_busy_for`);
+    // the `Sessions` std mutex is only taken briefly, never across an await.
+    let _removal = crate::accounts::account_removal_guard().await;
     let slot = claude_slot(&app, Some(&account_id))?;
+
+    // A sign-in for this account — waiting for the pasted code, or redeeming it — would
+    // write credentials into the directory we are about to delete (recreating it), under a
+    // Keychain item nobody could address once the row is gone. Refuse; the user finishes or
+    // cancels the sign-in first.
+    if crate::accounts::sign_in_busy_for(Some(&account_id)).await {
+        return Err(
+            "a sign-in is in progress for this account — finish or cancel it before removing \
+             the account"
+                .into(),
+        );
+    }
 
     // A live session authenticated as this account would keep running against credentials
     // we are removing, and its handle records an id about to vanish. Refuse rather than
     // leave that inconsistency behind.
-    if app
+    if !app
         .state::<Sessions>()
         .claude_handles_for(Some(&account_id))
-        .iter()
-        .next()
-        .is_some()
+        .is_empty()
     {
         return Err(
             "a conversation is still running on this account — stop it before removing the \
@@ -890,6 +939,10 @@ pub async fn account_claude_login_start(
     app: tauri::AppHandle,
     account_id: Option<String>,
 ) -> Result<String, String> {
+    // Held until the login is registered (`login_start` returns only then), so a removal
+    // either ran first (→ "unknown account") or sees this sign-in and refuses. The wait for
+    // the pasted code happens AFTER this returns, guarded by `sign_in_busy_for` instead.
+    let _account_use = crate::accounts::account_use_guard().await;
     let slot = claude_slot(&app, account_id.as_deref())?;
     crate::accounts::login_start(&slot, account_id).await
 }
@@ -4004,9 +4057,9 @@ mod tests {
             SessionHandle::from_channel(id.to_string(), tx)
         }
         let sessions = Sessions::new();
-        sessions.insert("session-2".into(), Backend::Codex, handle("session-2"), None);
-        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None);
-        sessions.insert("session-3".into(), Backend::Claude, handle("session-3"), None);
+        sessions.insert("session-2".into(), Backend::Codex, handle("session-2"), None, false);
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, false);
+        sessions.insert("session-3".into(), Backend::Claude, handle("session-3"), None, false);
 
         let ids: Vec<String> =
             sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
@@ -4039,12 +4092,13 @@ mod tests {
             SessionHandle::from_channel(id.to_string(), tx)
         }
         let sessions = Sessions::new();
-        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None);
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, false);
         sessions.insert(
             "session-2".into(),
             Backend::Claude,
             handle("session-2"),
             Some("acct-b".into()),
+            false,
         );
 
         let default: Vec<String> =
@@ -4062,6 +4116,30 @@ mod tests {
             sessions.claude_handles_for(Some("acct-c")).is_empty(),
             "an account with no live session has no fast path — never another account's"
         );
+    }
+
+    /// A REMOTE (SSH) session authenticates with the SERVER's credential store. It is
+    /// recorded with no account, so without an explicit exclusion it matched `None` and the
+    /// default account's usage ring asked it — showing the server account's quota as ours.
+    #[test]
+    fn remote_sessions_answer_for_no_local_account() {
+        fn handle(id: &str) -> SessionHandle {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            SessionHandle::from_channel(id.to_string(), tx)
+        }
+        let sessions = Sessions::new();
+        sessions.insert("session-1".into(), Backend::Claude, handle("session-1"), None, true);
+
+        assert!(
+            sessions.claude_handles_for(None).is_empty(),
+            "a remote session must not answer for the default account"
+        );
+        assert!(sessions.get("session-1").is_some(), "it is still a live, addressable session");
+
+        sessions.insert("session-2".into(), Backend::Claude, handle("session-2"), None, false);
+        let default: Vec<String> =
+            sessions.claude_handles_for(None).into_iter().map(|h| h.id).collect();
+        assert_eq!(default, ["session-2"], "only the LOCAL default-account session is asked");
     }
 
     /// The resume invocation is BACKEND-AWARE: Claude uses `--resume`, Codex uses the

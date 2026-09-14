@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 
-use super::{ensure_crypto_provider, read_oauth_token_for, snippet, UsageError, USER_AGENT};
+use super::{
+    ensure_crypto_provider, now_unix_ms, read_oauth_token_for, reject_expired_token,
+    rejected_token_error, snippet, UsageError, USER_AGENT,
+};
 
 const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
@@ -53,11 +56,14 @@ pub async fn fetch_profile_for(
     slot: &crate::accounts::AccountSlot,
 ) -> Result<AccountProfile, UsageError> {
     let slot = slot.clone();
-    let token = tokio::task::spawn_blocking(move || read_oauth_token_for(&slot))
+    let creds = tokio::task::spawn_blocking(move || read_oauth_token_for(&slot))
         .await
         .map_err(|e| UsageError::Network {
             detail: format!("token read task failed: {e}"),
         })??;
+    // Same expiry typing as the usage call: an idle account's lapsed token is not a revoked
+    // sign-in, so it must not surface as the terminal `Unauthorized`.
+    reject_expired_token(&creds, now_unix_ms())?;
 
     ensure_crypto_provider();
     // Fallible builder + explicit timeouts, for the same reasons as the usage call: a panic
@@ -71,7 +77,7 @@ pub async fn fetch_profile_for(
         })?;
     let resp = client
         .get(PROFILE_URL)
-        .bearer_auth(&token)
+        .bearer_auth(&creds.access_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -90,9 +96,7 @@ pub async fn fetch_profile_for(
     })?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(UsageError::Unauthorized {
-            status: status.as_u16(),
-        });
+        return Err(rejected_token_error(status.as_u16(), &creds, now_unix_ms()));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(UsageError::RateLimited { retry_after });
@@ -200,7 +204,7 @@ mod tests {
             .await
             .expect("token task")
         {
-            Ok(t) => t,
+            Ok(c) => c.access_token,
             Err(e) => {
                 eprintln!("SKIP: no usable token for the default account: {e:?}");
                 return;

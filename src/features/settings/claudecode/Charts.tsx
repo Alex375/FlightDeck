@@ -419,7 +419,9 @@ export interface StackedBarRow {
    *  truncated label never leaves the reader guessing which folder a row is. */
   detail?: string;
   total: number;
-  parts: Array<{ key: string; label: string; value: number }>;
+  /** `unpriced` parts have no price on the rate card: their `value` is a layout 0, and the
+   *  chart must say "no price" rather than let the row read as free. */
+  parts: Array<{ key: string; label: string; value: number; unpriced?: boolean }>;
 }
 
 /**
@@ -459,7 +461,14 @@ export function StackedBarChart({
       rows
         .map((r) => {
           const parts = r.parts.filter((p) => !hidden.has(p.key));
-          return { ...r, parts, total: parts.reduce((n, p) => n + p.value, 0) };
+          const unpriced = parts.filter((p) => p.unpriced);
+          return {
+            ...r,
+            parts,
+            total: parts.reduce((n, p) => n + p.value, 0),
+            unpricedLabels: unpriced.map((p) => p.label),
+            allUnpriced: parts.length > 0 && unpriced.length === parts.length,
+          };
         })
         .filter((r) => r.parts.length > 0)
         .sort((a, b) => b.total - a.total),
@@ -477,6 +486,14 @@ export function StackedBarChart({
   if (rows.length === 0) return <EmptyChart title={title} note={emptyNote} />;
 
   const max = Math.max(1, ...shown.map((r) => r.total));
+  // A row with unpriced models is a LOWER BOUND ("$12+"); one with nothing priced has no
+  // figure at all. Either way it must never print as a plain total or as $0.
+  const valueFor = (row: (typeof shown)[number]) =>
+    row.allUnpriced
+      ? "no price"
+      : row.unpricedLabels.length > 0
+        ? `${formatValue(row.total)}+`
+        : formatValue(row.total);
 
   return (
     <figure className="cc-chart">
@@ -501,6 +518,12 @@ export function StackedBarChart({
                     <>
                       <div className="cc-tip-head">{row.label}</div>
                       {row.detail && <div className="cc-tip-path">{row.detail}</div>}
+                      {row.unpricedLabels.length > 0 && (
+                        <div className="cc-tip-path">
+                          No price for {row.unpricedLabels.join(", ")} — not counted in the
+                          figure. Set one under Edit prices.
+                        </div>
+                      )}
                     </>
                   ),
                 })
@@ -539,7 +562,7 @@ export function StackedBarChart({
                               <b>{formatValue(part.value)}</b>
                             </div>
                             <div className="cc-tip-row cc-tip-total">
-                              Total<b>{formatValue(row.total)}</b>
+                              Total<b>{valueFor(row)}</b>
                             </div>
                           </>
                         ),
@@ -550,7 +573,7 @@ export function StackedBarChart({
                 );
               })}
             </div>
-            <span className="cc-hvalue">{formatValue(row.total)}</span>
+            <span className="cc-hvalue">{valueFor(row)}</span>
           </div>
         ))}
         <Tooltip state={tip} />

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Stub the IPC surface: the store's setters persist via `upsertConversation` and
 // push live changes via set*; both return an ok Result. We assert what gets called.
@@ -35,6 +35,7 @@ import { useAppControlPrefs } from "./appControl";
 import {
   acknowledgeConversation,
   createConversationInRepo,
+  createConversationInWorktree,
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
   demoteBypassConversations,
@@ -50,7 +51,12 @@ import {
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
-import { useClaudeAccountList, useClaudeAccountPrefs } from "./claudeAccounts";
+import {
+  clearManualAccountPicks,
+  manualAccountPick,
+  useClaudeAccountList,
+  useClaudeAccountPrefs,
+} from "./claudeAccounts";
 
 const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   id: "c1",
@@ -230,6 +236,94 @@ describe("conversationsStore — Claude account selection", () => {
     seed(baseConv({ handle: "session-7", liveClaudeAccountId: "acct-b" }));
     useConversationsStore.getState().setHandle("c1", null);
     expect(conv0().liveClaudeAccountId ?? null).toBeNull();
+  });
+});
+
+describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
+  // The core refuses any non-default account on a remote repo (the SSH launcher does not
+  // carry it), so a conversation seeded with the preferred default could never send.
+  const remoteRepo = { id: "rr", path: "/srv/app", addedAt: 1, machineId: "m1" };
+
+  beforeEach(() => {
+    useClaudeAccountList.getState().setAccounts([{ id: "acct-b", label: "B", sortIndex: 1 }]);
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "acct-b" });
+    clearManualAccountPicks();
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }, remoteRepo],
+      conversations: [],
+      activeId: null,
+    });
+  });
+  afterEach(() => {
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: null });
+  });
+
+  const byId = (id: string) =>
+    useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+
+  it("a new conversation in a remote repo starts on the default account", () => {
+    expect(byId(createConversationInRepo("/srv/app")).claudeAccountId).toBeNull();
+    // …while a local one still honours the preference.
+    expect(byId(createConversationInRepo("/tmp/r1")).claudeAccountId).toBe("acct-b");
+  });
+
+  it("a new worktree conversation of a remote repo starts on the default account", () => {
+    expect(byId(createConversationInWorktree("rr", "/srv/app/.claude/worktrees/x")).claudeAccountId).toBeNull();
+    expect(byId(createConversationInWorktree("r1", "/tmp/r1/wt")).claudeAccountId).toBe("acct-b");
+  });
+
+  it("a reactivated or forked conversation in a remote repo runs on the default account", () => {
+    const disk: DiskConversation = {
+      session_id: "s-remote",
+      cwd: "/srv/app",
+      repo_root: "/srv/app",
+      git_branch: null,
+      title: null,
+      excerpt: "hi",
+      mtime_ms: 100,
+      backend: "claude",
+    };
+    expect(byId(reactivateDiskConversation(disk)).claudeAccountId).toBeNull();
+    // A fork inheriting a non-default account from its source must not carry it either.
+    const forked = reactivateDiskConversation(
+      { ...disk, session_id: "s-fork" },
+      {
+        model: "opus",
+        effort: "xhigh",
+        ultracode: false,
+        permissionMode: "default",
+        cleanOutput: null,
+        claudeAccountId: "acct-b",
+      },
+    );
+    expect(byId(forked).claudeAccountId).toBeNull();
+  });
+
+  it("refuses a non-default account on a remote conversation, but allows the way back", () => {
+    useConversationsStore.setState({
+      repos: [remoteRepo],
+      conversations: [baseConv({ id: "c1", repoId: "rr", claudeAccountId: "acct-b" })],
+    });
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-c", { auto: true });
+    expect(byId("c1").claudeAccountId).toBe("acct-b");
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(byId("c1").claudeAccountId).toBeNull();
+  });
+});
+
+describe("conversationsStore — manual account picks pin the conversation", () => {
+  beforeEach(() => clearManualAccountPicks());
+
+  it("a USER pick is recorded, an automatic switch is not", () => {
+    useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b", { auto: true });
+    expect(manualAccountPick("c1")).toBeUndefined();
+
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(manualAccountPick("c1")).toBeNull();
+    // Re-stating the current account is a deliberate choice too.
+    clearManualAccountPicks();
+    useConversationsStore.getState().setConvClaudeAccount("c1", null);
+    expect(manualAccountPick("c1")).toBeNull();
   });
 });
 

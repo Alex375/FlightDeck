@@ -205,15 +205,41 @@ fn memory_path() -> Option<PathBuf> {
         .map(|home| home.join(".claude/CLAUDE.md"))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Atomic replace for a user-owned text file (`CLAUDE.md`, an agent definition): write a
+/// sibling temp file, then rename it over the target.
+///
+/// ⚠️ A symlink is written THROUGH, not replaced. Dotfile managers commonly symlink
+/// `~/.claude/CLAUDE.md` and `~/.claude/agents/*.md` into a git repo; renaming over the link
+/// itself would swap it for a regular file — the edit lands, the user's repo never sees it,
+/// and the link they set up is gone. So the link is resolved first and the temp file is
+/// created next to the REAL target (a rename only stays atomic within one filesystem). A
+/// dangling link is refused rather than guessed at.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let target = if is_link {
+        std::fs::canonicalize(path).map_err(|e| {
+            format!("{} is a symlink whose target cannot be resolved: {e}", path.display())
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", target.display()))?
+        .to_string_lossy()
+        .into_owned();
+
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("md.tosse-tmp.{}.{n}", std::process::id()));
+    let tmp = target.with_file_name(format!("{file_name}.tosse-tmp.{}.{n}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| format!("writing temporary file: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("atomic replacement of {}: {e}", path.display())
+        format!("atomic replacement of {}: {e}", target.display())
     })
 }
 
@@ -354,6 +380,48 @@ mod tests {
         let read = read_managed_at(&path).unwrap();
         assert!(read.marker_error.is_some());
         assert_eq!(read.managed_text, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writing_through_a_symlink_keeps_the_link_and_updates_its_target() {
+        let dir = std::env::temp_dir().join(format!("tosse-mem-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let real = dir.join("dotfiles/CLAUDE.md");
+        let link = dir.join("CLAUDE.md");
+        std::fs::write(&real, HAND).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_managed_at(&link, Some("policy")).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the user's link must survive the save"
+        );
+        let through_real = std::fs::read_to_string(&real).unwrap();
+        assert!(through_real.contains("policy"), "the edit lands in the real file");
+        assert!(through_real.starts_with(HAND));
+        // No temp file left behind next to either path.
+        for d in [&dir, &dir.join("dotfiles")] {
+            let stray = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains("tosse-tmp"));
+            assert!(!stray, "no temp file left in {}", d.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_refused_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("tosse-mem-dangle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("CLAUDE.md");
+        std::os::unix::fs::symlink(dir.join("gone.md"), &link).unwrap();
+        assert!(write_atomic(&link, b"x").is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

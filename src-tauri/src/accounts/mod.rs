@@ -14,9 +14,20 @@
 //! ## Multiple accounts
 //! Every entry point takes an [`AccountSlot`] saying WHICH credential store to drive. The
 //! slot is applied as an environment variable on the `claude` child, so signing a second
-//! account in never touches the first one's credentials — and never touches the shared
-//! `~/.claude` (transcripts, settings, plugins, skills, MCP). See [`slot`] for the verified
-//! mechanism and for why the default slot deliberately sets no variable at all.
+//! account in never touches the first one's credentials, nor the shared transcripts,
+//! settings, plugins, skills or MCP servers. It is NOT a full isolation, though: the CLI's
+//! login and logout both rewrite the account profile cache in the shared `~/.claude.json`
+//! (`oauthAccount` and a few model/usage caches), for every account at once. See [`slot`]
+//! for the verified mechanism, that shared-state effect and why it is tolerable, and why the
+//! default slot never gives the variable a value.
+//!
+//! ## Removal vs. sign-in vs. spawn
+//! Removing an account deletes the directory its Keychain item name is derived from, so it
+//! must never interleave with anything that is about to USE that slot: a sign-in (which
+//! would recreate the directory and write credentials nobody can address afterwards) or a
+//! session spawn (which would run on an account whose row is gone). [`account_use_guard`] /
+//! [`account_removal_guard`] serialize the two sides, and [`sign_in_busy_for`] tells the
+//! removal about a sign-in that is already past its start (awaiting or redeeming the code).
 
 pub mod slot;
 
@@ -71,6 +82,81 @@ static ACTIVE_LOGIN: Mutex<Option<ActiveLogin>> = Mutex::const_new(None);
 /// confusingly. Mirrors the Codex sibling's `LOGIN_FLOW` (its acute reason is a callback-port
 /// race; here it's the child/URL mismatch, but the fix is the same).
 static LOGIN_FLOW: Mutex<()> = Mutex::const_new(());
+
+/// The account-lifecycle lock: SHARED by everything that resolves an account slot and then
+/// puts it to use (session spawn, sign-in start, identity capture), EXCLUSIVE for removal.
+/// Without it, removal's "no session / no sign-in on this account" check and its row delete
+/// leave a window in which a spawn or a sign-in resolves the still-present row and then runs
+/// on an account that is being deleted.
+///
+/// Lock order (never take them the other way round — none of the later locks is ever held
+/// while acquiring an earlier one):
+/// `ACCOUNT_LIFECYCLE` → `LOGIN_FLOW` → `ACTIVE_LOGIN` → `REDEEMING`.
+/// Removal takes `ACCOUNT_LIFECYCLE` (write) then only `ACTIVE_LOGIN` → `REDEEMING` (via
+/// [`sign_in_busy_for`]); a sign-in start takes it (read) then `LOGIN_FLOW` → `ACTIVE_LOGIN`.
+static ACCOUNT_LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Hold while resolving an account slot AND putting it to use (spawning on it, starting its
+/// sign-in, persisting its identity), so a concurrent removal waits until the use is visible
+/// to its checks (a registered session, an in-flight login). Several uses run concurrently.
+/// ⚠️ Not re-entrant: never acquire it twice in one call chain (a queued removal would
+/// deadlock the second acquisition).
+pub async fn account_use_guard() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    ACCOUNT_LIFECYCLE.read().await
+}
+
+/// Hold across an account removal's whole check → sign-out → delete sequence (see
+/// [`ACCOUNT_LIFECYCLE`]).
+pub async fn account_removal_guard() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    ACCOUNT_LIFECYCLE.write().await
+}
+
+/// The accounts whose pasted code is being REDEEMED right now (`None` entry = the default
+/// slot). [`login_submit_code`] takes the login out of [`ACTIVE_LOGIN`] before waiting up to
+/// 90 s for the CLI to exchange the code and write the credentials — so without this, that
+/// most critical stretch would look like "no sign-in in flight" to a removal. A list, not a
+/// single slot: a new sign-in can start (and be submitted) while an older redemption is
+/// still settling.
+static REDEEMING: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+
+/// RAII entry in [`REDEEMING`], removed on every exit path of the redemption.
+struct RedeemingMark(Option<String>);
+
+impl RedeemingMark {
+    fn set(account_id: Option<String>) -> Self {
+        REDEEMING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(account_id.clone());
+        Self(account_id)
+    }
+}
+
+impl Drop for RedeemingMark {
+    fn drop(&mut self) {
+        let mut redeeming = REDEEMING.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = redeeming.iter().position(|id| *id == self.0) {
+            redeeming.swap_remove(idx);
+        }
+    }
+}
+
+/// Whether a sign-in for `account_id` (`None` = the default slot) is past its start: waiting
+/// for the pasted code, or redeeming it. Callers that must not race it (removal) hold
+/// [`account_removal_guard`], which already excludes a sign-in that is still STARTING.
+pub async fn sign_in_busy_for(account_id: Option<&str>) -> bool {
+    let active = ACTIVE_LOGIN.lock().await;
+    if active
+        .as_ref()
+        .is_some_and(|a| a.account_id.as_deref() == account_id)
+    {
+        return true;
+    }
+    // Read REDEEMING while still holding ACTIVE_LOGIN: `login_submit_code` moves a login from
+    // one to the other under that same lock, so no interleaving can see it in neither.
+    let redeeming = REDEEMING.lock().unwrap_or_else(|p| p.into_inner());
+    redeeming.iter().any(|id| id.as_deref() == account_id)
+}
 
 /// The `claude` binary, resolved like the session spawner (PATH, then well-known
 /// locations) so a Finder-launched bundle's minimal PATH still finds it.
@@ -263,6 +349,9 @@ pub async fn login_submit_code(account_id: Option<&str>, code: &str) -> Result<(
         Some(_) => {}
     }
     let mut active = guard.take().expect("checked as Some above");
+    // Registered BEFORE releasing ACTIVE_LOGIN, so `sign_in_busy_for` never sees a gap
+    // between "awaiting the code" and "redeeming it". Cleared when this function returns.
+    let _redeeming = RedeemingMark::set(active.account_id.clone());
     drop(guard);
     if let Err(e) = active.stdin.write_all(format!("{code}\n").as_bytes()).await {
         let _ = active.child.kill().await;
@@ -377,9 +466,13 @@ mod tests {
         }
         // The real flow is untouched, so the right card can still complete it.
         assert_eq!(login_in_flight().await, Some(Some("acct-b".into())));
+        // …and a removal of acct-b must see it as busy, while other accounts stay removable.
+        assert!(sign_in_busy_for(Some("acct-b")).await);
+        assert!(!sign_in_busy_for(Some("acct-c")).await);
 
         login_cancel().await;
         assert_eq!(login_in_flight().await, None);
+        assert!(!sign_in_busy_for(Some("acct-b")).await);
     }
 
     /// Submitting a code with no login in flight tells the user to restart the flow —

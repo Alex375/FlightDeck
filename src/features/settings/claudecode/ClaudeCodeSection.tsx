@@ -30,6 +30,7 @@ import {
   labelForTranscriptModel,
   modelsByRepo,
   pricingKeyForTranscriptModel,
+  unpricedKeys,
   type SpendFilter,
 } from "./spend";
 import "./claude-code-section.css";
@@ -93,6 +94,9 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
   const agents = routing.data?.agents ?? [];
   const baseline = routing.data?.baseline;
   const forced = baseline?.forced_model ?? null;
+  // settings.json exists but could not be read: the baseline and the lock are UNKNOWN, so
+  // offering to change them would write over a file we never understood.
+  const baselineError = baseline?.error ?? null;
 
   // The behaviour canary: what the transcripts say these agents actually ran on, over the
   // last week, versus what they are configured for.
@@ -109,6 +113,7 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
         name: a.name,
         model: a.effective_model,
         configuredAtMs: a.configured_at_ms,
+        overriddenByForce: a.overridden_by_force,
       })),
     );
   }, [spend.data, agents]);
@@ -131,17 +136,21 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
               {/* The helper's business name, not its dispatch name: the row below is
                   called "Code search", and a banner that says "Explore" sends the reader
                   looking for a setting that is not on the page. */}
-              {copyFor(drift[0]!.agent, null).title} is set to {drift[0]!.configuredLabel} but
-              ran on {drift[0]!.observedLabel}
+              {copyFor(drift[0]!.agent, null).title} recently ran on{" "}
+              {drift[0]!.observedLabel} while its setting says {drift[0]!.configuredLabel}
             </b>
+            {/* An observation, not an accusation: a model passed when the helper is started
+                outranks its setting BY DESIGN — and this app's own routing instructions
+                ask Claude to pass one. Claiming the setting "is not taking effect" would be
+                wrong in exactly the case the app encourages. */}
             <p>
               {drift[0]!.turns} turn{drift[0]!.turns === 1 ? "" : "s"}{" "}
               {drift[0]!.since
-                ? `since you changed this on ${drift[0]!.since}`
+                ? `since this last changed on ${drift[0]!.since}`
                 : "in the last 7 days"}
-              . Either something else is choosing the model for it, or the name this setting
-              hangs on has changed in the Claude CLI — in both cases the setting below is not
-              taking effect.
+              . A model passed when the helper is started — by Claude or by a workflow —
+              overrides this setting, so this can be expected. If nothing should be passing
+              one, the name this setting hangs on may have changed in the Claude CLI.
             </p>
           </div>
         </div>
@@ -152,11 +161,22 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
           <p className="cc-lede">
             The model helpers fall back to when nothing closer to the task says otherwise.
           </p>
+          {baselineError && (
+            <p className="cc-error">
+              <Ico name="alert" /> Could not read your Claude settings ({baselineError}), so the
+              baseline and the budget lock below are unknown. Fix the file by hand and reopen
+              this page — nothing will be written until then.
+            </p>
+          )}
           <ModelPicker
             value={baseline?.model ?? null}
-            onChange={(m) => setBaseline.mutate({ model: m, forced })}
+            // While the budget is locked the lock FOLLOWS the baseline: re-sending the old
+            // forced value kept every helper on the previous model while this picker showed
+            // the new one. Clearing the baseline clears the lock with it — a lock with no
+            // baseline has nothing on the page to point at.
+            onChange={(m) => setBaseline.mutate({ model: m, forced: forced ? m : null })}
             inheritLabel="No baseline — helpers follow the conversation"
-            disabled={setBaseline.isPending}
+            disabled={setBaseline.isPending || !!baselineError}
           />
           <p className="cc-hint">
             Does not reach <b>Code search</b> or <b>Planning</b>: those two keep following the
@@ -166,8 +186,11 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
             forced={forced}
             baselineModel={baseline?.model ?? null}
             onChange={(f) => setBaseline.mutate({ model: baseline?.model ?? null, forced: f })}
-            busy={setBaseline.isPending}
+            busy={setBaseline.isPending || !!baselineError}
           />
+          {setBaseline.error && (
+            <p className="cc-error">Could not save the baseline: {String(setBaseline.error)}</p>
+          )}
         </div>
       </SettingsGroup>
 
@@ -176,11 +199,20 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
         {routing.error && (
           <p className="cc-error cc-pad">Could not read the helpers: {String(routing.error)}</p>
         )}
+        {setModel.error && (
+          <p className="cc-error cc-pad">
+            Could not save the helper's setting: {String(setModel.error)}
+          </p>
+        )}
         {agents.map((agent: AgentRouting) => (
           <AgentRow
             key={`${agent.name}:${agent.path ?? "builtin"}`}
             agent={agent}
             forced={forced}
+            // Pending covers the write AND the refetch (onSettled returns the invalidation
+            // promise). A second edit before the fresh row lands would be built from the
+            // stale one and revert the first.
+            busy={setModel.isPending && setModel.variables?.path === agent.path}
             spend={spend.data?.buckets ?? []}
             onSetModel={(model, effort) =>
               agent.path
@@ -236,6 +268,16 @@ function ForceToggle({
             Force the baseline on every helper, overriding each setting below and any model a
             workflow asks for.
           </em>
+          {/* What settings.json ACTUALLY forces, read back from disk — not what the picker
+              above assumes. A lock left on an older model (by a hand edit, or by a previous
+              version of this page) must be visible, not hidden behind the new baseline. */}
+          {forced && (
+            <em>
+              Locked to <b className="cc-inline-b">{labelForTranscriptModel(forced)}</b>
+              {forced !== baselineModel &&
+                " — not the baseline above. Choose the baseline again to move the lock with it."}
+            </em>
+          )}
         </span>
       </label>
       <ConfirmDialog
@@ -262,6 +304,7 @@ function ForceToggle({
 function AgentRow({
   agent,
   forced,
+  busy,
   spend,
   onSetModel,
   userAgentsDir,
@@ -269,6 +312,7 @@ function AgentRow({
 }: {
   agent: AgentRouting;
   forced: string | null;
+  busy: boolean;
   spend: SpendBucket[];
   onSetModel: (model: string | null, effort: string | null) => void;
   userAgentsDir: string;
@@ -280,6 +324,10 @@ function AgentRow({
   const recommended = copy.recommend;
   const offRecommendation =
     recommended && agent.effective_model && agent.effective_model !== recommended.model;
+  // A plugin's definition lives in the plugin cache and is replaced wholesale on the next
+  // plugin update — an edit here would look saved and then silently disappear.
+  const pluginOwned = agent.origin === "plugin";
+  const locked = !!forced || pluginOwned || busy;
 
   const usage = useMemo(() => {
     const recent = spend.filter((b) => b.agent === agent.name && b.day >= dayCutoff(7));
@@ -325,7 +373,7 @@ function AgentRow({
             value={agent.effective_model}
             onChange={(m) => onSetModel(m, agent.effort)}
             inheritLabel="Follow the conversation"
-            disabled={!!forced}
+            disabled={locked}
           />
         ) : (
           <TakeControl
@@ -339,8 +387,10 @@ function AgentRow({
           <select
             className="cc-select cc-select-sm"
             value={agent.effort ?? ""}
-            disabled={!!forced}
-            onChange={(e) => onSetModel(agent.effective_model, e.target.value || null)}
+            disabled={locked}
+            // The file's OWN `model:`, not the effective one: that falls back to the
+            // baseline, and writing it back would pin the baseline's model into the file.
+            onChange={(e) => onSetModel(agent.defined_model, e.target.value || null)}
           >
             <option value="">Default depth</option>
             {efforts.map((level) => (
@@ -365,9 +415,16 @@ function AgentRow({
           Suggested: <b>{recommended.family}</b> — {recommended.because}
         </p>
       )}
+      {pluginOwned && (
+        <p className="cc-rec cc-rec-off">
+          <Ico name="alert" /> Provided by a plugin — changes here would be overwritten when
+          the plugin updates.
+        </p>
+      )}
       {forced && (
         <p className="cc-rec cc-rec-off">
-          <Ico name="alert" /> Overridden while the budget is locked.
+          <Ico name="alert" /> Runs on <b>{labelForTranscriptModel(forced)}</b> while the
+          budget is locked.
         </p>
       )}
     </div>
@@ -572,15 +629,30 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
         </button>
       </p>
 
-      {editingPrices && <PriceEditor />}
+      {editingPrices && <PriceEditor buckets={buckets} />}
 
       {spend.isLoading && <p className="cc-hint">Reading sub-agent transcripts…</p>}
       {spend.error && <p className="cc-error">Could not read the transcripts: {String(spend.error)}</p>}
+      {/* Every way the scan can come back partial is said out loud: a missing projects
+          directory must not pass for "no helper turns", and skipped lines must not pass
+          for a smaller bill. */}
+      {spend.data?.warnings.map((w) => (
+        <p key={w} className="cc-warn">
+          <Ico name="alert" /> Could not read the transcripts fully: {w}.
+        </p>
+      ))}
       {spend.data && spend.data.files_unreadable > 0 && (
         <p className="cc-warn">
           <Ico name="alert" /> {spend.data.files_unreadable} transcript
           {spend.data.files_unreadable === 1 ? " was" : "s were"} unreadable, so the totals below
           are lower than the real figure.
+        </p>
+      )}
+      {spend.data && spend.data.lines_unparsed > 0 && (
+        <p className="cc-warn">
+          <Ico name="alert" /> {spend.data.lines_unparsed.toLocaleString("en-US")} helper turn
+          {spend.data.lines_unparsed === 1 ? " was" : "s were"} written in a shape this version
+          cannot read, so the totals below may be lower than the real figure.
         </p>
       )}
 
@@ -706,7 +778,14 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
           {rows.length === 0 && (
             <tr>
               <td colSpan={4} className="cc-hint">
-                No helper turns in this range.
+                {spend.isLoading
+                  ? "Reading…"
+                  : spend.error ||
+                      (spend.data &&
+                        spend.data.files_scanned === 0 &&
+                        (spend.data.warnings.length > 0 || spend.data.files_unreadable > 0))
+                    ? "Nothing could be read — see the warning above."
+                    : "No helper turns in this range."}
               </td>
             </tr>
           )}
@@ -738,12 +817,15 @@ function Tile({ label, value, note }: { label: string; value: string; note?: str
   );
 }
 
-function PriceEditor() {
+function PriceEditor({ buckets }: { buckets: SpendBucket[] }) {
   const card = useRateCard();
   const setRate = useSubagentPricing((s) => s.setRate);
   const setCacheRatios = useSubagentPricing((s) => s.setCacheRatios);
   const resetAll = useSubagentPricing((s) => s.resetAll);
   const keys = Object.keys(card.rates).sort();
+  // Models that actually ran but have no price. Without them in this table an unpriced
+  // model could never be given one, and would stay a "—" in every total forever.
+  const missing = unpricedKeys(buckets, card);
   return (
     <div className="cc-prices">
       <table className="cc-table">
@@ -784,6 +866,9 @@ function PriceEditor() {
               </td>
             </tr>
           ))}
+          {missing.map((key) => (
+            <UnpricedRateRow key={key} modelKey={key} onCommit={(rate) => setRate(key, rate)} />
+          ))}
         </tbody>
       </table>
       <div className="cc-cacheratios">
@@ -816,6 +901,69 @@ function PriceEditor() {
         Reset to published prices
       </button>
     </div>
+  );
+}
+
+/**
+ * A model seen in the transcripts with no rate on the card. Held locally until BOTH figures
+ * are typed: committing after the first one would price the model with a 0 in the other
+ * column, and a half-priced model reads as cheap rather than as unknown.
+ *
+ * Committed when a field is LEFT (blur / Enter), never per keystroke: the commit moves the
+ * model into the priced rows above and unmounts this row, so committing on change would yank
+ * the field away mid-typing ("1" of "15").
+ */
+function UnpricedRateRow({
+  modelKey,
+  onCommit,
+}: {
+  modelKey: string;
+  onCommit: (rate: { input: number; output: number }) => void;
+}) {
+  const [input, setInput] = useState("");
+  const [output, setOutput] = useState("");
+  const commitIfComplete = () => {
+    const i = Number(input);
+    const o = Number(output);
+    if (input !== "" && output !== "" && i >= 0 && o >= 0 && Number.isFinite(i) && Number.isFinite(o)) {
+      onCommit({ input: i, output: o });
+    }
+  };
+  const commitOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") e.currentTarget.blur();
+  };
+  return (
+    <tr>
+      <td>
+        {labelForTranscriptModel(modelKey)} <span className="cc-badge">no price</span>
+      </td>
+      <td className="cc-num">
+        <input
+          type="number"
+          min={0}
+          step={0.25}
+          className="cc-numinput"
+          placeholder="—"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onBlur={commitIfComplete}
+          onKeyDown={commitOnEnter}
+        />
+      </td>
+      <td className="cc-num">
+        <input
+          type="number"
+          min={0}
+          step={0.25}
+          className="cc-numinput"
+          placeholder="—"
+          value={output}
+          onChange={(e) => setOutput(e.target.value)}
+          onBlur={commitIfComplete}
+          onKeyDown={commitOnEnter}
+        />
+      </td>
+    </tr>
   );
 }
 
@@ -946,10 +1094,13 @@ function InstructionsGroup() {
           type="button"
           className="cc-btn cc-btn-primary"
           disabled={draft === null || write.isPending || !!memory.data?.marker_error}
-          onClick={() => {
-            write.mutate(draft && draft.trim() ? draft : null);
-            setDraft(null);
-          }}
+          // The draft is dropped only once the file has it: clearing it on click lost
+          // everything typed whenever the save failed.
+          onClick={() =>
+            write.mutate(draft && draft.trim() ? draft : null, {
+              onSuccess: () => setDraft(null),
+            })
+          }
         >
           {write.isPending ? "Saving…" : "Save to CLAUDE.md"}
         </button>

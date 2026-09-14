@@ -231,12 +231,21 @@ struct TurnLine<'a> {
     cwd: Option<&'a str>,
     #[serde(rename = "attributionAgent")]
     attribution_agent: Option<&'a str>,
+    /// The API request this line belongs to — half of the de-duplication key, see
+    /// [`scan_file`].
+    #[serde(rename = "requestId")]
+    request_id: Option<&'a str>,
+    /// The line's own id: the de-duplication key of last resort, for a line that carries
+    /// neither a message id nor a request id.
+    uuid: Option<&'a str>,
     #[serde(borrow)]
     message: Option<TurnMessage<'a>>,
 }
 
 #[derive(Deserialize)]
 struct TurnMessage<'a> {
+    /// The API message id (`msg_…`) — shared by every line the CLI writes for one response.
+    id: Option<&'a str>,
     model: Option<&'a str>,
     usage: Option<TurnUsage>,
     // `content` is intentionally absent: serde skips it without allocating.
@@ -258,14 +267,25 @@ struct TurnUsage {
 
 /// Aggregate one transcript's assistant turns. Pure apart from the repo-root memo, so the
 /// parsing rules are unit-testable without a filesystem.
+///
+/// ⚠️ One API response is NOT one line. The CLI writes a line per content block (thinking,
+/// text, each tool call), every one of them repeating the same `message.id` / `requestId`
+/// and the same `usage` — input and cache counts identical, `output_tokens` partial on the
+/// early lines (`5`, `5`, `5`, then `473`). Summing every line inflated the dashboard ~4.5×
+/// (measured: 2 717 assistant lines = 613 distinct responses). So lines are first folded by
+/// response, keeping the one with the most output (the final, complete count), and only
+/// then aggregated — one turn per response.
 fn scan_file(
     text: &str,
     workflow: bool,
     repo_cache: &mut HashMap<String, String>,
 ) -> (Vec<(BucketKey, Counts)>, u32) {
-    let mut cells: HashMap<BucketKey, Counts> = HashMap::new();
+    // Response key → the bucket it lands in plus its best usage so far. The key is
+    // `(message.id, requestId)`, falling back to the line uuid, then to the line's position
+    // — a line with no identity at all is its own response rather than being merged.
+    let mut responses: HashMap<String, (BucketKey, Counts)> = HashMap::new();
     let mut unparsed = 0u32;
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         // Prefilter before any JSON parse. An assistant turn always carries
         // `"role":"assistant"`, so this can only ever over-select, never miss one.
         if !line.contains("\"assistant\"") {
@@ -310,12 +330,30 @@ fn scan_file(
             model: model.to_string(),
             workflow,
         };
-        let entry = cells.entry(key).or_default();
-        entry.turns += 1;
-        entry.input_tokens += usage.input_tokens;
-        entry.output_tokens += usage.output_tokens;
-        entry.cache_read_tokens += usage.cache_read_input_tokens;
-        entry.cache_creation_tokens += usage.cache_creation_input_tokens;
+        let counts = Counts {
+            turns: 1,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_creation_tokens: usage.cache_creation_input_tokens,
+        };
+        let response_key = match (message.id, turn.request_id, turn.uuid) {
+            (None, None, None) => format!("#line:{index}"),
+            (None, None, Some(uuid)) => format!("#uuid:{uuid}"),
+            (id, request, _) => format!("{}\u{0}{}", id.unwrap_or(""), request.unwrap_or("")),
+        };
+        match responses.get_mut(&response_key) {
+            // `>=`: on a tie the later line wins, which is the one the CLI wrote last.
+            Some(best) if counts.output_tokens >= best.1.output_tokens => *best = (key, counts),
+            Some(_) => {}
+            None => {
+                responses.insert(response_key, (key, counts));
+            }
+        }
+    }
+    let mut cells: HashMap<BucketKey, Counts> = HashMap::new();
+    for (key, counts) in responses.into_values() {
+        cells.entry(key).or_default().add(&counts);
     }
     (cells.into_iter().collect(), unparsed)
 }
@@ -534,6 +572,63 @@ mod tests {
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].0.model, "claude-opus-5");
         assert_eq!(cells[0].1.turns, 1);
+    }
+
+    /// An assistant line as the CLI really writes it: one per content block, sharing the
+    /// response's `message.id` / `requestId` and repeating its usage.
+    fn block_line(msg_id: &str, req_id: &str, uuid: &str, out: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","requestId":"{req_id}","timestamp":"2026-09-09T10:00:00Z","cwd":"/r/app","attributionAgent":"Explore","message":{{"id":"{msg_id}","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":10,"output_tokens":{out},"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn content_blocks_of_one_response_count_once_with_the_final_output() {
+        // Shape measured on a real sub-agent transcript: four lines at output 5 then the
+        // complete count on the last, all repeating the same input and cache figures.
+        let text = [
+            block_line("msg_a", "req_a", "u1", 5),
+            block_line("msg_a", "req_a", "u2", 5),
+            block_line("msg_a", "req_a", "u3", 473),
+            block_line("msg_b", "req_b", "u4", 8),
+            block_line("msg_b", "req_b", "u5", 297),
+        ]
+        .join("\n");
+        let mut memo = HashMap::new();
+        let (cells, unparsed) = scan_file(&text, false, &mut memo);
+        assert_eq!(unparsed, 0);
+        assert_eq!(cells.len(), 1);
+        let c = &cells[0].1;
+        assert_eq!(c.turns, 2, "two responses, not five lines");
+        assert_eq!(c.output_tokens, 473 + 297, "the complete count, not a sum of partials");
+        assert_eq!(c.input_tokens, 20, "input repeated on every block is counted once");
+        assert_eq!(c.cache_read_tokens, 200);
+        assert_eq!(c.cache_creation_tokens, 100);
+    }
+
+    #[test]
+    fn a_partial_block_written_after_the_complete_one_does_not_lower_the_count() {
+        let text = [block_line("msg_a", "req_a", "u1", 473), block_line("msg_a", "req_a", "u2", 5)]
+            .join("\n");
+        let mut memo = HashMap::new();
+        let (cells, _) = scan_file(&text, false, &mut memo);
+        assert_eq!(cells[0].1.output_tokens, 473);
+        assert_eq!(cells[0].1.turns, 1);
+    }
+
+    #[test]
+    fn lines_without_a_response_id_fall_back_to_their_own_identity() {
+        // `line()` carries no message id, request id or uuid: each is its own response,
+        // never merged with its neighbour.
+        let text = [
+            line("2026-09-09T10:00:00Z", "/r/app", "Explore", "claude-opus-5", 4),
+            line("2026-09-09T10:00:00Z", "/r/app", "Explore", "claude-opus-5", 4),
+        ]
+        .join("\n");
+        let mut memo = HashMap::new();
+        let (cells, _) = scan_file(&text, false, &mut memo);
+        assert_eq!(cells[0].1.turns, 2);
+        assert_eq!(cells[0].1.output_tokens, 8);
     }
 
     #[test]

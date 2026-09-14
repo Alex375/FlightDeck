@@ -261,12 +261,9 @@ struct SettingsJson {
     /// `autoUpdate` flag (mirrored into `known_marketplaces.json` by the CLI).
     #[serde(default, rename = "extraKnownMarketplaces")]
     extra_known_marketplaces: BTreeMap<String, ExtraMarketplace>,
-    /// Environment the CLI runs its sessions with. Read for the sub-agent model baseline
-    /// (`CLAUDE_CODE_SUBAGENT_MODEL`) and the auto-updater gate. ⚠️ Values here can be
-    /// arbitrary user secrets, so nothing copies this map wholesale into a domain type —
-    /// the readers pull the one key they need.
-    #[serde(default)]
-    env: BTreeMap<String, Value>,
+    // No `env` here on purpose: the sub-agent baseline reads it from a raw `Value` (see
+    // `baseline_from_settings`), so a drifted field elsewhere in this struct can never make
+    // the baseline read as "not set".
 }
 
 /// One `extraKnownMarketplaces[name]` entry — only the fields we read.
@@ -975,29 +972,85 @@ pub struct SubagentBaseline {
     /// both keep inheriting the conversation. Carried in the payload so the UI's
     /// explanation and the backend's behaviour can never drift apart.
     pub unreachable_builtins: Vec<String>,
+    /// Set when `settings.json` exists but could not be read or parsed. `model` and
+    /// `forced_model` are then UNKNOWN, not absent — the UI must say so and refuse to
+    /// offer a change, instead of rendering "No baseline" over a file it never read.
+    pub error: Option<String>,
 }
 
 /// The built-in sub-agents `CLAUDE_CODE_SUBAGENT_MODEL` does NOT reach.
 pub const BASELINE_BLIND_SPOTS: [&str; 2] = ["Explore", "Plan"];
 
 /// Read the sub-agent baseline out of `~/.claude/settings.json`. Absent file or absent
-/// keys → an empty baseline, which is the honest reading of "nothing is set".
+/// keys → an empty baseline, which is the honest reading of "nothing is set". A file that
+/// exists but cannot be read or parsed → the `error` field, never a silent empty baseline.
 pub fn subagent_baseline() -> SubagentBaseline {
-    let env = home_dir()
-        .map(|home| {
-            let settings: SettingsJson =
-                read_json(&home.join(".claude/settings.json")).unwrap_or_default();
-            settings.env
-        })
-        .unwrap_or_default();
-    SubagentBaseline {
-        model: env.get(SUBAGENT_MODEL_ENV).and_then(|v| v.as_str()).map(str::to_string),
-        forced_model: env
-            .get(SUBAGENT_MODEL_FORCE_ENV)
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+    let Some(home) = home_dir() else {
+        return baseline_from_settings(Err("could not resolve the home directory".to_string()));
+    };
+    let path = home.join(".claude/settings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} unreadable: {e}", path.display())),
+    };
+    baseline_from_settings(text)
+}
+
+/// Pure core of [`subagent_baseline`]: `Ok(None)` = no settings file.
+///
+/// Parsed as a raw `serde_json::Value` and NOT as the strictly-typed [`SettingsJson`]: a
+/// drifted field the baseline has nothing to do with (a new `enabledPlugins` value shape, a
+/// hand-edited `mcpServers`) would otherwise fail the whole parse and read as "no baseline".
+fn baseline_from_settings(text: Result<Option<String>, String>) -> SubagentBaseline {
+    let mut out = SubagentBaseline {
         unreachable_builtins: BASELINE_BLIND_SPOTS.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let text = match text {
+        Ok(Some(t)) => t,
+        Ok(None) => return out,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    let root: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            out.error = Some(format!("settings.json is not valid JSON: {e}"));
+            return out;
+        }
+    };
+    let Some(obj) = root.as_object() else {
+        out.error = Some("settings.json is not a JSON object".to_string());
+        return out;
+    };
+    let env = match obj.get("env") {
+        None | Some(Value::Null) => return out,
+        Some(Value::Object(env)) => env,
+        Some(_) => {
+            out.error = Some("settings.json has an `env` that is not an object".to_string());
+            return out;
+        }
+    };
+    let read = |key: &str| -> Result<Option<String>, String> {
+        match env.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            // The CLI reads env values as strings; a number or a bool here is something it
+            // will not honour the way the page would claim.
+            Some(_) => Err(format!("`env.{key}` in settings.json is not a string")),
+        }
+    };
+    match (read(SUBAGENT_MODEL_ENV), read(SUBAGENT_MODEL_FORCE_ENV)) {
+        (Ok(model), Ok(forced)) => {
+            out.model = model;
+            out.forced_model = forced;
+        }
+        (Err(e), _) | (_, Err(e)) => out.error = Some(e),
     }
+    out
 }
 
 /// Pure transform: set or clear the two sub-agent env vars in a settings.json document.
@@ -1700,6 +1753,42 @@ mod tests {
     fn baseline_refuses_a_settings_file_it_cannot_parse() {
         assert!(apply_subagent_baseline("not json", Some("haiku"), None).is_err());
         assert!(apply_subagent_baseline("[1,2]", Some("haiku"), None).is_err());
+    }
+
+    #[test]
+    fn baseline_reads_env_despite_unrelated_field_drift() {
+        // `enabledPlugins` holding a non-bool would fail the strictly-typed SettingsJson
+        // parse and used to read as "No baseline".
+        let src = r#"{"enabledPlugins":{"a@b":"yes"},"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"sonnet"}}"#;
+        let b = baseline_from_settings(Ok(Some(src.to_string())));
+        assert_eq!(b.error, None);
+        assert_eq!(b.model.as_deref(), Some("haiku"));
+        assert_eq!(b.forced_model.as_deref(), Some("sonnet"));
+        assert_eq!(b.unreachable_builtins, vec!["Explore", "Plan"]);
+    }
+
+    #[test]
+    fn baseline_absent_file_or_keys_is_empty_not_an_error() {
+        let none = baseline_from_settings(Ok(None));
+        assert_eq!((none.model, none.forced_model, none.error), (None, None, None));
+        let no_env = baseline_from_settings(Ok(Some("{}".to_string())));
+        assert_eq!(no_env.error, None);
+        assert_eq!(no_env.model, None);
+    }
+
+    #[test]
+    fn baseline_surfaces_an_unreadable_or_corrupt_settings_file() {
+        let io = baseline_from_settings(Err("settings.json unreadable: denied".to_string()));
+        assert!(io.error.unwrap().contains("denied"));
+        let corrupt = baseline_from_settings(Ok(Some("{ not json".to_string())));
+        assert!(corrupt.error.unwrap().contains("not valid JSON"));
+        assert_eq!(corrupt.model, None);
+        let not_object = baseline_from_settings(Ok(Some("[1]".to_string())));
+        assert!(not_object.error.is_some());
+        let bad_value = baseline_from_settings(Ok(Some(
+            r#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":3}}"#.to_string(),
+        )));
+        assert!(bad_value.error.unwrap().contains("not a string"));
     }
 
     #[test]

@@ -2462,6 +2462,15 @@ name: string; description: string | null;
  */
 effective_model: string | null; 
 /**
+ * The `model:` written in the agent's OWN definition file, verbatim (`inherit`
+ * included), or `None` when the file has no such key or there is no file.
+ * 
+ * Distinct from `effective_model` on purpose: that one falls back to the baseline, and
+ * an edit that round-trips it (changing only the effort, say) would pin the baseline's
+ * model into the file — silently detaching the agent from every later baseline change.
+ */
+defined_model: string | null; 
+/**
  * The effort pinned in the definition, when it has one.
  */
 effort: string | null; origin: RoutingOrigin; 
@@ -4404,7 +4413,13 @@ forced_model: string | null;
  * both keep inheriting the conversation. Carried in the payload so the UI's
  * explanation and the backend's behaviour can never drift apart.
  */
-unreachable_builtins: string[] }
+unreachable_builtins: string[]; 
+/**
+ * Set when `settings.json` exists but could not be read or parsed. `model` and
+ * `forced_model` are then UNKNOWN, not absent — the UI must say so and refuse to
+ * offer a change, instead of rendering "No baseline" over a file it never read.
+ */
+error: string | null }
 /**
  * Everything the routing section needs, in one read.
  */
@@ -4746,9 +4761,17 @@ export type UsageError =
  */
 { kind: "keychain_denied"; detail: string } | 
 /**
- * Endpoint rejected the token (HTTP 401/403): expired or revoked.
+ * Endpoint rejected a token that is NOT known to be expired (HTTP 401/403): revoked,
+ * or signed out. Terminal until the user signs in again.
  */
 { kind: "unauthorized"; status: number } | 
+/**
+ * The stored access token is past its `expiresAt`. NOT terminal: the refresh token is
+ * normally still valid, but only a running `claude` refreshes it (this module stays
+ * read-only), so usage returns once a conversation runs on the account. `detail` is a
+ * plain-English explanation, ready to show.
+ */
+{ kind: "token_expired"; detail: string } | 
 /**
  * The usage endpoint is itself rate-limited (HTTP 429). `retry_after` = seconds
  * from the `Retry-After` header when present. Do NOT hammer it — back off.

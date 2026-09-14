@@ -54,6 +54,13 @@ pub struct AgentRouting {
     /// The model this agent will run on, as far as we can tell, or `None` for "whatever
     /// the conversation is using".
     pub effective_model: Option<String>,
+    /// The `model:` written in the agent's OWN definition file, verbatim (`inherit`
+    /// included), or `None` when the file has no such key or there is no file.
+    ///
+    /// Distinct from `effective_model` on purpose: that one falls back to the baseline, and
+    /// an edit that round-trips it (changing only the effort, say) would pin the baseline's
+    /// model into the file — silently detaching the agent from every later baseline change.
+    pub defined_model: Option<String>,
     /// The effort pinned in the definition, when it has one.
     pub effort: Option<String>,
     pub origin: RoutingOrigin,
@@ -136,12 +143,28 @@ pub fn resolve_routing(
     // this is also the shadow list.
     for agent in agents {
         let built_in = KNOWN_BUILT_INS.iter().any(|(n, _)| *n == agent.name);
+        let effective_model = match agent.model.as_deref() {
+            // `model: inherit` is a level-2 answer in its own right — "the conversation's
+            // model" — so the baseline does not apply, and there is no model name to report.
+            Some("inherit") => None,
+            // Level 2 beats level 3: a definition's own `model:` stands, and only when it
+            // has none does the baseline apply.
+            Some(model) => Some(model.to_string()),
+            None => baseline.model.clone(),
+        };
+        // The setting a row runs under is spread over TWO files: its definition, and
+        // settings.json (the baseline, and the lock that overrides the definition). The
+        // drift canary must only weigh turns after the LATER of the two changed — otherwise
+        // turning the lock off reports every locked run as the definition being ignored.
+        let configured_at_ms = match (mtime_ms(Path::new(&agent.path)), baseline_changed_at) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
         rows.push(AgentRouting {
             name: agent.name.clone(),
             description: agent.description.clone(),
-            // Level 2 beats level 3: a definition's own `model:` stands, and only when it
-            // has none does the baseline apply.
-            effective_model: agent.model.clone().or_else(|| baseline.model.clone()),
+            effective_model,
+            defined_model: agent.model.clone(),
             effort: agent.effort.clone(),
             origin: match agent.scope {
                 ExtScope::User => RoutingOrigin::User,
@@ -155,7 +178,7 @@ pub fn resolve_routing(
             // It has a file already, so it is steerable whatever the env var cannot reach.
             needs_file_to_steer: false,
             overridden_by_force: forced,
-            configured_at_ms: mtime_ms(Path::new(&agent.path)),
+            configured_at_ms,
         });
     }
 
@@ -171,6 +194,7 @@ pub fn resolve_routing(
             // The blind spots ignore the baseline entirely: reporting the baseline's model
             // for them would be the exact lie this page exists to prevent.
             effective_model: if blind { None } else { baseline.model.clone() },
+            defined_model: None,
             effort: None,
             origin: RoutingOrigin::BuiltIn,
             path: None,
@@ -259,7 +283,45 @@ mod tests {
             model: model.map(str::to_string),
             forced_model: forced.map(str::to_string),
             unreachable_builtins: BASELINE_BLIND_SPOTS.iter().map(|s| s.to_string()).collect(),
+            error: None,
         }
+    }
+
+    #[test]
+    fn defined_model_is_the_files_own_key_never_the_baseline() {
+        let agents = [
+            agent("no-model", None, ExtScope::User),
+            agent("pinned", Some("opus"), ExtScope::User),
+            agent("inheritor", Some("inherit"), ExtScope::User),
+        ];
+        let r = resolve_routing(&agents, &baseline(Some("haiku"), None), "/u", "/p", None, false, None);
+        // The row still SHOWS the baseline it will run on…
+        assert_eq!(row(&r, "no-model").effective_model.as_deref(), Some("haiku"));
+        // …but an edit must not write it into the file.
+        assert_eq!(row(&r, "no-model").defined_model, None);
+        assert_eq!(row(&r, "pinned").defined_model.as_deref(), Some("opus"));
+        // `inherit` means the conversation's model: not the baseline, not a model named
+        // "inherit" — and it is preserved verbatim for the writer.
+        assert_eq!(row(&r, "inheritor").effective_model, None);
+        assert_eq!(row(&r, "inheritor").defined_model.as_deref(), Some("inherit"));
+        assert_eq!(row(&r, "Plan").defined_model, None);
+    }
+
+    #[test]
+    fn a_file_rows_change_date_includes_a_later_settings_change() {
+        let dir = std::env::temp_dir().join(format!("tosse-routing-mtime-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("helper.md");
+        std::fs::write(&path, "---\nname: helper\n---\nbody\n").unwrap();
+        let mut a = agent("helper", Some("opus"), ExtScope::User);
+        a.path = path.to_string_lossy().into_owned();
+        let file_mtime = mtime_ms(&path).unwrap();
+        let later = file_mtime + 86_400_000;
+        let r = resolve_routing(&[a.clone()], &baseline(None, None), "/u", "/p", None, false, Some(later));
+        assert_eq!(row(&r, "helper").configured_at_ms, Some(later), "the lock lives in settings.json");
+        let r = resolve_routing(&[a], &baseline(None, None), "/u", "/p", None, false, Some(0));
+        assert_eq!(row(&r, "helper").configured_at_ms, Some(file_mtime));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn row<'a>(r: &'a SubagentRouting, name: &str) -> &'a AgentRouting {

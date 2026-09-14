@@ -82,7 +82,11 @@ function ClaudeAccounts() {
   // The default account's address cannot be read live once a second account exists (the CLI's
   // profile cache is shared, so it would name whichever signed in last). This is the one
   // captured at its OWN sign-in; absent until it was signed in from the app.
-  const defaultIdentity = useClaudeDefaultIdentity(true).data ?? null;
+  const defaultIdentityQuery = useClaudeDefaultIdentity(true);
+  const defaultIdentity = defaultIdentityQuery.data ?? null;
+  // A stored identity that no longer parses is an error, not "never captured": the tile would
+  // otherwise quietly fall back to a generic name with nothing saying why.
+  const identityErr = (defaultIdentityQuery.error as Error | null)?.message ?? null;
   const defaultEmail = defaultIdentity?.email ?? null;
   // Every account's display name — its address, read with its own token.
   const names = useClaudeAccountNames([
@@ -158,9 +162,12 @@ function ClaudeAccounts() {
             {admin.create.isPending ? "Adding…" : "Add another Claude account"}
           </button>
         </div>
-        {addErr || listErr ? (
+        {addErr || listErr || identityErr ? (
           <div className={a.page} style={{ gap: 8, marginTop: 10 }}>
             {addErr ? <p className={a.err}>Could not add the account: {addErr}</p> : null}
+            {identityErr ? (
+              <p className={a.err}>Could not read the default account&rsquo;s address: {identityErr}</p>
+            ) : null}
             {/* A failed list read is NOT "no extra accounts": say so instead of an empty
                 grid that reads as if they had been deleted. */}
             {listErr ? <p className={a.err}>Could not load your Claude accounts: {listErr}</p> : null}
@@ -490,7 +497,15 @@ function UsageRings({ accountId }: { accountId: string | null }) {
       </div>
     );
   }
-  if (usage.error) return <p className={a.err}>{usageErrorText(usage.error)}</p>;
+  // An expired token is not a fault (it refreshes with the next session on the account), so
+  // it reads as a note, not in the error colour.
+  if (usage.error) {
+    return (
+      <p className={usage.error.kind === "token_expired" ? a.note : a.err}>
+        {usageErrorText(usage.error)}
+      </p>
+    );
+  }
   const u: PlanUsage = usage.data;
   const scoped = u.scoped ?? [];
   if (!u.five_hour && !u.seven_day && scoped.length === 0) {
@@ -1024,5 +1039,7 @@ function usageErrorText(e: UsageError): string {
       return "The usage endpoint answered in an unexpected shape.";
     case "unknown_account":
       return "This account no longer exists.";
+    case "token_expired":
+      return e.detail || "Sign-in needs refreshing — usage will show once a conversation runs on this account.";
   }
 }

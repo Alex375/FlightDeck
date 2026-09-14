@@ -158,18 +158,11 @@ pub fn create_agent_file(
     write_atomic(path, out.as_bytes())
 }
 
-/// Atomic replace for a markdown file. Sibling of `extensions::write_atomic`, which names
-/// its temp `.json` and reports "settings.json" in its error — wrong on both counts here.
+/// Atomic replace for a markdown file. Not `extensions::write_atomic`, which names its temp
+/// `.json` and reports "settings.json" in its error — wrong on both counts here. Shared with
+/// the instructions file: both must write THROUGH a symlinked definition, not replace it.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("md.tosse-tmp.{}.{n}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("writing temporary file: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("atomic replacement of {}: {e}", path.display())
-    })
+    crate::memoryfile::write_atomic(path, bytes)
 }
 
 /// One source line plus the terminator that followed it, and its byte offset.

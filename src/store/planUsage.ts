@@ -38,7 +38,11 @@ function isTransient(err: UsageError): boolean {
 
 /** Causes a re-fetch cannot fix — stop the background poll for them (a `keychain_denied`
  *  poll would even re-trigger the macOS Keychain prompt every interval). The manual
- *  button + on-open refetch still let the user retry deliberately. */
+ *  button + on-open refetch still let the user retry deliberately.
+ *
+ *  `token_expired` is deliberately NEITHER this nor {@link isTransient}: an immediate retry
+ *  cannot refresh the token, but a conversation running on the account will, at any moment —
+ *  so it keeps the normal poll cadence and picks the figure up on its own. */
 function isTerminal(err: UsageError): boolean {
   return (
     err.kind === "no_token" ||

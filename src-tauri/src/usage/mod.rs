@@ -54,6 +54,11 @@
 //! - **Read-only**: token used as-is, never refreshed nor written back — the `claude`
 //!   process this app keeps alive refreshes it for us. On any failure we return a
 //!   typed [`UsageError`] so the UI can tell the user exactly what to do.
+//! - **Expired ≠ revoked**: only a RUNNING `claude` refreshes a token, so an added account
+//!   with no conversation on it holds an access token that lapses while its refresh token
+//!   stays perfectly valid. A token past its stored `expiresAt` is therefore reported as
+//!   [`UsageError::TokenExpired`] (transient: usage returns once a session runs), never as
+//!   [`UsageError::Unauthorized`] (terminal: the sign-in itself is gone).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,8 +130,14 @@ pub enum UsageError {
     NoToken,
     /// The Keychain refused access (unsigned app not in the item ACL, or cancelled).
     KeychainDenied { detail: String },
-    /// Endpoint rejected the token (HTTP 401/403): expired or revoked.
+    /// Endpoint rejected a token that is NOT known to be expired (HTTP 401/403): revoked,
+    /// or signed out. Terminal until the user signs in again.
     Unauthorized { status: u16 },
+    /// The stored access token is past its `expiresAt`. NOT terminal: the refresh token is
+    /// normally still valid, but only a running `claude` refreshes it (this module stays
+    /// read-only), so usage returns once a conversation runs on the account. `detail` is a
+    /// plain-English explanation, ready to show.
+    TokenExpired { detail: String },
     /// The usage endpoint is itself rate-limited (HTTP 429). `retry_after` = seconds
     /// from the `Retry-After` header when present. Do NOT hammer it — back off.
     RateLimited { retry_after: Option<u64> },
@@ -161,11 +172,14 @@ pub async fn fetch_plan_usage_for(
     slot: &crate::accounts::AccountSlot,
 ) -> Result<PlanUsage, UsageError> {
     let slot = slot.clone();
-    let token = tokio::task::spawn_blocking(move || read_oauth_token_for(&slot))
+    let creds = tokio::task::spawn_blocking(move || read_oauth_token_for(&slot))
         .await
         .map_err(|e| UsageError::Network {
             detail: format!("token read task failed: {e}"),
         })??;
+    // A token already past its expiry cannot succeed, and the 401 it earns would read as a
+    // revoked sign-in (terminal). Say what is really going on instead — see `TokenExpired`.
+    reject_expired_token(&creds, now_unix_ms())?;
 
     ensure_crypto_provider();
     // Use the FALLIBLE builder (Client::new() panics on build failure, and the release
@@ -181,7 +195,7 @@ pub async fn fetch_plan_usage_for(
         })?;
     let resp = client
         .get(USAGE_URL)
-        .bearer_auth(&token)
+        .bearer_auth(&creds.access_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -202,9 +216,7 @@ pub async fn fetch_plan_usage_for(
     })?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(UsageError::Unauthorized {
-            status: status.as_u16(),
-        });
+        return Err(rejected_token_error(status.as_u16(), &creds, now_unix_ms()));
     }
     // The usage endpoint is itself rate-limited (it's polled by the CLI too) — give it
     // its own cause so the UI says "wait" instead of "server error", and so the caller
@@ -245,10 +257,44 @@ fn ensure_crypto_provider() {
 /// 10s timeout — 60s of slack covers it comfortably).
 const EXPIRY_SKEW_MS: i64 = 60_000;
 
-/// Resolve the OAuth access token: config file first *when valid* (no Keychain prompt),
+/// What [`UsageError::TokenExpired`] tells the user. Plain English, and actionable: the only
+/// thing that refreshes the token is a `claude` process running on that account.
+const TOKEN_EXPIRED_DETAIL: &str = "The saved sign-in for this account has expired, and only \
+     a running Claude conversation refreshes it. Start a conversation on this account — its \
+     usage will show again once it runs.";
+
+/// Pre-request expiry verdict (pure, clock injected): a token known to be past its expiry
+/// (within [`EXPIRY_SKEW_MS`]) is [`UsageError::TokenExpired`] without spending a request
+/// that can only come back 401. An UNKNOWN expiry passes — it can't be proven stale.
+fn reject_expired_token(creds: &Credentials, now_ms: i64) -> Result<(), UsageError> {
+    if creds.is_expired(now_ms) {
+        Err(UsageError::TokenExpired {
+            detail: TOKEN_EXPIRED_DETAIL.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Type an HTTP 401/403 (pure, clock injected). A 401 on a token that has meanwhile passed
+/// its expiry (it lapsed mid-request, or within the skew) is the expiry, not a revocation,
+/// so it stays non-terminal. Anything else — a 403, or a 401 on a token still in date or of
+/// unknown expiry — is a real rejection: [`UsageError::Unauthorized`].
+fn rejected_token_error(status: u16, creds: &Credentials, now_ms: i64) -> UsageError {
+    if status == 401 && creds.is_expired(now_ms) {
+        UsageError::TokenExpired {
+            detail: TOKEN_EXPIRED_DETAIL.to_string(),
+        }
+    } else {
+        UsageError::Unauthorized { status }
+    }
+}
+
+/// Resolve the OAuth credentials: config file first *when valid* (no Keychain prompt),
 /// then the macOS Keychain (cause-aware error). Returns a typed [`UsageError`] when no
-/// usable token is found.
-fn read_oauth_token_for(slot: &crate::accounts::AccountSlot) -> Result<String, UsageError> {
+/// usable token is found. The expiry travels with the token so callers can tell an expired
+/// token from a revoked one (see [`reject_expired_token`]).
+fn read_oauth_token_for(slot: &crate::accounts::AccountSlot) -> Result<Credentials, UsageError> {
     let creds_path = slot.credentials_file();
     let file_creds = creds_path
         .as_deref()
@@ -275,27 +321,27 @@ fn read_oauth_token_for(slot: &crate::accounts::AccountSlot) -> Result<String, U
 /// file token (avoids a Keychain prompt in the common case); otherwise consult the Keychain
 /// (the macOS source of truth, refreshed by the live `claude` process). If the Keychain
 /// yields nothing usable but we still hold a file token (merely expired), fall back to it so
-/// the endpoint returns a truthful 401 (`Unauthorized` → "relaunch claude") rather than a
-/// misleading `NoToken`/`KeychainDenied` that hides the real cause.
+/// the caller reports the truthful cause (`TokenExpired` → "run a conversation on it") rather
+/// than a misleading `NoToken`/`KeychainDenied` that hides it.
 fn resolve_token(
     file_creds: Option<Credentials>,
     now_ms: i64,
-    keychain: impl FnOnce() -> Result<String, UsageError>,
-) -> Result<String, UsageError> {
-    if let Some(creds) = &file_creds {
-        if !creds.is_expired(now_ms) {
-            return Ok(creds.access_token.clone());
+    keychain: impl FnOnce() -> Result<Credentials, UsageError>,
+) -> Result<Credentials, UsageError> {
+    // Only an EXPIRED file token survives this point (a fresh one returns immediately).
+    let stale_file_creds = match file_creds {
+        Some(creds) if !creds.is_expired(now_ms) => return Ok(creds),
+        Some(creds) => {
+            eprintln!(
+                "[usage] the credentials file token is expired; consulting the Keychain for a fresher one"
+            );
+            Some(creds)
         }
-        eprintln!(
-            "[usage] the credentials file token is expired; consulting the Keychain for a fresher one"
-        );
-    }
+        None => None,
+    };
     match keychain() {
-        Ok(tok) => Ok(tok),
-        Err(kc_err) => match file_creds {
-            Some(creds) => Ok(creds.access_token),
-            None => Err(kc_err),
-        },
+        Ok(creds) => Ok(creds),
+        Err(kc_err) => stale_file_creds.ok_or(kc_err),
     }
 }
 
@@ -330,10 +376,10 @@ fn read_credentials_file(path: &std::path::Path) -> Option<String> {
 /// truncated to 8 bits: 44 = item-not-found (errSecItemNotFound −25300), 36/51/128 =
 /// interaction-not-allowed / authFailed / userCancelled (access denied).
 /// `service` is the slot's item name (`Claude Code-credentials` for the default account,
-/// `Claude Code-<sha8>-credentials` for an isolated one) — see
+/// `Claude Code-credentials-<sha8>` for an isolated one) — see
 /// [`crate::accounts::AccountSlot::keychain_service`].
 #[cfg(target_os = "macos")]
-fn read_keychain_token(service: &str) -> Result<String, UsageError> {
+fn read_keychain_token(service: &str) -> Result<Credentials, UsageError> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", service, "-w"])
         .output()
@@ -343,7 +389,7 @@ fn read_keychain_token(service: &str) -> Result<String, UsageError> {
 
     if out.status.success() {
         let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return parse_access_token(&blob).ok_or_else(|| UsageError::Parse {
+        return parse_credentials(&blob).ok_or_else(|| UsageError::Parse {
             body: "keychain item is not valid credentials JSON".to_string(),
         });
     }
@@ -359,13 +405,15 @@ fn read_keychain_token(service: &str) -> Result<String, UsageError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_keychain_token(_service: &str) -> Result<String, UsageError> {
+fn read_keychain_token(_service: &str) -> Result<Credentials, UsageError> {
     // No Keychain off macOS; the file is the only source and it was absent.
     Err(UsageError::NoToken)
 }
 
-/// OAuth credentials parsed from the blob: the access token plus its optional expiry, so
-/// the caller can tell a fresh file token from a stale one (see [`resolve_token`]).
+/// OAuth credentials parsed from the blob (file or Keychain): the access token plus its
+/// optional expiry, so the caller can tell a fresh token from a stale one (see
+/// [`resolve_token`], [`reject_expired_token`]). Deliberately NOT `Debug`: it carries a
+/// bearer token that must never reach a log line.
 struct Credentials {
     access_token: String,
     /// `expiresAt` as ms since the Unix epoch, when the blob carries it. `None` for older
@@ -405,12 +453,6 @@ fn parse_credentials(blob: &str) -> Option<Credentials> {
         access_token,
         expires_at_ms,
     })
-}
-
-/// Just the access token — used by the Keychain path, which has no expiry policy to apply
-/// (the Keychain is already the refreshed source of truth).
-fn parse_access_token(blob: &str) -> Option<String> {
-    parse_credentials(blob).map(|c| c.access_token)
 }
 
 /// Parse the usage endpoint payload. The windows (`five_hour`, `seven_day`) sit at the
@@ -545,6 +587,10 @@ fn parse_window(v: Option<&Value>) -> Option<UsageWindow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_access_token(blob: &str) -> Option<String> {
+        parse_credentials(blob).map(|c| c.access_token)
+    }
 
     #[test]
     fn parses_access_token_from_nested_shape() {
@@ -797,36 +843,102 @@ mod tests {
         let now = 1_000_000_000_000;
         let file = Some(creds("file-fresh", Some(now + 3_600_000)));
         let tok = resolve_token(file, now, || panic!("keychain must not be consulted"))
+            .ok()
             .expect("valid file token");
-        assert_eq!(tok, "file-fresh");
+        assert_eq!(tok.access_token, "file-fresh");
     }
 
     #[test]
     fn resolve_expired_file_falls_through_to_keychain() {
         let now = 1_000_000_000_000;
         let file = Some(creds("file-stale", Some(now - 3_600_000)));
-        let tok = resolve_token(file, now, || Ok("keychain-fresh".to_string()))
+        let tok = resolve_token(file, now, || Ok(creds("keychain-fresh", Some(now + 3_600_000))))
+            .ok()
             .expect("keychain token");
-        assert_eq!(tok, "keychain-fresh"); // the reported bug: stale file no longer wins
+        assert_eq!(tok.access_token, "keychain-fresh"); // the reported bug: stale file no longer wins
     }
 
     #[test]
     fn resolve_expired_file_used_as_last_resort_when_keychain_empty() {
         let now = 1_000_000_000_000;
         let file = Some(creds("file-stale", Some(now - 3_600_000)));
-        // Keychain has nothing → fall back to the (expired) file token so the endpoint can
-        // answer a truthful 401 instead of masking the cause as NoToken.
-        let tok = resolve_token(file, now, || Err(UsageError::NoToken)).expect("file fallback");
-        assert_eq!(tok, "file-stale");
+        // Keychain has nothing → fall back to the (expired) file token so the caller reports
+        // the expiry (TokenExpired) instead of masking the cause as NoToken.
+        let tok = resolve_token(file, now, || Err(UsageError::NoToken))
+            .ok()
+            .expect("file fallback");
+        assert_eq!(tok.access_token, "file-stale");
+        assert!(matches!(
+            reject_expired_token(&tok, now),
+            Err(UsageError::TokenExpired { .. })
+        ));
     }
 
     #[test]
     fn resolve_no_file_uses_keychain_and_propagates_its_error() {
         let now = 1_000_000_000_000;
-        let tok = resolve_token(None, now, || Ok("keychain-only".to_string())).expect("keychain");
-        assert_eq!(tok, "keychain-only");
+        let tok = resolve_token(None, now, || Ok(creds("keychain-only", None)))
+            .ok()
+            .expect("keychain");
+        assert_eq!(tok.access_token, "keychain-only");
 
-        let err = resolve_token(None, now, || Err(UsageError::NoToken)).unwrap_err();
+        let err = resolve_token(None, now, || Err(UsageError::NoToken))
+            .err()
+            .expect("keychain error propagates");
         assert!(matches!(err, UsageError::NoToken));
+    }
+
+    /// An added account with no running session holds an access token that LAPSES while its
+    /// refresh token stays valid (only a running `claude` refreshes). That must be the
+    /// non-terminal `TokenExpired`, never `Unauthorized`, which the front treats as final and
+    /// stops polling on — forever, for an account that is merely idle.
+    #[test]
+    fn an_expired_token_is_token_expired_not_unauthorized() {
+        let now = 1_000_000_000_000;
+
+        // Before the request: past expiry (or inside the skew) → TokenExpired, no request.
+        for exp in [now - 3_600_000, now + 30_000] {
+            let err = reject_expired_token(&creds("t", Some(exp)), now)
+                .err()
+                .expect("expired token is rejected before the request");
+            match err {
+                UsageError::TokenExpired { detail } => {
+                    assert!(detail.contains("running Claude conversation"), "{detail}");
+                }
+                other => panic!("expected TokenExpired, got {other:?}"),
+            }
+        }
+        // In date, or of unknown expiry → the request goes ahead.
+        assert!(reject_expired_token(&creds("t", Some(now + 3_600_000)), now).is_ok());
+        assert!(reject_expired_token(&creds("t", None), now).is_ok());
+
+        // After a 401: expired meanwhile → TokenExpired; in date / unknown → Unauthorized.
+        assert!(matches!(
+            rejected_token_error(401, &creds("t", Some(now - 1)), now),
+            UsageError::TokenExpired { .. }
+        ));
+        assert!(matches!(
+            rejected_token_error(401, &creds("t", Some(now + 3_600_000)), now),
+            UsageError::Unauthorized { status: 401 }
+        ));
+        assert!(matches!(
+            rejected_token_error(401, &creds("t", None), now),
+            UsageError::Unauthorized { status: 401 }
+        ));
+        // A 403 is a refusal, not an expiry, whatever the clock says.
+        assert!(matches!(
+            rejected_token_error(403, &creds("t", Some(now - 1)), now),
+            UsageError::Unauthorized { status: 403 }
+        ));
+    }
+
+    /// The wire contract the front matches on: `kind: "token_expired"` + `detail: string`.
+    #[test]
+    fn token_expired_serializes_to_the_front_contract() {
+        let v = serde_json::to_value(UsageError::TokenExpired {
+            detail: "d".into(),
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({ "kind": "token_expired", "detail": "d" }));
     }
 }

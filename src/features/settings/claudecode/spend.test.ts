@@ -19,6 +19,7 @@ import {
   pricingKeyForTranscriptModel,
   stripDateSuffix,
   transcriptIdForLabel,
+  unpricedKeys,
   type RateCard,
 } from "./spend";
 
@@ -227,6 +228,35 @@ describe("chart shaping", () => {
     expect(rows[0]!.parts[0]!.label).toBe("Opus 4.8");
     expect(rows[0]!.total).toBeGreaterThan(rows[1]!.total);
   });
+
+  it("carries an unpriced model through to the folder instead of costing it $0", () => {
+    const rows = modelsByRepo(
+      [
+        bucket({ repo: "/r/a", repo_label: "a", model: "claude-opus-4-8", output_tokens: 1_000_000 }),
+        bucket({ repo: "/r/a", repo_label: "a", model: "claude-unreleased-9", output_tokens: 5 }),
+        bucket({ repo: "/r/b", repo_label: "b", model: "claude-unreleased-9", output_tokens: 5 }),
+      ],
+      CARD,
+    );
+    const a = rows.find((r) => r.repo === "/r/a")!;
+    expect(a.parts.find((p) => p.key === "claude-opus-4-8")!.unpriced).toBe(false);
+    expect(a.parts.find((p) => p.key === "claude-unreleased-9")!.unpriced).toBe(true);
+    const b = rows.find((r) => r.repo === "/r/b")!;
+    expect(b.parts.every((p) => p.unpriced)).toBe(true);
+  });
+
+  it("lists the pricing keys the report holds that the card cannot price", () => {
+    expect(
+      unpricedKeys(
+        [
+          bucket({ model: "claude-opus-4-8" }),
+          bucket({ model: "claude-unreleased-9-20260101" }),
+          bucket({ model: "claude-unreleased-9" }),
+        ],
+        CARD,
+      ),
+    ).toEqual(["claude-unreleased-9"]);
+  });
 });
 
 describe("the drift canary", () => {
@@ -261,6 +291,24 @@ describe("the drift canary", () => {
     // "Inherit the conversation" cannot disagree with anything.
     expect(
       findDrift([bucket({ agent: "Plan", model: "claude-opus-4-8" })], [{ name: "Plan", model: null }]),
+    ).toEqual([]);
+  });
+
+  it("ignores `model: inherit` — it names no model to contradict", () => {
+    expect(
+      findDrift([bucket({ agent: "Explore", model: "claude-opus-4-8", turns: 9 })], [
+        { name: "Explore", model: "inherit" },
+      ]),
+    ).toEqual([]);
+  });
+
+  it("ignores rows the budget lock overrides", () => {
+    // With the lock on every run uses the forced model; the row's own setting is not
+    // supposed to apply, so a mismatch is the lock working, not the setting failing.
+    expect(
+      findDrift([bucket({ agent: "Explore", model: "claude-opus-4-8", turns: 9 })], [
+        { name: "Explore", model: "haiku", overriddenByForce: true },
+      ]),
     ).toEqual([]);
   });
 

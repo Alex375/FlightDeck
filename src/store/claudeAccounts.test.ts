@@ -1,12 +1,20 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import type { PlanUsage } from "../ipc/client";
 import {
   DEFAULT_ACCOUNT_ID,
   DEFAULT_ACCOUNT_PREFS,
   resolveDefaultAccountId,
   SWITCH_COOLDOWN_MS,
+  atAccountSwitchBoundary,
+  autoSwitchSuspended,
   blockedNotice,
+  clearManualAccountPicks,
   decideSwitch,
+  isTransientUsageError,
+  manualAccountPick,
+  noteManualAccountPick,
+  usageForPolicy,
+  useClaudeAccountPrefs,
   peakUsagePercent,
   sanitizePrefs,
   switchCooldownElapsed,
@@ -234,6 +242,122 @@ describe("decideSwitch — unreadable current account", () => {
 
   it("stays quiet when the endpoint simply reported no window (no error)", () => {
     expect(decideSwitch(account(null, null), [account("b", 10)], DEFAULT_ACCOUNT_PREFS)).toBeNull();
+  });
+});
+
+describe("usageForPolicy", () => {
+  const good = usage(40, 10);
+
+  // A blip must not wipe the figure the policy acts on, nor surface as "could not be read"
+  // in every thread: the query keeps polling and heals (or escalates) on its own.
+  it("keeps the last good figure through transient failures, silently", () => {
+    for (const kind of ["network", "http", "rate_limited"]) {
+      expect(usageForPolicy({ data: good, error: { kind } }), kind).toEqual({
+        usage: good,
+        usageError: null,
+      });
+    }
+    expect(usageForPolicy({ data: null, error: { kind: "network" } })).toEqual({
+      usage: null,
+      usageError: null,
+    });
+  });
+
+  // An expired token only refreshes with a session on the account: whatever figure we hold
+  // may be arbitrarily old. Unknown — so never a target — but nothing wrong to report.
+  it("treats an expired token as unknown usage with nothing to report", () => {
+    expect(usageForPolicy({ data: good, error: { kind: "token_expired" } })).toEqual({
+      usage: null,
+      usageError: null,
+    });
+    expect(isTransientUsageError("token_expired")).toBe(true);
+  });
+
+  it("drops the figure and reports a terminal cause", () => {
+    for (const kind of ["no_token", "keychain_denied", "unauthorized", "parse", "unknown_account"]) {
+      expect(usageForPolicy({ data: good, error: { kind } }), kind).toEqual({
+        usage: null,
+        usageError: kind,
+      });
+    }
+  });
+
+  it("passes a successful read through", () => {
+    expect(usageForPolicy({ data: good, error: null })).toEqual({ usage: good, usageError: null });
+  });
+});
+
+describe("atAccountSwitchBoundary", () => {
+  const idle = (
+    over: { busy?: boolean; activity?: string | null; awaiting?: boolean; queued?: boolean; perms?: number } = {},
+  ) => ({
+    state: {
+      busy: over.busy ?? false,
+      activity: over.activity ?? null,
+      awaiting_permission: over.awaiting ?? false,
+    },
+    turns: { user_0: { queued: over.queued ?? false }, a1: {} },
+    pendingPermissions: Array.from({ length: over.perms ?? 0 }),
+  });
+
+  it("accepts a session genuinely at rest", () => {
+    expect(atAccountSwitchBoundary(idle(), 0, false)).toBe(true);
+    expect(atAccountSwitchBoundary(undefined, 0, false)).toBe(true);
+  });
+
+  // `!busy` is not the boundary: between a `result` and the next queued turn the CLI is
+  // idle for ~1 s, and a stop there throws the queued work away.
+  it("refuses while anything is still pending", () => {
+    expect(atAccountSwitchBoundary(idle({ busy: true }), 0, false)).toBe(false);
+    expect(atAccountSwitchBoundary(idle({ activity: "requesting" }), 0, false)).toBe(false);
+    expect(atAccountSwitchBoundary(idle({ awaiting: true }), 0, false)).toBe(false);
+    expect(atAccountSwitchBoundary(idle({ perms: 1 }), 0, false)).toBe(false);
+    expect(atAccountSwitchBoundary(idle({ queued: true }), 0, false)).toBe(false);
+    expect(atAccountSwitchBoundary(idle(), 1, false)).toBe(false);
+    expect(atAccountSwitchBoundary(undefined, 0, true)).toBe(false);
+  });
+});
+
+describe("manual picks suspend the auto-switch", () => {
+  beforeEach(() => {
+    clearManualAccountPicks();
+    useClaudeAccountPrefs.getState().set({ autoSwitch: false });
+  });
+
+  // Case A of the review: the user deliberately moves a conversation onto an account the
+  // policy considers too full. The next evaluation must not revert it.
+  it("pins a conversation to the account the user picked", () => {
+    noteManualAccountPick("c1", "acct-a");
+    expect(autoSwitchSuspended(manualAccountPick("c1"), "acct-a")).toBe(true);
+    // Picking the DEFAULT account is a pick too.
+    noteManualAccountPick("c2", null);
+    expect(manualAccountPick("c2")).toBeNull();
+    expect(autoSwitchSuspended(manualAccountPick("c2"), null)).toBe(true);
+  });
+
+  it("does not suspend a conversation the user never touched", () => {
+    expect(manualAccountPick("never")).toBeUndefined();
+    expect(autoSwitchSuspended(manualAccountPick("never"), null)).toBe(false);
+  });
+
+  // The pin protects a choice; once the conversation is no longer on that account for a
+  // reason that was not the user's (e.g. the account was removed), it lapses.
+  it("lapses when the conversation is no longer on the picked account", () => {
+    noteManualAccountPick("c1", "acct-a");
+    expect(autoSwitchSuspended(manualAccountPick("c1"), null)).toBe(false);
+  });
+
+  it("is released for the whole fleet when auto-switch is toggled", () => {
+    noteManualAccountPick("c1", "acct-a");
+    useClaudeAccountPrefs.getState().set({ autoSwitch: true });
+    expect(manualAccountPick("c1")).toBeUndefined();
+
+    noteManualAccountPick("c1", "acct-a");
+    // Any other pref change keeps the pins.
+    useClaudeAccountPrefs.getState().set({ switchAtPercent: 80 });
+    expect(manualAccountPick("c1")).toBe("acct-a");
+    useClaudeAccountPrefs.getState().set({ autoSwitch: false, switchAtPercent: 90 });
+    expect(manualAccountPick("c1")).toBeUndefined();
   });
 });
 

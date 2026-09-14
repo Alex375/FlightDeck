@@ -121,10 +121,51 @@ export const useClaudeAccountPrefs = create<ClaudeAccountsState>((set, get) => (
   ...load(),
   set: (patch) => {
     const next = sanitizePrefs({ ...get(), ...patch });
+    // Toggling auto-switch is the user re-stating the policy for the whole fleet: every
+    // per-conversation pin a manual pick left behind is released, so turning it back on
+    // really does resume watching every conversation.
+    if (next.autoSwitch !== get().autoSwitch) clearManualAccountPicks();
     save(next);
     set(next);
   },
 }));
+
+// ── Manual picks vs the auto-switch ──────────────────────────────────────────────────
+
+/** The account the USER last picked for a conversation (convId → account, `null` = the
+ *  default one). In memory, like `lastAccountSwitchAt`: it is a runtime truce between the
+ *  user and the policy, not a preference to carry across a relaunch.
+ *
+ *  Without it, a deliberate pick of an account the policy considers too full was reverted
+ *  on the very next render (with a "Switched" notice), and after an auto-switch the user's
+ *  pick back could be silently ignored. */
+const manualPicks = new Map<string, string | null>();
+
+/** Record that the user explicitly chose `accountId` for `convId`. */
+export function noteManualAccountPick(convId: string, accountId: string | null): void {
+  manualPicks.set(convId, accountId);
+}
+
+/** Release every manual pin (auto-switch toggled). */
+export function clearManualAccountPicks(): void {
+  manualPicks.clear();
+}
+
+/** The account the user pinned `convId` to, or `undefined` when they never picked one. */
+export function manualAccountPick(convId: string): string | null | undefined {
+  return manualPicks.has(convId) ? (manualPicks.get(convId) ?? null) : undefined;
+}
+
+/** Whether the auto-switch must leave a conversation alone because the user chose its
+ *  account. Holds only while the conversation is STILL on the account they picked: a later
+ *  change that did not come from them (the account was removed and the conversation fell
+ *  back to the default) lifts the pin, since the choice it protected no longer stands. */
+export function autoSwitchSuspended(
+  pick: string | null | undefined,
+  currentAccountId: string | null,
+): boolean {
+  return pick !== undefined && pick === currentAccountId;
+}
 
 /** Read the prefs OUTSIDE React (the auto-switch controller runs off store events). */
 export function accountPrefs(): ClaudeAccountPrefs {
@@ -173,8 +214,14 @@ export function claudeAccountList(): ClaudeAccountSummary[] | null {
 }
 
 /** The account a conversation created right now should run on: the user's chosen default,
- *  validated against the accounts that exist. */
-export function defaultAccountForNewConversation(): string | null {
+ *  validated against the accounts that exist.
+ *
+ *  `remote`: the conversation lives in a REMOTE (SSH) repo. It then always starts on the
+ *  default account — the account is a local environment variable the SSH launcher does not
+ *  carry, so the core refuses any other one there, and seeding the preference would leave
+ *  the conversation unable to send its first message. */
+export function defaultAccountForNewConversation(opts?: { remote?: boolean }): string | null {
+  if (opts?.remote) return null;
   return resolveDefaultAccountId(accountPrefs().defaultAccountId, claudeAccountList());
 }
 
@@ -291,6 +338,78 @@ export function decideSwitch(
       toPercent: best.pct,
     },
   };
+}
+
+/** Usage-read failures a later poll can plausibly heal. Reporting them would post a notice
+ *  on every blip (and again on every blip after a recovery), so the policy never reports
+ *  them: it keeps acting on the last good figure, or on none at all. */
+const TRANSIENT_USAGE_ERRORS = new Set(["network", "http", "rate_limited", "token_expired"]);
+
+/** Whether a usage-read failure is one the auto-switch should stay quiet about. */
+export function isTransientUsageError(kind: string): boolean {
+  return TRANSIENT_USAGE_ERRORS.has(kind);
+}
+
+/** Turn one account's usage query into what the policy may act on.
+ *
+ *  - success → the figure;
+ *  - a network / HTTP / rate-limit blip → the LAST GOOD figure (the query keeps polling, so
+ *    it is refreshed, or escalates to a terminal cause, on its own);
+ *  - `token_expired` → unknown, with no error: the stored token only refreshes when a
+ *    session runs on the account, so any old figure may be arbitrarily stale — never a
+ *    switch target, and nothing wrong to report;
+ *  - a TERMINAL cause (no token, Keychain refused, 401, unreadable body, removed account) →
+ *    no figure AND the error, which is what the policy reports: polling has stopped, and an
+ *    old figure would otherwise freeze the account at a stale measurement forever. */
+export function usageForPolicy(q: {
+  data: PlanUsage | null;
+  error: { kind: string } | null;
+}): { usage: PlanUsage | null; usageError: string | null } {
+  if (!q.error) return { usage: q.data, usageError: null };
+  if (q.error.kind === "token_expired") return { usage: null, usageError: null };
+  if (isTransientUsageError(q.error.kind)) return { usage: q.data, usageError: null };
+  return { usage: null, usageError: q.error.kind };
+}
+
+/** What the safe-boundary check reads from a conversation's live session entry. */
+export interface BoundarySession {
+  state: { busy: boolean; activity: string | null; awaiting_permission: boolean };
+  turns: Record<string, { queued?: boolean }>;
+  pendingPermissions: readonly unknown[];
+}
+
+/**
+ * Whether a live conversation is at a boundary where its process may be restarted onto
+ * another account (or have its account decided for it).
+ *
+ * `!busy` alone is NOT that boundary: a `result` hands control back for a moment, and the
+ * CLI takes it straight back for anything it has queued — a message sent mid-turn, a
+ * `<task-notification>`, an unmet `/goal` — within ~1 s. Killing the process in that gap
+ * throws the queued work away. So every sign of pending work must be clear:
+ *  - `busy` (a turn in flight — set by the core the moment a message is written, which also
+ *    covers a first message racing a just-bound handle),
+ *  - `activity` (the CLI already started the next model call, ~50 ms after the result),
+ *  - a permission prompt waiting on the user,
+ *  - a user message still QUEUED in the CLI,
+ *  - a background task, still working against the account being left,
+ *  - a spawn in flight.
+ *
+ * This is a snapshot test: callers that act on it must wait a settle delay and re-check
+ * against FRESH state before stopping anything (see `ClaudeAccountApplyHost`).
+ */
+export function atAccountSwitchBoundary(
+  session: BoundarySession | undefined,
+  backgroundRunning: number,
+  spawning: boolean,
+): boolean {
+  if (spawning || backgroundRunning > 0) return false;
+  // No entry yet: nothing has streamed for this process and nothing was sent through it.
+  if (!session) return true;
+  const { state } = session;
+  if (state.busy || state.activity !== null || state.awaiting_permission) return false;
+  if (session.pendingPermissions.length > 0) return false;
+  for (const id in session.turns) if (session.turns[id].queued) return false;
+  return true;
 }
 
 /** How long a conversation is left alone after a switch, whatever the figures say. The

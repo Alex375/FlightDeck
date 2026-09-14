@@ -46,12 +46,44 @@
 //! NON-ACTIVE account's token — the only way to show every account's rate limits from one
 //! app.
 //!
-//! ## Why the default slot passes NO variable
+//! ## Why the default slot UNSETS the variable (never sets it, not even to "")
 //! An empty string is NOT equivalent to "unset": per `t` above, `""` forces the
 //! *no-suffix* item even when `CLAUDE_CONFIG_DIR` is set, whereas leaving it unset lets
 //! the config dir keep deriving the name. A user who already scopes their CLI with
 //! `CLAUDE_CONFIG_DIR` must keep the exact credentials they have today, so the default
-//! slot sets nothing at all — the single-account setup is bit-for-bit unchanged.
+//! slot never gives the variable a value — the single-account setup is bit-for-bit unchanged.
+//!
+//! It does, however, actively REMOVE a `CLAUDE_SECURESTORAGE_CONFIG_DIR` the app itself
+//! inherited (e.g. launched from a shell, or from inside a `claude` session running on an
+//! isolated store). Otherwise the "default" child would silently authenticate as whatever
+//! store that inherited value names, while [`AccountSlot::keychain_service`] — and so the
+//! usage ring — kept reading the un-scoped `Claude Code-credentials` item: two identities
+//! behind one label.
+//!
+//! ## What an isolated account DOES share: the CLI's profile cache
+//! Scoping the credential store does not scope `~/.claude.json` (its path derives from
+//! `CLAUDE_CONFIG_DIR` / the home dir only), and two CLI paths WRITE account data there.
+//! Read from the claude 2.1.270 bundle (clean-room, minified names as found):
+//! ```js
+//! // `claude auth logout` → oV({clearOnboarding:!1,…}), which ends with a GLOBAL config write:
+//! await ve((u)=>{ let n={...u}; …; return n.oauthAccount=void 0, n.modelAccessCache=void 0,
+//!   n.orgModelDefaultCache=void 0, n.cachedUsageUtilization=void 0, … , n })
+//! // `claude auth login` (Rpn) → oV({…preserveInProcessTokens:!0…}) then
+//! iat({accountUuid:n.account.uuid, emailAddress:n.account.email, …, profileFetchedAt:Date.now()})
+//! // every CLI start (init, "init_after_oauth_populate") → P$n: refetch the profile with the
+//! // process's OWN token unless oauthAccount is complete AND fetched < lhe (=86400000 ms) ago
+//! ```
+//! Consequences, and why they are tolerable:
+//! - Signing an isolated account OUT blanks the shared `oauthAccount` (and those caches) for
+//!   every account, the default one included. It self-heals: the next `claude` session that
+//!   starts finds `oauthAccount` absent and refetches the profile with its own token.
+//!   (`claude auth status` does NOT refetch — it only reads the cache — so until a session
+//!   starts it reports `email: null` for the default account.)
+//! - Signing an isolated account IN overwrites `oauthAccount` with that account's profile,
+//!   stamped fresh, so the other accounts' CLIs read it as theirs for up to 24 h. The app
+//!   never relies on that cache to name an account (`usage::profile` asks the API with each
+//!   account's own token), and nothing the app can do fixes it without writing
+//!   `~/.claude.json` — which it must never do (CLI write races).
 
 use std::path::{Path, PathBuf};
 
@@ -174,24 +206,31 @@ impl AccountSlot {
         }
     }
 
-    /// Apply this slot to a `claude` invocation. The default slot deliberately sets
-    /// NOTHING (see the module docs) — that is what keeps a single-account setup, and a
-    /// user who scopes their CLI with `CLAUDE_CONFIG_DIR`, working exactly as before.
+    /// Apply this slot to a `claude` invocation. The default slot never gives the variable a
+    /// value (see the module docs) — that is what keeps a single-account setup, and a user
+    /// who scopes their CLI with `CLAUDE_CONFIG_DIR`, working exactly as before — but it
+    /// REMOVES one inherited from the app's own environment, so "default" always means the
+    /// un-scoped store [`Self::keychain_service`] reads.
     pub fn apply(&self, cmd: &mut tokio::process::Command) {
-        if let Some(dir) = &self.dir {
-            cmd.env(SECURESTORAGE_ENV, dir);
-        }
+        match &self.dir {
+            Some(dir) => cmd.env(SECURESTORAGE_ENV, dir),
+            None => cmd.env_remove(SECURESTORAGE_ENV),
+        };
     }
 
-    /// Same as [`Self::apply`] for the blocking `std` command type used by the spawner.
+    /// Same as [`Self::apply`] for the blocking `std` command type.
     pub fn apply_std(&self, cmd: &mut std::process::Command) {
-        if let Some(dir) = &self.dir {
-            cmd.env(SECURESTORAGE_ENV, dir);
-        }
+        match &self.dir {
+            Some(dir) => cmd.env(SECURESTORAGE_ENV, dir),
+            None => cmd.env_remove(SECURESTORAGE_ENV),
+        };
     }
 
     /// The `(key, value)` this slot contributes to a child environment, or `None` for the
     /// default slot. For spawners that build their env as a map rather than on a Command.
+    /// ⚠️ A map-based spawner that inherits the parent environment must ALSO drop
+    /// [`SECURESTORAGE_ENV`] for the default slot (see [`Self::apply`]); `None` here only
+    /// means "contribute nothing".
     pub fn env_pair(&self) -> Option<(&'static str, String)> {
         self.dir
             .as_ref()
@@ -219,15 +258,41 @@ fn dir_hash_suffix(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The default slot contributes NO environment: a single-account setup — and a user
-    /// who scopes the CLI with `CLAUDE_CONFIG_DIR` — must be bit-for-bit unchanged. An
-    /// empty string would NOT do (it forces the no-suffix item); only "unset" is correct.
+    /// The default slot contributes NO value: a single-account setup — and a user who
+    /// scopes the CLI with `CLAUDE_CONFIG_DIR` — must be bit-for-bit unchanged. An empty
+    /// string would NOT do (it forces the no-suffix item); only "unset" is correct.
     #[test]
     fn the_default_slot_sets_no_environment() {
         let slot = AccountSlot::default_slot();
         assert!(slot.is_default());
         assert_eq!(slot.env_pair(), None);
         assert_eq!(slot.keychain_service(), "Claude Code-credentials");
+    }
+
+    /// The default slot REMOVES an inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the child
+    /// (an explicit removal, never an empty value), and an isolated slot sets it. Checked on
+    /// both command types, since both are public entry points.
+    #[test]
+    fn apply_removes_an_inherited_store_for_the_default_slot() {
+        let key = std::ffi::OsStr::new("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+        let env_of = |cmd: &std::process::Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.map(|v| v.to_owned()))
+        };
+
+        let mut tokio_cmd = tokio::process::Command::new("claude");
+        AccountSlot::default_slot().apply(&mut tokio_cmd);
+        // `Some(None)` = explicitly removed from the child's environment.
+        assert_eq!(env_of(tokio_cmd.as_std()), Some(None));
+
+        let mut std_cmd = std::process::Command::new("claude");
+        AccountSlot::default_slot().apply_std(&mut std_cmd);
+        assert_eq!(env_of(&std_cmd), Some(None));
+
+        let mut isolated = std::process::Command::new("claude");
+        AccountSlot::isolated(PathBuf::from("/tmp/acc/abc")).apply_std(&mut isolated);
+        assert_eq!(env_of(&isolated), Some(Some("/tmp/acc/abc".into())));
     }
 
     /// An isolated slot scopes ONLY the credential store, never the config dir (which

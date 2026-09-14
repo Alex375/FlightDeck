@@ -160,6 +160,8 @@
 .cc-force { margin-top: 12px; }
 .cc-force b { display: block; color: var(--wf-tx-hi); }
 .cc-force em { display: block; margin-top: 2px; font-style: normal; color: var(--wf-tx-lo); line-height: 1.5; }
+/* The model named inside the "Locked to …" line stays in the sentence. */
+.cc-force em b.cc-inline-b { display: inline; }
 
 /* ---- Helper rows ------------------------------------------------------- */
 

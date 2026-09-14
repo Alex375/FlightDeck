@@ -55,9 +55,15 @@ export function useBackendUsage(
   // WHICH account's figures this conversation's ring shows. With several accounts signed
   // in, the un-scoped query would report the default account's quota next to a
   // conversation running on another one — a plausible-looking wrong number.
-  const accountId = useConversationsStore(
-    (s) => s.conversations.find((c) => c.id === convId)?.claudeAccountId ?? null,
-  );
+  //
+  // While a switch is PENDING, a live process is still billed to the account it started on:
+  // show that one (`liveClaudeAccountId`), exactly like the account chip does, and only
+  // follow the wanted account once there is no process to be out of step with.
+  const accountId = useConversationsStore((s) => {
+    const c = s.conversations.find((x) => x.id === convId);
+    if (!c) return null;
+    return c.handle ? (c.liveClaudeAccountId ?? null) : (c.claudeAccountId ?? null);
+  });
   const codexAvailable = useCodexAvailable();
   const planUsage = usePlanUsage({ enabled: opts.enabled && !isCodex, accountId });
   const codexPlan = useCodexPlanUsage();

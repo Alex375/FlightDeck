@@ -343,29 +343,57 @@ export function continuousDays(first: string, last: string): string[] {
   return out;
 }
 
+/** One model's share of a repo's cost. `unpriced` parts carry `value: 0` for layout only —
+ *  the chart must show them as "no price", never as $0. */
+export interface RepoModelPart {
+  key: string;
+  label: string;
+  value: number;
+  unpriced: boolean;
+}
+
 /** Model mix per repo, as absolute values — the caller decides whether to normalise. */
 export function modelsByRepo(
   buckets: SpendBucket[],
   card: RateCard,
-): Array<{ repo: string; label: string; total: number; parts: Array<{ key: string; label: string; value: number }> }> {
-  const repos = new Map<string, { label: string; parts: Map<string, number> }>();
+): Array<{ repo: string; label: string; total: number; parts: RepoModelPart[] }> {
+  const repos = new Map<string, { label: string; parts: Map<string, RepoModelPart> }>();
   for (const b of buckets) {
     let entry = repos.get(b.repo);
     if (!entry) {
       entry = { label: b.repo_label, parts: new Map() };
       repos.set(b.repo, entry);
     }
-    const cost = costOfBucket(b, card) ?? 0;
-    entry.parts.set(b.model, (entry.parts.get(b.model) ?? 0) + cost);
+    let part = entry.parts.get(b.model);
+    if (!part) {
+      part = { key: b.model, label: labelForTranscriptModel(b.model), value: 0, unpriced: false };
+      entry.parts.set(b.model, part);
+    }
+    const cost = costOfBucket(b, card);
+    // Carried, not folded to 0: a folder whose helpers all ran on an unpriced model would
+    // otherwise read as "$0", the exact impression `costOfBucket` returns null to prevent.
+    if (cost === null) part.unpriced = true;
+    else part.value += cost;
   }
   return [...repos.entries()]
     .map(([repo, { label, parts }]) => {
-      const list = [...parts.entries()]
-        .map(([key, value]) => ({ key, label: labelForTranscriptModel(key), value }))
-        .sort((a, b) => b.value - a.value);
+      const list = [...parts.values()].sort((a, b) => b.value - a.value);
       return { repo, label, total: sum(list.map((p) => p.value)), parts: list };
     })
     .sort((a, b) => b.total - a.total);
+}
+
+/**
+ * Every pricing key the report actually contains that the card has no rate for — the list
+ * the price editor must offer, or an unpriced model could never be given a price.
+ */
+export function unpricedKeys(buckets: SpendBucket[], card: RateCard): string[] {
+  const keys = new Set<string>();
+  for (const b of buckets) {
+    const key = pricingKeyForTranscriptModel(b.model);
+    if (!card.rates[key]) keys.add(key);
+  }
+  return [...keys].sort();
 }
 
 // ---- The drift canary ------------------------------------------------------
@@ -401,14 +429,31 @@ export function dayOfMs(ms: number): string {
  * Compares CATALOGUE ids, not raw strings — `haiku` and `claude-haiku-4-5-20251001` are the
  * same model written two ways, and reporting that as drift would cry wolf on every correctly
  * configured agent.
+ *
+ * Rows that cannot disagree are left out rather than compared:
+ *   - `overriddenByForce` — with the budget locked every run uses the forced model, so the
+ *     row's own setting is not supposed to take effect;
+ *   - no model, or `inherit` — "follow the conversation" names no model to contradict.
+ *
+ * ⚠️ A finding is not proof the setting is broken: a `model` passed at spawn time (by
+ * Claude, or by a workflow) outranks the definition by design. The UI words it as an
+ * observation, not an accusation.
  */
 export function findDrift(
   buckets: SpendBucket[],
-  configured: Array<{ name: string; model: string | null; configuredAtMs?: number | null }>,
+  configured: Array<{
+    name: string;
+    model: string | null;
+    configuredAtMs?: number | null;
+    overriddenByForce?: boolean;
+  }>,
 ): DriftFinding[] {
   const wanted = new Map(
     configured
-      .filter((c): c is typeof c & { model: string } => !!c.model)
+      .filter(
+        (c): c is typeof c & { model: string } =>
+          !!c.model && c.model !== "inherit" && !c.overriddenByForce,
+      )
       .map((c) => [c.name, c]),
   );
   const seen = new Map<string, Map<string, number>>();

@@ -683,7 +683,8 @@ export type PlanUsageError =
   | { kind: "http"; status: number; body: string }
   | { kind: "network"; detail: string }
   | { kind: "parse"; body: string }
-  | { kind: "unknown_account"; account_id: string };
+  | { kind: "unknown_account"; account_id: string }
+  | { kind: "token_expired"; detail: string };
 
 /** Message + actionable next step + retry-applies + raw detail, per cause.
  *  Single source of the copy so it lives in one place. */
@@ -752,6 +753,15 @@ function usageErrorCopy(e: PlanUsageError): {
         msg: "This conversation's Claude account no longer exists.",
         action: "Pick another account from the composer's account control.",
         retry: false,
+        detail: null,
+      };
+    case "token_expired":
+      // Not a fault: the core's own explanation IS the message, worded plainly — the
+      // figure comes back by itself once a session on this account refreshes the token.
+      return {
+        msg: e.detail || "Sign-in needs refreshing.",
+        action: "Usage will show once a conversation runs on this account.",
+        retry: true,
         detail: null,
       };
     default: {

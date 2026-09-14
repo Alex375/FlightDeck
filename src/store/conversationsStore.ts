@@ -44,6 +44,7 @@ import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
 import {
   defaultAccountForNewConversation,
+  noteManualAccountPick,
   toAccountSummary,
   useClaudeAccountList,
   useClaudeAccountPrefs,
@@ -1064,6 +1065,14 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   setConvClaudeAccount: (id, accountId, opts) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv || conv.kind !== "claude") return; // accounts are a Claude-side concept
+    // A remote (SSH) conversation can only run on the server's own account: the core refuses
+    // any other one at spawn, so accepting it here would leave the conversation unable to
+    // send. Moving it back to the default is always allowed (that is the repair path).
+    if (accountId !== null && get().repos.find((r) => r.id === conv.repoId)?.machineId) return;
+    // A pick by the USER pins the conversation against the auto-switch (see
+    // `autoSwitchSuspended`) — recorded even when it re-states the current account: choosing
+    // to stay on a nearly-full account is as deliberate as choosing to leave one.
+    if (!opts?.auto) noteManualAccountPick(id, accountId);
     if ((conv.claudeAccountId ?? null) === accountId) return; // idempotent
     const updated: Conversation = {
       ...conv,
@@ -1196,8 +1205,10 @@ export function createConversationInRepo(
     tosseTaskTitle: null,
     tosseTaskStatus: null,
     // Starts on the account chosen in Settings → Accounts (null = the default one, which
-    // is the whole of a single-account setup). Codex has no account concept.
-    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
+    // is the whole of a single-account setup). Codex has no account concept, and a REMOTE
+    // repo always runs on the server's own account.
+    claudeAccountId:
+      kind === "claude" ? defaultAccountForNewConversation({ remote: !!repo.machineId }) : null,
   });
   return id;
 }
@@ -1219,6 +1230,7 @@ export function createConversationInWorktree(
 ): string {
   const id = uid();
   const now = Date.now();
+  const remote = !!useConversationsStore.getState().repos.find((r) => r.id === repoId)?.machineId;
   useConversationsStore.getState().addConversation({
     id,
     name: DEFAULT_CONV_NAME,
@@ -1247,8 +1259,9 @@ export function createConversationInWorktree(
     tosseTaskTitle: null,
     tosseTaskStatus: null,
     // Starts on the account chosen in Settings → Accounts (null = the default one, which
-    // is the whole of a single-account setup). Codex has no account concept.
-    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
+    // is the whole of a single-account setup). Codex has no account concept, and a REMOTE
+    // repo always runs on the server's own account.
+    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation({ remote }) : null,
   });
   return id;
 }
@@ -1347,6 +1360,7 @@ export function reactivateDiskConversation(
   // the backend's own default model/effort so a Codex conversation never carries a Claude
   // alias its binary would reject at thread/start.
   const kind: BackendKind = d.backend === "codex" ? "codex" : "claude";
+  const remote = !!repo.machineId;
   const controls: InheritedControls = inherit ?? {
     model: defaultModelFor(kind),
     effort: defaultEffortFor(kind),
@@ -1357,7 +1371,7 @@ export function reactivateDiskConversation(
     cleanOutput: null,
     // No source to inherit from (a History-panel import), and a transcript records no
     // account: start on the configured default, like a new conversation.
-    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation() : null,
+    claudeAccountId: kind === "claude" ? defaultAccountForNewConversation({ remote }) : null,
   };
   useConversationsStore.getState().addConversation({
     id,
@@ -1389,8 +1403,9 @@ export function reactivateDiskConversation(
     tosseTaskTitle: null,
     tosseTaskStatus: null,
     // A FORK carries its source's account over; a History-panel import falls back to the
-    // configured default (see `controls` above).
-    claudeAccountId: kind === "claude" ? controls.claudeAccountId : null,
+    // configured default (see `controls` above). A REMOTE repo runs on the server's own
+    // account whatever the source said — the core would refuse any other one at spawn.
+    claudeAccountId: kind === "claude" && !remote ? controls.claudeAccountId : null,
   });
   return id;
 }
