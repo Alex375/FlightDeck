@@ -44,7 +44,9 @@ function isTerminal(err: UsageError): boolean {
     err.kind === "no_token" ||
     err.kind === "keychain_denied" ||
     err.kind === "unauthorized" ||
-    err.kind === "parse"
+    err.kind === "parse" ||
+    // A removed account will not come back by polling — stop instead of retrying forever.
+    err.kind === "unknown_account"
   );
 }
 

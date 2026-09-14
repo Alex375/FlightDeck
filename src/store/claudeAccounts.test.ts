@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { PlanUsage } from "../ipc/client";
 import {
+  DEFAULT_ACCOUNT_ID,
   DEFAULT_ACCOUNT_PREFS,
+  resolveDefaultAccountId,
   SWITCH_COOLDOWN_MS,
   blockedNotice,
   decideSwitch,
@@ -170,6 +172,90 @@ describe("sanitizePrefs", () => {
 
   it("clamps out-of-range percentages", () => {
     expect(sanitizePrefs({ switchAtPercent: 999 }).switchAtPercent).toBe(100);
-    expect(sanitizePrefs({ switchAtPercent: -5 }).switchAtPercent).toBe(1);
+    // Floors at 2, not 1: a trigger of 1 leaves no room for a ceiling strictly below it.
+    expect(sanitizePrefs({ switchAtPercent: -5 }).switchAtPercent).toBe(2);
+  });
+
+  // The invariant itself, over every clamp path — including the ones the previous test
+  // exercised but never checked the second half of.
+  it("always keeps the ceiling strictly below the trigger", () => {
+    const blobs: unknown[] = [
+      {},
+      { switchAtPercent: -5 },
+      { switchAtPercent: 0 },
+      { switchAtPercent: 1 },
+      { switchAtPercent: 2 },
+      { switchAtPercent: 999 },
+      { switchAtPercent: 60, targetBelowPercent: 90 },
+      { switchAtPercent: 90, targetBelowPercent: 90 },
+      { targetBelowPercent: -3 },
+      { switchAtPercent: "x", targetBelowPercent: NaN },
+    ];
+    for (const raw of blobs) {
+      const p = sanitizePrefs(raw);
+      expect(p.targetBelowPercent, JSON.stringify(raw)).toBeGreaterThanOrEqual(1);
+      expect(p.targetBelowPercent, JSON.stringify(raw)).toBeLessThan(p.switchAtPercent);
+    }
+  });
+});
+
+describe("decideSwitch — exact boundaries", () => {
+  const prefs = DEFAULT_ACCOUNT_PREFS; // 90 % trigger, 75 % ceiling
+
+  // A `<` flipped to `<=` (or back) would move the switch by one point and pass every
+  // test that only uses 89 / 91. These pin the comparison itself.
+  it("switches AT the trigger, not only above it", () => {
+    const res = decideSwitch(account(null, 90), [account("b", 10)], prefs);
+    expect(res && "switchTo" in res).toBe(true);
+  });
+
+  it("refuses a candidate exactly AT the ceiling and accepts one just below", () => {
+    expect(decideSwitch(account(null, 95), [account("b", 75)], prefs)).toEqual({
+      blocked: { reason: "no_capacity", candidates: 1 },
+    });
+    const res = decideSwitch(account(null, 95), [account("b", 74)], prefs);
+    expect(res && "switchTo" in res && res.switchTo.to.id).toBe("b");
+  });
+});
+
+describe("decideSwitch — unreadable current account", () => {
+  // A failed read on the account the conversation runs on must not be mistaken for
+  // "below the threshold": that made the opt-in a permanent, silent no-op.
+  it("reports it instead of doing nothing", () => {
+    const current = { ...account(null, null), usageError: "keychain_denied" };
+    const res = decideSwitch(current, [account("b", 10)], DEFAULT_ACCOUNT_PREFS);
+    expect(res).toEqual({
+      blocked: { reason: "unknown_current_usage", detail: "keychain_denied" },
+    });
+    expect(
+      blockedNotice(current, { reason: "unknown_current_usage", detail: "keychain_denied" }),
+    ).toContain("could not be read");
+  });
+
+  it("stays quiet when the endpoint simply reported no window (no error)", () => {
+    expect(decideSwitch(account(null, null), [account("b", 10)], DEFAULT_ACCOUNT_PREFS)).toBeNull();
+  });
+});
+
+describe("resolveDefaultAccountId", () => {
+  const known = [{ id: "acct-b" }];
+
+  it("keeps a preference naming an account that exists", () => {
+    expect(resolveDefaultAccountId("acct-b", known)).toBe("acct-b");
+  });
+
+  it("degrades a preference naming a removed account to the default one", () => {
+    expect(resolveDefaultAccountId("gone", known)).toBeNull();
+  });
+
+  it("maps the reserved id and an empty preference to the default account", () => {
+    expect(resolveDefaultAccountId(DEFAULT_ACCOUNT_ID, known)).toBeNull();
+    expect(resolveDefaultAccountId(null, known)).toBeNull();
+  });
+
+  // The boot-time bug: an UNLOADED list was treated as empty, silently dropping a valid
+  // preference for every conversation created before the list arrived.
+  it("passes the preference through while the list is not loaded yet", () => {
+    expect(resolveDefaultAccountId("acct-b", null)).toBe("acct-b");
   });
 });

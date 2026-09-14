@@ -42,7 +42,12 @@ import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
-import { defaultAccountForNewConversation } from "./claudeAccounts";
+import {
+  defaultAccountForNewConversation,
+  toAccountSummary,
+  useClaudeAccountList,
+  useClaudeAccountPrefs,
+} from "./claudeAccounts";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
@@ -1068,8 +1073,10 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       lastAccountSwitchAt: opts?.auto ? Date.now() : conv.lastAccountSwitchAt,
     };
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
-    syncToCore("upsertConversation(claudeAccount)", () =>
-      commands.upsertConversation(convToRecord(updated)),
+    // Through the DEDICATED command, never the wholesale upsert: the core only writes this
+    // column there (a stale record re-upserted elsewhere must not resurrect a removed id).
+    syncToCore("setConversationClaudeAccount", () =>
+      commands.setConversationClaudeAccount(id, accountId),
     );
     // A LIVE process cannot change account — the CLI reads its credentials once at
     // startup — so applying the choice means stopping it and letting the next turn
@@ -1452,9 +1459,36 @@ export function materializeCodexBranch(
  * (see [`loadConversationHistory`]) and its `claude` process is spawned only when
  * the user sends a message. An empty store stays empty — no default conversation.
  */
+/**
+ * Mirror, in memory, the detach the core performed when a Claude account was removed:
+ * every conversation that ran on it falls back to the default account. In memory only —
+ * `delete_claude_account` already cleared the column, in the same transaction.
+ *
+ * Without it the in-memory copies keep the dead id: the composer names an account that
+ * no longer exists and every spawn is refused until a relaunch. A LIVE session on it is
+ * left to `ClaudeAccountApplyHost`, which restarts it on the default account at the next
+ * safe boundary (the core refuses the removal while one is running anyway).
+ */
+export function detachClaudeAccount(accountId: string): void {
+  useConversationsStore.setState((s) => ({
+    conversations: s.conversations.map((c) =>
+      c.claudeAccountId === accountId ? { ...c, claudeAccountId: null } : c,
+    ),
+  }));
+  // Nor should it stay the default for NEW conversations.
+  const prefs = useClaudeAccountPrefs.getState();
+  if (prefs.defaultAccountId === accountId) prefs.set({ defaultAccountId: null });
+}
+
 export async function bootConversations(): Promise<void> {
   const res = await commands.loadPersistedState();
   if (res.status === "ok") {
+    // Seed the account mirror BEFORE any conversation can be created: the "default account
+    // for new conversations" preference is validated against it, and waiting for a
+    // component to mount the account query left it unloaded at boot.
+    useClaudeAccountList
+      .getState()
+      .setAccounts((res.data.claude_accounts ?? []).map(toAccountSummary));
     useConversationsStore.setState({
       machines: (res.data.machines ?? []).map(recordToMachine),
       repos: res.data.repos.map(recordToRepo),

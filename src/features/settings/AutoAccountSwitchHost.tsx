@@ -86,7 +86,12 @@ function AccountProbe({
   const usage = usePlanUsage({ accountId });
   const status = useClaudeAccount(true, accountId);
   const key = keyOf(accountId);
-  const data = usage.data ?? null;
+  // A read that currently FAILS publishes no figure. React Query keeps the last successful
+  // `data` across an error, and `usePlanUsage` stops polling for terminal causes — so
+  // trusting `data` here would freeze the account at an old measurement forever and let
+  // the policy act on it as if it were live.
+  const data = usage.isError ? null : (usage.data ?? null);
+  const usageError = usage.error ? usage.error.kind : null;
   const fetchedAt = usage.dataUpdatedAt || null;
   // A still-loading probe is NOT treated as signed in: an unproven target is never chosen,
   // the same rule that keeps an account with unknown usage out of the running.
@@ -97,12 +102,13 @@ function AccountProbe({
       label: label ?? "Claude",
       loggedIn,
       usage: data,
+      usageError,
       fetchedAt,
       // The default account sorts first, so it wins a tie against any added account.
       sortIndex: sortIndex ?? -1,
     });
     return () => useAccountSnapshots.getState().forget(key);
-  }, [key, accountId, label, sortIndex, loggedIn, data, fetchedAt]);
+  }, [key, accountId, label, sortIndex, loggedIn, data, usageError, fetchedAt]);
   return null;
 }
 

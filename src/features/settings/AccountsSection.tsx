@@ -14,6 +14,7 @@ import {
   useClaudeAccountActions,
   useClaudeAccountAdmin,
   useClaudeAccounts,
+  useClaudeLoginInFlight,
   useCodexAccount,
   useCodexAccountActions,
 } from "../../ipc/useAccounts";
@@ -71,14 +72,38 @@ function ClaudeAccountGroup() {
   const prefs = useClaudeAccountPrefs();
   const rows = accounts.data ?? [];
   const addErr = (admin.create.error as Error | null)?.message ?? null;
-  // A removal can succeed while still reporting a problem (the CLI logout failed but the
-  // row is gone). That warning is shown rather than dropped: the credential store may
-  // still hold a session the user believes they revoked.
-  const [removeWarning, setRemoveWarning] = useState<string | null>(null);
+  const listErr = (accounts.error as Error | null)?.message ?? null;
+  // Removal outcomes, per account. A REFUSED removal (the CLI sign-out failed) keeps the
+  // account and offers "Remove anyway"; a forced removal that went through still reports
+  // the Keychain item left behind. Neither is ever dropped: the credential store may still
+  // hold a session the user believes they revoked.
+  const [removal, setRemoval] = useState<
+    { accountId: string; kind: "refused" | "warning"; message: string } | null
+  >(null);
+  const [renameErr, setRenameErr] = useState<{ accountId: string; message: string } | null>(
+    null,
+  );
+
+  const remove = (accountId: string, force: boolean) =>
+    admin.remove.mutate(
+      { accountId, force },
+      {
+        onSuccess: (warning) =>
+          setRemoval(warning ? { accountId, kind: "warning", message: warning } : null),
+        onError: (e: unknown) =>
+          setRemoval({
+            accountId,
+            kind: "refused",
+            message: e instanceof Error ? e.message : String(e),
+          }),
+      },
+    );
 
   return (
     <>
-      <ClaudeAccountCard accountId={null} label="Claude" />
+      {/* With extra accounts signed in, `claude auth status` reports whichever account
+          signed in LAST as the email/org, so the default card must not show them. */}
+      <ClaudeAccountCard accountId={null} label="Claude" hideSharedIdentity={rows.length > 0} />
       {rows.map((a) => (
         <ClaudeAccountCard
           key={a.id}
@@ -87,15 +112,31 @@ function ClaudeAccountGroup() {
           email={a.email}
           orgName={a.org_name}
           subscriptionType={a.subscription_type}
-          onRename={(label) => admin.rename.mutate({ accountId: a.id, label })}
-          onRemove={() =>
-            admin.remove.mutate(a.id, {
-              onSuccess: (warning) => setRemoveWarning(warning ?? null),
-              onError: (e: unknown) =>
-                setRemoveWarning(e instanceof Error ? e.message : String(e)),
-            })
+          onRename={(label) =>
+            admin.rename.mutate(
+              { accountId: a.id, label },
+              {
+                onSuccess: () => setRenameErr(null),
+                onError: (e: unknown) =>
+                  setRenameErr({
+                    accountId: a.id,
+                    message: e instanceof Error ? e.message : String(e),
+                  }),
+              },
+            )
           }
-          removing={admin.remove.isPending}
+          renameError={renameErr?.accountId === a.id ? renameErr.message : null}
+          onRemove={() => remove(a.id, false)}
+          removing={admin.remove.isPending && admin.remove.variables?.accountId === a.id}
+          removal={
+            removal?.accountId === a.id
+              ? {
+                  ...removal,
+                  onForce: () => remove(a.id, true),
+                  onDismiss: () => setRemoval(null),
+                }
+              : null
+          }
         />
       ))}
       <SettingsGroup title="Claude accounts" icon="users">
@@ -113,10 +154,10 @@ function ClaudeAccountGroup() {
           }
         />
         {addErr ? <div className={s.err}>{addErr}</div> : null}
-        {removeWarning ? (
-          <div className={s.err}>
-            The account was removed, but the sign-out did not complete cleanly: {removeWarning}
-          </div>
+        {/* A failed list read is NOT "no extra accounts": say so instead of rendering an
+            empty panel that reads as if they had been deleted. */}
+        {listErr ? (
+          <div className={s.err}>Could not load your Claude accounts: {listErr}</div>
         ) : null}
         <ToggleRow
           title="Default account for new conversations"
@@ -168,31 +209,92 @@ function AutoSwitchRows({ accountCount }: { accountCount: number }) {
         onChange={(next) => prefs.set({ autoSwitch: next })}
       />
       {prefs.autoSwitch && enoughAccounts ? (
-        <ToggleRow
-          title="Switch threshold"
-          hint={`Arms at ${prefs.switchAtPercent}% used; only switches to an account below ${prefs.targetBelowPercent}%. The gap between the two is what stops it bouncing back and forth.`}
-          control={
-            <input
-              className={s.codeInput}
-              type="number"
-              min={50}
-              max={99}
-              value={prefs.switchAtPercent}
-              onChange={(e) => {
-                const at = Number(e.target.value);
-                if (!Number.isFinite(at)) return;
-                // Keep the hysteresis gap as the user drags the trigger down: the ceiling
-                // follows rather than becoming invalid (and silently clamped later).
-                prefs.set({
-                  switchAtPercent: at,
-                  targetBelowPercent: Math.min(prefs.targetBelowPercent, at - 5),
-                });
-              }}
-            />
-          }
-        />
+        <>
+          <ToggleRow
+            title="Switch when an account reaches"
+            hint="Percentage of its 5h or 7d window (50–99)."
+            control={
+              <PercentInput
+                value={prefs.switchAtPercent}
+                min={50}
+                max={99}
+                onCommit={(at) =>
+                  // Keep the ceiling strictly below the new trigger, but never RATCHET it:
+                  // raising the trigger back leaves the ceiling where the user put it.
+                  prefs.set({
+                    switchAtPercent: at,
+                    targetBelowPercent: Math.min(prefs.targetBelowPercent, at - 1),
+                  })
+                }
+              />
+            }
+          />
+          <ToggleRow
+            title="Only switch to an account below"
+            hint={`Must stay under the trigger (${prefs.switchAtPercent}%). The gap is what stops it bouncing back and forth.`}
+            control={
+              <PercentInput
+                value={prefs.targetBelowPercent}
+                min={1}
+                max={prefs.switchAtPercent - 1}
+                onCommit={(below) => prefs.set({ targetBelowPercent: below })}
+              />
+            }
+          />
+        </>
       ) : null}
     </>
+  );
+}
+
+/** A percentage field that COMMITS on blur / Enter, never per keystroke. Committing on
+ *  every keystroke fed intermediate values ("" → 0, "9" while retyping "95") straight into
+ *  the policy, where they were silently clamped to 1%. An out-of-range or empty entry is
+ *  refused and the field snaps back to the stored value, visibly. */
+function PercentInput({
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const [invalid, setInvalid] = useState(false);
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+  const commit = () => {
+    const trimmed = draft.trim();
+    const n = Number(trimmed);
+    if (trimmed === "" || !Number.isInteger(n) || n < min || n > max) {
+      setInvalid(true);
+      setDraft(String(value));
+      return;
+    }
+    setInvalid(false);
+    if (n !== value) onCommit(n);
+  };
+  return (
+    <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-end" }}>
+      <input
+        className={s.codeInput}
+        type="number"
+        min={min}
+        max={max}
+        value={draft}
+        aria-invalid={invalid}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+      />
+      {invalid ? <span className={s.err}>{`Enter a whole number from ${min} to ${max}.`}</span> : null}
+    </span>
   );
 }
 
@@ -203,9 +305,12 @@ function ClaudeAccountCard({
   email,
   orgName,
   subscriptionType,
+  hideSharedIdentity,
   onRename,
+  renameError,
   onRemove,
   removing,
+  removal,
 }: {
   /** `null` = the default, un-scoped account (the one that always exists). */
   accountId: string | null;
@@ -213,16 +318,46 @@ function ClaudeAccountCard({
   email?: string | null;
   orgName?: string | null;
   subscriptionType?: string | null;
+  /** Suppress the email/org read from `claude auth status` (default card only), because
+   *  with several accounts that shared profile cache names another account. */
+  hideSharedIdentity?: boolean;
   onRename?: (label: string) => void;
+  renameError?: string | null;
   onRemove?: () => void;
   removing?: boolean;
+  removal?: {
+    kind: "refused" | "warning";
+    message: string;
+    onForce: () => void;
+    onDismiss: () => void;
+  } | null;
 }) {
   const status = useClaudeAccount(true, accountId);
   const { loginStart, loginCode, loginCancel, logout } = useClaudeAccountActions(accountId);
   // The two-step login: null = idle; "code" = URL opened, waiting for the pasted code.
   const [step, setStep] = useState<"idle" | "code">("idle");
   const [code, setCode] = useState("");
+  const [identityWarning, setIdentityWarning] = useState<string | null>(null);
   const opener = useAuthUrlOpener();
+  // There is ONE in-flight sign-in for the whole app. If another card started one after
+  // this card opened its code box, this card's flow is gone: close the box rather than
+  // offer an input that would submit into someone else's login.
+  const inFlight = useClaudeLoginInFlight(step === "code");
+  // Set when THIS card's code box was closed because its flow was replaced — cleared the
+  // next time this card starts a sign-in. Explicit state rather than a value derived from
+  // the (by then disabled) poll, so the notice cannot linger or flicker.
+  const [superseded, setSuperseded] = useState(false);
+  useEffect(() => {
+    if (step !== "code" || !inFlight.isFetchedAfterMount || loginCode.isPending) return;
+    const f = inFlight.data;
+    if (!f || f.accountId !== accountId) {
+      setStep("idle");
+      setCode("");
+      // Another account's login replaced ours; no login at all means it was cancelled
+      // elsewhere — both close the box, only the first needs explaining.
+      setSuperseded(!!f);
+    }
+  }, [step, inFlight.isFetchedAfterMount, inFlight.data, accountId, loginCode.isPending]);
   const err =
     (loginStart.error as Error | null)?.message ??
     (loginCode.error as Error | null)?.message ??
@@ -230,6 +365,8 @@ function ClaudeAccountCard({
     null;
 
   const startLogin = () => {
+    setSuperseded(false);
+    setIdentityWarning(null);
     loginStart.mutate(undefined, {
       onSuccess: (url) => {
         setStep("code");
@@ -241,9 +378,10 @@ function ClaudeAccountCard({
   const submitCode = () => {
     if (!code.trim()) return;
     loginCode.mutate(code, {
-      onSuccess: () => {
+      onSuccess: (warning) => {
         setStep("idle");
         setCode("");
+        setIdentityWarning(warning);
       },
       // On failure the CLI child has exited: back to idle so "Sign in" restarts
       // a fresh flow (the error stays visible below).
@@ -293,8 +431,16 @@ function ClaudeAccountCard({
   // whatever `claude auth status` reports: that reads a profile cache all accounts share,
   // so it names whichever signed in last. The default card has no such record and falls
   // back to the live status, which is correct for it whenever it is the only account.
-  const shownEmail = accountId ? (email ?? null) : (status.data?.email ?? null);
-  const shownOrg = accountId ? (orgName ?? null) : (status.data?.orgName ?? null);
+  const shownEmail = accountId
+    ? (email ?? null)
+    : hideSharedIdentity
+      ? null
+      : (status.data?.email ?? null);
+  const shownOrg = accountId
+    ? (orgName ?? null)
+    : hideSharedIdentity
+      ? null
+      : (status.data?.orgName ?? null);
   const shownPlan = accountId
     ? (subscriptionType ?? status.data?.subscriptionType ?? null)
     : (status.data?.subscriptionType ?? null);
@@ -320,16 +466,25 @@ function ClaudeAccountCard({
     >
       {logged ? <AccountUsage accountId={accountId} /> : null}
       {onRename ? (
-        <div className={s.subRow}>
-          <span className={s.subLabel}>Name</span>
-          <input
-            className={s.codeInput}
-            defaultValue={label}
-            onBlur={(e) => {
-              const next = e.target.value.trim();
-              if (next && next !== label) onRename(next);
-            }}
-          />
+        <NameField label={label} onRename={onRename} error={renameError ?? null} />
+      ) : null}
+      {identityWarning ? <div className={s.err}>{identityWarning}</div> : null}
+      {superseded ? (
+        <div className={s.err}>
+          This sign-in was replaced by one started for another account. Click “Sign in” again.
+        </div>
+      ) : null}
+      {removal ? (
+        <div className={s.err}>
+          {removal.message}{" "}
+          {removal.kind === "refused" ? (
+            <button className={`${s.btn} ${s.danger}`} onClick={removal.onForce}>
+              Remove anyway
+            </button>
+          ) : null}{" "}
+          <button className={`${s.btn} ${s.ghost}`} onClick={removal.onDismiss}>
+            Dismiss
+          </button>
         </div>
       ) : null}
       {step === "code" ? (
@@ -364,6 +519,51 @@ function ClaudeAccountCard({
       ) : null}
       {err ? <div className={s.err}>{err}</div> : null}
     </ConnectionCard>
+  );
+}
+
+/** The account name field. CONTROLLED and re-seeded whenever the stored label changes:
+ *  the uncontrolled version kept its first `defaultValue`, so after the identity capture
+ *  renamed the account the stale DOM text was compared against the fresh label on the next
+ *  blur and silently written back. A failed rename is shown and the field reverts to the
+ *  name that is actually stored. */
+function NameField({
+  label,
+  onRename,
+  error,
+}: {
+  label: string;
+  onRename: (label: string) => void;
+  error: string | null;
+}) {
+  const [draft, setDraft] = useState(label);
+  useEffect(() => {
+    setDraft(label);
+  }, [label, error]);
+  const commit = () => {
+    const next = draft.trim();
+    if (!next) {
+      setDraft(label);
+      return;
+    }
+    if (next !== label) onRename(next);
+  };
+  return (
+    <>
+      <div className={s.subRow}>
+        <span className={s.subLabel}>Name</span>
+        <input
+          className={s.codeInput}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+          }}
+        />
+      </div>
+      {error ? <div className={s.err}>Could not rename this account: {error}</div> : null}
+    </>
   );
 }
 
@@ -414,6 +614,8 @@ function usageErrorText(e: UsageError): string {
       return `Could not reach the usage endpoint: ${e.detail}`;
     case "parse":
       return "The usage endpoint answered in an unexpected shape.";
+    case "unknown_account":
+      return "This account no longer exists.";
   }
 }
 

@@ -682,7 +682,8 @@ export type PlanUsageError =
   | { kind: "rate_limited"; retry_after: number | null }
   | { kind: "http"; status: number; body: string }
   | { kind: "network"; detail: string }
-  | { kind: "parse"; body: string };
+  | { kind: "parse"; body: string }
+  | { kind: "unknown_account"; account_id: string };
 
 /** Message + actionable next step + retry-applies + raw detail, per cause.
  *  Single source of the copy so it lives in one place. */
@@ -745,6 +746,13 @@ function usageErrorCopy(e: PlanUsageError): {
         action: "Probably a bug — report it with the details below.",
         retry: false,
         detail: e.body,
+      };
+    case "unknown_account":
+      return {
+        msg: "This conversation's Claude account no longer exists.",
+        action: "Pick another account from the composer's account control.",
+        retry: false,
+        detail: null,
       };
     default: {
       // Exhaustiveness guard: a new UsageError kind must be handled above (this line

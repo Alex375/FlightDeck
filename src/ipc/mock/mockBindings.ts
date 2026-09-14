@@ -295,6 +295,9 @@ let mockSentCounter = 0;
  *  Seeded with one so the multi-account surfaces are reachable in dev/Playwright without
  *  going through the sign-in flow, and mutable so add / rename / remove actually do
  *  something in the browser build. */
+/** The demo's in-flight Claude sign-in, mirroring the core's single global login. */
+let mockLoginInFlight: { accountId: string | null } | null = null;
+
 const mockClaudeAccounts: ClaudeAccountRecord[] = [
   {
     id: "acct-b",
@@ -304,6 +307,7 @@ const mockClaudeAccounts: ClaudeAccountRecord[] = [
     subscription_type: "max",
     sort_index: 1,
     added_at: 0,
+    label_is_generated: false,
   },
 ];
 
@@ -754,14 +758,28 @@ export const mockCommands = {
       subscriptionType: "max",
     });
   },
-  async accountClaudeLoginStart(_accountId: string | null): Promise<Result<string, string>> {
+  async accountClaudeLoginStart(accountId: string | null): Promise<Result<string, string>> {
+    mockLoginInFlight = { accountId };
     return ok("https://claude.ai/oauth/demo");
   },
-  async accountClaudeLoginCode(_code: string): Promise<Result<null, string>> {
+  async accountClaudeLoginCode(
+    accountId: string | null,
+    _code: string,
+  ): Promise<Result<null, string>> {
+    // Mirror the core's binding of the code to its account.
+    if (!mockLoginInFlight) return { status: "error", error: "no Claude sign-in in progress" };
+    if (mockLoginInFlight.accountId !== accountId) {
+      return { status: "error", error: "this sign-in was superseded by one for another account" };
+    }
+    mockLoginInFlight = null;
     return ok(null);
   },
   async accountClaudeLoginCancel(): Promise<Result<null, string>> {
+    mockLoginInFlight = null;
     return ok(null);
+  },
+  async accountClaudeLoginInFlight(): Promise<Result<{ accountId: string | null } | null, string>> {
+    return ok(mockLoginInFlight ? { accountId: mockLoginInFlight.accountId } : null);
   },
   async accountClaudeLogout(_accountId: string | null): Promise<Result<null, string>> {
     return ok(null);
@@ -778,13 +796,16 @@ export const mockCommands = {
       subscription_type: null,
       sort_index: mockClaudeAccounts.length + 1,
       added_at: Date.now(),
+      label_is_generated: !label.trim(),
     };
     mockClaudeAccounts.push(rec);
     return ok(rec);
   },
   async claudeAccountRename(accountId: string, label: string): Promise<Result<null, string>> {
     const rec = mockClaudeAccounts.find((a) => a.id === accountId);
-    if (rec) rec.label = label;
+    if (!rec) return { status: "error", error: "this Claude account no longer exists" };
+    rec.label = label;
+    rec.label_is_generated = false;
     return ok(null);
   },
   async claudeAccountCaptureIdentity(accountId: string): Promise<Result<ClaudeAccountRecord, string>> {
@@ -794,7 +815,10 @@ export const mockCommands = {
     rec.subscription_type = "max";
     return ok(rec);
   },
-  async claudeAccountRemove(accountId: string): Promise<Result<string | null, string>> {
+  async claudeAccountRemove(
+    accountId: string,
+    _force: boolean,
+  ): Promise<Result<string | null, string>> {
     const i = mockClaudeAccounts.findIndex((a) => a.id === accountId);
     if (i >= 0) mockClaudeAccounts.splice(i, 1);
     return ok(null);

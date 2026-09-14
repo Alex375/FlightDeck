@@ -133,6 +133,10 @@ pub enum UsageError {
     Network { detail: String },
     /// Response received but unparseable into the expected shape (carries body).
     Parse { body: String },
+    /// The usage was asked for a Claude account the app no longer knows (removed). A
+    /// permanent, locally-known cause: typed on its own so the UI says so and STOPS polling,
+    /// instead of presenting it as a network blip and retrying forever.
+    UnknownAccount { account_id: String },
 }
 
 /// Fetch the DEFAULT account's usage percentages — the un-scoped credential store, i.e.

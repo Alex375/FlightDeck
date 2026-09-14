@@ -342,14 +342,27 @@ fn migrate_v10(conn: &Connection) -> rusqlite::Result<()> {
 fn migrate_v11(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS claude_accounts (
-             id                TEXT PRIMARY KEY,
-             label             TEXT NOT NULL,
-             email             TEXT,
-             org_name          TEXT,
-             subscription_type TEXT,
-             sort_index        INTEGER NOT NULL DEFAULT 0,
-             added_at          INTEGER NOT NULL
+             id                 TEXT PRIMARY KEY,
+             label              TEXT NOT NULL,
+             email              TEXT,
+             org_name           TEXT,
+             subscription_type  TEXT,
+             sort_index         INTEGER NOT NULL DEFAULT 0,
+             added_at           INTEGER NOT NULL,
+             -- 1 while the label is still the placeholder minted at creation, 0 once the
+             -- user has named the account. Recorded as a FACT rather than re-derived from
+             -- the text: guessing by prefix would silently overwrite a real name like
+             -- \"Account manager\" the first time the identity is captured.
+             label_is_generated INTEGER NOT NULL DEFAULT 1
          );",
+    )?;
+    // Idempotent for a database created by an earlier build of this same migration (this
+    // schema version has never shipped, but a dev machine may already carry the v11 table).
+    add_column_if_absent(
+        conn,
+        "claude_accounts",
+        "label_is_generated",
+        "ALTER TABLE claude_accounts ADD COLUMN label_is_generated INTEGER NOT NULL DEFAULT 1",
     )?;
     add_column_if_absent(
         conn,
@@ -522,7 +535,8 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut acc_stmt = conn.prepare(
-            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at
+            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at,
+                    label_is_generated
              FROM claude_accounts ORDER BY sort_index ASC, added_at ASC",
         )?;
         let claude_accounts = acc_stmt
@@ -535,6 +549,7 @@ impl Store {
                     subscription_type: row.get(4)?,
                     sort_index: row.get(5)?,
                     added_at: row.get(6)?,
+                    label_is_generated: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -770,8 +785,14 @@ impl Store {
                  backend           = excluded.backend,
                  tosse_task_id     = excluded.tosse_task_id,
                  tosse_task_title  = excluded.tosse_task_title,
-                 tosse_task_status = excluded.tosse_task_status,
-                 claude_account_id = excluded.claude_account_id",
+                 tosse_task_status = excluded.tosse_task_status",
+            // ⚠️ `claude_account_id` is written on INSERT only, never in the UPDATE above:
+            // `set_conversation_claude_account` is its SOLE updater (the same discipline as
+            // `repos.tosse_repository_id`). The front re-upserts whole records on every
+            // activity bump / rename / model change from an in-memory copy; were the column
+            // in this SET list, a stale copy would silently write back an account id that
+            // `delete_claude_account` had just detached — resurrecting a dangling reference
+            // the spawner then refuses.
             params![
                 c.id,
                 c.name,
@@ -802,7 +823,8 @@ impl Store {
     pub fn list_claude_accounts(&self) -> rusqlite::Result<Vec<ClaudeAccountRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at
+            "SELECT id, label, email, org_name, subscription_type, sort_index, added_at,
+                    label_is_generated
              FROM claude_accounts ORDER BY sort_index ASC, added_at ASC",
         )?;
         let rows = stmt
@@ -815,6 +837,7 @@ impl Store {
                     subscription_type: row.get(4)?,
                     sort_index: row.get(5)?,
                     added_at: row.get(6)?,
+                    label_is_generated: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -826,14 +849,16 @@ impl Store {
     pub fn upsert_claude_account(&self, a: &ClaudeAccountRecord) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO claude_accounts
-                 (id, label, email, org_name, subscription_type, sort_index, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (id, label, email, org_name, subscription_type, sort_index, added_at,
+                  label_is_generated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
-                 label             = excluded.label,
-                 email             = excluded.email,
-                 org_name          = excluded.org_name,
-                 subscription_type = excluded.subscription_type,
-                 sort_index        = excluded.sort_index",
+                 label              = excluded.label,
+                 email              = excluded.email,
+                 org_name           = excluded.org_name,
+                 subscription_type  = excluded.subscription_type,
+                 sort_index         = excluded.sort_index,
+                 label_is_generated = excluded.label_is_generated",
             params![
                 a.id,
                 a.label,
@@ -841,7 +866,8 @@ impl Store {
                 a.org_name,
                 a.subscription_type,
                 a.sort_index,
-                a.added_at
+                a.added_at,
+                a.label_is_generated
             ],
         )?;
         Ok(())
@@ -1248,6 +1274,7 @@ mod tests {
             subscription_type: Some("max".into()),
             sort_index,
             added_at: 7,
+            label_is_generated: true,
         }
     }
 
@@ -1278,9 +1305,24 @@ mod tests {
         let loaded = || store.load_state().unwrap().conversations.remove(0);
         assert_eq!(loaded().claude_account_id.as_deref(), Some("b"));
 
-        // A rename must not disturb the link (or the other way round).
-        store.upsert_claude_account(&account("b", 5)).unwrap();
+        // A rename must not disturb the link (or the other way round) — and the rename
+        // itself must actually land: every updatable field is re-read, and the creation
+        // timestamp is NOT rewritten by the conflict clause.
+        let mut renamed = account("b", 5);
+        renamed.label = "Work".into();
+        renamed.label_is_generated = false;
+        store.upsert_claude_account(&renamed).unwrap();
         assert_eq!(loaded().claude_account_id.as_deref(), Some("b"));
+        let b = store
+            .list_claude_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == "b")
+            .unwrap();
+        assert_eq!(b.label, "Work");
+        assert_eq!(b.sort_index, 5);
+        assert!(!b.label_is_generated, "the user-named flag must persist");
+        assert_eq!(b.added_at, 7, "added_at is not rewritten on update");
     }
 
     /// Removing an account DETACHES the conversations that referenced it rather than
@@ -1317,6 +1359,28 @@ mod tests {
             Some("kept"),
             "a conversation on ANOTHER account must not be detached too"
         );
+    }
+
+    /// The regression the sole-writer rule prevents: after an account is removed (its
+    /// conversations detached), a STALE in-memory copy of a conversation re-upserted by the
+    /// front must not write the dead account id back.
+    #[test]
+    fn a_stale_conversation_upsert_cannot_resurrect_a_removed_account() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        store.upsert_claude_account(&account("b", 1)).unwrap();
+        let mut c = conv("c1", "r1", None);
+        c.claude_account_id = Some("b".into());
+        store.upsert_conversation(&c).unwrap(); // INSERT carries the account
+
+        store.delete_claude_account("b").unwrap();
+        // The front's copy still says "b" and is re-upserted on an unrelated change.
+        c.name = "renamed".into();
+        store.upsert_conversation(&c).unwrap();
+
+        let loaded = store.load_state().unwrap().conversations.remove(0);
+        assert_eq!(loaded.name, "renamed", "the unrelated change landed");
+        assert_eq!(loaded.claude_account_id, None, "the detach survived the stale upsert");
     }
 
     /// Pointing a conversation at an account (and back to the default) is its own call, so

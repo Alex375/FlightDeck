@@ -3,12 +3,12 @@
 //
 // Deliberately its own control rather than a section inside the model picker: the model is
 // what answers, the account is who pays for it. Folding them together would make one look
-// like a variant of the other — the task's "ne pas mélanger conceptuellement modèle et
-// compte".
+// like a variant of the other.
 //
-// It renders only when there IS a choice (two or more accounts signed in), which is what
-// keeps a single-account setup exactly as it was. Claude only; the composer bar's backend
-// filter keeps it off Codex conversations.
+// It renders when there IS a choice (two or more accounts signed in) — and ALSO whenever the
+// conversation points at an account that no longer exists, since this chip is the only UI
+// that can re-point it. Otherwise a single-account setup sees no change at all. Claude only;
+// the composer bar's backend filter keeps it off Codex conversations.
 import { Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useClaudeAccounts } from "../../ipc/useAccounts";
@@ -22,12 +22,22 @@ const DEFAULT_LABEL = "Claude";
 export function AccountChip({ session }: { session: string }) {
   const accounts = useClaudeAccounts(true);
   const conv = useConversationsStore((s) => s.conversations.find((c) => c.id === session));
+  // A conversation in a REMOTE repo runs on the server's own Claude account: the account
+  // is a local environment variable the SSH launcher does not carry, and the core refuses
+  // one there. Offering the picker would promise something that cannot be honoured.
+  const remote = useConversationsStore(
+    (s) => !!s.repos.find((r) => r.id === conv?.repoId)?.machineId,
+  );
   const rows = accounts.data ?? [];
   const currentId = conv?.claudeAccountId ?? null;
   const live = !!conv?.handle;
 
-  // Nothing to choose between: keep the bar as it was for a single-account setup.
-  if (rows.length === 0) return null;
+  // Computed BEFORE any early return: an orphaned pointer must keep its repair surface
+  // even when the last extra account is gone.
+  const orphaned = !!accounts.data && currentId !== null && !rows.some((a) => a.id === currentId);
+  if (rows.length === 0 && !orphaned) return null;
+  // A remote conversation already on the default account has nothing to choose.
+  if (remote && !orphaned && currentId === null) return null;
 
   const nameOf = (id: string | null) =>
     id === null
@@ -36,7 +46,6 @@ export function AccountChip({ session }: { session: string }) {
         // The conversation names an account that is gone. Say so rather than silently
         // showing the default: the session will refuse to start until it is re-pointed.
         "Unknown account");
-  const orphaned = currentId !== null && !rows.some((a) => a.id === currentId);
 
   // A running process cannot change identity, so the chip shows what the SESSION is
   // actually authenticated as until the restart lands — claiming the new account while the
@@ -73,15 +82,22 @@ export function AccountChip({ session }: { session: string }) {
         on={currentId === null}
         onPick={() => pick(null)}
       />
-      {rows.map((a) => (
-        <AccountOption
-          key={a.id}
-          accountId={a.id}
-          label={a.label}
-          on={currentId === a.id}
-          onPick={() => pick(a.id)}
-        />
-      ))}
+      {/* Remote conversations can only use the server's account, so the extra accounts are
+          not offered there — only the way back to the default. */}
+      {remote
+        ? null
+        : rows.map((a) => (
+            <AccountOption
+              key={a.id}
+              accountId={a.id}
+              label={a.label}
+              on={currentId === a.id}
+              onPick={() => pick(a.id)}
+            />
+          ))}
+      {remote ? (
+        <MenuItem disabled>Remote conversations use the server's Claude account</MenuItem>
+      ) : null}
       {/* A running process cannot change identity — the CLI reads its credentials once at
           startup — so a pick restarts the session, and only once the current turn (and any
           background task) has finished. Say when it takes effect instead of implying it
@@ -114,7 +130,7 @@ function AccountOption({
   onPick: () => void;
 }) {
   const usage = usePlanUsage({ accountId, enabled: false });
-  const pct = peakUsagePercent(usage.data ?? null);
+  const pct = usage.isError ? null : peakUsagePercent(usage.data ?? null);
   return (
     <MenuItem on={on} onClick={onPick}>
       {label}

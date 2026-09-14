@@ -10,11 +10,17 @@ import { commands } from "./client";
 import type {
   ClaudeAccountRecord,
   ClaudeAccountStatus,
+  ClaudeLoginInFlight,
   CodexAccountStatus,
   CodexLoginStart,
   Result,
 } from "./client";
-import { DEFAULT_ACCOUNT_ID, useClaudeAccountList } from "../store/claudeAccounts";
+import {
+  DEFAULT_ACCOUNT_ID,
+  toAccountSummary,
+  useClaudeAccountList,
+} from "../store/claudeAccounts";
+import { detachClaudeAccount } from "../store/conversationsStore";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
@@ -66,13 +72,21 @@ export function useClaudeAccounts(enabled = true) {
   const accounts = query.data;
   useEffect(() => {
     if (!accounts) return;
-    useClaudeAccountList
-      .getState()
-      .setAccounts(
-        accounts.map((a) => ({ id: a.id, label: a.label, sortIndex: a.sort_index })),
-      );
+    useClaudeAccountList.getState().setAccounts(accounts.map(toAccountSummary));
   }, [accounts]);
   return query;
+}
+
+/** The in-flight Claude sign-in (`null` = none). Polled only while a card shows its code
+ *  box, so a flow superseded by another card's "Sign in" closes instead of offering an
+ *  input that would submit into someone else's login. */
+export function useClaudeLoginInFlight(enabled: boolean) {
+  return useQuery<ClaudeLoginInFlight | null>({
+    queryKey: ["claude-login-in-flight"],
+    enabled,
+    queryFn: () => unwrap(commands.accountClaudeLoginInFlight()),
+    refetchInterval: enabled ? 1_000 : false,
+  });
 }
 
 /** Add / rename / remove a Claude account. Every mutation refreshes the list AND the
@@ -91,14 +105,20 @@ export function useClaudeAccountAdmin() {
   const rename = useMutation({
     mutationFn: (v: { accountId: string; label: string }): Promise<null> =>
       unwrap(commands.claudeAccountRename(v.accountId, v.label)),
-    onSuccess: refresh,
+    // Re-read either way: on failure the list must snap the field back to the stored name.
+    onSettled: refresh,
   });
   const remove = useMutation({
-    mutationFn: (accountId: string): Promise<string | null> =>
-      unwrap(commands.claudeAccountRemove(accountId)),
-    // `onSettled`, not `onSuccess`: the row may well be gone even when the call reports a
-    // failure (the delete is the last step), so the list must be re-read either way — the
-    // same trap the TOSSE task creation hit.
+    mutationFn: (v: { accountId: string; force: boolean }): Promise<string | null> =>
+      unwrap(commands.claudeAccountRemove(v.accountId, v.force)),
+    onSuccess: (_warning, v) => {
+      // The core detached the conversations in SQLite; mirror it in memory NOW. Without
+      // this the in-memory copies keep the dead id, the composer shows an account that no
+      // longer exists, and every spawn is refused until a relaunch.
+      detachClaudeAccount(v.accountId);
+    },
+    // `onSettled`, not `onSuccess`: re-read the list whether or not the removal went
+    // through — a refused removal must show the account still there.
     onSettled: refresh,
   });
   const captureIdentity = useMutation({
@@ -134,19 +154,24 @@ export function useClaudeAccountActions(accountId: string | null = null) {
     mutationFn: (): Promise<string> => unwrap(commands.accountClaudeLoginStart(accountId)),
   });
   const loginCode = useMutation({
-    mutationFn: (code: string): Promise<null> => unwrap(commands.accountClaudeLoginCode(code)),
-    onSuccess: async () => {
+    // The code is bound to the account whose card it was typed into: the core refuses it
+    // if the in-flight login belongs to another account.
+    mutationFn: async (code: string): Promise<string | null> => {
+      await unwrap(commands.accountClaudeLoginCode(accountId, code));
       // Capture the identity while the CLI's profile cache still describes THIS account
-      // (see the core's `accounts::status`). Best-effort: a failure leaves the label as it
-      // was rather than undoing a sign-in that actually succeeded.
-      if (accountId) {
-        try {
-          await commands.claudeAccountCaptureIdentity(accountId);
-        } catch {
-          /* keep the existing label */
-        }
-        void qc.invalidateQueries({ queryKey: claudeAccountsKey });
+      // (see the core's `accounts::status`). A failure does NOT undo the sign-in, which
+      // really succeeded — but it is returned as a warning to show on the card, never
+      // dropped: without it the account keeps a placeholder name nobody chose.
+      if (!accountId) return null;
+      try {
+        await unwrap(commands.claudeAccountCaptureIdentity(accountId));
+        return null;
+      } catch (e) {
+        return `Signed in, but this account's identity could not be read (${e instanceof Error ? e.message : String(e)}). Rename it below.`;
       }
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: claudeAccountsKey });
       refresh();
     },
   });

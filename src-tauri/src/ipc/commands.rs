@@ -225,8 +225,11 @@ pub async fn spawn_session(
     // Which Claude account this process authenticates as. An id naming an account the
     // user has since removed must NOT silently fall back to another identity: resolving
     // is fallible and the error names the id, so the UI can say why the session refused
-    // to start instead of quietly burning the wrong account's quota.
-    cfg.claude_account = claude_slot(&app, claude_account_id.as_deref())?;
+    // to start instead of quietly burning the wrong account's quota. The composer remedy
+    // is added here, where it is the right advice (the helper stays context-neutral).
+    cfg.claude_account = claude_slot(&app, claude_account_id.as_deref()).map_err(|e| {
+        format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
+    })?;
     // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
@@ -256,9 +259,22 @@ pub async fn spawn_session(
     // Route this session to its remote server when the repo is remote. Claude-only for
     // now: the Codex backend has its own local-only transport, so a "remote" Codex
     // conversation would silently run on THIS Mac — refuse it loudly instead.
+    let is_remote = remote_machine.is_some();
     if let Some(machine) = remote_machine {
         if matches!(backend, Backend::Codex) {
             return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
+        }
+        // The slot is an environment variable on a LOCAL child; `build_remote_command`
+        // exports nothing of the sort, so the daemon's `claude` authenticates with the
+        // SERVER's own credential store. Accepting an account here would run the session
+        // on one identity while the UI (and `claude_handles_for`, and the usage ring)
+        // claimed another — refuse it instead of quietly lying about which plan is paying.
+        if claude_account_id.is_some() {
+            return Err(
+                "Remote (SSH) conversations run on the server's own Claude account — \
+                 set this conversation back to the default account."
+                    .to_string(),
+            );
         }
         // A dedicated known_hosts under the app data dir, so pinning a server's host
         // key never touches the user's ~/.ssh/known_hosts.
@@ -334,8 +350,10 @@ pub async fn spawn_session(
         backend,
         handle,
         match backend {
-            Backend::Claude => claude_account_id,
-            Backend::Codex => None,
+            // A remote session is refused above unless its account is None, so this
+            // records what the process is REALLY authenticated as in every case.
+            Backend::Claude if !is_remote => claude_account_id,
+            _ => None,
         },
     );
     Ok(id)
@@ -592,10 +610,10 @@ fn claude_slot(
         .list_claude_accounts()
         .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
     if !known.iter().any(|a| a.id == id) {
-        return Err(format!(
-            "this conversation is tied to a Claude account that no longer exists — \
-             pick another account in the composer"
-        ));
+        // Context-NEUTRAL and naming the id: this helper also backs the Settings-side
+        // status / login / logout / capture commands, where composer wording would be
+        // nonsense. Each caller appends its own remedy.
+        return Err(format!("unknown Claude account {id}"));
     }
     let data_dir = app
         .path()
@@ -641,6 +659,8 @@ pub async fn claude_account_create(
     let record = crate::store::ClaudeAccountRecord {
         id,
         label: if label.is_empty() {
+            // `+ 2`: the default account always exists and has no row, so the first ADDED
+            // account is the user's second one ("Account 2").
             format!("Account {}", existing.len() + 2)
         } else {
             label.to_string()
@@ -650,6 +670,8 @@ pub async fn claude_account_create(
         subscription_type: None,
         sort_index: existing.iter().map(|a| a.sort_index).max().unwrap_or(0) + 1,
         added_at: now_ms(),
+        // Only a placeholder may later be replaced by the captured email.
+        label_is_generated: label.is_empty(),
     };
     store
         .upsert_claude_account(&record)
@@ -678,6 +700,8 @@ pub async fn claude_account_rename(
         return Err("this Claude account no longer exists".into());
     };
     record.label = label.to_string();
+    // A name the user typed is theirs: a later identity capture must not replace it.
+    record.label_is_generated = false;
     let record = record.clone();
     store
         .upsert_claude_account(&record)
@@ -708,16 +732,9 @@ pub async fn claude_account_capture_identity(
     let Some(record) = accounts.iter_mut().find(|a| a.id == account_id) else {
         return Err("this Claude account no longer exists".into());
     };
-    // Only overwrite the label when it is still the generated placeholder: a name the user
-    // typed is theirs to keep.
-    if let Some(email) = status.email.as_deref() {
-        if record.label.starts_with("Account ") || record.label.is_empty() {
-            record.label = email.to_string();
-        }
-    }
-    record.email = status.email;
-    record.org_name = status.org_name;
-    record.subscription_type = status.subscription_type;
+    // The label is replaced only while it is still the generated placeholder (a recorded
+    // fact, not a guess from its text) — see `ClaudeAccountRecord::apply_captured_identity`.
+    record.apply_captured_identity(status.email, status.org_name, status.subscription_type);
     let record = record.clone();
     store
         .upsert_claude_account(&record)
@@ -729,31 +746,71 @@ pub async fn claude_account_capture_identity(
 /// then delete the row (which detaches the conversations that used it, so they fall back to
 /// the default account rather than pointing at nothing).
 ///
-/// The logout is best-effort — an already signed-out or unreachable CLI must not strand the
-/// account in the list forever — but a REAL failure is reported alongside the removal so it
-/// is never silent.
+/// ⚠️ The sign-out is NOT best-effort, and the order matters. On macOS the credentials live
+/// in a Keychain item whose name is derived from the slot's DIRECTORY PATH, and that path
+/// contains the account id we are about to delete — so once the row and the directory are
+/// gone, the item can no longer be addressed by us or by the CLI: the OAuth tokens would
+/// stay in the Keychain, valid and unrevokable. A failed `claude auth logout` (an
+/// unresolvable `claude` binary, a non-zero exit, the 15 s timeout) therefore ABORTS the
+/// removal with the row intact, so the user can retry — rather than silently orphaning a
+/// live credential.
+///
+/// `force` is the escape hatch for an account whose CLI sign-out can never succeed. It
+/// proceeds anyway and RETURNS the exact Keychain item name, so the user can revoke it by
+/// hand in Keychain Access instead of being left with no way at all.
 #[tauri::command]
 #[specta::specta]
 pub async fn claude_account_remove(
     app: tauri::AppHandle,
     account_id: String,
+    force: bool,
 ) -> Result<Option<String>, String> {
     let slot = claude_slot(&app, Some(&account_id))?;
-    let logout_warning = crate::accounts::logout(&slot).await.err();
-    let dir_warning = slot.remove_dir().err();
+
+    // A live session authenticated as this account would keep running against credentials
+    // we are removing, and its handle records an id about to vanish. Refuse rather than
+    // leave that inconsistency behind.
+    if app
+        .state::<Sessions>()
+        .claude_handles_for(Some(&account_id))
+        .iter()
+        .next()
+        .is_some()
+    {
+        return Err(
+            "a conversation is still running on this account — stop it before removing the \
+             account"
+                .into(),
+        );
+    }
+
+    let mut warning = None;
+    if let Err(e) = crate::accounts::logout(&slot).await {
+        if !force {
+            return Err(format!(
+                "could not sign this account out ({e}). The account was kept so you can retry \
+                 — removing it now would leave its credentials in the Keychain with no way to \
+                 revoke them."
+            ));
+        }
+        warning = Some(format!(
+            "signed out failed ({e}) — its credentials may remain in the Keychain under the \
+             item \"{}\"; remove it in Keychain Access to revoke them.",
+            slot.keychain_service()
+        ));
+    }
+
+    // Only now is it safe to drop the path the item name is derived from.
+    if let Err(e) = slot.remove_dir() {
+        warning = Some(match warning {
+            Some(w) => format!("{w} · {e}"),
+            None => e,
+        });
+    }
     app.state::<Store>()
         .delete_claude_account(&account_id)
         .map_err(|e| format!("could not remove the Claude account: {e}"))?;
-    Ok(match (logout_warning, dir_warning) {
-        (None, None) => None,
-        (a, b) => Some(
-            [a, b]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · "),
-        ),
-    })
+    Ok(warning)
 }
 
 /// Point one conversation at a Claude account (`None` = the default account). Persisted, so
@@ -793,14 +850,44 @@ pub async fn account_claude_login_start(
     app: tauri::AppHandle,
     account_id: Option<String>,
 ) -> Result<String, String> {
-    crate::accounts::login_start(&claude_slot(&app, account_id.as_deref())?).await
+    let slot = claude_slot(&app, account_id.as_deref())?;
+    crate::accounts::login_start(&slot, account_id).await
 }
 
 /// Submit the authorization code the user pasted; completes the in-flight Claude login.
+///
+/// `account_id` must name the account the flow was STARTED for. There is one global
+/// in-flight login but one card per account, so a code pasted into a superseded card would
+/// otherwise be redeemed into another account's credential store.
 #[tauri::command]
 #[specta::specta]
-pub async fn account_claude_login_code(code: String) -> Result<(), String> {
-    crate::accounts::login_submit_code(&code).await
+pub async fn account_claude_login_code(
+    account_id: Option<String>,
+    code: String,
+) -> Result<(), String> {
+    crate::accounts::login_submit_code(account_id.as_deref(), &code).await
+}
+
+/// The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
+/// serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
+/// "nothing is signing in" (`None`) would both reach the front as `null` — exactly the
+/// distinction a superseded card needs to close its code box.
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeLoginInFlight {
+    /// The account the flow was started for; `null` = the default account.
+    pub account_id: Option<String>,
+}
+
+/// Which account has a sign-in in flight (`null` = none). Lets a card whose flow was
+/// superseded close its code box instead of offering an input that targets another
+/// account's login.
+#[tauri::command]
+#[specta::specta]
+pub async fn account_claude_login_in_flight() -> Result<Option<ClaudeLoginInFlight>, String> {
+    Ok(crate::accounts::login_in_flight()
+        .await
+        .map(|account_id| ClaudeLoginInFlight { account_id }))
 }
 
 /// Abort the in-flight Claude login (kills the CLI child). Safe when none is running.
@@ -1737,9 +1824,15 @@ pub async fn get_plan_usage(
     // HTTP fallback, scoped to the same account: it reads that slot's credentials file /
     // Keychain item, so it answers for the account asked about and never for another.
     let slot = claude_slot(&app, account_id.as_deref()).map_err(|detail| {
-        // A resolution failure is a real, explainable cause — not a network blip — but it
-        // has to travel in the typed error the popover branches on.
-        UsageError::Network { detail }
+        // An unknown account is a permanent, local cause — never a network blip, which the
+        // front would retry forever. The one other way `claude_slot` fails (the store could
+        // not be read) stays a transient `Network`.
+        match account_id.clone() {
+            Some(id) if detail.starts_with("unknown Claude account") => {
+                UsageError::UnknownAccount { account_id: id }
+            }
+            _ => UsageError::Network { detail },
+        }
     })?;
     crate::usage::fetch_plan_usage_for(&slot).await
 }

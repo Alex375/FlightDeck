@@ -29,12 +29,22 @@
 //!                        r = e !== void 0 ? e.normalize("NFC") : configDir(),
 //!                        c = t ? "" : `-${sha256(r).hex.substring(0,8)}`;
 //!                    return `Claude Code${OAUTH_FILE_SUFFIX}${n}${c}`; }
+//! // and the keychain store calls it as: Sx($5)
 //! ```
-//! So the macOS Keychain service is `Claude Code-<sha256(dir)[0..8]>-credentials` for an
-//! isolated slot and plain `Claude Code-credentials` for the default one, and the file
-//! fallback is `<dir>/.credentials.json`. [`AccountSlot::keychain_service`] mirrors that
-//! derivation so `usage/` can read a NON-ACTIVE account's token — the only way to show
-//! every account's rate limits from one app.
+//! ⚠️ The call site is what fixes the ORDER, and it is easy to get backwards: `$5` is
+//! passed as `n`, which lands BEFORE the hash. With `OAUTH_FILE_SUFFIX` empty (the prod
+//! config), an isolated slot's service is therefore
+//! `Claude Code-credentials-<sha256(dir)[0..8]>` — NOT `Claude Code-<sha8>-credentials`.
+//! The default slot (`c` empty) collapses to plain `Claude Code-credentials` either way,
+//! which is exactly why an inverted derivation looks fine on a single-account machine and
+//! only breaks the accounts the feature exists for. The file fallback is
+//! `<dir>/.credentials.json`, and on macOS the CLI DELETES it once the Keychain write
+//! succeeds — so for an isolated account the Keychain item is the only copy, and getting
+//! this name wrong means its usage can never be read at all.
+//!
+//! [`AccountSlot::keychain_service`] mirrors that derivation so `usage/` can read a
+//! NON-ACTIVE account's token — the only way to show every account's rate limits from one
+//! app.
 //!
 //! ## Why the default slot passes NO variable
 //! An empty string is NOT equivalent to "unset": per `t` above, `""` forces the
@@ -56,6 +66,11 @@ const SECURESTORAGE_ENV: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 
 /// Directory holding one isolated credential store per account, under the app data dir.
 const ACCOUNTS_DIRNAME: &str = "claude-accounts";
+
+/// The Keychain service name of the CLI's own, un-scoped credential store — and the PREFIX
+/// every isolated slot's item extends with `-<sha8>` (the hash is a suffix, see the module
+/// docs). Kept as one constant so the two cannot drift apart.
+const KEYCHAIN_BASE: &str = "Claude Code-credentials";
 
 /// Which credential store to drive a `claude` invocation against. `dir: None` is the
 /// default slot (no env var at all); `Some(dir)` isolates via [`SECURESTORAGE_ENV`].
@@ -149,10 +164,12 @@ impl AccountSlot {
     /// an account that has no live session.
     pub fn keychain_service(&self) -> String {
         match &self.dir {
-            None => "Claude Code-credentials".to_string(),
+            None => KEYCHAIN_BASE.to_string(),
             Some(dir) => {
+                // The hash goes LAST: the CLI calls `Sx("-credentials")`, so `-credentials`
+                // is inserted before the directory suffix. See the module docs.
                 let suffix = dir_hash_suffix(&dir.to_string_lossy());
-                format!("Claude Code-{suffix}-credentials")
+                format!("{KEYCHAIN_BASE}-{suffix}")
             }
         }
     }
@@ -223,28 +240,100 @@ mod tests {
         assert_eq!(value, "/tmp/acc/abc");
     }
 
-    /// The Keychain service mirrors the CLI's derivation: `Claude Code-<sha8>-credentials`,
-    /// stable for a given path and different across paths. The digest is pinned against a
-    /// value computed from the documented formula, so a refactor that changed the hash or
-    /// the truncation would fail here instead of silently reading the wrong item.
+    /// The Keychain service mirrors the CLI's derivation, HASH LAST:
+    /// `Claude Code-credentials-<sha8>`.
+    ///
+    /// ⚠️ This assertion is pinned to a LITERAL expected value, deliberately. The previous
+    /// version of this test only checked the shape the code itself produced ("starts with
+    /// `Claude Code-`, ends with `-credentials`, 8 hex in the middle"), so it happily passed
+    /// while the two segments were in the wrong ORDER — a bug that is invisible on a
+    /// single-account machine (where the suffix is empty) and makes every added account's
+    /// usage unreadable. A test that can only ever agree with the implementation is not a
+    /// test; the literal below, and `live_keychain_item_name_matches_the_cli`, are.
+    ///
+    /// The digest is `sha256("/tmp/acc/abc")[0..8]`, verifiable independently:
+    /// `printf '/tmp/acc/abc' | shasum -a 256 | cut -c1-8` → `8ebb034c`.
     #[test]
     fn keychain_service_mirrors_the_cli_derivation() {
-        let svc = AccountSlot::isolated(PathBuf::from("/tmp/acc/abc")).keychain_service();
-        assert!(svc.starts_with("Claude Code-"), "unexpected service: {svc}");
-        assert!(svc.ends_with("-credentials"), "unexpected service: {svc}");
-        let suffix = svc
-            .trim_start_matches("Claude Code-")
-            .trim_end_matches("-credentials");
-        assert_eq!(suffix.len(), 8, "suffix must be 8 hex chars: {suffix}");
-        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
-        // Same path → same item (stable across launches); different path → different item.
         assert_eq!(
-            svc,
-            AccountSlot::isolated(PathBuf::from("/tmp/acc/abc")).keychain_service()
+            AccountSlot::isolated(PathBuf::from("/tmp/acc/abc")).keychain_service(),
+            "Claude Code-credentials-8ebb034c",
         );
+        // The default slot is the CLI's own item, with no suffix at all.
+        assert_eq!(
+            AccountSlot::default_slot().keychain_service(),
+            "Claude Code-credentials",
+        );
+        // Same path → same item (stable across launches); different path → different item.
         assert_ne!(
-            svc,
-            AccountSlot::isolated(PathBuf::from("/tmp/acc/def")).keychain_service()
+            AccountSlot::isolated(PathBuf::from("/tmp/acc/abc")).keychain_service(),
+            AccountSlot::isolated(PathBuf::from("/tmp/acc/def")).keychain_service(),
+        );
+    }
+
+    /// PROBE (read-only): assert our derivation against the CLI'S OWN, rather than against
+    /// ourselves. Spawns `claude auth status` under an isolated slot with `security`
+    /// SHIMMED on PATH, and captures the `-s <service>` the CLI actually queries with.
+    ///
+    /// This is the test that would have caught the inverted order: it compares
+    /// `keychain_service()` to a string produced by the binary, not by us.
+    /// Run: `cargo test --lib -- --ignored --nocapture live_keychain_item_name_matches_the_cli`.
+    #[tokio::test]
+    #[ignore = "runs the real claude CLI"]
+    async fn live_keychain_item_name_matches_the_cli() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!("tosse-kc-probe-{}", std::process::id()));
+        let bin_dir = root.join("bin");
+        let slot_dir = root.join("slot");
+        std::fs::create_dir_all(&bin_dir).expect("probe bin dir");
+        std::fs::create_dir_all(&slot_dir).expect("probe slot dir");
+        let log = root.join("service.log");
+
+        // A `security` shim that records the service name it was asked for, then reports
+        // "item not found" (exit 44) so the CLI proceeds exactly as with a fresh slot.
+        let shim = bin_dir.join("security");
+        {
+            let mut f = std::fs::File::create(&shim).expect("write shim");
+            writeln!(
+                f,
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-s\" ]; then echo \"$2\" >> '{}'; fi\n  shift\ndone\nexit 44",
+                log.display()
+            )
+            .expect("write shim");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let slot = AccountSlot::isolated(slot_dir.clone());
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = tokio::process::Command::new(
+            crate::supervisor::transport::resolved_claude_bin(),
+        );
+        cmd.args(["auth", "status", "--json"])
+            .env("PATH", path)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        slot.apply(&mut cmd);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await;
+
+        let asked = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let expected = slot.keychain_service();
+        eprintln!("CLI queried: {asked:?}\nwe derive:   {expected:?}");
+        assert!(
+            asked.lines().any(|l| l.trim() == expected),
+            "the CLI queried a Keychain service we do not derive.\n  CLI asked for: {asked:?}\n  we derive:     {expected:?}"
         );
     }
 

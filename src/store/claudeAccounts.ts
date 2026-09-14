@@ -55,9 +55,14 @@ export const DEFAULT_ACCOUNT_PREFS: ClaudeAccountPrefs = {
  *  a constraint, so a stale one degrades rather than blocking work. */
 export function resolveDefaultAccountId(
   preferred: string | null,
-  known: readonly { id: string }[],
+  /** `null` = the list has NOT been loaded yet. That is not "no accounts": treating it as
+   *  empty would silently drop a perfectly valid preference for every conversation created
+   *  before the list arrived. An unloaded list passes the preference through, and the
+   *  spawn-side check stays the single authority on whether the account still exists. */
+  known: readonly { id: string }[] | null,
 ): string | null {
   if (!preferred || preferred === DEFAULT_ACCOUNT_ID) return null;
+  if (known === null) return preferred;
   return known.some((a) => a.id === preferred) ? preferred : null;
 }
 
@@ -67,20 +72,27 @@ export function resolveDefaultAccountId(
  *  simply never fire — the worst kind of failure: invisible). */
 export function sanitizePrefs(raw: unknown): ClaudeAccountPrefs {
   const p = (raw ?? {}) as Partial<ClaudeAccountPrefs>;
-  const pct = (v: unknown, fallback: number) =>
-    typeof v === "number" && Number.isFinite(v) ? Math.min(100, Math.max(1, Math.round(v))) : fallback;
-  const switchAt = pct(p.switchAtPercent, DEFAULT_ACCOUNT_PREFS.switchAtPercent);
-  // Keep the hysteresis gap even if the stored pair was inverted: a target ceiling at or
-  // above the trigger would make the policy oscillate between two equally-loaded accounts.
+  const pct = (v: unknown, fallback: number, lo: number, hi: number) =>
+    typeof v === "number" && Number.isFinite(v)
+      ? Math.min(hi, Math.max(lo, Math.round(v)))
+      : fallback;
+  // The trigger floors at 2 so a ceiling STRICTLY below it (≥ 1) always exists. With a
+  // floor of 1 the clamp produced trigger = ceiling = 1: the hysteresis gap — the whole
+  // anti-oscillation guarantee — silently gone on exactly the corrupt-blob path this
+  // function exists to repair.
+  const switchAt = pct(p.switchAtPercent, DEFAULT_ACCOUNT_PREFS.switchAtPercent, 2, 100);
+  // Keep the gap even if the stored pair was inverted: a ceiling at or above the trigger
+  // would make the policy oscillate between two equally-loaded accounts.
   const target = Math.min(
-    pct(p.targetBelowPercent, DEFAULT_ACCOUNT_PREFS.targetBelowPercent),
+    pct(p.targetBelowPercent, DEFAULT_ACCOUNT_PREFS.targetBelowPercent, 1, 99),
     switchAt - 1,
   );
   return {
-    defaultAccountId: typeof p.defaultAccountId === "string" && p.defaultAccountId ? p.defaultAccountId : null,
+    defaultAccountId:
+      typeof p.defaultAccountId === "string" && p.defaultAccountId ? p.defaultAccountId : null,
     autoSwitch: p.autoSwitch === true,
     switchAtPercent: switchAt,
-    targetBelowPercent: Math.max(1, target),
+    targetBelowPercent: target,
   };
 }
 
@@ -129,10 +141,12 @@ export function accountPrefs(): ClaudeAccountPrefs {
  *  truth. Empty until the first fetch — callers must treat "empty" as "not loaded yet or
  *  genuinely none", which is safe here because both mean "use the default account". */
 export const useClaudeAccountList = create<{
-  accounts: ClaudeAccountSummary[];
+  /** `null` until the list has been loaded once (seeded at boot from the persisted state,
+   *  then kept fresh by the query) — never conflated with "loaded, and empty". */
+  accounts: ClaudeAccountSummary[] | null;
   setAccounts: (accounts: ClaudeAccountSummary[]) => void;
 }>((set) => ({
-  accounts: [],
+  accounts: null,
   setAccounts: (accounts) => set({ accounts }),
 }));
 
@@ -143,8 +157,18 @@ export interface ClaudeAccountSummary {
   sortIndex: number;
 }
 
-/** Read the account list outside React. */
-export function claudeAccountList(): ClaudeAccountSummary[] {
+/** Project a persisted record onto the summary the mirror holds. One definition, shared by
+ *  the boot seeding and the query, so the two writers can never shape it differently. */
+export function toAccountSummary(a: {
+  id: string;
+  label: string;
+  sort_index: number;
+}): ClaudeAccountSummary {
+  return { id: a.id, label: a.label, sortIndex: a.sort_index };
+}
+
+/** Read the account list outside React (`null` = not loaded yet). */
+export function claudeAccountList(): ClaudeAccountSummary[] | null {
   return useClaudeAccountList.getState().accounts;
 }
 
@@ -167,6 +191,10 @@ export interface AccountUsageSnapshot {
    *  switch target — the session would fail to start. */
   loggedIn: boolean;
   usage: PlanUsage | null;
+  /** Why the figures could not be read, when they could not (e.g. `keychain_denied`). Kept
+   *  so an unmeasurable CURRENT account is reported rather than read as "below the
+   *  threshold" — see {@link decideSwitch}. */
+  usageError?: string | null;
   /** When the figures were last fetched successfully (ms). Stale data is not a reason to
    *  refuse a switch, but it IS a reason to prefer a freshly-measured candidate. */
   fetchedAt: number | null;
@@ -203,7 +231,11 @@ export interface SwitchDecision {
 export type SwitchBlocked =
   | { reason: "no_other_account" }
   | { reason: "no_capacity"; candidates: number }
-  | { reason: "unknown_usage"; candidates: number };
+  | { reason: "unknown_usage"; candidates: number }
+  /** The account the conversation RUNS on cannot be measured. Distinct from "below the
+   *  threshold": the opt-in would otherwise be a permanent, invisible no-op on exactly the
+   *  account it is supposed to protect. */
+  | { reason: "unknown_current_usage"; detail: string | null };
 
 /**
  * Decide whether to move off `current`, and to which account.
@@ -225,7 +257,14 @@ export function decideSwitch(
   prefs: ClaudeAccountPrefs,
 ): { switchTo: SwitchDecision } | { blocked: SwitchBlocked } | null {
   const currentPct = peakUsagePercent(current.usage);
-  if (currentPct === null || currentPct < prefs.switchAtPercent) return null;
+  // A FAILED read is not "below the threshold". (No figure and no error = the endpoint
+  // reported no window at all — nothing to act on, and nothing wrong to report.)
+  if (currentPct === null) {
+    return current.usageError
+      ? { blocked: { reason: "unknown_current_usage", detail: current.usageError } }
+      : null;
+  }
+  if (currentPct < prefs.switchAtPercent) return null;
 
   const candidates = others.filter((a) => a.id !== current.id && a.loggedIn);
   if (candidates.length === 0) return { blocked: { reason: "no_other_account" } };
@@ -283,5 +322,7 @@ export function blockedNotice(current: AccountUsageSnapshot, b: SwitchBlocked): 
       return `${head}, and the ${b.candidates === 1 ? "other account is" : `${b.candidates} other accounts are`} too close to their own limit to switch to.`;
     case "unknown_usage":
       return `${head}, but the usage of the other ${b.candidates === 1 ? "account" : "accounts"} could not be read, so no switch was made. Check Settings → Accounts.`;
+    case "unknown_current_usage":
+      return `The usage of Claude account ${current.label} could not be read${b.detail ? ` (${b.detail})` : ""}, so auto-switch cannot tell when it nears its limit. Check Settings → Accounts.`;
   }
 }

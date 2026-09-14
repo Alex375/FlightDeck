@@ -300,10 +300,14 @@ async accountClaudeLoginStart(accountId: string | null) : Promise<Result<string,
 },
 /**
  * Submit the authorization code the user pasted; completes the in-flight Claude login.
+ * 
+ * `account_id` must name the account the flow was STARTED for. There is one global
+ * in-flight login but one card per account, so a code pasted into a superseded card would
+ * otherwise be redeemed into another account's credential store.
  */
-async accountClaudeLoginCode(code: string) : Promise<Result<null, string>> {
+async accountClaudeLoginCode(accountId: string | null, code: string) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { code }) };
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_code", { accountId, code }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -328,6 +332,19 @@ async accountClaudeLoginCancel() : Promise<Result<null, string>> {
 async accountClaudeLogout(accountId: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("account_claude_logout", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Which account has a sign-in in flight (`null` = none). Lets a card whose flow was
+ * superseded close its code box instead of offering an input that targets another
+ * account's login.
+ */
+async accountClaudeLoginInFlight() : Promise<Result<ClaudeLoginInFlight | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("account_claude_login_in_flight") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -396,13 +413,22 @@ async claudeAccountCaptureIdentity(accountId: string) : Promise<Result<ClaudeAcc
  * then delete the row (which detaches the conversations that used it, so they fall back to
  * the default account rather than pointing at nothing).
  * 
- * The logout is best-effort — an already signed-out or unreachable CLI must not strand the
- * account in the list forever — but a REAL failure is reported alongside the removal so it
- * is never silent.
+ * ⚠️ The sign-out is NOT best-effort, and the order matters. On macOS the credentials live
+ * in a Keychain item whose name is derived from the slot's DIRECTORY PATH, and that path
+ * contains the account id we are about to delete — so once the row and the directory are
+ * gone, the item can no longer be addressed by us or by the CLI: the OAuth tokens would
+ * stay in the Keychain, valid and unrevokable. A failed `claude auth logout` (an
+ * unresolvable `claude` binary, a non-zero exit, the 15 s timeout) therefore ABORTS the
+ * removal with the row intact, so the user can retry — rather than silently orphaning a
+ * live credential.
+ * 
+ * `force` is the escape hatch for an account whose CLI sign-out can never succeed. It
+ * proceeds anyway and RETURNS the exact Keychain item name, so the user can revoke it by
+ * hand in Keychain Access instead of being left with no way at all.
  */
-async claudeAccountRemove(accountId: string) : Promise<Result<string | null, string>> {
+async claudeAccountRemove(accountId: string, force: boolean) : Promise<Result<string | null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("claude_account_remove", { accountId }) };
+    return { status: "ok", data: await TAURI_INVOKE("claude_account_remove", { accountId, force }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2485,7 +2511,14 @@ sort_index: number;
 /**
  * Unix ms timestamp the account was added.
  */
-added_at: number }
+added_at: number; 
+/**
+ * `true` while `label` is still the placeholder minted at creation, `false` once the
+ * user has named the account. Recorded as a FACT so the identity captured after
+ * sign-in replaces only a placeholder — guessing from the text ("starts with
+ * `Account `") would silently overwrite a real name like "Account manager".
+ */
+label_is_generated: boolean }
 /**
  * The signed-in Claude account, whitelisted from `claude auth status --json` (no
  * tokens — that output carries none; we forward only these fields).
@@ -2551,6 +2584,17 @@ channel: string | null;
  * default. `None` = configs read cleanly (or were simply absent — the normal case).
  */
 config_warning: string | null }
+/**
+ * The Claude sign-in currently in flight. A struct rather than `Option<Option<String>>`:
+ * serde flattens nested options, so "the DEFAULT account is signing in" (`Some(None)`) and
+ * "nothing is signing in" (`None`) would both reach the front as `null` — exactly the
+ * distinction a superseded card needs to close its code box.
+ */
+export type ClaudeLoginInFlight = { 
+/**
+ * The account the flow was started for; `null` = the default account.
+ */
+accountId: string | null }
 /**
  * Result of running `claude update`.
  */
@@ -4370,7 +4414,13 @@ export type UsageError =
 /**
  * Response received but unparseable into the expected shape (carries body).
  */
-{ kind: "parse"; body: string }
+{ kind: "parse"; body: string } | 
+/**
+ * The usage was asked for a Claude account the app no longer knows (removed). A
+ * permanent, locally-known cause: typed on its own so the UI says so and STOPS polling,
+ * instead of presenting it as a network blip and retrying forever.
+ */
+{ kind: "unknown_account"; account_id: string }
 /**
  * One rate-limit window's real fill: `used_percentage` (0–100) + optional reset as a
  * raw timestamp string (ISO 8601, or epoch-seconds digits for the alternate shape) —

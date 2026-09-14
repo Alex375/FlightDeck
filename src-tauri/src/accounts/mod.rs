@@ -45,6 +45,12 @@ pub struct ClaudeAccountStatus {
 
 /// The one in-flight `claude auth login` child (its stdin receives the pasted code).
 struct ActiveLogin {
+    /// WHICH account this login was started for (`None` = the default slot). The pasted
+    /// code MUST be matched against it: there is a single global in-flight login, but the
+    /// UI now shows one card per account, so without this check a code authorised for
+    /// account A could be written to account B's child — exchanging A's grant into B's
+    /// credential store and then labelling A with B's identity.
+    account_id: Option<String>,
     child: Child,
     stdin: ChildStdin,
     /// The child's stdout reader, HELD (never read again) for the child's whole lifetime.
@@ -147,7 +153,12 @@ pub async fn status(slot: &AccountSlot) -> Result<ClaudeAccountStatus, String> {
 /// Start a login: spawn `claude auth login`, wait for the OAuth URL on stdout (bounded),
 /// keep the child for the code submission, return the URL for the front to open.
 /// Any previous in-flight login is killed first (one at a time).
-pub async fn login_start(slot: &AccountSlot) -> Result<String, String> {
+/// `account_id` identifies the account this flow belongs to (`None` = the default slot);
+/// [`login_submit_code`] refuses a code submitted for any other one.
+pub async fn login_start(
+    slot: &AccountSlot,
+    account_id: Option<String>,
+) -> Result<String, String> {
     // Hold the flow lock across the WHOLE sequence (see LOGIN_FLOW). Call the INNER
     // `cancel_current` (not the public `login_cancel`, which also takes LOGIN_FLOW) to avoid
     // a self-deadlock, then keep the lock until ACTIVE_LOGIN is registered below.
@@ -203,21 +214,56 @@ pub async fn login_start(slot: &AccountSlot) -> Result<String, String> {
         }
     };
 
-    *ACTIVE_LOGIN.lock().await = Some(ActiveLogin { child, stdin, _stdout: reader });
+    *ACTIVE_LOGIN.lock().await = Some(ActiveLogin {
+        account_id,
+        child,
+        stdin,
+        _stdout: reader,
+    });
     Ok(url)
+}
+
+/// Which account the in-flight login belongs to: `Some(None)` = the default slot,
+/// `Some(Some(id))` = that account, `None` = no login in flight. The front polls this to
+/// close the code box on a card whose flow was superseded, instead of leaving an input
+/// that would submit into someone else's login.
+pub async fn login_in_flight() -> Option<Option<String>> {
+    ACTIVE_LOGIN
+        .lock()
+        .await
+        .as_ref()
+        .map(|a| a.account_id.clone())
 }
 
 /// Submit the authorization code the user pasted. Consumes the in-flight login: writes
 /// the code to the child's stdin and waits for it to exit (bounded). Success = exit 0,
 /// re-checked by the caller via [`status`]. The code NEVER appears in any error text.
-pub async fn login_submit_code(code: &str) -> Result<(), String> {
+pub async fn login_submit_code(account_id: Option<&str>, code: &str) -> Result<(), String> {
     let code = code.trim();
     if code.is_empty() {
         return Err("the authorization code is empty".into());
     }
-    let Some(mut active) = ACTIVE_LOGIN.lock().await.take() else {
-        return Err("no Claude sign-in in progress — start \"Sign in\" again".into());
-    };
+    // Take the login only once it is confirmed to be THIS account's, so a mismatched
+    // submission leaves the real flow intact and retryable instead of consuming it.
+    let mut guard = ACTIVE_LOGIN.lock().await;
+    match guard.as_ref() {
+        None => {
+            return Err("no Claude sign-in in progress — start \"Sign in\" again".into());
+        }
+        // A different account's login is in flight: starting one kills the previous child,
+        // so the flow this code belongs to is already gone. Say so instead of writing the
+        // code into the wrong credential store.
+        Some(active) if active.account_id.as_deref() != account_id => {
+            return Err(
+                "this sign-in was superseded by one for another account — start \"Sign in\" \
+                 again for this account"
+                    .into(),
+            );
+        }
+        Some(_) => {}
+    }
+    let mut active = guard.take().expect("checked as Some above");
+    drop(guard);
     if let Err(e) = active.stdin.write_all(format!("{code}\n").as_bytes()).await {
         let _ = active.child.kill().await;
         return Err(format!("could not send the code: {e}"));
@@ -293,15 +339,54 @@ mod tests {
     /// input is rejected immediately with an actionable message.
     #[tokio::test]
     async fn submit_code_rejects_an_empty_code() {
-        let err = login_submit_code("   \n").await.expect_err("empty code must fail");
+        let err = login_submit_code(None, "   \n")
+            .await
+            .expect_err("empty code must fail");
         assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// A code may only be submitted to the login it was authorised for. There is ONE
+    /// global in-flight login but one card per account, so without this guard a code
+    /// pasted into account A's still-visible box would be written to account B's child —
+    /// redeeming A's grant into B's credential store and then labelling A with B's
+    /// identity. The mismatched attempt must also LEAVE the real flow intact.
+    #[tokio::test]
+    async fn submit_code_refuses_a_login_started_for_another_account() {
+        // Stand in for an in-flight login belonging to "acct-b" without spawning the CLI.
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stand-in child");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        *ACTIVE_LOGIN.lock().await = Some(ActiveLogin {
+            account_id: Some("acct-b".into()),
+            child,
+            stdin,
+            _stdout: BufReader::new(stdout).lines(),
+        });
+
+        for wrong in [None, Some("acct-c")] {
+            let err = login_submit_code(wrong, "code-for-b")
+                .await
+                .expect_err("a mismatched account must be refused");
+            assert!(err.contains("superseded"), "unexpected error: {err}");
+            assert!(!err.contains("code-for-b"), "code leaked into error: {err}");
+        }
+        // The real flow is untouched, so the right card can still complete it.
+        assert_eq!(login_in_flight().await, Some(Some("acct-b".into())));
+
+        login_cancel().await;
+        assert_eq!(login_in_flight().await, None);
     }
 
     /// Submitting a code with no login in flight tells the user to restart the flow —
     /// and the pasted code NEVER leaks into the error text (module contract).
     #[tokio::test]
     async fn submit_code_without_a_login_in_flight_says_restart() {
-        let err = login_submit_code("sk-test-not-a-real-code")
+        let err = login_submit_code(None, "sk-test-not-a-real-code")
             .await
             .expect_err("no in-flight login must fail");
         assert!(err.contains("no Claude sign-in in progress"), "unexpected error: {err}");

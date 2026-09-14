@@ -21,6 +21,7 @@ vi.mock("../ipc/client", () => {
       loadSessionGoal: vi.fn(() => ok(null)),
       deleteConversation: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
+      setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
     },
@@ -37,6 +38,7 @@ import {
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
   demoteBypassConversations,
+  detachClaudeAccount,
   ensureConversationSession,
   loadConversationHistory,
   reactivateDiskConversation,
@@ -48,6 +50,7 @@ import {
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
+import { useClaudeAccountList, useClaudeAccountPrefs } from "./claudeAccounts";
 
 const baseConv = (over: Partial<Conversation> = {}): Conversation => ({
   id: "c1",
@@ -163,7 +166,10 @@ describe("conversationsStore — Claude account selection", () => {
     seed(baseConv({ handle: "session-7", liveClaudeAccountId: null }));
     useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b");
     expect(conv0().claudeAccountId).toBe("acct-b");
-    expect(commands.upsertConversation).toHaveBeenCalled();
+    // Persisted through the DEDICATED command — the core's sole writer of that column —
+    // never the wholesale upsert that a stale copy could replay.
+    expect(commands.setConversationClaudeAccount).toHaveBeenCalledWith("c1", "acct-b");
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
     expect(commands.stopSession).not.toHaveBeenCalled();
     // The live identity is untouched, so the composer can still say which account is
     // ACTUALLY in use rather than claiming the new one.
@@ -172,12 +178,44 @@ describe("conversationsStore — Claude account selection", () => {
 
   it("is idempotent and leaves Codex conversations alone", () => {
     useConversationsStore.getState().setConvClaudeAccount("c1", null); // already null
-    expect(commands.upsertConversation).not.toHaveBeenCalled();
+    expect(commands.setConversationClaudeAccount).not.toHaveBeenCalled();
 
     seed(baseConv({ kind: "codex" }));
     useConversationsStore.getState().setConvClaudeAccount("c1", "acct-b");
     expect(conv0().claudeAccountId).toBeNull();
-    expect(commands.upsertConversation).not.toHaveBeenCalled();
+    expect(commands.setConversationClaudeAccount).not.toHaveBeenCalled();
+  });
+
+  it("removing an account detaches its conversations in memory and clears the default", () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }],
+      conversations: [
+        baseConv({ id: "c1", claudeAccountId: "gone" }),
+        baseConv({ id: "c2", claudeAccountId: "kept" }),
+      ],
+      activeId: "c1",
+    });
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "gone" });
+
+    detachClaudeAccount("gone");
+
+    const byId = (id: string) =>
+      useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+    expect(byId("c1").claudeAccountId).toBeNull();
+    expect(byId("c2").claudeAccountId).toBe("kept");
+    expect(useClaudeAccountPrefs.getState().defaultAccountId).toBeNull();
+  });
+
+  it("a new Claude conversation starts on the configured default account", () => {
+    useClaudeAccountList.getState().setAccounts([{ id: "acct-b", label: "B", sortIndex: 1 }]);
+    useClaudeAccountPrefs.getState().set({ defaultAccountId: "acct-b" });
+    try {
+      const id = createConversationInRepo("/tmp/r1");
+      const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
+      expect(conv.claudeAccountId).toBe("acct-b");
+    } finally {
+      useClaudeAccountPrefs.getState().set({ defaultAccountId: null });
+    }
   });
 
   it("only an AUTOMATIC switch arms the anti-oscillation cooldown", () => {
