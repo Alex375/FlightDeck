@@ -310,6 +310,20 @@ let mockSentCounter = 0;
  *  Seeded with one so the multi-account surfaces are reachable in dev/Playwright without
  *  going through the sign-in flow, and mutable so add / rename / remove actually do
  *  something in the browser build. */
+type MockIdentity = {
+  email: string | null;
+  orgName: string | null;
+  subscriptionType: string | null;
+};
+
+/** The DEFAULT account's captured identity — what the app stores after signing that account
+ *  in itself. Seeded so the demo names it by its address rather than the fallback. */
+let mockDefaultIdentity: MockIdentity | null = {
+  email: "demo@example.com",
+  orgName: "Demo Org",
+  subscriptionType: "max",
+};
+
 /** The demo's in-flight Claude sign-in, mirroring the core's single global login. */
 let mockLoginInFlight: { accountId: string | null } | null = null;
 
@@ -852,10 +866,15 @@ export const mockCommands = {
   // dev/Playwright: the composer's account chip only renders once a second one exists,
   // and the auto-switch policy needs somewhere to switch to.
   async accountClaudeStatus(accountId: string | null): Promise<Result<ClaudeAccountStatus, string>> {
+    // An added account is signed in only once its identity was captured (i.e. after the
+    // sign-in flow completed), so "Add account" yields a signed-out tile whose flow can be
+    // exercised in dev/Playwright — as it is in the app.
+    const added = accountId ? mockClaudeAccounts.find((a) => a.id === accountId) : null;
+    const loggedIn = accountId === null || !!added?.email;
     return ok({
-      loggedIn: true,
-      authMethod: "claude.ai",
-      email: accountId ? "demo-b@example.com" : "demo@example.com",
+      loggedIn,
+      authMethod: loggedIn ? "claude.ai" : "none",
+      email: accountId ? (added?.email ?? null) : "demo@example.com",
       orgName: "Demo Org",
       subscriptionType: "max",
     });
@@ -903,19 +922,40 @@ export const mockCommands = {
     mockClaudeAccounts.push(rec);
     return ok(rec);
   },
-  async claudeAccountRename(accountId: string, label: string): Promise<Result<null, string>> {
+  async claudeAccountCaptureIdentity(accountId: string | null): Promise<Result<null, string>> {
+    if (accountId === null) {
+      mockDefaultIdentity = {
+        email: "demo@example.com",
+        orgName: "Demo Org",
+        subscriptionType: "max",
+      };
+      return ok(null);
+    }
     const rec = mockClaudeAccounts.find((a) => a.id === accountId);
     if (!rec) return { status: "error", error: "this Claude account no longer exists" };
-    rec.label = label;
-    rec.label_is_generated = false;
+    rec.email = `demo-${rec.id}@example.com`;
+    rec.subscription_type = "max";
+    if (rec.label_is_generated) rec.label = rec.email;
     return ok(null);
   },
-  async claudeAccountCaptureIdentity(accountId: string): Promise<Result<ClaudeAccountRecord, string>> {
+  async claudeDefaultIdentity(): Promise<Result<MockIdentity | null, string>> {
+    return ok(mockDefaultIdentity);
+  },
+  async claudeAccountIdentity(
+    accountId: string | null,
+  ): Promise<Result<MockIdentity, UsageError>> {
+    // Like the core: an account is known by its own token, so a signed-out one has no
+    // identity to read.
+    if (accountId === null) {
+      return { status: "ok", data: { email: "demo@example.com", orgName: "Demo Org", subscriptionType: "max" } };
+    }
     const rec = mockClaudeAccounts.find((a) => a.id === accountId);
-    if (!rec) return { status: "error", error: "this Claude account no longer exists" };
-    rec.email = "demo-b@example.com";
-    rec.subscription_type = "max";
-    return ok(rec);
+    if (!rec) return { status: "error", error: { kind: "unknown_account", account_id: accountId } };
+    if (!rec.email) return { status: "error", error: { kind: "no_token" } };
+    return {
+      status: "ok",
+      data: { email: rec.email, orgName: rec.org_name, subscriptionType: rec.subscription_type },
+    };
   },
   async claudeAccountRemove(
     accountId: string,

@@ -20,7 +20,11 @@ import {
   useClaudeAccountPrefs,
   type AccountUsageSnapshot,
 } from "../../store/claudeAccounts";
-import { useClaudeAccount, useClaudeAccounts } from "../../ipc/useAccounts";
+import {
+  useClaudeAccount,
+  useClaudeAccountIdentity,
+  useClaudeAccounts,
+} from "../../ipc/useAccounts";
 import { usePlanUsage } from "../../store/planUsage";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
@@ -61,7 +65,12 @@ export function AutoAccountSwitchHost() {
     <>
       <AccountProbe accountId={null} />
       {rows.map((a) => (
-        <AccountProbe key={a.id} accountId={a.id} label={a.label} sortIndex={a.sort_index} />
+        <AccountProbe
+          key={a.id}
+          accountId={a.id}
+          label={a.email ?? a.label}
+          sortIndex={a.sort_index}
+        />
       ))}
       <FleetEvaluator />
     </>
@@ -85,6 +94,10 @@ function AccountProbe({
 }) {
   const usage = usePlanUsage({ accountId });
   const status = useClaudeAccount(true, accountId);
+  // The switch notices name accounts by their ADDRESS (read with the account's own token),
+  // like every other surface; the passed label is only the fallback.
+  const identity = useClaudeAccountIdentity(accountId, true);
+  const name = identity.data?.email ?? label ?? "Claude";
   const key = keyOf(accountId);
   // A read that currently FAILS publishes no figure. React Query keeps the last successful
   // `data` across an error, and `usePlanUsage` stops polling for terminal causes — so
@@ -99,7 +112,7 @@ function AccountProbe({
   useEffect(() => {
     useAccountSnapshots.getState().publish(key, {
       id: accountId,
-      label: label ?? "Claude",
+      label: name,
       loggedIn,
       usage: data,
       usageError,
@@ -108,7 +121,7 @@ function AccountProbe({
       sortIndex: sortIndex ?? -1,
     });
     return () => useAccountSnapshots.getState().forget(key);
-  }, [key, accountId, label, sortIndex, loggedIn, data, usageError, fetchedAt]);
+  }, [key, accountId, name, sortIndex, loggedIn, data, usageError, fetchedAt]);
   return null;
 }
 

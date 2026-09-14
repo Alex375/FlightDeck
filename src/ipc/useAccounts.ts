@@ -5,11 +5,14 @@
 // the global `account_login` / `account/updated` invalidation refreshes both.
 
 import { useEffect } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
 import type {
+  AccountProfile,
+  UsageError,
   ClaudeAccountRecord,
   ClaudeAccountStatus,
+  ClaudeIdentity,
   ClaudeLoginInFlight,
   CodexAccountStatus,
   CodexLoginStart,
@@ -102,12 +105,6 @@ export function useClaudeAccountAdmin() {
       unwrap(commands.claudeAccountCreate(label)),
     onSuccess: refresh,
   });
-  const rename = useMutation({
-    mutationFn: (v: { accountId: string; label: string }): Promise<null> =>
-      unwrap(commands.claudeAccountRename(v.accountId, v.label)),
-    // Re-read either way: on failure the list must snap the field back to the stored name.
-    onSettled: refresh,
-  });
   const remove = useMutation({
     mutationFn: (v: { accountId: string; force: boolean }): Promise<string | null> =>
       unwrap(commands.claudeAccountRemove(v.accountId, v.force)),
@@ -122,11 +119,74 @@ export function useClaudeAccountAdmin() {
     onSettled: refresh,
   });
   const captureIdentity = useMutation({
-    mutationFn: (accountId: string): Promise<ClaudeAccountRecord> =>
+    mutationFn: (accountId: string | null): Promise<null> =>
       unwrap(commands.claudeAccountCaptureIdentity(accountId)),
     onSuccess: refresh,
   });
-  return { create, rename, remove, captureIdentity };
+  return { create, remove, captureIdentity };
+}
+
+/** Query key prefix for account identities — invalidating it refreshes every account's. */
+export const claudeIdentityPrefix = ["claude-identity"] as const;
+/** Query key for ONE account's identity (`null` = the default account). */
+export const claudeIdentityKey = (accountId: string | null) =>
+  [...claudeIdentityPrefix, accountId ?? DEFAULT_ACCOUNT_ID] as const;
+
+/** An address changes only on a sign-in, which invalidates it explicitly — so it can stay
+ *  fresh for a long time without re-reading every account's token. */
+const IDENTITY_STALE_MS = 10 * 60_000;
+
+function identityQuery(accountId: string | null, enabled: boolean) {
+  return {
+    queryKey: claudeIdentityKey(accountId),
+    enabled,
+    queryFn: async (): Promise<AccountProfile> => {
+      const res = await commands.claudeAccountIdentity(accountId);
+      if (res.status === "error") throw res.error;
+      return res.data;
+    },
+    staleTime: IDENTITY_STALE_MS,
+    // A signed-out account (no token) or a revoked one will not heal on a retry.
+    retry: false,
+  };
+}
+
+/** One account's identity — address, organization, plan — read with ITS OWN token. This is
+ *  what names an account everywhere: unlike `claude auth status` it cannot answer with the
+ *  address of another account. */
+export function useClaudeAccountIdentity(accountId: string | null, enabled = true) {
+  return useQuery<AccountProfile, UsageError>(identityQuery(accountId, enabled));
+}
+
+/** The display NAME of several accounts at once — always their address when one is known:
+ *  the live identity first, then the address captured at sign-in, and only then the
+ *  fallback ("Claude", or a generated label) for an account whose address cannot be read. */
+export function useClaudeAccountNames(
+  accounts: { id: string | null; capturedEmail?: string | null; fallback: string }[],
+): Record<string, string> {
+  const results = useQueries({ queries: accounts.map((a) => identityQuery(a.id, true)) });
+  const names: Record<string, string> = {};
+  accounts.forEach((a, i) => {
+    names[a.id ?? DEFAULT_ACCOUNT_ID] =
+      results[i]?.data?.email ?? a.capturedEmail ?? a.fallback;
+  });
+  return names;
+}
+
+/** Query key for the DEFAULT account's captured identity. */
+export const claudeDefaultIdentityKey = ["claude-default-identity"] as const;
+
+/** The default account's identity as captured at its own sign-in. It is NOT read live:
+ *  `claude auth status` answers from a profile cache every account shares, so with a second
+ *  account signed in it would name that one instead. `null` = never captured (the account was
+ *  signed in outside the app), which the UI must not dress up as an address. */
+export function useClaudeDefaultIdentity(enabled = true) {
+  return useQuery<ClaudeIdentity | null>({
+    queryKey: claudeDefaultIdentityKey,
+    enabled,
+    queryFn: () => unwrap(commands.claudeDefaultIdentity()),
+    staleTime: 30_000,
+  });
 }
 
 /** The signed-in Codex account (`account/read` on a transient app-server). */
@@ -158,20 +218,23 @@ export function useClaudeAccountActions(accountId: string | null = null) {
     // if the in-flight login belongs to another account.
     mutationFn: async (code: string): Promise<string | null> => {
       await unwrap(commands.accountClaudeLoginCode(accountId, code));
-      // Capture the identity while the CLI's profile cache still describes THIS account
-      // (see the core's `accounts::status`). A failure does NOT undo the sign-in, which
-      // really succeeded — but it is returned as a warning to show on the card, never
-      // dropped: without it the account keeps a placeholder name nobody chose.
-      if (!accountId) return null;
+      // Capture the identity while the CLI's profile cache still describes THIS account (see
+      // the core's `accounts::status`) — for the default account too, whose address cannot be
+      // read live once a second account exists. A failure does NOT undo the sign-in, which
+      // really succeeded, but it is returned as a warning rather than dropped: without the
+      // capture the account has no address to show.
       try {
         await unwrap(commands.claudeAccountCaptureIdentity(accountId));
         return null;
       } catch (e) {
-        return `Signed in, but this account's identity could not be read (${e instanceof Error ? e.message : String(e)}). Rename it below.`;
+        return `Signed in, but this account's address could not be read (${e instanceof Error ? e.message : String(e)}).`;
       }
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: claudeAccountsKey });
+      void qc.invalidateQueries({ queryKey: claudeDefaultIdentityKey });
+      // A sign-in is the one moment an address can change.
+      void qc.invalidateQueries({ queryKey: claudeIdentityPrefix });
       refresh();
     },
   });

@@ -679,67 +679,107 @@ pub async fn claude_account_create(
     Ok(record)
 }
 
-/// Rename an account. The label is what tells two accounts apart in the composer, so it is
-/// user-owned rather than derived from an email the CLI's shared profile cache can't be
-/// trusted for (see `accounts::status`).
+/// Where the DEFAULT account's captured identity is stored. It has no row of its own (it is
+/// the CLI's store, not one the app created), so it lives as one `meta` entry.
+const DEFAULT_IDENTITY_KEY: &str = "claude_default_identity";
+
+/// The non-sensitive identity of a Claude account — never a token.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeIdentity {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub subscription_type: Option<String>,
+}
+
+/// The DEFAULT account's identity as captured at ITS OWN sign-in, or `null` if it was never
+/// captured (it was signed in outside the app, or before this existed).
+///
+/// ⚠️ It cannot be read live once a second account exists: `claude auth status` answers from
+/// a profile cache every account SHARES, so it would name whichever account signed in last.
+/// The UI shows this stored value instead of a plausible-looking wrong address.
 #[tauri::command]
 #[specta::specta]
-pub async fn claude_account_rename(
+pub async fn claude_default_identity(
     store: tauri::State<'_, Store>,
-    account_id: String,
-    label: String,
-) -> Result<(), String> {
-    let label = label.trim();
-    if label.is_empty() {
-        return Err("the account name cannot be empty".into());
-    }
-    let mut accounts = store
-        .list_claude_accounts()
-        .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
-    let Some(record) = accounts.iter_mut().find(|a| a.id == account_id) else {
-        return Err("this Claude account no longer exists".into());
-    };
-    record.label = label.to_string();
-    // A name the user typed is theirs: a later identity capture must not replace it.
-    record.label_is_generated = false;
-    let record = record.clone();
-    store
-        .upsert_claude_account(&record)
-        .map_err(|e| format!("could not save the Claude account: {e}"))
+) -> Result<Option<ClaudeIdentity>, String> {
+    let raw = store
+        .get_config(DEFAULT_IDENTITY_KEY)
+        .map_err(|e| format!("could not read the default account's identity: {e}"))?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// One Claude account's identity — address, organization, plan — read with ITS OWN token
+/// (see `usage::profile`). This is what the UI names every account by: unlike
+/// `claude auth status`, whose profile cache all accounts share, it cannot answer with
+/// another account's address. `account_id: None` = the default account.
+#[tauri::command]
+#[specta::specta]
+pub async fn claude_account_identity(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> Result<crate::usage::profile::AccountProfile, UsageError> {
+    let slot = claude_slot(&app, account_id.as_deref()).map_err(|detail| {
+        // Same typing as the usage command: a removed account is permanent, not a blip.
+        match account_id.clone() {
+            Some(id) if detail.starts_with("unknown Claude account") => {
+                UsageError::UnknownAccount { account_id: id }
+            }
+            _ => UsageError::Network { detail },
+        }
+    })?;
+    crate::usage::profile::fetch_profile_for(&slot).await
 }
 
 /// Capture an account's identity from the CLI RIGHT AFTER it signed in, and persist it as
-/// non-sensitive metadata (never a token).
+/// non-sensitive metadata (never a token). `account_id: None` captures the DEFAULT account.
 ///
 /// ⚠️ This is deliberately a separate, post-login step. `claude auth status` reads
 /// `email`/`orgName` from a profile cache living in the CONFIG dir, which every account
 /// SHARES — so the answer is only reliably about THIS account in the moment just after its
-/// own login wrote that cache. Persisting it here is what lets the Accounts panel keep
-/// labelling each account correctly afterwards. Best-effort by design: a failure leaves the
-/// user-chosen label in place rather than blocking a successful sign-in.
+/// own login wrote that cache. Persisting it here is what lets the Accounts panel keep naming
+/// each account by its address afterwards. Best-effort by design: a failure leaves the
+/// previous identity in place rather than blocking a successful sign-in.
 #[tauri::command]
 #[specta::specta]
 pub async fn claude_account_capture_identity(
     app: tauri::AppHandle,
-    account_id: String,
-) -> Result<crate::store::ClaudeAccountRecord, String> {
-    let slot = claude_slot(&app, Some(&account_id))?;
+    account_id: Option<String>,
+) -> Result<(), String> {
+    let slot = claude_slot(&app, account_id.as_deref())?;
     let status = crate::accounts::status(&slot).await?;
     let store = app.state::<Store>();
+
+    // The default account keeps its identity in `meta`: it has no row, and creating one would
+    // make it show up among the accounts the user added.
+    let Some(account_id) = account_id.filter(|id| id != crate::accounts::DEFAULT_ACCOUNT_ID) else {
+        let identity = ClaudeIdentity {
+            email: status.email,
+            org_name: status.org_name,
+            subscription_type: status.subscription_type,
+        };
+        let json = serde_json::to_string(&identity)
+            .map_err(|e| format!("could not encode the default account's identity: {e}"))?;
+        return store
+            .set_config(DEFAULT_IDENTITY_KEY, &json)
+            .map_err(|e| format!("could not save the default account's identity: {e}"));
+    };
+
     let mut accounts = store
         .list_claude_accounts()
         .map_err(|e| format!("could not read the Claude accounts: {e}"))?;
     let Some(record) = accounts.iter_mut().find(|a| a.id == account_id) else {
         return Err("this Claude account no longer exists".into());
     };
-    // The label is replaced only while it is still the generated placeholder (a recorded
-    // fact, not a guess from its text) — see `ClaudeAccountRecord::apply_captured_identity`.
+    // The label follows the captured address while it is still the generated placeholder (a
+    // recorded fact, not a guess from its text) — see `apply_captured_identity`. The UI names
+    // accounts by `email`; the label is only the fallback until one is captured.
     record.apply_captured_identity(status.email, status.org_name, status.subscription_type);
     let record = record.clone();
     store
         .upsert_claude_account(&record)
         .map_err(|e| format!("could not save the Claude account: {e}"))?;
-    Ok(record)
+    Ok(())
 }
 
 /// Remove an account: sign its credential store out through the CLI, drop its directory,

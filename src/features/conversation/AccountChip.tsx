@@ -11,12 +11,16 @@
 // the composer bar's backend filter keeps it off Codex conversations.
 import { Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useConversationsStore } from "../../store/conversationsStore";
-import { useClaudeAccounts } from "../../ipc/useAccounts";
+import {
+  useClaudeAccountNames,
+  useClaudeAccounts,
+  useClaudeDefaultIdentity,
+} from "../../ipc/useAccounts";
 import { usePlanUsage } from "../../store/planUsage";
-import { peakUsagePercent } from "../../store/claudeAccounts";
+import { DEFAULT_ACCOUNT_ID, peakUsagePercent } from "../../store/claudeAccounts";
 import { AccountFace } from "./composerChipFaces";
 
-/** The label shown for the default (un-scoped) account — the one that always exists. */
+/** Stands in for the default account's address only while that address cannot be read. */
 const DEFAULT_LABEL = "Claude";
 
 export function AccountChip({ session }: { session: string }) {
@@ -31,6 +35,13 @@ export function AccountChip({ session }: { session: string }) {
   const rows = accounts.data ?? [];
   const currentId = conv?.claudeAccountId ?? null;
   const live = !!conv?.handle;
+  // Accounts are named by their ADDRESS, read with each account's own token (the same query
+  // cache Settings → Accounts uses). Called before any early return — the rules of hooks.
+  const defaultEmail = useClaudeDefaultIdentity(true).data?.email ?? null;
+  const names = useClaudeAccountNames([
+    { id: null, capturedEmail: defaultEmail, fallback: DEFAULT_LABEL },
+    ...rows.map((a) => ({ id: a.id, capturedEmail: a.email, fallback: a.label })),
+  ]);
 
   // Computed BEFORE any early return: an orphaned pointer must keep its repair surface
   // even when the last extra account is gone.
@@ -41,11 +52,12 @@ export function AccountChip({ session }: { session: string }) {
 
   const nameOf = (id: string | null) =>
     id === null
-      ? DEFAULT_LABEL
-      : (rows.find((a) => a.id === id)?.label ??
-        // The conversation names an account that is gone. Say so rather than silently
-        // showing the default: the session will refuse to start until it is re-pointed.
-        "Unknown account");
+      ? names[DEFAULT_ACCOUNT_ID]
+      : rows.some((a) => a.id === id)
+        ? names[id]
+        : // The conversation names an account that is gone. Say so rather than silently
+          // showing the default: the session will refuse to start until it is re-pointed.
+          "Unknown account";
 
   // A running process cannot change identity, so the chip shows what the SESSION is
   // actually authenticated as until the restart lands — claiming the new account while the
@@ -78,7 +90,7 @@ export function AccountChip({ session }: { session: string }) {
       <MenuLabel>Claude account</MenuLabel>
       <AccountOption
         accountId={null}
-        label={DEFAULT_LABEL}
+        label={names[DEFAULT_ACCOUNT_ID]}
         on={currentId === null}
         onPick={() => pick(null)}
       />
@@ -90,7 +102,7 @@ export function AccountChip({ session }: { session: string }) {
             <AccountOption
               key={a.id}
               accountId={a.id}
-              label={a.label}
+              label={names[a.id]}
               on={currentId === a.id}
               onPick={() => pick(a.id)}
             />

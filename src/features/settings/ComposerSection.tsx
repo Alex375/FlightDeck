@@ -372,8 +372,8 @@ function chipFace(id: string, props: { icon?: string } & Record<string, unknown>
       return <CodexOptionsFace {...rest} />;
     case "account":
       // A representative label: the preview must read as a real control, and this chip
-      // only ever appears once a second account exists.
-      return <AccountFace label="Claude" {...rest} />;
+      // only ever appears once a second account exists. Accounts are named by address.
+      return <AccountFace label="you@example.com" {...rest} />;
     case "outputStyle":
       // A representative non-default label so the chip reads as a real control here.
       return <OutputStyleFace label="Concise" {...rest} />;
