@@ -62,6 +62,7 @@ import {
   isDecisionKind,
   liveVisibleStart,
   runHeader,
+  sentMessageIds,
   splitFinalMessage,
   workStepIds,
   type GroupInput,
@@ -80,6 +81,7 @@ import { useShallow } from "zustand/react/shallow";
 import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
 import { ArtifactCard } from "./ArtifactCard";
+import { AgentMessageSentCard } from "./AgentMessageCards";
 import { resolveTranscriptSource } from "./transcriptSource";
 import type { StickToBottom } from "./useStickToBottom";
 import styles from "./ConductorThread.module.css";
@@ -185,7 +187,7 @@ export function MsgUser({
   // A `<task-notification>` (and other CLI-injected markers) reaches us AS a user turn,
   // but the human didn't type it — render the clean card instead of a raw user bubble.
   const special = parseSpecialMessage(text);
-  if (special) return <SpecialMessageCard data={special} />;
+  if (special) return <SpecialMessageCard data={special} queued={queued} />;
   return (
     <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
@@ -252,7 +254,7 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
   // A CLI-injected special message (e.g. a `<task-notification>`) reaches us as a user turn
   // too — render its clean card, exactly like a standalone user turn (MsgUser), never raw XML.
   const special = text.trim() ? parseSpecialMessage(text) : null;
-  if (special) return <SpecialMessageCard data={special} />;
+  if (special) return <SpecialMessageCard data={special} queued={turn?.queued ?? false} />;
   // Mirror MsgUser's affordance: while the message is still QUEUED (not yet delivered to the
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
@@ -774,6 +776,18 @@ function renderSegment(
         input={seg.step.input}
       />
     );
+  if (seg.kind === "message")
+    // A message to another conversation renders as a "message sent" card (recipient, text,
+    // delivery state), the recipient jumping to where the message arrived.
+    return (
+      <AgentMessageSentCard
+        key={seg.key}
+        session={session}
+        name={seg.step.name}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+      />
+    );
   if (seg.kind === "question")
     // A question to the user renders as its own inline card (question + chosen answer)
     // anchoring the exchange in the flow; the interactive ask stays in the bottom AskTurn.
@@ -826,7 +840,12 @@ function renderFoldedWork(
   // more work in the same group): split the fold at each so it renders in clear between runs.
   if (!folded.some(isDecisionKind)) {
     return (
-      <ClaudeWorkBlock count={countWorkSteps(folded)} foldConv={session} foldKey={roundKey}>
+      <ClaudeWorkBlock
+        count={countWorkSteps(folded)}
+        foldConv={session}
+        foldKey={roundKey}
+        jumpAnchors={sentMessageIds(folded)}
+      >
         {renderSegments(session, folded, false, -1, motion)}
       </ClaudeWorkBlock>
     );
@@ -844,6 +863,7 @@ function renderFoldedWork(
         count={countWorkSteps(c)}
         foldConv={session}
         foldKey={`${roundKey}#${idx}`}
+        jumpAnchors={sentMessageIds(c)}
       >
         {renderSegments(session, c, false, -1, motion)}
       </ClaudeWorkBlock>,
@@ -1224,6 +1244,9 @@ export function ConductorThread({
       rawPlan,
       (id) => notices?.[id]?.subtype,
       (id) => turns?.[id]?.injectedMidTurn ?? false,
+      // A message ANOTHER conversation sent stays in clear instead of folding with the work.
+      // Its text is set once at creation, so the same non-reactive read holds.
+      (id) => parseSpecialMessage(turns?.[id]?.streamingText ?? "")?.type === "agent-message",
     );
   }, [cleanOutput, rawPlan, notices, session]);
   const pending = usePendingPermissions(session);

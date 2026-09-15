@@ -50,6 +50,9 @@ import { useConversationsStore, type Conversation } from "../store/conversations
 import { useConversationStore } from "../store/conversationStore";
 import { useAppControlPrefs } from "../store/appControl";
 import type { Turn } from "../store/types";
+import { useDisplay } from "../store/display";
+import { useToasts } from "../store/toasts";
+import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
 import type { PermissionRequestPayload } from "../ipc/client";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
@@ -257,9 +260,77 @@ describe("appControl — conversations", () => {
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
+    const calls = vi.mocked(sendConversationMessage).mock.calls as unknown as Array<
+      [string, { text: string; queued: boolean }]
+    >;
+    expect(calls).toHaveLength(1);
+    const [target, vars] = calls[0];
+    expect(target).toBe("c2");
     // `queued` mirrors the composer's send exactly (false here: c2 is idle).
-    expect(sendConversationMessage).toHaveBeenCalledWith("c2", { text: "go", queued: false });
+    expect(vars.queued).toBe(false);
+    // Wrapped in its attribution envelope: the recipient knows which conversation sent it,
+    // and the result echoes the id that links the send to its arrival.
+    const envelope = parseAgentMessage(vars.text);
+    expect(envelope).toMatchObject({
+      fromConversationId: "c1",
+      fromTitle: "Alpha",
+      fromRepo: "r1",
+      fromBackend: "claude",
+      body: "go",
+    });
+    expect(out.message_id).toBe(envelope?.messageId);
     expect(out.delivered).toBe(true);
+  });
+
+  it("send_message from a caller with no conversation sends the text as is", async () => {
+    seed(conv(), conv({ id: "c2", name: "Beta" }));
+    const out = (await executeAppControlTool(
+      "send_message",
+      { conversation_id: "c2", text: "go" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(sendConversationMessage).toHaveBeenCalledWith("c2", { text: "go", queued: false });
+    expect(out.message_id).toBeUndefined();
+  });
+
+  it("send_message announces the exchange with a toast, unless switched off", async () => {
+    seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta" }));
+    useToasts.setState({ toasts: [] });
+    useDisplay.getState().set({ agentMessageToasts: true });
+    await executeAppControlTool("send_message", { conversation_id: "c2", text: "go" }, "session-7", helpers());
+    expect(useToasts.getState().toasts).toHaveLength(1);
+    expect(useToasts.getState().toasts[0]).toMatchObject({
+      kind: "agent-message",
+      fromConvId: "c1",
+      toConvId: "c2",
+      excerpt: "go",
+    });
+
+    useDisplay.getState().set({ agentMessageToasts: false });
+    await executeAppControlTool("send_message", { conversation_id: "c2", text: "again" }, "session-7", helpers());
+    expect(useToasts.getState().toasts).toHaveLength(1);
+    useDisplay.getState().set({ agentMessageToasts: true });
+  });
+
+  it("read_conversation attributes a message another conversation sent", async () => {
+    const envelope = buildAgentMessageEnvelope(
+      { conversationId: "c9", title: "Gamma", repo: null, backend: "claude" },
+      "m1",
+      "please rebase",
+    );
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: envelope }] });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<Record<string, unknown>> };
+    expect(out.turns[0]).toEqual({
+      role: "user",
+      from_conversation: { conversation_id: "c9", title: "Gamma" },
+      text: "please rebase",
+    });
   });
 
   it("create_conversation validates the folder, then creates + titles + sends", async () => {
@@ -280,6 +351,34 @@ describe("appControl — conversations", () => {
     expect(created?.name).toBe("Probe");
     expect(sendConversationMessage).toHaveBeenCalledWith(out.conversation_id, { text: "start" });
     expect(out.started).toBe(true);
+  });
+
+  it("create_conversation from a conversation attributes its first message and announces it", async () => {
+    seed(conv({ handle: "session-7" }));
+    useToasts.setState({ toasts: [] });
+    useDisplay.getState().set({ agentCreationToasts: true });
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/tmp/r1", title: "Probe", first_message: "start" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    const calls = vi.mocked(sendConversationMessage).mock.calls as unknown as Array<[string, { text: string }]>;
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe(out.conversation_id);
+    const envelope = parseAgentMessage(calls[0][1].text);
+    expect(envelope).toMatchObject({ fromConversationId: "c1", fromTitle: "Alpha", body: "start" });
+    expect(out.message_id).toBe(envelope?.messageId);
+    expect(useToasts.getState().toasts).toEqual([
+      expect.objectContaining({
+        kind: "conversation-created",
+        fromConvId: "c1",
+        convId: out.conversation_id,
+        title: "Probe",
+        repo: "r1",
+        messageId: envelope?.messageId,
+      }),
+    ]);
   });
 
   it("create_conversation normalizes the path and never steals the selection", async () => {

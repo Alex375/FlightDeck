@@ -496,6 +496,42 @@
 .cv-tasknote-result { padding-left:31px; min-width:0; font-size:12.5px; line-height:1.55; color:var(--wf-tx); }
 .cv-tasknote-note { margin:0; padding-left:31px; font-size:11px; line-height:1.5; color:var(--wf-tx-xlo); }
 
+/* Agent-to-agent exchange (flightdeck `send_message` / `create_conversation`), kept compact.
+   Received: a light bubble with a one-line lowercase "↩ from <conversation>" header, where a
+   prompt would sit — neither the human's bubble (no avatar) nor a tool card.
+   Sent: one step-like row in the assistant flow ("➤ Message to <conversation> ✓"), the text a
+   click away. The other conversation's name jumps to its side of the exchange. */
+.cv-agentmsg { display:flex; flex-direction:column; gap:5px; min-width:0; padding:8px 12px 9px; border:1px solid var(--wf-line); border-radius:10px; background:var(--wf-panel); }
+.cv-agentmsg-h { display:flex; align-items:center; gap:6px; min-width:0; font-size:11.5px; color:var(--wf-tx-lo); }
+.cv-agentmsg-ico { flex:none; color:var(--wf-msg); }
+.cv-agentmsg-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0; border:0; background:none; font:inherit; font-weight:600; color:var(--wf-tx-hi); text-align:left; }
+button.cv-agentmsg-name { cursor:pointer; }
+button.cv-agentmsg-name:hover,
+button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:underline; text-underline-offset:2px; outline:none; }
+.cv-agentmsg-name[data-gone] { font-weight:500; color:var(--wf-tx-lo); }
+.cv-agentmsg-repo { flex:none; color:var(--wf-tx-xlo); }
+.cv-agentmsg-repo::before { content:"·"; margin-right:6px; }
+.cv-agentmsg-pending { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--wf-wait); }
+.cv-agentmsg-pending::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--wf-wait); }
+.cv-agentmsg-body { min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+.cv-agentmsg-sent { border-radius:6px; }
+/* Consecutive sends read as one list, not as separate paragraphs of the response. */
+.cv-agentmsg-sent + .cv-agentmsg-sent { margin-top:-11px; }
+.cv-agentmsg-row { display:flex; align-items:center; gap:8px; min-width:0; padding:6px 8px; border-radius:6px; }
+.cv-agentmsg-row[role="button"] { cursor:pointer; }
+.cv-agentmsg-row[role="button"]:hover { background:color-mix(in srgb, var(--wf-tx-hi) 6%, transparent); }
+.cv-agentmsg-row-t { flex:1; min-width:0; display:flex; align-items:center; gap:5px; overflow:hidden; font-size:12px; color:var(--wf-tx); white-space:nowrap; }
+.cv-agentmsg-verb { flex:none; }
+.cv-agentmsg-queued { color:var(--wf-wait); }
+.cv-agentmsg-row-b { min-width:0; padding:4px 8px 8px 28px; font-size:12.5px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+.cv-agentmsg-err { margin:4px 0 0; font-size:12px; line-height:1.5; color:var(--wf-err); overflow-wrap:anywhere; }
+/* The target of a cross-conversation jump glows briefly, so the eye lands on it. */
+[data-jump-flash] { animation:cv-jump-flash 1.8s ease-out; }
+@keyframes cv-jump-flash {
+  0%, 35% { box-shadow:0 0 0 2px color-mix(in srgb, var(--wf-msg) 70%, transparent); }
+  100% { box-shadow:0 0 0 2px transparent; }
+}
+
 .cv-aibody { flex:1; min-width:0; display:flex; flex-direction:column; gap:13px; padding-top:3px; }
 
 .cv-tool { border:1px solid var(--wf-line); border-radius:8px; background:var(--wf-panel); overflow:hidden; }

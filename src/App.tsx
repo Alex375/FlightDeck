@@ -31,6 +31,8 @@ import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
 import { UpdateBanner } from "./features/settings/UpdateBanner";
 import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
+import { ToastHost } from "./ui/ToastHost";
+import { useThreadJump } from "./store/threadJump";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
@@ -107,6 +109,15 @@ export default function App() {
     },
     [closeReplyModal, tosseAvailable],
   );
+
+  // A jump to a message in another conversation (an agent-message card or its toast) selects
+  // that conversation in the store; showing it is ours. The pane then scrolls to the message.
+  const jumpNonce = useThreadJump((s) => s.request?.nonce ?? null);
+  const changeViewRef = useRef(changeView);
+  changeViewRef.current = changeView;
+  useEffect(() => {
+    if (jumpNonce !== null) changeViewRef.current("conversation");
+  }, [jumpNonce]);
 
   // Signing out (or switching the feature off) while the TOSSE view is open must not strand
   // the window on a view that no longer exists — fall back to the deck.
@@ -357,6 +368,8 @@ export default function App() {
           App-global on purpose — a per-view subscription would open and close the socket
           with the tab. Off unless connected AND the preference is on. */}
       <TosseLiveHost />
+      {/* Mounted once, globally: in-app toasts (e.g. one conversation messaging another). */}
+      <ToastHost />
     </Win>
   );
 }

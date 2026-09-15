@@ -901,11 +901,16 @@ function isSoftNotice(subtype: string | undefined): boolean {
  * no injection flag, so without this gate every past prompt would be swallowed and the whole
  * conversation would collapse into one fold. A LEADING user message (round not started) is never
  * absorbed either. Pure + testable; the default plan (non-clean) is untouched.
+ *
+ * `userIsAgentMessage` tags an absorbed user turn that ANOTHER conversation sent (an
+ * `<agent-message>` envelope) as an `agent` marker: same in-place rendering, but it stays in
+ * clear rather than folding with the work (see `isDecisionKind`).
  */
 export function coalesceCleanRounds(
   plan: RenderItem[],
   noticeSubtype: (id: string) => string | undefined,
   userIsInjected: (id: string) => boolean,
+  userIsAgentMessage: (id: string) => boolean = () => false,
 ): RenderItem[] {
   const out: RenderItem[] = [];
   let i = 0;
@@ -930,7 +935,11 @@ export function coalesceCleanRounds(
         continue;
       }
       if (nxt.kind === "user" && userIsInjected(nxt.id)) {
-        markers.push({ markerKind: "user", id: nxt.id, after: ids.length });
+        markers.push({
+          markerKind: userIsAgentMessage(nxt.id) ? "agent" : "user",
+          id: nxt.id,
+          after: ids.length,
+        });
         continue;
       }
       // A real new prompt, turn_result, error or hard notice ends the response (and this round).

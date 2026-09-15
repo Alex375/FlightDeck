@@ -19,6 +19,7 @@ import type {
   WorkflowJournal,
   WorkflowRun,
 } from "../client";
+import { buildAgentMessageEnvelope } from "../../features/conversation/agentMessage";
 
 export interface ScenarioEmit {
   state: (s: SessionStatePayload) => void;
@@ -811,6 +812,132 @@ export class ScenarioDriver {
         }),
       ),
     );
+  }
+
+  /**
+   * Agent-to-agent messaging demo (`?demo=agentmsg`): a message from another conversation
+   * arrives (the received card), then the agent answers through `send_message` — one send
+   * delivered, one refused (the failed card). Exercises both cards and their jump chips.
+   */
+  startAgentMessage() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+
+    this.step(200, () =>
+      this.emit.item({
+        kind: "user_message",
+        id: "u-agent",
+        parent_tool_use_id: null,
+        replay: false,
+        text: buildAgentMessageEnvelope(
+          { conversationId: "conv-demo-codex", title: "Codex demo", repo: "demo-repo", backend: "codex" },
+          "msg-demo-in",
+          "The API schema changed: `GET /users` now returns `{ items, next }`.\n\nCan you update the client in `src/api/users.ts` and tell me when it's done?",
+        ),
+      }),
+    );
+    this.step(260, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "Got it — I'll update the client, then report back to the Codex conversation.\n\n";
+    this.streamText("m1", t1);
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          {
+            type: "tool_use",
+            id: "toolu_send_ok",
+            name: "mcp__flightdeck__send_message",
+            input: {
+              conversation_id: "conv-demo-codex",
+              text: "Done: `src/api/users.ts` now reads `items` and follows `next` for pagination. Tests pass.",
+            },
+          },
+          {
+            type: "tool_use",
+            id: "toolu_send_err",
+            name: "mcp__flightdeck__send_message",
+            input: { conversation_id: "conv-gone", text: "Also pinging the review conversation." },
+          },
+          {
+            type: "tool_use",
+            id: "toolu_create",
+            name: "mcp__flightdeck__create_conversation",
+            input: {
+              repo_path: "/Users/dev/demo-repo",
+              title: "Review API client",
+              first_message: "Review the new pagination in `src/api/users.ts` and flag anything risky.",
+            },
+          },
+        ],
+      }),
+    );
+    this.step(500, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_send_ok",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { conversation_id: "conv-demo-codex", delivered: true, message_id: "msg-demo-out" },
+              null,
+              2,
+            ),
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(200, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_send_err",
+        content: [{ type: "text", text: "no conversation with id 'conv-gone' (see list_conversations)" }],
+        is_error: true,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(300, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_create",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { conversation_id: "conv-demo-codex", repo_path: "/Users/dev/demo-repo", backend: "codex", started: true, message_id: "msg-demo-create" },
+              null,
+              2,
+            ),
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(260, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t2 = "I've let the Codex conversation know; the review conversation no longer exists.";
+    this.streamText("m2", t2, 3, 18);
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [{ type: "text", text: t2 }],
+      }),
+    );
+    this.step(200, () =>
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 2, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500 }),
+    );
+    this.step(40, () => this.emit.state(idleState()));
   }
 
   /**

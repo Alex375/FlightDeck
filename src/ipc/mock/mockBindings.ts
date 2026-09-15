@@ -1304,6 +1304,7 @@ export const mockCommands = {
     else if (demo === "shell") driver.startShell();
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
+    else if (demo === "agentmsg") driver.startAgentMessage();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).

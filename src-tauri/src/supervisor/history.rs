@@ -450,6 +450,32 @@ fn strip_wrapper<'a>(t: &'a str, tag: &str) -> Option<&'a str> {
     Some(inner.strip_suffix(&format!("</{tag}>")).unwrap_or(inner))
 }
 
+/// What an agent-to-agent message SAYS: the body of the `<agent-message>` attribution envelope
+/// one conversation wraps around a message it sends another through the app's `send_message`
+/// tool (mirror of the front's `agentMessage.ts` parse: strict open-on-the-tag gate, body from
+/// the first `<body>` to the LAST `</body>`). A listing shows the message, never the tags.
+/// Anything else — including an envelope with an empty body — comes back unchanged.
+pub(crate) fn unwrap_agent_message(text: &str) -> &str {
+    let Some(rest) = text.trim_start().strip_prefix("<agent-message>") else {
+        return text;
+    };
+    let Some(open) = rest.find("<body>") else {
+        return text;
+    };
+    let start = open + "<body>".len();
+    let end = rest
+        .rfind("</body>")
+        .filter(|&e| e >= start)
+        .or_else(|| rest.rfind("</agent-message>").filter(|&e| e >= start))
+        .unwrap_or(rest.len());
+    let body = rest[start..end].trim();
+    if body.is_empty() {
+        text
+    } else {
+        body
+    }
+}
+
 /// Strip the `<ide_opened_file>…</ide_opened_file>` banner the IDE integration PREPENDS to
 /// a real prompt, in the same content array. Unlike everything in
 /// [`classify_injected_text`], this one must NOT drop the line: the human's actual message
@@ -1299,7 +1325,7 @@ fn first_user_text(entry: &Value) -> Option<String> {
     if text.trim().is_empty() || classify_injected_text(text).is_some() {
         None
     } else {
-        Some(text.to_string())
+        Some(unwrap_agent_message(text).to_string())
     }
 }
 
@@ -2073,6 +2099,23 @@ mod tests {
         let v: Value =
             serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#).unwrap();
         assert_eq!(first_user_text(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn an_agent_message_is_listed_by_what_it_says() {
+        let envelope = "<agent-message>\n<from>Refactor auth</from>\n<message-id>m1</message-id>\n\
+                        <body>\nPlease rebase on dev\n</body>\n</agent-message>";
+        let v = serde_json::json!({ "type": "user", "message": { "role": "user", "content": envelope } });
+        assert_eq!(first_user_text(&v).as_deref(), Some("Please rebase on dev"));
+        // Tag-looking text inside the body stays part of it.
+        assert_eq!(
+            unwrap_agent_message("<agent-message>\n<body>\na </body> b\n</body>\n</agent-message>"),
+            "a </body> b"
+        );
+        // Prose that merely mentions the tag, and an empty envelope, are left alone.
+        assert_eq!(unwrap_agent_message("what is <agent-message>?"), "what is <agent-message>?");
+        let empty = "<agent-message>\n<body>\n</body>\n</agent-message>";
+        assert_eq!(unwrap_agent_message(empty), empty);
     }
 
     #[test]

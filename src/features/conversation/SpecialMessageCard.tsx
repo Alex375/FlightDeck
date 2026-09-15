@@ -14,6 +14,7 @@ import { fmtTokens } from "../../store/contextData";
 import { useDisplay } from "../../store/display";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { taskNotificationStyle, type SpecialMessage, type TaskNotification } from "./specialMessage";
+import { AgentMessageReceivedCard } from "./AgentMessageCards";
 
 /** Shorten a task/tool id for the discreet mono chip; the full value is the title. */
 function shortId(id: string): string {
@@ -65,15 +66,17 @@ function TaskNotificationCard({ n }: { n: TaskNotification }) {
   );
 }
 
-/** Render an injected special message. One kind today; the switch keeps future
- *  injected markers (system reminders, other injections) tidy to add. Task
- *  notifications are hidden unless the user opts in (Settings → General) — the
- *  default-off gate that keeps the transcript clean on reload / history import. */
-export function SpecialMessageCard({ data }: { data: SpecialMessage }) {
+/** Render a special message. Task notifications are hidden unless the user opts in
+ *  (Settings → General) — the default-off gate that keeps the transcript clean on reload /
+ *  history import. A message from another conversation is always shown: it is addressed to
+ *  this agent, exactly like a prompt. `queued` = still pending (sent mid-turn). */
+export function SpecialMessageCard({ data, queued }: { data: SpecialMessage; queued?: boolean }) {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   switch (data.type) {
     case "task-notification":
       return showTaskNotifications ? <TaskNotificationCard n={data} /> : null;
+    case "agent-message":
+      return <AgentMessageReceivedCard message={data} queued={queued} />;
     default:
       return null;
   }

@@ -126,6 +126,8 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "System notification", section: "notifications", sub: "channels", group: "Channels", keywords: "os notification banner alerte" },
   { title: "Sound", section: "notifications", sub: "channels", group: "Channels", keywords: "chime audio son" },
   { title: "Dock bounce", section: "notifications", sub: "channels", group: "Channels", keywords: "dock icon attention rebond" },
+  { title: "Toast when agents message each other", section: "notifications", sub: "channels", group: "Agent messages", keywords: "agent message send_message conversation toast messagerie inter-conversation expéditeur destinataire" },
+  { title: "Toast when an agent creates a conversation", section: "notifications", sub: "channels", group: "Agent messages", keywords: "agent create_conversation new conversation created toast création nouvelle conversation" },
   { title: "Show in the Flight Deck", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout counters banner alerts alertes" },
   { title: "Show in the Conversation", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout sidebar counters alerts alertes" },
   { title: "Alert for background shell commands", section: "notifications", sub: "background", group: "Background tasks", keywords: "bash monitor background notification alerts alertes" },

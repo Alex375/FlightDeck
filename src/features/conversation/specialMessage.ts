@@ -9,6 +9,8 @@
 // The union is deliberately open (`SpecialMessage`) so future injected markers get a
 // new `type` here rather than another ad-hoc branch scattered across the renderers.
 
+import { parseAgentMessage, type AgentMessage } from "./agentMessage";
+
 export interface TaskNotificationUsage {
   tokens: number | null;
   toolUses: number | null;
@@ -30,8 +32,10 @@ export interface TaskNotification {
   usage: TaskNotificationUsage | null;
 }
 
-/** Extensible union: add future injected markers as new members. */
-export type SpecialMessage = TaskNotification;
+/** Extensible union: add future injected markers as new members. An agent-message is not
+ *  CLI-injected, but it is not the human speaking either (another conversation sent it), so
+ *  it shares the same routing: never a user bubble, never "the user's last message". */
+export type SpecialMessage = TaskNotification | AgentMessage;
 
 const TN_OPEN = "<task-notification>";
 const TN_CLOSE = "</task-notification>";
@@ -78,6 +82,8 @@ function usageField(body: string): TaskNotificationUsage | null {
  *  (we require the trimmed text to OPEN with the tag; real injections always do, and
  *  hand-written prompts referencing it in prose never do). */
 export function parseSpecialMessage(text: string): SpecialMessage | null {
+  const agent = parseAgentMessage(text);
+  if (agent) return agent;
   const t = text.trimStart();
   // The `startsWith` gate is the decisive anti-false-positive: real injections always
   // OPEN on the tag; prose that merely mentions it never does. Kept strict.

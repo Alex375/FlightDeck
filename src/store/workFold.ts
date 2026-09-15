@@ -27,6 +27,9 @@ interface WorkFoldState {
   open: FoldMap;
   /** Flip one block's open state (per conversation + round). Persisted. */
   toggle: (conv: string, key: string) => void;
+  /** Set one block's open state explicitly — a jump to a message folded inside it opens it
+   *  (a toggle could close a block that is already open). Persisted. */
+  setOpen: (conv: string, key: string, open: boolean) => void;
   /** Forget one conversation's fold state — wired into removeConversation/removeRepo,
    *  same as the other per-conversation UI caches (composer draft, todo bar). */
   clearConversation: (conv: string) => void;
@@ -40,6 +43,14 @@ export const useWorkFold = create<WorkFoldState>((set) => ({
     set((s) => {
       const convMap = s.open[conv] ?? {};
       const next: FoldMap = { ...s.open, [conv]: { ...convMap, [key]: !convMap[key] } };
+      save(next);
+      return { open: next };
+    }),
+  setOpen: (conv, key, open) =>
+    set((s) => {
+      const convMap = s.open[conv] ?? {};
+      if ((convMap[key] ?? false) === open) return s;
+      const next: FoldMap = { ...s.open, [conv]: { ...convMap, [key]: open } };
       save(next);
       return { open: next };
     }),
