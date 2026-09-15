@@ -1042,6 +1042,7 @@ impl Assembler {
                             // A live wire turn is an out-of-order replay to splice into place;
                             // a real remote turn always carries `isReplay:true` here.
                             replay: u.is_replay == Some(true),
+                            mid_turn: false,
                         }));
                     }
                 }

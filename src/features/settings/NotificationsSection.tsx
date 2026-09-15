@@ -2,6 +2,7 @@
 // channels fired when an agent finishes a turn or needs attention. Prefs live in
 // the notifications store; the actual dispatch is in src/notifications/.
 import { useNotifications } from "../../store/notifications";
+import { useDisplay } from "../../store/display";
 import { testSound } from "../../notifications/notify";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -13,6 +14,9 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
   const sound = useNotifications((s) => s.sound);
   const dockBounce = useNotifications((s) => s.dockBounce);
   const set = useNotifications((s) => s.set);
+  const agentMessageToasts = useDisplay((s) => s.agentMessageToasts);
+  const agentCreationToasts = useDisplay((s) => s.agentCreationToasts);
+  const setDisplay = useDisplay((s) => s.set);
 
   return (
     <div>
@@ -50,6 +54,23 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
           hint="The Flight Deck icon bounces in the Dock."
           checked={dockBounce}
           onChange={(v) => set({ dockBounce: v })}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Agent messages" icon="chat">
+        <ToggleRow
+          title="Toast when agents message each other"
+          hint="When a conversation sends a message to another one (the Flight Deck send_message tool), a short note in the corner names both. Click either name to jump to its side of the exchange."
+          checked={agentMessageToasts}
+          onChange={(v) => setDisplay({ agentMessageToasts: v })}
+          label="Toast when agents message each other"
+        />
+        <ToggleRow
+          title="Toast when an agent creates a conversation"
+          hint="When a conversation starts a new one (the Flight Deck create_conversation tool), a short note names both. Click either name to open it."
+          checked={agentCreationToasts}
+          onChange={(v) => setDisplay({ agentCreationToasts: v })}
+          label="Toast when an agent creates a conversation"
         />
       </SettingsGroup>
     </div>

@@ -520,6 +520,28 @@ describe("workStepIds", () => {
   it("is empty for prose/thinking only", () => {
     expect(workStepIds(segs([text("a"), thinking("b")]))).toEqual([]);
   });
+
+  it("tracks a message sent to another conversation like any tool", () => {
+    const s = segs([tool("a", "Read"), tool("m", "mcp__flightdeck__send_message")]);
+    expect(workStepIds(s)).toEqual(["a", "m"]);
+  });
+});
+
+describe("liveVisibleStart — messages sent", () => {
+  it("never folds a message that is still being sent", () => {
+    // The send leads three settled steps: the window alone would fold it (start 1), but a
+    // send to a cold conversation can take seconds and must stay on screen while it runs.
+    const atoms = flattenWork(
+      groupBlocks([
+        tool("m", "mcp__flightdeck__send_message"),
+        tool("a", "Read"),
+        tool("b", "Read"),
+        tool("c", "Read"),
+      ]),
+    );
+    expect(liveVisibleStart(atoms, () => false, 3)).toBe(1);
+    expect(liveVisibleStart(atoms, (id) => id === "m", 3)).toBe(0);
+  });
 });
 
 describe("flattenWork / atomsToSegments", () => {

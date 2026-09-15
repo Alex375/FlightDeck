@@ -42,6 +42,12 @@ import { useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
+import {
+  buildAgentMessageEnvelope,
+  parseAgentMessage,
+  type AgentMessageSender,
+} from "../features/conversation/agentMessage";
+import { pushAgentMessageToast, pushConversationCreatedToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
 import type { SessionEntry, Turn } from "../store/types";
@@ -95,6 +101,27 @@ async function assertFolder(tool: string, path: string): Promise<void> {
 }
 
 // ---- Caller / target resolution ---------------------------------------------
+
+/** A conversation as the sender of an agent message (its attribution envelope). */
+function senderOf(conv: Conversation): AgentMessageSender {
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId);
+  return {
+    conversationId: conv.id,
+    title: conv.name,
+    repo: repo ? baseName(repo.path) : null,
+    backend: conv.kind,
+  };
+}
+
+/** Only the app attributes a message to a conversation. A caller with no conversation (voice,
+ *  phone relay, external MCP client) handing in a ready-made envelope would pass its text off
+ *  as another conversation's — on screen and to the recipient model alike. */
+function assertNotForgedEnvelope(tool: string, argName: string, text: string): void {
+  if (parseAgentMessage(text))
+    throw new Error(
+      `${tool}: '${argName}' cannot be a <flightdeck-message> envelope — only a conversation's own send is attributed`,
+    );
+}
 
 /** The conversation a live session handle belongs to (the in-app caller). */
 function convBySession(session: string | null): Conversation | null {
@@ -200,6 +227,17 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     if (!turn || turn.parentToolUseId) continue;
     const text = turnText(turn);
     if (!text) continue;
+    // A message another conversation sent: attributed, rather than passing the envelope's
+    // tags off as the user's own words.
+    const agent = turn.role === "user" ? parseAgentMessage(text) : null;
+    if (agent) {
+      out.push({
+        role: "user",
+        from_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
+        text: clip(agent.body, 4000),
+      });
+      continue;
+    }
     out.push({ role: turn.role, text: clip(text, 4000) });
   }
   return out.reverse();
@@ -456,6 +494,17 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   const caller = convBySession(session);
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
+  if (!caller) assertNotForgedEnvelope("send_message", "text", text);
+  // From another conversation, the message travels inside its attribution envelope, so the
+  // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
+  // id it carries links the send to its arrival for navigation. A caller with no conversation
+  // (the voice agent, the phone relay, an external MCP client) is the human speaking through
+  // another surface: that text goes as is.
+  const messageId = caller ? crypto.randomUUID() : null;
+  const wireText =
+    caller && messageId
+      ? buildAgentMessageEnvelope(senderOf(caller), messageId, text)
+      : text;
   // Hydrate a COLD conversation's timeline BEFORE the send creates a live entry:
   // `loadConversationHistory` is additive and assumes it runs on a fresh entry —
   // loading it later (read_conversation, or the user opening the thread) would
@@ -466,17 +515,31 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   // `queued: busy` mirrors the composer's own send exactly (pending badge +
   // durable injectedMidTurn flag for clean-output's round grouping) — a tool
   // call and the equivalent click must never mean two different things.
-  await sendConversationMessage(conv.id, { text, queued: busy });
+  await sendConversationMessage(conv.id, { text: wireText, queued: busy });
+  if (caller && messageId) {
+    pushAgentMessageToast({
+      fromConvId: caller.id,
+      fromTitle: caller.name,
+      toConvId: conv.id,
+      toTitle: conv.name,
+      messageId,
+      excerpt: clip(text.replace(/\s+/g, " "), 160),
+    });
+  }
   return {
     conversation_id: conv.id,
     delivered: true,
+    ...(messageId ? { message_id: messageId } : {}),
     ...(busy ? { note: "the agent was mid-turn; the message was queued/injected" } : {}),
   };
 }
 
-async function createConversation(args: Record<string, unknown>) {
+async function createConversation(args: Record<string, unknown>, session: string | null) {
   const raw = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
   if (!raw) throw new Error("create_conversation: 'repo_path' is required");
+  // Before anything is created: a refused first message must not leave an empty conversation.
+  if (!convBySession(session) && typeof args.first_message === "string")
+    assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
   const repoPath = normalizeFolderPath("create_conversation", raw);
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.
@@ -494,8 +557,34 @@ async function createConversation(args: Record<string, unknown>) {
   const title = typeof args.title === "string" ? args.title.trim() : "";
   if (title) useConversationsStore.getState().renameConversation(id, title);
   const first = typeof args.first_message === "string" ? args.first_message.trim() : "";
-  if (first) await sendConversationMessage(id, { text: first });
-  return { conversation_id: id, repo_path: repoPath, backend, started: Boolean(first) };
+  // Created BY a conversation: its first message carries the same attribution as a
+  // send_message (the new agent knows who started it; the id links both sides), and the
+  // creation is announced. A caller with no conversation is the human: nothing changes.
+  const caller = convBySession(session);
+  const messageId = caller && first ? crypto.randomUUID() : null;
+  if (first) {
+    const text = caller && messageId ? buildAgentMessageEnvelope(senderOf(caller), messageId, first) : first;
+    await sendConversationMessage(id, { text });
+  }
+  if (caller) {
+    pushConversationCreatedToast({
+      fromConvId: caller.id,
+      fromTitle: caller.name,
+      convId: id,
+      title:
+        useConversationsStore.getState().conversations.find((c) => c.id === id)?.name ??
+        (title || baseName(repoPath)),
+      repo: baseName(repoPath),
+      messageId,
+    });
+  }
+  return {
+    conversation_id: id,
+    repo_path: repoPath,
+    backend,
+    started: Boolean(first),
+    ...(messageId ? { message_id: messageId } : {}),
+  };
 }
 
 function focusConversation(
@@ -779,7 +868,7 @@ export async function executeAppControlTool(
     case "send_message":
       return sendMessage(args, session);
     case "create_conversation":
-      return createConversation(args);
+      return createConversation(args, session);
     case "list_models":
       return listModels();
     case "set_conversation_model":

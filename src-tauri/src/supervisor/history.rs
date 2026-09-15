@@ -450,6 +450,44 @@ fn strip_wrapper<'a>(t: &'a str, tag: &str) -> Option<&'a str> {
     Some(inner.strip_suffix(&format!("</{tag}>")).unwrap_or(inner))
 }
 
+/// The attribution envelope one conversation wraps around a message it sends another through
+/// the app's `send_message` / `create_conversation` tools (mirror of the front's
+/// `agentMessage.ts`). ⚠️ NOT `<agent-message>`: the claude CLI owns that tag — it frames a
+/// sub-agent's hand-back as `<agent-message from="…">` and its renderer matches it.
+const AGENT_MESSAGE_OPEN: &str = "<flightdeck-message>";
+const AGENT_MESSAGE_CLOSE: &str = "</flightdeck-message>";
+
+/// Does this text OPEN on an agent-message envelope (the front's strict gate — prose that merely
+/// mentions the tag never does)?
+pub(crate) fn is_agent_message(text: &str) -> bool {
+    text.trim_start().starts_with(AGENT_MESSAGE_OPEN)
+}
+
+/// What an agent-to-agent message SAYS: the body of its attribution envelope (mirror of the
+/// front's `agentMessage.ts` parse: strict open-on-the-tag gate, body from the first `<body>`
+/// to the LAST `</body>`). A listing shows the message, never the tags. Anything else —
+/// including an envelope with an empty body — comes back unchanged.
+pub(crate) fn unwrap_agent_message(text: &str) -> &str {
+    let Some(rest) = text.trim_start().strip_prefix(AGENT_MESSAGE_OPEN) else {
+        return text;
+    };
+    let Some(open) = rest.find("<body>") else {
+        return text;
+    };
+    let start = open + "<body>".len();
+    let end = rest
+        .rfind("</body>")
+        .filter(|&e| e >= start)
+        .or_else(|| rest.rfind(AGENT_MESSAGE_CLOSE).filter(|&e| e >= start))
+        .unwrap_or(rest.len());
+    let body = rest[start..end].trim();
+    if body.is_empty() {
+        text
+    } else {
+        body
+    }
+}
+
 /// Strip the `<ide_opened_file>…</ide_opened_file>` banner the IDE integration PREPENDS to
 /// a real prompt, in the same content array. Unlike everything in
 /// [`classify_injected_text`], this one must NOT drop the line: the human's actual message
@@ -535,7 +573,10 @@ pub(crate) fn parse_transcript_str(
         match entry.get("type").and_then(Value::as_str) {
             Some("user") => push_user(&entry, &mut items),
             Some("assistant") => push_assistant(&entry, &mut items),
-            // mode / system / attachment / file-history-snapshot / summary / … —
+            // The one attachment that carries a turn: a message another conversation sent
+            // mid-turn (see `push_queued_agent_message`).
+            Some("attachment") => push_queued_agent_message(&entry, &mut items),
+            // mode / system / file-history-snapshot / summary / … —
             // bookkeeping the UI does not render.
             _ => {}
         }
@@ -632,12 +673,73 @@ fn push_user_text(uuid: &str, text: &str, items: &mut Vec<ConversationItem>) {
         }
         None => {}
     }
+    // Already restored from its `queued_command` attachment (it landed mid-turn): never twice.
+    if is_agent_message(text) && has_user_message(items, text) {
+        return;
+    }
     items.push(ConversationItem::UserMessage {
         id: uuid.to_string(),
         text: text.to_string(),
         parent_tool_use_id: None,
         // A transcript restore is already chronological → appended, never spliced.
         replay: false,
+        mid_turn: false,
+    });
+}
+
+fn has_user_message(items: &[ConversationItem], text: &str) -> bool {
+    items
+        .iter()
+        .any(|i| matches!(i, ConversationItem::UserMessage { text: t, .. } if t == text))
+}
+
+/// A message another conversation sent while this one was mid-turn.
+///
+/// ⚠️ The CLI writes NO `user` line for a prompt it queued and injected into a running turn:
+/// the only trace on disk is an `attachment{type:"queued_command", prompt}` line at the
+/// injection point (verified on 2.1.272). Skipping attachments made such a message vanish on
+/// reload — and with it the target of the sender's jump to its arrival.
+///
+/// Scoped to the app's own envelope on purpose. A human's queued prompt restored here would
+/// get rewind/fork controls whose text locator only knows `user` lines, and the CLI's own
+/// queued lines (task notifications, sub-agent hand-backs flagged `isMeta`) are plumbing.
+fn push_queued_agent_message(entry: &Value, items: &mut Vec<ConversationItem>) {
+    let Some(att) = entry.get("attachment") else {
+        return;
+    };
+    if att.get("type").and_then(Value::as_str) != Some("queued_command") {
+        return;
+    }
+    if [entry, att]
+        .iter()
+        .any(|v| v.get("isMeta").and_then(Value::as_bool) == Some(true))
+    {
+        return;
+    }
+    let text = match att.get("prompt") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return,
+    };
+    if !is_agent_message(&text) || has_user_message(items, &text) {
+        return;
+    }
+    let id = entry
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| format!("queued-{}", items.len()), str::to_string);
+    items.push(ConversationItem::UserMessage {
+        id,
+        text,
+        parent_tool_use_id: None,
+        replay: false,
+        mid_turn: true,
     });
 }
 
@@ -1299,7 +1401,7 @@ fn first_user_text(entry: &Value) -> Option<String> {
     if text.trim().is_empty() || classify_injected_text(text).is_some() {
         None
     } else {
-        Some(text.to_string())
+        Some(unwrap_agent_message(text).to_string())
     }
 }
 
@@ -2073,6 +2175,69 @@ mod tests {
         let v: Value =
             serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#).unwrap();
         assert_eq!(first_user_text(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn an_agent_message_is_listed_by_what_it_says() {
+        let envelope = "<flightdeck-message>\n<from>Refactor auth</from>\n<message-id>m1</message-id>\n\
+                        <body>\nPlease rebase on dev\n</body>\n</flightdeck-message>";
+        let v = serde_json::json!({ "type": "user", "message": { "role": "user", "content": envelope } });
+        assert_eq!(first_user_text(&v).as_deref(), Some("Please rebase on dev"));
+        // Tag-looking text inside the body stays part of it.
+        assert_eq!(
+            unwrap_agent_message("<flightdeck-message>\n<body>\na </body> b\n</body>\n</flightdeck-message>"),
+            "a </body> b"
+        );
+        // Prose that merely mentions the tag, and an empty envelope, are left alone.
+        assert_eq!(
+            unwrap_agent_message("what is <flightdeck-message>?"),
+            "what is <flightdeck-message>?"
+        );
+        let empty = "<flightdeck-message>\n<body>\n</body>\n</flightdeck-message>";
+        assert_eq!(unwrap_agent_message(empty), empty);
+        // The claude CLI's own frame is not ours.
+        let cli = "<agent-message from=\"a1\">\n<body>\nreport\n</body>\n</agent-message>";
+        assert!(!is_agent_message(cli));
+        assert_eq!(unwrap_agent_message(cli), cli);
+    }
+
+    #[test]
+    fn a_mid_turn_agent_message_is_restored_from_its_queued_command() {
+        // The CLI writes no `user` line for a message it injected into a running turn — only a
+        // `queued_command` attachment. Ours comes back (flagged mid-turn); nothing else does.
+        let envelope = "<flightdeck-message>\n<from>A</from>\n<message-id>m1</message-id>\n\
+                        <body>\nhi\n</body>\n</flightdeck-message>";
+        let lines = [
+            serde_json::json!({ "type": "user", "uuid": "u1", "message": { "role": "user", "content": "go" } }),
+            serde_json::json!({ "type": "attachment", "uuid": "att-1", "attachment": {
+                "type": "queued_command", "commandMode": "prompt",
+                "prompt": [{ "type": "text", "text": envelope }] } }),
+            // CLI plumbing queued the same way stays out: a task notification…
+            serde_json::json!({ "type": "attachment", "uuid": "att-2", "attachment": {
+                "type": "queued_command", "commandMode": "task-notification",
+                "prompt": "<task-notification>\n<task-id>t</task-id>\n</task-notification>" } }),
+            // …a sub-agent hand-back (even one shaped like our envelope)…
+            serde_json::json!({ "type": "attachment", "uuid": "att-3", "attachment": {
+                "type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": envelope } }),
+            // …and a human's queued prompt (its rewind locator only knows `user` lines).
+            serde_json::json!({ "type": "attachment", "uuid": "att-4", "attachment": {
+                "type": "queued_command", "commandMode": "prompt", "prompt": "also do Y" } }),
+            // The same envelope written again as a plain line is not duplicated.
+            serde_json::json!({ "type": "user", "uuid": "u-dup", "message": { "role": "user", "content": envelope } }),
+        ];
+        let content = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let (items, skipped) = parse_transcript_str(&content, true);
+        assert_eq!(skipped, 0);
+        let users: Vec<(&str, &str, bool)> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { id, text, mid_turn, .. } => {
+                    Some((id.as_str(), text.as_str(), *mid_turn))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec![("u1", "go", false), ("att-1", envelope, true)]);
     }
 
     #[test]

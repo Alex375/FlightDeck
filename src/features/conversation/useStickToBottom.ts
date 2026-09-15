@@ -36,6 +36,10 @@ export interface StickToBottom {
   onRender: () => void;
   /** Engage following and smooth-scroll to the bottom — used on send. */
   scrollToBottom: () => void;
+  /** Hand the position over to an explicit jump to one message (see useThreadJumpTarget):
+   *  end the initial-position restore and stop following the bottom, so neither pulls the
+   *  thread away from the message it was just scrolled to. */
+  release: () => void;
 }
 
 /**
@@ -209,6 +213,11 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, []);
 
+  const release = useCallback(() => {
+    restoring.current = false;
+    following.current = false;
+  }, []);
+
   // Drive the restore for frames where nothing re-renders the thread (the async load
   // settling after first paint). `onRender` covers render-triggered frames before
   // paint; this rAF covers the gaps. Both stop the moment the restore is done.
@@ -333,5 +342,5 @@ export function useStickToBottom(convId: string, preserveKey?: unknown): StickTo
     programmaticTop.current = el.scrollTop;
   }, [preserveKey]);
 
-  return { scrollRef, scrollEl, onRender, scrollToBottom };
+  return { scrollRef, scrollEl, onRender, scrollToBottom, release };
 }

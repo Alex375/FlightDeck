@@ -275,6 +275,12 @@ pub enum ConversationItem {
         /// can arrive out-of-order). `false` for a chronological transcript restore,
         /// which the UI appends. See the front `user_message` reducer.
         replay: bool,
+        /// `true` when the message reached the agent WHILE a turn was running (the CLI queued
+        /// it and injected it mid-work) — restored from a transcript's `queued_command`
+        /// attachment. The UI keeps it as the durable `injectedMidTurn` flag its own mid-turn
+        /// sends set, so clean output groups a restored round exactly as it did live.
+        #[serde(default)]
+        mid_turn: bool,
     },
     /// The authoritative assembled assistant message (text + tool_use blocks).
     /// Carries the same `id` as the streamed `message_start` — the UI reconciles.

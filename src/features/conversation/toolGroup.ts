@@ -15,6 +15,7 @@ import { isRunInBackground } from "../../agent/subagentMeta";
 import { parseMcpToolName, prettyMcpServer } from "../../agent/toolNames";
 import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
+import { isAgentMessagingTool } from "./agentMessage";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
  *  step rows and the static transcript pick the same glyph for a given tool. */
@@ -63,7 +64,7 @@ export interface ToolStep {
  */
 export interface BlockMarker {
   type: "marker";
-  markerKind: "notice" | "user";
+  markerKind: RoundMarker["markerKind"];
   /** notice id or user turn id, resolved to content at render. */
   id: string;
   key: string;
@@ -96,6 +97,11 @@ export type Segment =
   // DELIVERABLE, never intermediate work, so it is also peeled out of the clean-output work fold
   // (see splitFinalMessage) and shown in clear even when buried mid-round (see renderFoldedWork).
   | { kind: "artifact"; key: string; step: ToolStep }
+  // A message sent to another conversation (the flightdeck `send_message` tool, or
+  // `create_conversation` with its first message) is its own "message sent" row instead of an
+  // anonymous MCP step. Unlike a plan or an artifact it is ordinary work: under clean output it
+  // folds with the rest of the round.
+  | { kind: "message"; key: string; step: ToolStep }
   // `AskUserQuestion` — an interactive question to the user — is a DECISION artifact exactly
   // like a plan: it renders as its OWN inline card (question + chosen answer once settled)
   // instead of an anonymous "Question" step row buried in a collapsed run, and it is peeled
@@ -105,7 +111,7 @@ export type Segment =
   // An in-band marker (control-change bar / message injected mid-work) shown inline in the
   // flow. NOT work: it doesn't count as a step and never breaks the clean-output work fold —
   // it just renders at its chronological place (see coalesceCleanRounds / interleaveMarkers).
-  | { kind: "marker"; key: string; markerKind: "notice" | "user"; id: string };
+  | { kind: "marker"; key: string; markerKind: RoundMarker["markerKind"]; id: string };
 
 /**
  * A tool_use that is NEVER shown inline in the thread — it lives in a pinned bar or
@@ -204,6 +210,14 @@ export function groupBlocks(
         out.push({ kind: "artifact", key: `art-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;
       }
+      // A message to another conversation (or a conversation created with its first message)
+      // is its own compact row — it breaks the run so the exchange reads as messaging, not as
+      // one more MCP step.
+      if (isAgentMessagingTool(b.name)) {
+        run = null;
+        out.push({ kind: "message", key: `msg-${i}`, step: { id: b.id, name: b.name, input: b.input } });
+        return;
+      }
       // AskUserQuestion is a decision artifact (question + answer) — its own inline card,
       // breaks the run so the exchange stays readable in the flow.
       if (b.name === "AskUserQuestion") {
@@ -300,6 +314,8 @@ export type WorkAtom =
   // counts as a step nor holds the live window open (its publish settles quickly). It is pulled
   // back into clear by renderFoldedWork so a published artifact is never hidden.
   | { kind: "artifact"; key: string; step: ToolStep }
+  // A "message sent" card: folds with the surrounding work like any tool.
+  | { kind: "message"; key: string; step: ToolStep }
   // A question card: a non-step atom (like plan) — folds only when buried mid-work, never
   // counts as a step nor holds the live window open.
   | { kind: "question"; key: string; step: ToolStep }
@@ -307,7 +323,7 @@ export type WorkAtom =
   | { kind: "text"; key: string; text: string }
   // An in-band marker: a non-step atom (like text/thinking) — it folds with the surrounding
   // work but never counts as a step nor forces the fold open.
-  | { kind: "marker"; key: string; markerKind: "notice" | "user"; id: string };
+  | { kind: "marker"; key: string; markerKind: RoundMarker["markerKind"]; id: string };
 
 /**
  * Is this a DECISION or a DELIVERABLE rather than intermediate work?
@@ -323,10 +339,22 @@ export type WorkAtom =
  * full-height card twice for the whole flight; miss it in the fold split and an open fold plays
  * no arrival at all. Both are visual-only, so no test falls over.
  *
+ * A fourth case rides the same predicate: a message ANOTHER conversation sent this one, landed
+ * mid-work (an `agent` marker). It is addressed to this agent like a prompt, so it is never
+ * tucked away as intermediate work — the one thing the recipient's reader must not miss.
+ *
  * Typed on the shared `kind` field so it reads a {@link Segment} and a {@link WorkAtom} alike.
  */
-export function isDecisionKind(item: { kind: Segment["kind"] | WorkAtom["kind"] }): boolean {
-  return item.kind === "plan" || item.kind === "artifact" || item.kind === "question";
+export function isDecisionKind(item: {
+  kind: Segment["kind"] | WorkAtom["kind"];
+  markerKind?: RoundMarker["markerKind"];
+}): boolean {
+  return (
+    item.kind === "plan" ||
+    item.kind === "artifact" ||
+    item.kind === "question" ||
+    (item.kind === "marker" && item.markerKind === "agent")
+  );
 }
 
 /** Flatten work segments into per-item atoms (a run → one atom per step). */
@@ -346,6 +374,8 @@ export function flattenWork(segs: Segment[]): WorkAtom[] {
       out.push({ kind: "plan", key: seg.key, step: seg.step });
     } else if (seg.kind === "artifact") {
       out.push({ kind: "artifact", key: seg.key, step: seg.step });
+    } else if (seg.kind === "message") {
+      out.push({ kind: "message", key: seg.key, step: seg.step });
     } else if (seg.kind === "question") {
       out.push({ kind: "question", key: seg.key, step: seg.step });
     } else if (seg.kind === "thinking") {
@@ -389,6 +419,7 @@ export function atomsToSegments(atoms: WorkAtom[], keyPrefix: string): Segment[]
     else if (a.kind === "skill") out.push({ kind: "skill", key: a.key, step: a.step });
     else if (a.kind === "plan") out.push({ kind: "plan", key: a.key, step: a.step });
     else if (a.kind === "artifact") out.push({ kind: "artifact", key: a.key, step: a.step });
+    else if (a.kind === "message") out.push({ kind: "message", key: a.key, step: a.step });
     else if (a.kind === "question") out.push({ kind: "question", key: a.key, step: a.step });
     else if (a.kind === "thinking") out.push({ kind: "thinking", key: a.key, text: a.text });
     else if (a.kind === "marker")
@@ -440,7 +471,10 @@ export function liveVisibleStart(
   let runningStart = atoms.length;
   for (let i = 0; i < atoms.length; i++) {
     const a = atoms[i];
-    if ((a.kind === "step" || a.kind === "agent" || a.kind === "workflow") && isRunning(a.step.id)) {
+    if (
+      (a.kind === "step" || a.kind === "agent" || a.kind === "workflow" || a.kind === "message") &&
+      isRunning(a.step.id)
+    ) {
       runningStart = i;
       break;
     }
@@ -486,26 +520,34 @@ export function atomStillRunning(opts: {
 }
 
 /** How many "steps" a stretch of work represents, for the "Claude's work — N
- *  steps" header: every tool step across its runs PLUS each sub-agent (in clean-output the
- *  sub-agents fold into the block too, so they count as work). Prose and thinking are not
- *  steps and are not counted. */
+ *  steps" header: every tool step across its runs PLUS each sub-agent and each message sent
+ *  (in clean-output they fold into the block too, so they count as work). Prose and thinking
+ *  are not steps and are not counted. */
 export function countWorkSteps(segments: Segment[]): number {
   let n = 0;
   for (const s of segments) {
     if (s.kind === "run") n += s.steps.length;
-    else if (s.kind === "agent" || s.kind === "workflow") n += 1;
+    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message") n += 1;
   }
   return n;
 }
 
-/** The tool_use ids of a stretch of work — run steps + sub-agents, in order. Lets a fold
- *  subscribe to EXACTLY its own tools' results (running / errored) instead of the whole
- *  result map, so a settled round doesn't re-render while a later turn streams. */
+/** The tool_use ids of the "message sent" cards in a stretch of work. Stamped on the fold
+ *  that hides them, so a jump from the recipient's side can find the block and open it. */
+export function sentMessageIds(segments: Segment[]): string[] {
+  return segments.flatMap((s) => (s.kind === "message" ? [s.step.id] : []));
+}
+
+/** The tool_use ids of a stretch of work — run steps + sub-agents + messages sent, in order.
+ *  Lets a fold subscribe to EXACTLY its own tools' results (running / errored) instead of the
+ *  whole result map, so a settled round doesn't re-render while a later turn streams. A message
+ *  sent is tracked like any tool: a send to a cold conversation (history load + spawn) can take
+ *  seconds, and it must not fold away while it still reads "sending". */
 export function workStepIds(segments: Segment[]): string[] {
   const ids: string[] = [];
   for (const s of segments) {
     if (s.kind === "run") for (const st of s.steps) ids.push(st.id);
-    else if (s.kind === "agent" || s.kind === "workflow") ids.push(s.step.id);
+    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message") ids.push(s.step.id);
   }
   return ids;
 }

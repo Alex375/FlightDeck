@@ -28,6 +28,7 @@ import { QuestionnaireCard } from "./QuestionnaireAsk";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
+import { AgentMessageSentView } from "./AgentMessageCards";
 import { NoticeBlock } from "./noticeView";
 
 interface JoinedResult {
@@ -61,6 +62,17 @@ function renderSegments(segments: Segment[], results: Map<string, JoinedResult>)
       return <StaticToolStep key={seg.key} step={seg.step} result={results.get(seg.step.id)} />;
     // A model-invoked slash-command: the same dedicated command chip as the live thread.
     if (seg.kind === "skill") return <SkillChip key={seg.key} input={seg.step.input} />;
+    // A message to another conversation: the same "message sent" card as the live thread.
+    if (seg.kind === "message")
+      return (
+        <AgentMessageSentView
+          key={seg.key}
+          name={seg.step.name}
+          toolUseId={seg.step.id}
+          input={seg.step.input}
+          result={results.get(seg.step.id)}
+        />
+      );
     // In-band markers only exist in the LIVE thread (interleaveMarkers); a disk transcript
     // has none, but the union requires the branch — render nothing.
     if (seg.kind === "marker") return null;

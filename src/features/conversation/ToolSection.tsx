@@ -387,6 +387,7 @@ export function ClaudeWorkBlock({
   children,
   foldConv,
   foldKey,
+  jumpAnchors,
 }: {
   count: number;
   children: ReactNode;
@@ -396,8 +397,13 @@ export function ClaudeWorkBlock({
    *  state: the clean-output memory applies to the main thread only. */
   foldConv?: string;
   foldKey?: string;
+  /** tool_use ids of the "message sent" cards folded inside. Stamped on the block (with its
+   *  fold key) so a jump to one of those messages can find the block and open it — a closed
+   *  block does not mount its children, so the card itself is not in the DOM to be found. */
+  jumpAnchors?: string[];
 }) {
   const persisted = Boolean(foldConv && foldKey);
+  const anchored = persisted && !!jumpAnchors?.length;
   // Hooks run unconditionally (persisted or not); we just pick which state drives the UI.
   const storeOpen = useWorkFold((s) =>
     persisted ? (s.open[foldConv!]?.[foldKey!] ?? false) : false,
@@ -425,7 +431,11 @@ export function ClaudeWorkBlock({
   // matching the neighbouring labels ("Executed N steps").
   const label = count > 0 ? `Work · ${count} step${count > 1 ? "s" : ""}` : "Work";
   return (
-    <div className="cv-work">
+    <div
+      className="cv-work"
+      data-jump-anchors={anchored ? jumpAnchors!.join(" ") : undefined}
+      data-fold-key={anchored ? foldKey : undefined}
+    >
       <button
         type="button"
         className="cv-work-h"

@@ -17,6 +17,7 @@ import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { triggerLastMessageSummary } from "../store/lastMessageSummary";
 import { buildCodexControls } from "../features/conversation/codexControls";
+import { agentMessageTopic, parseAgentMessage } from "../features/conversation/agentMessage";
 import {
   endGoalClearing,
   refreshActiveGoal,
@@ -59,6 +60,11 @@ export async function sendConversationMessage(
   const showBubble = goal !== "plumbing";
   // Auto-title / "last ask" summary are for real conversational content only — never a `/goal`.
   const driveTitle = goal === undefined;
+  // A message from another conversation (flightdeck `send_message`) arrives inside its
+  // attribution envelope: a title comes from what it SAYS, never the tags, and it is not the
+  // user's "last ask" either.
+  const fromAgent = parseAgentMessage(text) !== null;
+  const topic = agentMessageTopic(text);
   // The core does not echo user turns, so append optimistically (keyed by the
   // stable id) before sending — instant even while the session spawns.
   let bubbleTurnId = "";
@@ -73,7 +79,7 @@ export async function sendConversationMessage(
     // the "New conversation" placeholder for good. This is the single send path, so every
     // caller gets the same behaviour. Idempotent — a conversation that already has a name
     // is left alone. Skipped for a `/goal`, which is a directive, not a topic.
-    if (driveTitle) useConversationsStore.getState().noteFirstMessage(convId, text);
+    if (driveTitle) useConversationsStore.getState().noteFirstMessage(convId, topic);
     // Sending the next message consumes any pending reminder: the user has moved on from
     // the previous result. `addUserTurn` clears the LIVE turnSeen, so the PERSISTED reminder
     // must be cleared under the SAME condition — a "plumbing" send does neither. Otherwise it
@@ -119,12 +125,12 @@ export async function sendConversationMessage(
     // frozen; no-op once renamed / over the cap / no live session). Like the VS Code
     // extension, but tracking the evolving topic. The title arrives via
     // SessionTitleEvent and replaces the optimistic placeholder name.
-    useConversationsStore.getState().triggerAutoTitle(convId, text);
+    useConversationsStore.getState().triggerAutoTitle(convId, topic);
     // Also (re)generate the Flight Deck's few-word summary of THIS message (the
     // "last ask"). Instant truncation now, replaced by a ≤6-word Haiku summary that
     // arrives via SessionSummaryEvent. Regenerated on every send (unlike the title,
     // which settles). `handle` is the live session we just sent through.
-    triggerLastMessageSummary(convId, handle, text);
+    if (!fromAgent) triggerLastMessageSummary(convId, handle, text);
   }
   if (goal !== undefined) {
     // A `/goal` was ACCEPTED. Refresh the target chip from the transcript on a short bounded

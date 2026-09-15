@@ -1,0 +1,151 @@
+/* In-app toasts: a narrow stack under the title bar, top-right. Above the Settings and History
+   panels (100), which a jump closes on its way to the thread (App); BELOW the blocking layers
+   (confirm dialogs, transcript / workflow popovers, portalled menus: 200), so a toast's jump
+   link can never navigate away underneath a dialog that is still open. */
+.stack {
+  position: fixed;
+  top: 52px;
+  right: 16px;
+  z-index: 150;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 8px 10px 12px;
+  border: 1px solid var(--wf-line);
+  border-radius: 10px;
+  background: var(--wf-panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  animation: toast-in 0.18s ease-out;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.ico {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-lo);
+}
+
+.ico :global(.wf-ico) {
+  width: 12px;
+  height: 12px;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.info {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--wf-tx);
+  padding-top: 3px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.conv {
+  min-width: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.link {
+  cursor: pointer;
+}
+
+.link:hover,
+.link:focus-visible {
+  text-decoration: underline;
+  outline: none;
+}
+
+.arrow {
+  flex: none;
+  color: var(--wf-tx-lo);
+}
+
+.verb {
+  flex: none;
+  font-size: 12px;
+  color: var(--wf-tx-lo);
+}
+
+.excerpt {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+
+.close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+
+.close:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+.close :global(.wf-ico) {
+  width: 11px;
+  height: 11px;
+}
