@@ -232,7 +232,10 @@ fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
                     _ => String::new(),
                 };
                 if !text.trim().is_empty() {
-                    excerpt = Some(history::flatten_truncate(&text, EXCERPT_CHARS));
+                    excerpt = Some(history::flatten_truncate(
+                        history::unwrap_agent_message(&text),
+                        EXCERPT_CHARS,
+                    ));
                 }
             }
             _ => {}
@@ -357,7 +360,7 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                     let text = message_text(payload);
                     if !text.trim().is_empty() {
                         if excerpt.is_empty() {
-                            excerpt = history::flatten_truncate(&text, EXCERPT_CHARS);
+                            excerpt = history::flatten_truncate(history::unwrap_agent_message(&text), EXCERPT_CHARS);
                         }
                         history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
                     }
@@ -379,7 +382,7 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                             let text = content_text(item.get("content"));
                             if !text.trim().is_empty() {
                                 if excerpt.is_empty() {
-                                    excerpt = history::flatten_truncate(&text, EXCERPT_CHARS);
+                                    excerpt = history::flatten_truncate(history::unwrap_agent_message(&text), EXCERPT_CHARS);
                                 }
                                 history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
                             }

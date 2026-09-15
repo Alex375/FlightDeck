@@ -12,6 +12,7 @@ import { BashBar } from "./BashBar";
 import { MonitorBar } from "./MonitorBar";
 import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
+import { useThreadJumpTarget } from "./useThreadJumpTarget";
 import { useEffectiveCleanOutput } from "../../store/display";
 
 /**
@@ -50,7 +51,9 @@ export function ConversationPane({
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
   // of jumping when the user flips it (via the chip or the global default).
   const cleanOutput = useEffectiveCleanOutput(session);
-  const { scrollRef, scrollEl, onRender, scrollToBottom } = useStickToBottom(session, cleanOutput);
+  const { scrollRef, scrollEl, onRender, scrollToBottom, release } = useStickToBottom(session, cleanOutput);
+  // Scroll to a message another conversation's card (or a toast) asked to be shown here.
+  useThreadJumpTarget(session, scrollEl, release);
   // The pane is the positioning context (position:relative in CSS) AND the scope for the
   // pin's "scroll to my last message" lookup — see LastMessagePin.
   const paneRef = useRef<HTMLDivElement>(null);

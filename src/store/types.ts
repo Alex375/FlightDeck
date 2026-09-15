@@ -186,9 +186,11 @@ export type TimelineEntry =
  * chronological place WITHOUT breaking the work fold — the fix for "a mid-turn marker cuts
  * clean output in two". `after` = how many of the round's assistant turns precede it (0 =
  * before the first turn); the referenced `id` is resolved to content only at render time.
+ * `agent` is a `user` turn that another conversation sent (an `<agent-message>` envelope):
+ * it renders in place like `user`, but stays in clear instead of folding with the work.
  */
 export interface RoundMarker {
-  markerKind: "notice" | "user";
+  markerKind: "notice" | "user" | "agent";
   id: string;
   after: number;
 }

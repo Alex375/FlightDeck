@@ -77,7 +77,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             name: "send_message",
             description: "Send a prompt to a conversation's agent. Starts the agent if it is \
                 not running; if a turn is already in flight the message is queued and injected \
-                mid-turn. Returns immediately after delivery — read the reply later with \
+                mid-turn. Sent from a conversation, the message reaches the recipient \
+                attributed to yours (title + conversation id) and the result carries its \
+                message_id. Returns immediately after delivery — read the reply later with \
                 read_conversation (or wait_for_events on the voice bridge).",
             kind: ToolKind::Front,
             schema: obj(

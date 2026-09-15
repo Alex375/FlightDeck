@@ -36,6 +36,8 @@
   --wf-done-bg:   #23252c;
   --wf-err:       #e0727c;   /* error */
   --wf-err-bg:    #3a1f23;
+  --wf-msg:       #6fbfcf;   /* a message between two agent conversations */
+  --wf-msg-bg:    #17303a;
 
   /* permission modes (⇧Tab selector, Claude Code terminal style) */
   --wf-perm-auto:       #e3c54e;  /* auto — yellow */

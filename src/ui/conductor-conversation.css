@@ -496,6 +496,43 @@
 .cv-tasknote-result { padding-left:31px; min-width:0; font-size:12.5px; line-height:1.55; color:var(--wf-tx); }
 .cv-tasknote-note { margin:0; padding-left:31px; font-size:11px; line-height:1.5; color:var(--wf-tx-xlo); }
 
+/* Agent-to-agent message (flightdeck `send_message`), both sides. Reads as MESSAGING: neither
+   the human's bubble (no avatar, no raised fill) nor a tool row. A teal left rule marks the
+   exchange and the header names the OTHER conversation as a chip that jumps to its side. The
+   received card sits in the timeline where a prompt would; the sent card in the assistant flow. */
+.cv-agentmsg { display:flex; flex-direction:column; gap:8px; min-width:0; padding:10px 13px 11px; border:1px solid var(--wf-line); border-left:2px solid var(--wf-msg); border-radius:10px; background:var(--wf-panel); }
+.cv-agentmsg.is-sent { border-left-color:color-mix(in srgb, var(--wf-msg) 55%, var(--wf-line)); }
+.cv-agentmsg[data-state="error"] { border-left-color:color-mix(in srgb, var(--wf-err) 65%, var(--wf-line)); }
+.cv-agentmsg-h { display:flex; align-items:center; flex-wrap:wrap; gap:6px 8px; min-width:0; }
+.cv-agentmsg-ico { flex:none; display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:6px; background:var(--wf-msg-bg); color:var(--wf-msg); }
+.cv-agentmsg-ico .wf-ico { width:12px; height:12px; }
+.cv-agentmsg-kind { flex:none; font-size:10px; font-weight:600; letter-spacing:.4px; text-transform:uppercase; color:var(--wf-tx-lo); }
+.cv-agentmsg-conv { display:inline-flex; align-items:center; gap:6px; min-width:0; max-width:100%; padding:2px 8px 2px 6px; border:1px solid var(--wf-line); border-radius:7px; background:var(--wf-bg-2); font:inherit; font-size:12px; color:var(--wf-tx-hi); text-align:left; }
+button.cv-agentmsg-conv { cursor:pointer; transition:border-color .14s ease, background .14s ease; }
+button.cv-agentmsg-conv:hover,
+button.cv-agentmsg-conv:focus-visible { border-color:color-mix(in srgb, var(--wf-msg) 50%, var(--wf-line)); background:var(--wf-panel-3); outline:none; }
+.cv-agentmsg-mark { flex:none; display:inline-flex; align-items:center; width:12px; height:12px; }
+.cv-agentmsg-mark svg { width:12px; height:12px; }
+.cv-agentmsg-conv-t { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+.cv-agentmsg-conv-repo { flex:none; font-size:11px; color:var(--wf-tx-lo); }
+.cv-agentmsg-conv-repo::before { content:"·"; margin-right:6px; opacity:.6; }
+.cv-agentmsg-conv-gone { flex:none; font-size:11px; font-style:italic; color:var(--wf-tx-xlo); }
+.cv-agentmsg-go { flex:none; color:var(--wf-tx-lo); transition:color .14s ease; }
+.cv-agentmsg-conv .wf-ico.cv-agentmsg-go { width:11px; height:11px; }
+button.cv-agentmsg-conv:hover .cv-agentmsg-go { color:var(--wf-msg); }
+.cv-agentmsg-status { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; letter-spacing:.4px; text-transform:uppercase; background:var(--wf-panel-3); color:var(--wf-tx-lo); }
+.cv-agentmsg-status.is-ok { background:var(--wf-run-bg); color:var(--wf-run); }
+.cv-agentmsg-status.is-wait { background:var(--wf-wait-bg); color:var(--wf-wait); }
+.cv-agentmsg-status.is-err { background:var(--wf-err-bg); color:var(--wf-err); }
+.cv-agentmsg-body { padding-left:30px; min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+.cv-agentmsg-err { margin:0; padding-left:30px; font-size:12px; line-height:1.5; color:var(--wf-err); overflow-wrap:anywhere; }
+/* The target of a cross-conversation jump glows briefly, so the eye lands on it. */
+[data-jump-flash] { animation:cv-jump-flash 1.8s ease-out; }
+@keyframes cv-jump-flash {
+  0%, 35% { box-shadow:0 0 0 2px color-mix(in srgb, var(--wf-msg) 70%, transparent); }
+  100% { box-shadow:0 0 0 2px transparent; }
+}
+
 .cv-aibody { flex:1; min-width:0; display:flex; flex-direction:column; gap:13px; padding-top:3px; }
 
 .cv-tool { border:1px solid var(--wf-line); border-radius:8px; background:var(--wf-panel); overflow:hidden; }

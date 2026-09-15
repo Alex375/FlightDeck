@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { parseSpecialMessage, taskNotificationStyle } from "./specialMessage";
+import {
+  parseSpecialMessage as parseAny,
+  taskNotificationStyle,
+  type TaskNotification,
+} from "./specialMessage";
+
+/** These cases only ever feed task notifications — narrow the union so their fields read. */
+const parseTask = (text: string) => parseAny(text) as TaskNotification | null;
 
 describe("parseSpecialMessage", () => {
   it("parses a background-command notification (summary only, no body)", () => {
@@ -10,7 +17,7 @@ describe("parseSpecialMessage", () => {
 <status>completed</status>
 <summary>Background command "Rebuild dev build via overlay config" completed (exit code 0)</summary>
 </task-notification>`;
-    expect(parseSpecialMessage(text)).toEqual({
+    expect(parseTask(text)).toEqual({
       type: "task-notification",
       taskId: "b9bv954mn",
       toolUseId: "toolu_01JvXJnRAY1zhBnCZeLsvbqc",
@@ -36,7 +43,7 @@ describe("parseSpecialMessage", () => {
 The routes are **multi-user** (devis, qonto) with a \`currentUserId\` check.</result>
 <usage><subagent_tokens>85450</subagent_tokens><tool_uses>20</tool_uses><duration_ms>41525</duration_ms></usage>
 </task-notification>`;
-    const parsed = parseSpecialMessage(text);
+    const parsed = parseTask(text);
     expect(parsed).not.toBeNull();
     expect(parsed?.type).toBe("task-notification");
     expect(parsed?.status).toBe("completed");
@@ -55,14 +62,14 @@ The routes are **multi-user** (devis, qonto) with a \`currentUserId\` check.</re
 <result>Here is code: <div class="a">1 &lt; 2</div> and a stray </result> mid-report.</result>
 </task-notification>`;
     // First `<result>` → LAST `</result>`, so the inner stray tag stays in the body.
-    expect(parseSpecialMessage(text)?.result).toBe(
+    expect(parseTask(text)?.result).toBe(
       'Here is code: <div class="a">1 &lt; 2</div> and a stray </result> mid-report.',
     );
   });
 
   it("maps the failed / killed / stopped statuses", () => {
     for (const status of ["failed", "killed", "stopped"] as const) {
-      const parsed = parseSpecialMessage(
+      const parsed = parseTask(
         `<task-notification>\n<task-id>t</task-id>\n<status>${status}</status>\n<summary>s</summary>\n</task-notification>`,
       );
       expect(parsed?.status).toBe(status);
@@ -71,34 +78,34 @@ The routes are **multi-user** (devis, qonto) with a \`currentUserId\` check.</re
 
   it("tolerates leading whitespace before the opening tag", () => {
     const text = "\n  <task-notification>\n<task-id>t</task-id>\n<status>completed</status>\n</task-notification>";
-    expect(parseSpecialMessage(text)?.taskId).toBe("t");
+    expect(parseTask(text)?.taskId).toBe("t");
   });
 
   it("returns null for prose that merely MENTIONS the tag (no false positive)", () => {
     // The exact shape of a real prompt that discusses the feature — must NOT parse.
     expect(
-      parseSpecialMessage(
+      parseTask(
         "Explain how to cleanly render the <task-notification> blocks injected into the thread.",
       ),
     ).toBeNull();
     expect(
-      parseSpecialMessage(
+      parseTask(
         "See the example below:\n<task-notification>\n<task-id>t</task-id>\n</task-notification>",
       ),
     ).toBeNull(); // opens with prose, not the tag
   });
 
   it("returns null for a normal prompt, a slash command and empty text", () => {
-    expect(parseSpecialMessage("just fix the login bug please")).toBeNull();
-    expect(parseSpecialMessage("<command-name>/clear</command-name>")).toBeNull();
-    expect(parseSpecialMessage("")).toBeNull();
+    expect(parseTask("just fix the login bug please")).toBeNull();
+    expect(parseTask("<command-name>/clear</command-name>")).toBeNull();
+    expect(parseTask("")).toBeNull();
   });
 
   it("still parses a truncated block whose closing tag is missing (opens on the tag)", () => {
     // Having opened strictly on the tag, it IS an injection — parse to the end rather
     // than dumping raw XML into a user bubble. (Prose can't reach here: it never opens
     // on the tag, so the anti-false-positive gate is untouched.)
-    const parsed = parseSpecialMessage(
+    const parsed = parseTask(
       "<task-notification>\n<task-id>t</task-id>\n<status>completed</status>",
     );
     expect(parsed?.taskId).toBe("t");
@@ -118,7 +125,7 @@ The routes are **multi-user** (devis, qonto) with a \`currentUserId\` check.</re
 <usage><subagent_tokens>999</subagent_tokens><tool_uses>1</tool_uses></usage></result>
 <usage><subagent_tokens>500</subagent_tokens><tool_uses>7</tool_uses><duration_ms>1234</duration_ms></usage>
 </task-notification>`;
-    const parsed = parseSpecialMessage(text);
+    const parsed = parseTask(text);
     expect(parsed?.summary).toBe("real summary");
     expect(parsed?.note).toBeNull(); // the <note> inside the report must not count
     expect(parsed?.usage).toEqual({ tokens: 500, toolUses: 7, durationMs: 1234 });

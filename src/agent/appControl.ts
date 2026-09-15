@@ -42,6 +42,8 @@ import { useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
+import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
+import { pushAgentMessageToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
 import type { SessionEntry, Turn } from "../store/types";
@@ -95,6 +97,12 @@ async function assertFolder(tool: string, path: string): Promise<void> {
 }
 
 // ---- Caller / target resolution ---------------------------------------------
+
+/** A conversation's repository, as a human label (null when its repo is gone). */
+function repoNameOf(conv: Conversation): string | null {
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId);
+  return repo ? baseName(repo.path) : null;
+}
 
 /** The conversation a live session handle belongs to (the in-app caller). */
 function convBySession(session: string | null): Conversation | null {
@@ -200,6 +208,17 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     if (!turn || turn.parentToolUseId) continue;
     const text = turnText(turn);
     if (!text) continue;
+    // A message another conversation sent: attributed, rather than passing the envelope's
+    // tags off as the user's own words.
+    const agent = turn.role === "user" ? parseAgentMessage(text) : null;
+    if (agent) {
+      out.push({
+        role: "user",
+        from_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
+        text: clip(agent.body, 4000),
+      });
+      continue;
+    }
     out.push({ role: turn.role, text: clip(text, 4000) });
   }
   return out.reverse();
@@ -456,6 +475,20 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   const caller = convBySession(session);
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
+  // From another conversation, the message travels inside its attribution envelope, so the
+  // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
+  // id it carries links the send to its arrival for navigation. A caller with no conversation
+  // (the voice agent, the phone relay, an external MCP client) is the human speaking through
+  // another surface: that text goes as is.
+  const messageId = caller ? crypto.randomUUID() : null;
+  const wireText =
+    caller && messageId
+      ? buildAgentMessageEnvelope(
+          { conversationId: caller.id, title: caller.name, repo: repoNameOf(caller), backend: caller.kind },
+          messageId,
+          text,
+        )
+      : text;
   // Hydrate a COLD conversation's timeline BEFORE the send creates a live entry:
   // `loadConversationHistory` is additive and assumes it runs on a fresh entry —
   // loading it later (read_conversation, or the user opening the thread) would
@@ -466,10 +499,21 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   // `queued: busy` mirrors the composer's own send exactly (pending badge +
   // durable injectedMidTurn flag for clean-output's round grouping) — a tool
   // call and the equivalent click must never mean two different things.
-  await sendConversationMessage(conv.id, { text, queued: busy });
+  await sendConversationMessage(conv.id, { text: wireText, queued: busy });
+  if (caller && messageId) {
+    pushAgentMessageToast({
+      fromConvId: caller.id,
+      fromTitle: caller.name,
+      toConvId: conv.id,
+      toTitle: conv.name,
+      messageId,
+      excerpt: clip(text.replace(/\s+/g, " "), 160),
+    });
+  }
   return {
     conversation_id: conv.id,
     delivered: true,
+    ...(messageId ? { message_id: messageId } : {}),
     ...(busy ? { note: "the agent was mid-turn; the message was queued/injected" } : {}),
   };
 }
