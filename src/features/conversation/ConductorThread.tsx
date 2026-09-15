@@ -75,6 +75,7 @@ import { NO_SLOTS, exitDelayMs, useWorkExit } from "./cleanExit";
 import { ClaudeWorkBlock, LiveToolStep, ToolSection } from "./ToolSection";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
+import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
 import { useShallow } from "zustand/react/shallow";
@@ -786,6 +787,7 @@ function renderSegment(
         name={seg.step.name}
         toolUseId={seg.step.id}
         input={seg.step.input}
+        active={active}
       />
     );
   if (seg.kind === "question")
@@ -1246,7 +1248,7 @@ export function ConductorThread({
       (id) => turns?.[id]?.injectedMidTurn ?? false,
       // A message ANOTHER conversation sent stays in clear instead of folding with the work.
       // Its text is set once at creation, so the same non-reactive read holds.
-      (id) => parseSpecialMessage(turns?.[id]?.streamingText ?? "")?.type === "agent-message",
+      (id) => parseAgentMessage(turns?.[id]?.streamingText ?? "") !== null,
     );
   }, [cleanOutput, rawPlan, notices, session]);
   const pending = usePendingPermissions(session);

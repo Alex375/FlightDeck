@@ -25,6 +25,19 @@ export interface JumpRequest {
   anchor: JumpAnchor | null;
   /** Distinguishes two clicks on the same target, so the second one scrolls again. */
   nonce: number;
+  /** When it was asked (`performance.now()`): the deadline runs from the click, not from
+   *  whenever a pane gets to it. */
+  at: number;
+}
+
+/** How long a jump may look for its target — long enough for a cold transcript to load and a
+ *  fold to open. Past it, a request nobody settled (its pane was left before the target
+ *  rendered) is dead: a later visit to that conversation must not replay it. */
+export const JUMP_TIMEOUT_MS = 6000;
+
+/** Has this request outlived its deadline? Pure, for the pane that picks it up. */
+export function jumpRequestExpired(request: JumpRequest, now: number): boolean {
+  return now - request.at > JUMP_TIMEOUT_MS;
 }
 
 interface ThreadJumpState {
@@ -43,5 +56,5 @@ export const useThreadJump = create<ThreadJumpState>((set) => ({
 /** Select `convId` and ask for its thread to be shown, scrolled to `anchor` when set. */
 export function openConversationAt(convId: string, anchor: JumpAnchor | null): void {
   useConversationsStore.getState().selectConversation(convId);
-  useThreadJump.setState({ request: { convId, anchor, nonce: ++seq } });
+  useThreadJump.setState({ request: { convId, anchor, nonce: ++seq, at: performance.now() } });
 }

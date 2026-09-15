@@ -7,7 +7,7 @@
 // (the lesson of `turn_result`, which a resumed history never carries). The envelope is
 // therefore a small tagged block the model reads naturally and every renderer parses back:
 //
-//   <agent-message>
+//   <flightdeck-message>
 //   <from>Refactor auth</from>
 //   <from-repo>tosse-code</from-repo>
 //   <from-backend>claude</from-backend>
@@ -17,11 +17,16 @@
 //   <body>
 //   …the message…
 //   </body>
-//   </agent-message>
+//   </flightdeck-message>
+//
+// ⚠️ The tag is NOT `<agent-message>`: the claude CLI owns that one (2.1.272 frames a
+// sub-agent's hand-back as `<agent-message from="…">` "with no user authority", and its own
+// renderer matches `^<agent-message[^>]*>\n … \n</agent-message>$`). Reusing it would let the
+// CLI's UIs and the model read our envelope as the CLI's frame.
 //
 // Pure + tested. The SAME parse feeds the live thread, the clean-output inline marker and
-// the disk transcript (via `parseSpecialMessage`), and is mirrored by the Rust excerpt
-// reader (`history::agent_message_body`) so the History panel never lists the raw tags.
+// the disk transcript (via `parseSpecialMessage`), and is mirrored by the Rust reader
+// (`history::unwrap_agent_message`) so the History panel never lists the raw tags.
 
 import type { JsonValue } from "../../ipc/client";
 import { resultText } from "../../agent/subagentMeta";
@@ -56,8 +61,8 @@ export interface AgentMessageSender {
   backend: string;
 }
 
-const OPEN = "<agent-message>";
-const CLOSE = "</agent-message>";
+const OPEN = "<flightdeck-message>";
+const CLOSE = "</flightdeck-message>";
 const BODY_OPEN = "<body>";
 const BODY_CLOSE = "</body>";
 
@@ -104,7 +109,7 @@ function scalar(header: string, tag: string): string | null {
 /** Parse an agent-message envelope out of a user message's text; `null` for anything else.
  *
  *  Same strict gate as `<task-notification>`: the trimmed text must OPEN on the tag — a
- *  prompt that merely mentions `<agent-message>` in prose never does. The body is free text
+ *  prompt that merely mentions `<flightdeck-message>` in prose never does. The body is free text
  *  (it may itself contain tag-looking strings, even `</body>`), so it spans from the first
  *  `<body>` to the LAST `</body>`, and the header fields are only read BEFORE the body. */
 export function parseAgentMessage(text: string): AgentMessage | null {
@@ -165,7 +170,8 @@ export function parseSendMessageResult(content: JsonValue | undefined): SendMess
 
 /** The tool_use id of the `send_message` call that produced `messageId` in this conversation,
  *  found through the message id its result echoes. `null` until that result is in the store
- *  (a cold conversation is still loading its history). */
+ *  (a cold conversation is still loading its history). Runs per frame while a jump looks for
+ *  its target, so a result that does not even contain the id is skipped before any JSON parse. */
 export function findSentMessageToolUse(
   entry: SessionEntry | undefined,
   messageId: string,
@@ -173,7 +179,9 @@ export function findSentMessageToolUse(
   if (!entry) return null;
   for (const r of Object.values(entry.toolResults)) {
     if (r.isError) continue;
-    if (parseSendMessageResult(r.content)?.messageId === messageId) return r.toolUseId;
+    const raw = resultText(r.content);
+    if (!raw.includes(messageId)) continue;
+    if (parseSendMessageResult(raw)?.messageId === messageId) return r.toolUseId;
   }
   return null;
 }

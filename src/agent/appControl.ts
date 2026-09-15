@@ -113,6 +113,16 @@ function senderOf(conv: Conversation): AgentMessageSender {
   };
 }
 
+/** Only the app attributes a message to a conversation. A caller with no conversation (voice,
+ *  phone relay, external MCP client) handing in a ready-made envelope would pass its text off
+ *  as another conversation's — on screen and to the recipient model alike. */
+function assertNotForgedEnvelope(tool: string, argName: string, text: string): void {
+  if (parseAgentMessage(text))
+    throw new Error(
+      `${tool}: '${argName}' cannot be a <flightdeck-message> envelope — only a conversation's own send is attributed`,
+    );
+}
+
 /** The conversation a live session handle belongs to (the in-app caller). */
 function convBySession(session: string | null): Conversation | null {
   if (!session) return null;
@@ -484,6 +494,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   const caller = convBySession(session);
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
+  if (!caller) assertNotForgedEnvelope("send_message", "text", text);
   // From another conversation, the message travels inside its attribution envelope, so the
   // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
   // id it carries links the send to its arrival for navigation. A caller with no conversation
@@ -526,6 +537,9 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
 async function createConversation(args: Record<string, unknown>, session: string | null) {
   const raw = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
   if (!raw) throw new Error("create_conversation: 'repo_path' is required");
+  // Before anything is created: a refused first message must not leave an empty conversation.
+  if (!convBySession(session) && typeof args.first_message === "string")
+    assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
   const repoPath = normalizeFolderPath("create_conversation", raw);
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.

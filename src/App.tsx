@@ -25,6 +25,7 @@ import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
 import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
 import { useTosseConnection } from "./ipc/useTosse";
 import { HistoryPanel } from "./features/history/HistoryPanel";
+import { useHistoryUi } from "./features/history/historyUiStore";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 import { useEditorStore } from "./features/editor/editorStore";
 import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
@@ -112,11 +113,16 @@ export default function App() {
 
   // A jump to a message in another conversation (an agent-message card or its toast) selects
   // that conversation in the store; showing it is ours. The pane then scrolls to the message.
+  // The panels that sit over the thread (Settings, History — whose preview renders the same
+  // cards) close with it: the jump must land on screen, not behind them.
   const jumpNonce = useThreadJump((s) => s.request?.nonce ?? null);
   const changeViewRef = useRef(changeView);
   changeViewRef.current = changeView;
   useEffect(() => {
-    if (jumpNonce !== null) changeViewRef.current("conversation");
+    if (jumpNonce === null) return;
+    useSettingsUi.getState().closeSettings();
+    useHistoryUi.getState().closePanel();
+    changeViewRef.current("conversation");
   }, [jumpNonce]);
 
   // Signing out (or switching the feature off) while the TOSSE view is open must not strand

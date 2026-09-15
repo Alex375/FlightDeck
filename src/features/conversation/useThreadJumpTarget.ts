@@ -12,14 +12,17 @@
 
 import { useEffect, type RefObject } from "react";
 import { useConversationStore } from "../../store/conversationStore";
-import { useThreadJump, type JumpAnchor } from "../../store/threadJump";
+import {
+  JUMP_TIMEOUT_MS,
+  jumpRequestExpired,
+  useThreadJump,
+  type JumpAnchor,
+} from "../../store/threadJump";
 import { pushInfoToast } from "../../store/toasts";
 import { useWorkFold } from "../../store/workFold";
 import { verticalScaleOfEl } from "../../ui/visualScale";
 import { findSentMessageToolUse } from "./agentMessage";
 
-/** Long enough for a cold transcript to load and a fold to open. */
-const FIND_TIMEOUT_MS = 6000;
 /** How long the target is held in place once found. */
 const SETTLE_MS = 900;
 const FLASH_MS = 1800;
@@ -35,11 +38,20 @@ function byData(root: HTMLElement, attr: string, key: string, value: string): HT
   return null;
 }
 
-/** The anchored element, or null for now. May open a fold as a side effect (sender side). */
-function locate(root: HTMLElement, session: string, anchor: JumpAnchor): HTMLElement | null {
+/** The anchored element, or null for now. May open a fold as a side effect (sender side).
+ *  `sent` remembers the tool_use id once resolved, so later frames skip the result scan. */
+function locate(
+  root: HTMLElement,
+  session: string,
+  anchor: JumpAnchor,
+  sent: { toolUseId: string | null },
+): HTMLElement | null {
   if (anchor.kind === "received") return byData(root, "data-agent-msg", "agentMsg", anchor.messageId);
-  const entry = useConversationStore.getState().sessions[session];
-  const toolUseId = findSentMessageToolUse(entry, anchor.messageId);
+  sent.toolUseId ??= findSentMessageToolUse(
+    useConversationStore.getState().sessions[session],
+    anchor.messageId,
+  );
+  const toolUseId = sent.toolUseId;
   if (!toolUseId) return null; // its result is not in the store yet
   const card = byData(root, "data-agent-msg-sent", "agentMsgSent", toolUseId);
   if (card) return card;
@@ -85,7 +97,13 @@ export function useThreadJumpTarget(
       settle(); // nothing to scroll to: opening the conversation was the whole jump
       return;
     }
-    const startedAt = performance.now();
+    // Left before its target rendered (the pane unmounted without settling — deliberately:
+    // StrictMode's remount would kill every jump): a late visit must not replay it.
+    if (jumpRequestExpired(request, performance.now())) {
+      settle();
+      return;
+    }
+    const sent = { toolUseId: null as string | null };
     let found: HTMLElement | null = null;
     let foundAt = 0;
     let raf = 0;
@@ -94,7 +112,7 @@ export function useThreadJumpTarget(
       const now = performance.now();
       if (found && !found.isConnected) found = null; // remounted meanwhile: look again
       if (root && !found) {
-        const el = locate(root, session, anchor);
+        const el = locate(root, session, anchor, sent);
         if (el) {
           found = el;
           foundAt = now;
@@ -112,7 +130,7 @@ export function useThreadJumpTarget(
         // the first scroll was clamped short) or late history landing above it. Reveal again.
         if (Math.abs(offsetInView(root, found) - wantedOffset(root, found)) > DRIFT_PX) reveal(root, found);
       }
-      if (!found && now - startedAt > FIND_TIMEOUT_MS) {
+      if (!found && now - request.at > JUMP_TIMEOUT_MS) {
         settle();
         pushInfoToast(
           anchor.kind === "sent"

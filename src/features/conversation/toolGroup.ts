@@ -471,7 +471,10 @@ export function liveVisibleStart(
   let runningStart = atoms.length;
   for (let i = 0; i < atoms.length; i++) {
     const a = atoms[i];
-    if ((a.kind === "step" || a.kind === "agent" || a.kind === "workflow") && isRunning(a.step.id)) {
+    if (
+      (a.kind === "step" || a.kind === "agent" || a.kind === "workflow" || a.kind === "message") &&
+      isRunning(a.step.id)
+    ) {
       runningStart = i;
       break;
     }
@@ -535,14 +538,16 @@ export function sentMessageIds(segments: Segment[]): string[] {
   return segments.flatMap((s) => (s.kind === "message" ? [s.step.id] : []));
 }
 
-/** The tool_use ids of a stretch of work — run steps + sub-agents, in order. Lets a fold
- *  subscribe to EXACTLY its own tools' results (running / errored) instead of the whole
- *  result map, so a settled round doesn't re-render while a later turn streams. */
+/** The tool_use ids of a stretch of work — run steps + sub-agents + messages sent, in order.
+ *  Lets a fold subscribe to EXACTLY its own tools' results (running / errored) instead of the
+ *  whole result map, so a settled round doesn't re-render while a later turn streams. A message
+ *  sent is tracked like any tool: a send to a cold conversation (history load + spawn) can take
+ *  seconds, and it must not fold away while it still reads "sending". */
 export function workStepIds(segments: Segment[]): string[] {
   const ids: string[] = [];
   for (const s of segments) {
     if (s.kind === "run") for (const st of s.steps) ids.push(st.id);
-    else if (s.kind === "agent" || s.kind === "workflow") ids.push(s.step.id);
+    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message") ids.push(s.step.id);
   }
   return ids;
 }

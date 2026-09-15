@@ -562,6 +562,10 @@ export const useConversationStore = create<ConversationState>((set) => {
               blocks: [],
               parentToolUseId: item.parent_tool_use_id,
               hasThinking: false,
+              // A message restored from a mid-turn injection (a transcript's queued_command)
+              // carries the same durable flag a live mid-turn send sets, so clean output
+              // groups the restored round as it did live.
+              injectedMidTurn: item.mid_turn === true,
             };
             const line = { kind: "turn", id: item.id } as const;
             // A HISTORY restore (`replay:false`) is already chronological → APPEND. It
@@ -903,7 +907,7 @@ function isSoftNotice(subtype: string | undefined): boolean {
  * absorbed either. Pure + testable; the default plan (non-clean) is untouched.
  *
  * `userIsAgentMessage` tags an absorbed user turn that ANOTHER conversation sent (an
- * `<agent-message>` envelope) as an `agent` marker: same in-place rendering, but it stays in
+ * `<flightdeck-message>` envelope) as an `agent` marker: same in-place rendering, but it stays in
  * clear rather than folding with the work (see `isDecisionKind`).
  */
 export function coalesceCleanRounds(

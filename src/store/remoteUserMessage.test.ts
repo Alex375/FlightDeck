@@ -139,6 +139,24 @@ describe("remote user_message rendering", () => {
     expect(turnOrder(s)).toEqual(["u1", "a1", "u2", "a2", "u3", "a3"]);
   });
 
+  it("keeps the mid-turn flag of a message restored from a queued injection", () => {
+    // A message another conversation sent while this one worked comes back from the
+    // transcript's queued_command with `mid_turn` — clean output needs the durable flag.
+    const s = "conv-midturn";
+    store().ensureSession(s);
+    store().applyItem(s, {
+      kind: "user_message",
+      id: "q1",
+      text: "<flightdeck-message>\n<body>\nhi\n</body>\n</flightdeck-message>",
+      parent_tool_use_id: null,
+      replay: false,
+      mid_turn: true,
+    } as ConversationItem);
+    userMessage(s, "u2", "plain prompt", false);
+    expect(store().sessions[s]?.turns.q1?.injectedMidTurn).toBe(true);
+    expect(store().sessions[s]?.turns.u2?.injectedMidTurn).toBe(false);
+  });
+
   it("first LIVE remote turn after a resume lands at the END of restored history", () => {
     const s = "conv-resume2";
     store().ensureSession(s);

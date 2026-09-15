@@ -14,7 +14,7 @@ import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
 import { useConversationsStore } from "../../store/conversationsStore";
-import { useToolResult } from "../../store/conversationStore";
+import { useSessionState, useToolResult } from "../../store/conversationStore";
 import { openConversationAt, type JumpAnchor } from "../../store/threadJump";
 import { Expandable } from "../../ui/Expandable";
 import { Ico } from "../../ui/kit";
@@ -130,12 +130,17 @@ export function AgentMessageSentView({
   toolUseId,
   input,
   result,
+  running = false,
 }: {
   /** `send_message` or `create_conversation`. */
   name: string;
   toolUseId: string;
   input: JsonValue;
   result: { content: JsonValue; isError: boolean } | undefined;
+  /** The call belongs to the live, busy turn — only then may a resultless send spin. A
+   *  resultless call in a past turn (a session torn down mid-call, a truncated transcript)
+   *  would otherwise read "sending" forever. */
+  running?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const created = name === CREATE_CONVERSATION_TOOL;
@@ -154,8 +159,9 @@ export function AgentMessageSentView({
       (created ? "The conversation could not be created" : "The message could not be sent")
     : null;
   const hasDetail = !!text || !!reason;
+  // No result and not running = unknown outcome: no glyph, like a resultless tool step.
   const status = !result ? (
-    <span className="cv-step-run" aria-label="sending" />
+    running ? <span className="cv-step-run" aria-label="sending" /> : null
   ) : errored ? (
     <Ico name="alert" className="sm cv-step-errico" />
   ) : outcome?.queued ? (
@@ -202,18 +208,30 @@ export function AgentMessageSentView({
   );
 }
 
-/** The sender's side in the live thread: its delivery state follows the tool_result. */
+/** The sender's side in the live thread: its delivery state follows the tool_result. `active`
+ *  marks a call of the actively streaming turn (same gate as `LiveToolStep`). */
 export function AgentMessageSentCard({
   session,
   name,
   toolUseId,
   input,
+  active = false,
 }: {
   session: string;
   name: string;
   toolUseId: string;
   input: JsonValue;
+  active?: boolean;
 }) {
   const result = useToolResult(session, toolUseId);
-  return <AgentMessageSentView name={name} toolUseId={toolUseId} input={input} result={result} />;
+  const busy = useSessionState(session)?.busy ?? false;
+  return (
+    <AgentMessageSentView
+      name={name}
+      toolUseId={toolUseId}
+      input={input}
+      result={result}
+      running={active && !result && busy}
+    />
+  );
 }

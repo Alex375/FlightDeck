@@ -1509,6 +1509,7 @@ impl CodexCore {
                             // Spliced into place: like a Claude bridge turn, it can land
                             // out of order against the streaming reply.
                             replay: true,
+                            mid_turn: false,
                         });
                     }
                 }

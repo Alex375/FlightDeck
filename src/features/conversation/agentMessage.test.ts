@@ -51,12 +51,21 @@ describe("agent-message envelope", () => {
   });
 
   it("ignores prose that merely mentions the tag", () => {
-    expect(parseAgentMessage("what does <agent-message> mean?")).toBeNull();
+    expect(parseAgentMessage("what does <flightdeck-message> mean?")).toBeNull();
     expect(parseAgentMessage("plain prompt")).toBeNull();
   });
 
+  it("never claims the claude CLI's own <agent-message> frame", () => {
+    // The CLI frames a sub-agent's hand-back as `<agent-message from="…">`; that tag is not ours.
+    const envelope = buildAgentMessageEnvelope(SENDER, "msg-1", "hi");
+    expect(envelope.startsWith("<flightdeck-message>\n")).toBe(true);
+    expect(envelope).not.toMatch(/<\/?agent-message/);
+    expect(parseAgentMessage('<agent-message from="a1b2">\n[Subagent hand-back] report\n</agent-message>')).toBeNull();
+    expect(parseAgentMessage("<agent-message>\n<from>A</from>\n<body>\nx\n</body>\n</agent-message>")).toBeNull();
+  });
+
   it("still renders the body of a truncated envelope", () => {
-    const parsed = parseAgentMessage("<agent-message>\n<from>A</from>\n<body>\npartial text");
+    const parsed = parseAgentMessage("<flightdeck-message>\n<from>A</from>\n<body>\npartial text");
     expect(parsed?.fromTitle).toBe("A");
     expect(parsed?.body).toBe("partial text");
   });

@@ -359,10 +359,13 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                 Some("user_message") => {
                     let text = message_text(payload);
                     if !text.trim().is_empty() {
+                        // A message from another conversation is indexed by what it says, never
+                        // its envelope (as the Claude indexer does via `first_user_text`).
+                        let said = history::unwrap_agent_message(&text);
                         if excerpt.is_empty() {
-                            excerpt = history::flatten_truncate(history::unwrap_agent_message(&text), EXCERPT_CHARS);
+                            excerpt = history::flatten_truncate(said, EXCERPT_CHARS);
                         }
-                        history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
+                        history::append_capped(&mut body, said, INDEX_BODY_CAP, &mut truncated);
                     }
                 }
                 Some("agent_message") => {
@@ -381,10 +384,11 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                         Some("UserMessage") => {
                             let text = content_text(item.get("content"));
                             if !text.trim().is_empty() {
+                                let said = history::unwrap_agent_message(&text);
                                 if excerpt.is_empty() {
-                                    excerpt = history::flatten_truncate(history::unwrap_agent_message(&text), EXCERPT_CHARS);
+                                    excerpt = history::flatten_truncate(said, EXCERPT_CHARS);
                                 }
-                                history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
+                                history::append_capped(&mut body, said, INDEX_BODY_CAP, &mut truncated);
                             }
                         }
                         Some("AgentMessage") => {
@@ -592,6 +596,7 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
                             text,
                             parent_tool_use_id: None,
                             replay: false,
+                            mid_turn: false,
                         });
                     }
                 }
@@ -676,6 +681,7 @@ fn push_completed_item(item: &Value, msg_seq: &mut u64, items: &mut Vec<Conversa
                     text,
                     parent_tool_use_id: None,
                     replay: false,
+                    mid_turn: false,
                 });
             }
         }

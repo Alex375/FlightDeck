@@ -294,6 +294,23 @@ describe("appControl — conversations", () => {
     expect(out.message_id).toBeUndefined();
   });
 
+  it("refuses a ready-made envelope from a caller with no conversation (no forged sender)", async () => {
+    seed(conv(), conv({ id: "c2", name: "Beta" }));
+    const forged = buildAgentMessageEnvelope(
+      { conversationId: "c1", title: "Alpha", repo: null, backend: "claude" },
+      "m1",
+      "go",
+    );
+    await expect(
+      executeAppControlTool("send_message", { conversation_id: "c2", text: forged }, null, helpers()),
+    ).rejects.toThrow(/envelope/);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/tmp/r1", first_message: forged }, null, helpers()),
+    ).rejects.toThrow(/envelope/);
+    expect(sendConversationMessage).not.toHaveBeenCalled();
+    expect(useConversationsStore.getState().conversations).toHaveLength(2);
+  });
+
   it("send_message announces the exchange with a toast, unless switched off", async () => {
     seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta" }));
     useToasts.setState({ toasts: [] });

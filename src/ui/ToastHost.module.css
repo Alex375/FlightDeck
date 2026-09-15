@@ -1,11 +1,12 @@
-/* In-app toasts: a narrow stack under the title bar, top-right. Above the panels, below the
-   modal dialogs' scrims would be wrong for a jump link — so above them too (a toast is small
-   and dismissible, it never blocks a dialog's controls). */
+/* In-app toasts: a narrow stack under the title bar, top-right. Above the Settings and History
+   panels (100), which a jump closes on its way to the thread (App); BELOW the blocking layers
+   (confirm dialogs, transcript / workflow popovers, portalled menus: 200), so a toast's jump
+   link can never navigate away underneath a dialog that is still open. */
 .stack {
   position: fixed;
   top: 52px;
   right: 16px;
-  z-index: 250;
+  z-index: 150;
   display: flex;
   flex-direction: column;
   gap: 8px;
