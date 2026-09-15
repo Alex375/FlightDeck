@@ -94,7 +94,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             name: "create_conversation",
             description: "Create a new conversation in a repository folder (registering the \
                 repository in the app if it is not listed yet) and optionally send its first \
-                prompt. Returns the new conversation id.",
+                prompt. Called from a conversation, that first prompt reaches the new agent \
+                attributed to yours and the result carries its message_id. Returns the new \
+                conversation id.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({

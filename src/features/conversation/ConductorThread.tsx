@@ -783,6 +783,7 @@ function renderSegment(
       <AgentMessageSentCard
         key={seg.key}
         session={session}
+        name={seg.step.name}
         toolUseId={seg.step.id}
         input={seg.step.input}
       />

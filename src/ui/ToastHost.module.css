@@ -107,6 +107,12 @@
   color: var(--wf-tx-lo);
 }
 
+.verb {
+  flex: none;
+  font-size: 12px;
+  color: var(--wf-tx-lo);
+}
+
 .excerpt {
   font-size: 11.5px;
   line-height: 1.4;

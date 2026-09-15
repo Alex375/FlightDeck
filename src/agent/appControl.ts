@@ -42,8 +42,12 @@ import { useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
-import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
-import { pushAgentMessageToast } from "../store/toasts";
+import {
+  buildAgentMessageEnvelope,
+  parseAgentMessage,
+  type AgentMessageSender,
+} from "../features/conversation/agentMessage";
+import { pushAgentMessageToast, pushConversationCreatedToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
 import type { SessionEntry, Turn } from "../store/types";
@@ -98,10 +102,15 @@ async function assertFolder(tool: string, path: string): Promise<void> {
 
 // ---- Caller / target resolution ---------------------------------------------
 
-/** A conversation's repository, as a human label (null when its repo is gone). */
-function repoNameOf(conv: Conversation): string | null {
+/** A conversation as the sender of an agent message (its attribution envelope). */
+function senderOf(conv: Conversation): AgentMessageSender {
   const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId);
-  return repo ? baseName(repo.path) : null;
+  return {
+    conversationId: conv.id,
+    title: conv.name,
+    repo: repo ? baseName(repo.path) : null,
+    backend: conv.kind,
+  };
 }
 
 /** The conversation a live session handle belongs to (the in-app caller). */
@@ -483,11 +492,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   const messageId = caller ? crypto.randomUUID() : null;
   const wireText =
     caller && messageId
-      ? buildAgentMessageEnvelope(
-          { conversationId: caller.id, title: caller.name, repo: repoNameOf(caller), backend: caller.kind },
-          messageId,
-          text,
-        )
+      ? buildAgentMessageEnvelope(senderOf(caller), messageId, text)
       : text;
   // Hydrate a COLD conversation's timeline BEFORE the send creates a live entry:
   // `loadConversationHistory` is additive and assumes it runs on a fresh entry —
@@ -518,7 +523,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   };
 }
 
-async function createConversation(args: Record<string, unknown>) {
+async function createConversation(args: Record<string, unknown>, session: string | null) {
   const raw = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
   if (!raw) throw new Error("create_conversation: 'repo_path' is required");
   const repoPath = normalizeFolderPath("create_conversation", raw);
@@ -538,8 +543,34 @@ async function createConversation(args: Record<string, unknown>) {
   const title = typeof args.title === "string" ? args.title.trim() : "";
   if (title) useConversationsStore.getState().renameConversation(id, title);
   const first = typeof args.first_message === "string" ? args.first_message.trim() : "";
-  if (first) await sendConversationMessage(id, { text: first });
-  return { conversation_id: id, repo_path: repoPath, backend, started: Boolean(first) };
+  // Created BY a conversation: its first message carries the same attribution as a
+  // send_message (the new agent knows who started it; the id links both sides), and the
+  // creation is announced. A caller with no conversation is the human: nothing changes.
+  const caller = convBySession(session);
+  const messageId = caller && first ? crypto.randomUUID() : null;
+  if (first) {
+    const text = caller && messageId ? buildAgentMessageEnvelope(senderOf(caller), messageId, first) : first;
+    await sendConversationMessage(id, { text });
+  }
+  if (caller) {
+    pushConversationCreatedToast({
+      fromConvId: caller.id,
+      fromTitle: caller.name,
+      convId: id,
+      title:
+        useConversationsStore.getState().conversations.find((c) => c.id === id)?.name ??
+        (title || baseName(repoPath)),
+      repo: baseName(repoPath),
+      messageId,
+    });
+  }
+  return {
+    conversation_id: id,
+    repo_path: repoPath,
+    backend,
+    started: Boolean(first),
+    ...(messageId ? { message_id: messageId } : {}),
+  };
 }
 
 function focusConversation(
@@ -823,7 +854,7 @@ export async function executeAppControlTool(
     case "send_message":
       return sendMessage(args, session);
     case "create_conversation":
-      return createConversation(args);
+      return createConversation(args, session);
     case "list_models":
       return listModels();
     case "set_conversation_model":

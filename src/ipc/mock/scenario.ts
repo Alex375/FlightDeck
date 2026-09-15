@@ -863,6 +863,16 @@ export class ScenarioDriver {
             name: "mcp__flightdeck__send_message",
             input: { conversation_id: "conv-gone", text: "Also pinging the review conversation." },
           },
+          {
+            type: "tool_use",
+            id: "toolu_create",
+            name: "mcp__flightdeck__create_conversation",
+            input: {
+              repo_path: "/Users/dev/demo-repo",
+              title: "Review API client",
+              first_message: "Review the new pagination in `src/api/users.ts` and flag anything risky.",
+            },
+          },
         ],
       }),
     );
@@ -890,6 +900,24 @@ export class ScenarioDriver {
         tool_use_id: "toolu_send_err",
         content: [{ type: "text", text: "no conversation with id 'conv-gone' (see list_conversations)" }],
         is_error: true,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(300, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_create",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { conversation_id: "conv-demo-codex", repo_path: "/Users/dev/demo-repo", backend: "codex", started: true, message_id: "msg-demo-create" },
+              null,
+              2,
+            ),
+          },
+        ],
+        is_error: false,
         parent_tool_use_id: null,
       }),
     );

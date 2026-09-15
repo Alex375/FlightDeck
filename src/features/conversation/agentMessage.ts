@@ -29,6 +29,13 @@ import type { SessionEntry } from "../../store/types";
 
 /** The in-app MCP server's `send_message` tool, as the model calls it. */
 export const SEND_MESSAGE_TOOL = "mcp__flightdeck__send_message";
+/** …and its `create_conversation` tool, whose optional first message is an agent message too. */
+export const CREATE_CONVERSATION_TOOL = "mcp__flightdeck__create_conversation";
+
+/** A tool call by which one conversation reaches another (rendered as a messaging row). */
+export function isAgentMessagingTool(name: string): boolean {
+  return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL;
+}
 
 export interface AgentMessage {
   type: "agent-message";

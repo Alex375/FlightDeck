@@ -15,7 +15,7 @@ import { isRunInBackground } from "../../agent/subagentMeta";
 import { parseMcpToolName, prettyMcpServer } from "../../agent/toolNames";
 import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
-import { SEND_MESSAGE_TOOL } from "./agentMessage";
+import { isAgentMessagingTool } from "./agentMessage";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
  *  step rows and the static transcript pick the same glyph for a given tool. */
@@ -97,9 +97,10 @@ export type Segment =
   // DELIVERABLE, never intermediate work, so it is also peeled out of the clean-output work fold
   // (see splitFinalMessage) and shown in clear even when buried mid-round (see renderFoldedWork).
   | { kind: "artifact"; key: string; step: ToolStep }
-  // A message sent to another conversation (the flightdeck `send_message` tool) is its own
-  // "message sent" card instead of an anonymous MCP step. Unlike a plan or an artifact it is
-  // ordinary work: under clean output it folds with the rest of the round.
+  // A message sent to another conversation (the flightdeck `send_message` tool, or
+  // `create_conversation` with its first message) is its own "message sent" row instead of an
+  // anonymous MCP step. Unlike a plan or an artifact it is ordinary work: under clean output it
+  // folds with the rest of the round.
   | { kind: "message"; key: string; step: ToolStep }
   // `AskUserQuestion` — an interactive question to the user — is a DECISION artifact exactly
   // like a plan: it renders as its OWN inline card (question + chosen answer once settled)
@@ -209,9 +210,10 @@ export function groupBlocks(
         out.push({ kind: "artifact", key: `art-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;
       }
-      // A message to another conversation is its own card (recipient, text, delivery) — it
-      // breaks the run so the exchange reads as messaging, not as one more MCP step.
-      if (b.name === SEND_MESSAGE_TOOL) {
+      // A message to another conversation (or a conversation created with its first message)
+      // is its own compact row — it breaks the run so the exchange reads as messaging, not as
+      // one more MCP step.
+      if (isAgentMessagingTool(b.name)) {
         run = null;
         out.push({ kind: "message", key: `msg-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;

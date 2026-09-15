@@ -1,11 +1,17 @@
-// Renders the in-app toasts (store/toasts.ts), stacked in the window's top-right corner.
+// Renders the in-app toasts (store/toasts.ts), stacked in the window's top-right corner:
+// a conversation messaging another, a conversation creating another, or a plain note.
 // Mounted once in App. Each toast leaves on its own after a few seconds, but not while the
 // pointer rests on it — a toast you are about to click must not vanish under the cursor.
 
 import { useEffect, useState } from "react";
 import { useConversationsStore } from "../store/conversationsStore";
 import { openConversationAt, type JumpAnchor } from "../store/threadJump";
-import { useToasts, type AgentMessageToast, type Toast } from "../store/toasts";
+import {
+  useToasts,
+  type AgentMessageToast,
+  type ConversationCreatedToast,
+  type Toast,
+} from "../store/toasts";
 import { Ico } from "./kit";
 import styles from "./ToastHost.module.css";
 
@@ -21,7 +27,8 @@ function ConversationLink({
 }: {
   id: string;
   fallback: string;
-  anchor: JumpAnchor;
+  /** `null` = just open the conversation. */
+  anchor: JumpAnchor | null;
   onOpen: () => void;
 }) {
   const name = useConversationsStore((s) => s.conversations.find((c) => c.id === id)?.name ?? null);
@@ -31,7 +38,7 @@ function ConversationLink({
     <button
       type="button"
       className={`${styles.conv} ${styles.link}`}
-      title="Open this conversation at the message"
+      title={anchor ? "Open this conversation at the message" : "Open this conversation"}
       onClick={() => {
         openConversationAt(id, anchor);
         onOpen();
@@ -70,6 +77,35 @@ function AgentMessageBody({ toast, onOpen }: { toast: AgentMessageToast; onOpen:
   );
 }
 
+function ConversationCreatedBody({
+  toast,
+  onOpen,
+}: {
+  toast: ConversationCreatedToast;
+  onOpen: () => void;
+}) {
+  return (
+    <>
+      <span className={styles.ico}>
+        <Ico name="plus" className="sm" />
+      </span>
+      <div className={styles.main}>
+        <div className={styles.head}>
+          <ConversationLink id={toast.fromConvId} fallback={toast.fromTitle} anchor={null} onOpen={onOpen} />
+          <span className={styles.verb}>created</span>
+          <ConversationLink
+            id={toast.convId}
+            fallback={toast.title}
+            anchor={toast.messageId ? { kind: "received", messageId: toast.messageId } : null}
+            onOpen={onOpen}
+          />
+        </div>
+        <div className={styles.excerpt}>New conversation in {toast.repo}</div>
+      </div>
+    </>
+  );
+}
+
 function ToastItem({ toast }: { toast: Toast }) {
   const dismiss = useToasts((s) => s.dismiss);
   const [hovered, setHovered] = useState(false);
@@ -88,6 +124,8 @@ function ToastItem({ toast }: { toast: Toast }) {
     >
       {toast.kind === "agent-message" ? (
         <AgentMessageBody toast={toast} onOpen={close} />
+      ) : toast.kind === "conversation-created" ? (
+        <ConversationCreatedBody toast={toast} onOpen={close} />
       ) : (
         <>
           <span className={styles.ico}>

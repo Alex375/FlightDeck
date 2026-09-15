@@ -75,6 +75,11 @@ export interface DisplayPrefs {
    *  default. Set from Settings → Notifications → Channels. Read by `pushAgentMessageToast`. */
   agentMessageToasts: boolean;
 
+  /** Pop an in-app toast when one conversation creates another through the flightdeck
+   *  `create_conversation` tool ("A created B", both names clickable). ON by default. Set
+   *  from Settings → Notifications → Channels. Read by `pushConversationCreatedToast`. */
+  agentCreationToasts: boolean;
+
   /** Show the floating "last message you sent" pin at the TOP of the conversation view
    *  — the same preview shown on the Flight Deck (the message verbatim when short, else
    *  its ≤6-word Haiku summary). Clicking it scrolls the thread to that message. On by
@@ -281,6 +286,7 @@ const DEFAULTS: DisplayPrefs = {
   fleetBannerConversation: true,
   showTaskNotifications: false,
   agentMessageToasts: true,
+  agentCreationToasts: true,
   showLastMessagePreview: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
@@ -357,6 +363,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
+        agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,

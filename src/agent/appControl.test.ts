@@ -353,6 +353,34 @@ describe("appControl — conversations", () => {
     expect(out.started).toBe(true);
   });
 
+  it("create_conversation from a conversation attributes its first message and announces it", async () => {
+    seed(conv({ handle: "session-7" }));
+    useToasts.setState({ toasts: [] });
+    useDisplay.getState().set({ agentCreationToasts: true });
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/tmp/r1", title: "Probe", first_message: "start" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    const calls = vi.mocked(sendConversationMessage).mock.calls as unknown as Array<[string, { text: string }]>;
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe(out.conversation_id);
+    const envelope = parseAgentMessage(calls[0][1].text);
+    expect(envelope).toMatchObject({ fromConversationId: "c1", fromTitle: "Alpha", body: "start" });
+    expect(out.message_id).toBe(envelope?.messageId);
+    expect(useToasts.getState().toasts).toEqual([
+      expect.objectContaining({
+        kind: "conversation-created",
+        fromConvId: "c1",
+        convId: out.conversation_id,
+        title: "Probe",
+        repo: "r1",
+        messageId: envelope?.messageId,
+      }),
+    ]);
+  });
+
   it("create_conversation normalizes the path and never steals the selection", async () => {
     // The user is looking at c1; a trailing-slash spelling of the SAME repo must
     // not duplicate the group, and creating must not switch the active conv.

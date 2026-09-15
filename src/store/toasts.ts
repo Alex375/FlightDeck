@@ -1,7 +1,7 @@
 // In-app toasts: short-lived notes stacked in a corner of the window, rendered by
 // `ToastHost`. Distinct from the OS notification channels (banner / sound / Dock), which
 // signal an agent needing YOU; a toast reports something that just happened in the app
-// while you look at it — today, one conversation messaging another.
+// while you look at it — today, one conversation messaging or creating another.
 
 import { create } from "zustand";
 import { useDisplay } from "./display";
@@ -17,12 +17,23 @@ export interface AgentMessageToast {
   excerpt: string;
 }
 
+export interface ConversationCreatedToast {
+  kind: "conversation-created";
+  fromConvId: string;
+  fromTitle: string;
+  convId: string;
+  title: string;
+  repo: string;
+  /** Its first message, when it was given one — the jump then lands on it. */
+  messageId: string | null;
+}
+
 export interface InfoToast {
   kind: "info";
   text: string;
 }
 
-export type ToastData = AgentMessageToast | InfoToast;
+export type ToastData = AgentMessageToast | ConversationCreatedToast | InfoToast;
 export type Toast = ToastData & { id: number };
 
 /** Oldest toasts give way beyond this — a burst of messages must not wall off the window. */
@@ -51,6 +62,14 @@ export const useToasts = create<ToastState>((set) => ({
 export function pushAgentMessageToast(toast: Omit<AgentMessageToast, "kind">): boolean {
   if (!useDisplay.getState().agentMessageToasts) return false;
   useToasts.getState().push({ kind: "agent-message", ...toast });
+  return true;
+}
+
+/** Announce a conversation that another conversation just created, unless the user switched
+ *  that toast off (Settings → Notifications). Returns whether a toast was shown. */
+export function pushConversationCreatedToast(toast: Omit<ConversationCreatedToast, "kind">): boolean {
+  if (!useDisplay.getState().agentCreationToasts) return false;
+  useToasts.getState().push({ kind: "conversation-created", ...toast });
   return true;
 }
 

@@ -15,6 +15,7 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
   const dockBounce = useNotifications((s) => s.dockBounce);
   const set = useNotifications((s) => s.set);
   const agentMessageToasts = useDisplay((s) => s.agentMessageToasts);
+  const agentCreationToasts = useDisplay((s) => s.agentCreationToasts);
   const setDisplay = useDisplay((s) => s.set);
 
   return (
@@ -63,6 +64,13 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
           checked={agentMessageToasts}
           onChange={(v) => setDisplay({ agentMessageToasts: v })}
           label="Toast when agents message each other"
+        />
+        <ToggleRow
+          title="Toast when an agent creates a conversation"
+          hint="When a conversation starts a new one (the Flight Deck create_conversation tool), a short note names both. Click either name to open it."
+          checked={agentCreationToasts}
+          onChange={(v) => setDisplay({ agentCreationToasts: v })}
+          label="Toast when an agent creates a conversation"
         />
       </SettingsGroup>
     </div>

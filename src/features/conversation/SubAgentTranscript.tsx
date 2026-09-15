@@ -67,6 +67,7 @@ function renderSegments(segments: Segment[], results: Map<string, JoinedResult>)
       return (
         <AgentMessageSentView
           key={seg.key}
+          name={seg.step.name}
           toolUseId={seg.step.id}
           input={seg.step.input}
           result={results.get(seg.step.id)}
