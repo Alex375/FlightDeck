@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.3.0
+
+- New: **messages between conversations are readable** — the receiving conversation shows which conversation sent a message, and the sender shows a compact "Message to …" line with its delivery status.
+- New: click a conversation's name on either side to **jump straight to the other side** of the exchange.
+- New: a conversation started by another one shows who created it, and its first message is attributed the same way.
+- New: **in-app toasts** when a conversation messages or creates another — each can be turned off in Settings → Notifications.
+
 ## v2.2.0
 
 - New: **multiple Claude accounts** — add several accounts, pick one per conversation or let the app switch automatically; each account is named by its own address.
