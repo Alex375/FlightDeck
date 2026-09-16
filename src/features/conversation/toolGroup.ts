@@ -16,6 +16,7 @@ import { parseMcpToolName, prettyMcpServer } from "../../agent/toolNames";
 import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
 import { isAgentMessagingTool } from "./agentMessage";
+import { isArtifactPublish } from "./artifacts";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
  *  step rows and the static transcript pick the same glyph for a given tool. */
@@ -200,12 +201,11 @@ export function groupBlocks(
       // An Artifact PUBLISH is its own inline card (a deliverable link) — breaks the run so the
       // published page stands out instead of hiding in a "Ran N steps" step row (and its .html
       // file_path never renders as an editor-opening chip pointing at a disposable temp file).
-      // Only a real publish qualifies: the `Artifact` tool also does `action:"list"` (enumerate
-      // the user's artifacts) and bare cross-conversation `url`-updates, which carry NO file_path
-      // and are NOT a local deliverable — those fall through to the normal run/step path so their
-      // result is shown like any other tool. This MUST mirror `selectArtifacts` (the chip's
-      // derivation, which skips file_path-less calls) or the two surfaces disagree.
-      if (b.name === "Artifact" && field(b.input, "file_path")) {
+      // Only a real publish qualifies: the `Artifact` tool also lists/reads, does bare
+      // cross-conversation `url`-updates and uploads assets, none of which is a local deliverable
+      // — those fall through to the normal run/step path so their result is shown like any other
+      // tool. The predicate is shared with `selectArtifacts` so the two surfaces never disagree.
+      if (b.name === "Artifact" && isArtifactPublish(b.input)) {
         run = null;
         out.push({ kind: "artifact", key: `art-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;

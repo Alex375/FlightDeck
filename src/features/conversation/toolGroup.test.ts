@@ -234,6 +234,13 @@ describe("groupBlocks — Artifact (publish only)", () => {
     const urlUpdate = groupBlocks([tool("u", "Artifact", { url: "https://claude.ai/code/artifact/abc" })]);
     expect(urlUpdate.map((s) => s.kind)).toEqual(["run"]);
   });
+
+  it("does NOT treat an asset upload (asset:true + file_path) as an artifact card", () => {
+    const upload = groupBlocks([
+      tool("u", "Artifact", { url: "https://claude.ai/artifact/abc", file_path: "/tmp/logo.png", asset: true }),
+    ]);
+    expect(upload.map((s) => s.kind)).toEqual(["run"]);
+  });
 });
 
 describe("groupBlocks — in-band markers (mid-turn separator)", () => {

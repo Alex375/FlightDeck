@@ -11,8 +11,13 @@ describe("isArtifactUrl", () => {
     expect(isArtifactUrl("https://claude.ai/code/artifact/acecfb35-f63b-49c3-b835-d0c856695a94")).toBe(true);
   });
 
+  it("matches the 2.1.272+ shape (claude.ai/artifact/<id>) — else a prose link renders as a bare anchor", () => {
+    expect(isArtifactUrl("https://claude.ai/artifact/66XHYkMzjJ4BdfJ64qa3cy")).toBe(true);
+  });
+
   it("rejects other claude.ai URLs and non-artifact links", () => {
     expect(isArtifactUrl("https://claude.ai/code/artifacts")).toBe(false); // the gallery, not one artifact
+    expect(isArtifactUrl("https://claude.ai/artifacts")).toBe(false);
     expect(isArtifactUrl("https://claude.ai/code/session_01ABC")).toBe(false);
     expect(isArtifactUrl("https://example.com/x")).toBe(false);
     expect(isArtifactUrl("/abs/path.html")).toBe(false);
