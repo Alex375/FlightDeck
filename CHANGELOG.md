@@ -9,6 +9,10 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.3.1
+
+- Fix: **artifacts published by Claude open again** — inline artifact cards no longer show "Unavailable", and artifact links in Claude's replies are back to clickable cards (Claude Code 2.1.272 changed the artifact link format).
+
 ## v2.3.0
 
 - New: **messages between conversations are readable** — the receiving conversation shows which conversation sent a message, and the sender shows a compact "Message to …" line with its delivery status.
