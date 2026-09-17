@@ -34,69 +34,72 @@ export interface SettingEntry {
 /** The sub-tabs of the sections that split their cards (kept here so the search
  *  and the panel agree on the ids — the test cross-checks the index against it). */
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
-  general: ["display", "timing", "system"],
-  conversation: ["markdown", "models", "composer"],
+  general: ["accounts", "system"],
+  display: ["appearance", "thread", "timing", "composer", "models", "order"],
+  claudeCode: ["instructions", "behavior", "helpers"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
-  // ---- General ------------------------------------------------------------
-  { title: "Interface zoom", section: "general", sub: "display", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
-  { title: "Clean output (default)", section: "general", sub: "display", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
-  { title: "Background task notifications", section: "general", sub: "display", group: "Thread", keywords: "task-notification messages thread display affichage" },
-  { title: "Preview of the last sent message", section: "general", sub: "display", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
-  { title: "Message minimap", section: "general", sub: "display", group: "Thread", keywords: "scrollbar map jump navigation display affichage" },
-  { title: "Live workflow on the Flight Deck card", section: "general", sub: "display", group: "Appearance", keywords: "workflow card phases display affichage" },
-  { title: "Per-agent detail in the workflow view", section: "general", sub: "display", group: "Appearance", keywords: "workflow agents phase live detail agents display affichage" },
-  { title: "Zoom when opening a card", section: "general", sub: "display", group: "Motion", keywords: "animation motion modal flight deck display affichage mouvement" },
-  { title: "Slide side panels open", section: "general", sub: "display", group: "Motion", keywords: "animation motion panel editor terminal display affichage mouvement" },
-  { title: "Animate the conversation", section: "general", sub: "display", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
-  { title: "Message controls", section: "general", sub: "display", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
-  { title: "Clickable filename on Read/Write rows", section: "general", sub: "display", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
-  { title: "Turn duration", section: "general", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
-  { title: "Model time", section: "general", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
-  { title: "Thinking time", section: "general", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
-  { title: "Tool time", section: "general", sub: "timing", group: "Durations & timing", keywords: "bash read edit duration outils" },
-  { title: "Allow Bypass permissions mode", section: "behavior", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
-  { title: "Output style", section: "behavior", group: "Output style", keywords: "writing tone concise explanatory style sortie ton" },
+  // ---- Display (Appearance / Thread / Durations / Composer / Models / Order) ----
+  { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
+  { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
+  { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
+  { title: "Message minimap", section: "display", sub: "thread", group: "Thread", keywords: "scrollbar map jump navigation display affichage" },
+  { title: "Live workflow on the Flight Deck card", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow card phases display affichage" },
+  { title: "Per-agent detail in the workflow view", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow agents phase live detail agents display affichage" },
+  { title: "Zoom when opening a card", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion modal flight deck display affichage mouvement" },
+  { title: "Slide side panels open", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion panel editor terminal display affichage mouvement" },
+  { title: "Animate the conversation", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
+  { title: "Message controls", section: "display", sub: "thread", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
+  { title: "Clickable filename on Read/Write rows", section: "display", sub: "thread", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
+  { title: "Turn duration", section: "display", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
+  { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
+  { title: "Thinking time", section: "display", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
+  { title: "Tool time", section: "display", sub: "timing", group: "Durations & timing", keywords: "bash read edit duration outils" },
+  { title: "Allow Bypass permissions mode", section: "claudeCode", sub: "behavior", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
+  { title: "Output style", section: "claudeCode", sub: "behavior", group: "Output style", keywords: "writing tone concise explanatory style sortie ton" },
   { title: "Keep the Mac awake", section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },
 
-  // ---- Accounts / TOSSE ---------------------------------------------------
-  { title: "Accounts", section: "accounts", group: "Accounts", keywords: "claude codex openai login sign in connexion compte" },
+  // ---- General (Accounts / System) + TOSSE --------------------------------
+  { title: "Accounts", section: "general", sub: "accounts", group: "Accounts", keywords: "claude codex openai login sign in connexion compte" },
   // Multiple Claude accounts: a grid of account tiles (each with its own rate-limit rings),
   // then the Switching group. Tiles are not rows, so the tile entries only land on the right
   // tab; the threshold steppers are labels inside the Switching card, so they flash the card.
-  { title: "Claude accounts", section: "accounts", group: "Claude accounts", keywords: "multiple accounts several rate limits usage quota 5h 7d weekly rings plusieurs comptes limites utilisation forfait" },
-  { title: "Add another Claude account", section: "accounts", group: "Claude accounts", keywords: "new second account sign in ajouter compte" },
-  { title: "Switching", section: "accounts", group: "Switching", keywords: "switch accounts default auto bascule changement compte" },
-  { title: "Default account for new conversations", section: "accounts", group: "Switching", keywords: "default account compte par defaut nouvelle conversation" },
-  { title: "Auto-switch account near usage limit", section: "accounts", group: "Switching", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
-  { title: "Switch at", flash: "Switching", section: "accounts", group: "Switching", keywords: "threshold trigger percent seuil declenchement pourcentage auto-switch" },
-  { title: "Target below", flash: "Switching", section: "accounts", group: "Switching", keywords: "ceiling hysteresis target oscillation plafond cible auto-switch" },
+  { title: "Claude accounts", section: "general", sub: "accounts", group: "Claude accounts", keywords: "multiple accounts several rate limits usage quota 5h 7d weekly rings plusieurs comptes limites utilisation forfait" },
+  { title: "Add another Claude account", section: "general", sub: "accounts", group: "Claude accounts", keywords: "new second account sign in ajouter compte" },
+  { title: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "switch accounts default auto bascule changement compte" },
+  { title: "Default account for new conversations", section: "general", sub: "accounts", group: "Switching", keywords: "default account compte par defaut nouvelle conversation" },
+  { title: "Auto-switch account near usage limit", section: "general", sub: "accounts", group: "Switching", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
+  { title: "Switch at", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "threshold trigger percent seuil declenchement pourcentage auto-switch" },
+  { title: "Target below", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "ceiling hysteresis target oscillation plafond cible auto-switch" },
   { title: "TOSSE mark on repositories", section: "tosse", group: "In the app", keywords: "badge repo crm" },
   { title: "TOSSE tasks view", section: "tosse", group: "In the app", keywords: "tasks board kanban taches" },
   { title: "Stay on the tasks view when you press Start", section: "tosse", group: "In the app", keywords: "pickup start navigation" },
   { title: "Warn before deleting a linked conversation", section: "tosse", group: "In the app", keywords: "delete confirm task suppression" },
   { title: "Client logos from the web", section: "tosse", group: "In the app", keywords: "favicon google privacy logo client" },
 
-  // ---- Claude Code (its own tab, only while a Claude account is connected) ---
-  { title: "Helpers", section: "claudeCode", group: "Helpers", keywords: "subagent routing model helper sous-agent routage claude code" },
-  { title: "What the helpers cost", section: "claudeCode", group: "What the helpers cost", keywords: "spend cost tokens dashboard depense cout" },
-  { title: "Instructions for Claude", section: "claudeCode", group: "Instructions for Claude", keywords: "claude md instructions file memoire" },
+  // ---- Claude Code (Instructions / Behavior / Helpers) --------------------
+  // Its own tab, shown only while a Claude account is connected — so are the two
+  // Behavior entries above, which is why they are Claude-only settings.
+  { title: "Helpers", section: "claudeCode", sub: "helpers", group: "Helpers", keywords: "subagent routing model helper sous-agent routage claude code" },
+  { title: "What the helpers cost", section: "claudeCode", sub: "helpers", group: "What the helpers cost", keywords: "spend cost tokens dashboard depense cout" },
+  { title: "Instructions for Claude", section: "claudeCode", sub: "instructions", group: "Instructions for Claude", keywords: "claude md instructions file memoire" },
 
-  // ---- Conversation (Markdown / Models / Composer sub-tabs) ---------------
-  { title: "Markdown rendering", section: "conversation", sub: "markdown", group: "Markdown", keywords: "markdown mode warm classic minimal thread rendering conversation rendu" },
-  { title: "Shown in the picker", section: "conversation", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
-  { title: "New conversations", section: "conversation", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
-  { title: "The bar", section: "conversation", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
-  { title: "Your buttons", section: "conversation", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
+  // ---- Display, continued: the conversation surfaces ----------------------
+  { title: "Markdown rendering", section: "display", sub: "thread", group: "Markdown", keywords: "markdown mode warm classic minimal thread rendering conversation rendu" },
+  { title: "Shown in the picker", section: "display", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
+  { title: "New conversations", section: "display", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
+  { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
+  { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 
-  // ---- Shortcuts / Reordering ---------------------------------------------
+  // ---- Shortcuts + Display → Order ----------------------------------------
   { title: "Keyboard shortcuts", section: "shortcuts", group: "Keyboard shortcuts", keywords: "keys chords raccourcis clavier" },
-  { title: "Conversations", section: "reordering", group: "Conversation order", keywords: "drag drop manual order tri ordre" },
-  { title: "Repositories", section: "reordering", group: "Conversation order", keywords: "drag drop manual order depots" },
-  { title: "Share order between the two views", section: "reordering", group: "Shared order", keywords: "sidebar flight deck sync" },
+  { title: "Conversations", section: "display", sub: "order", group: "Conversation order", keywords: "drag drop manual order tri ordre" },
+  { title: "Repositories", section: "display", sub: "order", group: "Conversation order", keywords: "drag drop manual order depots" },
+  { title: "Share order between the two views", section: "display", sub: "order", group: "Shared order", keywords: "sidebar flight deck sync" },
 
   // ---- Control ------------------------------------------------------------
   { title: "Let agents pilot the app", section: "control", sub: "agents", group: "Agent control of the app", keywords: "mcp flightdeck server in-process tools" },

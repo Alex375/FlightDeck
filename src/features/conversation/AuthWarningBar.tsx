@@ -42,7 +42,7 @@ export function AuthWarningBar({ session }: { session: string }) {
         <span className="cv-reviewbar-label">
           {name} CLI not found — the next messages will fail.
         </span>
-        <button className="cv-reviewbar-btn" onClick={() => openSettings("accounts")}>
+        <button className="cv-reviewbar-btn" onClick={() => openSettings("general", "accounts")}>
           Settings
         </button>
       </div>
@@ -58,7 +58,7 @@ export function AuthWarningBar({ session }: { session: string }) {
       <span className="cv-reviewbar-label">
         {name} account not connected — the next messages will fail.
       </span>
-      <button className="cv-reviewbar-btn" onClick={() => openSettings("accounts")}>
+      <button className="cv-reviewbar-btn" onClick={() => openSettings("general", "accounts")}>
         Sign in
       </button>
     </div>
