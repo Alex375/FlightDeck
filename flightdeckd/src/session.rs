@@ -24,6 +24,7 @@ use crate::config::{self, Config, PhoneToken};
 use crate::events::Event;
 use crate::frames;
 use crate::registry::{ConversationRow, Registry};
+use crate::replay::{self, ReplayItem, RingEntry};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -91,6 +92,8 @@ pub struct AttachReq {
     /// Count of replayable lines the client has already received this epoch.
     pub cursor: u64,
     pub queue: ClientQueue,
+    /// The client understands `fd_skip` (replay compaction, see `replay.rs`).
+    pub supports_skip: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +328,7 @@ impl SessionManager {
         claude_args: Vec<String>,
         epoch: Option<String>,
         cursor: u64,
+        supports_skip: bool,
         queue: ClientQueue,
     ) -> Result<(String, u64)> {
         let client_id = self.next_client_id();
@@ -333,7 +337,7 @@ impl SessionManager {
         // 1. by conversation id
         if let Some(id) = &conversation {
             if let Some(tx) = Self::live_tx(&mut sessions, id) {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue }))
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
                 return Ok((id.clone(), client_id));
             }
@@ -352,7 +356,7 @@ impl SessionManager {
                     .map(|st| st.running && st.session_id.as_deref() == Some(sid))
                     .unwrap_or(false);
                 if matched {
-                    tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue }))
+                    tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
                         .map_err(|_| anyhow!("session just ended — retry"))?;
                     return Ok((id, client_id));
                 }
@@ -408,7 +412,7 @@ impl SessionManager {
         self.spawn_into(&mut sessions, &conv_id, &cwd, args)?;
         let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
-        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue }))
+        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip }))
             .map_err(|_| anyhow!("session failed to start"))?;
         Ok((conv_id, client_id))
     }
@@ -694,7 +698,7 @@ struct SessionActor {
     epoch: String,
     /// Count of replayable lines emitted by this claude process so far.
     seq: u64,
-    ring: VecDeque<(u64, String)>,
+    ring: VecDeque<RingEntry>,
     ring_bytes: usize,
     /// Queue into the claude-stdin writer task; `None` once closed (EOF sent).
     stdin_tx: Option<mpsc::UnboundedSender<String>>,
@@ -812,7 +816,7 @@ impl SessionActor {
             }
             k if frames::is_replayable_type(k) && !k.is_empty() => {
                 self.seq += 1;
-                self.ring_push(&line);
+                self.ring_push(&line, replay::tag(k, &line));
                 match k {
                     "system" => {
                         if probe.as_ref().and_then(|p| p.subtype.as_deref()) == Some("init") {
@@ -980,7 +984,7 @@ impl SessionActor {
             0
         };
         let effective_from = match self.ring.front() {
-            Some((first_seq, _)) => from.max(first_seq.saturating_sub(1)),
+            Some(first) => from.max(first.seq.saturating_sub(1)),
             None => self.seq,
         };
         let pending_ids: Vec<&str> = self.pending.keys().map(String::as_str).collect();
@@ -991,14 +995,17 @@ impl SessionActor {
             self.seq,
             self.busy && self.running,
             &pending_ids,
+            req.supports_skip,
         )) {
             return;
         }
-        for (s, line) in self.ring.iter() {
-            if *s > effective_from {
-                if !req.queue.push(line.clone()) {
-                    return;
-                }
+        for item in replay::plan(&self.ring, effective_from, req.supports_skip) {
+            let line = match item {
+                ReplayItem::Line(l) => l.to_string(),
+                ReplayItem::Skip { from, to } => frames::fd_skip(from, to),
+            };
+            if !req.queue.push(line) {
+                return;
             }
         }
         // Outstanding permission prompts re-arrive after the replay.
@@ -1029,12 +1036,12 @@ impl SessionActor {
         }
     }
 
-    fn ring_push(&mut self, line: &str) {
+    fn ring_push(&mut self, line: &str, tag: replay::ReplayTag) {
         self.ring_bytes += line.len();
-        self.ring.push_back((self.seq, line.to_string()));
+        self.ring.push_back(RingEntry { seq: self.seq, line: line.to_string(), tag });
         while self.ring_bytes > RING_BYTES_MAX {
-            if let Some((_, dropped)) = self.ring.pop_front() {
-                self.ring_bytes -= dropped.len();
+            if let Some(dropped) = self.ring.pop_front() {
+                self.ring_bytes -= dropped.line.len();
             } else {
                 break;
             }

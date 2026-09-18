@@ -18,6 +18,7 @@ mod events;
 mod frames;
 mod registry;
 mod relay;
+mod replay;
 mod rpc;
 mod session;
 #[cfg(test)]
@@ -78,6 +79,10 @@ enum Cmd {
         /// overwrites the daemon's; blank is ignored).
         #[arg(long)]
         title: Option<String>,
+        /// The client understands `fd_skip`: the replay may leave out the
+        /// partial-message deltas of messages it replays complete.
+        #[arg(long)]
+        supports_skip: bool,
         /// Everything after `--` is the claude argv used if the daemon must
         /// spawn the session.
         #[arg(last = true)]
@@ -253,10 +258,10 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, title, claude_args } => {
+        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, title, supports_skip, claude_args } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            attach::attach_client(&socket, conversation, cwd, resume_session, epoch, cursor, claude_args, title)
-                .await
+            let params = attach::AttachArgs { conversation, cwd, resume_session, epoch, cursor, claude_args, title, supports_skip };
+            attach::attach_client(&socket, params).await
         }
         Cmd::AddPhone { token, label, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);

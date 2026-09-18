@@ -51,6 +51,9 @@ struct AttachParams {
     claude_args: Vec<String>,
     /// The client's title for the conversation — authoritative (overwrites).
     title: Option<String>,
+    /// The client understands `fd_skip` (replay compaction).
+    #[serde(default)]
+    supports_skip: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,7 +224,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 
     let (queue, lines_rx, outstanding) = ClientQueue::new();
     let attached = manager
-        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, queue)
+        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, p.supports_skip, queue)
         .await;
     let (conv_id, client_id) = match attached {
         Ok(x) => x,
@@ -405,29 +408,32 @@ async fn write_bounded<W: AsyncWrite + Unpin>(
 // ---------------------------------------------------------------------------
 // The client side (`flightdeckd attach` / `status` / `stop`), run over SSH.
 
-#[allow(clippy::too_many_arguments)]
-pub async fn attach_client(
-    socket: &Path,
-    conversation: Option<String>,
-    cwd: Option<String>,
-    resume_session: Option<String>,
-    epoch: Option<String>,
-    cursor: u64,
-    claude_args: Vec<String>,
-    title: Option<String>,
-) -> Result<()> {
+/// What `flightdeckd attach` asks the daemon for.
+pub struct AttachArgs {
+    pub conversation: Option<String>,
+    pub cwd: Option<String>,
+    pub resume_session: Option<String>,
+    pub epoch: Option<String>,
+    pub cursor: u64,
+    pub claude_args: Vec<String>,
+    pub title: Option<String>,
+    pub supports_skip: bool,
+}
+
+pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
     let conn = UnixStream::connect(socket).await.with_context(|| {
         format!("flightdeckd is not running (no socket at {})", socket.display())
     })?;
     let (read_half, mut write_half) = conn.into_split();
     let req = json!({"attach": {
-        "conversation": conversation,
-        "cwd": cwd,
-        "resume_session": resume_session,
-        "epoch": epoch,
-        "cursor": cursor,
-        "claude_args": claude_args,
-        "title": title,
+        "conversation": a.conversation,
+        "cwd": a.cwd,
+        "resume_session": a.resume_session,
+        "epoch": a.epoch,
+        "cursor": a.cursor,
+        "claude_args": a.claude_args,
+        "title": a.title,
+        "supports_skip": a.supports_skip,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
     write_half.flush().await?;
@@ -914,6 +920,88 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err());
         drop(peer);
         tokio::time::timeout(Duration::from_secs(2), wait).await.expect("EOF must end the reader");
+    }
+
+    /// Attach over the socket; returns (fd_attach, the lines that follow up to
+    /// and including the `result`, the open connection).
+    async fn attach_until_result(socket: &Path, req: Value) -> (Value, Vec<String>, UnixStream) {
+        let mut conn = UnixStream::connect(socket).await.unwrap();
+        conn.write_all(format!("{}\n", json!({"attach": req})).as_bytes()).await.unwrap();
+        let mut r = BufReader::new(&mut conn);
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        let att: Value = serde_json::from_str(&line).unwrap();
+        let mut got = Vec::new();
+        loop {
+            line.clear();
+            let n = tokio::time::timeout(Duration::from_secs(10), r.read_line(&mut line)).await.unwrap().unwrap();
+            assert!(n > 0, "stream ended before the result");
+            got.push(line.trim_end().to_string());
+            if line.contains("\"type\":\"result\"") {
+                break;
+            }
+        }
+        (att, got, conn)
+    }
+
+    #[tokio::test]
+    async fn reattach_replay_compacts_only_for_a_client_that_supports_skip() {
+        let dir = testutil::short_tempdir();
+        let turn = testutil::stream::turn();
+        let mut cfg = testutil::test_cfg();
+        cfg.claude_bin = testutil::fake_claude_emitting(dir.path(), &turn).to_string_lossy().into();
+        let m = testutil::test_manager(cfg);
+        let socket = testutil::serve_attach(m, dir.path()).await;
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        // Live: a fresh conversation, one turn streamed to a flagless client.
+        let mut conn = UnixStream::connect(&socket).await.unwrap();
+        conn.write_all(format!("{}\n", json!({"attach": {"cwd": cwd}})).as_bytes()).await.unwrap();
+        let mut r = BufReader::new(conn);
+        let mut first = String::new();
+        r.read_line(&mut first).await.unwrap();
+        let att: Value = serde_json::from_str(&first).unwrap();
+        let (conv, epoch) = (att["conversation"].clone(), att["epoch"].clone());
+        r.get_mut().write_all(b"{\"type\":\"user\"}\n").await.unwrap();
+        let mut live = Vec::new();
+        while live.len() < turn.len() {
+            let mut l = String::new();
+            r.read_line(&mut l).await.unwrap();
+            live.push(l.trim_end().to_string());
+        }
+        assert_eq!(live, turn);
+        drop(r);
+
+        // A flagless reattach from 0: the full replay, byte-identical, no fd_skip.
+        let (att, replay, _c) =
+            attach_until_result(&socket, json!({"conversation": conv, "epoch": epoch, "cursor": 0})).await;
+        assert!(att.get("skip").is_none());
+        assert_eq!(replay, turn);
+
+        // A skip-capable reattach from 0: complete messages without their deltas.
+        let (att, replay, _c) = attach_until_result(
+            &socket,
+            json!({"conversation": conv, "epoch": epoch, "cursor": 0, "supports_skip": true}),
+        )
+        .await;
+        assert_eq!(att["skip"], true);
+        let mut cursor = att["replay_from"].as_u64().unwrap();
+        let mut lines = Vec::new();
+        for l in &replay {
+            let v: Value = serde_json::from_str(l).unwrap();
+            if v["type"] == "fd_skip" {
+                assert_eq!(v["from"].as_u64().unwrap(), cursor + 1, "cursor gap at {l}");
+                cursor = v["to"].as_u64().unwrap();
+            } else {
+                assert!(crate::frames::is_replayable_line(l));
+                cursor += 1;
+                lines.push(l.clone());
+            }
+        }
+        assert_eq!(cursor, att["seq"].as_u64().unwrap(), "compacted replay must end on the same cursor");
+        let expected: Vec<String> = turn.iter().filter(|l| !l.contains("stream_event")).cloned().collect();
+        assert_eq!(lines, expected);
+        assert!(replay.len() < turn.len());
     }
 
     #[tokio::test]

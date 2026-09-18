@@ -1,6 +1,6 @@
 [package]
 name = "flightdeckd"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Flight Deck server daemon: owns detached claude sessions and serves them to the relay (phone) and to SSH-attached clients (Mac)."
 license = "UNLICENSED"

@@ -49,7 +49,9 @@ pub fn is_replayable_line(line: &str) -> bool {
 /// daemon's OWN turn state (a client whose optimistic busy flag disagrees can
 /// resync — a message lost in a dead link would otherwise leave it stuck);
 /// `pending` lists the outstanding can_use_tool request ids (a client drops
-/// stale permission cards not in this list).
+/// stale permission cards not in this list). `skip: true` appears ONLY when
+/// the client asked for replay compaction and this replay honors it (the
+/// frame is otherwise unchanged).
 pub fn fd_attach(
     conversation: &str,
     epoch: &str,
@@ -57,8 +59,9 @@ pub fn fd_attach(
     seq_now: u64,
     busy: bool,
     pending: &[&str],
+    skip: bool,
 ) -> String {
-    json!({
+    let mut v = json!({
         "type": "fd_attach",
         "conversation": conversation,
         "epoch": epoch,
@@ -66,8 +69,21 @@ pub fn fd_attach(
         "seq": seq_now,
         "busy": busy,
         "pending": pending,
-    })
-    .to_string()
+    });
+    if skip {
+        v["skip"] = json!(true);
+    }
+    v.to_string()
+}
+
+/// Replay compaction, sent only to a client that announced `supports_skip`:
+/// the replayable lines with seq `from..=to` (inclusive) were left out of this
+/// replay — partial-message `stream_event` deltas of messages whose complete
+/// `assistant` lines ARE replayed. On receipt the client's cursor is `from - 1`
+/// (anything else is a protocol error) and it sets it to `to`. Like every
+/// `fd_*` frame it is never counted itself.
+pub fn fd_skip(from: u64, to: u64) -> String {
+    json!({"type": "fd_skip", "from": from, "to": to}).to_string()
 }
 
 /// The running daemon's version (Cargo package version). Reported in
@@ -181,13 +197,19 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"]);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
         assert_eq!(v["seq"], 10);
         assert_eq!(v["busy"], true);
         assert_eq!(v["pending"][0], "rq-1");
+        assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true);
+        assert_eq!(serde_json::from_str::<Value>(&a).unwrap()["skip"], true);
+        let k = fd_skip(4, 9);
+        assert_eq!(serde_json::from_str::<Value>(&k).unwrap(), json!({"type": "fd_skip", "from": 4, "to": 9}));
+        assert!(!is_replayable_line(&k), "fd_skip must never count toward the cursor");
         let d = fd_detach("stalled", None);
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v, json!({"type": "fd_detach", "reason": "stalled"}));

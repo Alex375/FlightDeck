@@ -123,6 +123,38 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   plan de contrôle (`control_*`, `keep_alive`) et hors `fd_*` — même prédicat
   des deux côtés (`flightdeckd/src/frames.rs` ↔ tosse-code `transport.rs`).
 
+## Compaction du rejeu : `fd_skip` (contrat, démon ≥ 0.2.0)
+
+Avec `--include-partial-messages`, chaque message assistant arrive **deux
+fois** dans le ring : en deltas `stream_event` (message_start →
+content_block_* → message_delta → message_stop) puis en lignes `assistant`
+complètes (une par bloc, même `message.id`). Un client qui l'annonce peut
+recevoir un rejeu sans les deltas des messages déjà complets.
+
+- **Opt-in uniquement** : `flightdeckd attach --supports-skip` (ou
+  `"supports_skip": true` dans la requête d'attache sur le socket). Sans le
+  flag, rejeu intégral, **octet pour octet** identique à avant ; `fd_attach`
+  inchangé. Le flag CLI n'existe pas avant 0.2.0 (clap le refuse) : le client
+  doit d'abord vérifier `flightdeckd --version` ≥ 0.2.0.
+- Avec le flag, `fd_attach` porte `"skip": true`, et le rejeu remplace chaque
+  suite de lignes sautées par **`{"type":"fd_skip","from":F,"to":T}`** :
+  les lignes rejouables de seq `F..=T` (inclusif) sont omises. À réception, le
+  curseur du client vaut `F - 1` (sinon erreur de protocole) et il passe à `T`.
+  `fd_skip` est une frame `fd_*` : jamais comptée elle-même (le prédicat
+  `is_replayable_line` ne change pas). En fin de rejeu, le curseur du client
+  est le même qu'avec un rejeu intégral (`fd_attach.seq`).
+- **Ce qui est sauté** : uniquement les `stream_event` d'un message **complet
+  dans le ring** = son `message_stop` ET au moins une ligne `assistant` avec
+  son `message.id` y sont (le ring entier compte : un message fini avant le
+  curseur fait sauter ses derniers deltas situés après). Toujours rejoués : les
+  deltas d'un message en cours (pas de `message_stop`), interrompu, dont le
+  `message_start` est sorti du ring, ou illisibles ; tout ce qui n'est pas un
+  `stream_event`. Les flux entrelacés (sous-agents) sont suivis par
+  `parent_tool_use_id`.
+- Seul le **rejeu** est compacté ; le flux en direct qui suit est inchangé.
+- Mesuré sur un vrai tour (texte + un appel d'outil + résumé) : 41 lignes /
+  17,3 Ko en rejeu intégral → 18 lignes dont 5 `fd_skip` / 8,9 Ko.
+
 ## Limites connues (M1.1+)
 
 - **Démon redémarré = sessions perdues** (les pipes meurent avec lui). Le

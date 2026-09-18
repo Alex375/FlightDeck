@@ -83,3 +83,68 @@ pub async fn wait_for_session_id(m: &Arc<SessionManager>, conv_id: &str, session
     }
     panic!("{conv_id} never reported session {session_id}");
 }
+
+/// Builders for claude stream-json lines with partial messages, in the order
+/// observed from real claude (see `replay.rs`).
+pub mod stream {
+    use serde_json::json;
+
+    pub fn se(parent: Option<&str>, event: serde_json::Value) -> String {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": parent, "session_id": "s"}).to_string()
+    }
+    pub fn start(parent: Option<&str>, id: &str) -> String {
+        se(parent, json!({"type": "message_start", "message": {"id": id, "role": "assistant", "content": []}}))
+    }
+    pub fn delta(parent: Option<&str>, text: &str) -> String {
+        se(parent, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}))
+    }
+    pub fn ev(parent: Option<&str>, kind: &str) -> String {
+        se(parent, json!({"type": kind, "index": 0}))
+    }
+    pub fn assistant(parent: Option<&str>, id: &str, text: &str) -> String {
+        json!({"type": "assistant", "parent_tool_use_id": parent, "session_id": "s",
+               "message": {"id": id, "role": "assistant", "content": [{"type": "text", "text": text}]}})
+        .to_string()
+    }
+    pub fn other(kind: &str) -> String {
+        json!({"type": kind}).to_string()
+    }
+
+    /// One complete message in the observed claude order.
+    pub fn message(parent: Option<&str>, id: &str) -> Vec<String> {
+        vec![
+            start(parent, id),
+            ev(parent, "content_block_start"),
+            delta(parent, "Hel"),
+            delta(parent, "lo"),
+            assistant(parent, id, "Hello"),
+            ev(parent, "content_block_stop"),
+            ev(parent, "message_delta"),
+            ev(parent, "message_stop"),
+        ]
+    }
+
+    /// A realistic turn: init, the user echo, a streamed message, a tool
+    /// result, a second streamed message, the result.
+    pub fn turn() -> Vec<String> {
+        let mut t = vec![other("system"), other("user")];
+        t.extend(message(None, "msg_1"));
+        t.push(other("user")); // tool result
+        t.extend(message(None, "msg_2"));
+        t.push(other("result"));
+        t
+    }
+}
+
+/// A stand-in claude that waits for its first stdin line (the first turn),
+/// then prints `lines` and holds stdin open.
+pub fn fake_claude_emitting(dir: &Path, lines: &[String]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let data = dir.join("turn.jsonl");
+    std::fs::write(&data, lines.join("\n") + "\n").expect("write turn");
+    let path = dir.join("fake-claude-turn");
+    let script = format!("#!/bin/sh\nread _first\ncat '{}'\ncat >/dev/null\n", data.display());
+    std::fs::write(&path, script).expect("write fake claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
