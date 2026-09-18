@@ -13,8 +13,14 @@ Runs `flightdeckd attach` THROUGH REAL SSH against the M1 container:
      (ATTACH_WRITE_TIMEOUT), SIGCONT — the stalled stream must END after the
      kernel/ssh-buffered prefix (+ best-effort fd_detach{stalled}), never dump
      the outage backlog; a reattach from the cursor then replays the rest.
+  E: (own throwaway conversation) replay compaction on the wire: after a
+     complete turn, a reattach WITHOUT --supports-skip gets the full replay
+     (no fd_skip, stream_event deltas included); WITH it, fd_attach.skip is
+     true, fd_skip frames arrive gapless (from == cursor + 1), no delta of the
+     completed messages is replayed, and the cursor ends on the daemon's seq —
+     from 0 and from a cursor in the middle.
 
-Usage:  python3 m1-daemon/tests/detach_test.py [abc] [d]    (default: all)
+Usage:  python3 m1-daemon/tests/detach_test.py [abc] [d] [e]    (default: all)
 Env:    TARGET (agent@127.0.0.1), PORT (2224), KEY (~/.ssh/flightdeck_m0_ed25519),
         CWD (/work/demo) — point TARGET/PORT/KEY/CWD at a real server to run it there.
         WRITE_TIMEOUT (20) — the daemon's ATTACH_WRITE_TIMEOUT, in seconds.
@@ -45,8 +51,9 @@ def eligible(line: str) -> bool:
     return isinstance(t, str) and t not in CONTROL and not t.startswith("fd_")
 
 class Attach:
-    def __init__(self, conversation=None, cwd=None, epoch=None, cursor=0, resume=None):
+    def __init__(self, conversation=None, cwd=None, epoch=None, cursor=0, resume=None, skip=False):
         args = SSH + ["flightdeckd", "attach"]
+        if skip: args += ["--supports-skip"]
         if conversation: args += ["--conversation", conversation]
         if cwd: args += ["--cwd", cwd]
         if resume: args += ["--resume-session", resume]
@@ -58,6 +65,8 @@ class Attach:
         self.cursor = cursor
         self.bytes = 0  # bytes received on this link (stdout of the ssh child)
         self.err = []  # ssh's own stderr (auth, host key, connect errors…)
+        self.skips = 0  # fd_skip frames applied
+        self.skip_errors = []  # fd_skip frames that would leave a cursor gap
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._pump_err, daemon=True).start()
 
@@ -66,7 +75,21 @@ class Attach:
             self.bytes += len(line)
             line = line.rstrip("\n")
             if not line: continue
-            if eligible(line): self.cursor += 1
+            if eligible(line):
+                self.cursor += 1
+            else:
+                try:
+                    v = json.loads(line)
+                except Exception:
+                    v = {}
+                if v.get("type") == "fd_attach":
+                    self.cursor = v["replay_from"]
+                elif v.get("type") == "fd_skip":
+                    # the client side of the fd_skip contract (M1-DAEMON.md)
+                    if v["from"] != self.cursor + 1 or v["to"] < v["from"]:
+                        self.skip_errors.append((self.cursor, v))
+                    self.cursor = v["to"]
+                    self.skips += 1
             self.q.put(line)
         self.q.put(None)
 
@@ -234,6 +257,79 @@ def scenario_d():
         subprocess.run(SSH + [f"rm -rf {burst_dir}"], capture_output=True, timeout=15)
     print("D GOOD — a stalled link is given up on, not fed the outage")
 
+def read_until_cursor(att_client, att, timeout=60):
+    """Every line after fd_attach until the lines CONSUMED here bring the cursor
+    to the daemon's seq (the pump thread's own cursor runs ahead of the queue)."""
+    t0, got, cur = time.time(), [], att["replay_from"]
+    while cur < att["seq"] and time.time() - t0 < timeout:
+        try:
+            line = att_client.q.get(timeout=1)
+        except queue.Empty:
+            continue
+        if line is None: break
+        got.append(line)
+        if eligible(line):
+            cur += 1
+        elif jtype(json.loads(line)) == "fd_skip":
+            cur = json.loads(line)["to"]
+    return got
+
+def scenario_e():
+    print("== E: replay compaction on the wire (fd_skip / --supports-skip)")
+    a = Attach(cwd=CWD)  # a FRESH conversation
+    try:
+        _, att = a.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
+        assert att, "no fd_attach" + a.why()
+        conv, epoch = att["conversation"], att["epoch"]
+        a.send_user("Say one short sentence. Then use the Bash tool to run: echo compaction. "
+                    "Then reply with exactly the single word DONE_E.")
+        _, res = a.read_until(lambda v: jtype(v) == "result", timeout=120)
+        assert res and not res.get("is_error"), f"turn E failed: {res}" + a.why()
+        time.sleep(2)  # claude emits a line or two after its result
+    finally:
+        a.p.stdin.close(); time.sleep(0.3); a.kill()
+
+    def reattach(cursor, skip):
+        c = Attach(conversation=conv, epoch=epoch, cursor=cursor, skip=skip)
+        _, att = c.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
+        assert att and att["epoch"] == epoch, "reattach failed" + c.why()
+        lines = read_until_cursor(c, att)
+        c.p.stdin.close(); time.sleep(0.3); c.kill()
+        return c, att, lines
+
+    try:
+        full_c, full_att, full = reattach(0, skip=False)
+        assert "skip" not in full_att, f"fd_attach.skip sent to a flagless client: {full_att}"
+        assert not any(jtype(json.loads(l)) == "fd_skip" for l in full), "fd_skip sent to a flagless client"
+        assert full_c.cursor == full_att["seq"], f"flagless cursor {full_c.cursor} != seq {full_att['seq']}"
+        replayable = [l for l in full if eligible(l)]
+        deltas = sum(1 for l in replayable if jtype(json.loads(l)) == "stream_event")
+        assert deltas > 0, "no stream_event in the replay — nothing to compact, E would prove nothing"
+        print(f"   flagless: {len(replayable)} replayable lines ({deltas} stream_event), cursor {full_c.cursor} == seq")
+
+        for start in (0, full_att["seq"] // 2):
+            c, att, got = reattach(start, skip=True)
+            assert att.get("skip") is True, f"fd_attach.skip missing with --supports-skip: {att}" + c.why()
+            assert not c.skip_errors, f"fd_skip left a cursor gap: {c.skip_errors}"
+            assert c.cursor == att["seq"], f"compacted cursor {c.cursor} != seq {att['seq']}"
+            kept = [l for l in got if eligible(l)]
+            if att["seq"] == full_att["seq"]:
+                expected = [l for l in replayable[att["replay_from"]:] if jtype(json.loads(l)) != "stream_event"]
+                if kept != expected:
+                    diff = next((i for i, (x, y) in enumerate(zip(kept, expected)) if x != y), min(len(kept), len(expected)))
+                    raise AssertionError(
+                        f"the compacted replay (from {start}) differs from the full one minus the deltas: "
+                        f"{len(kept)} vs {len(expected)} lines, first difference at {diff}: "
+                        f"{kept[diff][:160] if diff < len(kept) else None!r} vs {expected[diff][:160] if diff < len(expected) else None!r}")
+            if start == 0:
+                assert c.skips >= 1, "no fd_skip received after a complete turn"
+                assert "DONE_E" in "\n".join(kept), "the assistant reply is missing from the compacted replay"
+            print(f"   --supports-skip from {start}: {len(kept)} lines + {c.skips} fd_skip, "
+                  f"cursor {c.cursor} == seq, gapless")
+    finally:
+        subprocess.run(SSH + ["flightdeckd", "stop", "--conversation", conv], capture_output=True, timeout=15)
+    print("E GOOD — fd_skip honoured on the wire, and only when asked")
+
 def scenarios_abc():
     print(f"== A: attach over ssh (port {PORT}), one full turn, clean detach")
     a = Attach(cwd=CWD)
@@ -280,11 +376,13 @@ def scenarios_abc():
     print("ABC GOOD — detachment over real SSH proven")
 
 def main():
-    which = "".join(sys.argv[1:]).lower() or "abcd"
+    which = "".join(sys.argv[1:]).lower() or "abcde"
     if "a" in which or "b" in which or "c" in which:
         scenarios_abc()
     if "d" in which:
         scenario_d()
+    if "e" in which:
+        scenario_e()
     print("ALL GOOD")
 
 if __name__ == "__main__":
