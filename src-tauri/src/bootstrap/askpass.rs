@@ -418,6 +418,19 @@ pub async fn run_with_password(
     classify_output(output, password)
 }
 
+/// Whether `stderr` from a FAILED ssh invocation carries one of OpenSSH's two host-key
+/// wordings for a genuine mismatch (an already-pinned key that changed, or — under
+/// `StrictHostKeyChecking=yes`, not used by this crate's TOFU paths, but tolerated here
+/// too — a new key refused outright). Pulled out of [`classify_output`] so
+/// `bootstrap::connect`'s two KEYED call sites (`verify_key_accepted`, `probe`) can
+/// classify the SAME wording without routing through `classify_output` itself: its
+/// `permission denied` branch would misclassify a rejected KEY — neither of those two
+/// calls ever involves a password at all — as [`BootstrapError::WrongPassword`].
+pub(crate) fn is_host_key_mismatch(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("host key verification failed") || lower.contains("remote host identification has changed")
+}
+
 /// Turns ssh's raw exit status/stderr into the typed outcome callers actually want.
 /// ssh's own convention: exit code 255 means SSH ITSELF failed (auth/connect/host-key)
 /// — any other code is the REMOTE COMMAND's own exit code carried through verbatim,
@@ -459,9 +472,7 @@ pub(crate) fn classify_output(
     if stderr.contains("permission denied") {
         return Err(BootstrapError::WrongPassword);
     }
-    if stderr.contains("host key verification failed")
-        || stderr.contains("remote host identification has changed")
-    {
+    if is_host_key_mismatch(&stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
     if stderr.contains("could not resolve hostname")
@@ -618,6 +629,45 @@ mod tests {
             args.iter().any(|a| a == "UserKnownHostsFile=/tmp/dedicated_known_hosts"),
             "expected the dedicated known_hosts override in {args:?}"
         );
+    }
+
+    // ---- is_host_key_mismatch (B7 — shared by classify_output AND
+    // bootstrap::connect's two KEYED call sites, verify_key_accepted/probe) ----
+
+    #[test]
+    fn is_host_key_mismatch_recognizes_a_changed_key() {
+        assert!(is_host_key_mismatch(
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+             WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n\
+             IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n"
+        ));
+    }
+
+    #[test]
+    fn is_host_key_mismatch_recognizes_a_refused_new_key() {
+        assert!(is_host_key_mismatch("Host key verification failed.\n"));
+    }
+
+    #[test]
+    fn is_host_key_mismatch_is_false_for_unrelated_failures() {
+        assert!(!is_host_key_mismatch("Permission denied (publickey).\n"));
+        assert!(!is_host_key_mismatch("ssh: connect to host example.com port 22: Connection refused\n"));
+        assert!(!is_host_key_mismatch(""));
+    }
+
+    /// `classify_output` must still route through [`is_host_key_mismatch`] correctly
+    /// after being refactored to call it — driven through a synthetic `Output` exactly
+    /// like `askpass_errors_never_contain_the_test_password` does below, rather than a
+    /// real ssh round-trip.
+    #[test]
+    fn classify_output_reports_host_key_mismatch_for_the_real_openssh_wording() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: b"Host key verification failed.\n".to_vec(),
+        };
+        let err = classify_output(out, "").expect_err("must classify as an error, not success");
+        assert_eq!(err, BootstrapError::HostKeyMismatch);
     }
 
     /// `run_with_password` is the one that owns `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE`

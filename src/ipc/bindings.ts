@@ -2425,14 +2425,21 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
  * [`install_key`]), reusing [`crate::ipc::commands::generate_or_reuse_pending_key`]
  * for the key itself (A3's lookup-or-generate primitive — never mints a key here).
  * 
- * On ANY successful connection this call makes (whether the outcome is
- * `Installed` or `AlreadyPresent`), emits
- * [`crate::ipc::events::HostKeyFingerprintEvent`] with the fingerprint TOFU-pinned in
- * the app's dedicated `known_hosts` and whether it was ALREADY pinned before THIS
- * call — display-only, NON-BLOCKING (Armand's decision: no confirmation gate). A host
- * key that CHANGED since a previous pin never reaches this far: it fails the
- * connection itself as [`BootstrapError::HostKeyMismatch`], and no event fires for
- * that call.
+ * On SUCCESS ONLY — [`install_key`] returns `Ok`, whether the outcome is `Installed`
+ * or `AlreadyPresent` — emits [`crate::ipc::events::HostKeyFingerprintEvent`] with the
+ * fingerprint TOFU-pinned in the app's dedicated `known_hosts` and whether it was
+ * ALREADY pinned before THIS call — display-only, NON-BLOCKING (Armand's decision: no
+ * confirmation gate). The emit is gated on the OVERALL `Result`, never on "some
+ * fingerprint happens to be readable": TOFU pinning happens at the transport layer,
+ * before auth, so a fingerprint can be readable even after a FAILED call (a wrong
+ * password still pins a fresh host key; a stale pin is still readable right after a
+ * [`BootstrapError::HostKeyMismatch`]) — without this gate a caller could mistake
+ * receipt of the event for a successful pairing step. Concretely: a wrong password on
+ * a brand-new host pins the key but does NOT emit here; the fingerprint becomes
+ * visible on the next, successful call instead (at which point `known` correctly
+ * reads `true`). A host key that CHANGED since a previous pin never reaches
+ * `Ok` at all — it fails as [`BootstrapError::HostKeyMismatch`] — so no event fires
+ * for that call either.
  */
 async bootstrapInstallKey(host: string, port: number, user: string, password: string, label: string) : Promise<Result<KeyInstallOutcome, string>> {
     try {
@@ -3615,15 +3622,18 @@ condition: string;
  */
 reason: string | null }
 /**
- * `bootstrap::connect`'s own TOFU host-key pin (B7), read back after ANY successful
- * connection through that module — the `install_key` password step, and every keyed
- * reconnect/probe after it. DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is
- * no confirmation step gating on this event, it never blocks the flow. `known` = the
+ * `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+ * `bootstrap_install_key` returns `Ok` (`Installed` or `AlreadyPresent`) — never on
+ * any `Err`, even one (like a wrong password) that still pinned a fresh host key at
+ * the transport layer; see `bootstrap::connect::bootstrap_install_key`'s own doc for
+ * why the emit is gated on the overall `Result`, not on "some fingerprint happens to
+ * be readable". DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+ * confirmation step gating on this event, it never blocks the flow. `known` = the
  * fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
  * this particular connection attempt — `false` only on a server's genuine first
- * contact. A host key that CHANGED versus what was pinned never reaches this event at
- * all: it fails the connection itself as `BootstrapError::HostKeyMismatch` instead
- * (see `bootstrap::connect::install_key`'s doc).
+ * contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
+ * it fails as `BootstrapError::HostKeyMismatch` instead (see
+ * `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
  */
 export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
 /**

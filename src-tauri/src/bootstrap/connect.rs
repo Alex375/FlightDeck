@@ -17,7 +17,12 @@
 //! KEYED path ([`crate::ipc::commands::keyed_ssh_options`]). Both share the SAME
 //! dedicated `known_hosts` file (`app_data/remote_known_hosts`, exactly like
 //! `spawn_session`/`add_machine`), pinned TOFU (`StrictHostKeyChecking=accept-new`) on
-//! first contact — see the module's host-key-fingerprint helpers below.
+//! first contact — see the module's host-key-fingerprint helpers below. A host-key
+//! mismatch discovered on ANY of the three ssh invocations in this module — the
+//! password-only first connection, or either of the two later keyed calls
+//! ([`verify_key_accepted`], [`probe`]) — is classified the SAME way, via
+//! [`askpass::is_host_key_mismatch`], so [`BootstrapError::HostKeyMismatch`] is never
+//! mistaken for a generic connection failure regardless of which call produced it.
 
 use std::path::Path;
 use std::time::Duration;
@@ -97,7 +102,7 @@ AUTH_KEYS="$HOME/.ssh/authorized_keys"
 if [ -e "$AUTH_KEYS" ] || [ -L "$AUTH_KEYS" ]; then
     REAL_AUTH_KEYS=$(readlink -f "$AUTH_KEYS" 2>/dev/null) || { echo FLIGHTDECK_AUTHORIZED_KEYS_UNREADABLE >&2; exit 5; }
     case "$REAL_AUTH_KEYS" in
-        "$HOME"/.ssh/authorized_keys) ;;
+        "$HOME"|"$HOME"/*) ;;
         *) echo FLIGHTDECK_AUTHORIZED_KEYS_ESCAPES_HOME >&2; exit 5 ;;
     esac
 fi
@@ -147,6 +152,18 @@ fn parse_install_key_output(success: bool, stdout: &str, stderr: &str) -> Result
 /// interactive step the user is actively waiting on, not a background poll.
 const INSTALL_KEY_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Serializes [`install_key`] end to end (password-step append, then the
+/// verify-reconnect) against every OTHER concurrent call — mirrors
+/// `ipc::commands::PENDING_KEY_LOCK`'s own reasoning (single global lock, not
+/// per-target: `install_key` is only ever driven by one human at a time through the
+/// wizard, so cross-target serialization costs nothing worth avoiding). Needed because
+/// [`INSTALL_KEY_SCRIPT`]'s own check-then-append (`grep -qxF` then `printf >>`) is not
+/// atomic across two simultaneous remote shells: without this lock, two overlapping
+/// `install_key` calls (e.g. a double click on "Add a server" before a future front end
+/// debounces it) could each read "not present yet" and both append the key line,
+/// leaving a duplicate in `authorized_keys`.
+static INSTALL_KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Idempotently install the app's dedicated PUBLIC key on a server the app has never
 /// paired, over B5's password-only first-contact path ([`askpass::bootstrap_ssh_command`]
 /// + [`askpass::run_with_password`]), then VERIFY it actually took by reconnecting
@@ -167,8 +184,13 @@ const INSTALL_KEY_DEADLINE: Duration = Duration::from_secs(30);
 /// [`read_pinned_fingerprint`]/[`HostKeyFingerprintEvent`].
 ///
 /// A host key that has CHANGED since a previous pin surfaces as
-/// [`BootstrapError::HostKeyMismatch`] (via `classify_output`, already wired in
-/// `askpass.rs`) — before either the append or the verify step gets a chance to run.
+/// [`BootstrapError::HostKeyMismatch`] — the password step's own connection classifies
+/// it via [`askpass::classify_output`] (already wired in `askpass.rs`), before either
+/// the append or the verify step gets a chance to run; [`verify_key_accepted`]'s own
+/// reconnect classifies the SAME mismatch the same way (via
+/// [`askpass::is_host_key_mismatch`]), should the key somehow change again in the few
+/// seconds between the two connections — never falling through to the ordinary
+/// [`BootstrapError::KeyInstalledButNotAccepted`] path in that case.
 pub async fn install_key(
     target: &BootstrapTarget,
     password: &str,
@@ -176,6 +198,7 @@ pub async fn install_key(
     public_key: &str,
     known_hosts: &str,
 ) -> Result<KeyInstallOutcome, BootstrapError> {
+    let _guard = INSTALL_KEY_LOCK.lock().await;
     let dest = target.ssh_destination();
     let cmd = askpass::bootstrap_ssh_command(&dest, None, Some(known_hosts), INSTALL_KEY_SCRIPT);
     let out = askpass::run_with_password(cmd, password, Some(public_key.as_bytes()), INSTALL_KEY_DEADLINE).await?;
@@ -194,7 +217,11 @@ pub async fn install_key(
 /// failure here — auth refused, connection dropped — becomes
 /// [`BootstrapError::KeyInstalledButNotAccepted`] with a hint built from ssh's own
 /// stderr, never a bare connection error (the password step already proved the host
-/// itself is reachable).
+/// itself is reachable) — UNLESS the failure is itself a host-key mismatch (the server
+/// was reimaged, or something is impersonating it, in the seconds between the password
+/// step and this reconnect), which is classified as [`BootstrapError::HostKeyMismatch`]
+/// via [`askpass::is_host_key_mismatch`] instead: a changed host key is never just "the
+/// key wasn't accepted".
 async fn verify_key_accepted(
     target: &BootstrapTarget,
     identity_file: &str,
@@ -211,7 +238,11 @@ async fn verify_key_accepted(
     if out.status.success() {
         return Ok(());
     }
-    let hint = key_rejection_hint(&String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if askpass::is_host_key_mismatch(&stderr) {
+        return Err(BootstrapError::HostKeyMismatch);
+    }
+    let hint = key_rejection_hint(&stderr);
     Err(BootstrapError::KeyInstalledButNotAccepted(hint))
 }
 
@@ -219,9 +250,24 @@ async fn verify_key_accepted(
 /// reconnect's raw stderr: recognizes the standard OpenSSH client wording for the
 /// common sshd-side causes, falling back to ssh's own last stderr line so nothing is
 /// ever silently generic. Pure, unit-tested against real OpenSSH wording.
+///
+/// This is fed ONLY [`verify_key_accepted`]'s stderr, and that reconnect authenticates
+/// through nothing but our OWN dedicated key (`IdentitiesOnly=yes`, and `BatchMode=yes`
+/// means password/keyboard-interactive is never even attempted) — so ANY "permission
+/// denied" there inherently means the key path is what failed, regardless of which
+/// method name ssh cites in parentheses. That parenthetical lists what the SERVER still
+/// offers as continuable, not what THIS client tried: VERIFIED live against a real
+/// fixture with `PubkeyAuthentication no` flipped on sshd AFTER a successful install —
+/// ssh's own message there reads `Permission denied (password).` (the server no longer
+/// offers publickey at all, so the client's summary names its next method instead),
+/// never `(publickey)` as might be assumed from the method WE offered; a bad
+/// `authorized_keys` entry/permissions instead produces `(publickey)` (the server still
+/// offers it, the specific key is what got rejected). Matching on the bare "permission
+/// denied" prefix, not a specific parenthetical, covers both real causes with the one,
+/// more useful hint instead of silently falling back to raw ssh wording for either one.
 fn key_rejection_hint(stderr: &str) -> String {
     let lower = stderr.to_lowercase();
-    if lower.contains("permission denied (publickey") {
+    if lower.contains("permission denied") {
         return "the key was installed but the server refused it when reconnecting — check that \
                 sshd has `PubkeyAuthentication yes` and `AuthorizedKeysFile` pointing at the \
                 default `~/.ssh/authorized_keys`"
@@ -461,7 +507,15 @@ exit 0
 /// already works, see the module doc). Parsing goes through the SAME
 /// [`crate::ipc::commands::parse_probe_output`] A1's own pairing probe uses — one
 /// parser, one struct (see that function's doc) — fed THIS module's own, extended
-/// [`PROBE_SCRIPT`].
+/// [`PROBE_SCRIPT`]. A connection-level failure that is itself a host-key mismatch
+/// (the server was reimaged, or something is impersonating it, since [`install_key`]
+/// last pinned it) is classified as [`BootstrapError::HostKeyMismatch`] via
+/// [`askpass::is_host_key_mismatch`] BEFORE falling through to `parse_probe_output`'s
+/// generic "could not connect" string — otherwise this exact case (a LATER connect
+/// against an already-keyed server, per this function's own doc) would be
+/// indistinguishable from an ordinary connection failure once the error is flattened
+/// to a `String` at the `#[tauri::command]` boundary, and a caller could never offer
+/// [`forget_host_key`] in response to it.
 pub async fn probe(
     target: &BootstrapTarget,
     identity_file: &str,
@@ -475,12 +529,12 @@ pub async fn probe(
         .output()
         .await
         .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
-    parse_probe_output(
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-        out.status.success(),
-    )
-    .map_err(BootstrapError::Other)
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && askpass::is_host_key_mismatch(&stderr) {
+        return Err(BootstrapError::HostKeyMismatch);
+    }
+    parse_probe_output(&String::from_utf8_lossy(&out.stdout), &stderr, out.status.success())
+        .map_err(BootstrapError::Other)
 }
 
 // ============================================================================
@@ -517,14 +571,21 @@ fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port: u16, fing
 /// [`install_key`]), reusing [`crate::ipc::commands::generate_or_reuse_pending_key`]
 /// for the key itself (A3's lookup-or-generate primitive — never mints a key here).
 ///
-/// On ANY successful connection this call makes (whether the outcome is
-/// `Installed` or `AlreadyPresent`), emits
-/// [`crate::ipc::events::HostKeyFingerprintEvent`] with the fingerprint TOFU-pinned in
-/// the app's dedicated `known_hosts` and whether it was ALREADY pinned before THIS
-/// call — display-only, NON-BLOCKING (Armand's decision: no confirmation gate). A host
-/// key that CHANGED since a previous pin never reaches this far: it fails the
-/// connection itself as [`BootstrapError::HostKeyMismatch`], and no event fires for
-/// that call.
+/// On SUCCESS ONLY — [`install_key`] returns `Ok`, whether the outcome is `Installed`
+/// or `AlreadyPresent` — emits [`crate::ipc::events::HostKeyFingerprintEvent`] with the
+/// fingerprint TOFU-pinned in the app's dedicated `known_hosts` and whether it was
+/// ALREADY pinned before THIS call — display-only, NON-BLOCKING (Armand's decision: no
+/// confirmation gate). The emit is gated on the OVERALL `Result`, never on "some
+/// fingerprint happens to be readable": TOFU pinning happens at the transport layer,
+/// before auth, so a fingerprint can be readable even after a FAILED call (a wrong
+/// password still pins a fresh host key; a stale pin is still readable right after a
+/// [`BootstrapError::HostKeyMismatch`]) — without this gate a caller could mistake
+/// receipt of the event for a successful pairing step. Concretely: a wrong password on
+/// a brand-new host pins the key but does NOT emit here; the fingerprint becomes
+/// visible on the next, successful call instead (at which point `known` correctly
+/// reads `true`). A host key that CHANGED since a previous pin never reaches
+/// `Ok` at all — it fails as [`BootstrapError::HostKeyMismatch`] — so no event fires
+/// for that call either.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_install_key(
@@ -547,8 +608,15 @@ pub async fn bootstrap_install_key(
     let known_before = host_key_pinned(&known_hosts, &host, port).await;
     let result = install_key(&target, &password, &key.identity_file, &key.public_key, &known_hosts).await;
 
-    if let Some(fingerprint) = read_pinned_fingerprint(&known_hosts, &host, port).await {
-        emit_host_key_fingerprint(&app, &host, port, &fingerprint, known_before);
+    // Gated on success (see this function's own doc): the TOFU pin itself happens at
+    // the transport layer, before auth, so a fingerprint can be readable here even
+    // after a FAILED call (a wrong password still pins a fresh host; a stale pin is
+    // still readable after a `HostKeyMismatch`) — emitting unconditionally would let a
+    // caller mistake receipt of this event for a successful pairing step.
+    if result.is_ok() {
+        if let Some(fingerprint) = read_pinned_fingerprint(&known_hosts, &host, port).await {
+            emit_host_key_fingerprint(&app, &host, port, &fingerprint, known_before);
+        }
     }
 
     result.map_err(|e| e.to_string())
@@ -597,6 +665,58 @@ mod tests {
     fn ssh_destination_uses_the_uri_form_on_a_non_default_port() {
         let t = BootstrapTarget { host: "127.0.0.1".to_string(), port: 2231, user: "deploy".to_string() };
         assert_eq!(t.ssh_destination(), "ssh://deploy@127.0.0.1:2231");
+    }
+
+    // ---- INSTALL_KEY_SCRIPT (golden string) ----
+
+    /// Makes [`INSTALL_KEY_SCRIPT`]'s doc claim of being "golden-string tested" true: an
+    /// INDEPENDENT literal copy of the script text, so an accidental edit to the real
+    /// constant (e.g. narrowing one of the two symlink-tolerance `case` patterns back to
+    /// an exact match, the actual shape of the blocker this test now guards against) is
+    /// caught here even though nothing else in this file necessarily exercises that
+    /// exact line — the live fixture tests prove BEHAVIOR against a real server, this
+    /// test proves the shipped TEXT hasn't drifted from what was reviewed.
+    #[test]
+    fn install_key_script_is_the_reviewed_golden_string() {
+        let expected = r#"set -e
+REAL_SSH_DIR=""
+if [ -e "$HOME/.ssh" ] || [ -L "$HOME/.ssh" ]; then
+    REAL_SSH_DIR=$(readlink -f "$HOME/.ssh" 2>/dev/null) || { echo FLIGHTDECK_SSH_DIR_UNREADABLE >&2; exit 5; }
+    case "$REAL_SSH_DIR" in
+        "$HOME"|"$HOME"/*) ;;
+        *) echo FLIGHTDECK_SSH_DIR_ESCAPES_HOME >&2; exit 5 ;;
+    esac
+fi
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+AUTH_KEYS="$HOME/.ssh/authorized_keys"
+if [ -e "$AUTH_KEYS" ] || [ -L "$AUTH_KEYS" ]; then
+    REAL_AUTH_KEYS=$(readlink -f "$AUTH_KEYS" 2>/dev/null) || { echo FLIGHTDECK_AUTHORIZED_KEYS_UNREADABLE >&2; exit 5; }
+    case "$REAL_AUTH_KEYS" in
+        "$HOME"|"$HOME"/*) ;;
+        *) echo FLIGHTDECK_AUTHORIZED_KEYS_ESCAPES_HOME >&2; exit 5 ;;
+    esac
+fi
+touch "$AUTH_KEYS"
+chmod 600 "$AUTH_KEYS"
+KEY=$(cat)
+if [ -z "$KEY" ]; then
+    echo FLIGHTDECK_EMPTY_KEY >&2
+    exit 5
+fi
+if grep -qxF "$KEY" "$AUTH_KEYS" 2>/dev/null; then
+    echo FLIGHTDECK_KEY_ALREADY_PRESENT
+else
+    printf '%s\n' "$KEY" >> "$AUTH_KEYS"
+    echo FLIGHTDECK_KEY_INSTALLED
+fi
+"#;
+        assert_eq!(
+            INSTALL_KEY_SCRIPT, expected,
+            "INSTALL_KEY_SCRIPT's text has drifted from what was reviewed — in particular, both \
+             the ~/.ssh AND authorized_keys symlink checks must tolerate any resolved path under \
+             $HOME (`\"$HOME\"|\"$HOME\"/*`), not just an exact-match literal"
+        );
     }
 
     // ---- parse_install_key_output ----
@@ -650,6 +770,18 @@ mod tests {
     #[test]
     fn key_rejection_hint_recognizes_the_real_publickey_denial_wording() {
         let hint = key_rejection_hint("deploy@127.0.0.1: Permission denied (publickey).\n");
+        assert!(hint.contains("PubkeyAuthentication"));
+        assert!(hint.contains("AuthorizedKeysFile"));
+    }
+
+    /// The wording ssh ACTUALLY produces (VERIFIED live against a real fixture) when
+    /// `PubkeyAuthentication no` is the sshd-side cause — a different parenthetical
+    /// than the "bad authorized_keys" case above, but the same underlying "your key
+    /// path is broken" situation, so it must produce the SAME actionable hint rather
+    /// than falling through to a bare, unexplained stderr line.
+    #[test]
+    fn key_rejection_hint_recognizes_the_real_wording_when_pubkeyauthentication_is_off() {
+        let hint = key_rejection_hint("deploy@127.0.0.1: Permission denied (password).\n");
         assert!(hint.contains("PubkeyAuthentication"));
         assert!(hint.contains("AuthorizedKeysFile"));
     }
@@ -936,6 +1068,121 @@ mod tests {
             let out = verify.output().await.expect("could not run ssh");
             assert!(out.status.success(), "key login must work: {}", String::from_utf8_lossy(&out.stderr));
             assert!(String::from_utf8_lossy(&out.stdout).contains("REMOTE_OK"));
+        }
+
+        /// PROVES the blocker fix: an `~/.ssh` symlink that resolves WITHIN `$HOME` (a
+        /// dotfiles-managed setup, say) with a PRE-EXISTING `authorized_keys` living
+        /// behind it is TOLERATED, not refused as escaping `$HOME`. Before the fix, the
+        /// `~/.ssh` check already tolerated any within-$HOME symlink target via a glob
+        /// pattern, but the `authorized_keys` check right after it used an EXACT
+        /// literal match against `$HOME/.ssh/authorized_keys` — so a real
+        /// `authorized_keys` living behind a within-$HOME `~/.ssh` symlink (anywhere
+        /// other than that one exact literal path) was wrongly refused with
+        /// `FLIGHTDECK_AUTHORIZED_KEYS_ESCAPES_HOME`, the SAME wording a genuine
+        /// escaping-HOME attack produces — reproduced live against this very fixture
+        /// while diagnosing the bug.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        async fn live_fixture_a_tolerates_a_within_home_ssh_symlink_with_existing_authorized_keys() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let target =
+                BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_A_PORT, user: FIXTURE_A_USER.to_string() };
+            let key = ThrowawayKey::generate("fixture-a-dotfiles-ssh");
+            let kh = ScratchKnownHosts::new("fixture-a-dotfiles-ssh");
+
+            // A dotfiles-managed ~/.ssh: a within-$HOME symlink pointing at a real
+            // directory that ALREADY has an authorized_keys file behind it (non-empty,
+            // like a real one would be) — every path here resolves under $HOME, so
+            // none of it should be refused.
+            let setup = "rm -rf ~/.ssh ~/dotfiles; mkdir -p ~/dotfiles/ssh; \
+                          printf '# pre-existing\\n' > ~/dotfiles/ssh/authorized_keys; \
+                          ln -s ~/dotfiles/ssh ~/.ssh";
+            let setup_cmd = askpass::bootstrap_ssh_command(&target.ssh_destination(), None, Some(kh.path()), setup);
+            let out = askpass::run_with_password(setup_cmd, FIXTURE_A_PASSWORD, None, Duration::from_secs(15))
+                .await
+                .expect("setting up the dotfiles-style ~/.ssh symlink must succeed");
+            assert!(out.status.success(), "dotfiles setup failed: {}", String::from_utf8_lossy(&out.stderr));
+
+            let outcome = install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path())
+                .await
+                .expect(
+                    "a within-$HOME ~/.ssh symlink with an existing authorized_keys behind it must \
+                     be tolerated, not refused as escaping $HOME",
+                );
+            assert_eq!(outcome, KeyInstallOutcome::Installed);
+
+            // Prove the key was appended to the REAL file behind the symlink (not
+            // silently dropped, and not some fresh ~/.ssh materialized alongside the
+            // symlink instead of through it) — a genuine BatchMode reconnect using it
+            // must work, exactly like the ordinary (no-symlink) case.
+            let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path()));
+            verify
+                .arg("-T")
+                .arg(format!("{}@{}", target.user, target.host))
+                .arg("echo REMOTE_OK");
+            let out = verify.output().await.expect("could not run ssh");
+            assert!(
+                out.status.success(),
+                "key login through the dotfiles symlink must work: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("REMOTE_OK"));
+        }
+
+        /// PROVES the brief's explicit "verification failure" scenario end to end — the
+        /// one live scenario the original review found completely unexercised:
+        /// `install_key`'s password step succeeds (it never uses key auth at all — see
+        /// `bootstrap_ssh_command`'s own doc — so disabling the server's key auth
+        /// afterward doesn't touch it), but the verify-reconnect that follows DOES use
+        /// the key, and genuinely fails once `PubkeyAuthentication` is turned off
+        /// server-side (flipped AFTER a first successful install, via `docker exec` —
+        /// mirrors the host-key-regeneration test's own technique). Proves this
+        /// "accepted the password but the key path specifically is broken" state
+        /// surfaces LOUDLY as `KeyInstalledButNotAccepted` with the sshd hint, never a
+        /// silent bare success.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        async fn live_fixture_a_verify_failure_surfaces_as_key_installed_but_not_accepted() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let target =
+                BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_A_PORT, user: FIXTURE_A_USER.to_string() };
+            let key = ThrowawayKey::generate("fixture-a-verify-fail");
+            let kh = ScratchKnownHosts::new("fixture-a-verify-fail");
+
+            let first = install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path())
+                .await
+                .expect("the first install (append + verify) must succeed");
+            assert_eq!(first, KeyInstallOutcome::Installed);
+
+            // Break ONLY the key path from outside.
+            let disable_pubkey = std::process::Command::new("docker")
+                .args([
+                    "exec",
+                    "fd-fixture-a",
+                    "sh",
+                    "-c",
+                    "echo 'PubkeyAuthentication no' >> /etc/ssh/sshd_config && systemctl restart ssh",
+                ])
+                .output()
+                .expect("docker exec must be available");
+            assert!(
+                disable_pubkey.status.success(),
+                "disabling PubkeyAuthentication failed: {}",
+                String::from_utf8_lossy(&disable_pubkey.stderr)
+            );
+
+            let second = install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path()).await;
+            match second {
+                Err(BootstrapError::KeyInstalledButNotAccepted(hint)) => {
+                    assert!(
+                        hint.contains("PubkeyAuthentication"),
+                        "the hint must mention PubkeyAuthentication, got: {hint:?}"
+                    );
+                }
+                other => panic!("expected KeyInstalledButNotAccepted, got {other:?}"),
+            }
         }
 
         /// PROVES `install_key` works end to end against `root` (fixture B, `sudo` not
