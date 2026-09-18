@@ -9,6 +9,8 @@
 //!   flightdeckd run       the daemon (relay client + attach socket)
 //!   flightdeckd attach    stdio bridge to a session (what the Mac runs via ssh)
 //!   flightdeckd status    one-line JSON snapshot of the sessions
+//!   flightdeckd add-phone / remove-phone   authorize / revoke a phone live
+//!   flightdeckd whoami    this node's relay identity (no daemon needed)
 
 mod attach;
 mod config;
@@ -68,6 +70,10 @@ enum Cmd {
         cursor: u64,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// The client's title for the conversation (authoritative: it
+        /// overwrites the daemon's; blank is ignored).
+        #[arg(long)]
+        title: Option<String>,
         /// Everything after `--` is the claude argv used if the daemon must
         /// spawn the session.
         #[arg(last = true)]
@@ -91,6 +97,43 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Authorize a phone on this node: persisted to the config and pushed to
+    /// the relay live by the running daemon.
+    AddPhone {
+        /// The phone's secret token; `-` reads it from stdin (keeps it out of
+        /// the process list).
+        #[arg(long)]
+        token: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Revoke a phone on this node (persisted + pushed to the relay live).
+    RemovePhone {
+        /// The phone's secret token; `-` reads it from stdin.
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Print this node's relay identity `{mac_id, relay_url, label}` as JSON,
+    /// straight from the config (works without a running daemon; never prints
+    /// a secret).
+    Whoami {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// `--token -` reads the secret from stdin's first line.
+fn token_arg(token: String) -> Result<String> {
+    if token != "-" {
+        return Ok(token);
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 fn pairing_link(cfg: &Config) -> Option<String> {
@@ -179,10 +222,29 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, claude_args } => {
+        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, title, claude_args } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            attach::attach_client(&socket, conversation, cwd, resume_session, epoch, cursor, claude_args)
+            attach::attach_client(&socket, conversation, cwd, resume_session, epoch, cursor, claude_args, title)
                 .await
+        }
+        Cmd::AddPhone { token, label, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::add_phone_client(&socket, &token_arg(token)?, &label).await?);
+            Ok(())
+        }
+        Cmd::RemovePhone { token, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::remove_phone_client(&socket, &token_arg(token)?).await?);
+            Ok(())
+        }
+        Cmd::Whoami { config: cfg_path } => {
+            let path = cfg_path.unwrap_or_else(config::default_config_path);
+            let cfg = Config::load(&path)?;
+            println!(
+                "{}",
+                serde_json::json!({"mac_id": cfg.mac_id, "relay_url": cfg.relay_url, "label": cfg.label})
+            );
+            Ok(())
         }
         Cmd::Status { socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);

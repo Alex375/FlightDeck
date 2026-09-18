@@ -78,7 +78,13 @@ flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh
 flightdeckd status    # snapshot JSON des sessions
 flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
+flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
+flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
+flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```
+
+`flightdeckd attach --title "…"` : le titre du client fait foi (écrase celui
+du registre ; vide = ignoré). `fd_status` porte la `version` du démon qui tourne.
 
 Le code a passé une **revue adversariale multi-agents** (31 agents, 23 findings
 confirmés puis corrigés : sérialisation des spawns, écrivain stdin non bloquant,

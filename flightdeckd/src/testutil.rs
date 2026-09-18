@@ -36,6 +36,14 @@ pub fn test_manager(cfg: Config) -> Arc<SessionManager> {
     )
 }
 
+/// A manager whose config is persisted at `dir/config.json` (phone-token
+/// changes land there).
+pub fn manager_with_config(dir: &Path, cfg: Config) -> Arc<SessionManager> {
+    let path = dir.join("config.json");
+    cfg.save(&path).expect("save test config");
+    SessionManager::new(cfg, Registry::open_in_memory().expect("registry"), path)
+}
+
 /// Serve the attach plane on `dir/fd.sock` and wait until it accepts.
 pub async fn serve_attach(manager: Arc<SessionManager>, dir: &Path) -> PathBuf {
     let socket = dir.join("fd.sock");

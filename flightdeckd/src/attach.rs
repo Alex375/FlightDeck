@@ -1,8 +1,8 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
 //! over SSH by the Mac) bridges to its stdio. First line in is the request
-//! (`attach`, `status` or `stop`); for `attach` the connection then becomes a
-//! transparent line pipe: client → claude stdin, claude stdout (replay + live)
-//! → client.
+//! (`attach`, or a one-shot: `status`, `stop`, `add_phone`, `remove_phone`);
+//! for `attach` the connection then becomes a transparent line pipe: client →
+//! claude stdin, claude stdout (replay + live) → client.
 
 use crate::frames;
 use crate::session::{ClientQueue, SessionManager, SessionMsg, ACTOR_REPLY_TIMEOUT, ATTACH_WRITE_TIMEOUT};
@@ -23,6 +23,20 @@ struct FirstLine {
     attach: Option<AttachParams>,
     status: Option<serde_json::Value>,
     stop: Option<StopParams>,
+    add_phone: Option<AddPhoneParams>,
+    remove_phone: Option<RemovePhoneParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddPhoneParams {
+    token: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemovePhoneParams {
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +49,8 @@ struct AttachParams {
     cursor: u64,
     #[serde(default)]
     claude_args: Vec<String>,
+    /// The client's title for the conversation — authoritative (overwrites).
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,8 +139,31 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         return Ok(());
     }
 
+    // Phone access changes: blocking (config file + its cross-process lock),
+    // so off the async workers. Replies never echo the token (a secret).
+    if let Some(add) = parsed.add_phone {
+        let m = manager.clone();
+        let res = tokio::task::spawn_blocking(move || m.add_phone_token(&add.token, &add.label)).await;
+        let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(added) => json!({"type": "fd_phone_added", "ok": true, "added": added}),
+            Err(e) => json!({"type": "fd_phone_added", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+    if let Some(rm) = parsed.remove_phone {
+        let m = manager.clone();
+        let res = tokio::task::spawn_blocking(move || m.remove_phone_token(&rm.token)).await;
+        let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(removed) => json!({"type": "fd_phone_removed", "ok": true, "removed": removed}),
+            Err(e) => json!({"type": "fd_phone_removed", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
     let Some(p) = parsed.attach else {
-        let msg = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status or stop"});
+        let msg = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status, stop, add_phone or remove_phone"});
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
     };
@@ -141,6 +180,11 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
             return Ok(());
         }
     };
+    if let Some(title) = p.title.as_deref() {
+        if let Err(e) = manager.with_registry(|r| r.set_title_authoritative(&conv_id, title)) {
+            warn!(conv = conv_id.as_str(), "cannot record the client's title: {e:#}");
+        }
+    }
 
     // daemon → client. Ending the pump drops the queue's receiver, so the
     // actor's next push fails and it forgets this client.
@@ -292,6 +336,7 @@ pub async fn attach_client(
     epoch: Option<String>,
     cursor: u64,
     claude_args: Vec<String>,
+    title: Option<String>,
 ) -> Result<()> {
     let conn = UnixStream::connect(socket).await.with_context(|| {
         format!("flightdeckd is not running (no socket at {})", socket.display())
@@ -304,6 +349,7 @@ pub async fn attach_client(
         "epoch": epoch,
         "cursor": cursor,
         "claude_args": claude_args,
+        "title": title,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
     write_half.flush().await?;
@@ -383,6 +429,29 @@ pub async fn status_client(socket: &Path) -> Result<String> {
 /// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
 pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
     one_shot(socket, json!({"stop": {"conversation": conversation}})).await
+}
+
+/// A one-shot whose reply carries `ok`: an `ok:false` reply becomes an Err
+/// (so the CLI exits non-zero), otherwise the raw line is returned.
+async fn one_shot_checked(socket: &Path, request: serde_json::Value) -> Result<String> {
+    let line = one_shot(socket, request).await?;
+    let v: serde_json::Value = serde_json::from_str(&line)
+        .with_context(|| format!("unexpected reply from flightdeckd: {line:?}"))?;
+    if v["ok"] != json!(true) {
+        anyhow::bail!("{}", v["error"].as_str().unwrap_or("flightdeckd refused the request"));
+    }
+    Ok(line)
+}
+
+/// Authorize a phone on this node (persisted + pushed to the relay live):
+/// `{"type":"fd_phone_added","ok":true,"added":<new?>}`.
+pub async fn add_phone_client(socket: &Path, token: &str, label: &str) -> Result<String> {
+    one_shot_checked(socket, json!({"add_phone": {"token": token, "label": label}})).await
+}
+
+/// De-authorize a phone: `{"type":"fd_phone_removed","ok":true,"removed":<was it?>}`.
+pub async fn remove_phone_client(socket: &Path, token: &str) -> Result<String> {
+    one_shot_checked(socket, json!({"remove_phone": {"token": token}})).await
 }
 
 #[cfg(test)]
@@ -504,6 +573,80 @@ mod tests {
         assert_eq!(end, PumpEnd::Closed);
         ours.shutdown().await.unwrap();
         assert_eq!(reader.await.unwrap(), lines);
+    }
+
+    #[tokio::test]
+    async fn one_shot_verbs_drive_phone_access_over_the_socket() {
+        let dir = testutil::short_tempdir();
+        let mut cfg = testutil::test_cfg();
+        cfg.phone_tokens = vec![crate::config::PhoneToken { token: "seed".into(), label: String::new() }];
+        let m = testutil::manager_with_config(dir.path(), cfg);
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
+
+        let v = parse(add_phone_client(&socket, "pt-1", "iPhone").await.unwrap());
+        assert_eq!(v, json!({"type": "fd_phone_added", "ok": true, "added": true}));
+        let v = parse(add_phone_client(&socket, "pt-1", "iPhone 16").await.unwrap());
+        assert_eq!(v["added"], false);
+        {
+            let phones = m.phones.lock().unwrap();
+            let tokens: Vec<(&str, &str)> =
+                phones.tokens.iter().map(|p| (p.token.as_str(), p.label.as_str())).collect();
+            assert_eq!(tokens, vec![("seed", ""), ("pt-1", "iPhone 16")]);
+        }
+        let err = add_phone_client(&socket, " ", "x").await.unwrap_err();
+        assert!(err.to_string().contains("phone token is empty"), "{err}");
+
+        let v = parse(remove_phone_client(&socket, "seed").await.unwrap());
+        assert_eq!(v, json!({"type": "fd_phone_removed", "ok": true, "removed": true}));
+        let v = parse(remove_phone_client(&socket, "seed").await.unwrap());
+        assert_eq!(v["removed"], false);
+        {
+            let phones = m.phones.lock().unwrap();
+            assert_eq!(phones.tokens.len(), 1);
+            assert_eq!(phones.revoked, vec!["seed".to_string()]);
+        }
+        let disk = crate::config::Config::load(&dir.path().join("config.json")).unwrap();
+        assert_eq!(disk.phone_tokens.len(), 1);
+        assert_eq!(disk.revoked_phone_tokens, vec!["seed".to_string()]);
+
+        // the older verbs still answer on the same socket
+        let v = parse(stop_client(&socket, "no-such-conv").await.unwrap());
+        assert_eq!(v["type"], "fd_stopped");
+        assert_eq!(v["stopped"], false);
+        let v = parse(status_client(&socket).await.unwrap());
+        assert_eq!(v["type"], "fd_status");
+    }
+
+    #[tokio::test]
+    async fn attach_title_is_authoritative() {
+        let dir = testutil::short_tempdir();
+        let mut cfg = testutil::test_cfg();
+        cfg.claude_bin = testutil::fake_claude(dir.path(), "sid-t").to_string_lossy().into();
+        let m = testutil::test_manager(cfg);
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let attach = |conversation: Option<String>, title: Option<&str>| {
+            let socket = socket.clone();
+            let req = json!({"attach": {"conversation": conversation, "cwd": cwd, "title": title}});
+            async move {
+                let mut conn = UnixStream::connect(&socket).await.unwrap();
+                conn.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut conn).read_line(&mut line).await.unwrap();
+                serde_json::from_str::<Value>(&line).unwrap()["conversation"].as_str().unwrap().to_string()
+            }
+        };
+        let title_of = |id: &str| m.with_registry(|r| r.get(id)).unwrap().unwrap().title;
+
+        let conv = attach(None, Some("My Feature")).await;
+        assert_eq!(title_of(&conv), "My Feature");
+        attach(Some(conv.clone()), Some("Renamed on the Mac")).await;
+        assert_eq!(title_of(&conv), "Renamed on the Mac");
+        attach(Some(conv.clone()), None).await; // no title: unchanged
+        attach(Some(conv.clone()), Some("  ")).await; // blank: unchanged
+        assert_eq!(title_of(&conv), "Renamed on the Mac");
     }
 
     #[tokio::test]
