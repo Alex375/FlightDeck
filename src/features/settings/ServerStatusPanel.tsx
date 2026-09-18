@@ -7,6 +7,8 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Ico } from "../../ui/kit";
 import { commands, type RepairAction, type ServerDiagnosis } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
+import { useMachineActiveConversationIds } from "../../agent/fleet";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
@@ -135,6 +137,16 @@ export function ServerStatusPanel({
   const [repairSudoAction, setRepairSudoAction] = useState<RepairAction | null>(null);
   const [repairSudoPassword, setRepairSudoPassword] = useState("");
   const [showClaudeSignIn, setShowClaudeSignIn] = useState(false);
+  // Remove-server confirm: only asked when this server has live work on it (same
+  // "busy for delete" rule the conversation/repo delete surfaces already gate on) —
+  // removing it stops every one of these `claude` processes.
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const activeConversationIds = useMachineActiveConversationIds(machine.id);
+  // If every conversation on this server settles while the confirm is open, the
+  // question is stale — close it, same as the sidebar/Flight Deck delete confirms do.
+  useEffect(() => {
+    if (confirmingRemove && activeConversationIds.length === 0) setConfirmingRemove(false);
+  }, [confirmingRemove, activeConversationIds.length]);
 
   // Always diagnoses FRESH on mount — never a cached/last-known stage. This is what
   // makes "close Settings mid-install, reopen" safe without any extra plumbing: the
@@ -271,10 +283,34 @@ export function ServerStatusPanel({
         <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onNewConversation}>
           New conversation…
         </button>
-        <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onRemove}>
+        <button
+          className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
+          onClick={() => {
+            if (activeConversationIds.length > 0) setConfirmingRemove(true);
+            else onRemove();
+          }}
+        >
           Remove
         </button>
       </div>
+
+      {confirmingRemove && (
+        <ConfirmDialog
+          open
+          danger
+          title={`Remove "${machine.label}"?`}
+          confirmLabel="Remove anyway"
+          onCancel={() => setConfirmingRemove(false)}
+          onConfirm={() => {
+            setConfirmingRemove(false);
+            onRemove();
+          }}
+        >
+          {activeConversationIds.length === 1
+            ? "1 conversation on this server is actively running — removing it stops that session."
+            : `${activeConversationIds.length} conversations on this server are actively running — removing it stops all of them.`}
+        </ConfirmDialog>
+      )}
 
       {loading ? (
         <div className={styles.checking}>Checking…</div>

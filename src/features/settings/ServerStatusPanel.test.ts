@@ -32,9 +32,12 @@ const mocks = vi.hoisted(() => {
     startClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
+    // Defaults to "nothing running on this server" — the Remove-confirm tests below
+    // override this per-case to drive the gate.
+    useMachineActiveConversationIds: vi.fn(() => [] as string[]),
   };
 });
-const { machineDiagnose, machineRepair } = mocks;
+const { machineDiagnose, machineRepair, useMachineActiveConversationIds } = mocks;
 
 vi.mock("../../ipc/client", () => ({
   commands: {
@@ -50,6 +53,12 @@ vi.mock("../../ipc/client", () => ({
   },
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
+// Real `useMachineActiveConversationIds` pulls from the live conversations/message
+// stores (repos, sessions, background-task counts) — irrelevant plumbing for this
+// component's own tests, which only care how the count it returns gates Remove.
+vi.mock("../../agent/fleet", () => ({
+  useMachineActiveConversationIds: mocks.useMachineActiveConversationIds,
+}));
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -101,6 +110,8 @@ beforeEach(() => {
   root = createRoot(container);
   machineDiagnose.mockReset();
   machineRepair.mockReset();
+  useMachineActiveConversationIds.mockReset();
+  useMachineActiveConversationIds.mockReturnValue([]);
 });
 
 afterEach(() => {
@@ -196,7 +207,7 @@ function baseMachine(over: Partial<Machine> = {}): Machine {
 
 const NEUTRAL_LABEL: ProvisionStatusLabel = { text: "not checked yet", canRetry: false, isProblem: false };
 
-function mountPanel(machine: Machine = baseMachine()) {
+function mountPanel(machine: Machine = baseMachine(), onRemove: () => void = () => {}) {
   act(() => {
     root.render(
       createElement(ServerStatusPanel, {
@@ -206,7 +217,7 @@ function mountPanel(machine: Machine = baseMachine()) {
         isRetrying: false,
         onRetryProvisioning: () => {},
         onNewConversation: () => {},
-        onRemove: () => {},
+        onRemove,
       }),
     );
   });
@@ -287,5 +298,89 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
     expect(container.querySelector('input[placeholder="Sudo password"]')).toBeNull();
     // Never submitted with the typed password.
     expect(machineRepair).toHaveBeenCalledTimes(1);
+  });
+});
+
+// B_lifecycle-#0: the Remove button used to have no isActivelyRunning gate at all,
+// unlike ConductorSidebar/StreamCard's conversation delete. These lock in the confirm
+// gate: friction-free when the server is idle, a ConfirmDialog naming how many live
+// conversations will be stopped otherwise, and onRemove only fires on the explicit
+// "Remove anyway" (never on the bare click, never on Cancel).
+//
+// `ConfirmDialog` portals to `document.body` (not into `container`), so these query/
+// click the whole document rather than the mount `container`, mirroring
+// DeleteConversationDialog.test.ts's own discipline for the same reason.
+function confirmDialog(): HTMLElement | null {
+  return document.querySelector('[role="alertdialog"]');
+}
+function clickDocumentButtonWithText(text: string) {
+  const btn = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === text);
+  if (!btn) throw new Error(`no button with text "${text}" anywhere in the document`);
+  act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+describe("ServerStatusPanel — Remove confirm gate", () => {
+  it("nothing running on this server: Remove calls onRemove immediately, no dialog", async () => {
+    useMachineActiveConversationIds.mockReturnValue([]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(confirmDialog()).toBeNull();
+  });
+
+  it("one live conversation on this server: Remove asks first and does not call onRemove yet", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine({ label: "prod box" }), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(onRemove).not.toHaveBeenCalled();
+    const dlg = confirmDialog();
+    expect(dlg).not.toBeNull();
+    expect(dlg!.textContent).toContain('Remove "prod box"?');
+    expect(dlg!.textContent).toContain("1 conversation on this server is actively running");
+  });
+
+  it("names how many conversations will be stopped when more than one is running", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1", "c2", "c3"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    mountPanel();
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(confirmDialog()!.textContent).toContain(
+      "3 conversations on this server are actively running",
+    );
+  });
+
+  it("Cancel closes the confirm without ever calling onRemove", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    clickDocumentButtonWithText("Cancel");
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(confirmDialog()).toBeNull();
+  });
+
+  it('"Remove anyway" confirms — onRemove fires exactly once', async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    clickDocumentButtonWithText("Remove anyway");
+    expect(onRemove).toHaveBeenCalledTimes(1);
   });
 });

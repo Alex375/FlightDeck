@@ -652,6 +652,45 @@ interface ConversationsState {
   linkConversationToTask: (id: string, task: LinkedTosseTask | null) => void;
 }
 
+/**
+ * Full per-conversation teardown, shared by every cascade-delete path (one
+ * conversation, a whole repo, or a whole server): stop the live `claude` process (if
+ * any — the no-orphan policy) and drop every per-conversation store + persisted cache,
+ * so nothing from a removed conversation lingers. `stopSession` failures are surfaced
+ * (never silent) via `syncToCore`'s app-error banner, same as every other write here.
+ *
+ * Deliberately does NOT touch the conversations/repos arrays themselves, undo-stack
+ * bookkeeping, or repo-scoped state (sidebar fold, manual repo order) — each caller
+ * owns those at its own level (see `removeConversation`/`removeRepo`/`removeMachine`).
+ */
+function teardownConversationSession(id: string, handle: string | null): void {
+  if (handle) {
+    syncToCore("stopSession", () => commands.stopSession(handle));
+  }
+  useConversationStore.getState().dropSession(id);
+  useBackgroundTasksStore.getState().dropSession(id);
+  useWorkflowLiveStore.getState().drop(id);
+  useWorkflowJournalStore.getState().drop(id);
+  clearCachedWindow(id);
+  disposeTerminal(id);
+  clearTodoBarOpen(id);
+  clearComposerDraft(id);
+  clearComposerAttachments(id);
+  clearCodexControls(id);
+  clearWorkFold(id);
+  clearPlanAnnotations(id);
+  useGitViewStore.getState().clear(id);
+  useRemoteControlStore.getState().clear(id);
+  useGoalStore.getState().clear(id);
+  // Drop the derived artifacts memo: it pins this conversation's timeline + tool results.
+  clearArtifactsCache(id);
+  useLastMessageSummaryStore.getState().clear(id);
+  autoTitlePending.delete(id);
+  titleContext.delete(id);
+  titleGenCount.delete(id);
+  lastAppliedSeq.delete(id);
+}
+
 export const useConversationsStore = create<ConversationsState>()((set, get) => ({
   repos: [],
   conversations: [],
@@ -687,16 +726,37 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
 
   removeMachine: (id) => {
     // Remove the server and everything anchored to it (its repos + their conversations),
-    // mirroring the core's cascade so the UI matches without a reload.
-    const repoIds = new Set(
-      get().repos.filter((r) => r.machineId === id).map((r) => r.id),
-    );
-    set((s) => ({
-      machines: s.machines.filter((m) => m.id !== id),
-      repos: s.repos.filter((r) => r.machineId !== id),
-      conversations: s.conversations.filter((c) => !repoIds.has(c.repoId)),
-    }));
+    // mirroring the core's cascade so the UI matches without a reload. The Rust
+    // delete_machine only cascades DB rows (repos, conversations) — it never touches a
+    // live process — so, same as removeRepo/removeConversation, we must stop every live
+    // `claude` on this server ourselves (no orphan) before dropping it from state.
+    const repos = get().repos.filter((r) => r.machineId === id);
+    const repoIds = new Set(repos.map((r) => r.id));
+    for (const c of get().conversations) {
+      if (!repoIds.has(c.repoId)) continue;
+      teardownConversationSession(c.id, c.handle);
+    }
+    for (const r of repos) {
+      // Forget this repo's sidebar collapse state + manual drag order — same repo-scoped
+      // cleanup removeRepo performs, so a removed server leaves nothing behind either.
+      clearSidebarFold(r.id);
+      clearManualOrderRepo(r.id);
+    }
+    set((s) => {
+      const conversations = s.conversations.filter((c) => !repoIds.has(c.repoId));
+      return {
+        machines: s.machines.filter((m) => m.id !== id),
+        repos: s.repos.filter((r) => r.machineId !== id),
+        conversations,
+        // Same reselect-on-cascade as removeRepo: fall back to the last remaining
+        // conversation (or none) when the active one was on this server.
+        activeId: conversations.some((c) => c.id === s.activeId)
+          ? s.activeId
+          : (conversations[conversations.length - 1]?.id ?? null),
+      };
+    });
     syncToCore("deleteMachine", () => commands.deleteMachine(id));
+    syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
   },
 
   addRemoteRepo: (machineId, path) => {
@@ -742,38 +802,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // Forget any manual drag order for this repo (and its conversations, in every slot).
     clearManualOrderRepo(repo.id);
     // Cascade-delete every conversation under this repo. Mirror removeConversation's
-    // full per-row teardown: the Rust delete_repo only cascades DB rows, so we must
-    // stop each live `claude` process here (no orphan) and drop every per-conversation
-    // store + persisted cache so nothing is leaked.
+    // full per-row teardown (shared helper below): the Rust delete_repo only cascades
+    // DB rows, so we must stop each live `claude` process here (no orphan) and drop
+    // every per-conversation store + persisted cache so nothing is leaked.
     for (const c of get().conversations) {
       if (c.repoId !== repo.id) continue;
-      // Kill the live `claude` process (if any) so deleting a repo never leaves an
-      // orphan — same no-orphan policy as removeConversation.
-      if (c.handle) {
-        syncToCore("stopSession", () => commands.stopSession(c.handle!));
-      }
-      useConversationStore.getState().dropSession(c.id);
-      useBackgroundTasksStore.getState().dropSession(c.id);
-      useWorkflowLiveStore.getState().drop(c.id);
-      useWorkflowJournalStore.getState().drop(c.id);
-      clearCachedWindow(c.id);
-      disposeTerminal(c.id);
-      clearTodoBarOpen(c.id);
-      clearComposerDraft(c.id);
-      clearComposerAttachments(c.id);
-      clearCodexControls(c.id);
-      clearWorkFold(c.id);
-      clearPlanAnnotations(c.id);
-      useGitViewStore.getState().clear(c.id);
-      useRemoteControlStore.getState().clear(c.id);
-      useGoalStore.getState().clear(c.id);
-      // Drop the derived artifacts memo: it pins this conversation's timeline + tool results.
-      clearArtifactsCache(c.id);
-      useLastMessageSummaryStore.getState().clear(c.id);
-      autoTitlePending.delete(c.id);
-      titleContext.delete(c.id);
-      titleGenCount.delete(c.id);
-      lastAppliedSeq.delete(c.id);
+      teardownConversationSession(c.id, c.handle);
     }
     set((s) => {
       const conversations = s.conversations.filter((c) => c.repoId !== repo.id);
@@ -820,43 +854,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
         activeId: s.activeId === id ? (rest[rest.length - 1]?.id ?? null) : s.activeId,
       };
     });
-    // Kill the live `claude` process (if any) so deleting a conversation never
-    // leaves an orphan. Distinct from interrupt: this terminates the session.
-    if (conv?.handle) {
-      syncToCore("stopSession", () => commands.stopSession(conv.handle!));
-    }
-    // Drop its (now unreachable) message timeline from the message store, and its
-    // persisted context-window so the localStorage cache doesn't keep orphans.
-    useConversationStore.getState().dropSession(id);
-    useBackgroundTasksStore.getState().dropSession(id);
-    useWorkflowLiveStore.getState().drop(id);
-    useWorkflowJournalStore.getState().drop(id);
-    clearCachedWindow(id);
-    clearTodoBarOpen(id);
-    clearComposerDraft(id);
-    clearComposerAttachments(id);
-    clearCodexControls(id);
-    clearWorkFold(id);
+    // Full shared teardown (stop the live `claude` process — no orphan — plus every
+    // per-conversation store/cache) — same helper removeRepo/removeMachine use.
+    teardownConversationSession(id, conv?.handle ?? null);
+    // Forget any manual drag order for this one conversation — repo-level removal
+    // clears its whole per-repo slot instead (see removeRepo/removeMachine).
     clearManualOrderConversation(id);
-    clearPlanAnnotations(id);
-    autoTitlePending.delete(id);
-    titleContext.delete(id);
-    titleGenCount.delete(id);
-    lastAppliedSeq.delete(id);
-    // Kill its integrated terminal (PTY shell + xterm instance) too — same no-orphan
-    // policy as the claude session above. No-op if it never opened a terminal.
-    disposeTerminal(id);
-    useGitViewStore.getState().clear(id);
-    // Drop the bridge state too — the session was just stopped, so a lingering
-    // "connected" chip would be a stale, misleading indicator.
-    useRemoteControlStore.getState().clear(id);
-    // Drop its active-goal too — the conversation is gone.
-    useGoalStore.getState().clear(id);
-    // Drop the derived artifacts memo, which pins the (now dropped) timeline + tool results —
-    // otherwise the heaviest part of a deleted conversation outlives it for the whole run.
-    clearArtifactsCache(id);
-    // Drop its Flight Deck last-message summary — the card is gone.
-    useLastMessageSummaryStore.getState().clear(id);
     syncToCore("deleteConversation", () => commands.deleteConversation(id));
     syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
   },

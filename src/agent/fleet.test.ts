@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  activeConversationIds,
   fleetSegments,
   isFleetCalm,
   lanesToTokens,
@@ -10,6 +11,7 @@ import {
 } from "./fleet";
 import { statusRank, type AgentStatus } from "./status";
 import type { Conversation, Repo } from "../store/conversationsStore";
+import type { SessionEntry } from "../store/types";
 
 function repo(id: string, addedAt: number): Repo {
   return { id, path: "/r/" + id, addedAt };
@@ -17,6 +19,80 @@ function repo(id: string, addedAt: number): Repo {
 function conv(id: string, repoId: string, lastActivityAt: number): Conversation {
   return { id, repoId, lastActivityAt } as unknown as Conversation;
 }
+
+/** A conversation with a live handle (the only field `activeConversationIds`
+ *  itself reads off `Conversation`, besides `id`/`pendingReminder`). */
+function liveConv(id: string, repoId: string, handle = "session-1"): Conversation {
+  return { id, repoId, handle, pendingReminder: null } as unknown as Conversation;
+}
+
+/** Minimal `SessionEntry` stub — only the fields `gather()`/`deriveAgentStatus`
+ *  actually read for a NON-settled (busy or awaiting-permission) entry, which is
+ *  all `activeConversationIds`'s test cases below need. */
+function sessionEntry(opts: {
+  busy?: boolean;
+  awaitingPermission?: boolean;
+  pendingTool?: string | null;
+  turnSeen?: boolean;
+}): SessionEntry {
+  return {
+    session: "s",
+    state: {
+      busy: opts.busy ?? false,
+      awaiting_permission: opts.awaitingPermission ?? false,
+      activity: null,
+    },
+    timeline: [],
+    turns: {},
+    notices: {},
+    errors: {},
+    turnResults: {},
+    toolResults: {},
+    pendingPermissions: opts.pendingTool
+      ? [{ request_id: "r", tool_name: opts.pendingTool, title: null, description: null }]
+      : [],
+    openBubble: {},
+    subThreads: {},
+    bgAgentIds: [],
+    todos: [],
+    turnSeen: opts.turnSeen ?? true,
+  } as unknown as SessionEntry;
+}
+
+describe("activeConversationIds", () => {
+  it("includes a conversation with a turn in flight", () => {
+    const convs = [liveConv("c1", "r1")];
+    const sessions = { c1: sessionEntry({ busy: true }) };
+    expect(activeConversationIds(convs, sessions, {}, {}, false)).toEqual(["c1"]);
+  });
+
+  it("excludes a settled, idle conversation with no background work", () => {
+    const convs = [liveConv("c1", "r1")];
+    const sessions = { c1: sessionEntry({}) };
+    expect(activeConversationIds(convs, sessions, {}, {}, false)).toEqual([]);
+  });
+
+  it("includes a conversation whose main loop is idle but background tools are running", () => {
+    const convs = [liveConv("c1", "r1")];
+    const sessions = { c1: sessionEntry({}) };
+    expect(activeConversationIds(convs, sessions, { c1: 2 }, {}, false)).toEqual(["c1"]);
+  });
+
+  it("includes a masked case — a blocking permission prompt hides `backgrounding`, but the background count still counts it as active", () => {
+    // needIntervention (a non-questionnaire pending tool) is not `isActivelyRunning`,
+    // yet the conversation genuinely has live background work — same masking ConvRow's
+    // own `busyForDelete` guards against.
+    const convs = [liveConv("c1", "r1")];
+    const sessions = { c1: sessionEntry({ awaitingPermission: true, pendingTool: "Bash" }) };
+    expect(activeConversationIds(convs, sessions, { c1: 3 }, {}, false)).toEqual(["c1"]);
+  });
+
+  it("only returns ids for the conversations passed in — callers filter to one server first", () => {
+    const convs = [liveConv("c1", "r1"), liveConv("c2", "r2")];
+    const sessions = { c1: sessionEntry({ busy: true }), c2: sessionEntry({ busy: true }) };
+    expect(activeConversationIds([convs[0]], sessions, {}, {}, false)).toEqual(["c1"]);
+  });
+});
 
 describe("tallyFleet", () => {
   it("folds every status kind into exactly one of the four readout stages", () => {
