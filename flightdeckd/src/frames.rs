@@ -91,7 +91,12 @@ pub fn fd_status(label: &str, conversations: Vec<Value>) -> String {
 /// Last line before the daemon closes an attach stream. `reason` ∈
 /// "replaced" (a newer client took over — do NOT auto-reconnect),
 /// "stopped" (explicit fd_stop — do not reconnect),
-/// "exited" (the claude process ended — do not reconnect, session is over).
+/// "exited" (the claude process ended — do not reconnect, session is over),
+/// "stalled" (the daemon gave up on a write the client's link did not accept
+/// for `ATTACH_WRITE_TIMEOUT` — the session is still alive: the client SHOULD
+/// reconnect and resume from its cursor). "stalled" is best effort: on a fully
+/// stalled link the frame usually cannot get through either, so a client must
+/// treat a bare EOF the same way.
 pub fn fd_detach(reason: &str, exit_code: Option<i32>) -> String {
     let mut v = json!({ "type": "fd_detach", "reason": reason });
     if let Some(c) = exit_code {
@@ -183,6 +188,10 @@ mod tests {
         assert_eq!(v["seq"], 10);
         assert_eq!(v["busy"], true);
         assert_eq!(v["pending"][0], "rq-1");
+        let d = fd_detach("stalled", None);
+        let v: Value = serde_json::from_str(&d).unwrap();
+        assert_eq!(v, json!({"type": "fd_detach", "reason": "stalled"}));
+        assert!(!is_replayable_line(&d), "fd_detach must never count toward the cursor");
         let d = fd_detach("exited", Some(1));
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v["reason"], "exited");

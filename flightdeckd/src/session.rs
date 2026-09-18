@@ -42,6 +42,12 @@ const RING_BYTES_MAX: usize = 64 * 1024 * 1024;
 /// sit unacknowledged in its outgoing queue — it will reattach from its cursor,
 /// so nothing is lost.
 const CLIENT_QUEUE_BYTES_MAX: i64 = 128 * 1024 * 1024;
+/// An attach client whose socket accepts NO bytes for this long is given up on
+/// (`fd_detach{stalled}`, best effort) and dropped. The byte budget above
+/// never trips on a degraded-but-alive link carrying small stream deltas, and
+/// an unbounded write would pin the client as "attached" forever while the
+/// daemon queues every new line for it. The client reattaches from its cursor.
+pub(crate) const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Teardown ladder pauses (mirrors tosse-code: EOF → SIGTERM(group) → SIGKILL).
 const LADDER_STEP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Bound on any actor round-trip (status queries, RPC acks) so one wedged
