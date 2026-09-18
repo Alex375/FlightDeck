@@ -10,16 +10,18 @@ Runs `flightdeckd attach` THROUGH REAL SSH against the M1 container:
   C: `flightdeckd status` still shows the session alive.
 
 Usage:  python3 m1-daemon/tests/detach_test.py
-Env:    PORT (2224), KEY (~/.ssh/flightdeck_m0_ed25519), CWD (/work/demo)
+Env:    TARGET (agent@127.0.0.1), PORT (2224), KEY (~/.ssh/flightdeck_m0_ed25519),
+        CWD (/work/demo) — point TARGET/PORT/KEY/CWD at a real server to run it there.
 """
 import json, os, signal, subprocess, sys, threading, time, queue
 
+TARGET = os.environ.get("TARGET", "agent@127.0.0.1")
 PORT = os.environ.get("PORT", "2224")
 KEY = os.path.expanduser(os.environ.get("KEY", "~/.ssh/flightdeck_m0_ed25519"))
 CWD = os.environ.get("CWD", "/work/demo")
-SSH = ["ssh", "-T", "-p", PORT, "-i", KEY,
+SSH = ["ssh", "-T", "-p", PORT, "-i", KEY, "-o", "IdentitiesOnly=yes",
        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-       "agent@127.0.0.1"]
+       TARGET]
 
 CONTROL = {"control_response", "control_request", "control_cancel_request", "keep_alive"}
 
