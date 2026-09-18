@@ -46,9 +46,21 @@ docker build -q -t flightdeck-m1 "$ctx" >/dev/null
 # The image generates SSH host keys when it is built: carry the previous
 # container's keys over, so a rebuild never changes the box's identity
 # (known_hosts on the Mac, the app's paired server, StrictHostKeyChecking).
+# The old container holds the ONLY copy: if they cannot be saved, stop before
+# removing it (FORCE=1 accepts a new identity instead).
 hostkeys="$ctx/hostkeys"
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
-  docker cp "$NAME:/etc/ssh" "$hostkeys" 2>/dev/null || true
+  if docker cp "$NAME:/etc/ssh" "$hostkeys" && ls "$hostkeys"/ssh_host_*_key >/dev/null 2>&1; then
+    echo "· saved $NAME's SSH host keys"
+  elif [ "${FORCE:-0}" = 1 ]; then
+    echo "!! could not save $NAME's SSH host keys — FORCE=1: replacing it anyway, its SSH identity WILL change" >&2
+    rm -rf "$hostkeys"
+  else
+    echo "!! could not save $NAME's SSH host keys — NOT replacing it: its SSH identity would change" >&2
+    echo "   (known_hosts and the app's pairing would reject the new box). Fix the cause, or rerun" >&2
+    echo "   with FORCE=1 to accept a new identity." >&2
+    exit 1
+  fi
   echo "· removing previous container $NAME"
   docker rm -f "$NAME" >/dev/null
 fi
@@ -59,7 +71,18 @@ if ls "$hostkeys"/ssh_host_*_key >/dev/null 2>&1; then
   for f in "$hostkeys"/ssh_host_*; do docker cp "$f" "$NAME:/etc/ssh/"; done
   docker exec "$NAME" sh -c 'chown root:root /etc/ssh/ssh_host_* && chmod 600 /etc/ssh/ssh_host_*_key \
     && chmod 644 /etc/ssh/ssh_host_*.pub && pkill -HUP -x sshd'
-  echo "· kept the previous container's SSH host keys"
+  # sshd refuses private host keys readable by others: check before trusting it.
+  bad="$(docker exec "$NAME" sh -c 'for k in /etc/ssh/ssh_host_*_key; do
+    [ "$(stat -c %U:%a "$k")" = root:600 ] || echo "$k ($(stat -c %U:%a "$k"))"; done')"
+  if [ -n "$bad" ]; then
+    echo "!! restored host keys with the wrong owner/mode: $bad" >&2
+    exit 1
+  fi
+  sleep 1
+  docker exec "$NAME" pgrep -x sshd >/dev/null || { echo "!! sshd is not running after reloading the host keys" >&2; exit 1; }
+  echo "· kept the previous container's SSH host keys (root:600)"
+else
+  echo "· no previous SSH host keys to carry over (first run, or FORCE=1) — this box has a NEW SSH identity"
 fi
 
 echo "· injecting SSH public key"
