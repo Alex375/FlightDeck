@@ -648,7 +648,12 @@ async fn run_actor(
             let (force_advance, new_streak, warn) =
                 malformed_replay_step(unparseable, malformed_replay_streak);
             malformed_replay_streak = new_streak;
-            cursor = attach_base + transport.lines_seen() + force_advance;
+            cursor = attach_base
+                + reattach_cursor_delta(
+                    transport.lines_seen(),
+                    transport.first_unparseable_offset(),
+                    force_advance,
+                );
             if warn {
                 eprintln!(
                     "[session] giving up on {force_advance} replayable line(s) this build \
@@ -830,6 +835,39 @@ fn malformed_replay_step(unparseable: u64, streak: u32) -> (u64, u32, bool) {
         (unparseable, 0, true)
     } else {
         (0, streak, false)
+    }
+}
+
+/// The CURRENT transport's contribution to the reattach cursor (`run_actor`
+/// adds the daemon's `replay_from` base on top). Pure and unit-testable —
+/// kept separate from `run_actor` so the composition of `lines_seen` /
+/// `first_unparseable_offset` / `force_advance` can be exercised without a
+/// live transport.
+///
+/// `lines_seen` (a raw count of SUCCESSFULLY parsed replayable lines this
+/// connection) is NOT the daemon's wire position: if later replayable lines
+/// go on to parse fine after an EARLIER one this build could not, `lines_seen`
+/// silently overtakes that earlier failure's true position. Reattaching with
+/// it would tell the daemon we already have everything through a point that
+/// includes a line we actually never received — permanently, silently lost,
+/// never replayed again.
+///
+/// - Still retrying (`force_advance == 0`): roll back to
+///   `first_unparseable_offset` when the transport saw a failure this
+///   connection (the count of successes strictly BEFORE it), so the daemon
+///   resends starting right before it — at the cost of re-delivering any
+///   later lines that DID already parse fine (a bounded duplicate, not a
+///   silent loss). No failure at all → `lines_seen` is exact, use it.
+/// - Giving up (`force_advance > 0`, from [`malformed_replay_step`]): skip
+///   past EVERYTHING this connection delivered, failures included —
+///   `lines_seen + force_advance` is the true total and thus the correct
+///   position; `first_unparseable_offset` must NOT be used here; it would
+///   roll back to a bad line we have just decided to stop asking for.
+fn reattach_cursor_delta(lines_seen: u64, first_unparseable_offset: Option<u64>, force_advance: u64) -> u64 {
+    if force_advance > 0 {
+        lines_seen + force_advance
+    } else {
+        first_unparseable_offset.unwrap_or(lines_seen)
     }
 }
 
@@ -3075,6 +3113,53 @@ mod tests {
         let (advance, _, warn) = malformed_replay_step(5, streak);
         assert_eq!(advance, 5, "must skip exactly the lines this attempt reported, not a stale count");
         assert!(warn);
+    }
+
+    /// A clean connection (no failures) uses the exact success count, same as
+    /// before this table existed.
+    #[test]
+    fn reattach_cursor_delta_uses_lines_seen_when_nothing_failed() {
+        assert_eq!(reattach_cursor_delta(4, None, 0), 4);
+    }
+
+    /// The blocker this guards against: OK, FAIL, OK, OK within ONE connection
+    /// (a bad line NOT last) — `lines_seen` (3, both successes before AND
+    /// after the failure) would silently overtake the failure's true position
+    /// and the daemon would never re-offer it. The correct delta rolls back to
+    /// `first_unparseable_offset` (1, the success BEFORE the failure), even
+    /// though `lines_seen` disagrees — this is exactly the case where using
+    /// `lines_seen` alone drops a message forever.
+    #[test]
+    fn reattach_cursor_delta_rolls_back_to_the_first_failure_not_lines_seen() {
+        let lines_seen = 3; // 1 success before FAIL, 2 more after it
+        let first_unparseable_offset = Some(1); // success count strictly before FAIL
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            1,
+            "must resume right before the still-unrecovered failure, not past it",
+        );
+        assert_ne!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            lines_seen,
+            "lines_seen is exactly the wrong answer here — it would skip the failure",
+        );
+    }
+
+    /// Once `malformed_replay_step` decides to give up (`force_advance > 0`),
+    /// the delta must skip past EVERYTHING this connection delivered —
+    /// successes before AND after the failure, plus the failure(s) themselves
+    /// — never roll back to `first_unparseable_offset` (that would ask for the
+    /// very line we just gave up on, forever).
+    #[test]
+    fn reattach_cursor_delta_skips_everything_when_giving_up() {
+        let lines_seen = 4; // successes both sides of the 2 failures
+        let force_advance = 2; // malformed_replay_step's give-up count
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, Some(1), force_advance),
+            6,
+            "giving up must use lines_seen + force_advance (the true total), \
+             ignoring first_unparseable_offset entirely",
+        );
     }
 
     /// Live M1 acceptance check, Mac side: "piloting a remote session from the

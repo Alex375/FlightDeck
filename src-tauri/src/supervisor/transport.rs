@@ -107,8 +107,11 @@ pub struct SpawnConfig {
 }
 
 /// Where to resume a remote attach stream: the daemon-side conversation, the
-/// claude-process epoch, and how many replayable lines this client has already
-/// received in that epoch (the cursor). See flightdeckd `frames.rs` — the
+/// claude-process epoch, and the reattach cursor — the wire POSITION (not a
+/// raw count) this client can prove it has fully received in that epoch, i.e.
+/// every replayable line up to and including that point either parsed or was
+/// explicitly given up on (see `session.rs::reattach_cursor_delta`, which
+/// composes it; never a bare `lines_seen`). See flightdeckd `frames.rs` — the
 /// replay-eligibility predicate ([`is_replayable_line`]) is a shared contract.
 #[derive(Debug, Clone, Default)]
 pub struct AttachPoint {
@@ -541,6 +544,15 @@ pub struct Transport {
     /// The session actor watches this across reconnects to bound how long it
     /// keeps asking the daemon to replay something it can never parse.
     unparseable_replayable: Arc<AtomicU64>,
+    /// `lines_seen`'s value at the moment the FIRST unparseable replayable line
+    /// hit this connection — i.e. how many replayable lines were successfully
+    /// parsed strictly BEFORE it. `u64::MAX` means no failure yet this
+    /// connection. ⚠️ Load-bearing for the reattach cursor: `lines_seen()`
+    /// alone is a raw success COUNT, not the daemon's wire POSITION, so it
+    /// silently overtakes an earlier unparsed line whenever later lines in the
+    /// SAME connection parse fine (session.rs's cursor math must roll back to
+    /// this offset instead — see `run_actor`).
+    first_unparseable_offset: Arc<AtomicU64>,
     /// Whether this transport is an ssh→flightdeckd attach stream (drives the
     /// `fd_stop` escalation in [`Transport::shutdown`]).
     is_remote: bool,
@@ -654,6 +666,7 @@ impl Transport {
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable_replayable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable_offset: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
 
         let pumps = vec![
             tokio::spawn(reader_loop(
@@ -662,6 +675,7 @@ impl Transport {
                 reader_err.clone(),
                 lines_seen.clone(),
                 unparseable_replayable.clone(),
+                first_unparseable_offset.clone(),
             )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
@@ -678,6 +692,7 @@ impl Transport {
                 writer_err,
                 lines_seen,
                 unparseable_replayable,
+                first_unparseable_offset,
                 is_remote: cfg.remote.is_some(),
             },
             msg_rx,
@@ -697,6 +712,20 @@ impl Transport {
     /// see `session.rs::malformed_replay_step`.
     pub fn unparseable_replayable(&self) -> u64 {
         self.unparseable_replayable.load(Ordering::Relaxed)
+    }
+
+    /// How many replayable lines this connection parsed successfully BEFORE
+    /// the first one it could not — `None` if every replayable line so far
+    /// has parsed. This is the true rollback point for a reattach: unlike
+    /// [`Self::lines_seen`] (a raw success count), it does not creep forward
+    /// when later lines in the same connection happen to parse fine, so the
+    /// session actor can ask the daemon to replay starting right before the
+    /// line it lost instead of skipping past it — see `session.rs::run_actor`.
+    pub fn first_unparseable_offset(&self) -> Option<u64> {
+        match self.first_unparseable_offset.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            n => Some(n),
+        }
     }
 
     /// OS process id, while the child is alive.
@@ -855,13 +884,19 @@ impl Transport {
 /// permanently drop it. A replayable line that fails to parse instead bumps
 /// `unparseable_replayable`, so the actor knows to ask the daemon to replay it
 /// again on the next reattach (and to bound that across reconnects — see
-/// `session.rs::malformed_replay_step`).
+/// `session.rs::malformed_replay_step`), and — the FIRST time only this
+/// connection — stamps `first_unparseable_offset` with `lines_seen`'s value at
+/// that moment, so a reattach can roll back to right before it even if MORE
+/// replayable lines go on to parse fine afterward (see
+/// `Transport::first_unparseable_offset`'s doc for why that distinction
+/// matters).
 async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     tx: mpsc::UnboundedSender<CliMessage>,
     reader_err: ErrSlot,
     lines_seen: Arc<AtomicU64>,
     unparseable_replayable: Arc<AtomicU64>,
+    first_unparseable_offset: Arc<AtomicU64>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -884,6 +919,17 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                     Err(e) => {
                         if replayable {
                             unparseable_replayable.fetch_add(1, Ordering::Relaxed);
+                            // Stamp the rollback point once, on the FIRST failure
+                            // this connection: `lines_seen` right now is exactly
+                            // "successes strictly before this line". A later
+                            // success must not move this — that is the whole
+                            // point of tracking it separately from `lines_seen`.
+                            let _ = first_unparseable_offset.compare_exchange(
+                                u64::MAX,
+                                lines_seen.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
                         }
                         eprintln!(
                             "[transport] skipping unparseable {} stdout line: {e}: {}",
@@ -1108,6 +1154,7 @@ mod tests {
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
 
         let task = tokio::spawn(reader_loop(
             reader,
@@ -1115,6 +1162,7 @@ mod tests {
             reader_err,
             lines_seen.clone(),
             unparseable.clone(),
+            first_unparseable.clone(),
         ));
 
         // Well-formed and replayable: a bare `result` message parses with every
@@ -1139,10 +1187,84 @@ mod tests {
             1,
             "the malformed replayable line is tracked separately, not silently dropped"
         );
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            1,
+            "the failure happened right after 1 successful parse"
+        );
         // The good message still reached the consumer; the bad one did not (and
         // never will, under this name — see CliMessage's Deserialize impl).
         let msg = rx.recv().await.expect("the well-formed line should be forwarded");
         assert!(matches!(msg, CliMessage::Result(_)));
+        assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
+    }
+
+    /// The blocker this guards against: `lines_seen` is a raw success COUNT, not
+    /// the daemon's wire POSITION — so if MORE replayable lines parse fine
+    /// AFTER an unparseable one in the same connection, a cursor built from
+    /// `lines_seen` alone creeps past the failure and the daemon judges it
+    /// "already delivered", never replaying it again (permanently, silently
+    /// lost — see `session.rs::run_actor`'s cursor math). Ordering here is
+    /// OK, FAIL, OK, OK: `first_unparseable_offset` must freeze at the count
+    /// BEFORE the failure (1) and not be dragged forward by the two later
+    /// successes, even though `lines_seen` legitimately keeps counting them.
+    #[tokio::test]
+    async fn first_unparseable_offset_freezes_before_the_first_failure() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (1)
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (2)
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (3)
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(
+            lines_seen.load(Ordering::Relaxed),
+            3,
+            "all 3 well-formed lines parse, including the two after the failure"
+        );
+        assert_eq!(unparseable.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            1,
+            "must stay at the count BEFORE the failure (1), not creep forward to 3 \
+             just because later lines happened to parse fine"
+        );
+        assert_ne!(
+            first_unparseable.load(Ordering::Relaxed),
+            lines_seen.load(Ordering::Relaxed),
+            "this is exactly the case where the two diverge — a cursor computed from \
+             lines_seen alone would wrongly skip past the still-unrecovered failure"
+        );
+
+        for _ in 0..3 {
+            rx.recv().await.expect("the 3 well-formed lines should be forwarded");
+        }
         assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
     }
 
