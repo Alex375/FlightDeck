@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
                 .init();
             let path = cfg_path.unwrap_or_else(config::default_config_path);
             config::harden_state_dir(&config::state_dir())?;
+            config::harden_private_file(&path)?;
             let cfg = Config::load(&path)
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
             let registry = registry::Registry::open(&config::registry_path())?;

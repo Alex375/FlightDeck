@@ -83,6 +83,24 @@ pub fn harden_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A secret-bearing file (the config holds `mac_token`) must be owner-only.
+/// Saves always write 0600, but a file left wider by an older daemon, a
+/// hand edit or an installer is narrowed here — with a warning. A missing
+/// file is not an error.
+pub fn harden_private_file(path: &Path) -> Result<()> {
+    let mode = match std::fs::metadata(path) {
+        Ok(m) => m.permissions().mode() & 0o777,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("cannot stat {}", path.display())),
+    };
+    if mode & 0o077 != 0 {
+        tracing::warn!("{} was mode {mode:o} — narrowing it to 600 (it holds the relay secret)", path.display());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot chmod 600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn state_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".flightdeckd")
 }
@@ -354,6 +372,19 @@ mod tests {
         let nested = root.path().join("new/config.json");
         test_cfg().save(&nested).unwrap();
         assert_eq!(mode(&root.path().join("new")), 0o700);
+    }
+
+    #[test]
+    fn a_config_left_wider_is_narrowed_to_600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        harden_private_file(&path).unwrap(); // missing: fine
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        harden_private_file(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "only the mode changes");
     }
 
     #[test]

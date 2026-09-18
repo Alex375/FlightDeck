@@ -68,6 +68,7 @@ fn cli_end_to_end() {
     let mut cfg: Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
     cfg["claude_bin"] = Value::String(fake.to_string_lossy().into());
     std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o664)).unwrap(); // like josty-cc's
 
     // whoami needs no daemon and never prints the secret
     let who = run_ok(fd(home).arg("whoami"), None);
@@ -79,6 +80,10 @@ fn cli_end_to_end() {
         assert!(t0.elapsed() < Duration::from_secs(10), "daemon never opened its socket");
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    // The config was rewritten above with the default umask (0644 here): the
+    // daemon narrows it back to owner-only on start.
+    assert_eq!(std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777, 0o600);
 
     let cwd = work.to_string_lossy().to_string();
     let conv = attach(home, &["--cwd", &cwd, "--title", "My Feature"]);
