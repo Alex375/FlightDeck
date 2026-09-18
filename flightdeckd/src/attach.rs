@@ -294,7 +294,8 @@ async fn read_client<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// Once a write has stalled, how long the farewell (`fd_detach{stalled}`) gets.
+/// Once a write has stalled, how long each write of the farewell
+/// (`fd_detach{stalled}`) may make no progress before it is abandoned.
 const STALL_FAREWELL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -315,10 +316,12 @@ enum PumpEnd {
 /// everything for it. The bound is on PROGRESS, not on a whole line, so a big
 /// line over a slow-but-moving link is not mistaken for a stall.
 ///
-/// On a stall: one best-effort write, bounded by `farewell_timeout`, of the
-/// torn line's remainder (if it was half-written — the client must never see a
-/// spliced line) followed by `fd_detach{stalled}`; the unwritten backlog is
-/// abandoned — the client gets it back by replay from its cursor.
+/// On a stall: one best-effort write of the torn line's remainder (if it was
+/// half-written — the client must never see a spliced line) followed by
+/// `fd_detach{stalled}`, bounded like every write here: it gives up once one
+/// write makes no progress for `farewell_timeout` (a link that drains again,
+/// even slowly, gets the whole farewell). The unwritten backlog is abandoned —
+/// the client gets it back by replay from its cursor.
 async fn pump_to_client<W: AsyncWrite + Unpin>(
     out: &mut W,
     mut lines_rx: mpsc::UnboundedReceiver<String>,
@@ -343,11 +346,7 @@ async fn pump_to_client<W: AsyncWrite + Unpin>(
                 }
                 farewell.extend_from_slice(frames::fd_detach("stalled", None).as_bytes());
                 farewell.push(b'\n');
-                let _ = tokio::time::timeout(
-                    farewell_timeout,
-                    write_bounded(out, &farewell, &mut 0, farewell_timeout),
-                )
-                .await;
+                let _ = write_bounded(out, &farewell, &mut 0, farewell_timeout).await;
                 return PumpEnd::Stalled;
             }
         }
@@ -663,6 +662,40 @@ mod tests {
         drop(ours);
         let got = reader.await.unwrap();
         assert_eq!(assert_stalled_farewell(&got, &lines), 9);
+    }
+
+    #[tokio::test]
+    async fn a_farewell_needing_several_slow_writes_still_gets_through() {
+        // A ~5 KB line through a 1000-byte pipe: 1000 bytes land, then the
+        // peer freezes → stall. It then drains 500 bytes every 150 ms: each
+        // farewell write progresses well within the 300 ms budget, but the
+        // whole farewell takes ~1.2 s — it must not be cut at 300 ms.
+        let (mut ours, mut theirs) = tokio::io::duplex(1000);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let big = json!({"type": "user", "pad": "y".repeat(5000)}).to_string();
+        tx.send(big.clone()).unwrap();
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut all = Vec::new();
+            let mut chunk = [0u8; 500];
+            loop {
+                match theirs.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => all.extend_from_slice(&chunk[..n]),
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            String::from_utf8(all).unwrap()
+        });
+        let outstanding = AtomicI64::new(0);
+        let end = pump_to_client(&mut ours, rx, &outstanding, Duration::from_millis(100), Duration::from_millis(300)).await;
+        assert_eq!(end, PumpEnd::Stalled);
+        drop(ours);
+        let got = reader.await.unwrap();
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines, vec![big.as_str(), r#"{"reason":"stalled","type":"fd_detach"}"#]);
+        drop(tx);
     }
 
     #[tokio::test]
