@@ -561,7 +561,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   );
 }
 
-type LegacyStage = "command" | "confirm" | "manual";
+type LegacyStage = "command" | "confirm" | "manual" | "done";
 
 /** The OLD ticket/paste flow, moved here verbatim from ControlSection.tsx (its own
  *  `buildServerCommand`/`parseTicket` stay put — their regression tests import them
@@ -579,6 +579,10 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set only when a pairing converged on an ALREADY-paired server (see `addMachine`'s
+  // `matchedExisting`) — the label to say "Updated the existing server ..." about,
+  // instead of the panel just closing as if a second server had silently appeared.
+  const [updatedExistingLabel, setUpdatedExistingLabel] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -626,7 +630,15 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
     setBusy(false);
     if (res.ok) {
       setGenKey(null);
-      onClose();
+      if (res.matchedExisting) {
+        // This host (or one of its other recorded addresses) was already paired —
+        // the row was UPDATED, not added. Say so rather than closing silently, which
+        // would read as a second server having appeared.
+        setUpdatedExistingLabel(res.machine.label);
+        setStage("done");
+      } else {
+        onClose();
+      }
     } else {
       setError(res.error);
     }
@@ -789,6 +801,20 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             <span className={sharedStyles.spacer} />
             <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onClose}>
               Cancel
+            </button>
+          </div>
+        </>
+      )}
+
+      {stage === "done" && (
+        <>
+          <div className={sharedStyles.remoteStep}>
+            Updated the existing server &ldquo;{updatedExistingLabel}&rdquo; — this host was already
+            paired, so nothing new was added.
+          </div>
+          <div className={sharedStyles.btnRow}>
+            <button className={`${sharedStyles.btn} ${sharedStyles.primary}`} onClick={onClose}>
+              Done
             </button>
           </div>
         </>

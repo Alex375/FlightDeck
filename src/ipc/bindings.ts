@@ -2022,8 +2022,19 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * `addresses`, carried for a later task (A6) to rotate through on a failed
  * reconnect; the transport itself still only ever dials `host` today. When every
  * candidate fails, the returned error names each one tried and why.
+ * 
+ * Converges on an already-paired server the SAME way the B11 bootstrap orchestrator
+ * does (B_lifecycle-#1 review finding — this used to always mint a fresh id, so
+ * pairing a server already paired by the wizard, or by an earlier legacy pairing of
+ * the same host, minted a DUPLICATE [`MachineRecord`]): before persisting, every
+ * candidate this attempt probed is checked against every OTHER machine's own
+ * `host`/`addresses` via [`crate::store::Store::machine_by_any_address`] — a
+ * different working address this time (a rotated Tailscale IP, or simply a different
+ * candidate answering first) still converges on the same row, keyed by (port, user).
+ * A different port or user is a different machine (a different login) and is never
+ * folded together.
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<MachineRecord, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
 } catch (e) {
@@ -2792,6 +2803,14 @@ export type AccountProfile = { email: string | null; orgName: string | null;
  * `organization.organization_type`. `None` for a type the CLI does not name either.
  */
 subscriptionType: string | null }
+/**
+ * The result of [`add_machine`]: the saved [`MachineRecord`], plus whether it
+ * UPDATED an already-paired server (`matched_existing: true`) rather than adding a
+ * brand-new one — see [`add_machine`]'s own doc (B_lifecycle-#1 review finding). The
+ * UI uses this to say "Updated the existing server …" instead of implying a second
+ * server was added.
+ */
+export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean }
 /**
  * See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
  */

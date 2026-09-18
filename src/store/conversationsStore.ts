@@ -503,7 +503,13 @@ interface ConversationsState {
    *  shows. `addresses` is the full set of candidates the pairing ticket discovered
    *  (Tailscale name / LAN IP / hostname) — the core probes them in priority order
    *  and persists whichever one actually worked as `Machine.host`, the full set as
-   *  `Machine.addresses`. */
+   *  `Machine.addresses`.
+   *
+   *  `matchedExisting: true` means this converged on an ALREADY-paired server (same
+   *  host/port/user, or the working address matched one of that machine's other
+   *  recorded addresses — see `Store::machine_by_any_address`) and UPDATED that row
+   *  rather than adding a new one; the caller shows "Updated the existing server …"
+   *  instead of implying a second server was added. */
   addMachine: (input: {
     label: string;
     host: string;
@@ -511,7 +517,10 @@ interface ConversationsState {
     user: string;
     identityFile: string | null;
     addresses?: AddressCandidate[] | null;
-  }) => Promise<{ ok: true; machine: Machine } | { ok: false; error: string }>;
+  }) => Promise<
+    | { ok: true; machine: Machine; matchedExisting: boolean }
+    | { ok: false; error: string }
+  >;
   /** Un-pair a server: removes it and every repo/conversation anchored to it. */
   removeMachine: (id: string) => void;
   /** Register a repo that lives on a remote server (idempotent by path+machine). */
@@ -717,11 +726,11 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       input.addresses ?? null,
     );
     if (res.status !== "ok") return { ok: false, error: res.error };
-    const machine = recordToMachine(res.data);
+    const machine = recordToMachine(res.data.machine);
     set((s) => ({
       machines: [...s.machines.filter((m) => m.id !== machine.id), machine],
     }));
-    return { ok: true, machine };
+    return { ok: true, machine, matchedExisting: res.data.matched_existing };
   },
 
   removeMachine: (id) => {

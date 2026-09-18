@@ -880,9 +880,9 @@ impl Store {
     /// `identity_file`) instead of duplicating it under a brand-new uuid every time
     /// (B11 review finding). Matches `host` literally (no DNS/IP normalization,
     /// exactly the string `add_machine`/the pipeline persisted it as) and returns the
-    /// most recently added match when more than one somehow exists. Never used by
-    /// `add_machine`'s own manual "Add a server" flow, which is deliberately left
-    /// free to mint a fresh record every time (see that function's doc).
+    /// most recently added match when more than one somehow exists. See
+    /// [`Self::machine_by_any_address`] for the broader lookup `add_machine`'s own
+    /// legacy pairing flow uses, which also matches a machine's recorded `addresses`.
     pub fn machine_by_address(&self, host: &str, port: u16, user: &str) -> rusqlite::Result<Option<MachineRecord>> {
         self.conn
             .lock()
@@ -911,6 +911,64 @@ impl Store {
                 },
             )
             .optional()
+    }
+
+    /// The broader convergence lookup `add_machine`'s legacy ticket/manual pairing
+    /// flow uses (B_lifecycle-#1 review finding): unlike [`Self::machine_by_address`],
+    /// which only matches a machine's CURRENT `host` column, this also matches every
+    /// value in a machine's recorded `addresses` (Tailscale name / LAN IP / hostname —
+    /// see [`crate::ipc::commands::probe_candidates`]). Pairing the same physical
+    /// server twice can legitimately resolve to a DIFFERENT working address the
+    /// second time (candidates are tried in priority order and the first reachable
+    /// one wins; a Tailscale name that answered before might time out while the LAN
+    /// IP now does), so matching on `host` alone would still mint a duplicate row for
+    /// a server that is, in fact, already paired.
+    ///
+    /// `candidates` is every address value THIS pairing attempt is willing to accept
+    /// as "this host" (every candidate `add_machine` probed, not just the one that
+    /// worked) — a match against ANY of an existing machine's own `host`/`addresses`
+    /// converges. Matches literally, same discipline as `machine_by_address` (no DNS/IP
+    /// normalization). `port`/`user` must still match exactly: a different port or a
+    /// different login user is a different machine, never folded together. Returns the
+    /// most recently added match when more than one somehow qualifies.
+    pub fn machine_by_any_address(
+        &self,
+        candidates: &[String],
+        port: u16,
+        user: &str,
+    ) -> rusqlite::Result<Option<MachineRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+             FROM machines WHERE port = ?1 AND user = ?2 ORDER BY added_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![port, user], |row| {
+                Ok(MachineRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    user: row.get(4)?,
+                    identity_file: row.get(5)?,
+                    added_at: row.get(6)?,
+                    addresses: decode_addresses(row.get(7)?),
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for m in rows {
+            let known_to_this_machine =
+                std::iter::once(m.host.as_str()).chain(m.addresses.iter().map(|a| a.value.as_str()));
+            if known_to_this_machine.into_iter().any(|known| candidates.iter().any(|c| c == known)) {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
     }
 
     /// Insert or update a remote server (idempotent by id). Connection coordinates
@@ -1746,6 +1804,83 @@ mod tests {
         assert!(s.machine_by_address("1.2.3.4", 2222, "deploy").unwrap().is_some());
         assert!(s.machine_by_address("1.2.3.4", 22, "someone-else").unwrap().is_none());
         assert!(s.machine_by_address("never-paired.example", 22, "deploy").unwrap().is_none());
+    }
+
+    /// [`Store::machine_by_any_address`] — the B_lifecycle-#1 review finding's
+    /// convergence lookup for `add_machine`'s own legacy pairing flow — matches a
+    /// candidate against a machine's RECORDED `addresses`, not just its current `host`.
+    #[test]
+    fn machine_by_any_address_matches_on_a_recorded_address_not_just_the_current_host() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "box.tailnet.ts.net".into(), // the address that answered LAST time
+            port: 22,
+            user: "deploy".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: vec![
+                AddressCandidate { kind: AddressKind::Tailscale, value: "box.tailnet.ts.net".into() },
+                AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+            ],
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        // THIS attempt's working address is the LAN one, never tried as `host` before —
+        // still converges on the same machine because it's in its recorded `addresses`.
+        let found = s
+            .machine_by_any_address(&["192.168.1.5".to_string()], 22, "deploy")
+            .unwrap()
+            .expect("must find m1 via its recorded LAN address");
+        assert_eq!(found.id, "m1");
+
+        // A candidate list with SEVERAL values, only one of which matches, still finds it.
+        assert!(s
+            .machine_by_any_address(&["unrelated.example".to_string(), "192.168.1.5".to_string()], 22, "deploy")
+            .unwrap()
+            .is_some());
+    }
+
+    /// Same (host, port) but a DIFFERENT user is a genuinely different login — never
+    /// folded together, even though the address matches.
+    #[test]
+    fn machine_by_any_address_same_host_different_user_stays_separate() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            user: "root".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: vec![AddressCandidate { kind: AddressKind::Manual, value: "1.2.3.4".into() }],
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        assert!(
+            s.machine_by_any_address(&["1.2.3.4".to_string()], 22, "deploy").unwrap().is_none(),
+            "a different SSH user must never converge on someone else's machine row",
+        );
+        // Same reasoning for a different port.
+        assert!(s.machine_by_any_address(&["1.2.3.4".to_string()], 2222, "root").unwrap().is_none());
+        // The real (host, port, user) still matches.
+        assert!(s.machine_by_any_address(&["1.2.3.4".to_string()], 22, "root").unwrap().is_some());
+    }
+
+    #[test]
+    fn machine_by_any_address_no_match_is_none_not_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.machine_by_any_address(&["never-paired.example".to_string()], 22, "deploy").unwrap().is_none());
     }
 
     /// The ssh-option-injection guard belongs to the persistence boundary, not just
