@@ -787,6 +787,49 @@ async fn run_actor(
                 // else: fall through to the normal reconnect path below,
                 // exactly like the FdDetach "stalled" case above — the table
                 // decides, `run_actor` never hardcodes the outcome.
+            } else if looks_like_clap_flag_rejection(exit_code, &stderr) {
+                // D6/C9 follow-up (review finding): the CACHED per-machine daemon
+                // version (`ipc::commands::daemon_version_for_machine`) said this
+                // server's `flightdeckd` understood `--supports-skip`/`--title`, but
+                // it just rejected one of them outright — the server was DOWNGRADED
+                // below 0.2.0 since that cache entry was learned. Without this,
+                // EVERY reconnect would keep passing the same now-unsupported
+                // flag(s), clap would reject them identically forever, and the
+                // conversation could never reconnect until the app restarts.
+                //
+                // Invalidate the cache (so the next fresh top-level spawn re-probes
+                // for real) and drop BOTH optional flags here, for the REST of this
+                // actor's own reconnect loop (both share the same 0.2.0 floor, so a
+                // daemon that rejects one can't understand the other either) —
+                // never re-offering them again this session, which is what "never
+                // loop" requires: a single flip, not a re-arm-and-fail cycle.
+                if let Some(machine_id) = cfg.remote.as_ref().and_then(|r| r.machine_id.as_deref()) {
+                    crate::ipc::commands::invalidate_daemon_version_cache(machine_id);
+                }
+                attach.supports_skip = false;
+                cfg.conversation_title = None;
+                let (message, terminal, narrated) =
+                    reconnect_policy_for_reason("flag_rejected", exit_code.map(i64::from), None);
+                if let Some(message) = &message {
+                    core.emit_error_notice(
+                        "process_exited",
+                        json!({
+                            "message": message,
+                            "reason": "flag_rejected",
+                            "detail": if stderr.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(stderr.join("\n"))
+                            },
+                        }),
+                    );
+                }
+                if terminal {
+                    deliberate_exit = narrated;
+                    break 'outer true;
+                }
+                // else: fall through to the normal reconnect path below, now
+                // downgraded — exactly one retry without the flags, per the table.
             }
         }
         // Remote link lost while the server-side session lives on: reconnect.
@@ -1011,6 +1054,20 @@ fn reconnect_policy_for_reason(
                 true,
             )
         }
+        // Synthesized locally by `looks_like_clap_flag_rejection`, never sent by the
+        // daemon. Non-terminal: `run_actor` has ALREADY invalidated the machine's
+        // cached daemon version and dropped the optional flags for the rest of this
+        // actor's reconnect loop by the time this is reached — this just decides the
+        // one-time notice, same as `"stalled"`.
+        "flag_rejected" => (
+            Some(
+                "The server's flightdeckd no longer understands an optional flag this \
+                 Mac was sending — retrying without it."
+                    .to_string(),
+            ),
+            false,
+            false, // not applicable — never reaches the exit-explain check (non-terminal)
+        ),
         _ => (
             Some(message.map(str::to_string).unwrap_or_else(|| "Remote attach failed.".to_string())),
             true,
@@ -1058,6 +1115,36 @@ fn looks_like_missing_daemon(exit_code: Option<i32>, stderr_tail: &[String], dae
         .rev()
         .find(|line| !line.trim().is_empty())
         .is_some_and(|line| line.to_lowercase().contains(&needle))
+}
+
+/// D6/C9 follow-up (review finding): does a just-closed remote transport's exit look
+/// like clap rejecting one of our two version-gated OPTIONAL attach flags
+/// (`--supports-skip` — D6 — or `--title` — C9) outright, rather than a network blip?
+/// Requires BOTH clap's own exit code for an unrecognized argument (2) AND the LAST
+/// non-empty stderr line naming one of the two flags specifically alongside clap's
+/// "unexpected argument" wording (case-insensitive, so a clap wording tweak across a
+/// future major still matches on the flag name, mirroring `looks_like_missing_daemon`'s
+/// own anchoring discipline — a looser match on exit code 2 ALONE would false-positive
+/// on an unrelated usage error and could misclassify a real problem as "just retry
+/// without the flags").
+///
+/// This can only fire when the CACHED per-machine version gate
+/// (`ipc::commands::daemon_version_for_machine`) was WRONG for the server's ACTUAL,
+/// now-downgraded `flightdeckd` — the version is learned once per app run and never
+/// re-checked mid-run otherwise (see that cache's doc).
+fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]) -> bool {
+    if exit_code != Some(2) {
+        return false;
+    }
+    stderr_tail
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("unexpected argument")
+                && (lower.contains("--supports-skip") || lower.contains("--title"))
+        })
 }
 
 /// How many consecutive reconnects in a row may see the SAME unparseable
@@ -2074,12 +2161,14 @@ mod tests {
     use crate::supervisor::model::{ConversationItem, PermissionRequestPayload, SessionStatePayload};
     use serde_json::json;
 
-    /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var,
-    /// so they never race under the default parallel test runner — mirrors
-    /// `transport::tests::ENV_LOCK` (which guards the sibling
-    /// `TOSSE_CLAUDE_BIN`), kept separate since the two env vars are
-    /// independent and each module's tests only ever touch its own.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var —
+    /// the SAME crate-wide lock `transport::tests` uses for its own direct
+    /// `push_remote_title`/`run_remote_stop` tests (see
+    /// [`transport::SSH_ENV_LOCK`]'s doc for why this must be ONE shared lock
+    /// rather than a second independent one: two different modules' tests
+    /// mutating the SAME real env var need to serialise against EACH OTHER,
+    /// not just against their own module).
+    use transport::SSH_ENV_LOCK as ENV_LOCK;
 
     /// Test sink: forwards every event onto a channel for assertions.
     struct ChannelEmitter {
@@ -3465,6 +3554,58 @@ mod tests {
             (Some("Remote attach failed.".to_string()), true, false),
             "a truly unknown reason must fall back to the wildcard, terminal, never panic",
         );
+        // The dedicated entry `looks_like_clap_flag_rejection` routes into (D6/C9
+        // follow-up): non-terminal — like "stalled", this is the SECOND
+        // reconnect-eligible reason, and by design (`run_actor` has already
+        // downgraded the flags and invalidated the cache by the time this table is
+        // consulted, purely for the notice).
+        assert_eq!(
+            reconnect_policy_for_reason("flag_rejected", Some(2), None),
+            (
+                Some(
+                    "The server's flightdeckd no longer understands an optional flag this \
+                     Mac was sending — retrying without it."
+                        .to_string()
+                ),
+                false,
+                false,
+            ),
+        );
+    }
+
+    /// [`looks_like_clap_flag_rejection`] unit coverage: exit code 2 alone is not
+    /// enough (any other usage error also exits 2) — the stderr must ALSO name one
+    /// of the two version-gated flags specifically.
+    #[test]
+    fn looks_like_clap_flag_rejection_requires_both_exit_code_and_flag_name() {
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &["error: unexpected argument '--supports-skip' found".to_string()],
+        ));
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &["error: unexpected argument '--title' found".to_string()],
+        ));
+        // Case-insensitive, and matched against the LAST non-empty line (clap
+        // prints usage/help lines after the actual error).
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &[
+                "noise".to_string(),
+                "".to_string(),
+                "ERROR: UNEXPECTED ARGUMENT '--title' FOUND".to_string(),
+            ],
+        ));
+        assert!(
+            !looks_like_clap_flag_rejection(Some(2), &["error: unexpected argument '--socket' found".to_string()]),
+            "a rejection of an UNRELATED flag must not trigger the downgrade",
+        );
+        assert!(
+            !looks_like_clap_flag_rejection(Some(1), &["error: unexpected argument '--title' found".to_string()]),
+            "the wrong exit code must never match, even with the right wording",
+        );
+        assert!(!looks_like_clap_flag_rejection(None, &["unexpected argument '--title'".to_string()]));
+        assert!(!looks_like_clap_flag_rejection(Some(2), &[]));
     }
 
     /// A6 — table-driven coverage of the pure rotation decision.
@@ -3897,6 +4038,156 @@ mod tests {
         );
     }
 
+    /// D6/C9 follow-up (review finding) end-to-end: a daemon DOWNGRADED below 0.2.0
+    /// mid-run rejects `--supports-skip`/`--title` with clap's unknown-argument exit
+    /// (2). The actor must invalidate the machine's cached version, retry EXACTLY
+    /// ONCE without either flag, and then behave completely normally (reconnect
+    /// succeeds, no loop) — never keep re-offering the flags the daemon just proved
+    /// it doesn't understand.
+    ///
+    /// Fakes the remote command like `run_actor_stops_cleanly_when_the_remote_daemon_
+    /// is_missing`, except this script behaves DIFFERENTLY on its first vs later
+    /// invocation (a call counter sidecar file): first call → clap's rejection
+    /// message + exit 2; every later call → a normal successful attach. It also logs
+    /// the exact command line each invocation received, so the test can assert the
+    /// SECOND attempt genuinely dropped both flags.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_retries_once_without_the_flags_after_a_clap_rejection() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-flag-rejected-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+for last; do :; done
+printf '%s\n' "$last" >> "$DIR/args.log"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+if [ "$N" -eq 1 ]; then
+    echo "error: unexpected argument '--supports-skip' found" 1>&2
+    exit 2
+fi
+printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Arrange "this machine's daemon version is already cached" (as a real
+        // spawn's D6/C9 gate would have left it) so the assertion below can prove
+        // the clap-rejection path actually invalidates it, not just that the retry
+        // behaves correctly.
+        let machine_id = "m-flag-test-clap-rejection";
+        crate::ipc::commands::seed_daemon_version_cache_for_test(
+            machine_id,
+            Some("flightdeckd 0.2.0".to_string()),
+        );
+        assert!(crate::ipc::commands::daemon_version_cache_contains(machine_id));
+
+        // Unlike a single-attempt test, this actor spawns TWO transports over its
+        // lifetime (the reconnect re-reads `TOSSE_SSH_BIN` — see
+        // `transport::resolve_ssh_bin`), so the guard is held for the WHOLE test
+        // body, exactly like `run_actor_rotates_to_the_next_address_after_repeated_
+        // failures_and_persists_it` — released only once no more spawns are coming.
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: Some(machine_id.to_string()),
+        });
+        cfg.conversation_title = Some("My Feature".into());
+        cfg.attach = Some(transport::AttachPoint {
+            conversation: None,
+            epoch: None,
+            cursor: 0,
+            supports_skip: true,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "flag-rejected-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        let handle = handle.expect("fake ssh should spawn");
+
+        // Wait for the "Reconnected" notice — proof the SECOND (downgraded) attempt
+        // actually succeeded, rather than the actor giving up or looping the first
+        // failure forever.
+        let mut reconnected_msg: Option<String> = None;
+        let mut flag_rejected_msg: Option<String> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    let text = detail["message"].as_str().unwrap_or_default().to_string();
+                    if subtype == "process_exited" && detail["reason"].as_str() == Some("flag_rejected") {
+                        flag_rejected_msg = Some(text);
+                    } else if subtype == "remote_link" && text.contains("Reconnected") {
+                        reconnected_msg = Some(text);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the actor must recover from the clap rejection within the deadline, not hang or loop");
+
+        // Safe to release now: the winning (downgraded) transport is already
+        // attached above — no more spawns are coming.
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        assert!(flag_rejected_msg.is_some(), "expected the one-time flag_rejected notice");
+        assert!(reconnected_msg.is_some(), "expected the downgraded retry to succeed");
+
+        let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
+        assert_eq!(calls, 2, "expected EXACTLY one retry (two total attempts), never a loop");
+
+        let log = fs::read_to_string(dir.join("args.log")).unwrap();
+        let attempts: Vec<&str> = log.lines().collect();
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts[0].contains("--supports-skip") && attempts[0].contains("--title="),
+            "the FIRST attempt should still ask for both flags: {}",
+            attempts[0],
+        );
+        assert!(
+            !attempts[1].contains("--supports-skip") && !attempts[1].contains("--title="),
+            "the SECOND (retry) attempt must drop BOTH optional flags: {}",
+            attempts[1],
+        );
+        assert!(
+            !crate::ipc::commands::daemon_version_cache_contains(machine_id),
+            "the clap rejection must invalidate the machine's cached daemon version, \
+             so the NEXT top-level spawn re-probes for real instead of repeating the \
+             now-stale answer",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// D6 wiring end-to-end: a daemon that sends a MISMATCHED `fd_skip` (a protocol
     /// violation it should never produce) must surface exactly one `protocol_error`
     /// notice through `run_actor` — proving `Transport::take_skip_violation`
@@ -4187,6 +4478,106 @@ esac
         assert!(
             remote_link_messages.iter().all(|m| !m.contains("Trying another address")),
             "a terminal reason must never rotate, even with a second candidate available: {remote_link_messages:?}",
+        );
+    }
+
+    /// Live M1 acceptance check (C9): spawning a REMOTE conversation with a title
+    /// set must have the daemon record it as the conversation's AUTHORITATIVE title
+    /// — verified the same way an operator would: `ssh … flightdeckd status` and
+    /// look for it in the JSON. Full path: `SpawnConfig::conversation_title` →
+    /// `build_remote_command`'s `--title=` → the daemon's `attach.rs::handle_conn`
+    /// (`set_title_authoritative`, run BEFORE the `fd_attach` ack — see
+    /// `transport::push_remote_title`'s doc) → `flightdeckd status`'s `title` field.
+    /// A distinctive, uuid-suffixed title makes a raw substring match in the status
+    /// JSON an unambiguous signal without needing to correlate rows by conversation
+    /// id (the daemon mints its own on a cold start).
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (flightdeck-server: `m1-daemon/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored spawn_with_a_title_sets_it_on_the_m1_daemon --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    async fn spawn_with_a_title_sets_it_on_the_m1_daemon() {
+        use std::time::Duration;
+        let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+            format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
+        });
+        let title = format!("tosse-c9-live-test-{}", uuid::Uuid::new_v4());
+
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.conversation_title = Some(title.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(identity.clone()),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "live-title-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("remote spawn should start");
+
+        handle
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .await
+            .expect("send should queue");
+
+        let mut result_ok: Option<bool> = None;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) = ev {
+                    result_ok = Some(!is_error);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn should complete within the deadline");
+        assert_eq!(result_ok, Some(true), "expected a successful remote turn");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        // `ssh <dest> 'exec flightdeckd status'` — the same one-shot pattern
+        // `transport::run_remote_stop` uses — read back the daemon's own view.
+        let out = tokio::process::Command::new("ssh")
+            .arg("-T")
+            .arg("-p")
+            .arg("2224")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-i")
+            .arg(&identity)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("agent@127.0.0.1")
+            .arg("exec flightdeckd status")
+            .output()
+            .await
+            .expect("ssh status should run");
+        let status_json = String::from_utf8_lossy(&out.stdout);
+        eprintln!("[live] flightdeckd status: {status_json}");
+        assert!(
+            status_json.contains(&title),
+            "expected the daemon's status to carry the title '{title}' — got: {status_json}",
         );
     }
 

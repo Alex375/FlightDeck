@@ -19,6 +19,7 @@ vi.mock("../ipc/client", () => {
       readDir: vi.fn(() => ok([])),
       answerPermission: vi.fn(() => ok()),
       publishControlEvent: vi.fn(() => Promise.resolve()),
+      pushRemoteConversationTitle: vi.fn(() => Promise.resolve(false)),
     },
   };
 });
@@ -210,6 +211,45 @@ describe("appControl — conversations", () => {
     expect((out[0].status as { kind: string }).kind).toBe("idle");
     expect((out[1].status as { kind: string }).kind).toBe("off");
     expect((out[0].repository as { name: string }).name).toBe("r1");
+    // C9: additive, local conversations report no host.
+    expect(out[0].hosted_on).toBeNull();
+    expect(out[0].session_id).toBeNull();
+  });
+
+  it("list_conversations and read_conversation report session_id + hosted_on for a REMOTE conversation (C9)", async () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r-remote", path: "/work/demo", addedAt: 1, machineId: "m1" }],
+      machines: [
+        {
+          id: "m1",
+          label: "build-server",
+          host: "h.example",
+          port: 22,
+          user: "agent",
+          addedAt: 1,
+          addresses: [],
+        },
+      ],
+      conversations: [conv({ id: "c1", repoId: "r-remote", sessionId: "claude-sess-1" })],
+      activeId: "c1",
+    });
+    const list = (await executeAppControlTool(
+      "list_conversations",
+      {},
+      null,
+      helpers(),
+    )) as Array<Record<string, unknown>>;
+    expect(list[0].hosted_on).toBe("build-server");
+    expect(list[0].session_id).toBe("claude-sess-1");
+
+    const read = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(read.hosted_on).toBe("build-server");
+    expect(read.session_id).toBe("claude-sess-1");
   });
 
   it("read_conversation serializes the dialogue and skips sub-agent turns", async () => {

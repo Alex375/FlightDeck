@@ -1746,6 +1746,12 @@ export const mockCommands = {
     _detail: unknown,
   ): Promise<void> {},
 
+  // C9: the demo/browser preview has no real remote (SSH) machines, so there is
+  // never anything to push — mirrors the real command's own "nothing to do" `false`.
+  async pushRemoteConversationTitle(_conversationId: string, _title: string): Promise<boolean> {
+    return false;
+  },
+
   async voiceBridgeStatus(): Promise<VoiceBridgeStatus> {
     return { ...mockVoiceBridge };
   },

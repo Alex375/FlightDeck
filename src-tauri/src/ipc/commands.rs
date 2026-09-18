@@ -180,6 +180,14 @@ pub struct SpawnFlags {
     pub app_control: bool,
     /// Which Claude account to authenticate as; `None` = the default, un-scoped store.
     pub claude_account_id: Option<String>,
+    /// The conversation's CURRENT title (C9), so a REMOTE spawn's `attach --title`
+    /// carries it from the very first attach — see
+    /// [`crate::supervisor::transport::SpawnConfig::conversation_title`]. Ignored for
+    /// a local conversation (Claude has no daemon-side title). The front omits this
+    /// (or sends `None`) for a conversation that is still on its placeholder name, so
+    /// an untitled conversation never stamps that placeholder as the daemon's
+    /// authoritative title (see `spawn_session`'s wiring).
+    pub conversation_title: Option<String>,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -220,6 +228,7 @@ pub async fn spawn_session(
         allow_bypass_permissions,
         app_control,
         claude_account_id,
+        conversation_title,
     } = flags;
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
@@ -310,6 +319,21 @@ pub async fn spawn_session(
         // this can never block or fail the spawn.
         let supports_skip =
             supports_skip_for_machine(&machine, known_hosts_file.as_deref()).await;
+        // C9: same discipline for `--title` — gated on the SAME cached probe (see
+        // `daemon_version_for_machine`), never guessed. An untitled conversation
+        // (the front omits `conversation_title` for its own placeholder name) sends
+        // `None` either way, so `cfg.conversation_title` only ever carries a REAL
+        // title through this gate.
+        cfg.conversation_title = match &conversation_title {
+            Some(title) if !title.trim().is_empty() => {
+                if supports_title_for_machine(&machine, known_hosts_file.as_deref()).await {
+                    Some(title.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let addresses = remote_target_addresses(&machine.host, machine.addresses);
         cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
             host: machine.host,
@@ -3841,13 +3865,26 @@ fn describe_probe_blockers(probe: &RemoteProbeResult) -> String {
 /// feature).
 const MIN_SKIP_DAEMON_VERSION: &str = "0.2.0";
 
-/// Per-app-run cache of whether a paired machine's `flightdeckd` is new enough to
-/// accept `--supports-skip`, keyed by [`crate::store::MachineRecord::id`]. In-memory
-/// only — never persisted (the daemon can be upgraded between app runs, and the probe
-/// is cheap enough to redo once per run) — so a fresh launch always reprobes a
-/// machine's first spawn, and every spawn after that in the SAME run reuses the
-/// answer instead of paying another ssh round trip on what is otherwise a hot path.
-static SKIP_SUPPORT_CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
+/// Minimum `flightdeckd` version that understands `attach --title` (C9) — landed in
+/// the SAME daemon release as `--supports-skip`, so it shares its floor. Kept as its
+/// own named constant (never literally re-using [`MIN_SKIP_DAEMON_VERSION`]) so the
+/// two features can diverge in a LATER daemon release without silently dragging each
+/// other along.
+const MIN_TITLE_DAEMON_VERSION: &str = "0.2.0";
+
+/// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
+/// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
+/// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
+/// `SKIP_SUPPORT_CACHE` (which cached only ONE derived bool) so every version-gated
+/// optional attach flag — `--supports-skip` (D6) and `--title` (C9), each with its
+/// own minimum — derives from the SAME cached probe instead of paying a separate ssh
+/// round trip per flag for what is fundamentally one fact about the machine. In-memory
+/// only, exactly like its predecessor: never persisted (the daemon can be upgraded
+/// between app runs, and the probe is cheap enough to redo once per run), so a fresh
+/// launch always reprobes a machine's first spawn, and every spawn after that in the
+/// SAME run reuses the answer instead of paying another ssh round trip on what is
+/// otherwise a hot path. `pub(crate)` invalidation: [`invalidate_daemon_version_cache`].
+static DAEMON_VERSION_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Pure gate: does `probed_version` (raw `flightdeckd --version` output, `None` on a
@@ -3860,24 +3897,30 @@ fn should_request_skip(probed_version: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `machine`'s paired `flightdeckd` accepts `--supports-skip` (D6) — a
-/// CACHED (see [`SKIP_SUPPORT_CACHE`]), bounded, best-effort lookup [`spawn_session`]
-/// feeds straight into the new session's
-/// [`crate::supervisor::transport::AttachPoint::supports_skip`].
-///
-/// Reuses A1's pairing probe ([`probe_remote`]) for the version — the SAME `--version`
-/// round trip pairing already trusts — wrapped in an outer timeout as a second belt
-/// (the probe's own `ConnectTimeout` only bounds the CONNECT phase, not a remote shell
-/// that hangs after connecting). A probe failure OR timeout reads as "unsupported" and
-/// is cached as `false`: this must NEVER block or fail the session spawn that asked
-/// for it — the worst case is simply falling back to the old, uncompacted replay,
-/// which is exactly what happens against a daemon that is actually too old.
-async fn supports_skip_for_machine(
+/// Pure gate: the C9 sibling of [`should_request_skip`] — does `probed_version` clear
+/// [`MIN_TITLE_DAEMON_VERSION`]?
+fn should_request_title(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_TITLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// The cached (or freshly probed) `flightdeckd --version` output for `machine`, or
+/// `None` on a probe failure/timeout. Every version-gated optional flag
+/// (`supports_skip_for_machine`, `supports_title_for_machine`) derives from this ONE
+/// probe — reusing A1's pairing probe ([`probe_remote`]) for the version, the SAME
+/// `--version` round trip pairing already trusts, wrapped in an outer timeout as a
+/// second belt (the probe's own `ConnectTimeout` only bounds the CONNECT phase, not a
+/// remote shell that hangs after connecting). A probe failure OR timeout is cached as
+/// `None` — this must NEVER block or fail the session spawn that asked for it; every
+/// gate built on top of `None` treats it as "assume the oldest behavior", the safe
+/// default against a daemon that might not understand a newer flag at all.
+async fn daemon_version_for_machine(
     machine: &crate::store::MachineRecord,
     known_hosts_file: Option<&str>,
-) -> bool {
-    if let Some(&cached) = SKIP_SUPPORT_CACHE.lock().unwrap().get(&machine.id) {
-        return cached;
+) -> Option<String> {
+    if let Some(cached) = DAEMON_VERSION_CACHE.lock().unwrap().get(&machine.id) {
+        return cached.clone();
     }
     let probed_version = tokio::time::timeout(
         std::time::Duration::from_secs(12),
@@ -3893,9 +3936,59 @@ async fn supports_skip_for_machine(
     .ok() // outer timeout elapsed -> None
     .and_then(Result::ok) // the ssh round trip itself failed -> None
     .and_then(|r| r.flightdeckd_version);
-    let supported = should_request_skip(probed_version.as_deref());
-    SKIP_SUPPORT_CACHE.lock().unwrap().insert(machine.id.clone(), supported);
-    supported
+    DAEMON_VERSION_CACHE.lock().unwrap().insert(machine.id.clone(), probed_version.clone());
+    probed_version
+}
+
+/// D6/C9 follow-up (review finding): drop `machine_id`'s cached probe so the VERY NEXT
+/// call to [`daemon_version_for_machine`] re-learns it for real instead of repeating a
+/// now-stale answer. The only caller today is `session.rs::run_actor`, when a reconnect
+/// attempt dies with clap's unknown-argument rejection of `--supports-skip`/`--title`
+/// (`looks_like_clap_flag_rejection`) — proof the cached version was wrong because the
+/// server's `flightdeckd` was DOWNGRADED since it was learned. A no-op for an
+/// unknown/already-absent `machine_id` (nothing to invalidate).
+pub(crate) fn invalidate_daemon_version_cache(machine_id: &str) {
+    DAEMON_VERSION_CACHE.lock().unwrap().remove(machine_id);
+}
+
+/// Test-only peek at whether `machine_id` currently has ANY cached entry (hit or a
+/// cached probe failure alike) — lets `session::tests` assert
+/// [`invalidate_daemon_version_cache`] actually ran as a side effect of the clap-
+/// rejection path, without exposing a real (non-test) reader of the cache's
+/// contents anywhere else.
+#[cfg(test)]
+pub(crate) fn daemon_version_cache_contains(machine_id: &str) -> bool {
+    DAEMON_VERSION_CACHE.lock().unwrap().contains_key(machine_id)
+}
+
+/// Test-only seed, the write-side twin of [`daemon_version_cache_contains`] — lets
+/// `session::tests` arrange "this machine's version is already cached" WITHOUT a
+/// real ssh probe, so it can then assert the clap-rejection path actually clears it.
+#[cfg(test)]
+pub(crate) fn seed_daemon_version_cache_for_test(machine_id: &str, version: Option<String>) {
+    DAEMON_VERSION_CACHE.lock().unwrap().insert(machine_id.to_string(), version);
+}
+
+/// Whether `machine`'s paired `flightdeckd` accepts `--supports-skip` (D6) — a
+/// CACHED (see [`DAEMON_VERSION_CACHE`]), bounded, best-effort lookup [`spawn_session`]
+/// feeds straight into the new session's
+/// [`crate::supervisor::transport::AttachPoint::supports_skip`].
+async fn supports_skip_for_machine(
+    machine: &crate::store::MachineRecord,
+    known_hosts_file: Option<&str>,
+) -> bool {
+    should_request_skip(daemon_version_for_machine(machine, known_hosts_file).await.as_deref())
+}
+
+/// Whether `machine`'s paired `flightdeckd` accepts `attach --title` (C9) — the sibling
+/// of [`supports_skip_for_machine`], sharing its cache and its caller discipline: feeds
+/// straight into [`crate::supervisor::transport::SpawnConfig::conversation_title`], and
+/// is what [`push_remote_conversation_title`] re-checks before its own ad hoc attach.
+async fn supports_title_for_machine(
+    machine: &crate::store::MachineRecord,
+    known_hosts_file: Option<&str>,
+) -> bool {
+    should_request_title(daemon_version_for_machine(machine, known_hosts_file).await.as_deref())
 }
 
 /// The order candidate addresses are tried in: a Tailscale name survives NAT/IP churn
@@ -4381,6 +4474,64 @@ pub fn upsert_conversation(
         .map_err(|e| e.to_string())
 }
 
+/// Best-effort push of a REMOTE conversation's CURRENT title to its daemon's
+/// authoritative record (C9) — the idle-rename path, for when the LOCAL rename
+/// (`upsert_conversation`) happens while this Mac isn't the one driving the
+/// conversation. `title` is passed explicitly rather than re-read from the store, so
+/// this never races that same rename's own `upsertConversation` write landing first.
+///
+/// See [`crate::supervisor::transport::push_remote_title`] for the wire mechanics and
+/// its SAFETY CONTRACT — most importantly: the caller (`renameConversation` in
+/// `conversationsStore.ts`) MUST have already confirmed this Mac holds no live
+/// session for `conversation_id` before ever calling this; that liveness
+/// (`conv.handle`) is front-end-only state this command cannot see, let alone check
+/// on its own.
+///
+/// Infallible from the caller's point of view (mirrors [`crate::supervisor::
+/// transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+/// whenever there's nothing useful to do (unknown conversation, local repo, no
+/// daemon session yet, or a paired daemon that predates `--title` support) or the ssh
+/// round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+/// which already landed — the next real spawn carries the title anyway (see
+/// `spawn_session`'s `conversation_title` wiring).
+#[tauri::command]
+#[specta::specta]
+pub async fn push_remote_conversation_title(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    title: String,
+) -> bool {
+    if title.trim().is_empty() {
+        return false;
+    }
+    let store = app.state::<Store>();
+    let Ok(Some((cwd, session_id, machine))) = store.remote_session_for_conversation(&conversation_id)
+    else {
+        return false;
+    };
+    let known_hosts_file = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+    if !supports_title_for_machine(&machine, known_hosts_file.as_deref()).await {
+        return false; // an older daemon's clap would reject --title outright
+    }
+    let addresses = remote_target_addresses(&machine.host, machine.addresses.clone());
+    let remote = crate::supervisor::transport::RemoteTarget {
+        host: machine.host,
+        port: machine.port,
+        user: machine.user,
+        identity_file: machine.identity_file,
+        known_hosts_file,
+        daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
+            .unwrap_or_else(|_| "flightdeckd".to_string()),
+        addresses,
+        machine_id: Some(machine.id),
+    };
+    crate::supervisor::transport::push_remote_title(&remote, &session_id, &cwd, &title).await
+}
+
 /// Forget a conversation's metadata.
 #[tauri::command]
 #[specta::specta]
@@ -4434,19 +4585,40 @@ pub fn app_control_respond(
     }
 }
 
-/// Publish one fleet event into the journal `wait_for_events` long-polls (the
-/// voice bridge). The FRONT calls this from its settled notification point
-/// (`fireAgentNotification`), so the voice agent hears exactly what the human
-/// would have been pinged about.
+/// Publish one fleet event into the journal `wait_for_events` long-polls (the voice
+/// bridge) AND the phone relay's push (`appmcp::relay`'s `events_task` — the SAME
+/// journal feeds both). The FRONT calls this from its settled notification point
+/// (`fireAgentNotification`), so the voice agent (and the phone) hear exactly what
+/// the human would have been pinged about.
+///
+/// C9 gate: a conversation this Mac only RELAYS (its repo is remote — `machine_id`
+/// set) has its OWN host `flightdeckd` daemon emitting these SAME phone-facing
+/// events independently (it runs the actual session; the Mac here is just an SSH
+/// spectator) — publishing them HERE too would double the phone's push per turn.
+/// This is the SINGLE entry point every phone-facing journal event passes through
+/// (`turn_completed` / `needs_attention` / `attention_cleared` / `task_finished`,
+/// from every call site in `useGlobalSessionEvents.ts` / `appControl.ts` /
+/// `conversationsStore.ts`), so gating it here covers all of them without touching
+/// any of those call sites individually. The DESKTOP's own OS notifications and
+/// in-app voice announcements are UNCHANGED — both are fed from a SEPARATE point in
+/// `useGlobalSessionEvents.ts` that never goes through this journal at all, remote
+/// conversation or not; only the phone-facing paths (voice bridge + relay) are
+/// gated. `unwrap_or(false)` degrades toward PUBLISHING on a lookup error — a
+/// missed suppression is, at worst, one duplicate push; a wrongly-swallowed event
+/// for a conversation this couldn't even confirm as remote would be a silent loss.
 #[tauri::command]
 #[specta::specta]
 pub fn publish_control_event(
+    store: tauri::State<'_, Store>,
     hub: tauri::State<'_, Arc<crate::appmcp::ControlHub>>,
     kind: String,
     conversation_id: String,
     title: String,
     detail: serde_json::Value,
 ) {
+    if store.conversation_repo_is_remote(&conversation_id).unwrap_or(false) {
+        return;
+    }
     hub.events.publish(&kind, &conversation_id, &title, detail);
 }
 
@@ -5322,6 +5494,105 @@ mod tests {
     fn should_request_skip_is_true_at_and_above_the_min_skip_version() {
         assert!(super::should_request_skip(Some("flightdeckd 0.2.0")), "exactly the minimum");
         assert!(super::should_request_skip(Some("flightdeckd 0.3.1")), "newer than the minimum");
+    }
+
+    // ---- C9: `attach --title` version gate — shares D6's cached probe -------------
+
+    #[test]
+    fn should_request_title_is_false_below_the_min_title_version() {
+        assert!(!super::should_request_title(Some("flightdeckd 0.1.9")), "0.1.9 predates --title");
+    }
+
+    #[test]
+    fn should_request_title_is_false_on_a_probe_error() {
+        assert!(!super::should_request_title(None), "must never speculatively opt in");
+    }
+
+    #[test]
+    fn should_request_title_is_true_at_and_above_the_min_title_version() {
+        assert!(super::should_request_title(Some("flightdeckd 0.2.0")), "exactly the minimum");
+        assert!(super::should_request_title(Some("flightdeckd 0.3.1")), "newer than the minimum");
+    }
+
+    fn cache_test_machine(id: &str) -> MachineRecord {
+        MachineRecord {
+            id: id.into(),
+            label: "t".into(),
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        }
+    }
+
+    /// The generalised [`DAEMON_VERSION_CACHE`] serves BOTH gates from ONE cached
+    /// probe (a cache HIT must never re-probe — seeded directly here rather than via
+    /// a real ssh round trip, which this test has no network for anyway), and
+    /// [`invalidate_daemon_version_cache`] genuinely removes the entry rather than,
+    /// say, resetting it to a stale-but-present value.
+    #[tokio::test]
+    async fn daemon_version_cache_serves_both_gates_and_invalidate_clears_it() {
+        let machine = cache_test_machine("m-cache-test-c9");
+        DAEMON_VERSION_CACHE
+            .lock()
+            .unwrap()
+            .insert(machine.id.clone(), Some("flightdeckd 0.2.0".to_string()));
+
+        assert_eq!(
+            daemon_version_for_machine(&machine, None).await.as_deref(),
+            Some("flightdeckd 0.2.0"),
+            "a cache hit must be served without a new probe",
+        );
+        assert!(supports_skip_for_machine(&machine, None).await);
+        assert!(supports_title_for_machine(&machine, None).await);
+
+        invalidate_daemon_version_cache(&machine.id);
+        assert!(
+            DAEMON_VERSION_CACHE.lock().unwrap().get(&machine.id).is_none(),
+            "invalidate must remove the entry outright, not merely stale it",
+        );
+
+        // Cleanup: don't leak state into other tests sharing this process-wide cache.
+        DAEMON_VERSION_CACHE.lock().unwrap().remove(&machine.id);
+    }
+
+    /// Invalidating a machine id the cache never held (or already forgot) is a
+    /// harmless no-op — never panics.
+    #[test]
+    fn invalidate_daemon_version_cache_is_a_no_op_for_an_unknown_machine() {
+        invalidate_daemon_version_cache("m-never-cached-c9");
+    }
+
+    /// The literal C9 gate scenario, end to end through the cache: a daemon below
+    /// 0.2.0 (0.1.1) opts OUT of both `--supports-skip` and `--title`; exactly at
+    /// 0.2.0 it opts INTO both — never one without the other, since they share the
+    /// same cached probe and the same minimum version.
+    #[tokio::test]
+    async fn daemon_0_1_1_gates_both_flags_off_and_0_2_0_gates_both_on() {
+        let old = cache_test_machine("m-gate-old-c9");
+        DAEMON_VERSION_CACHE
+            .lock()
+            .unwrap()
+            .insert(old.id.clone(), Some("flightdeckd 0.1.1".to_string()));
+        assert!(!supports_skip_for_machine(&old, None).await);
+        assert!(!supports_title_for_machine(&old, None).await);
+
+        let new = cache_test_machine("m-gate-new-c9");
+        DAEMON_VERSION_CACHE
+            .lock()
+            .unwrap()
+            .insert(new.id.clone(), Some("flightdeckd 0.2.0".to_string()));
+        assert!(supports_skip_for_machine(&new, None).await);
+        assert!(supports_title_for_machine(&new, None).await);
+
+        DAEMON_VERSION_CACHE.lock().unwrap().remove(&old.id);
+        DAEMON_VERSION_CACHE.lock().unwrap().remove(&new.id);
     }
 
     // ---- Remote pairing: one dedicated key per server (A3) ------------------------
