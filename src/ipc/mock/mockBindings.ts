@@ -3,16 +3,33 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AddressCandidate,
   AgentRouting,
   Backend,
+  BootstrapProgressEvent,
+  BootstrapReport,
   BranchInfo,
   CommitFile,
   CommitInfo,
   ContextFill,
   ConversationItem,
   ConversationRecord,
+  DiagnosisState,
   GoalState,
   DiskConversation,
+  GeneratedKey,
+  HostKeyFingerprintEvent,
+  LoginSession,
+  MachineProvisionStatus,
+  MachineRecord,
+  MachineRevokeStatus,
+  RepairAction,
+  RepairOutcome,
+  ServerDiagnosis,
+  ServerLoginPromptEvent,
+  ServerLoginResultEvent,
+  StepId,
+  StepState,
   ClaudeAccountRecord,
   ClaudeAccountStatus,
   ClaudeCliStatus,
@@ -192,6 +209,16 @@ const appControlRequestEvent = new MockEmitter<AppControlRequestEvent>();
 // No wake-word engine in the browser mock — never fires, but must exist so VoiceHost can
 // subscribe without crashing the whole app on boot.
 const wakeWordEvent = new MockEmitter<WakeWordEvent>();
+// B12: the bootstrap wizard's live checklist — pushed by `bootstrapServer`/
+// `bootstrapResume` below as they walk their scripted step sequence.
+const bootstrapProgressEvent = new MockEmitter<BootstrapProgressEvent>();
+// B12: the wizard's non-blocking host-key info line — pushed once by `bootstrapServer`
+// on a scripted first-contact run.
+const hostKeyFingerprintEvent = new MockEmitter<HostKeyFingerprintEvent>();
+// B12: the inline Claude sign-in flow — pushed by `startClaudeLogin`/
+// `submitClaudeLoginCode` below.
+const serverLoginPromptEvent = new MockEmitter<ServerLoginPromptEvent>();
+const serverLoginResultEvent = new MockEmitter<ServerLoginResultEvent>();
 
 export const mockEvents = {
   sessionMessageEvent,
@@ -216,6 +243,10 @@ export const mockEvents = {
   terminalExitEvent,
   appControlRequestEvent,
   wakeWordEvent,
+  bootstrapProgressEvent,
+  hostKeyFingerprintEvent,
+  serverLoginPromptEvent,
+  serverLoginResultEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
@@ -302,6 +333,229 @@ const mockRemote: RemoteStatus = {
   pairing_qr_svg: null,
   error: null,
 };
+
+// ---- Remote servers (SSH) + B12 bootstrap wizard --------------------------------
+// Pre-B12 the browser mock had NO implementation at all for the machine-pairing
+// commands (`generateMachineKey`/`addMachine`/`deleteMachine`/`listRemoteRepos`/
+// `listRemoteDir`/the phone-provisioning trio) — "Remote servers (SSH)" was entirely
+// non-functional in `pnpm dev`. Filled in here alongside the new B12 commands so the
+// whole card (legacy ticket flow included) is exercisable without a real Tauri host.
+
+/** Paired servers, mutated in place by `addMachine`/`bootstrapServer`/`deleteMachine`
+ *  below. `loadPersistedState` mirrors this array — see its own doc. */
+const mockMachines: MachineRecord[] = [];
+/** Each paired machine's CURRENT diagnosis — what `machineDiagnose` returns and
+ *  `machineRepair` mutates. Seeded by `bootstrapServer`'s own scripted scenario, or by
+ *  the `?demo=servers` fixture below. */
+const mockDiagnoses = new Map<string, ServerDiagnosis>();
+const mockProvisionStatuses = new Map<string, MachineProvisionStatus>();
+const mockRevokeStatuses = new Map<string, MachineRevokeStatus>();
+/** Hosts (well, `host:port`) a `HostKeyMismatch` failure was forgiven for — a
+ *  `bootstrap_forget_host_key` retry then converges on the "happy" outcome instead of
+ *  failing again, mirroring the real wizard's "forget & retry" affordance. */
+const mockForgottenHostKeys = new Set<string>();
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Mirrors `orchestrator::collapse_state` closely enough for the mock's own repairs
+ *  (below) to keep a machine's headline state honest after mutating its tri-state
+ *  facts — see that function's doc for the real ordering/rationale. */
+function collapseMockState(d: ServerDiagnosis): DiagnosisState {
+  if (d.installed_as === "none") return { kind: "failed", reason: "flightdeckd is not installed" };
+  if (d.installed_as === "unknown")
+    return { kind: "failed", reason: "could not determine whether flightdeckd is installed" };
+  if (d.daemon_running === false) return { kind: "failed", reason: "flightdeckd is not running" };
+  if (d.daemon_running === null)
+    return { kind: "failed", reason: "could not determine whether flightdeckd is running" };
+  if (d.claude_installed !== true || d.claude_logged_in !== true) return { kind: "needs_claude_sign_in" };
+  return d.reboot_safe === true ? { kind: "ready" } : { kind: "running_not_reboot_safe" };
+}
+
+function readyDiagnosis(): ServerDiagnosis {
+  return {
+    state: { kind: "ready" },
+    installed_as: "system",
+    daemon_running: true,
+    daemon_version_disk: "0.4.2",
+    daemon_version_running: "0.4.2",
+    restart_pending: false,
+    reboot_safe: true,
+    linger: null,
+    sleep_masked: true,
+    claude_installed: true,
+    claude_logged_in: true,
+    claude_email: "demo@example.com",
+    tailscale_name: "mock-server.tail1234.ts.net",
+    last_boot: "2026-09-15 08:12:03",
+    busy_conversations: 0,
+  };
+}
+
+const STEP_SEQUENCE: StepId[] = [
+  "install_key",
+  "probe",
+  "upload_daemon",
+  "install_service",
+  "escalate_persistence",
+  "run_init",
+  "claude_auth",
+  "add_machine",
+  "diagnose",
+];
+
+type MockScenario = "happy" | "sudo" | "hostkey" | "fail" | "claude" | "restart";
+
+/** Selects a scripted scenario from the ADDRESS field the wizard form was submitted
+ *  with — a dev/Playwright-only convention (never shown to a real user; the trusted
+ *  domains and real wire shapes are unaffected). Covers every needs_input kind the
+ *  brief asks to verify visually: `sudo` → blocking sudo-password pause, `restart` →
+ *  non-blocking restart-pending, `claude` → non-blocking Claude sign-in, `fail` → a
+ *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "forget the old key"),
+ *  anything else → the full happy path. */
+function scenarioFor(host: string): MockScenario {
+  const h = host.toLowerCase();
+  if (h.includes("hostkey") && !mockForgottenHostKeys.has(`${host}`)) return "hostkey";
+  if (h.includes("sudo")) return "sudo";
+  if (h.includes("fail")) return "fail";
+  if (h.includes("claude")) return "claude";
+  if (h.includes("restart")) return "restart";
+  return "happy";
+}
+
+type MockStepOutcome =
+  | { kind: "ok"; detail?: string }
+  | { kind: "needs_input"; detail: string; blocking: boolean }
+  | { kind: "failed"; detail: string };
+
+/** One step's scripted outcome for `scenario` — `resuming` is true only for the ONE
+ *  step `bootstrapResume` re-runs after a sudo password arrives (mirrors the real
+ *  pipeline re-trying `escalate_persistence` with the password now available). */
+function outcomeFor(scenario: MockScenario, id: StepId, resuming: boolean): MockStepOutcome {
+  if (id === "install_key" && scenario === "hostkey") {
+    return { kind: "failed", detail: "the server's host key does not match what was expected" };
+  }
+  if (id === "probe" && scenario === "fail") {
+    return { kind: "failed", detail: "could not reach the server: connection refused" };
+  }
+  if (id === "escalate_persistence" && scenario === "sudo" && !resuming) {
+    return {
+      kind: "needs_input",
+      detail: "this server needs a sudo password to finish persistence setup",
+      blocking: true,
+    };
+  }
+  if (id === "upload_daemon" && scenario === "restart") {
+    return { kind: "needs_input", detail: "restart pending — 2 conversation(s) running", blocking: false };
+  }
+  if (id === "claude_auth" && scenario === "claude") {
+    return { kind: "needs_input", detail: "Needs Claude sign-in", blocking: false };
+  }
+  const details: Partial<Record<StepId, string>> = {
+    install_key: "Installed",
+    probe: "arch=x86_64",
+    upload_daemon: "Uploaded { restart_required: false }",
+    install_service: "Installed { mechanism: System }",
+    run_init: "Initialized",
+    claude_auth: "demo@example.com",
+    add_machine: "saved",
+    diagnose: "Ready",
+  };
+  return { kind: "ok", detail: details[id] };
+}
+
+/** Advances the scripted pipeline from `fromIndex`, mutating and emitting `states`
+ *  (already sized to the full 9-row checklist) after every transition — mirrors
+ *  `orchestrator::run_steps`'s own "emit after every transition, stop on Failed or a
+ *  blocking pause" shape closely enough for the UI's live checklist to exercise the
+ *  same states a real run would. */
+async function runMockPipeline(
+  sessionId: string,
+  host: string,
+  states: StepState[],
+  fromIndex: number,
+  resuming: boolean,
+): Promise<{ states: StepState[]; needsInput: StepId | null }> {
+  const scenario = scenarioFor(host);
+  const emit = () => bootstrapProgressEvent.emit({ session_id: sessionId, host, steps: states.map((s) => ({ ...s })) });
+  emit();
+  for (let i = fromIndex; i < STEP_SEQUENCE.length; i++) {
+    const id = STEP_SEQUENCE[i];
+    states[i] = { id, status: "running", detail: null };
+    emit();
+    await wait(220);
+    if (id === "install_key" && i === 0) {
+      // Mirrors `step_install_key`'s own host-key-fingerprint event, folded into this
+      // same step — see the wizard's non-blocking info line.
+      hostKeyFingerprintEvent.emit({ host, port: 22, fingerprint: "SHA256:mockFingerprint0000000000000000000", known: false });
+    }
+    const outcome = outcomeFor(scenario, id, resuming && id === "escalate_persistence");
+    if (outcome.kind === "ok") {
+      states[i] = { id, status: "ok", detail: outcome.detail ?? null };
+      emit();
+    } else if (outcome.kind === "needs_input") {
+      states[i] = { id, status: "needs_input", detail: outcome.detail };
+      emit();
+      if (outcome.blocking) return { states, needsInput: id };
+    } else {
+      states[i] = { id, status: "failed", detail: outcome.detail };
+      emit();
+      return { states, needsInput: null };
+    }
+  }
+  return { states, needsInput: null };
+}
+
+interface MockPausedSession {
+  label: string;
+  host: string;
+  port: number;
+  user: string;
+  states: StepState[];
+  pausedAtIndex: number;
+}
+const mockPausedSessions = new Map<string, MockPausedSession>();
+/** In-flight Claude sign-in sessions (session_id → machine_id) — see
+ *  `startClaudeLogin`/`submitClaudeLoginCode`/`cancelClaudeLogin` below. */
+const mockLoginSessions = new Map<string, string>();
+let mockLoginCounter = 0;
+
+function findOrCreateMockMachine(label: string, host: string, port: number, user: string): MachineRecord {
+  const existing = mockMachines.find((m) => m.host === host && m.port === port && m.user === user);
+  if (existing) return existing;
+  const machine: MachineRecord = {
+    id: `mock-machine-${mockMachines.length + 1}-${Date.now()}`,
+    label,
+    host,
+    port,
+    user,
+    identity_file: `/mock/ssh_keys/${host}`,
+    added_at: Date.now(),
+    addresses: [{ kind: "manual", value: host }],
+    daemon_mac_id: `mac-${host}`,
+    daemon_relay_url: "https://relay-production-8fd4.up.railway.app",
+    daemon_label: label,
+    phone_provisioned_at: null,
+  };
+  mockMachines.push(machine);
+  return machine;
+}
+
+/** The final `ServerDiagnosis` for a just-finished scenario — independent tri-state
+ *  facts consistent with that scenario's own step outcomes (see `outcomeFor`), so the
+ *  status panel a wizard hands off to shows a diagnosis that actually matches what the
+ *  checklist just did. */
+function finalDiagnosisFor(scenario: MockScenario): ServerDiagnosis {
+  const base = readyDiagnosis();
+  if (scenario === "claude") {
+    return { ...base, claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_sign_in" } };
+  }
+  if (scenario === "restart") {
+    return { ...base, restart_pending: true, daemon_version_disk: "0.4.3", daemon_version_running: "0.4.2" };
+  }
+  return base;
+}
 
 let mockCounter = 0;
 /** Distinguishes the wire uuids the mock hands back for successive sends. */
@@ -1643,12 +1897,59 @@ export const mockCommands = {
     // Adding a repo needs the native folder picker (absent in the browser), so the
     // mock boots empty by default. With any `?demo` flag, seed one repo + conversation
     // so the dev/Playwright build has something to drive (e.g. `?demo=background`).
-    const demo =
-      typeof location !== "undefined" && new URLSearchParams(location.search).has("demo");
-    if (!demo)
-      return ok({ machines: [], claude_accounts: [], repos: [], conversations: [], active_id: null });
+    // `machines` always mirrors the mutable in-memory list — a server the wizard (or
+    // the legacy ticket flow) just paired must still be here on the NEXT call
+    // (`bootConversations()` re-reads this after a successful bootstrap), same as a
+    // real reload showing the DB's truth rather than a stale snapshot.
+    const demoParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("demo") : null;
+    // `?demo=servers` — B12 visual check fixture: one paired server per headline
+    // state (Ready / Needs Claude sign-in / Running-not-reboot-safe / Failed), seeded
+    // once (idempotent — a second load must not duplicate them).
+    if (demoParam === "servers" && mockMachines.length === 0) {
+      const seed: Array<[string, string, ServerDiagnosis]> = [
+        ["ready-vps", "ready.example.com", readyDiagnosis()],
+        [
+          "needs-signin-vps",
+          "needs-signin.example.com",
+          { ...readyDiagnosis(), claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_sign_in" } },
+        ],
+        [
+          "reboot-unsafe-vps",
+          "reboot-unsafe.example.com",
+          { ...readyDiagnosis(), reboot_safe: false, linger: false, sleep_masked: false, state: { kind: "running_not_reboot_safe" } },
+        ],
+        [
+          "unreachable-vps",
+          "unreachable.example.com",
+          {
+            state: { kind: "failed", reason: "could not reach the server" },
+            installed_as: "unknown",
+            daemon_running: null,
+            daemon_version_disk: null,
+            daemon_version_running: null,
+            restart_pending: false,
+            reboot_safe: null,
+            linger: null,
+            sleep_masked: null,
+            claude_installed: null,
+            claude_logged_in: null,
+            claude_email: null,
+            tailscale_name: null,
+            last_boot: null,
+            busy_conversations: null,
+          },
+        ],
+      ];
+      for (const [label, host, diagnosis] of seed) {
+        const m = findOrCreateMockMachine(label, host, 22, "deploy");
+        mockDiagnoses.set(m.id, diagnosis);
+      }
+    }
+    if (demoParam === null)
+      return ok({ machines: [...mockMachines], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
     return ok({
+      machines: [...mockMachines],
       repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
       conversations: [
         {
@@ -1748,10 +2049,241 @@ export const mockCommands = {
     _detail: unknown,
   ): Promise<void> {},
 
-  // C9: the demo/browser preview has no real remote (SSH) machines, so there is
-  // never anything to push — mirrors the real command's own "nothing to do" `false`.
+  // The mock DOES pair machines now (below) — this command specifically still has
+  // nothing to do for them, though: it pushes a title update to a LIVE relay
+  // connection on the daemon side, which the browser mock never opens.
   async pushRemoteConversationTitle(_conversationId: string, _title: string): Promise<boolean> {
     return false;
+  },
+
+  // ---- Remote servers (SSH) — pairing + B12 bootstrap wizard ----
+
+  async generateMachineKey(label: string): Promise<Result<GeneratedKey, string>> {
+    return ok({ identity_file: `/mock/ssh_keys/${label}-${Date.now()}`, public_key: "ssh-ed25519 AAAAMOCKKEY mock-key" });
+  },
+
+  async addMachine(
+    label: string,
+    host: string,
+    port: number,
+    user: string,
+    identityFile: string | null,
+    addresses: AddressCandidate[] | null,
+  ): Promise<Result<MachineRecord, string>> {
+    if (!host.trim() || !user.trim()) return err("host and user are required");
+    const machine = findOrCreateMockMachine(label || host, host, port, user);
+    machine.label = label || host;
+    machine.identity_file = identityFile ?? machine.identity_file;
+    if (addresses && addresses.length > 0) machine.addresses = addresses;
+    mockDiagnoses.set(machine.id, readyDiagnosis());
+    return ok(machine);
+  },
+
+  async deleteMachine(id: string): Promise<Result<null, string>> {
+    const i = mockMachines.findIndex((m) => m.id === id);
+    if (i >= 0) mockMachines.splice(i, 1);
+    mockDiagnoses.delete(id);
+    mockProvisionStatuses.delete(id);
+    mockRevokeStatuses.delete(id);
+    return ok(null);
+  },
+
+  async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
+    return ok(["/home/mockuser/app", "/home/mockuser/another-repo"]);
+  },
+
+  async listRemoteDir(_machineId: string, path: string): Promise<Result<{ path: string; dirs: string[] }, string>> {
+    const home = "/home/mockuser";
+    const p = path.trim() || home;
+    // A small, fixed two-level tree so the browser picker has something to descend
+    // into and climb back out of — no real ssh in the mock.
+    const tree: Record<string, string[]> = {
+      [home]: ["app", "another-repo", "scratch"],
+      [`${home}/app`]: ["src", "docs"],
+      [`${home}/another-repo`]: ["lib"],
+    };
+    return ok({ path: p, dirs: tree[p] ?? [] });
+  },
+
+  async prepareRemoteDir(_machineId: string, _path: string): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
+  async phoneProvisioningStatus(): Promise<MachineProvisionStatus[]> {
+    return [...mockProvisionStatuses.values()];
+  },
+
+  async phoneRevocationStatus(): Promise<MachineRevokeStatus[]> {
+    return [...mockRevokeStatuses.values()];
+  },
+
+  async retryPhoneProvisioning(machineId: string): Promise<Result<MachineProvisionStatus, string>> {
+    const status: MachineProvisionStatus = { machine_id: machineId, state: { kind: "provisioned", at_ms: Date.now() }, checked_at_ms: Date.now() };
+    mockProvisionStatuses.set(machineId, status);
+    return ok(status);
+  },
+
+  /** Runs the scripted pipeline chosen by `scenarioFor(host)` — see its own doc. */
+  async bootstrapServer(
+    label: string,
+    host: string,
+    port: number,
+    user: string,
+    _password: string | null,
+    _maskSleep: boolean,
+    _sudoPassword: string | null,
+  ): Promise<Result<BootstrapReport, string>> {
+    const sessionId = `mock-session-${Date.now()}`;
+    const states: StepState[] = STEP_SEQUENCE.map((id) => ({ id, status: "pending", detail: null }));
+    const { states: finalStates, needsInput } = await runMockPipeline(sessionId, host, states, 0, false);
+    if (needsInput) {
+      mockPausedSessions.set(sessionId, { label, host, port, user, states: finalStates, pausedAtIndex: STEP_SEQUENCE.indexOf(needsInput) });
+      return ok({ session_id: sessionId, host, steps: finalStates, needs_input: needsInput, machine_id: null, diagnosis: null });
+    }
+    const scenario = scenarioFor(host);
+    const failed = finalStates.some((s) => s.status === "failed");
+    if (failed) {
+      return ok({ session_id: sessionId, host, steps: finalStates, needs_input: null, machine_id: null, diagnosis: null });
+    }
+    const machine = findOrCreateMockMachine(label || host, host, port, user);
+    const diagnosis = finalDiagnosisFor(scenario);
+    mockDiagnoses.set(machine.id, diagnosis);
+    return ok({ session_id: sessionId, host, steps: finalStates, needs_input: null, machine_id: machine.id, diagnosis });
+  },
+
+  async bootstrapResume(sessionId: string, sudoPassword: string | null): Promise<Result<BootstrapReport, string>> {
+    const paused = mockPausedSessions.get(sessionId);
+    if (!paused) return err("no bootstrap run is paused under this session id");
+    if (!sudoPassword) return err("this server needs a sudo password to continue");
+    mockPausedSessions.delete(sessionId);
+    const { states: finalStates, needsInput } = await runMockPipeline(
+      sessionId,
+      paused.host,
+      paused.states,
+      paused.pausedAtIndex,
+      true,
+    );
+    if (needsInput) {
+      mockPausedSessions.set(sessionId, { ...paused, states: finalStates, pausedAtIndex: STEP_SEQUENCE.indexOf(needsInput) });
+      return ok({ session_id: sessionId, host: paused.host, steps: finalStates, needs_input: needsInput, machine_id: null, diagnosis: null });
+    }
+    const scenario = scenarioFor(paused.host);
+    const machine = findOrCreateMockMachine(paused.label || paused.host, paused.host, paused.port, paused.user);
+    const diagnosis = finalDiagnosisFor(scenario);
+    mockDiagnoses.set(machine.id, diagnosis);
+    return ok({ session_id: sessionId, host: paused.host, steps: finalStates, needs_input: null, machine_id: machine.id, diagnosis });
+  },
+
+  async bootstrapCancel(sessionId: string): Promise<Result<null, string>> {
+    mockPausedSessions.delete(sessionId);
+    return ok(null);
+  },
+
+  async machineDiagnose(machineId: string): Promise<Result<ServerDiagnosis, string>> {
+    const d = mockDiagnoses.get(machineId);
+    if (!d) return err("unknown server");
+    return ok({ ...d });
+  },
+
+  async machineRepair(machineId: string, action: RepairAction, _sudoPassword: string | null): Promise<Result<RepairOutcome, string>> {
+    const machine = mockMachines.find((m) => m.id === machineId);
+    if (!machine) return err("unknown server");
+    const d = { ...(mockDiagnoses.get(machineId) ?? readyDiagnosis()) };
+    let summary = "";
+    let label = "";
+    switch (action) {
+      case "reupload_daemon":
+        d.installed_as = d.installed_as === "none" ? "detached" : d.installed_as;
+        d.daemon_running = true;
+        d.daemon_version_disk = "0.4.2";
+        label = "Re-upload the flightdeckd binary";
+        summary = "Uploaded";
+        break;
+      case "restart_daemon":
+        d.daemon_running = true;
+        d.restart_pending = false;
+        d.daemon_version_running = d.daemon_version_disk;
+        label = "Restart the flightdeckd daemon";
+        summary = "restarted";
+        break;
+      case "install_service":
+        d.reboot_safe = true;
+        label = "Install the persistence service";
+        summary = "Installed";
+        break;
+      case "enable_linger":
+        d.linger = true;
+        d.reboot_safe = true;
+        label = "Enable linger for this user";
+        summary = "linger enabled";
+        break;
+      case "mask_sleep":
+        d.sleep_masked = true;
+        label = "Mask sleep/suspend targets";
+        summary = "sleep targets masked";
+        break;
+      case "run_init":
+        label = "Run flightdeckd init";
+        summary = "Initialized";
+        break;
+      case "sign_in_claude":
+        label = "Start the Claude sign-in flow";
+        summary = "sign-in session mock-login started";
+        break;
+      case "provision_phone":
+        label = "Provision this Mac's phone token";
+        summary = "Provisioned";
+        mockProvisionStatuses.set(machineId, { machine_id: machineId, state: { kind: "provisioned", at_ms: Date.now() }, checked_at_ms: Date.now() });
+        break;
+    }
+    d.state = collapseMockState(d);
+    mockDiagnoses.set(machineId, d);
+    await wait(200);
+    return ok({ action, label, summary, diagnosis: { ...d } });
+  },
+
+  async bootstrapForgetHostKey(host: string, _port: number): Promise<Result<null, string>> {
+    mockForgottenHostKeys.add(host);
+    return ok(null);
+  },
+
+  async startClaudeLogin(machineId: string): Promise<Result<LoginSession, string>> {
+    const sessionId = `mock-login-${++mockLoginCounter}`;
+    mockLoginSessions.set(sessionId, machineId);
+    setTimeout(() => {
+      serverLoginPromptEvent.emit({ machine_id: machineId, url: "https://claude.ai/oauth/authorize?mock=1" });
+    }, 260);
+    return ok({ session_id: sessionId, machine_id: machineId });
+  },
+
+  async submitClaudeLoginCode(session: LoginSession, code: string): Promise<Result<null, string>> {
+    if (!mockLoginSessions.has(session.session_id)) return err("that sign-in session is no longer active");
+    setTimeout(() => {
+      mockLoginSessions.delete(session.session_id);
+      const accepted = code.trim().length >= 4;
+      serverLoginResultEvent.emit({
+        machine_id: session.machine_id,
+        ok: accepted,
+        email: accepted ? "demo@example.com" : null,
+        error: accepted ? null : "that code wasn't accepted",
+      });
+      if (accepted) {
+        const d = mockDiagnoses.get(session.machine_id);
+        if (d) {
+          d.claude_installed = true;
+          d.claude_logged_in = true;
+          d.claude_email = "demo@example.com";
+          d.state = collapseMockState(d);
+          mockDiagnoses.set(session.machine_id, d);
+        }
+      }
+    }, 300);
+    return ok(null);
+  },
+
+  async cancelClaudeLogin(session: LoginSession): Promise<Result<null, string>> {
+    mockLoginSessions.delete(session.session_id);
+    return ok(null);
   },
 
   async voiceBridgeStatus(): Promise<VoiceBridgeStatus> {
