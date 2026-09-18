@@ -1,6 +1,12 @@
 pub mod accounts;
 pub mod agentspend;
 pub mod appmcp;
+// Unix-only: `mkfifo`/process-group signalling/SSH have no Windows equivalent, and
+// nothing outside this module (no IPC command yet) needs it to exist cross-platform —
+// unlike e.g. `power/mod.rs`, which stubs itself per-OS because the front calls its
+// commands regardless of platform.
+#[cfg(unix)]
+pub mod bootstrap;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
