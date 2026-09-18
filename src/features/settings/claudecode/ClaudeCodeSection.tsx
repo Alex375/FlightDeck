@@ -15,7 +15,7 @@ import { effortLevelsForModel } from "../../conversation/EffortGauge";
 import { EFFORT_LABELS } from "../../../agent/subagentMeta";
 import { Ico } from "../../../ui/kit";
 import { ConfirmDialog } from "../../../ui/ConfirmDialog";
-import { PageHead, SettingsGroup } from "../SettingsKit";
+import { SettingsGroup } from "../SettingsKit";
 import { StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
 import { copyFor, INSTRUCTION_BLOCKS } from "./agentCopy";
 import { countChanges, diffLines, withElisions } from "./lineDiff";
@@ -43,22 +43,29 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   return r.data;
 }
 
-export function ClaudeCodeSection() {
+/** The "Helpers" sub-page of the Claude Code tab: which model each helper runs on, and
+ *  what those helpers have cost. Routing and spend stay on ONE page on purpose — the
+ *  spend table is the bill for the routing above it, and splitting them would make you
+ *  switch pages to answer "is this routing worth it?".
+ *
+ *  Exported as a group (not a page) so `SettingsPanel` stays the single place that
+ *  describes the panel's shape — same pattern as `ControlSection`'s groups. */
+export function ClaudeCodeHelpers() {
   const convId = useActiveConversationId();
   const repo = useConversationRepo(convId);
   const repoPath = repo?.path ?? null;
-
   return (
-    <div>
-      <PageHead
-        title="Claude Code"
-        subtitle="Which model each helper runs on, what they cost, and the instructions Claude works from."
-      />
+    <>
       <RoutingGroup repoPath={repoPath} />
       <SpendGroup repoPath={repoPath} />
-      <InstructionsGroup />
-    </div>
+    </>
   );
+}
+
+/** The "Instructions" sub-page of the Claude Code tab: the CLAUDE.md files every
+ *  conversation starts from. First sub-tab of that tab — the widest-scope setting there. */
+export function ClaudeCodeInstructions() {
+  return <InstructionsGroup />;
 }
 
 // ---- A. Routing ------------------------------------------------------------

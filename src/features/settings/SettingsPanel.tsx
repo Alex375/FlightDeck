@@ -1,8 +1,11 @@
-// Settings modal — a left-rail tabbed panel (built to scale as more settings
-// land). Sections: General (about), Notifications, Updates, Data (the
-// destructive "drop all", kept while the SQL model is still in flux). The active
-// section is shared state so deep-links (e.g. the update banner) can open it
-// straight onto a given tab.
+// Settings modal — a left-rail tabbed panel. The active section is shared state so
+// deep-links (e.g. the update banner, the auth warning bar) can open it straight onto a
+// given tab and sub-tab.
+//
+// The rail is deliberately SHORT: a tab is a top-level CONCERN, not a single page.
+// Everything the app shows lives under "Display"; everything Claude-specific under
+// "Claude Code"; who you are signed in as and what the app may do to this machine under
+// "General". Sub-tabs carry the rest — growing the rail is the wrong axis.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
@@ -18,7 +21,7 @@ import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
-import { ClaudeCodeSection } from "./claudecode/ClaudeCodeSection";
+import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
 import { useClaudeAccount } from "../../ipc/useAccounts";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
@@ -46,27 +49,27 @@ const TABS: Array<{
   /** Hidden until a Claude account is connected. */
   needsClaude?: boolean;
 }> = [
+  // You and this machine: the accounts the agents sign in with, and the anti-sleep hold.
   { id: "general", label: "General", icon: "cog" },
-  { id: "accounts", label: "Accounts", icon: "key" },
-  // TOSSE sits next to Accounts (both are "connect to a service") but stays its own tab:
-  // Accounts signs the AGENTS in to their model providers, this signs YOU in to the CRM.
+  // TOSSE sits next to the accounts (both are "connect to a service") but stays its own
+  // tab: General → Accounts signs the AGENTS in to their model providers, this signs YOU
+  // in to the CRM.
   { id: "tosse", label: "TOSSE", icon: "list", mark: <TosseCrmMark className="sm" /> },
-  // Everything that shapes a conversation — Markdown rendering, the model picker, and the
-  // composer bar — behind this tab's sub-tabs (was three separate top-level tabs).
-  { id: "conversation", label: "Conversation", icon: "chat" },
-  // How CLAUDE itself behaves (not how we render it): its output style, what it is allowed
-  // to do without asking. Next to Conversation — both shape what a conversation is.
-  { id: "behavior", label: "Behavior", icon: "bot" },
+  // Everything the app SHOWS, behind this tab's sub-tabs: the app's look and motion, the
+  // thread (Markdown included), timings, the composer bar, the model picker, and the
+  // manual order of conversations and cards. Was a General sub-tab plus two top-level
+  // tabs of its own (Conversation, Reordering).
+  { id: "display", label: "Display", icon: "sidebar" },
   // Backend-specific by design, and only present while that backend is CONNECTED: the
-  // page is Claude model names and Claude file layout end to end, so an abstraction over
-  // both backends would have to speak in euphemisms. A Codex twin would be its own tab.
-  { id: "claudeCode", label: "Claude Code", icon: "bot", needsClaude: true },
-  { id: "reordering", label: "Reordering", icon: "reorder" },
+  // page is Claude model names, Claude file layout and Claude-only CLI flags end to end,
+  // so an abstraction over both backends would have to speak in euphemisms. A Codex twin
+  // would be its own tab. Holds what used to be the top-level "Behavior" tab (output
+  // style, bypass permissions) — both are Claude-only and do nothing for Codex.
+  { id: "claudeCode", label: "Claude Code", icon: "code", needsClaude: true },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
   { id: "control", label: "Control", icon: "wand" },
-  // OS channels + the fleet readout + background-task alerts, behind this tab's sub-tabs
-  // (the last two moved out of the old General → Alerts).
+  // OS channels + the fleet readout + background-task alerts, behind this tab's sub-tabs.
   { id: "notifications", label: "Notifications", icon: "bell" },
   { id: "updates", label: "Updates", icon: "refresh" },
   { id: "data", label: "Data", icon: "trash" },
@@ -76,15 +79,29 @@ const TABS: Array<{
  *  ids are mirrored by `settingsSearch.SETTINGS_SUBS` (a unit test keeps the search index
  *  from pointing at a sub-tab that doesn't exist). */
 const GENERAL_SUBS = [
-  { id: "display", label: "Display", icon: "list" },
-  { id: "timing", label: "Durations", icon: "clock" },
+  { id: "accounts", label: "Accounts", icon: "users" },
   { id: "system", label: "System", icon: "cog" },
 ] as const;
 
-const CONVERSATION_SUBS = [
-  { id: "markdown", label: "Markdown", icon: "chat" },
-  { id: "models", label: "Models", icon: "spark" },
+/** One tab for everything the app shows, split by the SURFACE each pref acts on rather
+ *  than by the store it lives in — so "where do I turn that off?" has one answer per
+ *  surface: the app itself (Appearance), the conversation (Thread / Durations), the
+ *  composer bar, the model picker, and the order things are listed in. */
+const DISPLAY_SUBS = [
+  { id: "appearance", label: "Appearance", icon: "eye" },
+  { id: "thread", label: "Thread", icon: "chat" },
+  { id: "timing", label: "Durations", icon: "clock" },
   { id: "composer", label: "Composer", icon: "wand" },
+  { id: "models", label: "Models", icon: "spark" },
+  { id: "order", label: "Order", icon: "reorder" },
+] as const;
+
+/** Claude Code, widest scope first: the instructions every conversation starts from, then
+ *  how Claude itself behaves, then the helpers it delegates to and what they cost. */
+const CLAUDE_CODE_SUBS = [
+  { id: "instructions", label: "Instructions", icon: "file" },
+  { id: "behavior", label: "Behavior", icon: "shield" },
+  { id: "helpers", label: "Helpers", icon: "bot" },
 ] as const;
 
 const CONTROL_SUBS = [
@@ -101,7 +118,8 @@ const NOTIFICATIONS_SUBS = [
 ] as const;
 
 type GeneralSub = (typeof GENERAL_SUBS)[number]["id"];
-type ConversationSub = (typeof CONVERSATION_SUBS)[number]["id"];
+type DisplaySub = (typeof DISPLAY_SUBS)[number]["id"];
+type ClaudeCodeSub = (typeof CLAUDE_CODE_SUBS)[number]["id"];
 type ControlSub = (typeof CONTROL_SUBS)[number]["id"];
 type NotificationsSub = (typeof NOTIFICATIONS_SUBS)[number]["id"];
 
@@ -196,8 +214,9 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const subs = useSettingsUi((s) => s.subs);
   const setSub = useSettingsUi((s) => s.setSub);
   const revealSetting = useSettingsUi((s) => s.revealSetting);
-  const generalSub = (subs.general ?? "display") as GeneralSub;
-  const conversationSub = (subs.conversation ?? "markdown") as ConversationSub;
+  const generalSub = (subs.general ?? "accounts") as GeneralSub;
+  const displaySub = (subs.display ?? "appearance") as DisplaySub;
+  const claudeCodeSub = (subs.claudeCode ?? "instructions") as ClaudeCodeSub;
   const controlSub = (subs.control ?? "agents") as ControlSub;
   const notificationsSub = (subs.notifications ?? "channels") as NotificationsSub;
   const [query, setQuery] = useState("");
@@ -321,7 +340,10 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
             {!searching && section === "general" && (
               <div>
-                <PageHead title="General" subtitle="Appearance, fleet, and app alerts." />
+                <PageHead
+                  title="General"
+                  subtitle="Who your agents sign in as, and what the app may do to this machine."
+                />
 
                 <div className={styles.about}>
                   <span className={styles.aboutMark}>
@@ -342,60 +364,75 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   onSelect={(id) => setSub("general", id)}
                   ariaLabel="General settings"
                 />
-                {generalSub === "display" && <DisplayPrefs />}
-                {generalSub === "timing" && <TimingPrefs />}
-                {/* "Bypass permissions" now lives in the Behavior tab — it is about what
-                    Claude may do, not about this machine. System keeps the machine card. */}
+                {/* Accounts was a top-level tab; it is the first thing this one is about. */}
+                {generalSub === "accounts" && <AccountsSection embedded />}
+                {/* "Bypass permissions" is NOT here — it is a Claude-only CLI flag and
+                    lives in Claude Code → Behavior. System is the machine card. */}
                 {generalSub === "system" && <CaffeinatePrefs />}
               </div>
             )}
 
-            {!searching && section === "accounts" && <AccountsSection />}
-
             {!searching && section === "tosse" && <TosseSection />}
 
-            {!searching && section === "conversation" && (
-              <div className={styles.page}>
+            {!searching && section === "display" && (
+              <div>
                 <PageHead
-                  title="Conversation"
-                  subtitle="How the thread renders, which models the picker offers, and the composer bar."
+                  title="Display"
+                  subtitle="What the app shows and how it reads — its look and motion, the conversation, the composer bar, the model picker, and the order things are listed in."
                 />
-                {/* One sub-page at a time. Markdown rendering, the model picker and the
-                    composer bar were three separate top-level tabs — bundled here because
-                    each shapes what a conversation is; the drag surfaces (model lists,
-                    composer bar) keep their own sub-page. */}
+                {/* One sub-page at a time. Appearance and Motion share a page (both are
+                    "how the app itself looks"); Markdown sits with the rest of the thread
+                    rather than on a page of its own. */}
                 <SubTabs
-                  tabs={CONVERSATION_SUBS}
-                  active={conversationSub}
-                  onSelect={(id) => setSub("conversation", id)}
-                  ariaLabel="Conversation settings"
+                  tabs={DISPLAY_SUBS}
+                  active={displaySub}
+                  onSelect={(id) => setSub("display", id)}
+                  ariaLabel="Display settings"
                 />
-                {conversationSub === "markdown" && <ConversationSection embedded />}
-                {conversationSub === "models" && <ModelsSection embedded />}
-                {conversationSub === "composer" && <ComposerSection embedded />}
+                {displaySub === "appearance" && (
+                  <>
+                    <AppearancePrefs />
+                    <MotionPrefs />
+                  </>
+                )}
+                {displaySub === "thread" && (
+                  <>
+                    <ThreadPrefs />
+                    <ConversationSection embedded />
+                  </>
+                )}
+                {displaySub === "timing" && <TimingPrefs />}
+                {displaySub === "composer" && <ComposerSection embedded />}
+                {displaySub === "models" && <ModelsSection embedded />}
+                {displaySub === "order" && <OrderingPrefs />}
               </div>
             )}
 
-            {!searching && section === "behavior" && (
+            {!searching && section === "claudeCode" && (
               <div>
                 <PageHead
-                  title="Behavior"
-                  subtitle="How Claude itself behaves — the writing style of its responses and what it may do without asking. These are global Claude settings; Codex has its own controls elsewhere."
+                  title="Claude Code"
+                  subtitle="The instructions Claude works from, how it behaves, and which model each of its helpers runs on."
                 />
-                <OutputStylePrefs />
-                <PermissionPrefs />
-              </div>
-            )}
-
-            {!searching && section === "claudeCode" && <ClaudeCodeSection />}
-
-            {!searching && section === "reordering" && (
-              <div>
-                <PageHead
-                  title="Reordering"
-                  subtitle="Freeze the automatic order and arrange conversations, cards and repositories by hand — drag them into place."
+                {/* Claude-only, all of it: the output style and the bypass-permissions
+                    unlock came from the old top-level "Behavior" tab — one writes
+                    `~/.claude/settings.json`, the other arms a `claude` CLI flag. Neither
+                    does anything for a Codex conversation, which is why they follow this
+                    tab's visibility. */}
+                <SubTabs
+                  tabs={CLAUDE_CODE_SUBS}
+                  active={claudeCodeSub}
+                  onSelect={(id) => setSub("claudeCode", id)}
+                  ariaLabel="Claude Code settings"
                 />
-                <OrderingPrefs />
+                {claudeCodeSub === "instructions" && <ClaudeCodeInstructions />}
+                {claudeCodeSub === "behavior" && (
+                  <>
+                    <OutputStylePrefs />
+                    <PermissionPrefs />
+                  </>
+                )}
+                {claudeCodeSub === "helpers" && <ClaudeCodeHelpers />}
               </div>
             )}
 
@@ -521,26 +558,13 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
   },
 ];
 
-/** The "Display" sub-tab of the General tab, split into three cards so a wall of a dozen
- *  unrelated switches reads as three intents: Appearance (the app's global look and what
- *  the Flight Deck card shows), Thread (how the conversation itself reads), and Motion (the
- *  optional animations, each of which the system's "reduce motion" always overrides). Every
- *  toggle here is a GLOBAL default — e.g. "clean output" folds each round's work behind a
- *  "Work" block, and a conversation's composer chip can still override its own. */
-function DisplayPrefs() {
+/** The "Appearance" card of Display → Appearance: the app's global look and what the
+ *  Flight Deck card shows. Shares its sub-page with {@link MotionPrefs} — both answer
+ *  "how does the app itself look", as opposed to the thread ({@link ThreadPrefs}). */
+function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
-  const cleanOutput = useDisplay((s) => s.cleanOutput);
-  const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
-  const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
-  const messageMinimap = useDisplay((s) => s.messageMinimap);
-  const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
-  const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
-  const panelAnimations = useDisplay((s) => s.panelAnimations);
-  const conversationAnimations = useDisplay((s) => s.conversationAnimations);
-  const messageControls = useDisplay((s) => s.messageControls);
-  const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -592,6 +616,25 @@ function DisplayPrefs() {
         />
       </SettingsGroup>
 
+    </>
+  );
+}
+
+/** The "Thread" card of Display → Thread: how the conversation itself reads. Every toggle
+ *  here is a GLOBAL default — e.g. "clean output" folds each round's work behind a "Work"
+ *  block, and a conversation's composer chip can still override its own. Rendered above
+ *  the Markdown card (`ConversationSection`), which is the same subject. */
+function ThreadPrefs() {
+  const cleanOutput = useDisplay((s) => s.cleanOutput);
+  const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
+  const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const messageMinimap = useDisplay((s) => s.messageMinimap);
+  const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
+  const messageControls = useDisplay((s) => s.messageControls);
+  const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
+  const set = useDisplay((s) => s.set);
+  return (
+    <>
       <SettingsGroup title="Thread" icon="chat">
         <ToggleRow
           title="Clean output (default)"
@@ -698,6 +741,19 @@ function DisplayPrefs() {
         />
       </SettingsGroup>
 
+    </>
+  );
+}
+
+/** The "Motion" card of Display → Appearance: the optional animations, each of which the
+ *  system's "reduce motion" always overrides. */
+function MotionPrefs() {
+  const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
+  const panelAnimations = useDisplay((s) => s.panelAnimations);
+  const conversationAnimations = useDisplay((s) => s.conversationAnimations);
+  const set = useDisplay((s) => s.set);
+  return (
+    <>
       <SettingsGroup title="Motion" icon="play">
         <ToggleRow
           title="Zoom when opening a card"
@@ -800,7 +856,7 @@ function ZoomStepper({ zoom, onChange }: { zoom: number; onChange: (next: number
   );
 }
 
-/** Ordering prefs (the "Reordering" tab), split so each surface is its own clear section:
+/** Ordering prefs (Display → Order), split so each surface is its own clear section:
  *  the conversation sidebar, the Flight Deck, then whether they share one order. Each toggle
  *  turns the AUTOMATIC reorder on/off for one surface + level. Off = a frozen drag-and-drop
  *  order that never reshuffles on its own (drag a conversation/card anywhere; repos/swimlanes
@@ -1013,7 +1069,7 @@ function BackgroundTaskPrefs() {
   );
 }
 
-/** Permission prefs in the General tab: unlock "Bypass permissions" as a mode a
+/** Permission prefs (Claude Code → Behavior): unlock "Bypass permissions" as a mode a
  *  conversation may be switched to. The unlock is a SPAWN flag
  *  (`--allow-dangerously-skip-permissions`), so it only reaches sessions started after
  *  it — the composer's menu says so when a running session can't honour it.
@@ -1052,7 +1108,7 @@ const CAFFEINATE_MODES: Array<{ id: CaffeinateMode; label: string; desc: string 
   {
     id: "light",
     label: "Light — follow the agents",
-    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. As soon as the whole fleet is idle, the Mac is free to sleep. The everyday mode: it never keeps the Mac awake needlessly.",
+    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the Mac is free to sleep — the minute lets an agent pick its work back up after a background task finishes. The everyday mode: it never keeps the Mac awake needlessly.",
   },
   {
     id: "hard",
@@ -1061,7 +1117,7 @@ const CAFFEINATE_MODES: Array<{ id: CaffeinateMode; label: string; desc: string 
   },
 ];
 
-/** Caffeinate prefs in the General tab: arm/disarm "keep the Mac awake" (same store as the
+/** Caffeinate prefs (General → System): arm/disarm "keep the Mac awake" (same store as the
  *  title-bar coffee button) and pick the mode. The mode selector spells out what Light vs
  *  Hard actually do, since the labels alone aren't self-explanatory. */
 function CaffeinatePrefs() {

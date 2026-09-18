@@ -44,7 +44,9 @@ const DEFAULT_ACCOUNT_KEY = DEFAULT_ACCOUNT_ID;
 /** Usage at or above this reads as "nearly full" — the same line the context ring draws. */
 const WARN_PERCENT = 80;
 
-export function AccountsSection() {
+// `embedded` = rendered inside the General tab's "Accounts" sub-tab, which already
+// carries the page heading — so the section drops its own.
+export function AccountsSection({ embedded = false }: { embedded?: boolean }) {
   // Tri-state (null while the one-shot probe is in flight): show the "CLI not found" tile
   // ONLY on a DEFINITIVE `false`. While still checking, render the normal tiles — they have
   // their own "Checking…" state — so a user with the CLI never sees a false alarm flash.
@@ -52,7 +54,9 @@ export function AccountsSection() {
   const codex = useBackendAvailabilityState("codex");
   return (
     <div>
-      <PageHead title="Accounts" subtitle="The accounts your agents sign in with." />
+      {!embedded && (
+        <PageHead title="Accounts" subtitle="The accounts your agents sign in with." />
+      )}
       <div className={a.page}>
         {claude === false ? <UnavailableTile backend="claude" /> : <ClaudeAccounts />}
         {codex === false ? <UnavailableTile backend="codex" /> : <CodexAccount />}

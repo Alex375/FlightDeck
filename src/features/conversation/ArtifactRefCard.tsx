@@ -1,5 +1,5 @@
 // A compact, pretty clickable card for an artifact LINK that Claude writes in its prose
-// (`[label](https://claude.ai/code/artifact/<uuid>)`) — rendered in place of a plain anchor by
+// (`[label](https://claude.ai/artifact/<id>)`, or the pre-2.1.272 `…/code/artifact/<uuid>`) — rendered in place of a plain anchor by
 // StreamMarkdown's link renderer. When the artifact belongs to this conversation it is enriched
 // from the registry (favicon + title) and opens in the in-app viewer; otherwise it opens the
 // hosted page in the browser. Inline-block so it flows inside a paragraph.

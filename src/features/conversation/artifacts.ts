@@ -1,5 +1,5 @@
 // Front-derived registry of the artifacts Claude published in a conversation via the
-// `Artifact` tool (a hosted HTML/MD page at claude.ai/code/artifact/<uuid>).
+// `Artifact` tool (a hosted HTML/MD page at claude.ai/artifact/<id>).
 //
 // Everything is DERIVED from the message stream already in `conversationStore` — the
 // `Artifact` tool_use inputs (file_path / description / favicon / label) joined to their
@@ -18,10 +18,27 @@ import { resultText } from "../../agent/subagentMeta";
 import { basename } from "./toolMeta";
 
 /** The canonical hosted-artifact URL shape. The publish tool_result is free text that
- *  ALWAYS begins "Published <abs_path> at https://claude.ai/code/artifact/<uuid>"; we anchor
- *  on this shape rather than parsing the surrounding human prose (which drifts across CLI
- *  versions — short vs long "To update:" forms). */
-export const ARTIFACT_URL_RE = /https:\/\/claude\.ai\/code\/artifact\/[A-Za-z0-9-]+/;
+ *  ALWAYS begins "Published <abs_path> at <url>"; we anchor on the URL shape rather than
+ *  parsing the surrounding human prose (which drifts across CLI versions — short vs long
+ *  "To update:" forms, the "(Version N)" suffix).
+ *
+ *  ⚠️ BOTH shapes, on purpose. Up to claude 2.1.270 the URL was
+ *  `https://claude.ai/code/artifact/<uuid>`; from 2.1.272 it is `https://claude.ai/artifact/<id>`
+ *  (a ~22-char base58 id). Transcripts written by older binaries keep the old URL forever, so
+ *  dropping it would regress every conversation already on disk. Missing the new one is what
+ *  turned every card "Unavailable" and every prose link into a bare anchor. The trailing `/`
+ *  keeps the gallery (`…/code/artifacts`) out. */
+export const ARTIFACT_URL_RE = /https:\/\/claude\.ai\/(?:code\/)?artifact\/[A-Za-z0-9-]+/;
+
+/** True when an `Artifact` tool_use is a real PUBLISH of a local page — the only call that is a
+ *  deliverable. The tool also does `action:"list"`/`"read"`/`"quickstart"` and bare `url`-updates
+ *  (no `file_path`), and `asset:true` UPLOADS (a `file_path` that is an image/font/PDF pushed into
+ *  an existing artifact's asset store — not a page of its own). SINGLE source of truth for the
+ *  inline card (`groupBlocks`) and the chip's list (`selectArtifacts`), so they never disagree. */
+export function isArtifactPublish(input: JsonValue): boolean {
+  if (!field(input, "file_path")) return false;
+  return (input as Record<string, JsonValue>).asset !== true;
+}
 
 /** Pull the published URL out of an `Artifact` tool_result. Null while the publish is still
  *  in flight (no result yet) or if the ack is ever reworded past the canonical URL shape —
@@ -52,7 +69,7 @@ export interface ArtifactVersion {
 
 /** An artifact grouped across its versions for one conversation. */
 export interface Artifact {
-  /** Hosted URL (claude.ai/code/artifact/<uuid>). Null only in the brief window between a
+  /** Hosted URL (see {@link ARTIFACT_URL_RE}). Null only in the brief window between a
    *  publish tool_use and its tool_result landing. */
   url: string | null;
   /** Emoji favicon — of the most recent version that set it (last-known-good, so a republish
@@ -98,9 +115,9 @@ function artifactTitle(latestLabel: string | null, latestFilePath: string): stri
  *    maps to the same URL, but the URL is only known once the tool_result lands — file_path is
  *    known at tool_use time, so it is the stable provisional key that never splits a republish
  *    into two items. Labels repeat across different files, so they are never a key.
- *  - Tool_uses with no file_path (an `action:"list"` or a bare cross-conversation url-update) are
- *    skipped — they don't describe a local publish. (The inline card path mirrors this guard in
- *    `groupBlocks`.)
+ *  - Anything but a real publish ({@link isArtifactPublish}: list/read/quickstart, a bare
+ *    cross-conversation url-update, an asset upload) is skipped — it doesn't describe a local page.
+ *    (The inline card path uses the same predicate in `groupBlocks`.)
  *  - An artifact whose EVERY publish terminally FAILED (all versions `is_error`, no URL) is dropped
  *    from this list: it is not an openable artifact, so it must not inflate the "Artifacts (N)" chip
  *    nor sit there mislabelled as "not published yet". The failure is still surfaced in the thread
@@ -116,9 +133,8 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
     const turn = entry.turns[t.id];
     if (!turn || turn.role !== "assistant" || turn.parentToolUseId !== null) continue;
     for (const b of turn.blocks) {
-      if (b.type !== "tool_use" || b.name !== "Artifact") continue;
-      const filePath = field(b.input, "file_path");
-      if (!filePath) continue;
+      if (b.type !== "tool_use" || b.name !== "Artifact" || !isArtifactPublish(b.input)) continue;
+      const filePath = field(b.input, "file_path")!;
       const label = field(b.input, "label") ?? null;
       const description = field(b.input, "description") ?? null;
       const favicon = field(b.input, "favicon") ?? null;

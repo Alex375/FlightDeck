@@ -6,22 +6,25 @@ import { create } from "zustand";
 
 /** The settings sections, mirrored by the panel's left-rail tabs. */
 export type SettingsSection =
+  /** You and this machine: the accounts your agents sign in with, and the anti-sleep hold. */
   | "general"
-  | "accounts"
   | "tosse"
-  // "conversation" now bundles the Markdown mode, the model picker and the composer bar
-  // behind its own sub-tabs (was three separate top-level tabs: conversation/models/composer).
-  | "conversation"
-  | "behavior"
-  /** Claude-specific settings: sub-agent routing, spend, and the instructions file.
-   *  Backend-specific ON PURPOSE — its whole content is Claude model names and Claude
-   *  file layout, so it is shown only while a Claude account is connected, and a Codex
-   *  twin would be its own tab rather than an abstraction over both. */
+  /** Everything about what the app SHOWS and how it reads: the app's look and motion, the
+   *  thread (including Markdown), timings, the composer bar, the model picker, and the
+   *  manual ordering of conversations/cards. Was a sub-tab of General plus three separate
+   *  top-level tabs (conversation, reordering). */
+  | "display"
+  /** Claude-specific settings: the instructions file, how Claude behaves (output style,
+   *  what it may do without asking), and sub-agent routing + spend.
+   *  Backend-specific ON PURPOSE — its whole content is Claude model names, Claude file
+   *  layout and Claude-only CLI flags, so it is shown only while a Claude account is
+   *  connected, and a Codex twin would be its own tab rather than an abstraction over both.
+   *  ⚠️ Consequence, accepted: with no Claude account signed in, "Output style" and
+   *  "Allow Bypass permissions mode" are not reachable — neither does anything to Codex. */
   | "claudeCode"
-  | "reordering"
   | "shortcuts"
   | "control"
-  // "notifications" now bundles the OS channels, the fleet readout and the background-task
+  // "notifications" bundles the OS channels, the fleet readout and the background-task
   // alert behind its own sub-tabs (the last two moved out of the old General → Alerts).
   | "notifications"
   | "updates"
@@ -47,8 +50,8 @@ interface SettingsUiState {
    * that no longer exists can never leave a highlight armed forever.
    */
   highlight: string | null;
-  /** Open the panel, optionally jumping straight to `section`. */
-  openSettings: (section?: SettingsSection) => void;
+  /** Open the panel, optionally jumping straight to `section` (and one of its sub-tabs). */
+  openSettings: (section?: SettingsSection, sub?: string) => void;
   closeSettings: () => void;
   /** Switch the active section while the panel is open. */
   setSection: (section: SettingsSection) => void;
@@ -71,8 +74,17 @@ export const useSettingsUi = create<SettingsUiState>((set, get) => ({
   section: "general",
   subs: {},
   highlight: null,
-  openSettings: (section) =>
-    set(section ? { open: true, section, highlight: null } : { open: true }),
+  openSettings: (section, sub) =>
+    set((s) =>
+      section
+        ? {
+            open: true,
+            section,
+            subs: sub ? { ...s.subs, [section]: sub } : s.subs,
+            highlight: null,
+          }
+        : { open: true },
+    ),
   closeSettings: () => set({ open: false, highlight: null }),
   setSection: (section) => set({ section, highlight: null }),
   setSub: (section, sub) =>

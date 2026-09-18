@@ -61,6 +61,17 @@ describe("artifactUrlFromResult", () => {
   it("handles the array content shape ({text})", () => {
     expect(artifactUrlFromResult([{ type: "text", text: SHORT("/tmp/x.html", URL_B) }] as unknown as JsonValue)).toBe(URL_B);
   });
+  it("parses the 2.1.272+ URL shape (claude.ai/artifact/<base58 id>, no /code/)", () => {
+    // Verbatim first lines of a real 2.1.272 ack: new host path + "(Version N)" suffix + a
+    // "Stored — contract …" paragraph. Missing this shape turned every card "Unavailable".
+    const url = "https://claude.ai/artifact/66XHYkMzjJ4BdfJ64qa3cy";
+    const ack = `Published /private/tmp/claude-501/x/scratchpad/catalogue/index.html at ${url} (Version 1)\n\nStored — contract 0.2.52 · capabilities db · sharing owner.`;
+    expect(artifactUrlFromResult(ack)).toBe(url);
+  });
+  it("does not mistake the artifacts GALLERY for an artifact", () => {
+    expect(artifactUrlFromResult("See https://claude.ai/code/artifacts")).toBeNull();
+    expect(artifactUrlFromResult("See https://claude.ai/artifacts")).toBeNull();
+  });
   it("returns null on empty / missing / non-canonical text (degrade, no dead link)", () => {
     expect(artifactUrlFromResult(undefined)).toBeNull();
     expect(artifactUrlFromResult("")).toBeNull();
@@ -130,6 +141,14 @@ describe("selectArtifacts", () => {
 
   it("skips tool_uses with no file_path (action:list / bare url-update)", () => {
     const e = entryOf([{ id: "t1", blocks: [tuse("u1", { limit: 25 })] }]);
+    expect(selectArtifacts(e)).toEqual([]);
+  });
+
+  it("skips asset uploads (asset:true carries a file_path but is not a page of its own)", () => {
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("a1", { url: URL_A, file_path: "/tmp/logo.png", asset: true })] }],
+      { a1: "Uploaded" },
+    );
     expect(selectArtifacts(e)).toEqual([]);
   });
 
