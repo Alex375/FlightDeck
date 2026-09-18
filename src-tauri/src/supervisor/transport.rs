@@ -142,6 +142,13 @@ pub struct RemoteTarget {
     /// remote PATH). Defaults to `"flightdeckd"`. The daemon resolves `claude`
     /// itself, server-side.
     pub daemon_bin: String,
+    /// Every candidate address for this server, `host` always FIRST (see
+    /// `ipc::commands::remote_target_addresses`), for a later task (A6) to rotate
+    /// through on a failed reconnect. CARRIED ONLY today — `host` is still the sole
+    /// address this transport ever dials (see [`build_remote_command`] /
+    /// [`Transport::spawn`]). Never empty, even for a paired-before-A5 machine with no
+    /// recorded candidates: that case falls back to the single known-good `host`.
+    pub addresses: Vec<String>,
 }
 
 impl SpawnConfig {
@@ -1169,6 +1176,7 @@ mod tests {
             identity_file: None,
             known_hosts_file: None,
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.starts_with("exec $(FLIGHTDECKD_NAME='flightdeckd'"), "cmd was: {cmd}");
@@ -1604,6 +1612,7 @@ mod tests {
             ),
             known_hosts_file: Some("/dev/null".into()),
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
         };
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-haiku-4-5-20251001".into());

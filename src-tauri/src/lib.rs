@@ -120,6 +120,7 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         user,
         identity_file,
         added_at: now,
+        addresses: Vec::new(),
     };
     if let Err(e) = store.upsert_machine(&machine) {
         eprintln!("[seed] failed to upsert remote demo machine: {e}");
@@ -704,6 +705,17 @@ pub fn run() {
             // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
             // on a normal run (env vars unset).
             seed_remote_demo_if_requested(&store);
+            // Sweep orphaned SSH pairing keys left under ssh_keys/ by an abandoned
+            // pairing attempt (pre-A3 leak: `server-<uuid>` / `{slug}-{uuid}` files
+            // never claimed nor cleaned up — 7+ existed on Armand's machine). Runs once
+            // per app launch, here rather than gated per-call, since this is the
+            // earliest point the store (and so the referenced-key set) is open.
+            // `load_state` failing degrades to "skip the sweep entirely" (fail-safe —
+            // see `sweep_orphan_ssh_keys`), never to blocking startup.
+            ipc::commands::sweep_orphan_ssh_keys(
+                &data_dir.join("ssh_keys"),
+                store.load_state().ok().as_ref().map(|s| s.machines.as_slice()),
+            );
             app.manage(store);
 
             // App-control hub: install its front outlet, then start the voice

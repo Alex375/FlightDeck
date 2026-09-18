@@ -8,7 +8,10 @@ use specta::Type;
 use tauri::Manager;
 
 use crate::ipc::events::TauriEmitter;
-use crate::store::{ConversationRecord, PersistedState, RepoRecord, Store};
+use crate::store::{
+    AddressCandidate, AddressKind, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
+    Store,
+};
 use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
@@ -300,6 +303,7 @@ pub async fn spawn_session(
             .app_data_dir()
             .ok()
             .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+        let addresses = remote_target_addresses(&machine.host, machine.addresses);
         cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
             host: machine.host,
             port: machine.port,
@@ -308,6 +312,7 @@ pub async fn spawn_session(
             known_hosts_file,
             daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
                 .unwrap_or_else(|_| "flightdeckd".to_string()),
+            addresses,
         });
         // Pre-mint the daemon-side conversation id so retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the
@@ -3361,6 +3366,146 @@ pub async fn generate_machine_key(
     generate_or_reuse_pending_key(&dir, &label).await
 }
 
+// ---- Orphaned pairing-key sweep (A7) --------------------------------------------
+// Every abandoned pairing attempt before A3 (and, in principle, still possible today
+// if a user closes the wizard mid-flight) left a keypair behind under `ssh_keys/`:
+// pre-A3 it was named `server-<uuid>` / `{slug}-{uuid}`, one per attempt — 7+
+// accumulated on Armand's machine alone. Swept automatically at app start (see
+// `lib.rs::run`'s `setup`, the earliest point the store — and so the referenced set —
+// is available) rather than gated behind a per-call flag: it naturally runs once per
+// app launch with no extra state to track.
+
+/// Grace window (ms) before an unreferenced key is considered safe to sweep — guards
+/// against a mid-flight pairing/rename race: a brand-new pending key, or one
+/// [`claim_pending_key`] just renamed to a machine id whose [`MachineRecord`] write
+/// hasn't landed on disk yet. A file younger than this is left alone even when
+/// nothing currently references it.
+const ORPHAN_SWEEP_GRACE_MS: i64 = 60 * 60 * 1000;
+
+/// One regular file the sweep's IO wrapper found directly under `ssh_keys/` — never a
+/// symlink or a subdirectory (those are filtered out before reaching the pure
+/// decision function below), with its last-modified time pre-read so
+/// [`orphan_keys_to_sweep`] stays pure and filesystem-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepCandidate {
+    path: PathBuf,
+    mtime_ms: i64,
+}
+
+/// Decide which of `entries` are orphaned pairing keys safe to delete. A file is kept
+/// (never swept) when its basename is the live `pending`/`pending.pub` keypair, or its
+/// path is in `referenced` (see [`referenced_key_paths`]); otherwise it is swept once
+/// it is older than [`ORPHAN_SWEEP_GRACE_MS`]. Pure — takes pre-enumerated entries and
+/// the referenced set so it is unit-tested without touching a real filesystem;
+/// [`sweep_orphan_ssh_keys`] is the (untestable) IO wrapper around it.
+fn orphan_keys_to_sweep(
+    entries: &[SweepCandidate],
+    referenced: &std::collections::HashSet<PathBuf>,
+    now_ms: i64,
+) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|e| {
+            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name == PENDING_KEY_BASENAME || name == format!("{PENDING_KEY_BASENAME}.pub") {
+                return false;
+            }
+            if referenced.contains(&e.path) {
+                return false;
+            }
+            now_ms.saturating_sub(e.mtime_ms) > ORPHAN_SWEEP_GRACE_MS
+        })
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+/// Every path currently referenced by a machine's `identity_file` — the private key
+/// itself, and its `.pub` twin — canonicalised where possible (falling back to the
+/// raw path when canonicalisation fails, e.g. a dangling reference; that only WIDENS
+/// what's protected, never narrows it, so a canonicalisation quirk can never cause a
+/// referenced key to be swept). The set [`orphan_keys_to_sweep`] must never touch.
+fn referenced_key_paths(machines: &[MachineRecord]) -> std::collections::HashSet<PathBuf> {
+    let mut referenced = std::collections::HashSet::new();
+    for m in machines {
+        let Some(identity) = &m.identity_file else { continue };
+        for candidate in [identity.clone(), format!("{identity}.pub")] {
+            let path = PathBuf::from(&candidate);
+            referenced.insert(path.canonicalize().unwrap_or(path));
+        }
+    }
+    referenced
+}
+
+/// [`orphan_keys_to_sweep`]'s IO wrapper: enumerate `ssh_keys_dir` — never following a
+/// symlink, never recursing into a subdirectory, never touching anything outside this
+/// one directory — decide, then remove each doomed file. `machines` is the current
+/// machine list; `None` means the store could not be read, and the WHOLE sweep is
+/// skipped (fail-safe: never delete a key this run can't prove is unreferenced,
+/// mirroring the `resolve_links`/`Option<&[…]>` "no verdict without a real look"
+/// discipline used for the TOSSE repo association). Every removal (path only) and
+/// every failure is logged; a failure to remove ONE file never stops the rest, and
+/// this never returns an error the caller must handle — a sweep that stumbles must
+/// never block pairing.
+pub(crate) fn sweep_orphan_ssh_keys(ssh_keys_dir: &Path, machines: Option<&[MachineRecord]>) {
+    let Some(machines) = machines else {
+        eprintln!("[ssh_keys] orphan sweep skipped: could not read the machine list");
+        return;
+    };
+    let referenced = referenced_key_paths(machines);
+    let now = now_ms();
+
+    let read_dir = match std::fs::read_dir(ssh_keys_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // No `ssh_keys/` yet (no server ever paired) is the ordinary case on a
+            // fresh install/first launch — not worth logging as a failure.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[ssh_keys] orphan sweep skipped: could not read {}: {e}",
+                    ssh_keys_dir.display()
+                );
+            }
+            return;
+        }
+    };
+
+    let mut candidates = Vec::new();
+    for entry in read_dir.flatten() {
+        // `DirEntry::file_type()` does not follow symlinks — a symlink entry reports
+        // `is_file() == false` here, so it (and any subdirectory) is skipped without
+        // ever being stat'd through.
+        let Ok(file_type) = entry.file_type() else { continue };
+        if !file_type.is_file() {
+            continue;
+        }
+        let mtime_ms = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            // An unreadable mtime is treated as "now" — fail-safe toward NOT
+            // sweeping this run, rather than risking a fresh key's grace window.
+            .unwrap_or(now);
+        // Canonicalise so this matches `referenced_key_paths`'s canonicalised set —
+        // without this, a `ssh_keys_dir` reached through a symlinked ancestor (e.g.
+        // macOS's `/var` -> `/private/var`) would never match a referenced
+        // `identity_file` that WAS canonicalised, and a live key would be swept out
+        // from under a paired machine. Falls back to the raw path when
+        // canonicalisation fails, matching `referenced_key_paths`'s own fallback.
+        let path = entry.path();
+        let path = path.canonicalize().unwrap_or(path);
+        candidates.push(SweepCandidate { path, mtime_ms });
+    }
+
+    for path in orphan_keys_to_sweep(&candidates, &referenced, now) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!("[ssh_keys] swept orphaned pairing key: {}", path.display()),
+            Err(e) => eprintln!("[ssh_keys] failed to sweep {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Minimum `flightdeckd` version pairing trusts — older ones hard-block pairing just
 /// like a missing binary (unknown protocol/wire compatibility). Bump when a wire
 /// change requires a specific daemon version.
@@ -3571,24 +3716,76 @@ fn describe_probe_blockers(probe: &RemoteProbeResult) -> String {
     format!("Connected over SSH, but pairing can't proceed: {}", blockers.join(" "))
 }
 
-/// One discovered candidate address for a paired server — as printed in the pairing
-/// ticket's `addresses` array (see the "1 · Run this once on your server" command in
-/// `RemoteServersGroup`, `ControlSection.tsx`). Not persisted anywhere yet: the confirm
-/// screen resolves it down to a single `host` before `add_machine` is called — the
-/// column for keeping the full discovered set lands in a later task.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "lowercase")]
-pub enum AddressKind {
-    Tailscale,
-    Lan,
-    Manual,
+/// The order candidate addresses are tried in: a Tailscale name survives NAT/IP churn
+/// the way a LAN or public IP doesn't, and a LAN address is more likely to still be
+/// reachable than a bare hostname a DNS lookup may not resolve from this Mac. `Manual`
+/// (typed by hand, or a `host` edit that doesn't match any discovered candidate) is
+/// tried last — it's the least informed guess of the four.
+fn address_kind_priority(kind: &AddressKind) -> u8 {
+    match kind {
+        AddressKind::Tailscale => 0,
+        AddressKind::Lan => 1,
+        AddressKind::Public => 2,
+        AddressKind::Manual => 3,
+    }
 }
 
-/// See [`AddressKind`].
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct AddressCandidate {
-    pub kind: AddressKind,
-    pub value: String,
+/// Order `candidates` by [`address_kind_priority`] (stable — candidates of equal
+/// priority keep their relative input order) and drop later duplicates BY VALUE
+/// (keeping the first, and therefore highest-priority, occurrence of a repeated
+/// address). Pure: used to decide the order [`add_machine`] probes addresses in AND
+/// the order `spawn_session` carries them on [`crate::supervisor::transport::
+/// RemoteTarget::addresses`] for a later reconnect task (A6) to rotate through.
+/// Idempotent — re-running it on its own output is a no-op, since the output is
+/// already sorted and duplicate-free.
+fn address_probe_order(candidates: Vec<AddressCandidate>) -> Vec<AddressCandidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<AddressCandidate> =
+        candidates.into_iter().filter(|c| seen.insert(c.value.clone())).collect();
+    deduped.sort_by_key(|c| address_kind_priority(&c.kind));
+    deduped
+}
+
+/// Reject an address value that would be unsafe or meaningless to hand to `ssh` as
+/// part of `user@<value>`: empty (nothing to connect to), containing whitespace or a
+/// control character (never a valid hostname/IP — most likely a paste mistake), or
+/// starting with `-` (would be parsed as an `ssh` OPTION rather than the destination —
+/// e.g. a crafted `-oProxyCommand=...` value achieving arbitrary command execution).
+/// Pure and side-effect-free; every address `add_machine` probes goes through this
+/// FIRST, before any `ssh` process is even spawned.
+fn validate_address_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("A server address cannot be empty.".to_string());
+    }
+    if value.starts_with('-') {
+        return Err(format!("Invalid address \"{value}\": cannot start with \"-\"."));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "Invalid address \"{value}\": cannot contain whitespace or control characters."
+        ));
+    }
+    Ok(())
+}
+
+/// Build the [`crate::supervisor::transport::RemoteTarget::addresses`] a spawn
+/// carries for a machine: `host` — the address that last actually worked, the one
+/// `RemoteTarget` still dials today — always FIRST, followed by every other recorded
+/// candidate in [`address_probe_order`] priority, deduplicated by value against
+/// `host`. Never empty, even for a machine paired before A5 recorded any candidates
+/// (`addresses == []`, e.g. a pre-migration row): that case falls back to the single
+/// known-good `host`. Pure, so the non-empty invariant is unit-tested without a spawn.
+fn remote_target_addresses(host: &str, addresses: Vec<AddressCandidate>) -> Vec<String> {
+    if addresses.is_empty() {
+        return vec![host.to_string()];
+    }
+    let mut values: Vec<String> = vec![host.to_string()];
+    for c in address_probe_order(addresses) {
+        if c.value != host {
+            values.push(c.value);
+        }
+    }
+    values
 }
 
 /// The specific message shown for an `identity_file` that turned out to belong to a
@@ -3682,15 +3879,33 @@ async fn claim_pending_key_locked(
     claim_pending_key(ssh_keys_dir, identity_file, machine_id)
 }
 
-/// Pair a remote server: probe it (SSH reachable + `claude` and `flightdeckd`
-/// present, `flightdeckd` current), and on success persist it as a [`MachineRecord`].
-/// Returns the saved record so the UI lists it. The probe runs FIRST so a bad
-/// host/key/paste or a missing/outdated tool fails loudly here, not at the first
-/// message.
+/// Fold `host` into `addresses` as a `Manual` candidate (unless it's already one of
+/// them, by value) and order the result via [`address_probe_order`]. Guarantees the
+/// address the user actually confirmed — typed by hand, or edited away from every
+/// ticket-discovered candidate on the confirm screen — is always among what
+/// [`add_machine`] probes, even when it was never a discovered candidate. Pure.
+fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
+    let mut candidates = addresses.unwrap_or_default();
+    if !candidates.iter().any(|c| c.value == host) {
+        candidates.push(AddressCandidate { kind: AddressKind::Manual, value: host.to_string() });
+    }
+    address_probe_order(candidates)
+}
+
+/// Pair a remote server: probe every candidate address in [`address_probe_order`]
+/// (Tailscale, then LAN, then public, then manual — see [`probe_candidates`]),
+/// stopping at the first that's SSH-reachable with `claude` and a current
+/// `flightdeckd` present, and on success persist it as a [`MachineRecord`]. Returns
+/// the saved record so the UI lists it. Probing runs FIRST so a bad host/key/paste or
+/// a missing/outdated tool fails loudly here, not at the first message.
 ///
 /// `addresses` is the full set of candidate hosts the pairing ticket discovered
-/// (Tailscale name, LAN IP, bare hostname) — currently informational only (ignored),
-/// kept so the front's IPC call is already shaped for the column a later task adds.
+/// (Tailscale name, LAN IP, bare hostname). The address that actually worked is
+/// persisted as `host` — what every other part of the app dials — while the full
+/// ordered, deduplicated candidate list (including `host` itself) is persisted as
+/// `addresses`, carried for a later task (A6) to rotate through on a failed
+/// reconnect; the transport itself still only ever dials `host` today. When every
+/// candidate fails, the returned error names each one tried and why.
 #[tauri::command]
 #[specta::specta]
 pub async fn add_machine(
@@ -3701,36 +3916,52 @@ pub async fn add_machine(
     user: String,
     identity_file: Option<String>,
     addresses: Option<Vec<AddressCandidate>>,
-) -> Result<crate::store::MachineRecord, String> {
-    let _ = addresses; // not yet persisted — see the doc comment above.
-
+) -> Result<MachineRecord, String> {
     if let Some(err) = stale_identity_file_error(&identity_file) {
         return Err(err);
     }
 
+    let candidates = probe_candidates(host.trim(), addresses);
+    for c in &candidates {
+        validate_address_value(&c.value)?;
+    }
+
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
-    let probe =
-        probe_remote(&host, port, &user, identity_file.as_deref(), Some(&known_hosts)).await?;
-    if probe.claude_missing || probe.flightdeckd_missing || probe.flightdeckd_outdated {
-        return Err(describe_probe_blockers(&probe));
+
+    // Probe every candidate, in order, stopping at the first success — collecting
+    // every failure along the way so a total failure can name each address tried.
+    let mut failures: Vec<String> = Vec::new();
+    let mut working_host: Option<String> = None;
+    for c in &candidates {
+        match probe_remote(&c.value, port, &user, identity_file.as_deref(), Some(&known_hosts)).await {
+            Ok(probe)
+                if !(probe.claude_missing || probe.flightdeckd_missing || probe.flightdeckd_outdated) =>
+            {
+                working_host = Some(c.value.clone());
+                break;
+            }
+            Ok(probe) => failures.push(format!("{}: {}", c.value, describe_probe_blockers(&probe))),
+            Err(e) => failures.push(format!("{}: {e}", c.value)),
+        }
     }
+    let working_host = working_host.ok_or_else(|| {
+        format!("Could not pair — every address failed. {}", failures.join(" — "))
+    })?;
 
     let machine_id = uuid::Uuid::new_v4().to_string();
     let identity_file =
         claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
 
-    let machine = crate::store::MachineRecord {
+    let machine = MachineRecord {
         id: machine_id,
         label,
-        host,
+        host: working_host,
         port,
         user,
         identity_file,
-        added_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
+        added_at: now_ms(),
+        addresses: candidates,
     };
     app.state::<Store>()
         .upsert_machine(&machine)
@@ -4652,6 +4883,122 @@ mod tests {
         assert!(err.contains("Permission denied"), "should surface the real ssh error: {err}");
     }
 
+    // ---- Remote pairing: candidate addresses (A5) ----------------------------------
+
+    fn addr(kind: AddressKind, value: &str) -> AddressCandidate {
+        AddressCandidate { kind, value: value.to_string() }
+    }
+
+    #[test]
+    fn address_probe_order_sorts_tailscale_lan_public_manual() {
+        let shuffled = vec![
+            addr(AddressKind::Manual, "manual-host"),
+            addr(AddressKind::Public, "1.2.3.4"),
+            addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            addr(AddressKind::Lan, "192.168.1.5"),
+        ];
+        let ordered = super::address_probe_order(shuffled);
+        let kinds: Vec<&AddressKind> = ordered.iter().map(|c| &c.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![&AddressKind::Tailscale, &AddressKind::Lan, &AddressKind::Public, &AddressKind::Manual],
+        );
+    }
+
+    #[test]
+    fn address_probe_order_is_stable_and_idempotent_on_a_partial_list() {
+        // No Tailscale/Public candidates at all — just two Lan entries whose relative
+        // order must survive the sort (a stable sort never reorders equal-priority
+        // items), followed by one Manual.
+        let partial = vec![
+            addr(AddressKind::Lan, "192.168.1.5"),
+            addr(AddressKind::Manual, "my-box"),
+            addr(AddressKind::Lan, "10.0.0.9"),
+        ];
+        let once = super::address_probe_order(partial);
+        assert_eq!(
+            once.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            vec!["192.168.1.5", "10.0.0.9", "my-box"],
+            "Lan entries keep their relative order (stable sort), Manual sorts last",
+        );
+
+        let twice = super::address_probe_order(once.clone());
+        assert_eq!(twice, once, "re-running on an already-sorted/deduped list is a no-op");
+    }
+
+    #[test]
+    fn address_probe_order_deduplicates_by_value() {
+        let candidates = vec![
+            addr(AddressKind::Lan, "192.168.1.5"),
+            addr(AddressKind::Tailscale, "192.168.1.5"), // same value, different kind
+            addr(AddressKind::Manual, "192.168.1.5"),
+            addr(AddressKind::Public, "1.2.3.4"),
+        ];
+        let ordered = super::address_probe_order(candidates);
+        assert_eq!(
+            ordered.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            vec!["192.168.1.5", "1.2.3.4"],
+            "only the FIRST occurrence of a repeated value survives",
+        );
+        assert_eq!(ordered[0].kind, AddressKind::Lan, "the first-seen kind for that value wins");
+    }
+
+    #[test]
+    fn validate_address_value_rejects_ssh_option_injection_empty_and_whitespace() {
+        assert!(super::validate_address_value("-oProxyCommand=evil").is_err());
+        assert!(super::validate_address_value("").is_err());
+        assert!(super::validate_address_value("has space").is_err());
+        assert!(super::validate_address_value("has\ttab").is_err());
+        assert!(super::validate_address_value("has\nnewline").is_err());
+        assert!(super::validate_address_value("box.tailnet.ts.net").is_ok());
+        assert!(super::validate_address_value("192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn probe_candidates_folds_host_in_as_manual_when_not_already_discovered() {
+        let discovered = vec![addr(AddressKind::Lan, "192.168.1.5")];
+        let candidates = super::probe_candidates("my-typed-host", Some(discovered));
+        assert!(
+            candidates.iter().any(|c| c.value == "my-typed-host" && c.kind == AddressKind::Manual),
+            "the confirmed host must always be tried even when it isn't a discovered candidate: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 2, "no duplicate entry for the same value");
+    }
+
+    #[test]
+    fn probe_candidates_does_not_duplicate_a_host_already_among_the_discovered_ones() {
+        let discovered = vec![addr(AddressKind::Tailscale, "box.tailnet.ts.net")];
+        let candidates = super::probe_candidates("box.tailnet.ts.net", Some(discovered));
+        assert_eq!(candidates.len(), 1, "host already present must not be duplicated as Manual");
+    }
+
+    #[test]
+    fn probe_candidates_with_no_discovered_addresses_falls_back_to_the_typed_host() {
+        let candidates = super::probe_candidates("my-typed-host", None);
+        assert_eq!(candidates, vec![addr(AddressKind::Manual, "my-typed-host")]);
+    }
+
+    #[test]
+    fn remote_target_addresses_is_never_empty_for_a_machine_with_zero_recorded_addresses() {
+        let addresses = super::remote_target_addresses("h.example", Vec::new());
+        assert_eq!(addresses, vec!["h.example".to_string()], "falls back to just the known-good host");
+    }
+
+    #[test]
+    fn remote_target_addresses_keeps_host_first_and_dedupes() {
+        let recorded = vec![
+            addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            addr(AddressKind::Lan, "h.example"), // same value as `host`, different kind
+            addr(AddressKind::Public, "1.2.3.4"),
+        ];
+        let addresses = super::remote_target_addresses("h.example", recorded);
+        assert_eq!(
+            addresses,
+            vec!["h.example".to_string(), "box.tailnet.ts.net".to_string(), "1.2.3.4".to_string()],
+            "host leads, the rest follow in probe-priority order, no duplicate of host",
+        );
+    }
+
     // ---- Remote pairing: one dedicated key per server (A3) ------------------------
 
     /// A throwaway `ssh_keys/`-shaped dir, removed when dropped — lets tests spawn
@@ -4808,6 +5155,7 @@ mod tests {
                 user: "agent".into(),
                 identity_file: Some(key.to_string_lossy().into_owned()),
                 added_at: 1,
+                addresses: Vec::new(),
             })
             .unwrap();
 
@@ -4829,6 +5177,7 @@ mod tests {
                 user: "agent".into(),
                 identity_file: None,
                 added_at: 1,
+                addresses: Vec::new(),
             })
             .unwrap();
         // Must not panic when there is no key to clean up.
@@ -4836,5 +5185,159 @@ mod tests {
 
         // Nor when the record doesn't even exist (already-deleted / bad id).
         super::delete_machine_and_key(&store, "no-such-machine").unwrap();
+    }
+
+    // ---- Orphaned pairing-key sweep (A7) --------------------------------------
+
+    fn sweep_candidate(path: &str, mtime_ms: i64) -> super::SweepCandidate {
+        super::SweepCandidate { path: PathBuf::from(path), mtime_ms }
+    }
+
+    #[test]
+    fn orphan_keys_to_sweep_only_removes_old_unreferenced_non_pending_files() {
+        let now = 10_000_000_000i64;
+        let grace = super::ORPHAN_SWEEP_GRACE_MS;
+        let old_unreferenced = sweep_candidate("/ssh_keys/server-old-uuid", now - grace - 1);
+        let entries = vec![
+            old_unreferenced.clone(),
+            sweep_candidate("/ssh_keys/server-young-uuid", now - grace + 1), // too young
+            sweep_candidate("/ssh_keys/pending", now - grace - 1),          // pending, any age
+            sweep_candidate("/ssh_keys/pending.pub", now - grace - 1),      // pending, any age
+            sweep_candidate("/ssh_keys/machine-1", now - grace - 1),        // referenced, any age
+            sweep_candidate("/ssh_keys/machine-1.pub", now - grace - 1),    // referenced, any age
+        ];
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert(PathBuf::from("/ssh_keys/machine-1"));
+        referenced.insert(PathBuf::from("/ssh_keys/machine-1.pub"));
+
+        let doomed = super::orphan_keys_to_sweep(&entries, &referenced, now);
+        assert_eq!(
+            doomed,
+            vec![old_unreferenced.path],
+            "only the old, unreferenced, non-pending file is swept"
+        );
+    }
+
+    #[test]
+    fn orphan_keys_to_sweep_exactly_at_the_grace_boundary_is_not_swept() {
+        let now = 10_000_000_000i64;
+        let grace = super::ORPHAN_SWEEP_GRACE_MS;
+        // Age == grace exactly — `>` (not `>=`) in the decision function means this is
+        // NOT yet old enough, a deliberately conservative boundary.
+        let entries = vec![sweep_candidate("/ssh_keys/server-uuid", now - grace)];
+        let doomed = super::orphan_keys_to_sweep(&entries, &std::collections::HashSet::new(), now);
+        assert!(doomed.is_empty(), "exactly at the grace window is not yet swept");
+    }
+
+    /// Backdate `path`'s mtime well past the sweep's grace window (2h), so a real-file
+    /// IO-wrapper test can exercise the "old enough to sweep" branch without waiting.
+    fn set_old_mtime(path: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        std::fs::File::open(path).unwrap().set_modified(old).unwrap();
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_removes_an_old_unreferenced_file() {
+        let dir = TempKeysDir::new("sweep-basic");
+        let doomed = dir.path().join("server-old-uuid");
+        std::fs::write(&doomed, "key").unwrap();
+        set_old_mtime(&doomed);
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&[]));
+
+        assert!(!doomed.exists(), "an old, unreferenced key must be swept");
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_respects_the_grace_window() {
+        let dir = TempKeysDir::new("sweep-grace");
+        // Freshly written — well under the 1h grace window.
+        let young = dir.path().join("server-young-uuid");
+        std::fs::write(&young, "key").unwrap();
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&[]));
+
+        assert!(young.exists(), "a file younger than the grace window must not be swept");
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_never_touches_pending_or_referenced_regardless_of_age() {
+        let dir = TempKeysDir::new("sweep-protected");
+        let pending = dir.path().join("pending");
+        let pending_pub = dir.path().join("pending.pub");
+        let referenced = dir.path().join("machine-1");
+        let referenced_pub = dir.path().join("machine-1.pub");
+        for p in [&pending, &pending_pub, &referenced, &referenced_pub] {
+            std::fs::write(p, "key").unwrap();
+            set_old_mtime(p);
+        }
+
+        let machines = [crate::store::MachineRecord {
+            id: "machine-1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: Some(referenced.to_string_lossy().into_owned()),
+            added_at: 1,
+            addresses: Vec::new(),
+        }];
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&machines));
+
+        for p in [&pending, &pending_pub, &referenced, &referenced_pub] {
+            assert!(p.exists(), "{p:?} must never be swept regardless of age");
+        }
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_ignores_symlinks_and_subdirectories() {
+        let dir = TempKeysDir::new("sweep-symlink");
+
+        let doomed = dir.path().join("server-old-uuid");
+        std::fs::write(&doomed, "key").unwrap();
+        set_old_mtime(&doomed);
+
+        // An old, dangling symlink must never be followed or removed.
+        let link = dir.path().join("a-symlink");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+
+        // A subdirectory — even one containing an old file of its own — must never be
+        // recursed into.
+        let subdir = dir.path().join("a-subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let nested = subdir.join("nested-old-file");
+        std::fs::write(&nested, "x").unwrap();
+        set_old_mtime(&nested);
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&[]));
+
+        assert!(!doomed.exists(), "the old, unreferenced regular file must still be swept");
+        assert!(link.symlink_metadata().is_ok(), "the symlink itself must survive, never followed");
+        assert!(subdir.exists(), "the subdirectory must survive, never recursed into");
+        assert!(nested.exists(), "nothing inside a subdirectory is ever touched");
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_skips_entirely_when_the_store_could_not_be_read() {
+        let dir = TempKeysDir::new("sweep-store-error");
+        let old_unreferenced = dir.path().join("server-old-uuid");
+        std::fs::write(&old_unreferenced, "key").unwrap();
+        set_old_mtime(&old_unreferenced);
+
+        super::sweep_orphan_ssh_keys(dir.path(), None);
+
+        assert!(
+            old_unreferenced.exists(),
+            "None (store unreadable) must skip the sweep entirely — fail safe"
+        );
+    }
+
+    #[test]
+    fn sweep_orphan_ssh_keys_missing_directory_is_a_harmless_noop() {
+        let dir = TempKeysDir::new("sweep-missing-dir");
+        let missing = dir.path().join("does-not-exist");
+        // Must not panic — a fresh install with no server ever paired has no ssh_keys/.
+        super::sweep_orphan_ssh_keys(&missing, Some(&[]));
     }
 }

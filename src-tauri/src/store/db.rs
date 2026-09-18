@@ -21,15 +21,21 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
-    RepoTosseLink, TosseProjectRepo,
+    AddressCandidate, ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState,
+    RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
+// `AddressKind` itself is only named directly in this module's tests (production code
+// here only ever moves `AddressCandidate` values around, never matches on their
+// `kind`), so it's imported test-only to avoid an unused-import warning on a normal
+// build.
+#[cfg(test)]
+use super::model::AddressKind;
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -62,6 +68,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v9,
     migrate_v10,
     migrate_v11,
+    migrate_v12,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -102,6 +109,40 @@ fn add_column_if_absent(
         conn.execute(ddl, [])?;
     }
     Ok(())
+}
+
+/// Decode a `machines.addresses` column value into its `Vec<AddressCandidate>` (see
+/// [`migrate_v12`]). `NULL` (every pre-migration row) decodes to an empty `Vec` —
+/// exactly like a corrupt/unparseable value, since a row this app never wrote is
+/// indistinguishable from one it wrote badly, and both must degrade the SAME way
+/// (never an error: a machine must still load with just its `host`). A decode
+/// failure is logged rather than silently dropped, so a real corruption is
+/// diagnosable instead of just quietly vanishing.
+fn decode_addresses(raw: Option<String>) -> Vec<AddressCandidate> {
+    match raw {
+        None => Vec::new(),
+        Some(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            eprintln!("[store] failed to decode machines.addresses ({json:?}): {e}");
+            Vec::new()
+        }),
+    }
+}
+
+/// Encode a machine's addresses for the `machines.addresses` column — the inverse of
+/// [`decode_addresses`]. An empty `Vec` is stored as `NULL` rather than `"[]"`, so a
+/// machine with no recorded candidates round-trips through the SAME `NULL` a
+/// pre-migration row already has, instead of gaining a distinct-but-equivalent
+/// on-disk representation.
+fn encode_addresses(addresses: &[AddressCandidate]) -> Option<String> {
+    if addresses.is_empty() {
+        None
+    } else {
+        // A `Vec<AddressCandidate>` of plain strings/enums always serializes — no
+        // fallible content (no maps with non-string keys, no NaN floats) — so this
+        // can't realistically fail; `unwrap_or_default` keeps a write from panicking
+        // over a theoretical serde bug rather than losing the whole machine record.
+        Some(serde_json::to_string(addresses).unwrap_or_default())
+    }
 }
 
 /// v1 — the initial schema: a key/value `meta` table, `repos`, and the
@@ -372,6 +413,19 @@ fn migrate_v11(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v12 — the full set of candidate addresses discovered (or typed) for a paired
+/// server, alongside its single `host`. `addresses` holds a JSON-encoded
+/// `Vec<AddressCandidate>` (see [`super::model::AddressCandidate`]) — a JSON blob
+/// rather than its own table because it is small, always read/written as a whole
+/// alongside its machine, and never queried by value. NULL (every pre-existing row)
+/// decodes to an empty `Vec` everywhere it's read (never an error — see
+/// [`decode_addresses`]), so a machine paired before this column existed keeps
+/// working exactly as it did: `RemoteTarget.addresses` falls back to `[host]` at the
+/// one construction site that needs a non-empty list (`spawn_session`).
+fn migrate_v12(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "machines", "addresses", "ALTER TABLE machines ADD COLUMN addresses TEXT")
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -469,7 +523,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let mut machines_stmt = conn.prepare(
-            "SELECT id, label, host, port, user, identity_file, added_at
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses
              FROM machines ORDER BY added_at ASC",
         )?;
         let machines = machines_stmt
@@ -482,6 +536,9 @@ impl Store {
                     user: row.get(4)?,
                     identity_file: row.get(5)?,
                     added_at: row.get(6)?,
+                    // NULL (pre-v12 rows) / a corrupt value both decode to `[]` — see
+                    // `decode_addresses`.
+                    addresses: decode_addresses(row.get(7)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -603,7 +660,7 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at
+                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses
                  FROM repos r JOIN machines m ON m.id = r.machine_id
                  WHERE r.path = ?1 AND r.machine_id IS NOT NULL LIMIT 1",
                 params![path],
@@ -616,6 +673,7 @@ impl Store {
                         user: row.get(4)?,
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
                     })
                 },
             )
@@ -628,7 +686,7 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, label, host, port, user, identity_file, added_at
+                "SELECT id, label, host, port, user, identity_file, added_at, addresses
                  FROM machines WHERE id = ?1",
                 params![id],
                 |row| {
@@ -640,6 +698,7 @@ impl Store {
                         user: row.get(4)?,
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
                     })
                 },
             )
@@ -647,15 +706,27 @@ impl Store {
     }
 
     /// Insert or update a remote server (idempotent by id). Connection coordinates
-    /// only — never key material (see [`MachineRecord`]).
+    /// only — never key material (see [`MachineRecord`]). `addresses` round-trips
+    /// through [`encode_addresses`]/[`decode_addresses`] as a JSON blob (see
+    /// [`migrate_v12`]).
     pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                  label = excluded.label, host = excluded.host, port = excluded.port,
-                 user = excluded.user, identity_file = excluded.identity_file",
-            params![m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at],
+                 user = excluded.user, identity_file = excluded.identity_file,
+                 addresses = excluded.addresses",
+            params![
+                m.id,
+                m.label,
+                m.host,
+                m.port,
+                m.user,
+                m.identity_file,
+                m.added_at,
+                encode_addresses(&m.addresses),
+            ],
         )?;
         Ok(())
     }
@@ -1056,6 +1127,7 @@ mod tests {
             user: "agent".into(),
             identity_file: Some("/keys/id".into()),
             added_at: 1,
+            addresses: Vec::new(),
         };
         s.upsert_machine(&m).unwrap();
 
@@ -1091,6 +1163,115 @@ mod tests {
         assert!(after.machines.is_empty());
         assert!(after.repos.iter().all(|r| r.id != "r-remote"), "remote repo gone with its server");
         assert!(after.repos.iter().any(|r| r.id == "r-local"), "local repo stays");
+    }
+
+    /// v12 — a machine's full candidate address list round-trips through every reader
+    /// (`machine_by_id`, `machine_for_repo_path`, `load_state`), not just the one that
+    /// happens to be queried by whichever call site exercises it.
+    #[test]
+    fn upsert_machine_round_trips_addresses() {
+        let s = Store::open_in_memory().unwrap();
+        let addresses = vec![
+            AddressCandidate { kind: AddressKind::Tailscale, value: "box.tailnet.ts.net".into() },
+            AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+        ];
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "box.tailnet.ts.net".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: addresses.clone(),
+        };
+        s.upsert_machine(&m).unwrap();
+        assert_eq!(s.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
+
+        let mut remote = repo_at("r1", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        assert_eq!(s.machine_for_repo_path("/work/demo").unwrap().unwrap().addresses, addresses);
+
+        assert_eq!(s.load_state().unwrap().machines[0].addresses, addresses);
+
+        // Re-upserting with a DIFFERENT list must replace it, not merge/append —
+        // ON CONFLICT sets `addresses = excluded.addresses` like every other column.
+        let mut updated = m.clone();
+        updated.addresses = vec![AddressCandidate { kind: AddressKind::Manual, value: "10.0.0.1".into() }];
+        s.upsert_machine(&updated).unwrap();
+        assert_eq!(s.machine_by_id("m1").unwrap().unwrap().addresses, updated.addresses);
+
+        // And an empty list round-trips too (stored as NULL — see `encode_addresses`).
+        let mut cleared = updated.clone();
+        cleared.addresses = Vec::new();
+        s.upsert_machine(&cleared).unwrap();
+        assert!(s.machine_by_id("m1").unwrap().unwrap().addresses.is_empty());
+    }
+
+    /// v12 — a row from BEFORE the `addresses` column existed (`ALTER TABLE ADD
+    /// COLUMN` leaves every pre-existing row NULL) must load with an empty `Vec`, not
+    /// an error — the whole point of [`decode_addresses`] treating NULL as "no
+    /// candidates recorded yet" rather than a decode failure.
+    #[test]
+    fn pre_migration_machines_row_reads_addresses_as_empty_vec() {
+        let tmp = TempDb::new("machines-v12-premigration");
+        // The v10 `machines` shape, pre-dating the v12 `addresses` column. Only `meta`
+        // + `machines` are needed: with the marker bridged to 11, the runner skips
+        // every migration up to and including v11 (already applied) and runs ONLY
+        // migrate_v12, which touches nothing but `machines`.
+        tmp.seed_raw(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE machines (
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                port          INTEGER NOT NULL,
+                user          TEXT NOT NULL,
+                identity_file TEXT,
+                added_at      INTEGER NOT NULL
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '11');
+            INSERT INTO machines (id, label, host, port, user, identity_file, added_at)
+                VALUES ('m1', 'vps', 'h.example', 22, 'agent', NULL, 1);
+            ",
+        );
+
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION, "marker 11 bridged, v12 applied");
+        let m = store.machine_by_id("m1").unwrap().expect("pre-migration row still loads");
+        assert!(m.addresses.is_empty(), "NULL addresses decodes to empty, never an error");
+        assert_eq!(m.host, "h.example", "every pre-existing column is untouched");
+    }
+
+    /// v12's `ALTER TABLE ... ADD COLUMN` is guarded by `add_column_if_absent` like
+    /// every other additive migration — reopening an already-migrated db (a second app
+    /// launch) must not error, re-add the column, or disturb the row.
+    #[test]
+    fn migrate_v12_reopen_is_idempotent() {
+        let tmp = TempDb::new("machines-v12-idempotent");
+        let addresses =
+            vec![AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.9".into() }];
+        {
+            let store = tmp.open();
+            store
+                .upsert_machine(&MachineRecord {
+                    id: "m1".into(),
+                    label: "vps".into(),
+                    host: "192.168.1.9".into(),
+                    port: 22,
+                    user: "agent".into(),
+                    identity_file: None,
+                    added_at: 1,
+                    addresses: addresses.clone(),
+                })
+                .unwrap();
+        }
+        let store = tmp.open(); // second open over an already-migrated db
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
     }
 
     fn conv_at(
