@@ -95,3 +95,31 @@ fn cli_end_to_end() {
     let empty = fd(home).args(["add-phone", "--token", "-"]).stdin(Stdio::null()).stdout(Stdio::null()).status().unwrap();
     assert!(!empty.success(), "an empty token must fail the CLI");
 }
+
+/// A phone secret on the command line works but is flagged (argv is
+/// world-readable); `--token -` stays quiet. No daemon needed: the warning
+/// comes before the socket connect, which then fails.
+#[test]
+fn a_token_on_the_command_line_is_flagged_stdin_is_not() {
+    let home = tempfile::Builder::new().prefix("fdd").tempdir_in("/tmp").unwrap();
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flightdeckd"))
+            .args(args)
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        String::from_utf8(child.wait_with_output().unwrap().stderr).unwrap()
+    };
+    for verb in ["add-phone", "remove-phone"] {
+        let err = run(&[verb, "--token", "s3cret"], "");
+        assert!(err.contains("visible to every user"), "{verb}: {err}");
+        assert!(err.contains("--token -"), "{verb}: {err}");
+        let err = run(&[verb, "--token", "-"], "s3cret\n");
+        assert!(!err.contains("visible to every user"), "{verb}: {err}");
+        assert!(err.contains("not running"), "{verb}: {err}");
+    }
+}

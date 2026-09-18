@@ -104,9 +104,9 @@ enum Cmd {
     /// Authorize a phone on this node: persisted to the config and pushed to
     /// the relay live by the running daemon.
     AddPhone {
-        /// The phone's secret token; `-` reads it from stdin (keeps it out of
-        /// the process list).
-        #[arg(long)]
+        /// The phone's secret token. Recommended: `--token -` and the token on
+        /// stdin — a value given here is visible to every user in `ps`.
+        #[arg(long, value_name = "-|TOKEN")]
         token: String,
         #[arg(long, default_value = "")]
         label: String,
@@ -115,8 +115,9 @@ enum Cmd {
     },
     /// Revoke a phone on this node (persisted + pushed to the relay live).
     RemovePhone {
-        /// The phone's secret token; `-` reads it from stdin.
-        #[arg(long)]
+        /// The phone's secret token. Recommended: `--token -` and the token on
+        /// stdin — a value given here is visible to every user in `ps`.
+        #[arg(long, value_name = "-|TOKEN")]
         token: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -130,9 +131,15 @@ enum Cmd {
     },
 }
 
-/// `--token -` reads the secret from stdin's first line.
+/// `--token -` reads the secret from stdin's first line. A token given on
+/// the command line still works (compatibility) but is flagged: argv is
+/// world-readable through `ps` / `/proc` for the process's lifetime.
 fn token_arg(token: String) -> Result<String> {
     if token != "-" {
+        eprintln!(
+            "flightdeckd: warning: a phone token passed with --token <value> is visible to every \
+             user on this machine (ps); prefer `--token -` with the token on stdin"
+        );
         return Ok(token);
     }
     let mut line = String::new();
