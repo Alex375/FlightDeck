@@ -2033,6 +2033,17 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
  * folded together.
+ * 
+ * Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
+ * finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
+ * `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+ * against the same server. Before this fix, this legacy/manual pairing command was
+ * the ONE entry point of the four that never claimed the lock at all, so it could
+ * still interleave ssh writes (key install, `AddMachine`'s pending-key rename) with
+ * one of the other three targeting the exact same host — precisely the race
+ * [`ServerLocks`] exists to prevent. Never blocks/waits; never pauses across separate
+ * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
+ * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
 async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
     try {

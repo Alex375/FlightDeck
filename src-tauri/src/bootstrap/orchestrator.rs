@@ -458,7 +458,13 @@ impl ServerLocks {
 /// machine_by_address`] (no DNS/case normalization) — a host typed two different but
 /// equivalent ways is treated as a different key, same as everywhere else addresses
 /// are compared in this crate.
-fn server_lock_key(existing_machine_id: Option<&str>, host: &str, port: u16, user: &str) -> String {
+///
+/// `pub(crate)`: also the key [`crate::ipc::commands::add_machine`] claims with
+/// (B_lifecycle-#addmachinelock review finding — the legacy/manual pairing command
+/// used to never claim this lock at all, so it could interleave ssh writes with a
+/// `bootstrap_server`/`bootstrap_resume`/`machine_repair` run already in flight
+/// against the exact same host).
+pub(crate) fn server_lock_key(existing_machine_id: Option<&str>, host: &str, port: u16, user: &str) -> String {
     match existing_machine_id {
         Some(id) => id.to_string(),
         None => format!("{host}:{port}:{user}"),
@@ -469,7 +475,10 @@ fn server_lock_key(existing_machine_id: Option<&str>, host: &str, port: u16, use
 /// keep the two in sync, same discipline as this crate's other Rust/TS wording
 /// contracts (e.g. TOSSE's `SESSION_GONE_MARKERS`): reformulating this silently breaks
 /// the front's "this is a ServerBusy, not just any failure" detection.
-fn server_busy_error(running_op: String) -> String {
+///
+/// `pub(crate)`: also used by [`crate::ipc::commands::add_machine`] — see
+/// [`server_lock_key`]'s own doc.
+pub(crate) fn server_busy_error(running_op: String) -> String {
     format!(
         "Another operation (\"{running_op}\") is already running on this server. \
          Wait for it to finish, then try again."
@@ -484,7 +493,12 @@ fn server_busy_error(running_op: String) -> String {
 /// alive across the whole pause, via [`Self::into_forgotten_key`] — the raw key is
 /// then handed to [`BootstrapSessions`] ([`StoredSession::lock_key`]) to release
 /// later, from `bootstrap_resume`'s own eventual completion or `bootstrap_cancel`.
-struct ServerLockGuard {
+///
+/// `pub(crate)`: [`crate::ipc::commands::add_machine`] also acquires one directly —
+/// see [`server_lock_key`]'s own doc. It never pauses, so it only ever uses
+/// [`Self::acquire`] and lets the guard drop normally at the end of the call, the same
+/// way [`machine_repair`] does.
+pub(crate) struct ServerLockGuard {
     locks: Arc<ServerLocks>,
     key: String,
     /// Set by [`Self::into_forgotten_key`] — `Drop` checks this flag rather than
@@ -496,7 +510,7 @@ struct ServerLockGuard {
 impl ServerLockGuard {
     /// Claim `key` for `op` and wrap it in a guard. `Err` — [`server_busy_error`]'s
     /// input — when another operation already holds this key.
-    fn acquire(locks: &Arc<ServerLocks>, key: String, op: &str) -> Result<Self, String> {
+    pub(crate) fn acquire(locks: &Arc<ServerLocks>, key: String, op: &str) -> Result<Self, String> {
         locks.claim(&key, op)?;
         Ok(Self { locks: locks.clone(), key, released: false })
     }
