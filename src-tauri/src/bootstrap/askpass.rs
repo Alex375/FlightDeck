@@ -35,7 +35,7 @@
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -47,8 +47,11 @@ use crate::ipc::commands::shq;
 
 /// Everything that can go wrong running a bootstrap ssh command. Every variant's
 /// [`Display`](std::fmt::Display) is worded from ssh's OWN exit status/stderr or a
-/// plumbing failure message — never from the password, which none of this module's
-/// code ever formats into a string. See
+/// plumbing failure message — never from the password. No code in this module ever
+/// formats the password INTO a message; the one place that even sees it after
+/// delivery (`classify_output`'s `Other` branch, which forwards a raw line of ssh's
+/// own stderr) only uses it to SCRUB a literal occurrence back out, for the untrusted
+/// first-contact host this bootstrap flow talks to — see that function's doc. See
 /// `askpass_errors_never_contain_the_test_password` at the bottom of this file, which
 /// mirrors the repo's `session_gone_errors_keep_the_wording_the_front_matches_on`
 /// discipline (`tosse/mod.rs`) for this module.
@@ -104,6 +107,25 @@ impl std::error::Error for BootstrapError {}
 /// goes through `run_with_password` (there is none in this crate yet) would need to
 /// set them itself.
 pub fn bootstrap_ssh_command(target: &str, identity_or_none: Option<&str>, remote_cmd: &str) -> Command {
+    let mut cmd = bootstrap_ssh_options(identity_or_none);
+    // MUST be the last two args appended: ssh's own argv grammar is
+    // `ssh [options] destination [command]` — anything appended after the
+    // destination is part of the REMOTE command line, not parsed as an ssh option
+    // any more. A caller (this module's own live test, notably) that needs to add
+    // one more `-o` on top of [`bootstrap_ssh_options`]'s set must do so BEFORE
+    // appending its own destination/command, not onto this function's return value.
+    cmd.arg(target).arg(remote_cmd);
+    cmd
+}
+
+/// The option half of [`bootstrap_ssh_command`], without the destination/remote
+/// command it appends last (see that function's doc for why the order matters).
+/// Split out so this module's live test can insert one more `-o` (an isolated
+/// `UserKnownHostsFile`) in the only place ssh will actually parse it as an option —
+/// before the destination — while still exercising every other flag this bootstrap
+/// flow really ships with, rather than a hand-duplicated copy that could drift from
+/// it.
+fn bootstrap_ssh_options(identity_or_none: Option<&str>) -> Command {
     let mut cmd = Command::new("ssh");
     cmd
         // No controlling terminal for ssh to fall back to prompting on either — a
@@ -123,7 +145,6 @@ pub fn bootstrap_ssh_command(target: &str, identity_or_none: Option<&str>, remot
         cmd.arg("-o")
             .arg("PreferredAuthentications=password,keyboard-interactive");
     }
-    cmd.arg(target).arg(remote_cmd);
     cmd
 }
 
@@ -146,16 +167,14 @@ impl AskpassGuard {
     /// path where cleanup can't be `Drop`'s job, since `Self` does not exist yet).
     fn new() -> Result<Self, BootstrapError> {
         let dir = std::env::temp_dir().join(format!("flightdeck-askpass-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)
+        // Created ALREADY-restricted (mode passed to the syscall itself), not
+        // created-then-chmod'd: the latter would leave a brief window where the dir
+        // exists at the process's default (umask-derived) mode before being narrowed,
+        // a create-then-restrict TOCTOU this relay's own safety bar rules out.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
             .map_err(|e| BootstrapError::Other(format!("askpass: could not create temp dir: {e}")))?;
-        if let Err(e) =
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(BootstrapError::Other(format!(
-                "askpass: could not restrict the temp dir's permissions: {e}"
-            )));
-        }
 
         let fifo = dir.join("pass.fifo");
         if let Err(e) = make_fifo(&fifo) {
@@ -164,9 +183,13 @@ impl AskpassGuard {
         }
 
         let helper = dir.join("askpass.sh");
-        // `exec cat` the fifo once — `exec` replaces the shell so no extra process
-        // lingers between ssh and the fifo read.
-        let script = format!("#!/bin/sh\nexec cat {}\n", shq(&fifo.to_string_lossy()));
+        // `exec /bin/cat` the fifo once — `exec` replaces the shell so no extra
+        // process lingers between ssh and the fifo read. An ABSOLUTE path, not a
+        // bare `cat` resolved via the ambient `PATH`: this is the one process in the
+        // whole relay whose job is to read the secret in cleartext, so it should not
+        // trust whatever `PATH` this process (and its ssh/sh children) happen to
+        // inherit.
+        let script = format!("#!/bin/sh\nexec /bin/cat {}\n", shq(&fifo.to_string_lossy()));
         if let Err(e) = std::fs::write(&helper, script)
             .map_err(|e| format!("could not write the helper script: {e}"))
             .and_then(|()| {
@@ -282,6 +305,14 @@ pub async fn run_with_password(
     // against delivery below without losing the ability to kill-by-pid afterward.
     let mut wait_task = tokio::spawn(async move { child.wait_with_output().await });
 
+    // A single overall deadline instant, used for BOTH waits below (delivery, then
+    // ssh's own exit) — not `deadline` applied twice in sequence. Applying it twice
+    // would let a caller wait up to `2 * deadline` in exactly the case this relay
+    // exists for: a fifo that's never opened (e.g. a host slow enough that neither
+    // ssh's own `ConnectTimeout` nor the askpass prompt fires within `deadline`, but
+    // ssh eventually gives up on its own a bit later).
+    let started = std::time::Instant::now();
+
     // Race delivery against ssh exiting on its own: ssh may fail (or, with a key,
     // succeed) before it EVER opens the askpass prompt — e.g. an unreachable host, or
     // a host-key mismatch — and that must not make this call sit out the whole
@@ -300,10 +331,23 @@ pub async fn run_with_password(
             joined
         }
         None => {
-            // Delivery settled first (delivered, or timed out on its own). Either
-            // way ssh is still the one running; give it the same overall deadline to
-            // actually exit and produce output, rather than hanging indefinitely.
-            match timeout(deadline, &mut wait_task).await {
+            // Delivery settled first — delivered, OR timed out on its own without
+            // ever being opened (in which case the writer thread from `deliver()` is
+            // still parked in a blocking `open()`, per its own doc). Poke
+            // UNCONDITIONALLY here, before waiting on ssh's own exit below: this is
+            // the only place that can release that thread if ssh goes on to exit
+            // gracefully (not via our own SIGKILL path further down) without ever
+            // invoking the askpass helper — the one interleaving none of the other
+            // exit paths in this function cover. Cheap and idempotent (a nonblocking
+            // open+close) when a reader already arrived.
+            guard.poke_writer();
+
+            // Either way ssh is still the one running; give it the REST of the
+            // overall deadline to actually exit and produce output (not a fresh
+            // `deadline`), so the total wall-clock bound on this whole call stays
+            // `deadline`, not `2 * deadline`.
+            let remaining = deadline.saturating_sub(started.elapsed());
+            match timeout(remaining, &mut wait_task).await {
                 Ok(joined) => joined,
                 Err(_elapsed) => {
                     if let Some(pid) = pid {
@@ -323,14 +367,40 @@ pub async fn run_with_password(
     let output = joined
         .map_err(|e| BootstrapError::Other(format!("internal error running ssh: {e}")))?
         .map_err(|e| BootstrapError::Other(format!("could not read ssh's output: {e}")))?;
-    classify_output(output)
+    classify_output(output, password)
 }
 
 /// Turns ssh's raw exit status/stderr into the typed outcome callers actually want.
 /// ssh's own convention: exit code 255 means SSH ITSELF failed (auth/connect/host-key)
 /// — any other code is the REMOTE COMMAND's own exit code carried through verbatim,
 /// meaning the connection and auth succeeded, so that case is always `Ok`.
-fn classify_output(out: std::process::Output) -> Result<std::process::Output, BootstrapError> {
+///
+/// That convention only applies to a process that actually exited normally.
+/// `ExitStatus::code()` returns `None` when ssh was instead terminated BY A SIGNAL
+/// (e.g. it crashed, or something other than this module's own SIGKILL timeout path —
+/// which returns `Timeout` directly and never reaches this function — killed it); such
+/// a status is neither a real "255" nor a real "auth succeeded" exit code, so it is
+/// classified as its own `Other` outcome rather than folded into the success branch
+/// below (`out.status.success()` would already read `false` there, but the `Output`
+/// itself would misleadingly flow back to the caller as `Ok`).
+///
+/// `password` is taken here ONLY to scrub it out of the one branch (`Other`, below)
+/// that forwards a raw line of ssh's own stderr verbatim — never to format it INTO a
+/// message. This matters specifically because [`bootstrap_ssh_command`] connects with
+/// `StrictHostKeyChecking=accept-new` (TOFU): on that first, not-yet-verified
+/// connection, the remote sshd receives our real password over the wire to check it,
+/// and — being unverified — could be malicious or a MITM; such a host can craft its
+/// own banner/diagnostic text (which ssh prints to stderr and this branch would
+/// otherwise forward untouched) to include whatever it just read, including our
+/// password reflected back. Redacting any literal occurrence of `password` here closes
+/// that reflection path without weakening the diagnostic value of the rest of the line.
+fn classify_output(out: std::process::Output, password: &str) -> Result<std::process::Output, BootstrapError> {
+    if out.status.code().is_none() {
+        return Err(BootstrapError::Other(format!(
+            "ssh exited abnormally: {}",
+            out.status
+        )));
+    }
     if out.status.code() != Some(255) {
         return Ok(out);
     }
@@ -351,14 +421,22 @@ fn classify_output(out: std::process::Output) -> Result<std::process::Output, Bo
     {
         return Err(BootstrapError::HostUnreachable);
     }
-    Err(BootstrapError::Other(
-        String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("ssh failed")
-            .to_string(),
-    ))
+    let last_line = String::from_utf8_lossy(&out.stderr)
+        .trim()
+        .lines()
+        .last()
+        .unwrap_or("ssh failed")
+        .to_string();
+    // Scrub any literal occurrence of the password before it becomes a
+    // `BootstrapError` (see this function's doc) — guarded on non-empty so an empty
+    // `password` (never a real login password, but worth being defensive about)
+    // can't turn this into a no-op replace-everything-with-redacted mess.
+    let last_line = if password.is_empty() {
+        last_line
+    } else {
+        last_line.replace(password, "[redacted]")
+    };
+    Err(BootstrapError::Other(last_line))
 }
 
 #[cfg(test)]
@@ -506,6 +584,16 @@ mod tests {
     /// like every other live-spawn test in this crate
     /// (`cargo test --lib -- --ignored --nocapture`); the container is torn down on
     /// every exit path, including a panicking assertion below, via `ContainerGuard`.
+    ///
+    /// ⚠️ Uses an ISOLATED `known_hosts` file, scoped to this one run, rather than
+    /// the developer's real `~/.ssh/known_hosts` that `bootstrap_ssh_command`'s
+    /// `StrictHostKeyChecking=accept-new` would otherwise pin into: the
+    /// `linuxserver/openssh-server` image generates a FRESH host key on every
+    /// `docker run`, so a second run on the same machine, on the same fixed
+    /// `PORT`, would collide with the first run's key pinned into a shared file and
+    /// fail with `HostKeyMismatch` instead of proving anything — reproduced while
+    /// fixing this test. A scratch `known_hosts` (removed on every exit path via
+    /// `KnownHostsGuard`) makes each run start from a clean slate.
     #[tokio::test]
     #[ignore]
     async fn run_with_password_distinguishes_wrong_from_right_over_a_live_sshd() {
@@ -521,11 +609,26 @@ mod tests {
             }
         }
 
+        /// Scratch dir holding this run's own `known_hosts` file, removed on every
+        /// exit path — never the developer's real `~/.ssh/known_hosts`.
+        struct KnownHostsGuard(PathBuf);
+        impl Drop for KnownHostsGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         // Best-effort teardown of a stale container from a previous aborted run,
         // THEN register the guard so THIS run's container is removed on every exit
         // path (including a panic from an assertion below).
         let _ = std::process::Command::new("docker").args(["rm", "-f", CONTAINER]).output();
         let _guard = ContainerGuard;
+
+        let known_hosts_dir =
+            std::env::temp_dir().join(format!("flightdeck-askpass-live-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&known_hosts_dir).expect("could not create a scratch dir for known_hosts");
+        let _kh_guard = KnownHostsGuard(known_hosts_dir.clone());
+        let known_hosts_file = known_hosts_dir.join("known_hosts");
 
         let run = std::process::Command::new("docker")
             .args([
@@ -552,6 +655,24 @@ mod tests {
         );
 
         let target = format!("ssh://{USER}@127.0.0.1:{PORT}");
+        // Every ssh invocation in this test goes through this helper so all of them
+        // — polling AND the final proof — share the same isolated `known_hosts`.
+        //
+        // Built from `bootstrap_ssh_options` (the option-only half of
+        // `bootstrap_ssh_command`), NOT by appending to `bootstrap_ssh_command`'s own
+        // return value: that function already appends the destination/remote-command
+        // pair last, and ssh treats anything appended AFTER those as part of the
+        // REMOTE command line, not as one of its own options — appending
+        // `-o UserKnownHostsFile=...` there would silently do nothing and leave ssh
+        // consulting the real `~/.ssh/known_hosts` (reproduced while fixing this
+        // test: the override was a no-op and the "isolated" run still failed with a
+        // `HostKeyMismatch` sourced from the developer's real known_hosts file).
+        let ssh_cmd = |remote_cmd: &str| {
+            let mut cmd = bootstrap_ssh_options(None);
+            cmd.arg("-o").arg(format!("UserKnownHostsFile={}", known_hosts_file.display()));
+            cmd.arg(&target).arg(remote_cmd);
+            cmd
+        };
 
         // Poll with the WRONG password until sshd actually accepts connections (a
         // freshly started container's sshd takes a moment to come up) — this
@@ -560,7 +681,7 @@ mod tests {
         let mut ready = false;
         let mut last_result = String::new();
         for _ in 0..30 {
-            let cmd = bootstrap_ssh_command(&target, None, "true");
+            let cmd = ssh_cmd("true");
             match run_with_password(cmd, "definitely-wrong-password", Duration::from_secs(5)).await {
                 Err(BootstrapError::WrongPassword) => {
                     ready = true;
@@ -576,7 +697,7 @@ mod tests {
 
         // The actual proof: the right password succeeds AND runs the remote
         // command, returning its real output.
-        let cmd = bootstrap_ssh_command(&target, None, "echo REMOTE_OK_$(id -un)");
+        let cmd = ssh_cmd("echo REMOTE_OK_$(id -un)");
         let out = run_with_password(cmd, PASSWORD, Duration::from_secs(10))
             .await
             .expect("the correct password must succeed");
@@ -594,11 +715,11 @@ mod tests {
     /// `tosse/mod.rs`'s `session_gone_errors_keep_the_wording_the_front_matches_on`
     /// discipline for this module. None of `BootstrapError`'s variants are ever built
     /// by formatting the password itself into a string (`WrongPassword`/`Timeout`/
-    /// `HostUnreachable`/`HostKeyMismatch` are fixed text; `Other` carries only ssh's
-    /// own diagnostic output or a plumbing-failure reason, neither of which this
-    /// module ever seeds with the password) — so this stays true structurally, not by
-    /// luck, and would fail LOUDLY if a future change added `format!("... {password}
-    /// ...")` to any error path.
+    /// `HostUnreachable`/`HostKeyMismatch` are fixed text; `Other`'s raw-stderr line is
+    /// actively scrubbed of any literal occurrence of the password passed alongside
+    /// it) — so this stays true structurally, not by luck, and would fail LOUDLY if a
+    /// future change added `format!("... {password} ...")` to any error path, or
+    /// dropped the scrub in `classify_output`'s `Other` branch.
     #[tokio::test]
     async fn askpass_errors_never_contain_the_test_password() {
         const SECRET: &str = "sUp3r-s3cr3t-t3st-p4ssw0rd-9f3c";
@@ -634,13 +755,30 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr_with_secret_nearby.into_bytes(),
         };
-        let err = classify_output(out).expect_err("\"Permission denied\" classifies as WrongPassword");
+        let err = classify_output(out, SECRET).expect_err("\"Permission denied\" classifies as WrongPassword");
         assert_eq!(err, BootstrapError::WrongPassword);
         rendered.push(err.to_string());
 
         // The fixed-message variants this module can also produce.
         rendered.push(BootstrapError::HostUnreachable.to_string());
         rendered.push(BootstrapError::HostKeyMismatch.to_string());
+
+        // `classify_output`'s catch-all `Other` branch is the ONE path that forwards
+        // a raw line of ssh's own stderr — exactly the case an untrusted first-contact
+        // host (this bootstrap flow's `StrictHostKeyChecking=accept-new`) could try to
+        // exploit by reflecting the password it just received back in a banner/
+        // disconnect message. Stderr here deliberately does NOT match any of the
+        // fixed-message branches above (no "permission denied" / host-key / hostname
+        // wording), so it must fall all the way through to `Other`.
+        let reflecting_stderr = format!("Disconnected by application: you sent '{SECRET}', goodbye");
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: reflecting_stderr.into_bytes(),
+        };
+        let err = classify_output(out, SECRET).expect_err("unrecognized 255 stderr classifies as Other");
+        assert!(matches!(err, BootstrapError::Other(_)));
+        rendered.push(err.to_string());
 
         for r in &rendered {
             assert!(!r.contains(SECRET), "a BootstrapError rendering leaked the password: {r:?}");

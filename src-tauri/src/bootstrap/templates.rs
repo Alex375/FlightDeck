@@ -31,8 +31,54 @@
 //! [`render_system_unit`] otherwise mirrors, line for line, the unit file already
 //! running the real `flightdeckd` on `josty-cc` (fetched 2026-09-18, read-only, over
 //! the existing SSH pairing — nothing was installed or changed on that box).
+//!
+//! ## Newline injection is a SEPARATE hazard from shell quoting
+//!
+//! `shq()` only defends shell-lexer interpolation (the hazard above). A systemd unit
+//! file is parsed line by line, BEFORE any value-level tokenization — an embedded
+//! `\n`/`\r` byte in `user` or `home` starts a brand-new `KEY=VALUE` line of its own,
+//! regardless of any `shq()` quoting wrapped around the value (quoting a string with
+//! `'...'` does not stop a literal newline INSIDE it from still being a newline once
+//! that string lands in a line-oriented file rather than a shell argv). Verified
+//! against `systemd-analyze verify` (systemd 252): a `user`/`home` containing
+//! `\nExecStartPre=...` produces a syntactically valid, silently-accepted extra
+//! directive in the rendered unit. Both renderers below therefore reject a `user`/
+//! `home` carrying `\n` or `\r` up front — fail closed rather than emit a unit file
+//! that isn't the one line of text its caller asked for.
 
 use crate::ipc::commands::shq;
+
+/// A `user`/`home` value that cannot be safely rendered into a systemd unit file: it
+/// carries an embedded `\n`/`\r`, which would start a new, uncontrolled `KEY=VALUE`
+/// line in the rendered file (see the module doc's "Newline injection" note) — a
+/// hazard `shq()`'s shell-style quoting does not cover, since a unit file is parsed
+/// line by line, not by a shell lexer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnsafeUnitValue {
+    /// Which parameter failed the check (`"user"` or `"home"`), for the error text.
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for UnsafeUnitValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} contains a newline or carriage return and cannot be safely rendered into a systemd unit file",
+            self.field
+        )
+    }
+}
+
+impl std::error::Error for UnsafeUnitValue {}
+
+/// Rejects a value carrying `\n`/`\r` before it is interpolated into a unit-file
+/// line — the one check both unit renderers share.
+fn reject_unit_line_break(field: &'static str, value: &str) -> Result<(), UnsafeUnitValue> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(UnsafeUnitValue { field });
+    }
+    Ok(())
+}
 
 /// systemd **user** unit for `flightdeckd` (installed at
 /// `~/.config/systemd/user/flightdeckd.service`, enabled with
@@ -43,10 +89,13 @@ use crate::ipc::commands::shq;
 /// `home` lands inside `ExecStart=`, whose tokenizer honours `shq()`'s single-quote
 /// escaping (see the module doc), so a home directory with a space or a shell
 /// metacharacter in it still resolves to the right, single path — it does not need to
-/// be a "normal" path for this to stay correct.
-pub fn render_user_unit(home: &str) -> String {
+/// be a "normal" path for this to stay correct. It still must not carry an embedded
+/// newline (see the module doc); this returns [`UnsafeUnitValue`] rather than emit an
+/// injectable unit file.
+pub fn render_user_unit(home: &str) -> Result<String, UnsafeUnitValue> {
+    reject_unit_line_break("home", home)?;
     let home = shq(home);
-    format!(
+    Ok(format!(
         "[Unit]\n\
          Description=Flight Deck server daemon (flightdeckd)\n\
          \n\
@@ -57,7 +106,7 @@ pub fn render_user_unit(home: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n"
-    )
+    ))
 }
 
 /// systemd **system** unit for `flightdeckd` (installed at
@@ -73,10 +122,14 @@ pub fn render_user_unit(home: &str) -> String {
 /// — see the module doc) so it is interpolated RAW; `home` sits inside `Environment=`/
 /// `ExecStart=` (both DO shell-unquote) so it is `shq()`-escaped, matching the real
 /// file's `PATH` line, which threads a quoted home in between two unquoted,
-/// colon-separated literal segments.
-pub fn render_system_unit(user: &str, home: &str) -> String {
+/// colon-separated literal segments. Neither may carry an embedded newline (see the
+/// module doc); this returns [`UnsafeUnitValue`] rather than emit an injectable unit
+/// file.
+pub fn render_system_unit(user: &str, home: &str) -> Result<String, UnsafeUnitValue> {
+    reject_unit_line_break("user", user)?;
+    reject_unit_line_break("home", home)?;
     let home = shq(home);
-    format!(
+    Ok(format!(
         "[Unit]\n\
          Description=Flight Deck server daemon (flightdeckd)\n\
          After=network-online.target\n\
@@ -92,7 +145,7 @@ pub fn render_system_unit(user: &str, home: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
-    )
+    ))
 }
 
 /// The ONE command in the whole bootstrap flow that needs `sudo` on the target host:
@@ -121,7 +174,7 @@ mod tests {
 
     #[test]
     fn user_unit_golden_string() {
-        let got = render_user_unit("/home/alex");
+        let got = render_user_unit("/home/alex").expect("plain home must render");
         let want = "[Unit]\n\
                      Description=Flight Deck server daemon (flightdeckd)\n\
                      \n\
@@ -140,7 +193,7 @@ mod tests {
     /// account it runs under there).
     #[test]
     fn system_unit_matches_the_real_server() {
-        let got = render_system_unit("josty", "/home/josty");
+        let got = render_system_unit("josty", "/home/josty").expect("plain user/home must render");
         let want = "[Unit]\n\
                      Description=Flight Deck server daemon (flightdeckd)\n\
                      After=network-online.target\n\
@@ -157,6 +210,45 @@ mod tests {
                      [Install]\n\
                      WantedBy=multi-user.target\n";
         assert_eq!(got, want);
+    }
+
+    /// An embedded newline in `home` must be REJECTED, not silently rendered — a raw
+    /// `\n` would start a brand-new, uncontrolled `KEY=VALUE` line in the unit file
+    /// regardless of `shq()`'s shell-style quoting (see the module doc's "Newline
+    /// injection" note). Both renderers share this check.
+    #[test]
+    fn user_unit_rejects_a_newline_in_home() {
+        let evil = "/home/alex\nExecStartPre=/bin/touch /tmp/PWNED";
+        let err = render_user_unit(evil).expect_err("a newline in home must be rejected");
+        assert_eq!(err, UnsafeUnitValue { field: "home" });
+    }
+
+    #[test]
+    fn system_unit_rejects_a_newline_in_user() {
+        let evil = "josty\nExecStartPre=/bin/touch /tmp/PWNED\n#";
+        let err = render_system_unit(evil, "/home/josty").expect_err("a newline in user must be rejected");
+        assert_eq!(err, UnsafeUnitValue { field: "user" });
+    }
+
+    #[test]
+    fn system_unit_rejects_a_newline_in_home() {
+        let evil = "/home/x\nExecStartPre=/bin/touch /tmp/PWNED\n#";
+        let err = render_system_unit("josty", evil).expect_err("a newline in home must be rejected");
+        assert_eq!(err, UnsafeUnitValue { field: "home" });
+    }
+
+    /// A carriage return is just as much a line terminator to a line-oriented parser
+    /// as `\n` is — reject it too, on either field.
+    #[test]
+    fn system_unit_rejects_a_carriage_return_in_either_field() {
+        assert_eq!(
+            render_system_unit("jos\rty", "/home/josty").unwrap_err(),
+            UnsafeUnitValue { field: "user" }
+        );
+        assert_eq!(
+            render_system_unit("josty", "/home/jos\rty").unwrap_err(),
+            UnsafeUnitValue { field: "home" }
+        );
     }
 
     #[test]
@@ -215,7 +307,7 @@ mod tests {
 
     #[test]
     fn user_unit_home_with_space_is_shq_safe() {
-        let got = render_user_unit("/home/jos ty");
+        let got = render_user_unit("/home/jos ty").expect("a space is not a line break");
         assert!(got.contains("ExecStart='/home/jos ty'/.local/bin/flightdeckd run"));
     }
 }
