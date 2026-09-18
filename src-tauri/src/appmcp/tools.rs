@@ -563,12 +563,18 @@ mod tests {
     }
 
     /// The blacklist stays a blacklist: no destructive / privilege-raising tool
-    /// name may ever appear on either surface.
+    /// name may ever appear on either surface. `"bootstrap"`/`"diagnose"`/`"repair"`
+    /// (B11) cover `bootstrap_server`/`bootstrap_resume`/`bootstrap_cancel`/
+    /// `machine_diagnose`/`machine_repair` — none of the orchestrator's commands are
+    /// agent tools: installing a service, escalating `sudo`, or driving a server's
+    /// `claude` sign-in stays human-only, same as everything else on this list.
     #[test]
     fn forbidden_tools_are_absent() {
         for surface in [Surface::App, Surface::Voice] {
             for t in for_surface(surface) {
-                for banned in ["permission", "remote_control", "delete", "wipe", "rewind", "fork"] {
+                for banned in
+                    ["permission", "remote_control", "delete", "wipe", "rewind", "fork", "bootstrap", "diagnose", "repair"]
+                {
                     assert!(!t.name.contains(banned), "{} exposes banned capability", t.name);
                 }
             }

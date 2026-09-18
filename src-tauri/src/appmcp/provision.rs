@@ -39,8 +39,12 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ipc::commands::{run_ssh_on_machine, run_ssh_on_machine_stdin, shq};
+use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, shq};
 use crate::store::{MachineRecord, Store};
+
+/// Bound for this module's stdin-bearing ssh calls (`add-phone`/`remove-phone`) —
+/// unchanged from what this module used before B11's ssh-helper unification.
+const PHONE_ROUND_TRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -258,7 +262,9 @@ async fn run_phone_reply(
     remote_cmd: &str,
     stdin_payload: &[u8],
 ) -> Result<DaemonReply, String> {
-    let out = run_ssh_on_machine_stdin(machine, known_hosts, remote_cmd, stdin_payload).await?;
+    let out =
+        run_ssh_on_machine_stdin(machine, known_hosts, remote_cmd, stdin_payload, None, PHONE_ROUND_TRIP_TIMEOUT)
+            .await?;
     if let Some(reply) = parse_daemon_reply(&out.stdout) {
         return Ok(reply);
     }
@@ -306,10 +312,17 @@ pub async fn provision_phone_on_machine(
         return Ok(ProvisionState::Failed { reason: "no phone pairing token minted yet".into() });
     }
 
+    // Resolved via the crate's ONE shared resolver (`ipc::commands::
+    // resolve_daemon_bin_expr`, B11) rather than a bare `flightdeckd` — a
+    // non-interactive ssh shell never has `~/.local/bin` on `PATH`, so a user-level
+    // install made every call below fail with "command not found" until this
+    // resolved it the same way `bootstrap::install`/`bootstrap::server_setup` do.
+    let daemon_bin = resolve_daemon_bin_expr("flightdeckd");
+
     // Best-effort: attach this daemon's own identity if whoami answers. Neither a
     // connectivity failure nor an unparsable answer stops provisioning below —
     // `add-phone` is the round trip that actually determines the outcome.
-    if let Ok(stdout) = run_ssh_on_machine(&machine, known_hosts, "flightdeckd whoami").await {
+    if let Ok(stdout) = run_ssh_on_machine(&machine, known_hosts, &format!("{daemon_bin} whoami")).await {
         if let Ok(identity) = serde_json::from_str::<WhoamiIdentity>(stdout.trim()) {
             let _ = store.set_machine_daemon_identity(
                 &machine.id,
@@ -320,7 +333,7 @@ pub async fn provision_phone_on_machine(
         }
     }
 
-    let cmd = format!("flightdeckd add-phone --token - --label {}", shq(&cfg.mac_label));
+    let cmd = format!("{daemon_bin} add-phone --token - --label {}", shq(&cfg.mac_label));
     let state = match run_phone_reply(&machine, known_hosts, &cmd, cfg.phone_token.as_bytes()).await {
         Ok(DaemonReply::Ok { .. }) => {
             store
@@ -406,7 +419,8 @@ pub async fn revoke_phone_on_machine(
     machine: &MachineRecord,
     token: &str,
 ) -> RevokeOutcome {
-    match run_phone_reply(machine, known_hosts, "flightdeckd remove-phone --token -", token.as_bytes()).await {
+    let cmd = format!("{} remove-phone --token -", resolve_daemon_bin_expr("flightdeckd"));
+    match run_phone_reply(machine, known_hosts, &cmd, token.as_bytes()).await {
         Ok(DaemonReply::Ok { .. }) => {
             let _ = store.clear_daemon_phone_revocation(&machine.id, token);
             RevokeOutcome::Removed

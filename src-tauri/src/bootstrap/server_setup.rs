@@ -145,13 +145,19 @@ pub async fn run_init(
     known_hosts: Option<&str>,
     label: &str,
 ) -> Result<InitOutcome, BootstrapError> {
-    let init_cmd = format!("flightdeckd init --label {}", crate::ipc::commands::shq(label));
+    // Resolved via the crate's ONE shared resolver (`ipc::commands::
+    // resolve_daemon_bin_expr`, B11) rather than a bare `flightdeckd` — a
+    // non-interactive ssh shell never has `~/.local/bin` on `PATH`, so a user-level
+    // install (see `bootstrap::install`'s own identical trap) made every call in this
+    // function fail with "command not found" until this resolved it the same way.
+    let daemon_bin = crate::ipc::commands::resolve_daemon_bin_expr("flightdeckd");
+    let init_cmd = format!("{daemon_bin} init --label {}", crate::ipc::commands::shq(label));
     let already_initialized = match run_ssh_on_machine(machine, known_hosts, &init_cmd).await {
         Ok(_stdout) => false,
         Err(stderr) => classify_init(false, &stderr)?,
     };
 
-    let identity = run_ssh_on_machine(machine, known_hosts, "flightdeckd whoami")
+    let identity = run_ssh_on_machine(machine, known_hosts, &format!("{daemon_bin} whoami"))
         .await
         .ok()
         .and_then(|stdout| parse_whoami(&stdout));
@@ -304,7 +310,7 @@ fn parse_auth_status(stdout: &str) -> Option<AuthStatus> {
 /// never gating on `output.status.success()`. This mirrors that: read stdout, parse
 /// it, done. `None` on an ssh-level failure (couldn't connect, etc.) or an unparseable
 /// answer — both already mean "could not confirm" to every caller here.
-async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
+pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
     let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
     cmd.arg("-T")
         .arg(format!("{}@{}", machine.user, machine.host))

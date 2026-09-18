@@ -5,7 +5,7 @@
 //!
 //! Both halves go over the crate's existing KEYED ssh path (`keyed_ssh_options` /
 //! [`crate::ipc::commands::run_ssh_on_machine`] / [`crate::ipc::commands::
-//! run_ssh_on_machine_with_stdin`]) — never `bootstrap::askpass`'s first-contact,
+//! run_ssh_on_machine_stdin`]) — never `bootstrap::askpass`'s first-contact,
 //! password-only relay: by this point in the flow the server already has the app's key
 //! (see [`crate::bootstrap::connect`]) and has already been probed
 //! ([`crate::ipc::commands::RemoteProbeResult`], B7). The ONE place this module DOES
@@ -37,8 +37,18 @@ use specta::Type;
 
 use crate::bootstrap::askpass::{self, BootstrapError, SecretString};
 use crate::bootstrap::templates;
-use crate::ipc::commands::{run_ssh_on_machine, run_ssh_on_machine_with_stdin, RemoteProbeResult};
+use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, RemoteProbeResult};
 use crate::store::{MachineRecord, Store};
+
+/// Default bound for this module's stdin-bearing ssh calls — every one here except the
+/// daemon binary upload itself is a short script with no meaningful payload (a unit
+/// file is a few hundred bytes, a status/sudo check has none at all).
+const SSH_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound for [`stream_upload`] specifically — the static musl `flightdeckd` binary can
+/// be tens of MB, over whatever link the target VPS happens to have; the default
+/// [`SSH_STDIN_TIMEOUT`] would be too tight for a slow connection.
+const SSH_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 // ============================================================================
 // B8 — upload_daemon
@@ -169,16 +179,17 @@ async fn resolve_target_and_check(
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<(String, Option<String>), BootstrapError> {
-    let (success, stdout, stderr) = run_ssh_on_machine_with_stdin(
+    let out = run_ssh_on_machine_stdin(
         machine,
         known_hosts,
         templates::RESOLVE_DAEMON_TARGET_SCRIPT,
         &[],
         ssh_bin_override,
+        SSH_STDIN_TIMEOUT,
     )
     .await
     .map_err(BootstrapError::Other)?;
-    parse_resolve_target_output(&stdout, &stderr, success)
+    parse_resolve_target_output(&out.stdout, &out.stderr, out.success)
 }
 
 /// Parses [`templates::render_upload_script`]'s result. `Ok(())` ONLY when the script's
@@ -217,14 +228,13 @@ async fn stream_upload(
     expected_sha256: &str,
 ) -> Result<(), BootstrapError> {
     let script = templates::render_upload_script(target, bytes.len() as u64, expected_sha256);
-    let (success, stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, &script, bytes, ssh_bin_override)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if !success && askpass::is_host_key_mismatch(&stderr) {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, &script, bytes, ssh_bin_override, SSH_UPLOAD_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if !out.success && askpass::is_host_key_mismatch(&out.stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
-    parse_upload_output(&stdout, success, bytes.len() as u64)
+    parse_upload_output(&out.stdout, out.success, bytes.len() as u64)
 }
 
 /// Best-effort removal of any leftover `.flightdeckd.upload.*` temp file under
@@ -247,7 +257,9 @@ async fn cleanup_upload_temp(
         "rm -f \"$(dirname {target})\"/.flightdeckd.upload.* 2>/dev/null",
         target = crate::ipc::commands::shq(target)
     );
-    if let Err(e) = run_ssh_on_machine_with_stdin(machine, known_hosts, &cmd, &[], ssh_bin_override).await {
+    if let Err(e) =
+        run_ssh_on_machine_stdin(machine, known_hosts, &cmd, &[], ssh_bin_override, SSH_STDIN_TIMEOUT).await
+    {
         eprintln!("[bootstrap::install] best-effort upload-temp cleanup failed: {e}");
     }
 }
@@ -459,15 +471,14 @@ async fn install_system_unit(machine: &MachineRecord, known_hosts: Option<&str>)
         .map_err(|e| BootstrapError::Other(e.to_string()))?;
     let script = "cat > /etc/systemd/system/flightdeckd.service && systemctl daemon-reload && \
                    systemctl enable --now flightdeckd";
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, script, unit.as_bytes(), None)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if success {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, script, unit.as_bytes(), None, SSH_STDIN_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if out.success {
         Ok(())
     } else {
         Err(BootstrapError::Other(
-            stderr.trim().lines().last().unwrap_or("could not install the system unit").to_string(),
+            out.stderr.trim().lines().last().unwrap_or("could not install the system unit").to_string(),
         ))
     }
 }
@@ -487,15 +498,14 @@ async fn install_user_unit(machine: &MachineRecord, known_hosts: Option<&str>) -
                    cat > ~/.config/systemd/user/flightdeckd.service && \
                    systemctl --user daemon-reload && \
                    systemctl --user enable --now flightdeckd";
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, script, unit.as_bytes(), None)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if success {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, script, unit.as_bytes(), None, SSH_STDIN_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if out.success {
         Ok(())
     } else {
         Err(BootstrapError::Other(
-            stderr.trim().lines().last().unwrap_or("could not install the user unit").to_string(),
+            out.stderr.trim().lines().last().unwrap_or("could not install the user unit").to_string(),
         ))
     }
 }
@@ -529,21 +539,25 @@ async fn install_detached_process(
         return Ok(());
     }
     let script = "setsid nohup \"$HOME/.local/bin/flightdeckd\" run >/dev/null 2>&1 </dev/null &";
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, script, &[], ssh_bin_override)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if success {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, script, &[], ssh_bin_override, SSH_STDIN_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if out.success {
         Ok(())
     } else {
         Err(BootstrapError::Other(
-            stderr.trim().lines().last().unwrap_or("could not launch the detached flightdeckd process").to_string(),
+            out.stderr
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("could not launch the detached flightdeckd process")
+                .to_string(),
         ))
     }
 }
 
 /// Whether `flightdeckd status` already reports the daemon running, via
-/// [`DAEMON_STATUS_CMD`] — the SAME application-level check [`verify_daemon_running`]
+/// [`daemon_status_cmd`] — the SAME application-level check [`verify_daemon_running`]
 /// polls for (never a `pgrep`/`ps` cmdline match, which a renamed or re-exec'd process
 /// could dodge). Used by [`install_detached_process`] as its idempotency guard. A
 /// failure to even run the check (unreachable, no output) reads as "not confirmed
@@ -554,11 +568,11 @@ async fn daemon_already_running(
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> bool {
-    let (success, stdout, _stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, DAEMON_STATUS_CMD, &[], ssh_bin_override)
-            .await
-            .unwrap_or((false, String::new(), String::new()));
-    success && stdout.contains("fd_status")
+    let cmd = daemon_status_cmd();
+    match run_ssh_on_machine_stdin(machine, known_hosts, &cmd, &[], ssh_bin_override, SSH_STDIN_TIMEOUT).await {
+        Ok(out) => out.success && out.stdout.contains("fd_status"),
+        Err(_) => false,
+    }
 }
 
 /// Which `systemctl` scope (if any) governs the daemon — feeds
@@ -582,20 +596,23 @@ impl UnitScope {
 const DAEMON_UP_POLL_ATTEMPTS: u32 = 10;
 const DAEMON_UP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Runs `flightdeckd status`, resolving the binary the SAME way
-/// `bootstrap::connect::PROBE_SCRIPT` does (`PATH` first, falling back to
-/// `~/.local/bin/flightdeckd`) rather than a bare `flightdeckd` — a non-interactive ssh
-/// command never sources `.profile`/`.bashrc`, so `~/.local/bin` is never on `PATH`
-/// for the NON-root install paths this module itself uploads to (see
-/// [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`]'s own doc for the identical trap on the
-/// upload side) — VERIFIED live: without this resolution, [`verify_daemon_running`] reported
-/// a false "did not come up" against fixture A/D even though `systemctl is-active`
-/// showed the unit genuinely running (`command not found` on the bare name). The
-/// root/system-unit path (`/usr/local/bin`) is unaffected either way — it is on the
-/// default non-interactive `PATH` on every distro this app targets.
-const DAEMON_STATUS_CMD: &str = "FLIGHTDECKD_BIN=$(command -v flightdeckd 2>/dev/null); \
-                                  [ -n \"$FLIGHTDECKD_BIN\" ] || FLIGHTDECKD_BIN=\"$HOME/.local/bin/flightdeckd\"; \
-                                  \"$FLIGHTDECKD_BIN\" status 2>/dev/null";
+/// The `flightdeckd status` command run by [`daemon_already_running`] /
+/// [`verify_daemon_running`], resolving the binary via the crate's ONE shared
+/// resolver ([`resolve_daemon_bin_expr`] — B11's unification of what used to be this
+/// function's own, narrower PATH-then-`~/.local/bin` search, missing the
+/// `/usr/local/bin` fallback the shared resolver also covers) rather than a bare
+/// `flightdeckd` — a non-interactive ssh command never sources `.profile`/`.bashrc`, so
+/// `~/.local/bin` is never on `PATH` for the NON-root install paths this module itself
+/// uploads to (see [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`]'s own doc for the
+/// identical trap on the upload side) — VERIFIED live: without this resolution,
+/// [`verify_daemon_running`] reported a false "did not come up" against fixture A/D
+/// even though `systemctl is-active` showed the unit genuinely running (`command not
+/// found` on the bare name). The root/system-unit path (`/usr/local/bin`) is
+/// unaffected either way — it is on the default non-interactive `PATH` on every distro
+/// this app targets.
+fn daemon_status_cmd() -> String {
+    format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"))
+}
 
 /// Polls `flightdeckd status` up to [`DAEMON_UP_POLL_ATTEMPTS`] times
 /// ([`DAEMON_UP_POLL_INTERVAL`] apart) for the real daemon's own `fd_status` response —
@@ -610,11 +627,12 @@ async fn verify_daemon_running(
     known_hosts: Option<&str>,
     unit_scope: Option<UnitScope>,
 ) -> Result<(), BootstrapError> {
+    let status_cmd = daemon_status_cmd();
     for attempt in 0..DAEMON_UP_POLL_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(DAEMON_UP_POLL_INTERVAL).await;
         }
-        if let Ok(out) = run_ssh_on_machine(machine, known_hosts, DAEMON_STATUS_CMD).await {
+        if let Ok(out) = run_ssh_on_machine(machine, known_hosts, &status_cmd).await {
             if out.contains("fd_status") {
                 return Ok(());
             }
@@ -786,14 +804,13 @@ async fn sudo_dash_n_true(
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<bool, BootstrapError> {
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, "sudo -n true", &[], ssh_bin_override)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if !success && askpass::is_host_key_mismatch(&stderr) {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, "sudo -n true", &[], ssh_bin_override, SSH_STDIN_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if !out.success && askpass::is_host_key_mismatch(&out.stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
-    Ok(success)
+    Ok(out.success)
 }
 
 /// Runs `script` under passwordless `sudo -n` — only ever called once
@@ -807,15 +824,14 @@ async fn run_sudo_passwordless(
     script: &str,
 ) -> Result<(), BootstrapError> {
     let remote = format!("sudo -n sh -c {}", crate::ipc::commands::shq(script));
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, &remote, &[], ssh_bin_override)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if success {
+    let out = run_ssh_on_machine_stdin(machine, known_hosts, &remote, &[], ssh_bin_override, SSH_STDIN_TIMEOUT)
+        .await
+        .map_err(BootstrapError::Other)?;
+    if out.success {
         Ok(())
     } else {
         Err(BootstrapError::Other(
-            stderr.trim().lines().last().unwrap_or("sudo escalation failed").to_string(),
+            out.stderr.trim().lines().last().unwrap_or("sudo escalation failed").to_string(),
         ))
     }
 }
@@ -850,17 +866,23 @@ async fn run_sudo_with_password(
 ) -> Result<(), BootstrapError> {
     let remote = format!("sudo -S -p '' sh -c {}", crate::ipc::commands::shq(script));
     let payload = format!("{}\n", password.expose());
-    let (success, _stdout, stderr) =
-        run_ssh_on_machine_with_stdin(machine, known_hosts, &remote, payload.as_bytes(), ssh_bin_override)
-            .await
-            .map_err(BootstrapError::Other)?;
-    if success {
+    let out = run_ssh_on_machine_stdin(
+        machine,
+        known_hosts,
+        &remote,
+        payload.as_bytes(),
+        ssh_bin_override,
+        SSH_STDIN_TIMEOUT,
+    )
+    .await
+    .map_err(BootstrapError::Other)?;
+    if out.success {
         return Ok(());
     }
-    if is_wrong_sudo_password(&stderr) {
+    if is_wrong_sudo_password(&out.stderr) {
         return Err(BootstrapError::NeedsSudoPassword);
     }
-    let last_line = stderr.trim().lines().last().unwrap_or("sudo escalation failed").to_string();
+    let last_line = out.stderr.trim().lines().last().unwrap_or("sudo escalation failed").to_string();
     // Scrub any literal occurrence of the password before it becomes a
     // `BootstrapError` — mirrors `askpass::classify_output`'s own discipline for the
     // SAME reason: this is the one branch that forwards a raw line of the remote's own

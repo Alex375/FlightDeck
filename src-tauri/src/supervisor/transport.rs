@@ -313,16 +313,11 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
 /// wins outright" rule. The bare name itself is shell-quoted throughout, so an
 /// unusual (but slash-free) override can't break the surrounding script.
 fn resolve_remote_daemon_bin(daemon_bin: &str) -> String {
-    if daemon_bin.contains('/') {
-        return shell_quote(daemon_bin);
-    }
-    let name = shell_quote(daemon_bin);
-    format!(
-        "$(FLIGHTDECKD_NAME={name}; command -v \"$FLIGHTDECKD_NAME\" 2>/dev/null || \
-         {{ [ -x \"$HOME/.local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"$HOME/.local/bin/$FLIGHTDECKD_NAME\"; }} || \
-         {{ [ -x \"/usr/local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"/usr/local/bin/$FLIGHTDECKD_NAME\"; }} || \
-         printf %s \"$FLIGHTDECKD_NAME\")"
-    )
+    // Delegates to the crate's ONE shared resolver (`ipc::commands::
+    // resolve_daemon_bin_expr`, B11's unification of what used to be four
+    // independent copies of this same search) — kept as a thin, locally-named
+    // wrapper so every existing call site / test in this module stays unchanged.
+    crate::ipc::commands::resolve_daemon_bin_expr(daemon_bin)
 }
 
 /// Build the single POSIX-sh command `ssh` runs on the remote host: `exec
