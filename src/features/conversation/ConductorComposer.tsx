@@ -25,7 +25,8 @@ import {
   useSlashCommands,
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
-import { useEffectiveCleanOutput } from "../../store/display";
+import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { openInIdeBlockedReason } from "../ide/openInIde";
 import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
 import { ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
@@ -303,6 +304,17 @@ export const ConductorComposer = forwardRef<
     (s) => s.conversations.find((c) => c.id === session)?.name ?? "Conversation",
   );
   const openExtensions = useExtensionsUi((s) => s.openManager);
+  // Why a user-made "IDE view" button must grey itself out here, if it must: the
+  // conversation's repository is remote, or the view is switched off in Settings.
+  const repoIsRemote = useConversationsStore((s) => {
+    const conv = s.conversations.find((c) => c.id === session);
+    return !!s.repos.find((r) => r.id === conv?.repoId)?.machineId;
+  });
+  const ideViewEnabled = useDisplay((s) => s.ideView);
+  const ideBlocked = openInIdeBlockedReason(
+    repoIsRemote ? { machineId: "remote" } : null,
+    ideViewEnabled,
+  );
   // The `/` catalogue is backend-specific: Claude's comes from its `initialize`
   // response (per cwd); Codex's from `skills/list` (fetched only for a Codex conv).
   // Both share the same `SlashCommand` shape + insert/run behaviour (a `/name` in the
@@ -712,6 +724,7 @@ export const ConductorComposer = forwardRef<
     // makes file mentions inert), so panel actions must refuse there rather than flip
     // the persisted layout flags invisibly.
     hostHasPanels: hasPanels,
+    ideBlocked,
   };
 
   // The composer's primary send (button / Enter): text + this conversation's

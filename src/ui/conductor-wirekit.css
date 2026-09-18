@@ -235,15 +235,18 @@
   cursor: pointer;
   transition: background .15s ease, border-color .15s ease, color .15s ease, transform .12s ease;
 }
-.wf-icon-btn:hover:not(:disabled) {
+.wf-icon-btn:hover:not(:disabled):not([aria-disabled]) {
   background: var(--wf-panel-3); border-color: var(--wf-line-2); color: var(--wf-tx-hi);
   transform: translateY(-1px);
 }
-.wf-icon-btn:active:not(:disabled) {
+.wf-icon-btn:active:not(:disabled):not([aria-disabled]) {
   transform: translateY(0) scale(.94);
   background: var(--wf-panel-2);
 }
-.wf-icon-btn:disabled {
+/* `[aria-disabled]` = refused but still HOVERABLE, so the tooltip carrying the reason can
+   render (a truly `disabled` button takes no pointer events). Looks the same as disabled. */
+.wf-icon-btn:disabled,
+.wf-icon-btn[aria-disabled] {
   opacity: .38; cursor: default; color: var(--wf-tx-lo);
 }
 /* Active/toggled state (e.g. the editor panel is open). */

@@ -17,6 +17,11 @@
   border-left: 0;
   border-top: 1px solid var(--wf-line);
 }
+/* Inside the IDE dock, whose header already separates it from the editor. */
+.termFlush {
+  border-left: 0;
+  border-top: 0;
+}
 
 /* xterm fills the host; kill the default focus outline (the app has its own look). */
 .term :global(.xterm),

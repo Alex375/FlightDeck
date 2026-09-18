@@ -35,14 +35,14 @@ export interface SettingEntry {
  *  and the panel agree on the ids — the test cross-checks the index against it). */
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
   general: ["accounts", "system"],
-  display: ["appearance", "thread", "timing", "composer", "models", "order"],
+  display: ["appearance", "thread", "timing", "composer", "models", "ide", "order"],
   claudeCode: ["instructions", "behavior", "helpers"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
-  // ---- Display (Appearance / Thread / Durations / Composer / Models / Order) ----
+  // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
@@ -94,6 +94,15 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "New conversations", section: "display", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
   { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
   { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
+
+  // ---- Display, continued: IDE ---------------------------------------------
+  // The IDE card's own title is indexed too (like "Switching" below): on its own it's a
+  // second way to land on the card, and it's the flash target for "Panel position",
+  // which has no titled row of its own to flash instead.
+  { title: "IDE", section: "display", sub: "ide", group: "IDE", keywords: "ide view editor explorer files folder workspace terminals dock panel conversations vue ide" },
+  { title: "IDE view", section: "display", sub: "ide", group: "IDE", keywords: "ide editor explorer files folder workspace terminals dock tab onglet dossier fichiers vs code" },
+  { title: "Panel position", flash: "IDE", section: "display", sub: "ide", group: "IDE", keywords: "panneau position droite bas marge pied de page dock terminal conversations" },
+  { title: "Dim hidden files in the explorer", section: "display", sub: "ide", group: "IDE", keywords: "fichiers cachés dotfiles estomper explorateur git" },
 
   // ---- Shortcuts + Display → Order ----------------------------------------
   { title: "Keyboard shortcuts", section: "shortcuts", group: "Keyboard shortcuts", keywords: "keys chords raccourcis clavier" },

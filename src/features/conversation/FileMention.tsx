@@ -52,7 +52,15 @@ interface MentionCtx {
    *  card (a dual-purpose click), and touches NOTHING else — not the filename in the expanded
    *  diff/snippet header, not prose paths, not Markdown file links. */
   stepRowInert: boolean;
+  /** Where a clicked mention opens, when the host is NOT the conversation view. The IDE
+   *  view sets it so a file opens in the IDE's own editor instead of the conversation's
+   *  side region — which is not on screen there, so the default route would be a dead
+   *  click that also flips the persisted `editorOpen` flag. Null = the default route. */
+  onOpen: MentionOpener | null;
 }
+
+/** Opens an absolute path (optionally at a line) in whatever editor the host owns. */
+export type MentionOpener = (abs: string, opts?: { line?: number; column?: number }) => void;
 
 const Ctx = createContext<MentionCtx | null>(null);
 
@@ -60,11 +68,14 @@ export function FileMentionProvider({
   convId,
   cwd,
   inert = false,
+  onOpen = null,
   children,
 }: {
   convId: string;
   cwd: string;
   inert?: boolean;
+  /** Route mention clicks to the host's own editor (see {@link MentionCtx.onOpen}). */
+  onOpen?: MentionOpener | null;
   children: ReactNode;
 }) {
   // The "clickable file paths (Read/Write tools)" pref gates ONE surface: the filename on a
@@ -72,8 +83,8 @@ export function FileMentionProvider({
   // links, the filename in a diff/snippet header — stays clickable regardless of it.
   const clickableStepRow = useDisplay((s) => s.clickableFileMentions);
   const value = useMemo(
-    () => ({ convId, cwd, inert, stepRowInert: inert || !clickableStepRow }),
-    [convId, cwd, inert, clickableStepRow],
+    () => ({ convId, cwd, inert, stepRowInert: inert || !clickableStepRow, onOpen }),
+    [convId, cwd, inert, clickableStepRow, onOpen],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
@@ -95,6 +106,16 @@ function useFileMentionCtx(): MentionCtx | null {
  * inert provider degrades.
  */
 export function useHostInert(): boolean {
+  const ctx = useFileMentionCtx();
+  // A host that routes mentions to its OWN editor (the IDE view) has no conversation side
+  // region either: the artifact viewer lives there, so it degrades exactly like the modal.
+  return (ctx?.inert ?? false) || !!ctx?.onOpen;
+}
+
+/** True when FILE mentions must render as plain text. Narrower than {@link useHostInert}:
+ *  the IDE view has no side region (artifacts degrade) but does have an editor (mentions
+ *  stay clickable). Same off-provider answer (`false`) as its sibling, on purpose. */
+function useMentionsInert(): boolean {
   return useFileMentionCtx()?.inert ?? false;
 }
 
@@ -136,13 +157,18 @@ function useMentionTarget(raw: string): MentionTarget | null {
 }
 
 function openTarget(t: MentionTarget): void {
+  const opts = t.mention.line != null ? { line: t.mention.line, column: t.mention.column } : undefined;
+  if (t.ctx.onOpen) {
+    t.ctx.onOpen(t.abs, opts);
+    return;
+  }
   useEditorStore
     .getState()
     .revealInEditor(
       t.ctx.convId,
       t.ctx.cwd,
       t.abs,
-      t.mention.line != null ? { line: t.mention.line, column: t.mention.column } : undefined,
+      opts,
     );
 }
 
@@ -337,9 +363,10 @@ export function MentionLink({
   // only because a provider-less render also has no convId, so nothing consulted the value —
   // exactly the kind of contradiction that surfaces the day one branch starts reading it.
   const hostInert = useHostInert();
+  const mentionsInert = useMentionsInert();
   const route = useMemo(
-    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: hostInert }),
-    [href, ctx?.cwd, hostInert],
+    () => routeMarkdownLink(href ?? "", { cwd: ctx?.cwd ?? "", inert: mentionsInert }),
+    [href, ctx?.cwd, mentionsInert],
   );
   // A hosted-artifact URL renders as a compact artifact card (opens the in-app viewer / browser),
   // not a plain anchor — regardless of host, so it's recognisable everywhere Claude links one.

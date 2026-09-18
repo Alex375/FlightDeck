@@ -26,6 +26,10 @@ import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
 import { useTosseConnection } from "./ipc/useTosse";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { useHistoryUi } from "./features/history/historyUiStore";
+import { IdeView } from "./features/ide/IdeView";
+import { OpenInIdeButton } from "./features/ide/OpenInIdeButton";
+import { runIdeAction } from "./features/ide/ideActions";
+import { useActiveWorkspace, useIdeStore, workspaceLabel } from "./features/ide/ideStore";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 import { useEditorStore } from "./features/editor/editorStore";
 import { UltraCodeBlast } from "./features/conversation/UltraCodeBlast";
@@ -100,15 +104,21 @@ export default function App() {
   const { data: tosseConnection } = useTosseConnection(tosseTabEnabled);
   const tosseAvailable = tosseTabEnabled && tosseConnection?.connected === true;
 
+  // The IDE tab is conditional too, on its display preference alone (Settings → General →
+  // Display). Off → no tab, no "Open in IDE" entry points, and the view is never mounted.
+  const ideAvailable = useDisplay((s) => s.ideView);
+  const ideWorkspace = useActiveWorkspace();
+
   const changeView = useCallback(
     (next: View) => {
       // A view that isn't currently available is a no-op, not a blank screen: ⌘3 while
       // signed out must leave you where you are.
       if (next === "tosse" && !tosseAvailable) return;
+      if (next === "ide" && !ideAvailable) return;
       if (next !== "flightdeck") closeReplyModal();
       setView(next);
     },
-    [closeReplyModal, tosseAvailable],
+    [closeReplyModal, tosseAvailable, ideAvailable],
   );
 
   // A jump to a message in another conversation (an agent-message card or its toast) selects
@@ -125,11 +135,24 @@ export default function App() {
     changeViewRef.current("conversation");
   }, [jumpNonce]);
 
+  // "Open in IDE", from wherever it was asked (a sidebar button, the title bar, the
+  // composer, ⌘⇧I): the opener set the workspace up in the IDE store; showing the view is
+  // ours — the same split as the thread jump above. 0 is the initial value, not a request.
+  const ideShowNonce = useIdeStore((s) => s.showNonce);
+  useEffect(() => {
+    if (ideShowNonce === 0) return;
+    changeViewRef.current("ide");
+  }, [ideShowNonce]);
+
   // Signing out (or switching the feature off) while the TOSSE view is open must not strand
   // the window on a view that no longer exists — fall back to the deck.
   useEffect(() => {
     if (view === "tosse" && !tosseAvailable) setView("flightdeck");
   }, [view, tosseAvailable]);
+  // Same for the IDE view when its preference is switched off from inside it.
+  useEffect(() => {
+    if (view === "ide" && !ideAvailable) setView("conversation");
+  }, [view, ideAvailable]);
   // Defensive backstop: if a view change ever bypasses `changeView`, still close the
   // modal on leaving the deck (post-render, so it can lag — `changeView` is the
   // race-free path every current caller uses).
@@ -205,6 +228,12 @@ export default function App() {
       // chords above, ⌘+key never types a character, so they win over the editor.
       for (const b of ACTION_BINDINGS) {
         if (!matchChord(e, b.spec)) continue;
+        // In the IDE view the conversation-scoped chords keep their sense but drive the
+        // IDE's own explorer and dock (⌘B / ⌘J …) — see runIdeAction.
+        if (b.scope === "conversation" && viewRef.current === "ide") {
+          if (runIdeAction(b.action)) e.preventDefault();
+          return;
+        }
         if (b.scope === "conversation" && viewRef.current !== "conversation") return;
         if (runAppAction(b.action, { changeView })) e.preventDefault();
         return;
@@ -243,7 +272,11 @@ export default function App() {
           ? "Flight Deck"
           : view === "tosse"
             ? "TOSSE"
-            : active?.name ?? "Conductor"
+            : view === "ide"
+              ? ideWorkspace
+                ? `${workspaceLabel(ideWorkspace.path)} — IDE`
+                : "IDE"
+              : active?.name ?? "Conductor"
       }
       banner={<><UpdateBanner /><ClaudeCliBanner /><AppErrorBanner /></>}
       nav={
@@ -270,6 +303,16 @@ export default function App() {
               on={view === "tosse"}
               title="TOSSE tasks (⌘3)"
               onClick={() => changeView("tosse")}
+            />
+          ) : null}
+          {/* Last, so it keeps ⌘4 whether or not the conditional TOSSE tab is showing. */}
+          {ideAvailable ? (
+            <NavBtn
+              icon="ide"
+              label="IDE"
+              on={view === "ide"}
+              title="IDE (⌘4)"
+              onClick={() => changeView("ide")}
             />
           ) : null}
         </>
@@ -307,6 +350,8 @@ export default function App() {
               {active ? <EditorToggle /> : null}
               {active ? <TerminalToggle /> : null}
               {active ? <GitToggle /> : null}
+              {/* Continue this conversation — and the files open beside it — in the IDE view. */}
+              {active && ideAvailable ? <OpenInIdeButton conv={active} /> : null}
               {active ? (
                 <OpenInTerminalButton
                   sessionId={active.sessionId}
@@ -323,6 +368,8 @@ export default function App() {
         <ConductorConversation active={active} />
       ) : view === "tosse" ? (
         <TosseView onOpenConversation={openConversation} />
+      ) : view === "ide" ? (
+        <IdeView onOpenConversation={openConversation} />
       ) : (
         <FlightDeck onOpen={openConversation} />
       )}
@@ -357,9 +404,9 @@ export default function App() {
       {/* Idem (render-null): executes the app-control tool calls bridged from the
           app-hosted MCP servers (agents piloting the app). Mounted HERE so it can
           drive the view, like the keyboard shortcuts. */}
-      <AppControlHost changeView={changeView} tosseAvailable={tosseAvailable} />
+      <AppControlHost changeView={changeView} currentView={view} tosseAvailable={tosseAvailable} />
       {/* Idem (render-null): the voice agent's helpers + announcement drain. */}
-      <VoiceHost changeView={changeView} tosseAvailable={tosseAvailable} />
+      <VoiceHost changeView={changeView} currentView={view} tosseAvailable={tosseAvailable} />
       {/* Idem (render-null): keeps each linked conversation's copy of its TOSSE task in step
           with the CRM, so the delete warning stops asking about tasks that are already done. */}
       <LinkedTaskSync />

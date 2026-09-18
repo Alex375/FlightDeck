@@ -404,18 +404,28 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 },
                 ToolSpec {
                     name: "open_file",
-                    description: "Open a file in the app's editor panel, optionally at a line \
-                        and column — use it to show the user the code you are talking about. \
-                        Focuses the target conversation (default: the calling one) and its \
-                        editor. Relative paths resolve against that conversation's working \
-                        directory.",
+                    description: "Open a file in the app's editor, optionally at a line and \
+                        column — use it to show the user the code you are talking about. \
+                        Relative paths resolve against the target conversation's working \
+                        directory. Leave `view` OUT unless the user asked for a specific place: \
+                        the file then opens where the user is looking — in the IDE view when it \
+                        is on screen and showing this conversation's folder, otherwise in the \
+                        conversation's own side editor (which focuses that conversation). \
+                        view: \"ide\" forces the top-level IDE view (the conversation's folder is \
+                        opened or focused as a workspace and the file opens in ITS editor); it is \
+                        refused when the IDE view is switched off or the conversation's \
+                        repository is remote (the IDE only browses this Mac's files). \
+                        view: \"conversation\" forces the conversation's side editor.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
                             "path": { "type": "string", "description": "File path (absolute, or relative to the conversation's cwd)." },
                             "line": { "type": "integer", "minimum": 1, "description": "1-based line to reveal." },
                             "column": { "type": "integer", "minimum": 1, "description": "1-based column." },
-                            "conversation_id": conversation_id_prop("Conversation whose editor opens the file (default: the calling one)."),
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) opens the file (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Force where the file opens. Omit it (recommended) to \
+                                    open it where the user is currently looking." },
                         }),
                         &["path"],
                     ),
@@ -423,11 +433,12 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 ToolSpec {
                     name: "open_view",
                     description: "Switch the app's main view: 'conversation' (the active \
-                        thread), 'flightdeck' (the fleet overview) or 'tosse' (the CRM tasks \
-                        board, only when signed in).",
+                        thread), 'flightdeck' (the fleet overview), 'tosse' (the CRM tasks \
+                        board, only when signed in) or 'ide' (folders opened as workspaces: \
+                        file explorer, editor, terminals and docked conversations).",
                     kind: ToolKind::Front,
                     schema: obj(
-                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse"] } }),
+                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse", "ide"] } }),
                         &["view"],
                     ),
                 },

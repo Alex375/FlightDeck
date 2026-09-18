@@ -14,15 +14,20 @@ import type { View } from "../ui/shortcuts";
 
 export function AppControlHost({
   changeView,
+  currentView,
   tosseAvailable,
 }: {
   changeView: (view: View) => void;
+  /** The view on screen, so a tool can route to where the user is looking. */
+  currentView: View;
   tosseAvailable: boolean;
 }) {
   // The listener is mounted once (empty deps) but must always use the LIVE
-  // changeView / availability (they re-bind on tosse sign-in); refs bridge.
+  // changeView / view / availability (they re-bind on tosse sign-in); refs bridge.
   const changeViewRef = useRef(changeView);
   changeViewRef.current = changeView;
+  const currentViewRef = useRef(currentView);
+  currentViewRef.current = currentView;
   const tosseRef = useRef(tosseAvailable);
   tosseRef.current = tosseAvailable;
 
@@ -30,6 +35,9 @@ export function AppControlHost({
     let disposed = false;
     const helpers: AppControlHelpers = {
       changeView: (view) => changeViewRef.current(view),
+      get currentView() {
+        return currentViewRef.current;
+      },
       get tosseAvailable() {
         return tosseRef.current;
       },

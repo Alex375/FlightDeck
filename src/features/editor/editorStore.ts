@@ -56,6 +56,29 @@ export function diskStampChanged(stamp: DiskStamp | null, stat: FileStat): boole
   return stat.mtime_ms !== stamp.mtimeMs;
 }
 
+/**
+ * The chain of directories to unfold so that `path` becomes visible in a tree
+ * rooted at `root`: the root itself, then each intermediate directory, down to
+ * (and including) the file's parent. The file itself is never in the list.
+ *
+ * Returns an empty list when `path` is the root or lies outside it — there is
+ * nothing to unfold, which is what makes "reveal a file from another tree" a
+ * clean no-op instead of an error.
+ */
+export function ancestorDirs(root: string, path: string): string[] {
+  if (path === root || !isWithin(root, path)) return [];
+  // Drop empty segments so a doubled separator ("/repo//src/a.ts") can't produce a
+  // phantom directory whose read would fail for no reason the user could act on.
+  const segments = path.slice(root.length + 1).split("/").filter(Boolean);
+  const chain = [root];
+  let dir = root;
+  for (const segment of segments.slice(0, -1)) {
+    dir = `${dir}/${segment}`;
+    chain.push(dir);
+  }
+  return chain;
+}
+
 /** The disk stamp carried by a completed read (`readFile` / `readImage`). */
 function stampOf(read: { size: number; mtime_ms: number | null }): DiskStamp {
   return { size: read.size, mtimeMs: read.mtime_ms };
@@ -141,6 +164,13 @@ interface ConvEditor {
   dirErrors: Record<string, string>;
   /** The single in-progress inline edit (new file/folder or rename), or null. */
   editing: EditTarget | null;
+  /**
+   * A one-shot "scroll this row into view" request for the FILE TREE, consumed
+   * once by FileTree then cleared. Same shape and contract as a buffer's
+   * `pendingReveal`: `seq` is a monotonic nonce so asking again for the SAME path
+   * still re-fires the scroll (the row may have been scrolled away since).
+   */
+  treeReveal: { path: string; seq: number } | null;
   /** Open tab paths, in tab order. */
   tabs: string[];
   activeTab: string | null;
@@ -266,7 +296,28 @@ interface EditorState {
   // ---- Tree ----
   /** Initialise a conversation's tree at `root`, resetting it if the root moved. */
   ensureConv: (convId: string, root: string) => void;
+  /** Forget a whole slice (tree + tabs + buffers) — a closed IDE workspace. Unsaved edits
+   *  are flushed to disk FIRST: their autosave timer would otherwise fire against a slice
+   *  that no longer exists, and the last second of typing would vanish without a word.
+   *  Resolves false — slice KEPT — when one of them could not be saved. */
+  dropConv: (convId: string) => Promise<boolean>;
   toggleDir: (convId: string, path: string) => Promise<void>;
+  /**
+   * Unfold the tree down to `path` and ask FileTree to scroll that row into view
+   * (an IDE's "auto reveal": you always SEE where the open file lives).
+   *
+   * Loads every ancestor directory that isn't loaded yet — through `toggleDir`, so
+   * a read records `loadingDirs` / `dirErrors` exactly as a click would — and
+   * expands the ones that are merely folded, never collapsing one that is already
+   * open. A path outside the slice's root is a clean no-op (the file is simply not
+   * in this tree), a directory that fails to read stops the descent and leaves
+   * `dirErrors` to surface it, and a root that moves (or a slice that disappears)
+   * mid-read stops the walk quietly — that reveal was about a tree that no longer
+   * exists.
+   */
+  revealInTree: (convId: string, path: string) => Promise<void>;
+  /** Clear a consumed one-shot tree-scroll request. */
+  clearTreeReveal: (convId: string) => void;
 
   // ---- Explorer mutations (context menu) ----
   /** Begin creating a new file/folder inside `parentDir`: expands it and shows an
@@ -458,6 +509,10 @@ async function safeCmd<T>(
 // Monotonic nonce for line-reveal requests, so re-clicking the SAME line re-fires.
 let revealSeq = 0;
 
+// The same nonce for TREE-scroll requests (see `ConvEditor.treeReveal`), so
+// revealing the same file twice scrolls to it twice.
+let treeRevealSeq = 0;
+
 const autosaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const timerKey = (convId: string, path: string) => `${convId} ${path}`;
 
@@ -495,6 +550,7 @@ function emptyConv(root: string): ConvEditor {
     loadingDirs: {},
     dirErrors: {},
     editing: null,
+    treeReveal: null,
     tabs: [],
     activeTab: null,
     buffers: {},
@@ -581,6 +637,19 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       // listing. Never let that pass silently (zero-silent-error): surface it on
       // the app banner so the user knows the view may be out of date and can act.
       reportFsError("Tree not refreshed — it may be out of date.", res.error);
+    }
+  }
+
+  /** Wait for a directory read STARTED ELSEWHERE to settle (bounded, then gives up).
+   *  `toggleDir` never starts a second read for the same directory, so a reveal that
+   *  arrives while the tree is loading that very folder has to wait for it — the
+   *  alternative is stopping the descent on a folder that is about to be there, i.e.
+   *  a reveal that quietly does nothing. The bound is a safety net: if the flag were
+   *  ever left set, this returns instead of spinning forever (the caller then sees
+   *  the directory as unloaded and reads it itself). */
+  async function settleDirLoad(convId: string, dir: string): Promise<void> {
+    for (let i = 0; i < 60 && get().byConv[convId]?.loadingDirs[dir]; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
 
@@ -847,6 +916,33 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       });
     },
 
+    dropConv: async (convId) => {
+      const conv = get().byConv[convId];
+      if (!conv) return true;
+      for (const path of conv.tabs) {
+        const b = conv.buffers[path];
+        if (!b?.dirty || b.binary || b.tooLarge) continue;
+        await get().saveBuffer(convId, path);
+        // `saveBuffer` reports a failure on the BUFFER — which is about to be deleted, so
+        // nobody would ever read it. Refuse the drop instead: the edits stay on screen,
+        // and the banner says which file is holding the workspace open.
+        if (get().byConv[convId]?.buffers[path]?.dirty) {
+          useAppErrors
+            .getState()
+            .pushError(`Could not save ${baseName(path)} — the workspace was kept open.`, path);
+          return false;
+        }
+      }
+      for (const path of conv.tabs) clearAutosave(convId, path);
+      set((s) => {
+        if (!s.byConv[convId]) return s;
+        const byConv = { ...s.byConv };
+        delete byConv[convId];
+        return { byConv };
+      });
+      return true;
+    },
+
     toggleDir: async (convId, path) => {
       const conv = get().byConv[convId];
       if (!conv) return;
@@ -883,6 +979,56 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         };
       });
     },
+
+    revealInTree: async (convId, path) => {
+      const conv = get().byConv[convId];
+      if (!conv) return;
+      // Captured once: every hop below compares against it, so a worktree move
+      // mid-walk is noticed instead of unfolding the OLD tree into the new one.
+      const root = conv.root;
+      const chain = ancestorDirs(root, path);
+      if (chain.length === 0) return; // not in this tree (or it IS the root) — nothing to unfold
+
+      for (const dir of chain) {
+        // Re-read the slice on every hop: we awaited, so the workspace may have
+        // been dropped (`dropConv`) or re-rooted under us in the meantime.
+        let c = get().byConv[convId];
+        if (!c || c.root !== root) return;
+        // Someone else may already be reading this directory — the tree's own mount
+        // effect races us for the root. `toggleDir` refuses to start a second read,
+        // so wait for the one in flight rather than stopping short of a folder that
+        // is about to be there (which would silently leave the file unrevealed).
+        if (c.loadingDirs[dir]) {
+          await settleDirLoad(convId, dir);
+          c = get().byConv[convId];
+          if (!c || c.root !== root) return;
+        }
+        if (c.dirs[dir] === undefined) {
+          // Not loaded: read it through the ONE path that records loadingDirs and
+          // dirErrors (it expands on success, which is exactly what we want).
+          await get().toggleDir(convId, dir);
+          const after = get().byConv[convId];
+          if (!after || after.root !== root) return;
+          // Still not loaded → the read failed. `dirErrors` already shows it in the
+          // tree; stop the descent here rather than throwing, since there is nothing
+          // below an unreadable directory to unfold.
+          if (after.dirs[dir] === undefined) return;
+        } else if (!c.expanded[dir]) {
+          // Loaded but folded. NEVER `toggleDir` here: it TOGGLES, so this would
+          // shut a directory the user just opened.
+          patchConv(convId, (cc) => ({ ...cc, expanded: { ...cc.expanded, [dir]: true } }));
+        }
+      }
+
+      // Every ancestor is listed and open, so the row exists in the very render this
+      // request lands in — FileTree consumes it there (see `clearTreeReveal`).
+      patchConv(convId, (c) =>
+        c.root === root ? { ...c, treeReveal: { path, seq: ++treeRevealSeq } } : c,
+      );
+    },
+
+    clearTreeReveal: (convId) =>
+      patchConv(convId, (c) => (c.treeReveal ? { ...c, treeReveal: null } : c)),
 
     // ---- Explorer mutations (context menu) ----
 

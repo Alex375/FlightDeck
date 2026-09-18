@@ -35,6 +35,7 @@ vi.mock("../notifications/notify", () => ({
 const editorActions = {
   revealInEditor: vi.fn(),
   ensureConv: vi.fn(),
+  openFile: vi.fn(() => Promise.resolve()),
   setOpen: vi.fn(),
   setTerminalOpen: vi.fn(),
   setGitOpen: vi.fn(),
@@ -56,6 +57,9 @@ import { useToasts } from "../store/toasts";
 import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
 import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
+// The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
+// view:"ide" tests below is that a real workspace gets opened, not a stub of one.
+import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -182,6 +186,9 @@ beforeEach(() => {
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.setState({ sessions: {} });
   useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
+  // A real store (not mocked): reset it so a workspace opened by one test never leaks
+  // into the next.
+  useIdeStore.setState({ workspaces: [], activeId: null, dockMaximized: false });
   seed(conv());
 });
 
@@ -577,6 +584,21 @@ describe("appControl — UI actions", () => {
     expect(h.views).toEqual([]);
   });
 
+  it("open_view opens the IDE view, and refuses it when the preference is off", async () => {
+    const h = helpers();
+    useDisplay.getState().set({ ideView: true });
+    await executeAppControlTool("open_view", { view: "ide" }, null, h);
+    expect(h.views).toEqual(["ide"]);
+    // `changeView` no-ops on a switched-off view; the TOOL must say so rather than report
+    // a success that changed nothing.
+    useDisplay.getState().set({ ideView: false });
+    await expect(executeAppControlTool("open_view", { view: "ide" }, null, h)).rejects.toThrow(
+      /switched off/,
+    );
+    expect(h.views).toEqual(["ide"]);
+    useDisplay.getState().set({ ideView: true });
+  });
+
   it("open_file refuses '~' paths and nonexistent files", async () => {
     seed(conv({ handle: "session-7" }));
     await expect(
@@ -607,6 +629,182 @@ describe("appControl — UI actions", () => {
   it("notify_user forwards to the agent-notification path", async () => {
     await executeAppControlTool("notify_user", { message: "look here", critical: true }, null, helpers());
     expect(notifyFromAgent).toHaveBeenCalledWith("look here", true);
+  });
+});
+
+describe("appControl — open_file view:\"ide\"", () => {
+  it("opens the file in the workspace's OWN editor slice and switches to the IDE view", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_file",
+      { path: "src/main.rs", line: 42, view: "ide" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+
+    expect(h.views).toEqual(["ide"]);
+    expect(out).toMatchObject({ conversation_id: "c1", path: "/tmp/r1/src/main.rs", line: 42, view: "ide" });
+
+    // One workspace, opened on the conversation's cwd (== the repo folder here).
+    const workspaces = useIdeStore.getState().workspaces;
+    expect(workspaces).toHaveLength(1);
+    const ws = workspaces[0];
+    expect(ws.path).toBe("/tmp/r1");
+
+    const key = editorKeyFor(ws.id);
+    expect(editorActions.ensureConv).toHaveBeenCalledWith(key, "/tmp/r1");
+    expect(editorActions.openFile).toHaveBeenCalledWith(key, "/tmp/r1/src/main.rs", {
+      preview: true,
+      reveal: { line: 42, column: undefined },
+    });
+    // The conversation-view path (revealInEditor mutates the CONVERSATION's global layout
+    // flags) must never fire for an IDE-view open.
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("leaves the app's ACTIVE conversation alone: a background agent asked for a FILE", async () => {
+    // Two conversations in one folder; the user is on c2, and c1 (in the background) opens
+    // a file. It used to repoint the app's selection to c1 — persisted, inherited by ⌘1 and
+    // ⌘⌥↑/↓ — with nothing on screen to say so when the dock was closed or on Terminals.
+    seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta", handle: "session-8" }));
+    useConversationsStore.setState({ activeId: "c2" });
+    useDisplay.getState().set({ ideView: true });
+    await executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", helpers());
+    expect(useConversationsStore.getState().activeId).toBe("c2");
+    expect(editorActions.openFile).toHaveBeenCalled();
+    // …and the conversation the DOCK shows is left alone too: repointing it swapped the
+    // thread the user was reading for the calling agent's, mid-read.
+    expect(useIdeStore.getState().workspaces[0].lastConvId).toBeNull();
+  });
+
+  it("never swaps the folder under the user — even when the docked agent has LEFT it", async () => {
+    // The worktree is the workspace on screen and c1 is docked there; its agent then ran
+    // ExitWorktree (what `/land` does), so it now works at the repository root and every
+    // path it names lives OUTSIDE the workspace. Opening the root as a second workspace
+    // would swap explorer, tabs, terminals and dock mid-`/land`, from a background call.
+    const wt = "/tmp/r1/.claude/worktrees/x";
+    seed(conv({ handle: "session-7", cwd: "/tmp/r1", liveCwd: "/tmp/r1" }));
+    useDisplay.getState().set({ ideView: true });
+    const ws = useIdeStore.getState().openWorkspace(wt, "r1");
+    useIdeStore.getState().noteConversation(ws, "c1"); // docked → pinned although outside
+    const h = { ...helpers(), currentView: "ide" as const };
+    await executeAppControlTool("open_file", { path: "CHANGELOG.md" }, "session-7", h);
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+    expect(useIdeStore.getState().activeId).toBe(ws);
+    // The file still opens — in the workspace on screen, as a tab rooted elsewhere.
+    expect(editorActions.openFile).toHaveBeenCalledWith(
+      editorKeyFor(ws),
+      "/tmp/r1/CHANGELOG.md",
+      expect.anything(),
+    );
+    expect(h.views).toEqual(["ide"]);
+  });
+
+  it("with no 'view', follows the user's eyes: stays in the IDE when the agent is docked there", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    useIdeStore.getState().openWorkspace("/tmp/r1", "r1");
+    const h = { ...helpers(), currentView: "ide" as const };
+    const out = (await executeAppControlTool("open_file", { path: "src/main.rs" }, "session-7", h)) as Record<
+      string,
+      unknown
+    >;
+    // The historical default threw the user out of the IDE view to show the file in a side
+    // editor they were not using.
+    expect(h.views).toEqual(["ide"]);
+    expect(out.view).toBe("ide");
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("with no 'view', keeps the conversation default when the IDE shows ANOTHER folder", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    const other = useIdeStore.getState().openWorkspace("/tmp/elsewhere", null);
+    const h = { ...helpers(), currentView: "ide" as const };
+    await executeAppControlTool("open_file", { path: "src/main.rs" }, "session-7", h);
+    // Opening a file must not swap the folder under the user.
+    expect(h.views).toEqual(["conversation"]);
+    expect(useIdeStore.getState().activeId).toBe(other);
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+  });
+
+  it("stays in the workspace on screen when it already holds the file and the agent", async () => {
+    // The repository's folder is open; the agent works in a worktree UNDER it. A second
+    // workspace for the worktree would swap the explorer to show a file it already reaches.
+    const wt = "/tmp/r1/.claude/worktrees/x";
+    seed(conv({ handle: "session-7", liveCwd: wt }));
+    useDisplay.getState().set({ ideView: true });
+    const root = useIdeStore.getState().openWorkspace("/tmp/r1", "r1");
+    await executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", helpers());
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+    expect(useIdeStore.getState().activeId).toBe(root);
+    expect(editorActions.openFile).toHaveBeenCalledWith(
+      editorKeyFor(root),
+      `${wt}/src/main.rs`,
+      expect.anything(),
+    );
+  });
+
+  it("refuses when the IDE view is switched off — nothing opened, no view change", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: false });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", h),
+    ).rejects.toThrow(/switched off/);
+    expect(h.views).toEqual([]);
+    expect(editorActions.ensureConv).not.toHaveBeenCalled();
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
+    useDisplay.getState().set({ ideView: true }); // restore for the tests that follow
+  });
+
+  it("refuses a conversation whose repository is remote", async () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1, machineId: "mac-2" }],
+      conversations: [conv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    useDisplay.getState().set({ ideView: true });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", h),
+    ).rejects.toThrow(/remote repository/);
+    expect(h.views).toEqual([]);
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
+  });
+
+  it("refuses an unknown 'view' value", async () => {
+    seed(conv({ handle: "session-7" }));
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "flightdeck" }, "session-7", helpers()),
+    ).rejects.toThrow(/'view' must be conversation \| ide/);
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("view:\"conversation\" (explicit) behaves exactly like the default", async () => {
+    seed(conv({ handle: "session-7" }));
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_file",
+      { path: "src/main.rs", line: 42, view: "conversation" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+    expect(h.views).toEqual(["conversation"]);
+    expect(editorActions.revealInEditor).toHaveBeenCalledWith(
+      "c1",
+      "/tmp/r1",
+      "/tmp/r1/src/main.rs",
+      { line: 42, column: undefined },
+    );
+    // No 'view' key — the same shape open_file has always returned.
+    expect(out).toEqual({ conversation_id: "c1", path: "/tmp/r1/src/main.rs", line: 42 });
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
   });
 });
 

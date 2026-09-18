@@ -48,6 +48,11 @@
 .cv-repo-act { width:24px; height:24px; flex:0 0 auto; border:0; background:transparent; color:var(--wf-tx-lo); display:inline-flex; align-items:center; justify-content:center; border-radius:6px; cursor:pointer; opacity:.8; transition:opacity .12s ease, background .12s ease, color .12s ease; }
 .cv-repo-h:hover .cv-repo-act { opacity:1; }
 .cv-repo-act:hover { background:var(--wf-panel-3); color:var(--wf-tx-hi); }
+/* A refused action (e.g. "Open in IDE" on a remote repository) stays visible AND hoverable:
+   it is `aria-disabled`, never `disabled` — a disabled button takes no pointer events, so
+   the tooltip carrying the reason would never render. The click itself says why. */
+.cv-repo-h:hover .cv-repo-act[aria-disabled], .cv-repo-act[aria-disabled],
+.cv-repo-act[aria-disabled]:hover { opacity:.35; cursor:default; background:transparent; color:var(--wf-tx-lo); }
 /* The repo-delete button is a reveal action but danger-tinted on hover (mirrors .cv-sess-del). */
 .cv-repo-del:hover { background:var(--wf-err-bg); color:var(--wf-err); }
 /* Reveal-on-hover: display:none at rest so it reserves ZERO width (a flexed icon button

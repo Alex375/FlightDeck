@@ -1,0 +1,726 @@
+/* The IDE view. Global theme tokens (--wf-*) throughout, and the editor panel's own
+   metrics where the two meet (40px tab bars, --wf-bg-2 chrome over --wf-bg content), so
+   the dock reads as a continuation of the editor above it rather than a second design. */
+
+.root {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-bg);
+}
+
+/* ---- Open folders ---- */
+.strip {
+  flex: 0 0 34px;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 6px;
+  background: var(--wf-bg-2);
+  border-bottom: 1px solid var(--wf-line);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.strip::-webkit-scrollbar {
+  display: none;
+}
+.wsTab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 240px;
+  margin-top: 5px;
+  padding: 0 6px 0 11px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wsTab:hover {
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+}
+/* The open folder's tab joins the content below it: same surface, no bottom edge. */
+.wsTabOn,
+.wsTabOn:hover {
+  background: var(--wf-bg);
+  border-color: var(--wf-line);
+  color: var(--wf-tx-hi);
+  margin-bottom: -1px;
+}
+.wsTabName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.stripAdd {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.stripAdd:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Attention pips (folder tabs, the Conversations switch, the status bar) ---- */
+.pips {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.pips:empty {
+  display: none;
+}
+.pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wf-att);
+}
+.pip[data-attn="review"] {
+  background: var(--wf-wait);
+}
+.pip[data-attn="error"] {
+  background: var(--wf-err);
+}
+
+/* ---- Workspace body ---- */
+.main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+/* Relative so the drop-zone overlay can pin itself to the editor + dock area. Nothing else
+   inside positions itself against an ancestor this far out (the editor's and the composer's
+   own absolutes all sit under a nearer relative parent). */
+.split {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.editorSlot {
+  min-width: 0;
+  min-height: 90px;
+}
+.dockSlot {
+  min-width: 0;
+  display: flex;
+}
+
+/* ---- Dock ---- */
+.dock {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-bg);
+}
+.dockHead {
+  flex: 0 0 36px;
+  display: flex;
+  align-items: stretch;
+  background: var(--wf-bg-2);
+  border-bottom: 1px solid var(--wf-line);
+}
+/* While the panel is being dragged the whole header reads as held. (The page-wide
+   `grabbing` cursor is set on <body> by the drag itself, for everywhere the pointer goes.) */
+.dockHead[data-dragging] {
+  cursor: grabbing;
+}
+
+/* ---- Moving the dock: the grip, and the drop zones it drags onto ---- */
+/* The affordance for the whole feature — a panel that can be moved has to LOOK like one,
+   which a lone icon button on the far right never did. */
+.grip {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 18px;
+  height: 24px;
+  margin-left: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--wf-tx-xlo);
+  cursor: grab;
+  /* The gesture is ours from the first pointerdown: no scrolling or panning may take the
+     pointer sequence away mid-drag. */
+  touch-action: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.grip:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx);
+}
+.dockHead[data-dragging] .grip {
+  cursor: grabbing;
+  color: var(--wf-accent);
+}
+.modeSwitch {
+  flex: 0 0 auto;
+  align-self: center;
+  display: inline-flex;
+  gap: 2px;
+  margin: 0 8px;
+  padding: 2px;
+  border: 1px solid var(--wf-line);
+  border-radius: 7px;
+  background: var(--wf-panel);
+}
+.modeBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.modeBtn:hover {
+  color: var(--wf-tx);
+}
+.modeBtn[data-on] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+/* Beside the editor the dock is narrow (it holds to the composer's floor), and the tabs
+   are what the width is for: the switch falls back to its icons, which the counts and the
+   tooltips keep readable. */
+.dock[data-position="right"] .modeLabel {
+  display: none;
+}
+.count {
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  color: var(--wf-tx-lo);
+}
+.modeBtn[data-on] .count {
+  color: var(--wf-tx);
+}
+
+.tabStrip {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  border-left: 1px solid var(--wf-line);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  /* Its EMPTY end is a second place to take hold of the panel; the tabs and the + button
+     carry their own `pointer` cursor, so only the filler shows this one. */
+  cursor: grab;
+}
+.tabStrip::-webkit-scrollbar {
+  display: none;
+}
+.tab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 300px;
+  padding: 0 6px 0 12px;
+  border: 0;
+  border-right: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tab:hover {
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+}
+.tab[data-on] {
+  background: var(--wf-bg);
+  color: var(--wf-tx-hi);
+  box-shadow: inset 0 -2px 0 var(--wf-accent);
+}
+/* (No extra right padding: a conversation tab ends on its close button, like a terminal's.)
+   The focus ring is the keyboard user's only cue on a div-based tab. */
+.convTab:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: -1px;
+}
+/* A conversation that wants the user tints its tab in its status colour — the sidebar
+   row's language, so "amber = it is waiting for you" means the same thing here. */
+.convTab[data-attn="input"] {
+  --ide-attn: var(--wf-att);
+  --ide-attn-bg: var(--wf-att-bg);
+}
+.convTab[data-attn="review"] {
+  --ide-attn: var(--wf-wait);
+  --ide-attn-bg: var(--wf-wait-bg);
+}
+.convTab[data-attn="error"] {
+  --ide-attn: var(--wf-err);
+  --ide-attn-bg: var(--wf-err-bg);
+}
+.convTab[data-attn] {
+  background: var(--ide-attn-bg);
+  color: var(--wf-tx-hi);
+}
+.convTab[data-attn][data-on] {
+  background: color-mix(in srgb, var(--ide-attn) 18%, var(--ide-attn-bg));
+  box-shadow: inset 0 -2px 0 var(--ide-attn);
+}
+.tabName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tabState {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+}
+.tabState[data-s="work"],
+.tabState[data-s="bg"] {
+  color: var(--wf-run);
+}
+.tabState[data-s="ask"] {
+  color: var(--wf-att);
+}
+.tabState[data-s="review"] {
+  color: var(--wf-wait);
+}
+.tabState[data-s="err"] {
+  color: var(--wf-err);
+}
+.tabEdit {
+  width: 110px;
+  padding: 1px 5px;
+  border: 1px solid var(--wf-accent);
+  border-radius: 4px;
+  background: var(--wf-bg);
+  color: var(--wf-tx-hi);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.tabClose {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+/* …and whenever the keyboard reaches it (the tab itself, or the button): an invisible
+   focused × would close a tab the user cannot see is targeted. */
+.tab:hover .tabClose,
+.tab[data-on] .tabClose,
+.tab:focus-within .tabClose,
+.wsTab:hover .tabClose,
+.wsTabOn .tabClose,
+.wsTab:focus-within .tabClose,
+.tabClose:focus-visible {
+  opacity: 1;
+}
+.tabClose:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.tabClose:focus-visible,
+.tab:focus-visible,
+.wsTab:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: -1px;
+}
+/* A pinned conversation whose agent has LEFT this folder: the name reads as "not from
+   here" (dimmed, italic) and carries a small "elsewhere" glyph. */
+.convTab[data-outside] .tabName {
+  font-style: italic;
+  color: var(--wf-tx-lo);
+}
+.tabOutside {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--wf-tx-lo);
+}
+.tabAdd {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.tabAdd:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+.dockActions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 6px;
+  border-left: 1px solid var(--wf-line);
+}
+.headBtn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.headBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.headBtn[data-on] {
+  color: var(--wf-accent);
+}
+/* "N closed tabs" — wider than a plain header button: it carries a count (and pips). */
+.reopenBtn {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.reopenBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+/* The kit's chevron points down; "maximize" wants it pointing up. */
+.flip {
+  transform: rotate(180deg);
+}
+
+.dockBody {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.bodyFill {
+  flex: 1;
+  background: var(--wf-bg);
+}
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+}
+.empty p {
+  margin: 0;
+}
+.emptyActions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+/* ---- Drop zones (shown over the editor + dock while the panel is dragged) ---- */
+.dropOverlay {
+  position: absolute;
+  inset: 0;
+  /* Above Monaco's own layers and xterm's canvases, below the kit's portalled menus (200).
+     It is a picture of the drag, never a participant: it must never be what a pointer
+     lands on, or the drop would be hit-tested against the overlay instead of the area. */
+  z-index: 40;
+  pointer-events: none;
+}
+.dropZone {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed color-mix(in srgb, var(--wf-accent) 50%, transparent);
+  border-radius: var(--wf-r-l);
+  /* Veils what is underneath instead of hiding it: the editor stays recognisable, so the
+     zone reads as a place on screen rather than as a floating rectangle. */
+  background: color-mix(in srgb, var(--wf-bg) 62%, transparent);
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+/* The inset keeps the outline clear of the window edges; the size on the other axis comes
+   from the component, out of the same constant the hit-test uses. */
+.dropZone[data-zone="bottom"] {
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+}
+.dropZone[data-zone="right"] {
+  top: 6px;
+  right: 6px;
+  bottom: 6px;
+}
+/* The one under the pointer: solid, filled, unmistakable — this is where it lands. */
+.dropZone[data-hot] {
+  border-style: solid;
+  border-color: var(--wf-accent);
+  background: var(--wf-accent-dim);
+}
+.dropChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 10px 26px -14px #000;
+}
+.dropZone[data-hot] .dropChip {
+  border-color: var(--wf-accent);
+  color: var(--wf-tx-hi);
+}
+/* "current" — dropping here leaves the panel exactly where it already is. */
+.dropCurrent {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--wf-tx-xlo);
+}
+.dropZone[data-hot] .dropCurrent {
+  color: var(--wf-accent);
+}
+.dropHint {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  /* Over the zones: the right-hand one reaches the top of the area and would otherwise
+     swallow the middle of the sentence as soon as it goes solid. */
+  z-index: 1;
+  max-width: calc(100% - 20px);
+  padding: 5px 13px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 10px 26px -14px #000;
+}
+
+/* ---- Status bar ---- */
+.status {
+  flex: 0 0 24px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  background: var(--wf-bg-2);
+  border-top: 1px solid var(--wf-line);
+  color: var(--wf-tx-lo);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.statusItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px;
+  color: var(--wf-tx);
+}
+.statusDim {
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  color: var(--wf-tx-lo);
+}
+.statusPath {
+  min-width: 0;
+  padding: 0 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Truncate from the LEFT: the end of a path is the part that tells folders apart. */
+  direction: rtl;
+  text-align: left;
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+}
+.statusSpacer {
+  flex: 1;
+}
+.statusBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.statusBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.statusBtn[data-on] {
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Welcome (no folder open) ---- */
+.welcome {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: auto;
+}
+.welcomeCard {
+  width: min(460px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+}
+.welcomeMark {
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 12px;
+  background: var(--wf-panel);
+  color: var(--wf-accent);
+}
+.welcomeTitle {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+.welcomeText {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--wf-tx-lo);
+}
+.welcomeList {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r-l);
+  background: var(--wf-panel);
+  overflow: hidden;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.welcomeRepo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.welcomeRepo:last-child {
+  border-bottom: 0;
+}
+.welcomeRepo:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.welcomeRepo:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.welcomeRepoName {
+  flex: 0 0 auto;
+  font-weight: 500;
+}
+.welcomeRepoPath {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: right;
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+}
