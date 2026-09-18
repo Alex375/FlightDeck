@@ -3765,7 +3765,41 @@ added_at: number;
  * list must degrade to "just `host`", not break the machine (see
  * [`super::db::Store::machine_by_id`]).
  */
-addresses?: AddressCandidate[] }
+addresses?: AddressCandidate[]; 
+/**
+ * This node's relay identity, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::mac_id`] so a result from that
+ * probe can be stored directly, no reshaping. `None` until a `flightdeckd init` /
+ * `whoami` round trip has succeeded for this machine (every machine paired before
+ * the daemon flow existed, and any machine whose `whoami` hasn't run yet). Written
+ * only by [`super::db::Store::set_machine_daemon_identity`] — never by the
+ * wholesale [`super::db::Store::upsert_machine`], so a caller that knows nothing
+ * about the daemon (add/rename/probe) can never blank it.
+ */
+daemon_mac_id?: string | null; 
+/**
+ * This node's relay URL, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::relay_url`]. Same write/`None`
+ * discipline as [`Self::daemon_mac_id`].
+ */
+daemon_relay_url?: string | null; 
+/**
+ * The label the daemon itself was initialized with (`flightdeckd init --label
+ * …`), straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::label`]. Deliberately a
+ * SEPARATE field from [`Self::label`] (the human-facing name Flight Deck shows for
+ * this server): the two can drift, and this one exists to compare against /
+ * display what the daemon believes its own identity is. Same write/`None`
+ * discipline as [`Self::daemon_mac_id`].
+ */
+daemon_label?: string | null; 
+/**
+ * Unix ms timestamp the phone (mobile relay) was provisioned for this server, or
+ * `None` if it never has been. Written only by
+ * [`super::db::Store::set_machine_phone_provisioned_at`] — same non-erasure
+ * discipline as the `daemon_*` fields above.
+ */
+phone_provisioned_at?: number | null }
 /**
  * What the instructions file looks like right now.
  */

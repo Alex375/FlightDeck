@@ -123,6 +123,10 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         identity_file,
         added_at: now,
         addresses: Vec::new(),
+        daemon_mac_id: None,
+        daemon_relay_url: None,
+        daemon_label: None,
+        phone_provisioned_at: None,
     };
     if let Err(e) = store.upsert_machine(&machine) {
         eprintln!("[seed] failed to upsert remote demo machine: {e}");

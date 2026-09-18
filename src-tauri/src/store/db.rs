@@ -35,7 +35,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -69,6 +69,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v10,
     migrate_v11,
     migrate_v12,
+    migrate_v13,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -437,6 +438,32 @@ fn migrate_v12(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "machines", "addresses", "ALTER TABLE machines ADD COLUMN addresses TEXT")
 }
 
+/// v13 — daemon-relay metadata for a paired server: its `flightdeckd whoami` identity
+/// (`daemon_mac_id` / `daemon_relay_url` / `daemon_label`, mirroring
+/// [`crate::bootstrap::server_setup::ServerIdentity`]) and when the mobile relay was
+/// last provisioned for it (`phone_provisioned_at`, Unix ms). All four NULLABLE with no
+/// default: NULL (every pre-existing row, and every machine whose daemon round trip
+/// hasn't run yet) means "not known yet", not "empty" — the same degrade-gracefully
+/// discipline as `machines.addresses` in v12. Written only by the dedicated
+/// [`Store::set_machine_daemon_identity`] / [`Store::set_machine_phone_provisioned_at`]
+/// setters, never by the wholesale [`Store::upsert_machine`] (see that function's doc).
+fn migrate_v13(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "machines", "daemon_mac_id", "ALTER TABLE machines ADD COLUMN daemon_mac_id TEXT")?;
+    add_column_if_absent(
+        conn,
+        "machines",
+        "daemon_relay_url",
+        "ALTER TABLE machines ADD COLUMN daemon_relay_url TEXT",
+    )?;
+    add_column_if_absent(conn, "machines", "daemon_label", "ALTER TABLE machines ADD COLUMN daemon_label TEXT")?;
+    add_column_if_absent(
+        conn,
+        "machines",
+        "phone_provisioned_at",
+        "ALTER TABLE machines ADD COLUMN phone_provisioned_at INTEGER",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -534,7 +561,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let mut machines_stmt = conn.prepare(
-            "SELECT id, label, host, port, user, identity_file, added_at, addresses
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
              FROM machines ORDER BY added_at ASC",
         )?;
         let machines = machines_stmt
@@ -550,6 +578,12 @@ impl Store {
                     // NULL (pre-v12 rows) / a corrupt value both decode to `[]` — see
                     // `decode_addresses`.
                     addresses: decode_addresses(row.get(7)?),
+                    // NULL (pre-v13 rows, or a machine whose daemon round trip hasn't
+                    // run yet) → None everywhere below.
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -671,7 +705,8 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses
+                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
+                        m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
                  FROM repos r JOIN machines m ON m.id = r.machine_id
                  WHERE r.path = ?1 AND r.machine_id IS NOT NULL LIMIT 1",
                 params![path],
@@ -685,6 +720,10 @@ impl Store {
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
                         addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
                     })
                 },
             )
@@ -697,7 +736,8 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, label, host, port, user, identity_file, added_at, addresses
+                "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                        daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
                  FROM machines WHERE id = ?1",
                 params![id],
                 |row| {
@@ -710,6 +750,10 @@ impl Store {
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
                         addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
                     })
                 },
             )
@@ -724,6 +768,17 @@ impl Store {
     /// `ipc::commands::add_machine` runs before ever probing, enforced again here so
     /// this invariant belongs to the boundary that actually owns it, not just to
     /// today's one caller.
+    ///
+    /// The four daemon-metadata fields (`daemon_mac_id`/`daemon_relay_url`/
+    /// `daemon_label`/`phone_provisioned_at`) are PRESERVED on update when the incoming
+    /// value is `None`: `COALESCE(excluded.x, machines.x)`, mirroring how
+    /// [`Self::upsert_repo`] preserves `machine_id`. Every existing caller of this
+    /// method (adding a server, a probe re-save) knows nothing about the daemon and
+    /// always passes `None` for these — without the COALESCE, that wholesale rewrite
+    /// would silently erase metadata the dedicated setters wrote. `addresses` is
+    /// deliberately NOT preserved this way (see [`upsert_machine_round_trips_addresses`]
+    /// in the test module): a full re-pairing OWNS the whole address list, unlike the
+    /// daemon identity, which is populated by a separate, later step.
     pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {
         validate_machine_addresses(m).map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -732,12 +787,17 @@ impl Store {
             )))
         })?;
         self.conn.lock().unwrap().execute(
-            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses,
+                                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                  label = excluded.label, host = excluded.host, port = excluded.port,
                  user = excluded.user, identity_file = excluded.identity_file,
-                 addresses = excluded.addresses",
+                 addresses = excluded.addresses,
+                 daemon_mac_id = COALESCE(excluded.daemon_mac_id, machines.daemon_mac_id),
+                 daemon_relay_url = COALESCE(excluded.daemon_relay_url, machines.daemon_relay_url),
+                 daemon_label = COALESCE(excluded.daemon_label, machines.daemon_label),
+                 phone_provisioned_at = COALESCE(excluded.phone_provisioned_at, machines.phone_provisioned_at)",
             params![
                 m.id,
                 m.label,
@@ -747,9 +807,43 @@ impl Store {
                 m.identity_file,
                 m.added_at,
                 encode_addresses(&m.addresses),
+                m.daemon_mac_id,
+                m.daemon_relay_url,
+                m.daemon_label,
+                m.phone_provisioned_at,
             ],
         )?;
         Ok(())
+    }
+
+    /// Store this machine's `flightdeckd whoami` identity — the ONLY writer of the
+    /// three `daemon_*` columns. A focused UPDATE (not a re-upsert of the whole
+    /// record) so a later caller (the C9 daemon-init flow) never needs to round-trip
+    /// the rest of the [`MachineRecord`] just to attach the identity it just learned.
+    /// Returns the number of rows touched, so the caller can tell "saved" from
+    /// "that machine id doesn't exist" instead of reporting success either way.
+    pub fn set_machine_daemon_identity(
+        &self,
+        id: &str,
+        mac_id: &str,
+        relay_url: &str,
+        label: &str,
+    ) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE machines SET daemon_mac_id = ?2, daemon_relay_url = ?3, daemon_label = ?4
+             WHERE id = ?1",
+            params![id, mac_id, relay_url, label],
+        )
+    }
+
+    /// Record when the mobile relay was (re)provisioned for this machine — the ONLY
+    /// writer of `phone_provisioned_at`. Same focused-UPDATE discipline as
+    /// [`Self::set_machine_daemon_identity`].
+    pub fn set_machine_phone_provisioned_at(&self, id: &str, ts_ms: i64) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE machines SET phone_provisioned_at = ?2 WHERE id = ?1",
+            params![id, ts_ms],
+        )
     }
 
     /// Remove a remote server and everything anchored to it. Deletes its repos first
@@ -1149,6 +1243,10 @@ mod tests {
             identity_file: Some("/keys/id".into()),
             added_at: 1,
             addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         };
         s.upsert_machine(&m).unwrap();
 
@@ -1205,6 +1303,10 @@ mod tests {
             identity_file: None,
             added_at: 1,
             addresses: addresses.clone(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         };
         s.upsert_machine(&m).unwrap();
         assert_eq!(s.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
@@ -1248,6 +1350,10 @@ mod tests {
             identity_file: None,
             added_at: 1,
             addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         };
 
         m.host = "-oProxyCommand=evil".into();
@@ -1322,12 +1428,221 @@ mod tests {
                     identity_file: None,
                     added_at: 1,
                     addresses: addresses.clone(),
+                    daemon_mac_id: None,
+                    daemon_relay_url: None,
+                    daemon_label: None,
+                    phone_provisioned_at: None,
                 })
                 .unwrap();
         }
         let store = tmp.open(); // second open over an already-migrated db
         assert_eq!(store.schema_version(), SCHEMA_VERSION);
         assert_eq!(store.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
+    }
+
+    /// v13 — a machine's daemon-relay metadata (identity + phone-provisioning
+    /// timestamp) round-trips through every reader (`machine_by_id`,
+    /// `machine_for_repo_path`, `load_state`), mirroring `upsert_machine_round_trips_addresses`.
+    #[test]
+    fn machine_daemon_metadata_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: Some("mac-abc".into()),
+            daemon_relay_url: Some("https://relay.example/".into()),
+            daemon_label: Some("josty-cc".into()),
+            phone_provisioned_at: Some(12_345),
+        };
+        s.upsert_machine(&m).unwrap();
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(got.daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(got.daemon_label, m.daemon_label);
+        assert_eq!(got.phone_provisioned_at, m.phone_provisioned_at);
+
+        let mut remote = repo_at("r1", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        let via_repo = s.machine_for_repo_path("/work/demo").unwrap().unwrap();
+        assert_eq!(via_repo.daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(via_repo.daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(via_repo.daemon_label, m.daemon_label);
+        assert_eq!(via_repo.phone_provisioned_at, m.phone_provisioned_at);
+
+        let loaded = s.load_state().unwrap();
+        assert_eq!(loaded.machines[0].daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(loaded.machines[0].daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(loaded.machines[0].daemon_label, m.daemon_label);
+        assert_eq!(loaded.machines[0].phone_provisioned_at, m.phone_provisioned_at);
+    }
+
+    /// v13 — a row from BEFORE the daemon-metadata columns existed (`ALTER TABLE ADD
+    /// COLUMN` leaves every pre-existing row NULL) must load with `None` for all four
+    /// fields, never an error — the same degrade-gracefully discipline as v12's
+    /// `addresses` (see `pre_migration_machines_row_reads_addresses_as_empty_vec`).
+    #[test]
+    fn pre_migration_machines_row_reads_daemon_metadata_as_none() {
+        let tmp = TempDb::new("machines-v13-premigration");
+        // The v12 `machines` shape (addresses column present), pre-dating v13. Marker
+        // bridged to 12 so the runner skips every migration up to and including v12
+        // (already applied) and runs ONLY migrate_v13, which touches nothing but
+        // `machines`.
+        tmp.seed_raw(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE machines (
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                port          INTEGER NOT NULL,
+                user          TEXT NOT NULL,
+                identity_file TEXT,
+                added_at      INTEGER NOT NULL,
+                addresses     TEXT
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '12');
+            INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
+                VALUES ('m1', 'vps', 'h.example', 22, 'agent', NULL, 1, NULL);
+            ",
+        );
+
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION, "marker 12 bridged, v13 applied");
+        let m = store.machine_by_id("m1").unwrap().expect("pre-migration row still loads");
+        assert_eq!(m.daemon_mac_id, None);
+        assert_eq!(m.daemon_relay_url, None);
+        assert_eq!(m.daemon_label, None);
+        assert_eq!(m.phone_provisioned_at, None);
+        assert_eq!(m.host, "h.example", "every pre-existing column is untouched");
+    }
+
+    /// v13's `ALTER TABLE ... ADD COLUMN` ×4 is guarded by `add_column_if_absent` like
+    /// every other additive migration — reopening an already-migrated db (a second app
+    /// launch) must not error, re-add a column, or disturb the row.
+    #[test]
+    fn migrate_v13_reopen_is_idempotent() {
+        let tmp = TempDb::new("machines-v13-idempotent");
+        {
+            let store = tmp.open();
+            store
+                .upsert_machine(&MachineRecord {
+                    id: "m1".into(),
+                    label: "vps".into(),
+                    host: "h.example".into(),
+                    port: 22,
+                    user: "agent".into(),
+                    identity_file: None,
+                    added_at: 1,
+                    addresses: Vec::new(),
+                    daemon_mac_id: Some("mac-abc".into()),
+                    daemon_relay_url: Some("https://relay.example/".into()),
+                    daemon_label: Some("josty-cc".into()),
+                    phone_provisioned_at: Some(99),
+                })
+                .unwrap();
+        }
+        let store = tmp.open(); // second open over an already-migrated db
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let m = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(m.daemon_mac_id.as_deref(), Some("mac-abc"));
+        assert_eq!(m.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(m.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(m.phone_provisioned_at, Some(99));
+    }
+
+    /// A wholesale `upsert_machine` with all four daemon fields `None` — exactly what
+    /// every existing caller (`add_machine`, the demo seed, a probe re-save) passes,
+    /// since none of them know about the daemon — must NOT erase metadata a dedicated
+    /// setter already wrote. Mirrors `repos.machine_id`'s COALESCE guard
+    /// (`machines_pair_repos_resolve_and_cascade`).
+    #[test]
+    fn upsert_machine_with_none_daemon_fields_preserves_existing_metadata() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        s.set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc").unwrap();
+        s.set_machine_phone_provisioned_at("m1", 555).unwrap();
+
+        // A caller that knows nothing about the daemon re-upserts the whole record,
+        // e.g. renaming the machine — every daemon field stays `None` on its end.
+        let mut renamed = m.clone();
+        renamed.label = "vps (renamed)".into();
+        s.upsert_machine(&renamed).unwrap();
+
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.label, "vps (renamed)");
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"), "daemon identity must survive a None-field upsert");
+        assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(got.phone_provisioned_at, Some(555), "phone-provisioned timestamp must survive too");
+    }
+
+    /// The two focused setters (`set_machine_daemon_identity` /
+    /// `set_machine_phone_provisioned_at`) round-trip independently of each other and
+    /// of a full `upsert_machine`, and report "no such machine" via their row count
+    /// rather than erroring.
+    #[test]
+    fn machine_daemon_setters_round_trip_and_report_missing_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let touched = s
+            .set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc")
+            .unwrap();
+        assert_eq!(touched, 1);
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"));
+        assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(got.phone_provisioned_at, None, "identity setter must not touch the phone timestamp");
+
+        let touched = s.set_machine_phone_provisioned_at("m1", 42).unwrap();
+        assert_eq!(touched, 1);
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.phone_provisioned_at, Some(42));
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"), "phone setter must not touch the identity");
+
+        // Neither setter errors against an unknown machine id — it just touches 0 rows.
+        assert_eq!(
+            s.set_machine_daemon_identity("no-such-machine", "x", "y", "z").unwrap(),
+            0
+        );
+        assert_eq!(s.set_machine_phone_provisioned_at("no-such-machine", 1).unwrap(), 0);
     }
 
     fn conv_at(

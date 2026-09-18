@@ -137,6 +137,19 @@ export interface Machine {
    *  (A6) to rotate through on a failed reconnect; today only `host` is dialed.
    *  Empty for a machine paired before this was recorded. */
   addresses: AddressCandidate[];
+  /** This node's relay identity, straight off `flightdeckd whoami`. `null` until a
+   *  daemon init/whoami round trip has succeeded for this machine. */
+  daemonMacId?: string | null;
+  /** This node's relay URL, straight off `flightdeckd whoami`. Same `null` discipline
+   *  as {@link daemonMacId}. */
+  daemonRelayUrl?: string | null;
+  /** The label the daemon itself was initialized with — separate from {@link label}
+   *  (the human-facing name Flight Deck shows), the two can drift. Same `null`
+   *  discipline as {@link daemonMacId}. */
+  daemonLabel?: string | null;
+  /** Unix ms timestamp the phone (mobile relay) was last provisioned for this server,
+   *  or `null`/`undefined` if it never has been. */
+  phoneProvisionedAt?: number | null;
 }
 
 /** Which agent backend drives a conversation. Chosen at creation, immutable after
@@ -368,6 +381,10 @@ const recordToMachine = (m: MachineRecord): Machine => ({
   // omits the field — but the `?? []` mirrors how `PersistedState.machines` is
   // already defaulted below, for the same reason.
   addresses: m.addresses ?? [],
+  daemonMacId: m.daemon_mac_id,
+  daemonRelayUrl: m.daemon_relay_url,
+  daemonLabel: m.daemon_label,
+  phoneProvisionedAt: m.phone_provisioned_at,
 });
 
 const convToRecord = (c: Conversation): ConversationRecord => ({
