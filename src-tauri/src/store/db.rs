@@ -816,10 +816,14 @@ impl Store {
         Ok(())
     }
 
-    /// Store this machine's `flightdeckd whoami` identity — the ONLY writer of the
-    /// three `daemon_*` columns. A focused UPDATE (not a re-upsert of the whole
-    /// record) so a later caller (the C9 daemon-init flow) never needs to round-trip
-    /// the rest of the [`MachineRecord`] just to attach the identity it just learned.
+    /// Store this machine's `flightdeckd whoami` identity — by convention the only
+    /// writer of the three `daemon_*` columns ([`Self::upsert_machine`]'s COALESCE
+    /// only keeps an incoming `None` from erasing what this sets; it does not stop a
+    /// caller from setting these columns directly through `upsert_machine`, since
+    /// every existing caller just happens to pass `None` for them). A focused UPDATE
+    /// (not a re-upsert of the whole record) so a later caller (the C9 daemon-init
+    /// flow) never needs to round-trip the rest of the [`MachineRecord`] just to
+    /// attach the identity it just learned.
     /// Returns the number of rows touched, so the caller can tell "saved" from
     /// "that machine id doesn't exist" instead of reporting success either way.
     pub fn set_machine_daemon_identity(
@@ -836,8 +840,10 @@ impl Store {
         )
     }
 
-    /// Record when the mobile relay was (re)provisioned for this machine — the ONLY
-    /// writer of `phone_provisioned_at`. Same focused-UPDATE discipline as
+    /// Record when the mobile relay was (re)provisioned for this machine — by
+    /// convention the only writer of `phone_provisioned_at` (same caveat as
+    /// [`Self::set_machine_daemon_identity`]: the COALESCE in `upsert_machine`
+    /// prevents erasure, not direct writes). Same focused-UPDATE discipline as
     /// [`Self::set_machine_daemon_identity`].
     pub fn set_machine_phone_provisioned_at(&self, id: &str, ts_ms: i64) -> rusqlite::Result<usize> {
         self.conn.lock().unwrap().execute(

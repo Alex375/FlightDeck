@@ -3771,16 +3771,18 @@ addresses?: AddressCandidate[];
  * [`crate::bootstrap::server_setup::ServerIdentity::mac_id`] so a result from that
  * probe can be stored directly, no reshaping. `None` until a `flightdeckd init` /
  * `whoami` round trip has succeeded for this machine (every machine paired before
- * the daemon flow existed, and any machine whose `whoami` hasn't run yet). Written
- * only by [`super::db::Store::set_machine_daemon_identity`] — never by the
- * wholesale [`super::db::Store::upsert_machine`], so a caller that knows nothing
- * about the daemon (add/rename/probe) can never blank it.
+ * the daemon flow existed, and any machine whose `whoami` hasn't run yet). By
+ * convention, only [`super::db::Store::set_machine_daemon_identity`] populates
+ * this field — [`super::db::Store::upsert_machine`]'s COALESCE keeps a `None`
+ * there from erasing it, but nothing in the type system stops a caller from
+ * constructing a record with this field set and passing it to `upsert_machine`
+ * directly; every existing caller (add/rename/probe) just happens to pass `None`.
  */
 daemon_mac_id?: string | null; 
 /**
  * This node's relay URL, straight off `flightdeckd whoami` — mirrors
  * [`crate::bootstrap::server_setup::ServerIdentity::relay_url`]. Same write/`None`
- * discipline as [`Self::daemon_mac_id`].
+ * convention as [`Self::daemon_mac_id`].
  */
 daemon_relay_url?: string | null; 
 /**
@@ -3790,14 +3792,14 @@ daemon_relay_url?: string | null;
  * SEPARATE field from [`Self::label`] (the human-facing name Flight Deck shows for
  * this server): the two can drift, and this one exists to compare against /
  * display what the daemon believes its own identity is. Same write/`None`
- * discipline as [`Self::daemon_mac_id`].
+ * convention as [`Self::daemon_mac_id`].
  */
 daemon_label?: string | null; 
 /**
  * Unix ms timestamp the phone (mobile relay) was provisioned for this server, or
- * `None` if it never has been. Written only by
+ * `None` if it never has been. By convention, populated only by
  * [`super::db::Store::set_machine_phone_provisioned_at`] — same non-erasure
- * discipline as the `daemon_*` fields above.
+ * convention as the `daemon_*` fields above.
  */
 phone_provisioned_at?: number | null }
 /**
