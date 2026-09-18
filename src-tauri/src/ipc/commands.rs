@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -3259,28 +3259,68 @@ pub struct GeneratedKey {
     pub public_key: String,
 }
 
-/// Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
-/// key), stored under the app data dir. Returns the private-key path and the public
-/// key to paste on the server. The private key never leaves this Mac. Wraps the system
-/// `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
-#[tauri::command]
-#[specta::specta]
-pub async fn generate_machine_key(
-    app: tauri::AppHandle,
-    label: String,
-) -> Result<GeneratedKey, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("ssh_keys");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let slug: String = label
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let key = dir.join(format!("{slug}-{}", uuid::Uuid::new_v4()));
+/// Fixed basename (under `ssh_keys/`) for the keypair a not-yet-paired server's
+/// command line embeds. Fixed rather than `{slug}-{uuid}` per call so re-opening the
+/// wizard (or a double click) reuses the SAME pending pair instead of minting a new
+/// one every time — see [`generate_machine_key`].
+const PENDING_KEY_BASENAME: &str = "pending";
+
+/// Serializes [`generate_machine_key`] end to end (read-or-mint, then the
+/// `ssh-keygen` spawn). The fixed `pending` filename it reads/writes means two
+/// concurrent callers (e.g. a double click on "+ Add a server") would otherwise race
+/// `ssh-keygen -f pending` — the loser hitting an interactive "overwrite?" prompt on
+/// stdin nobody is reading, which hangs the command forever.
+static PENDING_KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Absolute path of the not-yet-claimed pairing key `generate_machine_key` writes to
+/// (no `.pub` suffix — callers append it themselves as needed), under an app's
+/// `ssh_keys/` directory.
+fn pending_key_path(ssh_keys_dir: &Path) -> PathBuf {
+    ssh_keys_dir.join(PENDING_KEY_BASENAME)
+}
+
+/// Generate (or, if one is already waiting to be claimed, REUSE) the dedicated
+/// ed25519 keypair for a not-yet-paired remote server (Flight Deck's own access key),
+/// under `ssh_keys_dir` (created if missing). Returns the private-key path and the
+/// public key to paste on the server. The private key never leaves this Mac. Wraps
+/// the system `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+///
+/// Writes to the FIXED `pending`(`.pub`) basename rather than minting a fresh
+/// `{slug}-{uuid}` pair on every call — re-opening the "add a server" wizard (close
+/// Settings, reopen, "+ Add a server" again) used to mint a brand-new key each time:
+/// 7 keys generated pairing ONE server. If a pending pair already exists on disk it's
+/// read back byte-identical instead of re-running `ssh-keygen` (`label` only feeds the
+/// `-C` comment of a freshly minted key, so it can't affect a reused one) — the same
+/// pairing command can be safely re-pasted until [`claim_pending_key`] (called from
+/// [`add_machine`]) claims it, which is the whole point of re-entering the wizard.
+/// Guarded by [`PENDING_KEY_LOCK`]; see its doc comment. Takes a plain path (not a
+/// `tauri::AppHandle`) so it's testable without a running app — [`generate_machine_key`]
+/// is the thin IPC wrapper that resolves the real app data dir.
+async fn generate_or_reuse_pending_key(ssh_keys_dir: &Path, label: &str) -> Result<GeneratedKey, String> {
+    let _guard = PENDING_KEY_LOCK.lock().await;
+    std::fs::create_dir_all(ssh_keys_dir).map_err(|e| e.to_string())?;
+    let key = pending_key_path(ssh_keys_dir);
     let pub_path = PathBuf::from(format!("{}.pub", key.display()));
+
+    match (key.exists(), pub_path.exists()) {
+        (true, true) => {
+            let public_key = std::fs::read_to_string(&pub_path)
+                .map_err(|e| e.to_string())?
+                .trim()
+                .to_string();
+            return Ok(GeneratedKey { identity_file: key.to_string_lossy().into_owned(), public_key });
+        }
+        (false, false) => {}
+        // Partial state from an interrupted previous run (crash mid-keygen): clear it
+        // so `ssh-keygen -f` below doesn't hit an "overwrite?" prompt nobody can answer.
+        _ => {
+            let _ = std::fs::remove_file(&key);
+            let _ = std::fs::remove_file(&pub_path);
+        }
+    }
+
+    let slug: String =
+        label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     let out = tokio::process::Command::new("ssh-keygen")
         .arg("-t")
         .arg("ed25519")
@@ -3309,16 +3349,90 @@ pub async fn generate_machine_key(
     })
 }
 
-/// Verify we can SSH into a server AND that `claude` runs there, with a fast, batch
-/// (never-prompting) probe. Returns the server's `claude --version` on success, or an
-/// actionable error (unreachable / auth refused / claude missing).
+/// See [`generate_or_reuse_pending_key`] — this is the IPC wrapper that resolves the
+/// real app data dir.
+#[tauri::command]
+#[specta::specta]
+pub async fn generate_machine_key(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<GeneratedKey, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("ssh_keys");
+    generate_or_reuse_pending_key(&dir, &label).await
+}
+
+/// Minimum `flightdeckd` version pairing trusts — older ones hard-block pairing just
+/// like a missing binary (unknown protocol/wire compatibility). Bump when a wire
+/// change requires a specific daemon version.
+const MIN_DAEMON_VERSION: &str = "0.1.0";
+
+/// Whether `v` — typically raw `<name> <version>` `--version` output such as
+/// `"flightdeckd 0.1.0"` — is at least `min` (a plain dotted version like
+/// `"0.1.0"`). Compares the LAST whitespace-separated token of each input,
+/// component-wise; any non-numeric component parses as `0` rather than panicking, so
+/// a future `--version` format tweak degrades to "0.0.0 → outdated" instead of
+/// crashing the probe. Pure and side-effect-free — the version text is all it needs.
+fn version_at_least(v: &str, min: &str) -> bool {
+    fn parts(s: &str) -> Vec<u32> {
+        let token = s.split_whitespace().last().unwrap_or(s);
+        token.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    }
+    let (vp, mp) = (parts(v), parts(min));
+    for i in 0..vp.len().max(mp.len()) {
+        let a = vp.get(i).copied().unwrap_or(0);
+        let b = mp.get(i).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    true
+}
+
+/// Outcome of probing a remote server for the two binaries pairing needs. `Ok` covers
+/// EVERY combination of present/missing/outdated — "missing" is data IN the struct,
+/// never an ssh-level failure — so [`add_machine`] can name every blocker at once
+/// instead of just whichever the remote shell happened to trip over first. An `Err`
+/// means the ssh round-trip itself failed (unreachable host, auth refused, …), before
+/// the probe script could report anything. Designed as the base a later installer
+/// task extends (e.g. a `conflict` field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProbeResult {
+    pub claude_version: Option<String>,
+    pub claude_missing: bool,
+    pub flightdeckd_version: Option<String>,
+    pub flightdeckd_missing: bool,
+    pub flightdeckd_outdated: bool,
+}
+
+/// Pulls the value after a `MARKER:` line out of the probe script's stdout. `None`
+/// means the marker line never showed up at all (e.g. the connection died before the
+/// script could run), as opposed to showing up with an empty value.
+fn extract_marker(stdout: &str, marker: &str) -> Option<String> {
+    stdout.lines().find_map(|l| l.strip_prefix(marker)).map(|v| v.trim().to_string())
+}
+
+/// Verify we can SSH into a server AND check the two binaries pairing needs —
+/// `claude` and `flightdeckd` — with a single fast, batch (never-prompting) probe.
+///
+/// The remote script is an ACCUMULATING check: each binary is tested behind its own
+/// `if`, and the script only `exit`s at the very end. The previous version ran `claude
+/// --version || { …; exit 3; }` — that `exit` is NOT inside a subshell, so it killed
+/// the WHOLE remote script, meaning a second check appended after it would never run
+/// when `claude` was ALSO missing. Accumulating first means "neither present" reports
+/// BOTH, not just whichever came first.
+///
+/// `flightdeckd` is looked for the same way the daemon-attach command resolves it
+/// (`transport::build_remote_command`'s `daemon_bin`, default `"flightdeckd"`, override
+/// `TOSSE_REMOTE_FLIGHTDECKD_BIN`): first on `PATH` (as a non-interactive ssh shell
+/// sees it), then the two common non-PATH install spots, `~/.local/bin` and
+/// `/usr/local/bin`.
 async fn probe_remote(
     host: &str,
     port: u16,
     user: &str,
     identity: Option<&str>,
     known_hosts: Option<&str>,
-) -> Result<String, String> {
+) -> Result<RemoteProbeResult, String> {
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.arg("-T")
         .arg("-p")
@@ -3335,33 +3449,196 @@ async fn probe_remote(
     if let Some(id) = identity {
         cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
     }
-    cmd.arg(format!("{user}@{host}")).arg(
-        "command -v claude >/dev/null 2>&1 && claude --version || { echo FLIGHTDECK_NO_CLAUDE >&2; exit 3; }",
-    );
+    // Findings ride on stdout as `MARKER:value` lines (parsed below via
+    // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
+    // with the old single-tool probe and for anyone reading raw ssh output by hand.
+    let script = r#"
+MISSING=""
+CLAUDE_VERSION=""
+if command -v claude >/dev/null 2>&1; then
+    CLAUDE_VERSION=$(claude --version 2>/dev/null)
+else
+    MISSING="$MISSING claude"
+fi
+FLIGHTDECKD_BIN=""
+if command -v flightdeckd >/dev/null 2>&1; then
+    FLIGHTDECKD_BIN=flightdeckd
+elif [ -x "$HOME/.local/bin/flightdeckd" ]; then
+    FLIGHTDECKD_BIN="$HOME/.local/bin/flightdeckd"
+elif [ -x /usr/local/bin/flightdeckd ]; then
+    FLIGHTDECKD_BIN=/usr/local/bin/flightdeckd
+fi
+FLIGHTDECKD_VERSION=""
+if [ -n "$FLIGHTDECKD_BIN" ]; then
+    FLIGHTDECKD_VERSION=$("$FLIGHTDECKD_BIN" --version 2>/dev/null)
+else
+    MISSING="$MISSING flightdeckd"
+fi
+echo "FLIGHTDECK_CLAUDE_VERSION:$CLAUDE_VERSION"
+echo "FLIGHTDECK_DAEMON_VERSION:$FLIGHTDECKD_VERSION"
+case " $MISSING " in
+    *" claude "*) echo FLIGHTDECK_NO_CLAUDE >&2 ;;
+esac
+case " $MISSING " in
+    *" flightdeckd "*) echo FLIGHTDECK_NO_DAEMON >&2 ;;
+esac
+if [ -n "$MISSING" ]; then
+    case "$MISSING" in
+        *claude*) exit 3 ;;
+        *) exit 4 ;;
+    esac
+fi
+exit 0
+"#;
+    cmd.arg(format!("{user}@{host}")).arg(script);
     let out = cmd
         .output()
         .await
         .map_err(|e| format!("could not run ssh: {e}"))?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if out.status.code() == Some(3) || stderr.contains("FLIGHTDECK_NO_CLAUDE") {
-        return Err("Connected over SSH, but `claude` is not installed on the server. \
-                    On the server run: curl -fsSL https://claude.ai/install.sh | sh — \
-                    then log Claude in there (`claude`), and retry."
-            .to_string());
-    }
-    Err(format!(
-        "Could not connect over SSH: {}",
-        stderr.trim().lines().last().unwrap_or("unknown error")
-    ))
+    parse_probe_output(
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+        out.status.success(),
+    )
 }
 
-/// Pair a remote server: probe it (SSH reachable + `claude` present), and on success
-/// persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
-/// probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
-/// not at the first message.
+/// Turns the probe script's captured stdout/stderr/exit-success triple into a
+/// [`RemoteProbeResult`], or an `Err` when the ssh round-trip itself failed before the
+/// script could report anything (unreachable host, auth refused, …). Pure — this is
+/// what makes every combination of present/missing/outdated unit-testable without a
+/// real ssh round-trip; [`probe_remote`] is the (untestable) shell around it.
+fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool) -> Result<RemoteProbeResult, String> {
+    let raw_claude = extract_marker(stdout, "FLIGHTDECK_CLAUDE_VERSION:");
+    let raw_flightdeckd = extract_marker(stdout, "FLIGHTDECK_DAEMON_VERSION:");
+    // Neither marker LINE ever showed up (not just "showed up empty"): the script
+    // itself never ran — a connection-level failure (bad host/key/auth), not a "tool
+    // missing" finding the script would otherwise have reported via an empty value.
+    if raw_claude.is_none() && raw_flightdeckd.is_none() && !ssh_succeeded {
+        return Err(format!(
+            "Could not connect over SSH: {}",
+            stderr.trim().lines().last().unwrap_or("unknown error")
+        ));
+    }
+    let claude_version = raw_claude.filter(|s| !s.is_empty());
+    let flightdeckd_version = raw_flightdeckd.filter(|s| !s.is_empty());
+
+    let claude_missing = stderr.contains("FLIGHTDECK_NO_CLAUDE");
+    let flightdeckd_missing = stderr.contains("FLIGHTDECK_NO_DAEMON");
+    let flightdeckd_outdated = !flightdeckd_missing
+        && flightdeckd_version
+            .as_deref()
+            .map(|v| !version_at_least(v, MIN_DAEMON_VERSION))
+            .unwrap_or(false);
+
+    Ok(RemoteProbeResult {
+        claude_version,
+        claude_missing,
+        flightdeckd_version,
+        flightdeckd_missing,
+        flightdeckd_outdated,
+    })
+}
+
+/// Turns a probe result that failed pairing's minimum bar into ONE human-readable
+/// error, naming every blocker at once — so a server missing both `claude` and
+/// `flightdeckd` doesn't make the user fix one, retry, then learn about the other.
+fn describe_probe_blockers(probe: &RemoteProbeResult) -> String {
+    let mut blockers = Vec::new();
+    if probe.claude_missing {
+        blockers.push(
+            "`claude` is not installed on the server. On the server run: \
+             curl -fsSL https://claude.ai/install.sh | sh — then log Claude in there \
+             (`claude`), and retry."
+                .to_string(),
+        );
+    }
+    if probe.flightdeckd_missing {
+        blockers.push(
+            "`flightdeckd` is not installed on the server (checked PATH, ~/.local/bin \
+             and /usr/local/bin) — install it before pairing."
+                .to_string(),
+        );
+    } else if probe.flightdeckd_outdated {
+        blockers.push(format!(
+            "The server's `flightdeckd` ({}) is older than the minimum supported \
+             version ({MIN_DAEMON_VERSION}). Update it on the server, then retry.",
+            probe.flightdeckd_version.as_deref().unwrap_or("unknown version")
+        ));
+    }
+    format!("Connected over SSH, but pairing can't proceed: {}", blockers.join(" "))
+}
+
+/// One discovered candidate address for a paired server — as printed in the pairing
+/// ticket's `addresses` array (see the "1 · Run this once on your server" command in
+/// `RemoteServersGroup`, `ControlSection.tsx`). Not persisted anywhere yet: the confirm
+/// screen resolves it down to a single `host` before `add_machine` is called — the
+/// column for keeping the full discovered set lands in a later task.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressKind {
+    Tailscale,
+    Lan,
+    Manual,
+}
+
+/// See [`AddressKind`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AddressCandidate {
+    pub kind: AddressKind,
+    pub value: String,
+}
+
+/// The "already used" guard `add_machine` runs BEFORE probing: an `identity_file`
+/// that no longer exists on disk means this pairing command was already claimed by a
+/// DIFFERENT server (see [`claim_pending_key`]'s rename) — most likely the same
+/// command pasted onto two boxes before either was paired. Returns the specific error
+/// to show, or `None` when the check passes (including "no identity_file to check" —
+/// the "use my default SSH key/agent" case, which is never stale).
+fn stale_identity_file_error(identity_file: &Option<String>) -> Option<String> {
+    let id = identity_file.as_deref()?;
+    if Path::new(id).exists() {
+        return None;
+    }
+    Some(
+        "This pairing command was already used — click + Add a server again for a \
+         fresh one."
+            .to_string(),
+    )
+}
+
+/// On a successful pairing, claims the PENDING key — if `identity_file` actually IS
+/// the pending one under `ssh_keys_dir` — by renaming it to a per-machine filename, so
+/// a LATER `generate_machine_key` call (for the NEXT server) mints a fresh pending
+/// pair instead of silently handing out this one's already-claimed key. A
+/// non-pending `identity_file` (a custom key) or `None` (default SSH key/agent) is
+/// returned UNCHANGED. Takes plain paths so it's testable without a `tauri::AppHandle`.
+fn claim_pending_key(
+    ssh_keys_dir: &Path,
+    identity_file: Option<String>,
+    machine_id: &str,
+) -> Result<Option<String>, String> {
+    let pending = pending_key_path(ssh_keys_dir);
+    match &identity_file {
+        Some(id) if Path::new(id) == pending => {
+            let claimed = ssh_keys_dir.join(machine_id);
+            std::fs::rename(&pending, &claimed).map_err(|e| e.to_string())?;
+            std::fs::rename(format!("{}.pub", pending.display()), format!("{}.pub", claimed.display()))
+                .map_err(|e| e.to_string())?;
+            Ok(Some(claimed.to_string_lossy().into_owned()))
+        }
+        _ => Ok(identity_file),
+    }
+}
+
+/// Pair a remote server: probe it (SSH reachable + `claude` and `flightdeckd`
+/// present, `flightdeckd` current), and on success persist it as a [`MachineRecord`].
+/// Returns the saved record so the UI lists it. The probe runs FIRST so a bad
+/// host/key/paste or a missing/outdated tool fails loudly here, not at the first
+/// message.
+///
+/// `addresses` is the full set of candidate hosts the pairing ticket discovered
+/// (Tailscale name, LAN IP, bare hostname) — currently informational only (ignored),
+/// kept so the front's IPC call is already shaped for the column a later task adds.
 #[tauri::command]
 #[specta::specta]
 pub async fn add_machine(
@@ -3371,22 +3648,27 @@ pub async fn add_machine(
     port: u16,
     user: String,
     identity_file: Option<String>,
+    addresses: Option<Vec<AddressCandidate>>,
 ) -> Result<crate::store::MachineRecord, String> {
-    let known_hosts = app
-        .path()
-        .app_data_dir()
-        .ok()
-        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    probe_remote(
-        &host,
-        port,
-        &user,
-        identity_file.as_deref(),
-        known_hosts.as_deref(),
-    )
-    .await?;
+    let _ = addresses; // not yet persisted — see the doc comment above.
+
+    if let Some(err) = stale_identity_file_error(&identity_file) {
+        return Err(err);
+    }
+
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
+    let probe =
+        probe_remote(&host, port, &user, identity_file.as_deref(), Some(&known_hosts)).await?;
+    if probe.claude_missing || probe.flightdeckd_missing || probe.flightdeckd_outdated {
+        return Err(describe_probe_blockers(&probe));
+    }
+
+    let machine_id = uuid::Uuid::new_v4().to_string();
+    let identity_file = claim_pending_key(&app_data_dir.join("ssh_keys"), identity_file, &machine_id)?;
+
     let machine = crate::store::MachineRecord {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: machine_id,
         label,
         host,
         port,
@@ -3403,11 +3685,28 @@ pub async fn add_machine(
     Ok(machine)
 }
 
-/// Un-pair a remote server: removes it and every repo/conversation anchored to it.
+/// Core of [`delete_machine`], taking a plain `&Store` — pulled out so it's testable
+/// without a `tauri::State` wrapper (unavailable outside a running app). Removes the
+/// server and everything anchored to it, and best-effort deletes its dedicated SSH
+/// keypair (`Store::delete_machine` is SQL-only — without this, every removed server
+/// permanently leaked its key files on disk).
+fn delete_machine_and_key(store: &Store, id: &str) -> Result<(), String> {
+    // Read the record BEFORE deleting it — the row (and its identity_file path) is
+    // gone from the store immediately after.
+    let identity_file = store.machine_by_id(id).map_err(|e| e.to_string())?.and_then(|m| m.identity_file);
+    store.delete_machine(id).map_err(|e| e.to_string())?;
+    if let Some(identity) = identity_file {
+        let _ = std::fs::remove_file(&identity);
+        let _ = std::fs::remove_file(format!("{identity}.pub"));
+    }
+    Ok(())
+}
+
+/// Un-pair a remote server. See [`delete_machine_and_key`].
 #[tauri::command]
 #[specta::specta]
 pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), String> {
-    store.delete_machine(&id).map_err(|e| e.to_string())
+    delete_machine_and_key(&store, &id)
 }
 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
@@ -4181,5 +4480,252 @@ mod tests {
             "'.' should resolve to an absolute path, got {resolved:?}"
         );
         assert!(!resolved.contains("/./"), "should not keep a literal '.' segment");
+    }
+
+    // ---- Remote pairing: version comparison (A1) ---------------------------------
+
+    #[test]
+    fn version_at_least_compares_dotted_versions() {
+        assert!(super::version_at_least("0.1.0", "0.1.0"), "equal versions are 'at least'");
+        assert!(!super::version_at_least("0.0.9", "0.1.0"), "0.0.9 is older than 0.1.0");
+        assert!(super::version_at_least("0.2.0", "0.1.0"), "0.2.0 is newer than 0.1.0");
+    }
+
+    /// A future `--version` format tweak (extra field, unparseable suffix, …) must
+    /// degrade to "outdated", never panic the probe.
+    #[test]
+    fn version_at_least_treats_malformed_components_as_zero() {
+        assert!(!super::version_at_least("garbage", "0.1.0"), "unparseable version reads as 0.0.0");
+        assert!(!super::version_at_least("", "0.1.0"), "empty version reads as 0.0.0");
+        assert!(super::version_at_least("garbage", ""), "0.0.0 is still 'at least' an empty min");
+    }
+
+    #[test]
+    fn version_at_least_reads_the_clap_name_version_shape() {
+        // `<name> <version>` output (what `claude --version` / `flightdeckd --version`
+        // actually print) — only the LAST whitespace token is the version.
+        assert!(super::version_at_least("flightdeckd 0.1.0", "0.1.0"));
+        assert!(!super::version_at_least("flightdeckd 0.0.9", "0.1.0"));
+    }
+
+    // ---- Remote pairing: combined probe parsing (A1) ------------------------------
+    //
+    // No local sshd fixture exists in this suite, so these exercise the PURE parser
+    // over captured stdout/stderr/exit-success triples — exactly what a real
+    // `probe_remote` ssh round-trip would hand it.
+
+    #[test]
+    fn probe_parsing_reports_both_tools_missing_together() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:\nFLIGHTDECK_DAEMON_VERSION:\n";
+        let stderr = "FLIGHTDECK_NO_CLAUDE\nFLIGHTDECK_NO_DAEMON\n";
+        let result = super::parse_probe_output(stdout, stderr, false)
+            .expect("the script ran (markers present) even though it exited nonzero");
+        assert!(result.claude_missing, "claude must be reported missing");
+        assert!(result.flightdeckd_missing, "flightdeckd must be reported missing TOO");
+        assert!(result.claude_version.is_none());
+        assert!(result.flightdeckd_version.is_none());
+
+        // The user-facing error must name BOTH — this is the exact bug the old
+        // script's mid-script `exit 3` caused (flightdeckd's check never ran).
+        let msg = super::describe_probe_blockers(&result);
+        assert!(msg.contains("claude"), "must mention claude: {msg}");
+        assert!(msg.contains("flightdeckd"), "must mention flightdeckd: {msg}");
+    }
+
+    #[test]
+    fn probe_parsing_names_flightdeckd_when_only_it_is_missing() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272 (Claude Code)\nFLIGHTDECK_DAEMON_VERSION:\n";
+        let stderr = "FLIGHTDECK_NO_DAEMON\n";
+        let result = super::parse_probe_output(stdout, stderr, false).unwrap();
+        assert!(!result.claude_missing);
+        assert!(result.flightdeckd_missing);
+        assert_eq!(result.claude_version.as_deref(), Some("2.1.272 (Claude Code)"));
+
+        let msg = super::describe_probe_blockers(&result);
+        assert!(msg.contains("flightdeckd"), "must name flightdeckd specifically: {msg}");
+        assert!(!msg.contains("`claude` is not installed"), "claude is fine, must not be blamed: {msg}");
+    }
+
+    #[test]
+    fn probe_parsing_flags_an_outdated_daemon_distinctly_from_a_missing_one() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\nFLIGHTDECK_DAEMON_VERSION:flightdeckd 0.0.9\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert!(!result.flightdeckd_missing, "an outdated daemon is PRESENT, just too old");
+        assert!(result.flightdeckd_outdated);
+
+        let msg = super::describe_probe_blockers(&result);
+        assert!(msg.contains("older than"), "must give a distinct, version-specific message: {msg}");
+        assert!(!msg.contains("is not installed"), "must not conflate outdated with missing: {msg}");
+    }
+
+    #[test]
+    fn probe_parsing_is_ok_when_both_tools_are_present_and_current() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\nFLIGHTDECK_DAEMON_VERSION:flightdeckd 0.1.0\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert!(!result.claude_missing);
+        assert!(!result.flightdeckd_missing);
+        assert!(!result.flightdeckd_outdated);
+    }
+
+    /// A genuine ssh-level failure (bad host/key/auth) never even reaches the probe
+    /// script — neither marker line shows up at all, as opposed to showing up empty
+    /// (the "both missing" case above).
+    #[test]
+    fn probe_parsing_reports_a_connection_failure_as_err_not_missing_tools() {
+        let err = super::parse_probe_output("", "Permission denied (publickey).\n", false)
+            .expect_err("no marker lines at all means the script never ran");
+        assert!(err.contains("Permission denied"), "should surface the real ssh error: {err}");
+    }
+
+    // ---- Remote pairing: one dedicated key per server (A3) ------------------------
+
+    /// A throwaway `ssh_keys/`-shaped dir, removed when dropped — lets tests spawn
+    /// real `ssh-keygen` without touching the real app data dir.
+    struct TempKeysDir(std::path::PathBuf);
+    impl TempKeysDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("tosse-sshkeys-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempKeysDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_machine_key_reuses_the_same_pending_pair() {
+        let dir = TempKeysDir::new("reuse");
+        let first = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+        let second = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+        assert_eq!(first.public_key, second.public_key, "the SAME pending pair must come back");
+        assert_eq!(first.identity_file, second.identity_file);
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 2, "exactly one key pair (private + .pub), not one per call");
+    }
+
+    /// Two concurrent callers (e.g. a double click on "+ Add a server") must not race
+    /// `ssh-keygen -f pending` into an "overwrite?" prompt nobody answers (a hang) —
+    /// `PENDING_KEY_LOCK` serializes them, and both still see the SAME result.
+    #[tokio::test]
+    async fn generate_machine_key_concurrent_calls_do_not_race() {
+        let dir = TempKeysDir::new("concurrent");
+        let (a, b) = tokio::join!(
+            super::generate_or_reuse_pending_key(dir.path(), "server"),
+            super::generate_or_reuse_pending_key(dir.path(), "server"),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.public_key, b.public_key, "both callers must see the same pending pair");
+        assert_eq!(a.identity_file, b.identity_file);
+    }
+
+    #[tokio::test]
+    async fn add_machine_success_claims_pending_and_frees_a_fresh_slot() {
+        let dir = TempKeysDir::new("claim");
+        let pending = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+
+        let claimed = super::claim_pending_key(dir.path(), Some(pending.identity_file.clone()), "machine-1")
+            .unwrap()
+            .expect("a pending identity_file must be claimed, not passed through as None");
+        assert!(claimed.ends_with("machine-1"), "renamed to the machine id: {claimed}");
+        assert!(std::path::Path::new(&claimed).exists());
+        assert!(std::path::Path::new(&format!("{claimed}.pub")).exists());
+        assert!(!std::path::Path::new(&pending.identity_file).exists(), "pending must be GONE, not copied");
+
+        // The next generate_machine_key call (for a SECOND server) must mint a FRESH
+        // pending pair — not resurrect the one just claimed.
+        let fresh = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+        assert_eq!(fresh.identity_file, pending.identity_file, "same fixed pending path");
+        assert_ne!(fresh.public_key, pending.public_key, "but a DIFFERENT (fresh) key");
+    }
+
+    #[test]
+    fn claim_pending_key_passes_through_a_non_pending_identity_file_unchanged() {
+        let dir = TempKeysDir::new("passthrough");
+        let custom = dir.path().join("my-custom-key");
+        std::fs::write(&custom, "not a real key, just a marker").unwrap();
+
+        let custom_str = custom.to_string_lossy().into_owned();
+        let out = super::claim_pending_key(dir.path(), Some(custom_str.clone()), "machine-1").unwrap();
+        assert_eq!(out, Some(custom_str), "a non-pending identity_file must not be touched");
+        assert!(custom.exists(), "and certainly not moved");
+
+        let none_out = super::claim_pending_key(dir.path(), None, "machine-1").unwrap();
+        assert_eq!(none_out, None, "no identity_file (default SSH key/agent) stays None");
+    }
+
+    #[test]
+    fn stale_identity_file_error_only_fires_on_a_missing_path() {
+        assert!(
+            super::stale_identity_file_error(&None).is_none(),
+            "no identity_file (default key/agent) is never stale"
+        );
+
+        let dir = TempKeysDir::new("stale");
+        let real = dir.path().join("real-key");
+        std::fs::write(&real, "x").unwrap();
+        assert!(
+            super::stale_identity_file_error(&Some(real.to_string_lossy().into_owned())).is_none(),
+            "an existing identity_file passes"
+        );
+
+        let gone = dir.path().join("already-claimed-by-someone-else");
+        let msg = super::stale_identity_file_error(&Some(gone.to_string_lossy().into_owned()))
+            .expect("a nonexistent identity_file must be flagged");
+        assert!(msg.contains("already used"), "must name the specific cause: {msg}");
+    }
+
+    #[test]
+    fn delete_machine_and_key_removes_both_key_files() {
+        let dir = TempKeysDir::new("delete");
+        let key = dir.path().join("machine-1");
+        std::fs::write(&key, "priv").unwrap();
+        std::fs::write(format!("{}.pub", key.display()), "pub").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_machine(&crate::store::MachineRecord {
+                id: "machine-1".into(),
+                label: "vps".into(),
+                host: "h.example".into(),
+                port: 22,
+                user: "agent".into(),
+                identity_file: Some(key.to_string_lossy().into_owned()),
+                added_at: 1,
+            })
+            .unwrap();
+
+        super::delete_machine_and_key(&store, "machine-1").unwrap();
+        assert!(!key.exists(), "private key removed");
+        assert!(!std::path::Path::new(&format!("{}.pub", key.display())).exists(), "public key removed");
+        assert!(store.machine_by_id("machine-1").unwrap().is_none(), "record gone too");
+    }
+
+    #[test]
+    fn delete_machine_and_key_is_a_harmless_noop_without_an_identity_file() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_machine(&crate::store::MachineRecord {
+                id: "machine-2".into(),
+                label: "vps".into(),
+                host: "h.example".into(),
+                port: 22,
+                user: "agent".into(),
+                identity_file: None,
+                added_at: 1,
+            })
+            .unwrap();
+        // Must not panic when there is no key to clean up.
+        super::delete_machine_and_key(&store, "machine-2").unwrap();
+
+        // Nor when the record doesn't even exist (already-deleted / bad id).
+        super::delete_machine_and_key(&store, "no-such-machine").unwrap();
     }
 }

@@ -21,7 +21,7 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import type { AddressCandidate, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
@@ -454,14 +454,19 @@ interface ConversationsState {
   generateMachineKey: (
     label: string,
   ) => Promise<{ ok: true; key: GeneratedKey } | { ok: false; error: string }>;
-  /** Pair a remote server: probe it (SSH + `claude`) and, on success, persist +
-   *  add it. Returns the saved machine, or an actionable error the form shows. */
+  /** Pair a remote server: probe it (SSH + `claude` + `flightdeckd`) and, on success,
+   *  persist + add it. Returns the saved machine, or an actionable error the form
+   *  shows. `addresses` is the full set of candidates the pairing ticket discovered
+   *  (Tailscale name / LAN IP / hostname) — currently informational on the core side
+   *  (ignored there until a later task persists it), kept here so the confirm screen
+   *  can offer them and the wire is already shaped for that task. */
   addMachine: (input: {
     label: string;
     host: string;
     port: number;
     user: string;
     identityFile: string | null;
+    addresses?: AddressCandidate[] | null;
   }) => Promise<{ ok: true; machine: Machine } | { ok: false; error: string }>;
   /** Un-pair a server: removes it and every repo/conversation anchored to it. */
   removeMachine: (id: string) => void;
@@ -616,14 +621,16 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   addMachine: async (input) => {
-    // The core probes the server (SSH reachable + `claude` present) BEFORE saving,
-    // so a bad host / key / paste / missing claude surfaces as an error here.
+    // The core probes the server (SSH reachable + `claude` + `flightdeckd` present,
+    // `flightdeckd` current) BEFORE saving, so a bad host / key / paste / missing or
+    // outdated tool surfaces as an error here.
     const res = await commands.addMachine(
       input.label,
       input.host,
       input.port,
       input.user,
       input.identityFile,
+      input.addresses ?? null,
     );
     if (res.status !== "ok") return { ok: false, error: res.error };
     const machine = recordToMachine(res.data);

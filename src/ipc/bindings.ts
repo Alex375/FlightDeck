@@ -1995,10 +1995,8 @@ async deleteRepo(id: string) : Promise<Result<null, string>> {
 }
 },
 /**
- * Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
- * key), stored under the app data dir. Returns the private-key path and the public
- * key to paste on the server. The private key never leaves this Mac. Wraps the system
- * `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+ * See [`generate_or_reuse_pending_key`] — this is the IPC wrapper that resolves the
+ * real app data dir.
  */
 async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> {
     try {
@@ -2009,21 +2007,26 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
- * Pair a remote server: probe it (SSH reachable + `claude` present), and on success
- * persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
- * probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
- * not at the first message.
+ * Pair a remote server: probe it (SSH reachable + `claude` and `flightdeckd`
+ * present, `flightdeckd` current), and on success persist it as a [`MachineRecord`].
+ * Returns the saved record so the UI lists it. The probe runs FIRST so a bad
+ * host/key/paste or a missing/outdated tool fails loudly here, not at the first
+ * message.
+ * 
+ * `addresses` is the full set of candidate hosts the pairing ticket discovered
+ * (Tailscale name, LAN IP, bare hostname) — currently informational only (ignored),
+ * kept so the front's IPC call is already shaped for the column a later task adds.
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null) : Promise<Result<MachineRecord, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<MachineRecord, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Un-pair a remote server: removes it and every repo/conversation anchored to it.
+ * Un-pair a remote server. See [`delete_machine_and_key`].
  */
 async deleteMachine(id: string) : Promise<Result<null, string>> {
     try {
@@ -2431,6 +2434,18 @@ export type AccountProfile = { email: string | null; orgName: string | null;
  * `organization.organization_type`. `None` for a type the CLI does not name either.
  */
 subscriptionType: string | null }
+/**
+ * See [`AddressKind`].
+ */
+export type AddressCandidate = { kind: AddressKind; value: string }
+/**
+ * One discovered candidate address for a paired server — as printed in the pairing
+ * ticket's `addresses` array (see the "1 · Run this once on your server" command in
+ * `RemoteServersGroup`, `ControlSection.tsx`). Not persisted anywhere yet: the confirm
+ * screen resolves it down to a single `host` before `add_machine` is called — the
+ * column for keeping the full discovered set lands in a later task.
+ */
+export type AddressKind = "tailscale" | "lan" | "manual"
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
