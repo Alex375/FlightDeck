@@ -51,3 +51,38 @@ fn bridge_exits_when_the_daemon_closes_even_with_stdin_open() {
     std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
     assert_eq!(out, "{\"type\":\"fd_attach\"}\n{\"type\":\"fd_detach\",\"reason\":\"stalled\"}\n");
 }
+
+/// Lines the client wrote just before the daemon closed the stream are still
+/// delivered to the daemon (the bridge drains its stdin queue on the way out).
+#[test]
+fn bridge_delivers_stdin_lines_written_just_before_the_daemon_closes() {
+    let dir = tempfile::Builder::new().prefix("fdd").tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("fd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flightdeckd"))
+        .args(["attach", "--cwd", "/tmp", "--socket"])
+        .arg(&socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (conn, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    let mut request = String::new();
+    reader.read_line(&mut request).unwrap();
+
+    for i in 0..40 {
+        writeln!(stdin, "{{\"type\":\"user\",\"i\":{i}}}").unwrap();
+    }
+    stdin.flush().unwrap();
+    let mut w = conn;
+    w.write_all(b"{\"type\":\"fd_detach\",\"reason\":\"replaced\"}\n").unwrap();
+    w.shutdown(std::net::Shutdown::Write).unwrap(); // the daemon is done talking
+
+    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect(); // until the bridge closes
+    assert_eq!(lines.len(), 40, "stdin lines were lost: got {}", lines.len());
+    assert!(child.wait().unwrap().success());
+    drop(stdin);
+}

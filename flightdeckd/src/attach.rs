@@ -377,13 +377,11 @@ pub async fn attach_client(
             }
         }
     });
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let stdin_pump = tokio::spawn(async move {
-        while let Some(chunk) = stdin_rx.recv().await {
-            if write_half.write_all(&chunk).await.is_err() || write_half.flush().await.is_err() {
-                break;
-            }
-        }
+        let res = pump_stdin(&mut write_half, &mut stdin_rx, stop_rx, STDIN_DRAIN_QUIET).await;
         write_half.shutdown().await.ok();
+        res
     });
 
     // socket → stdout; ends when the daemon closes (fd_detach) or the pipe dies.
@@ -402,8 +400,61 @@ pub async fn attach_client(
             Err(_) => break,
         }
     }
-    stdin_pump.abort();
+    // Lines already read off stdin were SENT as far as the client knows:
+    // deliver them (bounded) or fail loudly — never drop them silently.
+    let _ = stop_tx.send(());
+    match tokio::time::timeout(STDIN_DRAIN_TOTAL, stdin_pump).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => Err(anyhow::anyhow!("the stdin pump crashed: {e}")),
+        Err(_) => anyhow::bail!(
+            "stdin lines were still queued {STDIN_DRAIN_TOTAL:?} after flightdeckd closed the stream — not delivered"
+        ),
+    }
+}
+
+/// How long the bridge may spend delivering the stdin lines it had already
+/// read when the daemon ended the stream.
+const STDIN_DRAIN_TOTAL: Duration = Duration::from_secs(2);
+/// During that drain, a line that has not arrived within this long is not
+/// coming (the stdin thread is waiting on the client, not holding a line).
+const STDIN_DRAIN_QUIET: Duration = Duration::from_millis(200);
+
+/// stdin lines → the daemon socket, in order. Runs until stdin ends (Ok) or
+/// `stop` fires (the daemon ended the stream); then it DRAINS what the stdin
+/// thread already read: every such line is written, or this fails with an
+/// explicit error — a line is never dropped silently.
+async fn pump_stdin<W: AsyncWrite + Unpin>(
+    out: &mut W,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    stop: oneshot::Receiver<()>,
+    quiet: Duration,
+) -> Result<()> {
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            biased;
+            chunk = rx.recv() => match chunk {
+                Some(c) => deliver_stdin(out, &c, rx).await?,
+                None => return Ok(()), // stdin EOF
+            },
+            _ = &mut stop => break,
+        }
+    }
+    while let Ok(Some(c)) = tokio::time::timeout(quiet, rx.recv()).await {
+        deliver_stdin(out, &c, rx).await?;
+    }
     Ok(())
+}
+
+async fn deliver_stdin<W: AsyncWrite + Unpin>(out: &mut W, chunk: &[u8], rx: &mpsc::Receiver<Vec<u8>>) -> Result<()> {
+    let res = async {
+        out.write_all(chunk).await?;
+        out.flush().await
+    }
+    .await;
+    res.map_err(|e| {
+        anyhow::anyhow!("{} stdin line(s) could not be delivered to flightdeckd: {e}", 1 + rx.len())
+    })
 }
 
 async fn one_shot(socket: &Path, request: serde_json::Value) -> Result<String> {
@@ -647,6 +698,53 @@ mod tests {
         attach(Some(conv.clone()), None).await; // no title: unchanged
         attach(Some(conv.clone()), Some("  ")).await; // blank: unchanged
         assert_eq!(title_of(&conv), "Renamed on the Mac");
+    }
+
+    fn queued_lines(n: usize) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(64);
+        for i in 0..n {
+            tx.try_send(format!("{{\"type\":\"user\",\"i\":{i}}}\n").into_bytes()).unwrap();
+        }
+        (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn stdin_lines_queued_when_the_daemon_closes_are_all_delivered() {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let (_tx, mut rx) = queued_lines(50); // stdin still open, 50 lines already read
+        let (stop_tx, stop_rx) = oneshot::channel();
+        stop_tx.send(()).unwrap(); // the daemon ended the stream right away
+        pump_stdin(&mut ours, &mut rx, stop_rx, Duration::from_millis(50)).await.unwrap();
+        drop(ours);
+        let got = read_all_lines(theirs, Duration::ZERO).await;
+        assert_eq!(got.len(), 50, "a queued stdin line was dropped");
+        assert!(got[49].contains("\"i\":49"));
+    }
+
+    #[tokio::test]
+    async fn a_stdin_line_arriving_during_the_drain_is_delivered_too() {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let (tx, mut rx) = queued_lines(1);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        stop_tx.send(()).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await; // the stdin thread hands over one more
+            tx.send(b"{\"type\":\"late\"}\n".to_vec()).await.unwrap();
+        });
+        pump_stdin(&mut ours, &mut rx, stop_rx, Duration::from_millis(300)).await.unwrap();
+        drop(ours);
+        assert_eq!(read_all_lines(theirs, Duration::ZERO).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn undeliverable_stdin_lines_fail_loudly() {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs); // the daemon's side is gone
+        let (_tx, mut rx) = queued_lines(3);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        stop_tx.send(()).unwrap();
+        let err = pump_stdin(&mut ours, &mut rx, stop_rx, Duration::from_millis(50)).await.unwrap_err();
+        assert!(err.to_string().contains("3 stdin line(s) could not be delivered"), "{err}");
     }
 
     #[tokio::test]
