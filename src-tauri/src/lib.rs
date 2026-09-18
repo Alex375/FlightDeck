@@ -79,13 +79,14 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
+use bootstrap::connect::{bootstrap_forget_host_key, bootstrap_install_key, bootstrap_probe};
 use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    SessionTaskEvent, SessionTitleEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent, TickEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
@@ -361,6 +362,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             start_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
+            bootstrap_install_key,
+            bootstrap_probe,
+            bootstrap_forget_host_key,
         ])
         .events(collect_events![
             TickEvent,
@@ -387,6 +391,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             WakeWordEvent,
             ServerLoginPromptEvent,
             ServerLoginResultEvent,
+            HostKeyFingerprintEvent,
         ])
 }
 

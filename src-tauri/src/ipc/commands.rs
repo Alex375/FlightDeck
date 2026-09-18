@@ -3312,7 +3312,11 @@ fn pending_key_path(ssh_keys_dir: &Path) -> PathBuf {
 /// Guarded by [`PENDING_KEY_LOCK`]; see its doc comment. Takes a plain path (not a
 /// `tauri::AppHandle`) so it's testable without a running app — [`generate_machine_key`]
 /// is the thin IPC wrapper that resolves the real app data dir.
-async fn generate_or_reuse_pending_key(ssh_keys_dir: &Path, label: &str) -> Result<GeneratedKey, String> {
+///
+/// `pub(crate)` so `bootstrap::connect::install_key` (B7) reuses this SAME
+/// lookup-or-generate primitive for the app's dedicated per-server key, rather than
+/// minting a second one.
+pub(crate) async fn generate_or_reuse_pending_key(ssh_keys_dir: &Path, label: &str) -> Result<GeneratedKey, String> {
     let _guard = PENDING_KEY_LOCK.lock().await;
     std::fs::create_dir_all(ssh_keys_dir).map_err(|e| e.to_string())?;
     let key = pending_key_path(ssh_keys_dir);
@@ -3544,27 +3548,77 @@ fn version_at_least(v: &str, min: &str) -> bool {
     true
 }
 
-/// Outcome of probing a remote server for the two binaries pairing needs. `Ok` covers
-/// EVERY combination of present/missing/outdated — "missing" is data IN the struct,
-/// never an ssh-level failure — so [`add_machine`] can name every blocker at once
-/// instead of just whichever the remote shell happened to trip over first. An `Err`
-/// means the ssh round-trip itself failed (unreachable host, auth refused, …), before
-/// the probe script could report anything. Designed as the base a later installer
-/// task extends (e.g. a `conflict` field).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of probing a remote server for the two binaries pairing needs, PLUS (B7)
+/// the install-mode facts [`bootstrap::connect::probe`] needs to decide how (or
+/// whether) to install `flightdeckd` on a server that has never been paired before.
+/// `Ok` covers EVERY combination of present/missing/outdated — "missing" is data IN
+/// the struct, never an ssh-level failure — so [`add_machine`] can name every blocker
+/// at once instead of just whichever the remote shell happened to trip over first. An
+/// `Err` means the ssh round-trip itself failed (unreachable host, auth refused, …),
+/// before the probe script could report anything.
+///
+/// The install-mode fields (`conflict`/`os`/`arch`/`systemd`/`passwordless_sudo`/
+/// `linger`/`kill_user_processes`) are ALWAYS `None` for a pairing probe
+/// ([`probe_remote`]'s own script never emits their markers — see
+/// [`parse_probe_output`]'s doc) — [`add_machine`] ignores them either way, exactly as
+/// before this struct grew them. Only [`bootstrap::connect::probe`]'s own, EXTENDED
+/// script populates them.
+///
+/// `Serialize`/`Type` (B7): [`bootstrap::connect::bootstrap_probe`] returns this
+/// directly across the Tauri IPC boundary — [`add_machine`]'s own use never needed
+/// this before, since it only ever consumed a `RemoteProbeResult` internally and
+/// returned a [`MachineRecord`] instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct RemoteProbeResult {
     pub claude_version: Option<String>,
     pub claude_missing: bool,
     pub flightdeckd_version: Option<String>,
     pub flightdeckd_missing: bool,
     pub flightdeckd_outdated: bool,
+    /// One-line description of a pre-existing `flightdeckd` install this server
+    /// already carries (a system unit, a binary outside `~/.local/bin`, or an existing
+    /// `~/.flightdeckd/config.json`) — meaning "adopt it, don't reinstall", not a
+    /// failure. `None` when the probe script found none of those (or never ran this
+    /// check at all — a pairing probe, see the struct doc).
+    pub conflict: Option<String>,
+    /// `uname -s` (e.g. `"Linux"`).
+    pub os: Option<String>,
+    /// `uname -m` (e.g. `"x86_64"`/`"aarch64"`) — picks the daemon binary to install.
+    pub arch: Option<String>,
+    /// Whether systemd is PID 1 (`/run/systemd/system` exists).
+    pub systemd: Option<bool>,
+    /// Whether `sudo -n true` succeeds (passwordless sudo) — never prompts, so this is
+    /// safe to run from a batch probe.
+    pub passwordless_sudo: Option<bool>,
+    /// `loginctl show-user $USER -p Linger` — whether the user can keep a `systemd
+    /// --user` unit running after the SSH session that started it closes.
+    pub linger: Option<bool>,
+    /// logind's `KillUserProcesses` setting (best-effort, via `busctl` — `None` when
+    /// `busctl` itself is unavailable, never an error): whether a detached process
+    /// (the no-linger, no-sudo fallback) survives the session closing.
+    pub kill_user_processes: Option<bool>,
 }
 
 /// Pulls the value after a `MARKER:` line out of the probe script's stdout. `None`
 /// means the marker line never showed up at all (e.g. the connection died before the
 /// script could run), as opposed to showing up with an empty value.
-fn extract_marker(stdout: &str, marker: &str) -> Option<String> {
+///
+/// `pub(crate)` so `bootstrap::connect`'s own extended probe script (B7) reuses this
+/// SAME marker-extraction primitive instead of growing a second one.
+pub(crate) fn extract_marker(stdout: &str, marker: &str) -> Option<String> {
     stdout.lines().find_map(|l| l.strip_prefix(marker)).map(|v| v.trim().to_string())
+}
+
+/// Parses a `"yes"`/`"no"` marker value into a bool — anything else (missing, empty,
+/// garbled) is `None`, never an error: a probe script's best-effort fact (e.g. `sudo`
+/// or `busctl` behaving unexpectedly on some distro) must degrade silently, not fail
+/// the whole probe.
+pub(crate) fn parse_yes_no_marker(v: Option<String>) -> Option<bool> {
+    match v.as_deref() {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => None,
+    }
 }
 
 /// The shared option-only base of every SSH call this crate makes to an ALREADY-PAIRED
@@ -3692,7 +3746,16 @@ exit 0
 /// script could report anything (unreachable host, auth refused, …). Pure — this is
 /// what makes every combination of present/missing/outdated unit-testable without a
 /// real ssh round-trip; [`probe_remote`] is the (untestable) shell around it.
-fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool) -> Result<RemoteProbeResult, String> {
+///
+/// The install-mode markers ([`RemoteProbeResult`]'s new B7 fields) are parsed
+/// UNCONDITIONALLY here too, via the same [`extract_marker`]/[`parse_yes_no_marker`]
+/// primitives — but [`probe_remote`]'s own script (used by [`add_machine`] pairing)
+/// never emits them, so they simply come back `None` for every pairing call, exactly
+/// the "ignores the new fields" behavior the brief requires. `bootstrap::connect`'s
+/// own EXTENDED script (which DOES emit them) is what actually populates them; this
+/// one function serves both, so there is exactly one place that turns probe stdout
+/// into a [`RemoteProbeResult`], never two structs or two parsers drifting apart.
+pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool) -> Result<RemoteProbeResult, String> {
     let raw_claude = extract_marker(stdout, "FLIGHTDECK_CLAUDE_VERSION:");
     let raw_flightdeckd = extract_marker(stdout, "FLIGHTDECK_DAEMON_VERSION:");
     // Neither marker LINE ever showed up (not just "showed up empty"): the script
@@ -3715,12 +3778,27 @@ fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool) -> Result
             .map(|v| !version_at_least(v, MIN_DAEMON_VERSION))
             .unwrap_or(false);
 
+    let conflict = extract_marker(stdout, "FLIGHTDECK_CONFLICT:").filter(|s| !s.is_empty());
+    let os = extract_marker(stdout, "FLIGHTDECK_OS:").filter(|s| !s.is_empty());
+    let arch = extract_marker(stdout, "FLIGHTDECK_ARCH:").filter(|s| !s.is_empty());
+    let systemd = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_SYSTEMD:"));
+    let passwordless_sudo = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_PASSWORDLESS_SUDO:"));
+    let linger = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_LINGER:"));
+    let kill_user_processes = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_KILL_USER_PROCESSES:"));
+
     Ok(RemoteProbeResult {
         claude_version,
         claude_missing,
         flightdeckd_version,
         flightdeckd_missing,
         flightdeckd_outdated,
+        conflict,
+        os,
+        arch,
+        systemd,
+        passwordless_sudo,
+        linger,
+        kill_user_processes,
     })
 }
 
@@ -4976,6 +5054,90 @@ mod tests {
         let err = super::parse_probe_output("", "Permission denied (publickey).\n", false)
             .expect_err("no marker lines at all means the script never ran");
         assert!(err.contains("Permission denied"), "should surface the real ssh error: {err}");
+    }
+
+    // ---- Install-mode probe facts (B7) ----------------------------------------------
+    // `add_machine`'s own pairing script (`probe_remote`, above) never emits any of
+    // these markers — so every pairing call gets `None`/`None`/... here for free,
+    // exactly the "ignores the new fields" behavior the brief requires. These tests
+    // drive `parse_probe_output` directly with `bootstrap::connect::PROBE_SCRIPT`-shaped
+    // marker lines, since that extended script is the only thing that ever emits them.
+
+    /// A minimal pairing-style probe (only the two original markers) must leave every
+    /// new B7 field `None` — proves pairing's own script truly is unaffected by the
+    /// struct growing these fields.
+    #[test]
+    fn probe_parsing_leaves_install_mode_fields_none_when_their_markers_never_ran() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\nFLIGHTDECK_DAEMON_VERSION:flightdeckd 0.1.0\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert_eq!(result.conflict, None);
+        assert_eq!(result.os, None);
+        assert_eq!(result.arch, None);
+        assert_eq!(result.systemd, None);
+        assert_eq!(result.passwordless_sudo, None);
+        assert_eq!(result.linger, None);
+        assert_eq!(result.kill_user_processes, None);
+    }
+
+    #[test]
+    fn probe_parsing_reads_every_install_mode_marker_when_present() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\n\
+                       FLIGHTDECK_DAEMON_VERSION:\n\
+                       FLIGHTDECK_OS:Linux\n\
+                       FLIGHTDECK_ARCH:aarch64\n\
+                       FLIGHTDECK_SYSTEMD:yes\n\
+                       FLIGHTDECK_PASSWORDLESS_SUDO:no\n\
+                       FLIGHTDECK_LINGER:no\n\
+                       FLIGHTDECK_KILL_USER_PROCESSES:no\n\
+                       FLIGHTDECK_CONFLICT:an existing system unit at /etc/systemd/system/flightdeckd.service\n";
+        let result = super::parse_probe_output(stdout, "FLIGHTDECK_NO_DAEMON\n", false).unwrap();
+        assert_eq!(result.os.as_deref(), Some("Linux"));
+        assert_eq!(result.arch.as_deref(), Some("aarch64"));
+        assert_eq!(result.systemd, Some(true));
+        assert_eq!(result.passwordless_sudo, Some(false));
+        assert_eq!(result.linger, Some(false));
+        assert_eq!(result.kill_user_processes, Some(false));
+        assert_eq!(
+            result.conflict.as_deref(),
+            Some("an existing system unit at /etc/systemd/system/flightdeckd.service")
+        );
+    }
+
+    /// `FLIGHTDECK_KILL_USER_PROCESSES:` with an EMPTY value (the extended script's own
+    /// shape when `busctl` is unavailable, or its output doesn't parse) must read back
+    /// `None`, never a false `Some(false)` — a missing/garbled fact must degrade
+    /// silently, never masquerade as a confident negative answer.
+    #[test]
+    fn probe_parsing_reads_an_empty_marker_value_as_none_not_a_false_negative() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\n\
+                       FLIGHTDECK_DAEMON_VERSION:flightdeckd 0.1.0\n\
+                       FLIGHTDECK_KILL_USER_PROCESSES:\n\
+                       FLIGHTDECK_LINGER:\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert_eq!(result.kill_user_processes, None);
+        assert_eq!(result.linger, None);
+    }
+
+    /// A garbled `yes`/`no` marker value (neither exact string) must also degrade to
+    /// `None`, never panic or silently coerce to a boolean.
+    #[test]
+    fn probe_parsing_treats_a_garbled_yes_no_marker_as_none() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\n\
+                       FLIGHTDECK_DAEMON_VERSION:flightdeckd 0.1.0\n\
+                       FLIGHTDECK_SYSTEMD:maybe\n\
+                       FLIGHTDECK_PASSWORDLESS_SUDO:Y\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert_eq!(result.systemd, None);
+        assert_eq!(result.passwordless_sudo, None);
+    }
+
+    /// No conflict line at all (the ordinary, non-conflicting case) must read back
+    /// `None`, never an empty string.
+    #[test]
+    fn probe_parsing_reads_no_conflict_marker_as_none() {
+        let stdout = "FLIGHTDECK_CLAUDE_VERSION:2.1.272\nFLIGHTDECK_DAEMON_VERSION:flightdeckd 0.1.0\n";
+        let result = super::parse_probe_output(stdout, "", true).unwrap();
+        assert_eq!(result.conflict, None);
     }
 
     // ---- Remote pairing: candidate addresses (A5) ----------------------------------

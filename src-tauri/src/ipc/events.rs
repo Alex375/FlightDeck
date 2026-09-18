@@ -287,6 +287,26 @@ pub struct ServerLoginResultEvent {
     pub error: Option<String>,
 }
 
+/// `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+/// `bootstrap_install_key` returns `Ok` (`Installed` or `AlreadyPresent`) — never on
+/// any `Err`, even one (like a wrong password) that still pinned a fresh host key at
+/// the transport layer; see `bootstrap::connect::bootstrap_install_key`'s own doc for
+/// why the emit is gated on the overall `Result`, not on "some fingerprint happens to
+/// be readable". DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+/// confirmation step gating on this event, it never blocks the flow. `known` = the
+/// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
+/// this particular connection attempt — `false` only on a server's genuine first
+/// contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
+/// it fails as `BootstrapError::HostKeyMismatch` instead (see
+/// `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct HostKeyFingerprintEvent {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub known: bool,
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {
