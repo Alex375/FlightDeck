@@ -118,6 +118,15 @@ pub struct AttachPoint {
     pub conversation: Option<String>,
     pub epoch: Option<String>,
     pub cursor: u64,
+    /// Opt into the daemon's reattach-replay compaction (D6): the client can prove it
+    /// tracks `fd_skip{from,to}` frames instead of a literal replay of every line, so
+    /// [`build_remote_command`] appends `--supports-skip`. Decided ONCE, before the
+    /// FIRST spawn, from a cached per-machine version probe (`ipc::commands::
+    /// supports_skip_for_machine`) — an older daemon's clap REJECTS the unknown flag
+    /// outright, so this must never be guessed or flipped mid-session; every
+    /// reconnect for the same session carries the SAME value forward (see
+    /// `session.rs::run_actor`). Default `false`: the unchanged, pre-D6 wire.
+    pub supports_skip: bool,
 }
 
 /// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
@@ -304,6 +313,13 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
         s.push_str(&format!(" --epoch {}", shell_quote(epoch)));
     }
     s.push_str(&format!(" --cursor {}", attach.cursor));
+    // Opt into fd_skip reattach-replay compaction (D6) — ONLY when the gate in
+    // `ipc::commands::supports_skip_for_machine` already confirmed the daemon's
+    // version accepts it. An older daemon's clap REJECTS an unknown flag outright
+    // (the whole attach fails), so this is never speculative.
+    if attach.supports_skip {
+        s.push_str(" --supports-skip");
+    }
     s.push_str(" --");
     for arg in args {
         s.push(' ');
@@ -607,6 +623,13 @@ pub struct Transport {
     /// SAME connection parse fine (session.rs's cursor math must roll back to
     /// this offset instead — see `run_actor`).
     first_unparseable_offset: Arc<AtomicU64>,
+    /// Set once by `reader_loop` when an `fd_skip{from,to}` frame's `from` did not
+    /// match this connection's recorded wire position (see [`apply_fd_skip`]) — a
+    /// protocol violation the daemon should never produce. `None` once
+    /// [`Self::take_skip_violation`] has consumed it (or nothing has gone wrong).
+    /// Surfaced by the session actor as a single `protocol_error` notice — see
+    /// `session.rs::run_actor`.
+    skip_violation: Arc<Mutex<Option<String>>>,
     /// Whether this transport is an ssh→flightdeckd attach stream (drives the
     /// `fd_stop` escalation in [`Transport::shutdown`]).
     is_remote: bool,
@@ -722,6 +745,7 @@ impl Transport {
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable_replayable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let first_unparseable_offset: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let pumps = vec![
             tokio::spawn(reader_loop(
@@ -731,6 +755,7 @@ impl Transport {
                 lines_seen.clone(),
                 unparseable_replayable.clone(),
                 first_unparseable_offset.clone(),
+                skip_violation.clone(),
             )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone(), stderr_done.clone())),
@@ -749,6 +774,7 @@ impl Transport {
                 lines_seen,
                 unparseable_replayable,
                 first_unparseable_offset,
+                skip_violation,
                 is_remote: cfg.remote.is_some(),
             },
             msg_rx,
@@ -782,6 +808,16 @@ impl Transport {
             u64::MAX => None,
             n => Some(n),
         }
+    }
+
+    /// Take (and clear) a one-time note that this connection received an `fd_skip`
+    /// frame whose `from` did not match our recorded wire position — see
+    /// [`apply_fd_skip`]. `None` on every call after the first (or when nothing has
+    /// gone wrong this connection). The session actor polls this whenever it wakes up
+    /// to process the next inbound message and, if `Some`, surfaces it as a single
+    /// `protocol_error` notice — see `session.rs::run_actor`.
+    pub fn take_skip_violation(&self) -> Option<String> {
+        self.skip_violation.lock().ok().and_then(|mut g| g.take())
     }
 
     /// OS process id, while the child is alive.
@@ -960,6 +996,24 @@ impl Transport {
 /// replayable lines go on to parse fine afterward (see
 /// `Transport::first_unparseable_offset`'s doc for why that distinction
 /// matters).
+///
+/// D6: an `fd_skip{from,to}` frame is intercepted HERE, never forwarded through
+/// `tx` — it folds `to-from+1` replayable lines straight into `lines_seen`
+/// (see [`apply_fd_skip`]) instead of being individually re-parsed, and a
+/// mismatch against the connection's recorded position is recorded once in
+/// `skip_violation` for the session actor to surface.
+///
+/// ⚠️ `fd_skip{from,to}` is in the DAEMON's session-absolute seq space (the same
+/// numbering as `fd_attach.replay_from`), while `lines_seen` is always 0-based
+/// PER CONNECTION (reset by every `Transport::spawn`, including every
+/// reconnect — see its doc). Reconciling the two requires this connection's own
+/// `attach_base`: the `replay_from` carried by the `fd_attach` frame the daemon
+/// always sends first on a remote attach stream (a local, non-remote session
+/// never sees `fd_attach`/`fd_skip` at all, so `attach_base` simply stays `0`
+/// and every check below degrades to the pre-D6, connection-relative-only math).
+/// Captured HERE, from the live wire message, rather than threaded in from
+/// `SpawnConfig` — the daemon's actual `replay_from` is the authoritative base,
+/// not the cursor we merely asked to resume from.
 async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     tx: mpsc::UnboundedSender<CliMessage>,
@@ -967,8 +1021,13 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     lines_seen: Arc<AtomicU64>,
     unparseable_replayable: Arc<AtomicU64>,
     first_unparseable_offset: Arc<AtomicU64>,
+    skip_violation: Arc<Mutex<Option<String>>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
+    // This connection's absolute base (see the doc above) — learned from the
+    // FIRST `fd_attach` frame it receives, `0` until then (and forever, for a
+    // local session or a remote one that never gets one).
+    let mut attach_base: u64 = 0;
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
@@ -978,7 +1037,40 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 }
                 let replayable = is_replayable_line(trimmed);
                 match serde_json::from_str::<CliMessage>(trimmed) {
+                    Ok(CliMessage::FdSkip(skip)) => {
+                        // D6: fold the skipped range directly into this connection's
+                        // position counter — `fd_skip` itself is never replayable (the
+                        // `fd_` prefix excludes it, like `fd_attach`/`fd_detach`) and is
+                        // NEVER forwarded to the UI (there is nothing for the assembler
+                        // to render). See `apply_fd_skip`'s doc for the invariant.
+                        let current = lines_seen.load(Ordering::Relaxed);
+                        let (new_position, violation) =
+                            apply_fd_skip(attach_base, current, skip.from, skip.to);
+                        lines_seen.store(new_position, Ordering::Relaxed);
+                        if violation {
+                            let expected = attach_base + current + 1;
+                            let note = format!(
+                                "server sent fd_skip{{from:{}, to:{}}} but this connection \
+                                 expected the next replayable seq to be {expected} \
+                                 (attach_base {attach_base} + position {current}) — \
+                                 resyncing to relative position {new_position}",
+                                skip.from, skip.to
+                            );
+                            eprintln!("[transport] {note}");
+                            if let Ok(mut slot) = skip_violation.lock() {
+                                if slot.is_none() {
+                                    *slot = Some(note);
+                                }
+                            }
+                        }
+                    }
                     Ok(msg) => {
+                        if let CliMessage::FdAttach(attach) = &msg {
+                            // Learn this connection's absolute base from the daemon's
+                            // own claim, BEFORE any `fd_skip` on this connection can
+                            // arrive (the daemon always sends `fd_attach` first).
+                            attach_base = attach.replay_from;
+                        }
                         if replayable {
                             lines_seen.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1020,6 +1112,49 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 break;
             }
         }
+    }
+}
+
+/// Pure step function applying one `fd_skip{from,to}` frame (D6) to a connection's
+/// replayable-line position counter (mirrors [`Transport::lines_seen`]) — kept
+/// separate from [`reader_loop`] so the invariant is unit-testable without a live
+/// transport.
+///
+/// `from`/`to` are in the DAEMON's session-absolute seq space (same numbering as
+/// `fd_attach.replay_from` — see the flightdeckd sibling repo's `session.rs`/
+/// `replay.rs`), while `current` (and the returned `new_position`) are this
+/// connection's own 0-based [`Transport::lines_seen`]. `attach_base` — this
+/// connection's own `fd_attach.replay_from`, `0` if none was ever seen — bridges
+/// the two spaces: the absolute position this connection has actually reached is
+/// `attach_base + current`, so the daemon's next skip is only valid when
+/// `attach_base + current + 1 == from` (⚠️ NOT `current + 1 == from` — that bare
+/// form is only correct by coincidence when `attach_base` happens to be `0`, i.e.
+/// the very first attach of a session; every later reattach has a nonzero base,
+/// which is precisely when a skip actually fires in practice).
+///
+/// The daemon is contractually supposed to only ever skip a well-formed range
+/// (`to >= from`) starting exactly where our reported position left off. That
+/// should never fail, but a client that blindly trusted it anyway would silently
+/// corrupt its reattach cursor forever after a single dropped/reordered/malformed
+/// frame, so this verifies it instead of assuming it:
+///   - match (`attach_base + current + 1 == from` AND `to >= from`): the whole
+///     range is absorbed — `new_position = to - attach_base` (back in this
+///     connection's relative space; equivalently `current + (to - from + 1)`).
+///   - mismatch (bad `from`, OR a matching `from` with an inverted `to < from`):
+///     still resync to the daemon's own claim, converted into this connection's
+///     relative space (`to.saturating_sub(attach_base)`), so a transient
+///     disagreement cannot wedge the connection forever repeating the same
+///     mismatch, but NEVER move backwards — `current.max(...)` — a stale,
+///     reordered, or (for the inverted-range case) nonsensical `to` behind where
+///     we already are must not un-count lines we already have.
+///
+/// Returns `(new_position, violation)`; the caller surfaces `violation` as a one-time
+/// `protocol_error` notice (see [`Transport::take_skip_violation`]).
+fn apply_fd_skip(attach_base: u64, current: u64, from: u64, to: u64) -> (u64, bool) {
+    if attach_base + current + 1 == from && to >= from {
+        (to - attach_base, false)
+    } else {
+        (current.max(to.saturating_sub(attach_base)), true)
     }
 }
 
@@ -1193,11 +1328,24 @@ mod tests {
             conversation: Some("conv-1".into()),
             epoch: Some("ep-1".into()),
             cursor: 42,
+            supports_skip: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
         assert!(cmd.contains("--epoch 'ep-1'"));
         assert!(cmd.contains("--cursor 42"));
+        assert!(!cmd.contains("--supports-skip"), "must not opt in unless asked: {cmd}");
+
+        // Asking opts in — the flag rides at the end of the reattach coordinates,
+        // before the claude argv separator.
+        cfg.attach = Some(AttachPoint {
+            conversation: Some("conv-1".into()),
+            epoch: Some("ep-1".into()),
+            cursor: 42,
+            supports_skip: true,
+        });
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
     }
 
     /// [`resolve_remote_daemon_bin`] must search the remote host the SAME way
@@ -1240,6 +1388,7 @@ mod tests {
         assert!(!is_replayable_line(r#"{"type":"keep_alive"}"#));
         assert!(!is_replayable_line(r#"{"type":"fd_attach"}"#));
         assert!(!is_replayable_line(r#"{"type":"fd_detach"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_skip","from":1,"to":2}"#));
         assert!(!is_replayable_line("not json"));
         assert!(!is_replayable_line(r#"{"no_type":true}"#));
     }
@@ -1266,6 +1415,7 @@ mod tests {
             lines_seen.clone(),
             unparseable.clone(),
             first_unparseable.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         // Well-formed and replayable: a bare `result` message parses with every
@@ -1327,6 +1477,7 @@ mod tests {
             lines_seen.clone(),
             unparseable.clone(),
             first_unparseable.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         writer
@@ -1369,6 +1520,323 @@ mod tests {
             rx.recv().await.expect("the 3 well-formed lines should be forwarded");
         }
         assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
+    }
+
+    // --- D6: fd_skip reattach-replay compaction ---------------------------------
+
+    /// [`apply_fd_skip`] on the happy path with `attach_base == 0` (this
+    /// connection's very first attach — no prior backlog, `from`/`to` and
+    /// `current`/`new_position` coincide numerically): the range starts exactly
+    /// where our position left off, so it is fully absorbed and the position
+    /// becomes `to`.
+    #[test]
+    fn apply_fd_skip_absorbs_a_matching_range() {
+        assert_eq!(apply_fd_skip(0, 1, 2, 5), (5, false));
+        // The degenerate single-line "range" (from == to) still just works.
+        assert_eq!(apply_fd_skip(0, 0, 1, 1), (1, false));
+    }
+
+    /// The realistic, common case this whole function exists for (a reattach with
+    /// backlog — every previous test in this module used an implicit
+    /// `attach_base` of 0, i.e. a first-ever attach, which is the ONE case a skip
+    /// essentially never fires in practice): a NONZERO `attach_base`, learned from
+    /// this connection's own `fd_attach.replay_from`, composes with the
+    /// connection-relative `current`/`new_position` exactly like the daemon's own
+    /// `attach.rs` integration test (`flightdeck-server`, seeded from
+    /// `replay_from`, not 0). `attach_base + new_position` must equal the
+    /// daemon's absolute `to` — the true wire position this connection has
+    /// reached — which is what `session.rs::run_actor` composes into the next
+    /// reattach cursor.
+    #[test]
+    fn apply_fd_skip_composes_correctly_with_a_nonzero_attach_base() {
+        let attach_base = 100u64;
+        let current = 2u64; // 2 replayable lines already parsed on THIS connection
+        // Absolute position so far: attach_base + current = 102. The daemon's next
+        // skip must therefore start at 103 to be valid.
+        let (new_position, violation) = apply_fd_skip(attach_base, current, 103, 110);
+        assert!(!violation, "from == attach_base + current + 1 is a valid, matching skip");
+        assert_eq!(
+            new_position,
+            current + (110 - 103 + 1),
+            "relative position advances by the skipped range's size, not by the raw absolute `to`"
+        );
+        assert_eq!(attach_base + new_position, 110, "composed absolute position must equal the daemon's `to`");
+    }
+
+    /// Violation: `from` does not follow the recorded position by exactly one —
+    /// checked in the SAME (attach_base-composed) space as the match branch, not
+    /// against a bare `current`, or every reattach with backlog would misfire (see
+    /// the nonzero-attach_base test above). Still resyncs to the daemon's claimed
+    /// `to` (converted into this connection's relative space) so the connection
+    /// doesn't wedge forever on the same mismatch, and flags it — the caller turns
+    /// this into the one-time `protocol_error` notice.
+    #[test]
+    fn apply_fd_skip_flags_a_mismatched_from_and_resyncs_to_to() {
+        let attach_base = 0u64;
+        let cursor = 10u64;
+        let (new_position, violation) = apply_fd_skip(attach_base, cursor, cursor + 3, cursor + 3 + 20);
+        assert!(violation);
+        assert_eq!(new_position, cursor + 3 + 20, "cursor must become `to` (attach_base is 0 here)");
+    }
+
+    /// Never regress: a violation whose claimed `to` is BEHIND our current position
+    /// must not un-count lines we already have — `current.max(to)`.
+    #[test]
+    fn apply_fd_skip_never_moves_the_position_backwards() {
+        let (new_position, violation) = apply_fd_skip(0, 10, 3, 4);
+        assert!(violation);
+        assert_eq!(new_position, 10, "a stale/behind `to` must not roll the position back");
+    }
+
+    /// Major finding: a matching `from` with an INVERTED `to < from` must still be
+    /// flagged as a violation, not silently accepted — `from` alone is not enough
+    /// to trust the frame. `apply_fd_skip(0, 5, 6, 3)`: `current=5` expects
+    /// `from=6` (matches), but `to=3 < from` — this must resync-with-violation,
+    /// never regress the position, and never report `violation: false`.
+    #[test]
+    fn apply_fd_skip_rejects_a_matching_from_with_an_inverted_to() {
+        let (new_position, violation) = apply_fd_skip(0, 5, 6, 3);
+        assert!(violation, "a matching `from` does not excuse a malformed to < from range");
+        assert!(new_position >= 5, "must not regress below the current position");
+    }
+
+    /// End-to-end through `reader_loop` (D6 spec example): lines
+    /// `[OK, fd_skip{2,5}, OK]` → the skip is folded into `lines_seen` (1 → 5),
+    /// the trailing OK bumps it to 6, and the UI (the `tx`/`rx` channel) receives
+    /// ONLY the two OK messages — the `fd_skip` frame itself is never forwarded.
+    #[tokio::test]
+    async fn reader_loop_folds_fd_skip_into_lines_seen_without_forwarding_it() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":5}\n") // absorbed: lines_seen -> 5
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 5 -> 6
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 6, "wire position after the skip + trailing OK");
+        assert!(skip_violation.lock().unwrap().is_none(), "the range matched — no violation");
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(received.len(), 2, "the UI must receive exactly the 2 OK messages, never the skip");
+        assert!(received.iter().all(|m| matches!(m, CliMessage::Result(_))));
+    }
+
+    /// Blocker regression test: the realistic reattach case — a NONZERO
+    /// `attach_base`, learned from a real `fd_attach` line at the top of the
+    /// stream (mirroring flightdeckd's own `attach.rs` integration test, which
+    /// seeds its cursor from `replay_from`, never 0). Before the fix, `reader_loop`
+    /// checked a well-formed skip against the bare connection-relative `current`
+    /// instead of `attach_base + current`, so this exact well-formed frame would
+    /// have misfired as a "violation" and corrupted `lines_seen` into an
+    /// already-absolute number — silently doubling `attach_base` on the NEXT
+    /// reattach (see `session.rs::run_actor`'s `cursor = attach_base +
+    /// reattach_cursor_delta(transport.lines_seen(), …)`). This is the case every
+    /// OTHER `fd_skip` test in this module skips, by construction (none of them
+    /// send an `fd_attach` first, so they all run with an implicit `attach_base`
+    /// of 0 — the one case a skip essentially never fires in practice).
+    #[tokio::test]
+    async fn reader_loop_composes_fd_skip_with_a_nonzero_attach_base_from_fd_attach() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        // Always line 1 of a real remote attach stream: this connection resumes at
+        // absolute position 100 (a reattach with backlog, NOT a first-ever attach).
+        writer
+            .write_all(
+                b"{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":100}\n",
+            )
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1 (absolute 101)
+            .await
+            .unwrap();
+        // Valid, well-formed skip in the DAEMON's absolute space: after the OK above,
+        // current == 1, so the next expected seq is attach_base(100) + current(1) + 1
+        // == 102 — exactly this frame's `from`.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":102,\"to\":105}\n") // absorbed: lines_seen -> 5
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 5 -> 6 (absolute 106)
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert!(
+            skip_violation.lock().unwrap().is_none(),
+            "a well-formed skip composed against the nonzero attach_base must not violate"
+        );
+        let relative = lines_seen.load(Ordering::Relaxed);
+        assert_eq!(relative, 6, "connection-relative position: 1 (pre-skip) + 4 (skip) + 1 (post-skip)");
+        let attach_base = 100u64;
+        assert_eq!(
+            attach_base + relative,
+            106,
+            "composed absolute position (what session.rs::run_actor adds attach_base to) must be exact"
+        );
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        // fd_attach itself is never replayable and never forwarded past reader_loop
+        // as anything OTHER than a normal CliMessage — it IS forwarded (session.rs
+        // needs it to sync its own attach_base/busy/pending state), just not counted.
+        assert_eq!(received.len(), 3, "fd_attach + the 2 OK messages; the fd_skip itself is never forwarded");
+        assert!(matches!(received[0], CliMessage::FdAttach(_)));
+        assert!(matches!(received[1], CliMessage::Result(_)));
+        assert!(matches!(received[2], CliMessage::Result(_)));
+    }
+
+    /// Cursor composition: an `fd_skip` followed by a LATER unparseable line must
+    /// still roll the reattach cursor back to the right offset — `lines_seen` has
+    /// already absorbed the skip by the time the failure is recorded, so
+    /// `first_unparseable_offset` freezes at the POST-skip count, not some stale
+    /// pre-skip value.
+    #[tokio::test]
+    async fn fd_skip_then_a_later_unparseable_line_rolls_back_past_the_skip() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":9}\n") // absorbed: lines_seen -> 9
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL right after the skip
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 9 -> 10
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            9,
+            "must freeze at the POST-skip count (9), the true position right before the failure"
+        );
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(received.len(), 2, "the 2 OK messages, never the skip or the malformed line");
+    }
+
+    /// A violated `fd_skip{from}` (not `current + 1`) resyncs the position AND
+    /// records exactly one violation note — a SECOND violation in the same
+    /// connection must not overwrite the first (the "once" in "one-time notice").
+    #[tokio::test]
+    async fn reader_loop_flags_a_skip_violation_once_and_resyncs() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, _rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        // Wildly out-of-range `from` (should be 1): current is 0, so the only
+        // non-violating `from` would be 1.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":9,\"to\":20}\n")
+            .await
+            .unwrap();
+        // A second violation must not clobber the first note.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":50,\"to\":60}\n")
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 60, "resynced to the second frame's `to`");
+        let note = skip_violation.lock().unwrap().clone();
+        assert!(
+            note.as_deref().unwrap_or_default().contains("from:9"),
+            "must record the FIRST violation's detail, not the second: {note:?}"
+        );
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real
@@ -1674,6 +2142,7 @@ mod tests {
             conversation: Some(attach.conversation.clone()),
             epoch: Some(attach.epoch.clone()),
             cursor,
+            supports_skip: false,
         });
         let (mut transport2, mut rx2) =
             Transport::spawn(cfg2).expect("reattach spawn should start");

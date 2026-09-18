@@ -593,44 +593,57 @@ async fn run_actor(
         // Drive the CURRENT transport until it closes or a Shutdown lands.
         loop {
             tokio::select! {
-                maybe_msg = msg_rx.recv() => match maybe_msg {
-                    Some(CliMessage::FdAttach(a)) => {
-                        attach.conversation = Some(a.conversation);
-                        attach.epoch = Some(a.epoch);
-                        attach_base = a.replay_from;
-                        attach_seen = true;
-                        delay = std::time::Duration::from_secs(1);
-                        if reconnect_pending {
-                            reconnect_pending = false;
-                            core.emit_error_notice("remote_link", json!({
-                                "message": "Reconnected to the server.",
-                            }));
-                        }
-                        // Resync with the daemon's truth: turn state + pending
-                        // permission prompts (see the core methods' docs).
-                        if let Some(daemon_busy) = a.busy {
-                            core.sync_remote_busy(daemon_busy);
-                        }
-                        if let Some(pending) = &a.pending {
-                            core.sync_pending_permissions(pending);
-                        }
+                maybe_msg = msg_rx.recv() => {
+                    // D6: `reader_loop` folds a valid `fd_skip` straight into
+                    // `Transport::lines_seen` and never forwards it here — this is
+                    // just the wake-up point where we poll for the one-time note a
+                    // MISMATCHED frame would have left (see
+                    // `transport::apply_fd_skip`'s doc). Checked on every wake-up
+                    // (message OR transport-closed), not only on a specific
+                    // message type, so it surfaces promptly without adding any
+                    // wire traffic of its own.
+                    if let Some(detail) = transport.take_skip_violation() {
+                        core.emit_error_notice("protocol_error", json!({ "message": detail }));
                     }
-                    Some(CliMessage::FdDetach(d)) => {
-                        let (message, terminal, narrated) =
-                            reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
-                        if let Some(message) = message {
-                            core.emit_error_notice("remote_link", json!({ "message": message }));
+                    match maybe_msg {
+                        Some(CliMessage::FdAttach(a)) => {
+                            attach.conversation = Some(a.conversation);
+                            attach.epoch = Some(a.epoch);
+                            attach_base = a.replay_from;
+                            attach_seen = true;
+                            delay = std::time::Duration::from_secs(1);
+                            if reconnect_pending {
+                                reconnect_pending = false;
+                                core.emit_error_notice("remote_link", json!({
+                                    "message": "Reconnected to the server.",
+                                }));
+                            }
+                            // Resync with the daemon's truth: turn state + pending
+                            // permission prompts (see the core methods' docs).
+                            if let Some(daemon_busy) = a.busy {
+                                core.sync_remote_busy(daemon_busy);
+                            }
+                            if let Some(pending) = &a.pending {
+                                core.sync_pending_permissions(pending);
+                            }
                         }
-                        if terminal {
-                            no_reconnect = Some(d.reason);
-                            deliberate_exit = narrated;
+                        Some(CliMessage::FdDetach(d)) => {
+                            let (message, terminal, narrated) =
+                                reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
+                            if let Some(message) = message {
+                                core.emit_error_notice("remote_link", json!({ "message": message }));
+                            }
+                            if terminal {
+                                no_reconnect = Some(d.reason);
+                                deliberate_exit = narrated;
+                            }
+                            // else: "stalled" — non-terminal, fall through to the normal
+                            // reconnect path below exactly like a spontaneous transport
+                            // close (`None => break`).
                         }
-                        // else: "stalled" — non-terminal, fall through to the normal
-                        // reconnect path below exactly like a spontaneous transport
-                        // close (`None => break`).
+                        Some(msg) => core.on_message(msg),
+                        None => break, // transport closed
                     }
-                    Some(msg) => core.on_message(msg),
-                    None => break, // transport closed
                 },
                 maybe_cmd = cmd_rx.recv() => match maybe_cmd {
                     Some(SessionCommand::Shutdown { ack, stop_remote: sr }) => {
@@ -777,6 +790,13 @@ async fn run_actor(
                 conversation: attach.conversation.clone(),
                 epoch: attach.epoch.clone(),
                 cursor,
+                // D6: decided ONCE at the very first spawn (from a cached per-machine
+                // version probe — see `ipc::commands::supports_skip_for_machine`) and
+                // never re-decided here: `attach` (this loop's local reattach state)
+                // is seeded from `cfg.attach` and nothing ever mutates its
+                // `supports_skip` afterward, so every reconnect for this session's
+                // lifetime carries forward the SAME opt-in it started with.
+                supports_skip: attach.supports_skip,
             });
             match Transport::spawn(cfg2) {
                 Ok((t, rx)) => {
@@ -3555,6 +3575,94 @@ mod tests {
             Some("daemon_missing"),
             "the notice must carry a stable, structured reason alongside the free-text \
              message, so a future UI can match on it instead of parsing English prose",
+        );
+    }
+
+    /// D6 wiring end-to-end: a daemon that sends a MISMATCHED `fd_skip` (a protocol
+    /// violation it should never produce) must surface exactly one `protocol_error`
+    /// notice through `run_actor` — proving `Transport::take_skip_violation`
+    /// actually reaches the session's event stream, not just the transport-level
+    /// unit tests. Fakes the remote command the same way
+    /// `run_actor_stops_cleanly_when_the_remote_daemon_is_missing` does
+    /// (`$TOSSE_SSH_BIN` pointed at a script), except this one behaves like a live
+    /// `flightdeckd attach`: prints a handshake, a normal replayable line, the
+    /// violating `fd_skip`, then one more replayable line (the actor's natural
+    /// wake-up point to check the flag — see `run_actor`'s `maybe_msg` arm) before
+    /// going quiet.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_surfaces_a_skip_violation_as_one_protocol_error_notice() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-skip-violation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+printf '%s\n' '{"type":"result","subtype":"success"}'
+printf '%s\n' '{"type":"fd_skip","from":5,"to":8}'
+printf '%s\n' '{"type":"result","subtype":"success"}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "skip-violation-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        // The fake daemon goes quiet (just `sleep`s) right after the 4 scripted
+        // lines, so drain only until the ONE notice we're looking for shows up.
+        let mut protocol_error_notices: Vec<Value> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    if subtype == "protocol_error" {
+                        protocol_error_notices.push(detail);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected a protocol_error notice for the mismatched fd_skip");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(protocol_error_notices.len(), 1, "exactly one notice for the one violation");
+        let message = protocol_error_notices[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("fd_skip"),
+            "expected the fd_skip violation wording, got: {message:?}"
         );
     }
 
