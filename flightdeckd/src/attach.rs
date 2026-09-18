@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -219,7 +219,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 
     // daemon → client. Ending the pump drops the queue's receiver, so the
     // actor's next push fails and it forgets this client.
-    let writer = {
+    let mut writer = {
         let conv_id = conv_id.clone();
         tokio::spawn(async move {
             let end = pump_to_client(
@@ -237,33 +237,61 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 );
             }
             write_half.shutdown().await.ok();
+            end
         })
     };
 
-    // client → daemon (complete lines only, same contract as the stdout pump)
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {
-                if buf.last() != Some(&b'\n') {
-                    break;
-                }
-                let line = String::from_utf8_lossy(&buf).trim_end().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                if manager.route(&conv_id, SessionMsg::ClientLine(line)).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    let writer_end = async { (&mut writer).await.unwrap_or(PumpEnd::Broken) };
+    read_client(&mut reader, &manager, &conv_id, writer_end).await;
     let _ = manager.route(&conv_id, SessionMsg::ClientGone(client_id)).await;
     writer.abort();
     Ok(())
+}
+
+/// Client → daemon: route complete lines (same contract as the stdout pump)
+/// into the session until the client closes. If the write pump gives up first
+/// (stalled or broken link), the connection is dead: stop right away and
+/// release it, instead of holding the task and fd until ssh or the kernel
+/// notices. No idle timeout — a healthy client can stay silent for hours.
+/// When the session closed the stream (Closed: replaced / stopped / exited),
+/// the peer is healthy and closes on its own: keep reading until it does.
+async fn read_client<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    manager: &SessionManager,
+    conv_id: &str,
+    writer_end: impl std::future::Future<Output = PumpEnd>,
+) {
+    let lines = async {
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf.last() != Some(&b'\n') {
+                        break;
+                    }
+                    let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if manager.route(conv_id, SessionMsg::ClientLine(line)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    tokio::pin!(lines);
+    tokio::select! {
+        _ = &mut lines => {}
+        end = writer_end => {
+            if end == PumpEnd::Closed {
+                lines.await;
+            }
+        }
+    }
 }
 
 /// Once a write has stalled, how long the farewell (`fd_detach{stalled}`) gets.
@@ -787,6 +815,39 @@ mod tests {
         // and its owner still gets in (peer credentials match)
         let line = status_client(&socket).await.unwrap();
         assert!(line.contains("fd_status"));
+    }
+
+    #[tokio::test]
+    async fn a_given_up_writer_releases_a_silent_connection_at_once() {
+        let m = testutil::test_manager(testutil::test_cfg());
+        for end in [PumpEnd::Stalled, PumpEnd::Broken] {
+            let (ours, _peer) = UnixStream::pair().unwrap(); // the peer never writes nor closes
+            let mut reader = BufReader::new(ours);
+            let writer_end = async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                end
+            };
+            tokio::time::timeout(Duration::from_secs(2), read_client(&mut reader, &m, "c", writer_end))
+                .await
+                .expect("the reader outlived a write pump that gave up");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_healthy_client_is_never_timed_out() {
+        let m = testutil::test_manager(testutil::test_cfg());
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(ours);
+        let never = std::future::pending::<PumpEnd>();
+        let r = tokio::time::timeout(Duration::from_millis(400), read_client(&mut reader, &m, "c", never)).await;
+        assert!(r.is_err(), "an idle but healthy client was dropped");
+        // after the session closed the stream, the reader waits for the peer to close
+        let closed = async { PumpEnd::Closed };
+        let wait = read_client(&mut reader, &m, "c", closed);
+        tokio::pin!(wait);
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err());
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(2), wait).await.expect("EOF must end the reader");
     }
 
     #[tokio::test]
