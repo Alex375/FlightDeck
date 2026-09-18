@@ -47,7 +47,7 @@ tosse-code/
   flightdeckd/                  ← flightdeck-server/flightdeckd/
     src/ tests/ scripts/        le crate, tel quel
     docs/                       ← flightdeck-server/docs/
-    live/m1/                    ← flightdeck-server/m1-daemon/ (+ base.Dockerfile, cf. m0)
+    live/m1/                    ← flightdeck-server/m1-daemon/
     live/bootstrap-fixtures/    ← flightdeck-server/bootstrap-fixtures/
 ```
 
@@ -56,14 +56,13 @@ tosse-code/
 | `flightdeckd/` (22 fichiers : `Cargo.toml`, `Cargo.lock`, `src/` ×13, `tests/` ×4, `scripts/` ×3, `.gitignore`) | **DÉMÉNAGE** → `flightdeckd/` | Le `Cargo.lock` du crate **disparaît** (un seul lock par workspace). `.gitignore` du crate (`/target`) devient inutile mais inoffensif. |
 | `flightdeckd/scripts/{build-musl.sh, smoke-musl.sh, musl-builder.Dockerfile}` | **DÉMÉNAGE** (avec le crate) | `build-musl.sh` monte aujourd'hui **le crate** dans le conteneur : dans un workspace, il n'y a plus de lock au niveau du crate et `--locked` échoue. Il faut monter **la racine du workspace** et passer `-p flightdeckd`. Les binaires passent de `flightdeckd/target/musl/dist/` à `target/musl/dist/` (racine). `smoke-musl.sh` : suivre ce chemin. |
 | `flightdeckd/tests/` (`attach_bridge`, `cli_e2e`, `config_lock`, `shutdown`) | **DÉMÉNAGE** | Portables : `CARGO_BIN_EXE_flightdeckd` + `/tmp`. Tournent sur macOS **et** Linux. |
-| `m1-daemon/` (`Dockerfile`, `entrypoint.sh`, `scripts/up.sh`, `tests/detach_test.py`, `tests/phone-cut-test.mjs`) | **DÉMÉNAGE** → `flightdeckd/live/m1/` | C'est le banc live du démon ET de l'app : les tests `#[ignore]` de tosse-code (`actor_survives_ssh_cut_and_replays`, `remote_transport_streams_over_ssh`) visent `flightdeck-m1:2224`. Le `Dockerfile` compile aujourd'hui le crate depuis la racine du repo (`COPY flightdeckd/Cargo.lock …`) et `up.sh` fait `docker build … .` à la racine : dans tosse-code, ce contexte embarquerait `node_modules/` et `target/`. **À réécrire** : l'image prend le **binaire musl statique** de `build-musl.sh` (plus de compilation dans Docker, plus de dépendance au lock), contexte restreint à `live/m1/`. |
-| `m0-ssh-remote/Dockerfile` | **DÉMÉNAGE seul** → `flightdeckd/live/m1/base.Dockerfile` (ou fusionné en étage de base du Dockerfile M1) | L'image M1 fait `FROM flightdeck-m0:latest` : sans lui, pas de banc M1. |
-| `m0-ssh-remote/` (le reste : `docker-compose.yml`, `scripts/*` — `remote-claude.sh`, `render-stream.py`, `inject-secrets.sh`…, `runs/`, `README.md`) | **RESTE** (archive du prototype M0) | Preuve M0 historique, remplacée par M1. **Question ouverte** : `inject-secrets.sh` rafraîchit les creds de *tous* les conteneurs flightdeck (commit `c39f6ba`), et le conteneur `flightdeck-test:2223` apparié dans l'app d'Armand en dépend peut-être — si oui, le déplacer avec `live/m1/`. |
+| `m1-daemon/` (`Dockerfile`, `entrypoint.sh`, `scripts/up.sh`, `tests/detach_test.py`, `tests/phone-cut-test.mjs`) | **DÉMÉNAGE** → `flightdeckd/live/m1/` | C'est le banc live du démon ET de l'app : les tests `#[ignore]` de tosse-code (`actor_survives_ssh_cut_and_replays`, `remote_transport_streams_over_ssh`) visent `flightdeck-m1:2224`. **Déjà prêt (move-5)** : l'image embarque le binaire musl statique de `build-musl.sh` (plus de compilation dans Docker, plus de lock, plus d'image `flightdeck-m0`) ; `up.sh` construit dans un contexte temporaire (Dockerfile + entrypoint + binaire), trouve le crate en frère aujourd'hui ou en grand-parent une fois sous `flightdeckd/live/m1/`, et reporte les clés d'hôte SSH du conteneur précédent (identité stable pour `known_hosts`). |
+| `m0-ssh-remote/` (tout : `Dockerfile`, `docker-compose.yml`, `scripts/*` — `remote-claude.sh`, `render-stream.py`, `inject-secrets.sh`…, `runs/`, `README.md`) | **RESTE** (archive du prototype M0) | Preuve M0 historique, remplacée par M1. Son Dockerfile est désormais **intégré** en étage `base` du Dockerfile M1 (move-5) : plus rien ne dépend de l'image `flightdeck-m0`. `flightdeck-test:2223` n'est plus utilisé (remplacé par josty-cc) → `inject-secrets.sh` reste dans l'archive. |
 | `bootstrap-fixtures/` (`Dockerfile`, `fixture.sh`, `askpass.sh`, `flightdeckd.service`, `d-linger-experiment.sh`) | **DÉMÉNAGE** → `flightdeckd/live/bootstrap-fixtures/` | Banc de l'installeur Mac (`src-tauri/src/bootstrap/`) : sa place est à côté de lui. `fixture.sh` pointe `$HERE/../flightdeckd/target/musl/dist` et `$HERE/../flightdeckd/scripts/build-musl.sh` → à corriger (binaire à la racine `target/musl/dist/`). Le `Dockerfile` n'a pas de chemin externe (contexte temporaire). |
 | `docs/M1-DAEMON.md` (contrat du protocole : `fd_*`, curseur, `fd_skip`, verrou de config, permissions) | **DÉMÉNAGE** → `flightdeckd/docs/` | Référence du contrat que `src-tauri/src/supervisor/transport.rs` implémente en face. |
 | `docs/B0-MUSL-SPIKE.md`, `docs/B6-FIXTURES.md` | **DÉMÉNAGE** | Suivent leurs scripts / fixtures ; chemins cités à corriger. |
 | `docs/CADRAGE.md`, `CDC-M1-DAEMON.md`, `M0-APP-REMOTE.md`, `M0-TEST-PAIRING.md`, `REMOTE-PAIRING.md` | **DÉMÉNAGE** (historique de conception) | Rien à adapter hors liens relatifs. |
-| `docs/program/plan-2026-09-18.json` | **À décider** (archive de l'orchestrateur) | Déménage par défaut avec `docs/` ; l'exclure du `filter-repo` si l'orchestrateur préfère le garder ailleurs. |
+| `docs/program/plan-2026-09-18.json` | **DÉMÉNAGE** avec `docs/` (décision de l'orchestrateur) | — |
 | `docs/MONOREPO-MOVE.md` (ce fichier) | déménage | — |
 | `README.md` | **RESTE**, réécrit en pierre tombale | « Déménagé dans `tosse-code/flightdeckd` @ `<sha>` » + table de correspondance des SHA. Puis archiver le repo (GitHub *Archive*). |
 | `.gitignore` racine | **RESTE**, mais **reporter** ses motifs secrets dans celui de tosse-code | tosse-code ignore `target/` mais **pas** `*.pem`, `*.key`, `id_ed25519*`, `id_rsa*`, `pairing-ticket*.json`, `.env`, `.colima/` — à ajouter avant que les bancs live y tournent. |
@@ -156,12 +155,9 @@ git clone --no-local ~/Documents/repositories/flightdeck-server /tmp/fds-move
 cd /tmp/fds-move && git checkout main
 git filter-repo \
   --path flightdeckd/ --path m1-daemon/ --path bootstrap-fixtures/ --path docs/ \
-  --path m0-ssh-remote/Dockerfile \
   --path-rename m1-daemon/:flightdeckd/live/m1/ \
   --path-rename bootstrap-fixtures/:flightdeckd/live/bootstrap-fixtures/ \
-  --path-rename docs/:flightdeckd/docs/ \
-  --path-rename m0-ssh-remote/Dockerfile:flightdeckd/live/m1/base.Dockerfile
-#    (ajouter --invert-paths --path docs/program/ si le plan ne doit pas suivre)
+  --path-rename docs/:flightdeckd/docs/
 cp .git/filter-repo/commit-map /tmp/fds-commit-map.txt   # ancien SHA → nouveau SHA
 
 # 2. Import dans tosse-code, sur une branche.
@@ -237,9 +233,13 @@ embarqué dans le bundle de l'app) — hors de ce document.
    ignored » : au passage en workspace, retirer le `[profile.release]` du crate
    (ses réglages vivent dans `[profile.daemon]` à la racine).
 5. `live/m1` : l'image M1 consomme le binaire musl (plus de compilation dans
-   Docker), étage de base M0 intégré.
+   Docker), étage de base M0 intégré. **Fait** (+ clés d'hôte SSH conservées
+   d'un `up.sh` à l'autre) ; `detach_test.py` A/B/C/D vert sur cette image.
 
-**Le déménagement** (une branche tosse-code, une PR vers `dev`) :
+**Le déménagement** — décision de l'orchestrateur : d'abord l'**option à
+moindre risque** (paquet autonome avec son propre lock, cf. ci-dessous), le
+workspace (§4) dans un second temps ; les scripts du crate fonctionnent dans
+les deux cas (move-4). Étapes (une branche tosse-code, une PR vers `dev`) :
 
 6. Geler `flightdeck-server` (wave1 + wave2 intégrées à `main`).
 7. `filter-repo` + import avec historique (§5).

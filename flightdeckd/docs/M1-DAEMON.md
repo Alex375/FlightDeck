@@ -49,7 +49,9 @@ et le téléphone passait par le Mac. Maintenant :
 ## Démarrer / tester
 
 ```bash
-# le conteneur M1 (sshd + flightdeckd), clés + creds injectés, lien pairing affiché
+# le conteneur M1 (sshd + claude + flightdeckd), clés + creds injectés, lien pairing affiché ;
+# construit le binaire musl statique depuis les sources courantes (build-musl.sh)
+# et garde les clés d'hôte SSH du conteneur précédent
 m1-daemon/scripts/up.sh                    # flightdeck-m1, ssh sur 127.0.0.1:2224
 
 # critère Mac (headless, ssh réel)
