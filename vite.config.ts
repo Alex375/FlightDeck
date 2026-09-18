@@ -22,8 +22,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // Don't let Vite watch the Rust crate.
-      ignored: ["**/src-tauri/**"],
+      // Don't let Vite watch the Rust crates (their target/ dirs get large).
+      ignored: ["**/src-tauri/**", "**/flightdeckd/**"],
     },
   },
 }));
