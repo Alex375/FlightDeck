@@ -173,6 +173,15 @@ fn default_claude_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
+/// The `ssh` binary a remote spawn execs. `$TOSSE_SSH_BIN` first — a test-only
+/// escape hatch mirroring `$TOSSE_CLAUDE_BIN` (see [`default_claude_bin`]), so a
+/// test can point a remote launch at a fake script (e.g. one that exits 127 to
+/// simulate a missing `flightdeckd`) without mutating `$PATH` — else the bare
+/// `"ssh"` resolved on `PATH`, exactly as before. Never set in production.
+fn resolve_ssh_bin() -> String {
+    std::env::var("TOSSE_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
+}
+
 /// Build the `claude` argv (everything after the binary) from a [`SpawnConfig`].
 /// Shared verbatim by the local and remote launchers: the SAME flags must run
 /// whether `claude` is spawned here or over SSH, so the wire protocol is identical
@@ -273,7 +282,7 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
 /// command ran and exited 0; failures are logged, never surfaced (the session
 /// is already torn down locally).
 pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_ssh_bin());
     cmd.arg("-T")
         .arg("-p")
         .arg(remote.port.to_string())
@@ -579,7 +588,7 @@ impl Transport {
             // are the ssh channel, so the reader/writer/stderr pumps below are reused
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
-            let mut cmd = Command::new("ssh");
+            let mut cmd = Command::new(resolve_ssh_bin());
             cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
                 .arg("-p")
                 .arg(remote.port.to_string())

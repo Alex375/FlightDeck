@@ -640,6 +640,41 @@ async fn run_actor(
         if cfg.remote.is_none() || no_reconnect.is_some() {
             break 'outer true;
         }
+        // Whether THIS transport ever completed the fd_attach handshake —
+        // captured now, before the shutdown below reaps the process. A spawn
+        // that never attached (the remote command itself failed, e.g. `ssh`
+        // exec'd `flightdeckd` and it isn't on PATH) never produces an
+        // `FdDetach`, so the existing reason-based exit check above can never
+        // fire for it — this is the only case `looks_like_missing_daemon`
+        // needs to look at.
+        let had_attach = attach_seen;
+        if !had_attach {
+            // Safe to call before `shutdown` (see their doc comments in
+            // transport.rs) — the process already exited on its own; this
+            // just reaps it and reads back what it left behind.
+            let exit_code = transport.wait_status().await.and_then(|s| s.code());
+            let stderr = transport.stderr_tail();
+            if looks_like_missing_daemon(exit_code, &stderr) {
+                let (message, terminal) =
+                    reconnect_policy_for_reason("daemon_missing", exit_code.map(i64::from), None);
+                debug_assert!(terminal, "daemon_missing must be a terminal reason");
+                if let Some(message) = message {
+                    core.emit_error_notice(
+                        "process_exited",
+                        json!({
+                            "message": message,
+                            "detail": if stderr.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(stderr.join("\n"))
+                            },
+                        }),
+                    );
+                }
+                no_reconnect = Some("daemon_missing".to_string());
+                break 'outer true;
+            }
+        }
         // Remote link lost while the server-side session lives on: reconnect.
         // Advance the cursor ONLY if this transport completed its handshake;
         // otherwise keep the last known-good position.
@@ -721,11 +756,15 @@ async fn run_actor(
     };
     // The process vanished without us asking: surface why (exit code + last stderr)
     // so a crash / OOM / auth failure mid-turn is never a silent stop — EXCEPT a
-    // deliberate remote goodbye (exited / replaced / stopped), which was already
-    // narrated with its real reason; the local ssh exit status would only add
-    // noise ("exited (code 0)").
+    // deliberate remote goodbye (exited / replaced / stopped) or a classified
+    // daemon_missing, both already narrated with their real reason above; the
+    // local ssh exit status would only add noise ("exited (code 0)") or a
+    // second, generic notice on top of the specific one.
     if process_gone {
-        let deliberate = matches!(no_reconnect.as_deref(), Some("exited" | "replaced" | "stopped"));
+        let deliberate = matches!(
+            no_reconnect.as_deref(),
+            Some("exited" | "replaced" | "stopped" | "daemon_missing")
+        );
         let status = transport.wait_status().await;
         if !deliberate {
             core.emit_process_exit(
@@ -762,12 +801,14 @@ async fn run_actor(
 }
 
 /// Decide what an `FdDetach` notice says and whether `run_actor` may keep
-/// auto-reconnecting, from the daemon's `reason` plus the two fields the
-/// message text draws from (`exit_code` for "exited", `message` for the
-/// wildcard fallback). Pure and unit-testable — the SINGLE table `run_actor`
-/// wires the inline `match d.reason.as_str() { .. }` into, and the ONE place a
-/// future reason (e.g. a daemon-missing detach) gets added, never a second
-/// hand-edit of `run_actor`'s match.
+/// auto-reconnecting, from a `reason` plus the two fields the message text
+/// draws from (`exit_code` for "exited", `message` for the wildcard
+/// fallback). Pure and unit-testable — the SINGLE table `run_actor` wires
+/// BOTH the inline `match d.reason.as_str() { .. }` on a real `FdDetach` AND
+/// the synthesized `"daemon_missing"` reason (from `looks_like_missing_daemon`
+/// classifying a transport that closed before ever attaching) into — the ONE
+/// place a new reason gets added, never a second hand-edit of `run_actor`'s
+/// match.
 ///
 /// `"stalled"` is the ONLY reconnect-eligible reason; every other or unknown
 /// reason keeps today's terminal behavior (mirrors `FdDetachMsg`'s doc comment
@@ -794,11 +835,50 @@ fn reconnect_policy_for_reason(
             Some("Connection stalled — reconnecting…".to_string()),
             false,
         ),
+        // Synthesized locally by `looks_like_missing_daemon`, never sent by the
+        // daemon (a missing daemon can't send anything) — a hard precondition
+        // failure, not a retryable blip, so this must stop the auto-reconnect
+        // loop instead of retrying forever on a binary that will never appear.
+        "daemon_missing" => (
+            Some(
+                "flightdeckd isn't installed or isn't on PATH on the server — install it, \
+                 then reopen this conversation."
+                    .to_string(),
+            ),
+            true,
+        ),
         _ => (
             Some(message.map(str::to_string).unwrap_or_else(|| "Remote attach failed.".to_string())),
             true,
         ),
     }
+}
+
+/// Hard-precondition classifier: does a just-closed remote transport's exit
+/// look like the remote command itself was never found — `flightdeckd` isn't
+/// installed or isn't on `PATH` on the server — rather than a retryable
+/// network blip? Requires BOTH an exit code of 127 (the shell convention for
+/// "command not found") AND the LAST non-empty stderr line naming
+/// `flightdeckd` specifically (case-insensitive substring).
+///
+/// Anchoring on the command name — not a generic "command not found" / "no
+/// such file" phrase alone — is load-bearing: a looser match would
+/// false-positive on unrelated remote-shell noise that happens to share exit
+/// code 127 (a stale MOTD script, a broken dotfile, some other command
+/// failing in the same ssh session on a real Ubuntu box) and PERMANENTLY kill
+/// a retryable blip instead of reconnecting. Covers the common shell
+/// wordings: `bash: flightdeckd: command not found`, `zsh: command not
+/// found: flightdeckd`, `sh: 1: flightdeckd: not found`, `exec: flightdeckd:
+/// not found`.
+fn looks_like_missing_daemon(exit_code: Option<i32>, stderr_tail: &[String]) -> bool {
+    if exit_code != Some(127) {
+        return false;
+    }
+    stderr_tail
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.to_lowercase().contains("flightdeckd"))
 }
 
 /// How many consecutive reconnects in a row may see the SAME unparseable
@@ -3009,8 +3089,9 @@ mod tests {
         assert!(out.contains("tosse-bg-done"), "output file should hold the echo");
     }
 
-    /// Table-driven: every named `FdDetach` reason plus one unknown reason,
-    /// asserting the EXACT (message, terminal) pair — the shared table
+    /// Table-driven: every named reason (the daemon-sent `FdDetach` ones plus
+    /// the locally-synthesized `"daemon_missing"`) plus one truly unknown
+    /// reason, asserting the EXACT (message, terminal) pair — the shared table
     /// `run_actor` wires the inline reason match into. `"stalled"` must be the
     /// only reconnect-eligible (non-terminal) entry; every other reason,
     /// including an unrecognized one, must keep today's terminal behavior.
@@ -3052,11 +3133,81 @@ mod tests {
             reconnect_policy_for_reason("error", None, None),
             (Some("Remote attach failed.".to_string()), true),
         );
+        // The dedicated entry `looks_like_missing_daemon` routes into (A2):
+        // terminal, with its own explanatory message regardless of exit_code/
+        // message inputs — never the wildcard's "Remote attach failed.".
         assert_eq!(
-            reconnect_policy_for_reason("daemon_missing", None, None),
-            (Some("Remote attach failed.".to_string()), true),
-            "an unknown reason must fall back to the wildcard, terminal, never panic",
+            reconnect_policy_for_reason("daemon_missing", Some(127), None),
+            (
+                Some(
+                    "flightdeckd isn't installed or isn't on PATH on the server — install it, \
+                     then reopen this conversation."
+                        .to_string()
+                ),
+                true,
+            ),
         );
+        assert_eq!(
+            reconnect_policy_for_reason("banana_unrecognized_reason", None, None),
+            (Some("Remote attach failed.".to_string()), true),
+            "a truly unknown reason must fall back to the wildcard, terminal, never panic",
+        );
+    }
+
+    /// The common shell wordings for "the remote command wasn't found" — all
+    /// must be recognized when the exit code is 127.
+    #[test]
+    fn looks_like_missing_daemon_recognizes_the_common_shell_wordings() {
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["bash: flightdeckd: command not found".to_string()],
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["zsh: command not found: flightdeckd".to_string()],
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["sh: 1: flightdeckd: not found".to_string()],
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["exec: flightdeckd: not found".to_string()],
+        ));
+    }
+
+    /// The direct regression test for the false-positive risk the doc comment
+    /// warns about: an UNRELATED command failing with the same exit code (e.g.
+    /// a stale MOTD script or a broken dotfile) must never be mistaken for a
+    /// missing `flightdeckd` — the anchor is the command NAME, not the exit
+    /// code or the generic "command not found" phrasing.
+    #[test]
+    fn looks_like_missing_daemon_rejects_unrelated_command_not_found() {
+        assert!(!looks_like_missing_daemon(
+            Some(127),
+            &["sl: command not found".to_string()],
+        ));
+    }
+
+    /// Exit-code precondition is required: even the exact daemon-missing
+    /// stderr wording must not classify without a 127 (e.g. the process is
+    /// still alive / hasn't been reaped yet, `wait_status` returned `None`).
+    #[test]
+    fn looks_like_missing_daemon_requires_exit_code_127() {
+        assert!(!looks_like_missing_daemon(
+            None,
+            &["bash: flightdeckd: command not found".to_string()],
+        ));
+    }
+
+    /// An unrelated failure (e.g. SSH auth) sharing neither the exit code nor
+    /// the stderr wording must not classify.
+    #[test]
+    fn looks_like_missing_daemon_rejects_unrelated_failure() {
+        assert!(!looks_like_missing_daemon(
+            Some(255),
+            &["Permission denied (publickey)".to_string()],
+        ));
     }
 
     /// A healthy reconnect (no unparseable replayable lines) never accumulates
@@ -3159,6 +3310,97 @@ mod tests {
             6,
             "giving up must use lines_seen + force_advance (the true total), \
              ignoring first_unparseable_offset entirely",
+        );
+    }
+
+    /// Actor-level regression for A2: a remote spawn whose command fails
+    /// immediately because `flightdeckd` isn't on the remote `PATH` must stop
+    /// with EXACTLY ONE terminal notice and never loop retrying forever — the
+    /// bug this task fixes (today, before this fix, this would hang until the
+    /// timeout below fires, since no `FdDetach` is ever produced by a spawn
+    /// failure).
+    ///
+    /// Fakes the remote command by pointing `$TOSSE_SSH_BIN` (a test-only
+    /// escape hatch, see `transport::resolve_ssh_bin`) at a tiny script that
+    /// ignores every `ssh` flag/arg and just prints the exact wording a real
+    /// remote shell prints for a command that isn't on `PATH`, then exits 127
+    /// — precisely what a real Ubuntu box without `flightdeckd` installed
+    /// would produce over the wire.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_stops_cleanly_when_the_remote_daemon_is_missing() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-daemon-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"bash: flightdeckd: command not found\" 1>&2\nexit 127\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `TOSSE_SSH_BIN` is a test-only escape hatch read once at spawn time;
+        // no other test in this crate touches it, so a lock isn't needed here.
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "daemon-missing-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        // Drain every notice until the actor tears itself down and the event
+        // channel closes on its own (nothing left holding `event_tx` once
+        // `run_actor` drops `core`) — the actor reconnecting forever instead
+        // would never close it, so the timeout is the "it looped" assertion.
+        let mut process_exited_notices: Vec<Value> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    if subtype == "process_exited" {
+                        process_exited_notices.push(detail);
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the actor must stop on its own instead of reconnecting forever \
+             on a daemon binary that will never appear",
+        );
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            process_exited_notices.len(),
+            1,
+            "expected exactly one terminal notice, not a reconnect loop nor a double notice: {process_exited_notices:?}",
+        );
+        let message = process_exited_notices[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("flightdeckd isn't installed"),
+            "expected the daemon-missing message, got: {message:?}",
         );
     }
 
