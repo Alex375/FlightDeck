@@ -53,7 +53,8 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             name: "list_conversations",
             description: "List every conversation in the Flight Deck app: id, title, repository, \
                 backend (claude/codex), live status (running / needs_input / needs_permission / \
-                review / error / backgrounding / idle / off) and last activity. Use it to find a \
+                review / error / backgrounding / idle / off), last activity and background_tasks \
+                (how many background tasks are running, whatever the status). Use it to find a \
                 conversation before reading or messaging it.",
             kind: ToolKind::Front,
             schema: obj(json!({}), &[]),
@@ -198,8 +199,11 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         ToolSpec {
             name: "list_background_tasks",
             description: "The conversation's background tasks (bg shell commands, monitors, \
-                sub-agents, workflows): task_id, kind, status, label. Live-only — a reloaded \
-                conversation has none.",
+                sub-agents, workflows): task_id, kind, status, label, command (Bash only), \
+                and foreground:true on a sub-agent that is part of the running turn rather \
+                than detached. Finished tasks stay listed with their final status — filter on \
+                status 'running' for what is live now. Live-only — a reloaded conversation \
+                has none.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),

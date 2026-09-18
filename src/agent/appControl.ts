@@ -14,6 +14,7 @@
 
 import {
   commands,
+  type BackgroundTask,
   type DiskConversation,
   type JsonValue,
   type PermissionDecision,
@@ -259,6 +260,10 @@ function listConversations(session: string | null): unknown {
       model: c.model,
       effort: c.ultracode ? "ultracode" : c.effort,
       last_activity_at: c.lastActivityAt,
+      // Background work running NOW, whatever the status: `status.background_tasks` only
+      // exists in `backgrounding`, so a remote client could not otherwise tell that a
+      // `running` / `needs_*` conversation also has background work going on.
+      background_tasks: runningBackgroundCount(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
     };
   });
@@ -336,7 +341,33 @@ async function stopStream(args: Record<string, unknown>, session: string | null)
   return { conversation_id: conv.id, stopped: true };
 }
 
-/** The conversation's background tasks (live-only registry). */
+/**
+ * A task the registry holds that is NOT background work: a FOREGROUND sub-agent (the
+ * `Agent` tool without run_in_background). It is part of the running turn and renders
+ * inline in the thread, never in the pinned bars — AgentBar keeps only the detached ones
+ * (`bgAgentIds`). Codex has no detached/foreground split: every sub-agent is background
+ * (mirrors AgentBar).
+ */
+function isForegroundTask(t: BackgroundTask, conv: Conversation): boolean {
+  if (t.kind !== "agent" || conv.kind === "codex") return false;
+  const detached = useConversationStore.getState().sessions[conv.id]?.bgAgentIds ?? [];
+  return t.tool_use_id == null || !detached.includes(t.tool_use_id);
+}
+
+/** How many background tasks are running now — what the desktop's pinned bars list. */
+function runningBackgroundCount(conv: Conversation): number {
+  const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
+  let n = 0;
+  for (const t of Object.values(tasks)) {
+    if (t.status === "running" && !isForegroundTask(t, conv)) n++;
+  }
+  return n;
+}
+
+/** The conversation's background tasks (live-only registry). The registry KEEPS finished
+ *  tasks (completed / failed / stopped), so callers that want what is running now must
+ *  filter on `status`. `command` is the raw shell command of a Bash task — the readable
+ *  fallback when the agent gave the task no `label` (what the desktop bar shows). */
 function listBackgroundTasksTool(args: Record<string, unknown>, session: string | null): unknown {
   const conv = resolveTarget(args, session);
   const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
@@ -347,6 +378,8 @@ function listBackgroundTasksTool(args: Record<string, unknown>, session: string 
       kind: t.kind,
       status: t.status,
       label: t.label ?? null,
+      command: t.command ? clip(t.command, 400) : null,
+      ...(isForegroundTask(t, conv) ? { foreground: true } : {}),
     })),
   };
 }

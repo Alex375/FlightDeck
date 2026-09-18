@@ -53,7 +53,8 @@ import type { Turn } from "../store/types";
 import { useDisplay } from "../store/display";
 import { useToasts } from "../store/toasts";
 import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
-import type { PermissionRequestPayload } from "../ipc/client";
+import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
+import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -113,6 +114,25 @@ const conv = (over: Partial<Conversation> = {}): Conversation => ({
   ...over,
 });
 
+const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
+  task_id: "b1",
+  kind: "bash",
+  tool_use_id: null,
+  label: "build the app",
+  command: null,
+  subagent_type: null,
+  model: null,
+  agent_id: null,
+  status: "running",
+  progress: null,
+  tokens: null,
+  tool_uses: null,
+  duration_ms: null,
+  summary: null,
+  output_file: null,
+  ...over,
+});
+
 function seed(...convs: Conversation[]) {
   useConversationsStore.setState({
     repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }],
@@ -159,6 +179,7 @@ const helpers = (tosseAvailable = true): AppControlHelpers & { views: string[] }
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationStore.setState({ sessions: {} });
+  useBackgroundTasksStore.setState({ sessions: {} });
   useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
   seed(conv());
 });
@@ -210,6 +231,53 @@ describe("appControl — conversations", () => {
     expect((out[0].status as { kind: string }).kind).toBe("idle");
     expect((out[1].status as { kind: string }).kind).toBe("off");
     expect((out[0].repository as { name: string }).name).toBe("r1");
+  });
+
+  it("list_conversations counts RUNNING background tasks whatever the status", async () => {
+    seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta", handle: null }));
+    useConversationStore.getState().ensureSession("c1");
+    const entry = useConversationStore.getState().sessions.c1;
+    useConversationStore.setState({ sessions: { c1: { ...entry, bgAgentIds: ["tu-bg"] } } });
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          b1: bgTask({ task_id: "b1", status: "running" }),
+          b2: bgTask({ task_id: "b2", kind: "agent", tool_use_id: "tu-bg" }), // detached
+          b3: bgTask({ task_id: "b3", kind: "agent", tool_use_id: "tu-fg" }), // foreground: part of the turn
+          b4: bgTask({ task_id: "b4", status: "completed" }), // finished: not counted
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_conversations",
+      {},
+      null,
+      helpers(),
+    )) as Array<Record<string, unknown>>;
+    expect(out[0].background_tasks).toBe(2);
+    expect(out[1].background_tasks).toBe(0);
+  });
+
+  it("list_background_tasks keeps finished tasks and carries the Bash command", async () => {
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          b1: bgTask({ task_id: "b1", label: null, command: "npm run build" }),
+          b2: bgTask({ task_id: "b2", kind: "agent", status: "failed", label: "Explore", command: null }),
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_background_tasks",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { tasks: Array<Record<string, unknown>> };
+    expect(out.tasks).toEqual([
+      { task_id: "b1", kind: "bash", status: "running", label: null, command: "npm run build" },
+      // No bgAgentIds entry: a foreground sub-agent, flagged so a client can leave it out.
+      { task_id: "b2", kind: "agent", status: "failed", label: "Explore", command: null, foreground: true },
+    ]);
   });
 
   it("read_conversation serializes the dialogue and skips sub-agent turns", async () => {
