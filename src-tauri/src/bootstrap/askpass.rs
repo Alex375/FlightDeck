@@ -83,6 +83,20 @@ pub enum BootstrapError {
     /// string so the message names what's missing rather than a generic IO error — the
     /// brief's own requirement.
     DaemonBinaryNotBundled(String),
+    /// (B2/B3) [`crate::bootstrap::install::bundled_daemon_manifest`] found no
+    /// `manifest.json` next to the bundled binaries (or couldn't parse it) — a fresh
+    /// clone with no `pnpm daemon:build` ever run (Docker not available), or the
+    /// bundled resource dir is otherwise incomplete. Distinct from
+    /// [`Self::DaemonBinaryNotBundled`] (one specific binary file missing): this means
+    /// "there is no way to VERIFY whichever binary IS there", which must block an
+    /// upload exactly as hard — see [`crate::bootstrap::install::upload_daemon`].
+    DaemonManifestMissing,
+    /// (B2/B3) [`crate::bootstrap::install::upload_daemon`] hashed the bundled binary
+    /// for `arch` and it does NOT match the sha256 its own
+    /// [`crate::bootstrap::install::DaemonManifest`] records for that target — the
+    /// resource on disk was corrupted, tampered with, or left over from a partial/stale
+    /// build. Never uploaded; there is no fallback, only a fresh `pnpm daemon:build`.
+    DaemonBinaryTampered { arch: String, expected: String, actual: String },
     /// (B8) [`crate::bootstrap::install::upload_daemon`]'s remote self-verification
     /// (size AND sha256 of the temp file, BEFORE it is ever promoted over the real
     /// target) found a mismatch, or the transfer never finished at all (the ssh
@@ -129,6 +143,14 @@ impl std::fmt::Display for BootstrapError {
             Self::DaemonBinaryNotBundled(arch) => {
                 write!(f, "no bundled flightdeckd binary for arch \"{arch}\"")
             }
+            Self::DaemonManifestMissing => write!(
+                f,
+                "no bundled flightdeckd manifest — run `pnpm daemon:build` (or set $TOSSE_FLIGHTDECKD_BIN_DIR) first"
+            ),
+            Self::DaemonBinaryTampered { arch, expected, actual } => write!(
+                f,
+                "the bundled flightdeckd binary for \"{arch}\" does not match its manifest (expected sha256 {expected}, got {actual}) — refusing to upload it"
+            ),
             Self::UploadTruncated { expected, got } => write!(
                 f,
                 "the daemon upload was truncated: expected {expected} bytes, the server received {got}"

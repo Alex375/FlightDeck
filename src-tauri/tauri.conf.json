@@ -33,6 +33,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "resources/flightdeckd/": "flightdeckd/"
+    },
     "createUpdaterArtifacts": true,
     "macOS": {
       "hardenedRuntime": false

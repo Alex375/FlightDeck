@@ -14,6 +14,16 @@ target/
 # === Tauri generated artifacts ===
 src-tauri/gen/
 
+# === Bundled flightdeckd daemon binaries (B2/B3) ===
+# `pnpm daemon:build` (scripts/build-daemon.mjs) writes the static musl binaries + their
+# manifest.json here so tauri.conf.json's bundle.resources can embed them in the app —
+# built locally (needs Docker) or downloaded from CI. The directory itself IS committed
+# (with only a README) so a fresh clone with no Docker still has a `bundle.resources`
+# source to bundle from (an empty/placeholder resources dir — the app then reports
+# DaemonBinaryNotBundled at runtime instead of failing the build).
+src-tauri/resources/flightdeckd/flightdeckd-*
+src-tauri/resources/flightdeckd/manifest.json
+
 # === Playwright (dev/test visual artifacts, not committed) ===
 .playwright-mcp/
 *.local.png

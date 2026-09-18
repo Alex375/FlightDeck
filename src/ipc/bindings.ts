@@ -4773,7 +4773,24 @@ restart_pending: boolean; reboot_safe: boolean | null;
  * install, but is never itself gated on that (never a false `Some(false)`
  * manufactured for an install kind it doesn't apply to).
  */
-linger: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null }
+linger: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+/**
+ * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
+ * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
+ * by [`with_bundled_version`] AFTER [`diagnose`]'s ssh round trip, not inside
+ * [`parse_diagnosis_fields`] (which has no [`tauri::AppHandle`] to read it from —
+ * see the module doc's "`diagnose` / `repair`" section). `None` when this build has
+ * no daemon bundled at all (a fresh clone, no `pnpm daemon:build` ever run).
+ */
+bundled_daemon_version: string | null; 
+/**
+ * `true` only when BOTH [`Self::daemon_version_running`] and
+ * [`Self::bundled_daemon_version`] are known and the bundled one is strictly newer
+ * — the server needs [`RepairAction::ReuploadDaemon`] (then, once
+ * [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
+ * See [`daemon_is_outdated`].
+ */
+daemon_outdated: boolean }
 /**
  * This node's relay identity, straight off `flightdeckd whoami` (`{mac_id, relay_url,
  * label}` — see that subcommand's own doc in `flightdeckd/src/main.rs`). Field names

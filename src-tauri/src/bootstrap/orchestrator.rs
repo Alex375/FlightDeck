@@ -851,7 +851,7 @@ async fn step_diagnose(app: &tauri::AppHandle, ctx: &Arc<Mutex<PipelineCtx>>) ->
         Err(e) => return StepOutcome::Failed(e.to_string()),
     };
     let known_hosts = known_hosts_path(app);
-    let diagnosis = diagnose(&machine, known_hosts.as_deref()).await;
+    let diagnosis = with_bundled_version(app, diagnose(&machine, known_hosts.as_deref()).await);
     let detail = format!("{:?}", diagnosis.state);
     ctx.lock().await.diagnosis = Some(diagnosis);
     StepOutcome::Ok(Some(detail))
@@ -1112,6 +1112,19 @@ pub struct ServerDiagnosis {
     pub tailscale_name: Option<String>,
     pub last_boot: Option<String>,
     pub busy_conversations: Option<u32>,
+    /// (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
+    /// bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
+    /// by [`with_bundled_version`] AFTER [`diagnose`]'s ssh round trip, not inside
+    /// [`parse_diagnosis_fields`] (which has no [`tauri::AppHandle`] to read it from —
+    /// see the module doc's "`diagnose` / `repair`" section). `None` when this build has
+    /// no daemon bundled at all (a fresh clone, no `pnpm daemon:build` ever run).
+    pub bundled_daemon_version: Option<String>,
+    /// `true` only when BOTH [`Self::daemon_version_running`] and
+    /// [`Self::bundled_daemon_version`] are known and the bundled one is strictly newer
+    /// — the server needs [`RepairAction::ReuploadDaemon`] (then, once
+    /// [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
+    /// See [`daemon_is_outdated`].
+    pub daemon_outdated: bool,
 }
 
 impl ServerDiagnosis {
@@ -1134,6 +1147,8 @@ impl ServerDiagnosis {
             tailscale_name: None,
             last_boot: None,
             busy_conversations: None,
+            bundled_daemon_version: None,
+            daemon_outdated: false,
         }
     }
 }
@@ -1305,6 +1320,12 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         tailscale_name,
         last_boot,
         busy_conversations,
+        // Folded in by `with_bundled_version` at the module's public boundaries
+        // (`machine_diagnose`, `step_diagnose`, `repair`) — never a remote fact this
+        // script's markers could carry, see `ServerDiagnosis::bundled_daemon_version`'s
+        // own doc.
+        bundled_daemon_version: None,
+        daemon_outdated: false,
     }
 }
 
@@ -1371,12 +1392,39 @@ async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerD
     }
 }
 
+/// Pure: does the server's own RUNNING `flightdeckd` (never `daemon_version_disk` — a
+/// binary already re-uploaded but not yet restarted into is exactly what
+/// [`ServerDiagnosis::restart_pending`] already reports, not a second "outdated"
+/// signal here) trail this Mac's BUNDLED version? `false` whenever either side is
+/// unknown — never a false positive nagging to re-upload over a probe that simply
+/// couldn't confirm a version.
+fn daemon_is_outdated(running: Option<&str>, bundled: Option<&str>) -> bool {
+    match (running, bundled) {
+        (Some(r), Some(b)) => !crate::ipc::commands::version_at_least(r, b),
+        _ => false,
+    }
+}
+
+/// Folds this Mac's BUNDLED `flightdeckd` version into an already-computed
+/// [`ServerDiagnosis`] — see [`ServerDiagnosis::bundled_daemon_version`]'s own doc for
+/// why this happens here and not inside [`diagnose`] itself. Applied at every point a
+/// diagnosis crosses out of this module ([`machine_diagnose`], [`step_diagnose`],
+/// [`repair`]'s own final diagnosis) — never at [`restart_daemon`]'s internal
+/// busy-conversations check, which has no [`tauri::AppHandle`] and no need for this
+/// fact either.
+fn with_bundled_version(app: &tauri::AppHandle, mut d: ServerDiagnosis) -> ServerDiagnosis {
+    let bundled = install::bundled_daemon_manifest(app).ok().map(|m| m.version);
+    d.daemon_outdated = daemon_is_outdated(d.daemon_version_running.as_deref(), bundled.as_deref());
+    d.bundled_daemon_version = bundled;
+    d
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn machine_diagnose(app: tauri::AppHandle, machine_id: String) -> Result<ServerDiagnosis, String> {
     let machine = machine_by_id(&app, &machine_id)?;
     let known_hosts = known_hosts_path(&app);
-    Ok(diagnose(&machine, known_hosts.as_deref()).await)
+    Ok(with_bundled_version(&app, diagnose(&machine, known_hosts.as_deref()).await))
 }
 
 // ============================================================================
@@ -1509,7 +1557,7 @@ async fn repair(
             format!("{state:?}")
         }
     };
-    let diagnosis = diagnose(machine, known_hosts).await;
+    let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
 }
 
@@ -1741,6 +1789,8 @@ mod tests {
             tailscale_name: None,
             last_boot: Some("2026-01-01 00:00:00".into()),
             busy_conversations: Some(0),
+            bundled_daemon_version: None,
+            daemon_outdated: false,
         }
     }
 
@@ -1811,6 +1861,27 @@ mod tests {
         assert_eq!(d.installed_as, InstalledAs::Unknown);
         assert_eq!(d.daemon_running, None);
         assert_eq!(d.claude_logged_in, None);
+    }
+
+    // ---- daemon_is_outdated (B2/B3: bundled version vs. the server's running one) ----
+
+    #[test]
+    fn daemon_is_outdated_true_when_the_bundled_version_is_newer() {
+        assert!(daemon_is_outdated(Some("0.1.0"), Some("0.2.0")));
+        assert!(daemon_is_outdated(Some("flightdeckd 0.1.0"), Some("0.2.0")));
+    }
+
+    #[test]
+    fn daemon_is_outdated_false_when_equal_or_the_server_is_newer() {
+        assert!(!daemon_is_outdated(Some("0.2.0"), Some("0.2.0")));
+        assert!(!daemon_is_outdated(Some("0.3.0"), Some("0.2.0")));
+    }
+
+    #[test]
+    fn daemon_is_outdated_never_true_on_an_unknown_side() {
+        assert!(!daemon_is_outdated(None, Some("0.2.0")), "unknown running version must never nag");
+        assert!(!daemon_is_outdated(Some("0.1.0"), None), "no bundled daemon at all must never nag");
+        assert!(!daemon_is_outdated(None, None));
     }
 
     // ---- repair dispatch exhaustive (compile-time) ----

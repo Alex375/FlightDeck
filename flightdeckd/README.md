@@ -45,6 +45,29 @@ scripts/build-musl.sh --print-dist-dir                   # where binaries land
 scripts/smoke-musl.sh                                     # ldd + --version + init + run/TLS + status, per arch
 ```
 
+## Bundling into the Mac app (B2/B3)
+
+The Mac app's in-app installer (`src-tauri/src/bootstrap/install.rs`) uploads a static
+musl `flightdeckd` to a paired server — it needs the binaries actually PRESENT in the
+app bundle to do that. From the repo root (not this directory):
+
+```bash
+pnpm daemon:build                                       # both architectures (Docker)
+TARGETS=aarch64-unknown-linux-musl pnpm daemon:build     # one architecture only
+```
+
+`scripts/build-daemon.mjs` drives `scripts/build-musl.sh` above and copies its output,
+plus a generated `manifest.json` (version + per-target sha256/size), into
+`src-tauri/resources/flightdeckd/` — see that directory's own README for the exact
+layout, `tauri.conf.json`'s `bundle.resources` for how it gets embedded, and
+`bootstrap::install::{daemon_binary_path,bundled_daemon_manifest,upload_daemon}` for
+how the app resolves and verifies it at runtime (never uploads a binary whose sha256
+doesn't match the manifest). `.github/workflows/release.yml`'s `daemon` job runs this
+same script (with pinned tooling) so every release ships current binaries; a build with
+none of this ever run (a fresh clone, no Docker) still succeeds — the resources
+directory is committed with only a README, and the app just reports
+`DaemonBinaryNotBundled` for any upload attempt instead of failing the build.
+
 ## Live harnesses (need Docker, not run in CI)
 
 - **`live/bootstrap-fixtures/`** — four throwaway, password-auth Ubuntu 20.04
