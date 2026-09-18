@@ -24,6 +24,7 @@ import { bootConversations, useConversationsStore } from "../../store/conversati
 import { useSettingsUi } from "../../store/settingsUi";
 import { buildServerCommand, parseTicket } from "./ControlSection";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
+import { firstConnectionFieldError } from "./sshValidation";
 import { ToggleRow } from "./SettingsKit";
 import {
   claudeSignInStep,
@@ -320,6 +321,18 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
     setRestartNeedsSudo(false);
   }, []);
 
+  // Mirrors the Rust `validate_ssh_user`/`validate_address_value`/`validate_ssh_port`
+  // rule (see `sshValidation.ts`'s own doc — CRM holistic-review blocker #3, chantier
+  // A `bd7ca709`): refuses an ssh-option-shaped user/host/port before "Install" is
+  // even clickable, rather than only after a round trip to the core. Computed only
+  // once something has actually been typed, so a freshly opened, blank form shows no
+  // alarming message — it just stays disabled exactly as before this validation
+  // existed.
+  const fieldError = useMemo(() => {
+    if (!address.trim() && !user.trim()) return null;
+    return firstConnectionFieldError(user.trim(), address.trim(), Number(port) || 0);
+  }, [address, user, port]);
+
   const failedStep = steps.find((s) => s.status === "failed") ?? null;
   const installKeyMismatch = useMemo(
     () => failedStep?.id === "install_key" && isHostKeyMismatch(failedStep.detail),
@@ -405,11 +418,12 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
           checked={keepAwake}
           onChange={setKeepAwake}
         />
+        {fieldError && <div className={sharedStyles.errorMsg}>{fieldError}</div>}
         {topError && <div className={sharedStyles.errorMsg}>{topError}</div>}
         <div className={sharedStyles.btnRow}>
           <button
             className={`${sharedStyles.btn} ${sharedStyles.primary}`}
-            disabled={busy || !address.trim() || !user.trim()}
+            disabled={busy || !address.trim() || !user.trim() || !!fieldError}
             onClick={() => void install()}
           >
             {busy ? "Installing…" : "Install"}
@@ -603,9 +617,21 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
       return;
     }
     const preferred = t.addresses.find((a) => a.kind === "tailscale") ?? t.addresses[0];
+    const candidateHost = preferred?.value || t.host;
+    const candidatePort = Number(t.port) || 22;
+    // A pairing ticket is SERVER-PRINTED, not typed by this Mac's user — a hostile or
+    // compromised server can hand back one that pre-fills an ssh-option-shaped
+    // user/host (CRM holistic-review blocker #3, chantier A `bd7ca709`). Refused
+    // HERE, before the confirm screen (and "Test & pair") ever shows it, rather than
+    // only after a round trip to the core.
+    const fieldErr = firstConnectionFieldError(t.user, candidateHost, candidatePort);
+    if (fieldErr) {
+      setError(`This pairing ticket isn't safe to use — ${fieldErr}`);
+      return;
+    }
     setLabel(t.label);
-    setHost(preferred?.value || t.host);
-    setPort(t.port || "22");
+    setHost(candidateHost);
+    setPort(String(candidatePort));
     setUser(t.user);
     setAddresses(t.addresses);
     setError(null);
@@ -631,6 +657,19 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
       setError(res.error);
     }
   }, [label, host, port, user, genKey, addresses, onClose]);
+
+  // Live validation of whatever `host`/`user`/`port` currently hold — covers every
+  // way they can get set: a parsed ticket (already pre-screened by
+  // `continueFromTicket`), a click on one of the OTHER discovered address candidates
+  // below (`onClick={() => setHost(a.value)}`, never itself re-validated until now),
+  // or the manual-entry stage's plain text fields. This is what actually gates "Test
+  // & pair" — see `sshValidation.ts`'s own doc (CRM holistic-review blocker #3,
+  // chantier A `bd7ca709`). Computed only once something has been typed, so the
+  // freshly opened manual-entry stage shows no alarming message before that.
+  const fieldError = useMemo(() => {
+    if (!host.trim() && !user.trim()) return null;
+    return firstConnectionFieldError(user.trim(), host.trim(), Number(port) || 0);
+  }, [host, user, port]);
 
   return (
     <div className={sharedStyles.remotePanel}>
@@ -765,11 +804,12 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
               autoComplete="off"
             />
           </div>
+          {fieldError && <div className={sharedStyles.errorMsg}>{fieldError}</div>}
           {error && <div className={sharedStyles.errorMsg}>{error}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
-              disabled={busy || !host.trim() || !user.trim()}
+              disabled={busy || !host.trim() || !user.trim() || !!fieldError}
               onClick={() => void pair()}
             >
               {busy ? "Testing…" : "Test & pair"}

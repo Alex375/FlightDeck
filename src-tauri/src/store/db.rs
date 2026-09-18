@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    validate_address_value, AddressCandidate, ClaudeAccountRecord, ConversationRecord,
+    validate_address_value, validate_ssh_user, AddressCandidate, ClaudeAccountRecord, ConversationRecord,
     MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
@@ -147,14 +147,19 @@ fn encode_addresses(addresses: &[AddressCandidate]) -> Option<String> {
     }
 }
 
-/// [`validate_address_value`] over `m.host` and every `m.addresses` value — the
-/// persistence-layer half of the ssh-option-injection guard (see
-/// [`Store::upsert_machine`]).
+/// [`validate_address_value`] over `m.host` and every `m.addresses` value, plus
+/// [`validate_ssh_user`] over `m.user` — the persistence-layer half of the
+/// ssh-option-injection guard (see [`Store::upsert_machine`]). This is the LAST line
+/// of defense: even if every upstream caller somehow forgot to check `user` (the CRM
+/// holistic-review blocker this closes — `user` was validated NOWHERE before this),
+/// a write that would let a future `ssh` invocation parse it as an option never
+/// reaches the row.
 fn validate_machine_addresses(m: &MachineRecord) -> Result<(), String> {
     validate_address_value(&m.host)?;
     for c in &m.addresses {
         validate_address_value(&c.value)?;
     }
+    validate_ssh_user(&m.user)?;
     Ok(())
 }
 
@@ -1785,6 +1790,63 @@ mod tests {
             "an unsafe value inside `addresses` must be rejected too, not just `host`"
         );
         assert!(s.machine_by_id("m1").unwrap().is_none());
+    }
+
+    /// CRM holistic-review blocker #3 (chantier A `bd7ca709`): `user` gets the SAME
+    /// persistence-layer guard `host`/`addresses` already had — this is the last
+    /// line of defense, so a future write path (an "edit server" command, an
+    /// import) can't reintroduce the injection class just by skipping every
+    /// upstream check.
+    #[test]
+    fn upsert_machine_rejects_an_unsafe_user_value() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "-oProxyCommand=touch /tmp/pwned".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        assert!(s.upsert_machine(&m).is_err(), "an unsafe user must be rejected before writing");
+        assert!(s.machine_by_id("m1").unwrap().is_none(), "the rejected row must not land in the db");
+    }
+
+    /// A machines row that fails `validate_ssh_user` on READ (an older app version
+    /// that never had the check, or a manual DB edit) must NOT crash or vanish — the
+    /// row is written directly via raw SQL here, bypassing `upsert_machine`'s own
+    /// guard, to simulate exactly that legacy state. `machine_by_id`/`all_machines`
+    /// never validate on read (by design — see their own docs), so both must still
+    /// return the row intact; it is up to a CONNECT attempt (`Transport::spawn`,
+    /// `ipc::commands::spawn_session`, `bootstrap::orchestrator::diagnose`, …) to
+    /// surface the typed, actionable error instead — proven at those call sites'
+    /// own test suites (`supervisor::transport`'s
+    /// `spawn_refuses_a_legacy_row_with_an_invalid_user_without_spawning_ssh`).
+    #[test]
+    fn a_legacy_row_with_an_invalid_user_loads_intact_never_vanishes_or_panics() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
+                 VALUES ('legacy1', 'old box', 'h.example', 22, '-oProxyCommand=touch /tmp/pwned', NULL, 1, NULL)",
+                [],
+            )
+            .unwrap();
+
+        let loaded = s.machine_by_id("legacy1").unwrap();
+        assert!(loaded.is_some(), "a legacy row with an invalid user must still load, not vanish");
+        assert_eq!(loaded.unwrap().user, "-oProxyCommand=touch /tmp/pwned");
+
+        let all = s.all_machines().unwrap();
+        assert_eq!(all.len(), 1, "the row must still be listed");
     }
 
     /// A6: a rotation that wins persists the new `host`, round-tripping through

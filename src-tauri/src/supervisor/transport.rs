@@ -394,7 +394,15 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     if let Some(identity) = &remote.identity_file {
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     }
-    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+    // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
+    // manual DB edit) must not reach a real ssh spawn here — degrade to the SAME
+    // "failed" outcome an unreachable host already reports, never a crash or a spawn
+    // built from it (CRM holistic-review blocker #3, chantier A `bd7ca709`).
+    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
+        eprintln!("[transport] remote stop refused an invalid user/host: {e}");
+        return false;
+    }
+    cmd.arg(format!(
         "exec {} stop --conversation {}",
         resolve_remote_daemon_bin(&remote.daemon_bin),
         shell_quote(conversation),
@@ -474,7 +482,13 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
     if let Some(identity) = &remote.identity_file {
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     }
-    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
+    // caller SHOULD already have a validated `remote.user`/`.host`.
+    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
+        eprintln!("[transport] remote title push refused an invalid user/host: {e}");
+        return false;
+    }
+    cmd.arg(format!(
         "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
         resolve_remote_daemon_bin(&remote.daemon_bin),
         shell_quote(session_id),
@@ -760,6 +774,14 @@ pub enum TransportError {
     /// there. Kept distinct from [`Spawn`] because a missing cwd and a missing
     /// binary both surface as `NotFound`, and the two need different fixes.
     CwdMissing(std::path::PathBuf),
+    /// A remote (SSH) spawn's [`RemoteTarget::user`]/`.host` failed
+    /// [`crate::store::validate_ssh_user`]/[`crate::store::validate_address_value`] —
+    /// a `MachineRecord` on disk that predates that validator (an older app version,
+    /// or a manual DB edit), surfaced here so it never silently vanishes or crashes:
+    /// the machine stays listed, and any attempt to connect gets this clear, typed,
+    /// actionable error instead (CRM holistic-review blocker #3, chantier A
+    /// `bd7ca709`).
+    InvalidRemoteTarget(String),
     /// The writer channel is closed — the session is gone.
     Closed,
 }
@@ -783,6 +805,10 @@ impl std::fmt::Display for TransportError {
                 "This conversation's working directory no longer exists: {}. \
                  Its worktree may have been removed, or the folder moved.",
                 p.display(),
+            ),
+            TransportError::InvalidRemoteTarget(_) => write!(
+                f,
+                "This server's saved user name is not valid — remove and re-add it.",
             ),
             TransportError::Closed => write!(f, "claude session transport is closed"),
         }
@@ -896,7 +922,14 @@ impl Transport {
                 // authentication failures" when the agent holds many keys).
                 cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
             }
-            cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(remote_cmd);
+            // The live session spawn itself — the MOST load-bearing entry point (CRM
+            // holistic-review blocker #3, chantier A `bd7ca709`): a `MachineRecord`
+            // that predates `validate_ssh_user` (older app version, manual DB edit)
+            // must never reach an actual ssh spawn built from its raw `user`/`host`.
+            if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
+                return Err(TransportError::InvalidRemoteTarget(e));
+            }
+            cmd.arg(remote_cmd);
             cmd
         } else {
             // Local: a conversation whose cwd has vanished (e.g. its worktree was
@@ -1965,8 +1998,8 @@ done
         let run_status = || {
             let remote = remote.clone();
             async move {
-                let out = tokio::process::Command::new(resolve_ssh_bin())
-                    .arg("-T")
+                let mut cmd = tokio::process::Command::new(resolve_ssh_bin());
+                cmd.arg("-T")
                     .arg("-p")
                     .arg(remote.port.to_string())
                     .arg("-o")
@@ -1980,8 +2013,10 @@ done
                     .arg("-i")
                     .arg(remote.identity_file.as_deref().unwrap_or_default())
                     .arg("-o")
-                    .arg("IdentitiesOnly=yes")
-                    .arg(format!("{}@{}", remote.user, remote.host))
+                    .arg("IdentitiesOnly=yes");
+                crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host)
+                    .expect("a fixed literal test user/host must always validate");
+                let out = cmd
                     .arg("exec flightdeckd status")
                     .output()
                     .await
@@ -2548,6 +2583,54 @@ done
             Err(other) => panic!("expected CwdMissing, got error: {other:?}"),
             Ok(_) => panic!("expected CwdMissing, but spawn succeeded"),
         }
+    }
+
+    /// The MOST load-bearing entry point (CRM holistic-review blocker #3, chantier A
+    /// `bd7ca709`): a `RemoteTarget` built from a legacy `MachineRecord` row that
+    /// predates `validate_ssh_user` (older app version, manual DB edit — see
+    /// `store::db`'s own `a_legacy_row_with_an_invalid_user_loads_intact_never_
+    /// vanishes_or_panics` test for that half of the story) must NEVER reach an
+    /// actual ssh spawn: `Transport::spawn` itself refuses it with the clear, typed
+    /// `InvalidRemoteTarget` error the brief asks for, proven here with a fake `ssh`
+    /// that would leave a marker file behind if it were EVER invoked.
+    #[test]
+    fn spawn_refuses_a_legacy_row_with_an_invalid_user_without_spawning_ssh() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = SSH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tosse-spawn-invalid-user-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("invoked.marker");
+        let script = dir.join("fake-ssh.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nexit 0\n", shell_quote(&marker.to_string_lossy())))
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+
+        let mut cfg = SpawnConfig::new(std::env::temp_dir());
+        cfg.remote = Some(RemoteTarget {
+            host: "example.com".into(),
+            port: 22,
+            user: "-oProxyCommand=touch /tmp/pwned".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.com".into()],
+            machine_id: Some("legacy1".into()),
+        });
+        let result = Transport::spawn(cfg);
+        std::env::remove_var("TOSSE_SSH_BIN");
+
+        match result {
+            Err(TransportError::InvalidRemoteTarget(_)) => {}
+            Err(other) => panic!("expected InvalidRemoteTarget, got: {other}"),
+            Ok(_) => panic!("expected InvalidRemoteTarget, but spawn succeeded"),
+        }
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ACCEPTANCE (zero orphans): a session's grandchild — the kind `claude`

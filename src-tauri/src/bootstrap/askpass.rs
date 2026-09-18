@@ -204,6 +204,16 @@ impl std::fmt::Debug for SecretString {
 /// deliberately OMITS `BatchMode=yes` (see the module doc) so a password prompt is
 /// even possible in the first place.
 ///
+/// Takes `user`/`host`/`port` SEPARATELY rather than a pre-built destination string
+/// (CRM holistic-review blocker #3, chantier A `bd7ca709`): this is the very FIRST
+/// ssh call the bootstrap flow ever makes, against a host the app has never talked to
+/// — `user` can arrive from a hostile source (a server-printed pairing ticket, see
+/// `bootstrap::connect::BootstrapTarget`'s own doc), so it is validated here via
+/// [`crate::ipc::commands::push_ssh_destination`] (`-l <user>` for the login, `--`
+/// before `host`) rather than ever being concatenated into a single `user@host`
+/// argument a leading `-` could hijack into an ssh OPTION. Returns `Err` — and spawns
+/// nothing — when either fails validation.
+///
 /// `identity_or_none`: `Some` when this connection already has a key to offer (a
 /// later bootstrap step, once our key is installed) — that path leaves ssh's normal
 /// auth negotiation alone. `None` is the FIRST-contact, password-only step: it tells
@@ -225,23 +235,32 @@ impl std::fmt::Debug for SecretString {
 /// goes through `run_with_password` (there is none in this crate yet) would need to
 /// set them itself.
 pub fn bootstrap_ssh_command(
-    target: &str,
+    user: &str,
+    host: &str,
+    port: u16,
     identity_or_none: Option<&str>,
     known_hosts: Option<&str>,
     remote_cmd: &str,
-) -> Command {
-    let mut cmd = bootstrap_ssh_options(identity_or_none, known_hosts);
-    // MUST be the last two args appended: ssh's own argv grammar is
+) -> Result<Command, String> {
+    let mut cmd = bootstrap_ssh_options(port, identity_or_none, known_hosts);
+    // MUST be appended right before `remote_cmd`: ssh's own argv grammar is
     // `ssh [options] destination [command]` — anything appended after the
     // destination is part of the REMOTE command line, not parsed as an ssh option
-    // any more.
-    cmd.arg(target).arg(remote_cmd);
-    cmd
+    // any more. `push_ssh_destination` itself appends `-l <user> -- <host>`, still
+    // well within the "options" half of that grammar (`--` marks the end of
+    // OPTIONS, not the start of the remote command).
+    crate::ipc::commands::push_ssh_destination(&mut cmd, user, host)?;
+    cmd.arg(remote_cmd);
+    Ok(cmd)
 }
 
 /// The option half of [`bootstrap_ssh_command`], without the destination/remote
-/// command it appends last (see that function's doc for why the order matters).
-fn bootstrap_ssh_options(identity_or_none: Option<&str>, known_hosts: Option<&str>) -> Command {
+/// command it appends last (see that function's doc for why the order matters). Takes
+/// `port` explicitly (mirroring [`crate::ipc::commands::keyed_ssh_options`]) rather
+/// than folding it into a `ssh://user@host:port` URI destination string the way this
+/// module used to on a non-default port — `-p <port>` works identically for every
+/// port, so there is no longer a second destination SHAPE to keep validated.
+fn bootstrap_ssh_options(port: u16, identity_or_none: Option<&str>, known_hosts: Option<&str>) -> Command {
     let mut cmd = Command::new("ssh");
     cmd
         // No controlling terminal for ssh to fall back to prompting on either — a
@@ -249,6 +268,8 @@ fn bootstrap_ssh_options(identity_or_none: Option<&str>, known_hosts: Option<&st
         // let ssh read a stray byte from wherever ours happens to be wired up.
         .stdin(Stdio::null())
         .arg("-T") // no PTY: we want plain output, not a terminal session
+        .arg("-p")
+        .arg(port.to_string())
         .arg("-o")
         .arg("NumberOfPasswordPrompts=1")
         .arg("-o")
@@ -696,7 +717,7 @@ mod tests {
 
     #[test]
     fn bootstrap_ssh_command_omits_batch_mode() {
-        let cmd = bootstrap_ssh_command("tester@127.0.0.1", None, None, "true");
+        let cmd = bootstrap_ssh_command("tester", "127.0.0.1", 22, None, None, "true").unwrap();
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
@@ -709,7 +730,7 @@ mod tests {
 
     #[test]
     fn bootstrap_ssh_command_with_identity_skips_password_only_restriction() {
-        let cmd = bootstrap_ssh_command("tester@127.0.0.1", Some("/tmp/some_key"), None, "true");
+        let cmd = bootstrap_ssh_command("tester", "127.0.0.1", 22, Some("/tmp/some_key"), None, "true").unwrap();
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "IdentitiesOnly=yes"));
@@ -724,13 +745,52 @@ mod tests {
     /// `~/.ssh/known_hosts` — proves the option actually lands on the built command.
     #[test]
     fn bootstrap_ssh_command_with_known_hosts_sets_the_dedicated_file() {
-        let cmd = bootstrap_ssh_command("tester@127.0.0.1", None, Some("/tmp/dedicated_known_hosts"), "true");
+        let cmd =
+            bootstrap_ssh_command("tester", "127.0.0.1", 22, None, Some("/tmp/dedicated_known_hosts"), "true")
+                .unwrap();
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
             args.iter().any(|a| a == "UserKnownHostsFile=/tmp/dedicated_known_hosts"),
             "expected the dedicated known_hosts override in {args:?}"
         );
+    }
+
+    /// The actual argv SHAPE this blocker fix demands: `user` rides on `-l`, never
+    /// concatenated into a `user@host` positional argument, and `host` is the LAST
+    /// argv element, preceded by `--` — so even a value that somehow slipped past
+    /// [`crate::store::validate_ssh_user`]/[`crate::store::validate_address_value`]
+    /// starting with `-` could not be parsed as an ssh OPTION.
+    #[test]
+    fn bootstrap_ssh_command_argv_shape_uses_dash_l_and_dash_dash() {
+        let cmd = bootstrap_ssh_command("deploy", "example.com", 2222, None, None, "true").unwrap();
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let l_idx = args.iter().position(|a| a == "-l").expect("must pass -l");
+        assert_eq!(args[l_idx + 1], "deploy", "the login name must follow -l directly");
+        let dd_idx = args.iter().position(|a| a == "--").expect("must pass --");
+        assert_eq!(args[dd_idx + 1], "example.com", "host must immediately follow --");
+        // The remote command is the very last argv element, after the host.
+        assert_eq!(args.last(), Some(&"true".to_string()));
+        // `-p 2222` is present (this builder no longer folds the port into a
+        // `ssh://user@host:port` URI destination).
+        let p_idx = args.iter().position(|a| a == "-p").expect("must pass -p");
+        assert_eq!(args[p_idx + 1], "2222");
+    }
+
+    /// The blocker itself: a `user` shaped like an ssh option must never reach argv at
+    /// all — [`bootstrap_ssh_command`] returns `Err` instead of building a command a
+    /// caller could go on to spawn.
+    #[test]
+    fn bootstrap_ssh_command_rejects_an_option_injection_user() {
+        let err = bootstrap_ssh_command("-oProxyCommand=touch /tmp/pwned", "example.com", 22, None, None, "true")
+            .expect_err("an ssh-option-shaped user must be refused, not built into argv");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_ssh_command_rejects_an_option_injection_host() {
+        assert!(bootstrap_ssh_command("deploy", "-oProxyCommand=touch /tmp/pwned", 22, None, None, "true").is_err());
     }
 
     // ---- is_host_key_mismatch (B7 — shared by classify_output AND
@@ -782,11 +842,11 @@ mod tests {
     /// code/wording, not a hand-built `Output`.
     #[tokio::test]
     async fn run_with_password_reports_host_unreachable_against_a_real_closed_port() {
-        // Port 1 is reserved and never has anything listening on it locally. The
-        // `ssh://` URI destination form is used (rather than `user@host`) because a
-        // plain destination doesn't accept a trailing `:port` — OpenSSH's URI form
-        // does (manually verified against the local OpenSSH_10.3 client).
-        let cmd = bootstrap_ssh_command("ssh://nobody@127.0.0.1:1", None, None, "true");
+        // Port 1 is reserved and never has anything listening on it locally. `-p 1`
+        // now carries the port explicitly (this builder no longer needs the `ssh://`
+        // URI destination form to reach a non-default port — see `bootstrap_ssh_
+        // options`'s own doc for why that second destination shape is gone).
+        let cmd = bootstrap_ssh_command("nobody", "127.0.0.1", 1, None, None, "true").unwrap();
         let result = run_with_password(cmd, "irrelevant", None, Duration::from_secs(10)).await;
         assert_eq!(result, Err(BootstrapError::HostUnreachable));
     }
@@ -871,7 +931,6 @@ mod tests {
             String::from_utf8_lossy(&run.stderr)
         );
 
-        let target = format!("ssh://{USER}@127.0.0.1:{PORT}");
         // Every ssh invocation in this test goes through this helper so all of them
         // — polling AND the final proof — share the same isolated `known_hosts`, via
         // `bootstrap_ssh_command`'s own `known_hosts` parameter (B7) rather than a
@@ -881,7 +940,10 @@ mod tests {
         // anything after those as part of the REMOTE command line, not its own
         // options; reproduced while first building this test).
         let known_hosts_str = known_hosts_file.to_str().expect("scratch known_hosts path must be UTF-8");
-        let ssh_cmd = |remote_cmd: &str| bootstrap_ssh_command(&target, None, Some(known_hosts_str), remote_cmd);
+        let ssh_cmd = |remote_cmd: &str| {
+            bootstrap_ssh_command(USER, "127.0.0.1", PORT, None, Some(known_hosts_str), remote_cmd)
+                .expect("a fixed literal test user/host must always validate")
+        };
 
         // Poll with the WRONG password until sshd actually accepts connections (a
         // freshly started container's sshd takes a moment to come up) — this

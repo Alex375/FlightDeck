@@ -205,6 +205,38 @@ describe("ServerBootstrapWizard — form", () => {
     const toggle = container.querySelector('[role="switch"]');
     expect(toggle?.getAttribute("aria-checked")).toBe("true");
   });
+
+  // CRM holistic-review blocker #3 (chantier A bd7ca709): an ssh-option-shaped user
+  // (or host) must never reach `bootstrap_server` — the "Install" button must refuse
+  // to submit it, with an inline reason shown, mirroring the Rust
+  // `validate_ssh_user`/`validate_address_value` rule (`sshValidation.ts`).
+  it("refuses an ssh-option-shaped user: Install stays disabled, shows an inline reason, never calls bootstrap_server", async () => {
+    mount();
+    fill("Address", "example.com");
+    fill("User", "-oProxyCommand=touch /tmp/pwned");
+    await settle();
+
+    const installBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Install",
+    ) as HTMLButtonElement;
+    expect(installBtn.disabled).toBe(true);
+    expect(container.textContent).toMatch(/User name cannot start with/);
+    expect(bootstrapServer).not.toHaveBeenCalled();
+  });
+
+  it("refuses an ssh-option-shaped address the same way", async () => {
+    mount();
+    fill("Address", "-oProxyCommand=touch /tmp/pwned");
+    fill("User", "deploy");
+    await settle();
+
+    const installBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Install",
+    ) as HTMLButtonElement;
+    expect(installBtn.disabled).toBe(true);
+    expect(container.textContent).toMatch(/Address cannot start with/);
+    expect(bootstrapServer).not.toHaveBeenCalled();
+  });
 });
 
 describe("ServerBootstrapWizard — needs_input states", () => {
@@ -635,5 +667,56 @@ describe("ServerBootstrapWizard — legacy flow", () => {
     await settle();
     expect(container.textContent).toContain("Run this once on your server");
     expect(container.textContent).toContain("ssh-ed25519 AAAA mock");
+  });
+
+  // CRM holistic-review blocker #3 (chantier A bd7ca709): a pairing ticket is
+  // SERVER-PRINTED — a hostile or compromised server can hand back one that
+  // pre-fills an ssh-option-shaped `user`. "Continue" must refuse it and stay on the
+  // ticket-paste stage, so the confirm screen (and "Test & pair") never even sees it.
+  it("refuses a malicious ticket's user, staying on the ticket-paste stage", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
+    mount();
+    clickButtonWithText("Use a command instead (servers with key-only login)");
+    await settle();
+
+    const ticket = `fdpair:${btoa(
+      JSON.stringify({
+        label: "evil",
+        host: "example.com",
+        port: 22,
+        user: "-oProxyCommand=touch /tmp/pwned",
+      }),
+    )}`;
+    fill("fdpair", ticket);
+    const continueBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Continue",
+    ) as HTMLButtonElement;
+    expect(continueBtn.disabled).toBe(false); // non-empty ticket text — the CLICK is what must refuse it
+    act(() => continueBtn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await settle();
+
+    // Still on the ticket-paste stage — "3 · Confirm the connection" (and, with it,
+    // "Test & pair") never rendered.
+    expect(container.textContent).not.toContain("Confirm the connection");
+    expect(container.textContent).toMatch(/isn't safe to use/);
+  });
+
+  it("manual entry: refuses an ssh-option-shaped user, disabling Test & pair with an inline reason", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
+    mount();
+    clickButtonWithText("Use a command instead (servers with key-only login)");
+    await settle();
+    clickButtonWithText("Enter details manually");
+    await settle();
+
+    fill("Host or IP", "example.com");
+    fill("User", "-oProxyCommand=touch /tmp/pwned");
+    await settle();
+
+    const pairBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Test & pair",
+    ) as HTMLButtonElement;
+    expect(pairBtn.disabled).toBe(true);
+    expect(container.textContent).toMatch(/User name cannot start with/);
   });
 });
