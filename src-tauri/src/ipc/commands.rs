@@ -305,18 +305,24 @@ pub async fn spawn_session(
                     .to_string(),
             );
         }
-        // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
-        // version, or a manual DB edit) — refuse here, BEFORE this `RemoteTarget` is
-        // built or any of the ssh round trips below run, with a clear, typed,
-        // actionable error rather than letting an invalid value ride all the way to
-        // `Transport::spawn`'s own (later, lazy) last-resort check. The machine row
+        // A `MachineRecord` on disk could predate `validate_ssh_user`/`validate_ssh_port`
+        // (an older app version, or a manual DB edit) — refuse here, BEFORE this
+        // `RemoteTarget` is built or any of the ssh round trips below run, with a clear,
+        // typed, actionable error rather than letting an invalid value ride all the way
+        // to `Transport::spawn`'s own (later, lazy) last-resort check. The machine row
         // itself is untouched and stays listed — see `crate::store::validate_ssh_user`'s
-        // doc (CRM holistic-review blocker #3, chantier A `bd7ca709`).
-        if let Err(e) = validate_ssh_user(&machine.user) {
-            return Err(format!("This server's saved user name is not valid — remove and re-add it. ({e})"));
+        // doc (CRM holistic-review blocker #3, chantier A `bd7ca709`). The error text
+        // deliberately omits the underlying validator's message (which embeds the raw
+        // offending value) — same discipline as `TransportError::InvalidRemoteTarget`'s
+        // `Display` impl.
+        if validate_ssh_user(&machine.user).is_err() {
+            return Err("This server's saved user name is not valid — remove and re-add it.".to_string());
         }
-        if let Err(e) = validate_address_value(&machine.host) {
-            return Err(format!("This server's saved address is not valid — remove and re-add it. ({e})"));
+        if validate_address_value(&machine.host).is_err() {
+            return Err("This server's saved address is not valid — remove and re-add it.".to_string());
+        }
+        if crate::store::validate_ssh_port(machine.port).is_err() {
+            return Err("This server's saved port is not valid — remove and re-add it.".to_string());
         }
         // A dedicated known_hosts under the app data dir, so pinning a server's host
         // key never touches the user's ~/.ssh/known_hosts.
@@ -4873,6 +4879,19 @@ pub async fn push_remote_conversation_title(
             return false;
         }
     };
+    // A `MachineRecord` on disk could predate `validate_ssh_user`/`validate_ssh_port`
+    // (older app version, manual DB edit) — refuse here, BEFORE any ssh round trip
+    // (including the capability probe below) runs, same discipline as `spawn_session`'s
+    // own early check. `push_remote_title` re-validates internally too (belt and
+    // suspenders), but every keyed helper should refuse up front rather than rely
+    // solely on a deeper builder (CRM holistic-review blocker #3, chantier A
+    // `bd7ca709`).
+    if validate_ssh_user(&machine.user).is_err()
+        || validate_address_value(&machine.host).is_err()
+        || crate::store::validate_ssh_port(machine.port).is_err()
+    {
+        return false;
+    }
     let known_hosts_file = app
         .path()
         .app_data_dir()

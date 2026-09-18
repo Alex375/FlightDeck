@@ -397,9 +397,18 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
     // manual DB edit) must not reach a real ssh spawn here — degrade to the SAME
     // "failed" outcome an unreachable host already reports, never a crash or a spawn
-    // built from it (CRM holistic-review blocker #3, chantier A `bd7ca709`).
-    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
-        eprintln!("[transport] remote stop refused an invalid user/host: {e}");
+    // built from it (CRM holistic-review blocker #3, chantier A `bd7ca709`). The `Err`
+    // is deliberately discarded (never interpolated into the log line): it is
+    // `validate_ssh_user`/`validate_address_value`'s own message, which embeds the raw
+    // offending value verbatim — printing it into this process's stderr would reopen a
+    // terminal-escape-injection surface on the very value this validator exists to
+    // neutralize (a hostile pairing ticket can carry ANSI/OSC bytes in `user`/`host`).
+    // Same discipline as `TransportError::InvalidRemoteTarget`'s own `Display` impl.
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] remote stop refused an invalid user/host — this server's saved \
+             connection details failed validation; remove and re-add it."
+        );
         return false;
     }
     cmd.arg(format!(
@@ -483,9 +492,13 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     }
     // See `run_remote_stop`'s own doc for why this can't be skipped even though every
-    // caller SHOULD already have a validated `remote.user`/`.host`.
-    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
-        eprintln!("[transport] remote title push refused an invalid user/host: {e}");
+    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
+    // `Err` is discarded rather than logged (it embeds the raw offending value).
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] remote title push refused an invalid user/host — this server's \
+             saved connection details failed validation; remove and re-add it."
+        );
         return false;
     }
     cmd.arg(format!(

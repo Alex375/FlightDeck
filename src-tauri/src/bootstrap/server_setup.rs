@@ -677,9 +677,11 @@ async fn drive_claude_login(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host) {
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
+        // The `Err` is deliberately discarded — see `diagnose`'s identical guard in
+        // `orchestrator.rs` for why (it embeds the raw offending value).
         return LoginOutcome::Failed {
-            reason: format!("this server's saved connection details are not valid — remove and re-add it ({e})"),
+            reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
         };
     }
     cmd.arg("claude auth login");

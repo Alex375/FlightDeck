@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    validate_address_value, validate_ssh_user, AddressCandidate, ClaudeAccountRecord, ConversationRecord,
-    MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
+    validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
+    ConversationRecord, MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -148,18 +148,20 @@ fn encode_addresses(addresses: &[AddressCandidate]) -> Option<String> {
 }
 
 /// [`validate_address_value`] over `m.host` and every `m.addresses` value, plus
-/// [`validate_ssh_user`] over `m.user` — the persistence-layer half of the
-/// ssh-option-injection guard (see [`Store::upsert_machine`]). This is the LAST line
-/// of defense: even if every upstream caller somehow forgot to check `user` (the CRM
-/// holistic-review blocker this closes — `user` was validated NOWHERE before this),
-/// a write that would let a future `ssh` invocation parse it as an option never
-/// reaches the row.
+/// [`validate_ssh_user`] over `m.user` and [`validate_ssh_port`] over `m.port` — the
+/// persistence-layer half of the ssh-option-injection guard (see
+/// [`Store::upsert_machine`]). This is the LAST line of defense: even if every
+/// upstream caller somehow forgot to check `user`/`port` (the CRM holistic-review
+/// blocker this closes — `user` was validated NOWHERE before this), a write that
+/// would let a future `ssh` invocation parse it as an option, or persist an
+/// unconnectable port, never reaches the row.
 fn validate_machine_addresses(m: &MachineRecord) -> Result<(), String> {
     validate_address_value(&m.host)?;
     for c in &m.addresses {
         validate_address_value(&c.value)?;
     }
     validate_ssh_user(&m.user)?;
+    validate_ssh_port(m.port)?;
     Ok(())
 }
 
@@ -921,10 +923,10 @@ impl Store {
     /// Insert or update a remote server (idempotent by id). Connection coordinates
     /// only — never key material (see [`MachineRecord`]). `addresses` round-trips
     /// through [`encode_addresses`]/[`decode_addresses`] as a JSON blob (see
-    /// [`migrate_v12`]). Re-checks `host` and every `addresses` value through
-    /// [`validate_address_value`] before writing — the SAME ssh-option-injection guard
-    /// `ipc::commands::add_machine` runs before ever probing, enforced again here so
-    /// this invariant belongs to the boundary that actually owns it, not just to
+    /// [`migrate_v12`]). Re-checks `host`/every `addresses` value/`user`/`port` through
+    /// [`validate_machine_addresses`] before writing — the SAME ssh-option-injection
+    /// guard `ipc::commands::add_machine` runs before ever probing, enforced again here
+    /// so this invariant belongs to the boundary that actually owns it, not just to
     /// today's one caller.
     ///
     /// The four daemon-metadata fields (`daemon_mac_id`/`daemon_relay_url`/
@@ -1815,6 +1817,30 @@ mod tests {
             phone_provisioned_at: None,
         };
         assert!(s.upsert_machine(&m).is_err(), "an unsafe user must be rejected before writing");
+        assert!(s.machine_by_id("m1").unwrap().is_none(), "the rejected row must not land in the db");
+    }
+
+    /// `port` gets the SAME persistence-layer guard `host`/`addresses`/`user` already
+    /// have (review completeness finding on the ssh-injection fix): `port: 0` is never
+    /// a real listener, so it must not be persisted undetected.
+    #[test]
+    fn upsert_machine_rejects_an_invalid_port() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 0,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        assert!(s.upsert_machine(&m).is_err(), "port 0 must be rejected before writing");
         assert!(s.machine_by_id("m1").unwrap().is_none(), "the rejected row must not land in the db");
     }
 

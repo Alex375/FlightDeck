@@ -1403,10 +1403,13 @@ async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerD
     // version, or a manual DB edit) — degrade to a clear, typed failure instead of
     // spawning ssh with it (or, worse, panicking): the machine stays listed, this
     // is just what any attempt to actually reach it now reports.
-    if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host) {
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
+        // The `Err` is deliberately discarded — it embeds the raw offending value (see
+        // `validate_ssh_user`/`validate_address_value`'s own docs) and this reason
+        // string is user-facing. Same discipline as `TransportError::InvalidRemoteTarget`.
         return ServerDiagnosis {
             state: DiagnosisState::Failed {
-                reason: format!("this server's saved connection details are not valid — remove and re-add it ({e})"),
+                reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
             },
             ..ServerDiagnosis::unreachable()
         };
