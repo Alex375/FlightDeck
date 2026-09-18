@@ -77,4 +77,15 @@ describe("settingsUi store", () => {
       vi.useRealTimers();
     }
   });
+
+  // `ServerBootstrapWizard` arms/disarms this while paused on the sudo-password
+  // prompt — `SettingsPanel` reads it to confirm before closing instead of silently
+  // abandoning a paused install (see the field's own doc).
+  it("starts with no bootstrap guard, and setBootstrapGuard sets/clears the reason", () => {
+    expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+    useSettingsUi.getState().setBootstrapGuard("needs a sudo password");
+    expect(useSettingsUi.getState().bootstrapGuard).toBe("needs a sudo password");
+    useSettingsUi.getState().setBootstrapGuard(null);
+    expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+  });
 });

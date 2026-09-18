@@ -170,6 +170,8 @@ export function ClaudeSignInInline({
           onKeyDown={(e) => {
             if (e.key === "Enter") submit();
           }}
+          aria-label="Authorization code"
+          autoComplete="off"
         />
         <button
           type="button"

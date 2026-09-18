@@ -124,6 +124,12 @@ export function ServerStatusPanel({
   const [diagnosis, setDiagnosis] = useState<ServerDiagnosis | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Set on a FAILED `machine_diagnose` (initial load or Refresh) — never silently
+  // dropped: with no `diagnosis` yet this is the only thing standing between the
+  // card and a blank space below the server's name/address row, and even once a
+  // `diagnosis` exists (a failed Refresh after an earlier success), it still says so
+  // rather than quietly keeping the stale one on screen with nothing to show for it.
+  const [diagError, setDiagError] = useState<string | null>(null);
   const [repairBusy, setRepairBusy] = useState<RepairAction | null>(null);
   const [repairError, setRepairError] = useState<string | null>(null);
   const [repairSudoAction, setRepairSudoAction] = useState<RepairAction | null>(null);
@@ -138,11 +144,20 @@ export function ServerStatusPanel({
   useEffect(() => {
     let disposed = false;
     setLoading(true);
-    void commands.machineDiagnose(machine.id).then((res) => {
-      if (disposed) return;
-      setLoading(false);
-      if (res.status === "ok") setDiagnosis(res.data);
-    });
+    setDiagError(null);
+    void commands.machineDiagnose(machine.id).then(
+      (res) => {
+        if (disposed) return;
+        setLoading(false);
+        if (res.status === "ok") setDiagnosis(res.data);
+        else setDiagError(res.error);
+      },
+      (e: unknown) => {
+        if (disposed) return;
+        setLoading(false);
+        setDiagError(e instanceof Error ? e.message : String(e));
+      },
+    );
     return () => {
       disposed = true;
     };
@@ -150,9 +165,19 @@ export function ServerStatusPanel({
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
-    const res = await commands.machineDiagnose(machine.id);
-    setRefreshing(false);
-    if (res.status === "ok") setDiagnosis(res.data);
+    try {
+      const res = await commands.machineDiagnose(machine.id);
+      if (res.status === "ok") {
+        setDiagnosis(res.data);
+        setDiagError(null);
+      } else {
+        setDiagError(res.error);
+      }
+    } catch (e) {
+      setDiagError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRefreshing(false);
+    }
   }, [machine.id]);
 
   const runRepair = useCallback(
@@ -188,6 +213,14 @@ export function ServerStatusPanel({
     setRepairSudoPassword(""); // cleared the instant it's handed off
     void runRepair(repairSudoAction, pw || null);
   }, [repairSudoAction, repairSudoPassword, runRepair]);
+
+  // The one dismissal this prompt had NONE of before: opting out (rather than
+  // submitting, or the whole panel unmounting) still has to scrub whatever was typed,
+  // same as every other password dismissal in this component/the wizard.
+  const cancelRepairSudo = useCallback(() => {
+    setRepairSudoAction(null);
+    setRepairSudoPassword("");
+  }, []);
 
   // Never written to any store/localStorage, so unmount already erases it — explicit
   // for the same reason as the wizard's own equivalent.
@@ -248,6 +281,9 @@ export function ServerStatusPanel({
       ) : diagnosis ? (
         <>
           <DiagnosisSummary diagnosis={diagnosis} repairBusy={repairBusy} onRepair={onRepair} />
+          {diagError && (
+            <div className={sharedStyles.errorMsg}>Couldn&apos;t refresh this server&apos;s status: {diagError}</div>
+          )}
           {repairSudoAction && (
             <div className={styles.repairs}>
               <input
@@ -260,6 +296,8 @@ export function ServerStatusPanel({
                 onKeyDown={(e) => {
                   if (e.key === "Enter") submitRepairSudo();
                 }}
+                aria-label="Sudo password for the repair"
+                autoComplete="new-password"
               />
               <button
                 type="button"
@@ -268,6 +306,14 @@ export function ServerStatusPanel({
                 onClick={submitRepairSudo}
               >
                 Retry with sudo password
+              </button>
+              <button
+                type="button"
+                className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
+                disabled={repairBusy !== null}
+                onClick={cancelRepairSudo}
+              >
+                Cancel
               </button>
             </div>
           )}
@@ -296,7 +342,21 @@ export function ServerStatusPanel({
             </div>
           )}
         </>
-      ) : null}
+      ) : (
+        <div className={styles.repairs}>
+          <div className={sharedStyles.errorMsg}>
+            Couldn&apos;t check this server&apos;s status{diagError ? `: ${diagError}` : "."}
+          </div>
+          <button
+            type="button"
+            className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
+            disabled={refreshing}
+            onClick={() => void refresh()}
+          >
+            {refreshing ? "Retrying…" : "Retry"}
+          </button>
+        </div>
+      )}
 
       {children}
     </div>

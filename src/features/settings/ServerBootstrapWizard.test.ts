@@ -79,6 +79,7 @@ vi.mock("../../ipc/client", () => ({
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
+import { useSettingsUi } from "../../store/settingsUi";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -159,6 +160,7 @@ beforeEach(() => {
   generateMachineKey.mockReset();
   loadPersistedState.mockReset();
   loadPersistedState.mockResolvedValue({ status: "ok", data: { machines: [], repos: [], conversations: [], active_id: null } });
+  useSettingsUi.setState({ bootstrapGuard: null });
 });
 
 afterEach(() => {
@@ -365,6 +367,263 @@ describe("ServerBootstrapWizard — needs_input states", () => {
     await settle();
     expect(bootstrapForgetHostKey).toHaveBeenCalledWith("hostkey.example.com", 22);
     expect(bootstrapServer).toHaveBeenCalledTimes(2);
+  });
+
+  // Regression for a shipped bug: filling the form top-to-bottom (the normal order —
+  // Address, then User, then Password) and hitting a host-key mismatch used to retry
+  // with an EMPTY user/password (a stale closure captured before those fields were
+  // typed, on top of `password` itself already being cleared from state the instant
+  // the first attempt submitted). See the module doc's "Forget the old key and retry"
+  // note.
+  it("host key mismatch: retries with the password actually typed, not stale or empty", async () => {
+    bootstrapServer.mockResolvedValueOnce({
+      status: "ok",
+      data: {
+        session_id: "sess-hostkey-pw",
+        host: "hostkey2.example.com",
+        steps: allOk({ install_key: { status: "failed", detail: "the server's host key does not match what was expected" } }),
+        needs_input: null,
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
+    bootstrapServer.mockResolvedValueOnce({
+      status: "ok",
+      data: { session_id: "sess-hostkey-pw-2", host: "hostkey2.example.com", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: { state: { kind: "ready" } } },
+    });
+
+    mount();
+    // Fill order matters: Address, then User, then Password — the order the form
+    // actually lists them in, and the one the shipped bug got wrong.
+    fill("Address", "hostkey2.example.com");
+    fill("User", "deploy");
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).toHaveBeenNthCalledWith(1, "hostkey2.example.com", "hostkey2.example.com", 22, "deploy", "hunter2", true, null);
+    clickButtonWithText("Forget the old key and retry");
+    await settle();
+
+    expect(bootstrapServer).toHaveBeenNthCalledWith(2, "hostkey2.example.com", "hostkey2.example.com", 22, "deploy", "hunter2", true, null);
+  });
+
+  it("host key mismatch: a failed forget-host-key surfaces an error and skips the retry", async () => {
+    bootstrapServer.mockResolvedValueOnce({
+      status: "ok",
+      data: {
+        session_id: "sess-hostkey-fail",
+        host: "hostkey-fail.example.com",
+        steps: allOk({ install_key: { status: "failed", detail: "the server's host key does not match what was expected" } }),
+        needs_input: null,
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    bootstrapForgetHostKey.mockResolvedValue({ status: "error", error: "could not update known_hosts" });
+
+    mount();
+    fill("Address", "hostkey-fail.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    clickButtonWithText("Forget the old key and retry");
+    await settle();
+
+    expect(container.textContent).toContain("could not update known_hosts");
+    // Never retried against the still-mismatched key.
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
+  });
+
+  it("a rejected bootstrap_server call resets busy and surfaces an error instead of hanging forever", async () => {
+    bootstrapServer.mockRejectedValueOnce(new Error("ECONNRESET"));
+    mount();
+    fill("Address", "flaky.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(container.textContent).toContain("ECONNRESET");
+    // Busy was reset — no button is stuck reading "Installing…".
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Installing…")).toBe(false);
+  });
+
+  it("a rejected bootstrap_resume call resets the sudo-busy state and surfaces an error", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-sudo-reject",
+        host: "sudo-reject.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    bootstrapResume.mockRejectedValueOnce(new Error("socket hang up"));
+    mount();
+    fill("Address", "sudo-reject.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    const sudoInput = container.querySelector('input[placeholder="Sudo password"]') as HTMLInputElement;
+    setValue(sudoInput, "rootpw");
+    clickButtonWithText("Resume");
+    await settle();
+
+    expect(container.textContent).toContain("socket hang up");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Resuming…")).toBe(false);
+  });
+
+  it("Cancel on a paused session awaits bootstrap_cancel and logs a failure instead of pretending it worked", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      bootstrapServer.mockResolvedValue({
+        status: "ok",
+        data: {
+          session_id: "sess-cancel-fail",
+          host: "cancel-fail.example.com",
+          steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+          needs_input: "escalate_persistence",
+          machine_id: null,
+          diagnosis: null,
+        },
+      });
+      bootstrapCancel.mockRejectedValueOnce(new Error("session already gone"));
+      mount();
+      fill("Address", "cancel-fail.example.com");
+      fill("User", "deploy");
+      clickButtonWithText("Install");
+      await settle();
+
+      clickButtonWithText("Cancel");
+      await settle();
+
+      expect(bootstrapCancel).toHaveBeenCalledWith("sess-cancel-fail");
+      expect(consoleError).toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  // A B11 review finding, re-checked here: `upload_daemon`'s restart-pending is
+  // NON-blocking (`NeedsInputContinue`), so it can be reached while a LATER blocking
+  // step (`escalate_persistence`'s sudo prompt) is still open — before `AddMachine`
+  // has ever run. `machineId` is null in that combination.
+  it("restart pending before the server is persisted: Restart now stays disabled and explains why", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-restart-early",
+        host: "restart-early.example.com",
+        steps: allOk({
+          upload_daemon: { status: "needs_input", detail: "restart pending — 1 conversation(s) running" },
+          escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" },
+        }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "restart-early.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(container.textContent).toContain("Restart pending");
+    expect(container.textContent).toContain("Waiting for the rest of the install to finish");
+    const restartBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.startsWith("Restart now"));
+    expect(restartBtn).not.toBeUndefined();
+    expect(restartBtn?.disabled).toBe(true);
+  });
+
+  it("password fields never carry autocomplete hints that could surface a save-password prompt", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-autocomplete",
+        host: "autocomplete.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    const formPassword = container.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(formPassword.autocomplete).toBe("new-password");
+    fill("Address", "autocomplete.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    const sudoInput = container.querySelector('input[placeholder="Sudo password"]') as HTMLInputElement;
+    expect(sudoInput.autocomplete).toBe("new-password");
+    expect(sudoInput.getAttribute("aria-label")).toBeTruthy();
+  });
+});
+
+describe("ServerBootstrapWizard — Settings-close guard while paused", () => {
+  it("arms the shared guard while paused on the sudo prompt, and clears it once resolved", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-guard",
+        host: "guard.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+    fill("Address", "guard.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    // Paused on the blocking sudo prompt: the guard must be armed so `SettingsPanel`
+    // confirms before letting the panel close and silently abandoning this session.
+    expect(useSettingsUi.getState().bootstrapGuard).not.toBeNull();
+
+    bootstrapResume.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "sess-guard", host: "guard.example.com", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: { state: { kind: "ready" } } },
+    });
+    const sudoInput = container.querySelector('input[placeholder="Sudo password"]') as HTMLInputElement;
+    setValue(sudoInput, "rootpw");
+    clickButtonWithText("Resume");
+    await settle();
+
+    expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+  });
+
+  it("clears the guard on unmount even if it was still paused", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-guard-unmount",
+        host: "guard-unmount.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "guard-unmount.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+    expect(useSettingsUi.getState().bootstrapGuard).not.toBeNull();
+
+    act(() => root.unmount());
+    expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
   });
 });
 

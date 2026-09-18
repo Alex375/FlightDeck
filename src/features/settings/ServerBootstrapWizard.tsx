@@ -7,10 +7,21 @@
 // ControlSection.tsx — its own regression tests import them from there) stays reachable
 // behind a secondary link, for servers this Mac can only reach with a pre-authorized
 // key (no password prompt at all).
-import { useCallback, useEffect, useMemo, useState } from "react";
+//
+// ⚠️ `install`/`runInstall` split (review fix): the typed password is cleared from
+// `password` state the instant an attempt submits — win or lose — so a HostKeyMismatch
+// failure's own "Forget the old key and retry" can't just re-read `password`, and an
+// earlier version of this file also memoized `forgetAndRetry` over a stale `install`
+// closure on top of that, so the retry silently went out with an EMPTY user/password.
+// `runInstall(pw)` is the shared body both `install()` and `forgetAndRetry()` call;
+// `pendingKeyPasswordRef` is what lets the retry hand back the password that was
+// actually typed. See `ServerBootstrapWizard.test.ts`'s "retries with the password
+// actually typed" test.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Ico } from "../../ui/kit";
 import { commands, events, type AddressCandidate, type HostKeyFingerprintEvent, type StepState } from "../../ipc/client";
 import { bootConversations, useConversationsStore } from "../../store/conversationsStore";
+import { useSettingsUi } from "../../store/settingsUi";
 import { buildServerCommand, parseTicket } from "./ControlSection";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
 import { ToggleRow } from "./SettingsKit";
@@ -40,6 +51,13 @@ const STEP_STATUS_ICON: Record<StepRowVM["status"], string> = {
 
 function initialSteps(): StepState[] {
   return STEP_ORDER.map((id) => ({ id, status: "pending", detail: null }));
+}
+
+/** A rejected promise's message, for the paths below that must surface a genuine
+ *  transport-level exception (not just a returned `{status:"error"}`) — see the
+ *  generated binding's own `catch`, which re-throws a real `Error` verbatim. */
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function StepChecklist({ steps }: { steps: StepState[] }) {
@@ -90,6 +108,15 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
 
   const [forgetBusy, setForgetBusy] = useState(false);
 
+  // Holds the password from the run that just failed as a `HostKeyMismatch`, so
+  // "Forget the old key and retry" can hand it BACK to a fresh `bootstrap_server`
+  // call — `password` (the visible field) is cleared the instant `install` submits
+  // it, win or lose, so by the time this failure panel shows, that state is already
+  // empty. Never rendered, never touched by anything but `install`/`forgetAndRetry`;
+  // cleared by `clearPasswords` the same as every other password this component
+  // holds (retry-after-failure, cancel, unmount).
+  const pendingKeyPasswordRef = useRef<string | null>(null);
+
   // Live progress: subscribed for this component's whole lifetime. Only one bootstrap
   // call is ever in flight from this wizard at a time, so no session filtering is
   // needed to know these events are "ours".
@@ -109,10 +136,12 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
     setPassword("");
     setSudoPassword("");
     setRestartSudoPassword("");
+    pendingKeyPasswordRef.current = null;
   }, []);
   // Unmount: nothing here is ever written to a store or localStorage, so React
   // discarding this component's state already erases every password — this just
-  // makes that guarantee explicit and independently testable.
+  // makes that guarantee explicit and independently testable. The ref above is
+  // scrubbed explicitly since React discarding the component doesn't null it out.
   useEffect(() => () => clearPasswords(), [clearPasswords]);
 
   const applyReport = useCallback((report: {
@@ -131,33 +160,62 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
       // Settings gets closed the instant this resolves.
       void bootConversations();
     }
+    // Hold onto `pendingKeyPasswordRef` only for as long as ANOTHER host-key-mismatch
+    // retry might still need it — once the run lands anywhere else (success, a
+    // different failure, a needs_input pause), there is nothing left that would ever
+    // read it again, so scrub it right away rather than waiting for the next explicit
+    // retry/cancel/unmount.
+    const stillMismatched = report.steps.some(
+      (s) => s.id === "install_key" && s.status === "failed" && isHostKeyMismatch(s.detail),
+    );
+    if (!stillMismatched) pendingKeyPasswordRef.current = null;
   }, []);
 
-  const install = useCallback(async () => {
-    setTopError(null);
-    setBusy(true);
-    setStarted(true);
-    setSteps(initialSteps());
-    setNeedsInput(null);
-    setFingerprint(null);
-    setRestartDismissed(false);
-    setRestartNeedsSudo(false);
-    setRestartError(null);
+  // The actual pipeline call, parameterized by password so both a fresh `install()`
+  // and a same-run `forgetAndRetry()` go through the identical body — see the module
+  // doc up top: a stale/empty password on that retry hop was a real shipped bug.
+  const runInstall = useCallback(
+    async (pw: string | null) => {
+      setTopError(null);
+      setBusy(true);
+      setStarted(true);
+      setSteps(initialSteps());
+      setNeedsInput(null);
+      setFingerprint(null);
+      setRestartDismissed(false);
+      setRestartNeedsSudo(false);
+      setRestartError(null);
+      try {
+        const res = await commands.bootstrapServer(
+          name.trim() || address.trim(),
+          address.trim(),
+          Number(port) || 22,
+          user.trim(),
+          pw,
+          keepAwake,
+          null,
+        );
+        if (res.status === "ok") applyReport(res.data);
+        else {
+          setTopError(res.error);
+          pendingKeyPasswordRef.current = null;
+        }
+      } catch (e) {
+        setTopError(errorMessage(e));
+        pendingKeyPasswordRef.current = null;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [name, address, port, user, keepAwake, applyReport],
+  );
+
+  const install = useCallback(() => {
     const pw = password;
     setPassword(""); // cleared the instant it's handed to the IPC call
-    const res = await commands.bootstrapServer(
-      name.trim() || address.trim(),
-      address.trim(),
-      Number(port) || 22,
-      user.trim(),
-      pw || null,
-      keepAwake,
-      null,
-    );
-    setBusy(false);
-    if (res.status === "ok") applyReport(res.data);
-    else setTopError(res.error);
-  }, [name, address, port, user, password, keepAwake, applyReport]);
+    pendingKeyPasswordRef.current = pw || null; // …but kept for a same-run "forget and retry" hop
+    return runInstall(pw || null);
+  }, [password, runInstall]);
 
   const resume = useCallback(async () => {
     if (!sessionId) return;
@@ -165,20 +223,37 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
     setTopError(null);
     const pw = sudoPassword;
     setSudoPassword(""); // cleared the instant it's handed off — success or failure
-    const res = await commands.bootstrapResume(sessionId, pw || null);
-    setSudoBusy(false);
-    if (res.status === "ok") applyReport(res.data);
-    else setTopError(res.error);
+    try {
+      const res = await commands.bootstrapResume(sessionId, pw || null);
+      if (res.status === "ok") applyReport(res.data);
+      else setTopError(res.error);
+    } catch (e) {
+      setTopError(errorMessage(e));
+    } finally {
+      setSudoBusy(false);
+    }
   }, [sessionId, sudoPassword, applyReport]);
 
-  const cancelPaused = useCallback(() => {
-    if (sessionId) void commands.bootstrapCancel(sessionId);
+  const cancelPaused = useCallback(async () => {
+    const id = sessionId;
     clearPasswords();
     setStarted(false);
     setSteps(initialSteps());
     setSessionId(null);
     setNeedsInput(null);
     setTopError(null);
+    if (!id) return;
+    try {
+      const res = await commands.bootstrapCancel(id);
+      // A failed cancel leaves the paused session (and the sudo password it was
+      // holding server-side) alive behind a form that now looks blank — not
+      // something this view can retry (there's no session id left to target once
+      // the form above has reset), but silently pretending it worked would be worse.
+      // At minimum, this makes it visible rather than swallowed.
+      if (res.status !== "ok") console.error(`bootstrap_cancel(${id}) failed:`, res.error);
+    } catch (e) {
+      console.error(`bootstrap_cancel(${id}) rejected:`, errorMessage(e));
+    }
   }, [sessionId, clearPasswords]);
 
   const retryAfterFailure = useCallback(() => {
@@ -190,11 +265,28 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
 
   const forgetAndRetry = useCallback(async () => {
     setForgetBusy(true);
-    await commands.bootstrapForgetHostKey(address.trim(), Number(port) || 22);
-    setForgetBusy(false);
-    void install();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address, port]);
+    setTopError(null);
+    try {
+      const res = await commands.bootstrapForgetHostKey(address.trim(), Number(port) || 22);
+      if (res.status !== "ok") {
+        // Forgetting the key itself is what failed — retrying `install` against the
+        // still-mismatched pin would only reproduce the exact same host-key error on
+        // a loop, with nothing telling the user THIS step is the one actually broken.
+        setTopError(res.error);
+        return;
+      }
+      // The password from the run that just failed — `password` (the visible field)
+      // was already cleared the moment that first attempt submitted; this is the only
+      // place it survived. `null` when the very first attempt never got a password at
+      // all (the key might still turn out to already be installed once the new host
+      // key is accepted, and `runInstall` finds out for real rather than guessing).
+      await runInstall(pendingKeyPasswordRef.current);
+    } catch (e) {
+      setTopError(errorMessage(e));
+    } finally {
+      setForgetBusy(false);
+    }
+  }, [address, port, runInstall]);
 
   const restartNow = useCallback(async () => {
     if (!machineId) return;
@@ -202,17 +294,31 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
     setRestartError(null);
     const pw = restartNeedsSudo ? restartSudoPassword : null;
     setRestartSudoPassword("");
-    const res = await commands.machineRepair(machineId, "restart_daemon", pw);
-    setRestartBusy(false);
-    if (res.status === "ok") {
-      setRestartDismissed(true);
-      setRestartNeedsSudo(false);
-    } else if (isSudoPasswordError(res.error)) {
-      setRestartNeedsSudo(true);
-    } else {
-      setRestartError(res.error);
+    try {
+      const res = await commands.machineRepair(machineId, "restart_daemon", pw);
+      if (res.status === "ok") {
+        setRestartDismissed(true);
+        setRestartNeedsSudo(false);
+      } else if (isSudoPasswordError(res.error)) {
+        setRestartNeedsSudo(true);
+      } else {
+        setRestartError(res.error);
+      }
+    } catch (e) {
+      setRestartError(errorMessage(e));
+    } finally {
+      setRestartBusy(false);
     }
   }, [machineId, restartNeedsSudo, restartSudoPassword]);
+
+  const dismissRestartLater = useCallback(() => {
+    setRestartDismissed(true);
+    // The user opted OUT of restarting right now — a sudo password already typed for
+    // it (if any) has no further use and shouldn't linger in state past this point,
+    // same discipline as every other dismissal in this component.
+    setRestartSudoPassword("");
+    setRestartNeedsSudo(false);
+  }, []);
 
   const failedStep = steps.find((s) => s.status === "failed") ?? null;
   const installKeyMismatch = useMemo(
@@ -223,6 +329,20 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   const restartStep = restartDismissed ? null : restartPendingStep(steps);
   const claudeStep = claudeSignInStep(steps);
   const pipelineSettled = started && !busy && !sudoBusy && needsInput === null;
+
+  // Guards `SettingsPanel`'s close paths (✕, Escape, the scrim) against silently
+  // discarding this exact pause — see the store field's own doc. `paused` is the
+  // ONLY case a fresh Settings reopen can't recover from (no session-listing IPC to
+  // find it again by), which is why this tracks it and nothing else needs-input-y.
+  useEffect(() => {
+    useSettingsUi.getState().setBootstrapGuard(
+      paused ? "This server needs a sudo password to finish setting up persistence." : null,
+    );
+  }, [paused]);
+  // Unconditional on unmount, regardless of `paused`'s last value — leaving this view
+  // (Settings actually closing, or the parent tearing the wizard down after a Cancel/
+  // Done) always means there is nothing left here for the guard to protect.
+  useEffect(() => () => useSettingsUi.getState().setBootstrapGuard(null), []);
 
   if (!started) {
     return (
@@ -236,12 +356,16 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
           placeholder="Name (e.g. my-vps)"
           value={name}
           onChange={(e) => setName(e.target.value)}
+          aria-label="Server name"
+          autoComplete="off"
         />
         <input
           className={sharedStyles.field}
           placeholder="Address — an IP, hostname, or Tailscale name"
           value={address}
           onChange={(e) => setAddress(e.target.value)}
+          aria-label="Server address"
+          autoComplete="off"
         />
         <div className={sharedStyles.fieldRow}>
           <input
@@ -251,12 +375,16 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
             placeholder="Port"
             value={port}
             onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+            aria-label="SSH port"
+            autoComplete="off"
           />
           <input
             className={sharedStyles.field}
             placeholder="User (e.g. root)"
             value={user}
             onChange={(e) => setUser(e.target.value)}
+            aria-label="SSH user"
+            autoComplete="off"
           />
         </div>
         <input
@@ -268,6 +396,8 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
           onKeyDown={(e) => {
             if (e.key === "Enter") void install();
           }}
+          aria-label="SSH password"
+          autoComplete="new-password"
         />
         <ToggleRow
           title="Keep this server awake (disable sleep)"
@@ -335,6 +465,8 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
             onKeyDown={(e) => {
               if (e.key === "Enter") void resume();
             }}
+            aria-label="Sudo password"
+            autoComplete="new-password"
           />
           <div className={sharedStyles.btnRow}>
             <button
@@ -344,7 +476,11 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
             >
               {sudoBusy ? "Resuming…" : "Resume"}
             </button>
-            <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} disabled={sudoBusy} onClick={cancelPaused}>
+            <button
+              className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
+              disabled={sudoBusy}
+              onClick={() => void cancelPaused()}
+            >
               Cancel
             </button>
           </div>
@@ -362,25 +498,35 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
                 : ""}
             . A newer daemon is installed but not running yet.
           </div>
-          {restartNeedsSudo && (
-            <input
-              className={sharedStyles.field}
-              type="password"
-              placeholder="Sudo password"
-              value={restartSudoPassword}
-              onChange={(e) => setRestartSudoPassword(e.target.value)}
-            />
+          {!machineId ? (
+            <div className={sharedStyles.note}>
+              Waiting for the rest of the install to finish before this server can be restarted.
+            </div>
+          ) : (
+            <>
+              {restartNeedsSudo && (
+                <input
+                  className={sharedStyles.field}
+                  type="password"
+                  placeholder="Sudo password"
+                  value={restartSudoPassword}
+                  onChange={(e) => setRestartSudoPassword(e.target.value)}
+                  aria-label="Sudo password for the restart"
+                  autoComplete="new-password"
+                />
+              )}
+              {restartError && <div className={sharedStyles.errorMsg}>{restartError}</div>}
+            </>
           )}
-          {restartError && <div className={sharedStyles.errorMsg}>{restartError}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
-              disabled={restartBusy || (restartNeedsSudo && !restartSudoPassword)}
+              disabled={!machineId || restartBusy || (restartNeedsSudo && !restartSudoPassword)}
               onClick={() => void restartNow()}
             >
               {restartBusy ? "Restarting…" : "Restart now"}
             </button>
-            <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={() => setRestartDismissed(true)}>
+            <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={dismissRestartLater}>
               Later
             </button>
           </div>
@@ -518,6 +664,8 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             onKeyDown={(e) => {
               if (e.key === "Enter") continueFromTicket();
             }}
+            aria-label="Pairing ticket"
+            autoComplete="off"
           />
           {error && <div className={sharedStyles.errorMsg}>{error}</div>}
           <div className={sharedStyles.btnRow}>
@@ -569,12 +717,16 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             placeholder="Name (e.g. my-vps)"
             value={label}
             onChange={(e) => setLabel(e.target.value)}
+            aria-label="Server name"
+            autoComplete="off"
           />
           <input
             className={sharedStyles.field}
             placeholder="Host or IP (reachable from this Mac)"
             value={host}
             onChange={(e) => setHost(e.target.value)}
+            aria-label="Server host or IP"
+            autoComplete="off"
           />
           {stage === "confirm" && addresses.length > 1 && (
             <div className={sharedStyles.remoteStep}>
@@ -601,12 +753,16 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
               placeholder="Port"
               value={port}
               onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+              aria-label="SSH port"
+              autoComplete="off"
             />
             <input
               className={sharedStyles.field}
               placeholder="User (e.g. root)"
               value={user}
               onChange={(e) => setUser(e.target.value)}
+              aria-label="SSH user"
+              autoComplete="off"
             />
           </div>
           {error && <div className={sharedStyles.errorMsg}>{error}</div>}
