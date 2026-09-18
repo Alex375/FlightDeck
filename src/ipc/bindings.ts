@@ -2619,6 +2619,14 @@ async bootstrapEscalatePersistence(machineId: string, password: string | null, m
  * new key (the shared "pending" one was already claimed/renamed by the first run's
  * `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
  * host under a fresh uuid, rather than converging on the one that already exists.
+ * 
+ * Claims this host's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+ * running a single ssh round trip — `Err` with [`server_busy_error`] when
+ * `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+ * against the same server, rather than racing it (the previous behaviour: two
+ * concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
+ * against the same host, the loser typically failing opaquely at its very last
+ * step). Never blocks/waits.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -2633,12 +2641,24 @@ async bootstrapServer(label: string, host: string, port: number, user: string, p
  * needing a sudo password) — re-runs the same, idempotent pipeline with
  * `sudo_password` now available.
  * 
- * Runs the SAME idempotency lookup [`bootstrap_server`] does (rather than assuming
- * the paused session is the only in-progress state that matters): a completely
- * separate, already-finished pairing for this exact host could exist by the time a
- * resume happens (e.g. the same host paired again through a different session while
- * this one sat paused) — reusing it here keeps `bootstrap_resume` exactly as
- * convergent as a fresh `bootstrap_server` call.
+ * Re-finds the [`MachineRecord`] the paused session already converged on via
+ * [`resolve_resume_machine`] — BY ID when the ORIGINAL `bootstrap_server` call found
+ * one (`StoredSession::machine_id`), never by re-deriving `(host, port, user)` from
+ * the FROZEN request the session was paused under (B_lifecycle-#8 review finding: A6's
+ * live address-rotation, `Store::set_machine_preferred_host`, can rewrite that same
+ * row's `host` column WHILE this session sits paused — an address lookup would then
+ * find nothing and this resume would proceed as if pairing a brand-new host, which,
+ * with B_lifecycle-#1 unfixed, minted a duplicate). Falls back to the address lookup
+ * [`bootstrap_server`] itself uses ONLY when no id was ever recorded — a genuinely
+ * first-contact host, paused before [`StepId::AddMachine`] had ever run once — which
+ * also covers a completely separate, already-finished pairing for that host existing
+ * by the time this resume happens (e.g. the same host paired again through a
+ * different session while this one sat paused).
+ * 
+ * [`ServerLocks`]: REUSES (never re-claims) the [`ServerLockGuard`] the original
+ * `bootstrap_server` call claimed and left held across the pause (B_lifecycle-#7) —
+ * see [`BootstrapSessions::resume`]'s own `lock_key`. A fresh `claim` here would
+ * simply collide with this very session's own still-held lock.
  */
 async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -2649,7 +2669,9 @@ async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<
 }
 },
 /**
- * Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`].
+ * Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
+ * releases the [`ServerLocks`] claim that paused run left held (B_lifecycle-#7 review
+ * finding) — no-op when nothing was paused under this id.
  */
 async bootstrapCancel(sessionId: string) : Promise<Result<null, string>> {
     try {
@@ -2667,6 +2689,15 @@ async machineDiagnose(machineId: string) : Promise<Result<ServerDiagnosis, strin
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+ * running anything — `Err` with [`server_busy_error`] when a `bootstrap_server`/
+ * `bootstrap_resume`/another `machine_repair` is already in flight against it (the
+ * previous behaviour: the Settings UI kept every paired machine's Repair buttons
+ * clickable regardless of what else was running against that same host, including
+ * the "+ Add a server" wizard). Always released before this returns — `repair` itself
+ * never pauses across separate calls the way the bootstrap pipeline can.
+ */
 async machineRepair(machineId: string, action: RepairAction, sudoPassword: string | null) : Promise<Result<RepairOutcome, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("machine_repair", { machineId, action, sudoPassword }) };
