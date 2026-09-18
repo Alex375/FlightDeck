@@ -29,6 +29,7 @@
 
 pub mod events;
 pub mod http;
+pub mod provision;
 pub mod relay;
 pub mod router;
 pub mod tools;
@@ -110,6 +111,11 @@ pub const DEFAULT_VOICE_PORT: u16 = 7068;
 /// Settings. Deployed from the `flightdeck-remote` repo (Railway).
 pub const DEFAULT_RELAY_URL: &str = "https://relay-production-8fd4.up.railway.app";
 
+/// This Mac's default node display name (C11 decision) — shown in a paired
+/// phone's node list (`{type:"set_label"}`, PROTOCOL.md §4) until the user
+/// renames it in Settings → Control → Remote access.
+pub const DEFAULT_MAC_LABEL: &str = "This Mac";
+
 /// Live state of the outbound remote-access relay connection, for the Settings
 /// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
 /// failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
@@ -120,6 +126,8 @@ pub struct RemoteStatus {
     pub relay_url: String,
     pub mac_id: String,
     pub phone_token: String,
+    /// This Mac's node display name (C11), as sent to the relay via `set_label`.
+    pub mac_label: String,
     pub pairing_url: Option<String>,
     pub pairing_qr_svg: Option<String>,
     pub error: Option<String>,
@@ -134,6 +142,17 @@ pub struct RemoteConfig {
     pub mac_id: String,
     pub mac_token: String,
     pub phone_token: String,
+    /// This Mac's node display name (C11) — sent as `{type:"set_label"}` right
+    /// after the authorize burst on every (re)connect (see
+    /// `relay::post_connect_frames`).
+    pub mac_label: String,
+    /// Phone tokens still awaiting `{type:"revoke_phone"}` on THIS Mac's own relay
+    /// connection (C10's critical fix: a regenerated pairing must forget the OLD
+    /// token, not just mint a new one). Loaded fresh from
+    /// [`crate::store::Store::pending_relay_phone_revocations`] every time this
+    /// config is built, and sent — best-effort, the wire has no delivery ack — on
+    /// every (re)connect until `Store::clear_relay_phone_revocation` drops them.
+    pub revoke_phone_tokens: Vec<String>,
 }
 
 /// Runtime half of the voice bridge: the desired config plus what the listener
@@ -203,6 +222,8 @@ impl ControlHub {
                     mac_id: String::new(),
                     mac_token: String::new(),
                     phone_token: String::new(),
+                    mac_label: DEFAULT_MAC_LABEL.to_string(),
+                    revoke_phone_tokens: Vec::new(),
                 },
                 connected: false,
                 error: None,
@@ -378,6 +399,7 @@ impl ControlHub {
             relay_url: r.cfg.relay_url.clone(),
             mac_id: r.cfg.mac_id.clone(),
             phone_token: r.cfg.phone_token.clone(),
+            mac_label: r.cfg.mac_label.clone(),
             pairing_url: pairing,
             pairing_qr_svg: qr,
             error: r.error.clone(),

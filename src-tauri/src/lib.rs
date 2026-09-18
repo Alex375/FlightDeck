@@ -74,7 +74,7 @@ use ipc::commands::{
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
-    remote_status, set_remote,
+    remote_status, set_remote, phone_provisioning_status, retry_phone_provisioning,
     add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -358,6 +358,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            phone_provisioning_status,
+            retry_phone_provisioning,
             bootstrap_run_init,
             start_claude_login,
             submit_claude_login_code,
@@ -649,6 +651,11 @@ pub fn run() {
         // An Arc so `start_claude_login`'s spawned actor can hold it beyond the
         // spawning command's own lifetime.
         .manage(std::sync::Arc::new(bootstrap::server_setup::LoginSessions::new()))
+        // C10: last known phone-provisioning outcome per paired daemon, for
+        // Settings' per-server status row. An Arc so the background hooks
+        // (`add_machine`, `set_remote`) can record into it after their spawning
+        // command has already returned.
+        .manage(std::sync::Arc::new(appmcp::provision::ProvisionRegistry::new()))
         .setup(move |app| {
             use tauri::Manager;
 

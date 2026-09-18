@@ -121,6 +121,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Remote servers (SSH)", section: "control", sub: "remote", group: "Remote servers (SSH)", keywords: "ssh host machine distant serveur" },
   { title: "Reach your agents from your phone", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "relay pairing mobile telephone" },
   { title: "Answer permission requests remotely", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "permission phone relay" },
+  { title: "This Mac's name", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "label node name mac relay nom" },
   { title: "Local MCP server for an external agent", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge token port externe" },
   { title: "Port", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge listen" },
   { title: "Access token", section: "control", sub: "bridge", group: "Voice bridge", keywords: "bearer secret bridge jeton" },

@@ -3638,12 +3638,30 @@ pub(crate) fn parse_yes_no_marker(v: Option<String>) -> Option<bool> {
 /// last by the caller, exactly like `bootstrap_ssh_options`'s own doc explains for its
 /// sibling — ssh's own argv grammar stops parsing options once it sees the
 /// destination).
+/// Test-only override for which `ssh` binary [`keyed_ssh_options`] spawns — an
+/// ABSOLUTE PATH to a stand-in script, read ONCE per call. This exists so C10's
+/// `appmcp::provision` tests can intercept every keyed ssh call end-to-end
+/// (through the real, unmodified production functions) WITHOUT mutating the
+/// process-wide `PATH` env var: an earlier version of that test harness did
+/// exactly that and it redirected every OTHER concurrently-running test's own
+/// `ssh`/`ssh-keygen` spawn too (caught by `bootstrap::askpass`'s
+/// `run_with_password_reports_host_unreachable_against_a_real_closed_port`
+/// starting to fail under full-suite `cargo test --lib`, not run in isolation).
+/// Unset (the default) everywhere outside those guarded tests — a complete
+/// no-op in production and in every other test in this crate.
+fn ssh_binary() -> String {
+    std::env::var("TOSSE_TEST_SSH_BIN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ssh".to_string())
+}
+
 pub(crate) fn keyed_ssh_options(
     port: u16,
     identity: Option<&str>,
     known_hosts: Option<&str>,
 ) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("ssh");
+    let mut cmd = tokio::process::Command::new(ssh_binary());
     cmd.arg("-p")
         .arg(port.to_string())
         .arg("-o")
@@ -4149,6 +4167,29 @@ pub async fn add_machine(
     app.state::<Store>()
         .upsert_machine(&machine)
         .map_err(|e| e.to_string())?;
+
+    // C10 hook (a): a freshly paired server should already answer this phone,
+    // without a separate manual step — but only when there is a phone pairing to
+    // extend in the first place (remote access enabled AND a token minted); a
+    // fresh install with remote access off has neither, and this must stay a
+    // silent no-op rather than mint a token/turn anything on by itself.
+    // Backgrounded so pairing a server never waits on a THIRD ssh round trip on
+    // top of the probe(s) already paid above.
+    let cfg = load_remote_config(&app.state::<Store>());
+    if cfg.enabled && !cfg.phone_token.is_empty() {
+        let app2 = app.clone();
+        let machine_id = machine.id.clone();
+        tokio::spawn(async move {
+            let store = app2.state::<Store>();
+            let known_hosts = remote_known_hosts_path(&app2);
+            let registry = (*app2.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>()).clone();
+            let state = crate::appmcp::provision::provision_phone_on_machine(&store, known_hosts.as_deref(), &machine_id)
+                .await
+                .unwrap_or_else(|e| crate::appmcp::provision::ProvisionState::Failed { reason: e });
+            registry.record(&machine_id, state);
+        });
+    }
+
     Ok(machine)
 }
 
@@ -4175,6 +4216,35 @@ fn delete_machine_and_key(store: &Store, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// C10 hook (c): best-effort `flightdeckd remove-phone` on a machine BEFORE it is
+/// deleted locally — once [`delete_machine_and_key`] runs, the row (and the
+/// ability to ssh into it with the identity Flight Deck generated) is gone, so
+/// this is the last chance to tell that daemon to forget this Mac's phone token.
+/// Independent-failure tolerant BOTH ways: a failed/queued revoke never blocks
+/// the local delete (the user asked to remove a server, not to be stuck because
+/// it's offline), and a failed local delete is reported normally regardless of
+/// how the revoke went. Only machines this Mac actually provisioned
+/// (`phone_provisioned_at.is_some()`) are worth an ssh round trip here — one
+/// never provisioned never had the token authorized.
+///
+/// Testable core (plain `&Store` + `known_hosts`, mirrors
+/// `appmcp::provision`'s own split) — the `#[tauri::command]` below is a thin
+/// `AppHandle`-unwrapping shell around it.
+async fn delete_machine_core(store: &Store, known_hosts: Option<&str>, id: &str) -> Result<(), String> {
+    if let Ok(Some(machine)) = store.machine_by_id(id) {
+        if machine.phone_provisioned_at.is_some() {
+            let token = load_remote_config(store).phone_token;
+            if !token.is_empty() {
+                // Outcome intentionally discarded: Queued/Failed/DaemonTooOld all
+                // still proceed to the local delete below — this call's only job
+                // is "best-effort, in order", not to gate the delete on it.
+                let _ = crate::appmcp::provision::revoke_phone_on_machine(store, known_hosts, &machine, &token).await;
+            }
+        }
+    }
+    delete_machine_and_key(store, id)
+}
+
 /// Best-effort `std::fs::remove_file`, logging any failure that isn't "the file was
 /// already gone" (an ordinary, expected case — e.g. only the `.pub` half was ever
 /// written, or a previous delete already removed it) rather than discarding it via a
@@ -4187,11 +4257,14 @@ fn log_remove_file_failure(path: &str) {
     }
 }
 
-/// Un-pair a remote server. See [`delete_machine_and_key`].
+/// Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
+/// and [`delete_machine_and_key`] (the delete itself).
 #[tauri::command]
 #[specta::specta]
-pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), String> {
-    delete_machine_and_key(&store, &id)
+pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let store = app.state::<Store>();
+    let known_hosts = remote_known_hosts_path(&app);
+    delete_machine_core(&store, known_hosts.as_deref(), &id).await
 }
 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
@@ -4223,6 +4296,72 @@ pub(crate) async fn run_ssh_on_machine(
             .unwrap_or("ssh command failed")
             .to_string())
     }
+}
+
+/// The raw outcome of [`run_ssh_on_machine_stdin`] — stdout/stderr/exit-success,
+/// all three, rather than collapsing to a single `Result<String, String>` like its
+/// sibling [`run_ssh_on_machine`]. `flightdeckd add-phone`/`remove-phone` (C10) can
+/// answer a well-formed JSON verdict (including a business-logic refusal, e.g. "too
+/// many authorized phones") on stdout regardless of the ssh command's own exit
+/// code — mirroring why `bootstrap::server_setup::probe_auth_status` reads `claude
+/// auth status --json`'s stdout "regardless of the ssh command's exit status" (see
+/// that function's doc for the same trap this avoids). The caller decides what a
+/// non-zero exit with unparsable stdout means.
+pub(crate) struct SshStdinOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
+/// Run a command on a server over SSH (batch, never-prompting) with `stdin_payload`
+/// piped to the remote command's stdin and then closed (EOF) — the SAME keyed ssh
+/// path as [`run_ssh_on_machine`] (see its doc), extended with a stdin pipe for a
+/// remote subcommand that reads a secret from stdin rather than argv
+/// (`flightdeckd add-phone --token -` / `remove-phone --token -`, C10) so the
+/// secret never appears in `ps` output or shell history on the far end.
+///
+/// `Err` only for a failure to even run the ssh process itself (couldn't spawn,
+/// couldn't write to its stdin, or it never exited within the bound below) — never
+/// for a non-zero exit, which is carried in [`SshStdinOutput::success`] instead so
+/// a caller that wants stdout regardless of exit code (see that struct's doc) can
+/// still get it.
+///
+/// Bounded by an overall timeout distinct from `ssh`'s own `ConnectTimeout` (that
+/// one only covers the TCP/SSH handshake, not the remote command actually
+/// running) — a wedged remote `flightdeckd` must not hang provisioning forever.
+pub(crate) async fn run_ssh_on_machine_stdin(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+) -> Result<SshStdinOutput, String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
+    cmd.arg("-T")
+        .arg(format!("{}@{}", m.user, m.host))
+        .arg(remote_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(stdin_payload).await {
+            return Err(format!("could not write to ssh's stdin: {e}"));
+        }
+        // Drop to close (EOF) — the remote command's own read is waiting on exactly
+        // this to know the payload is complete.
+        drop(stdin);
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+        .await
+        .map_err(|_| "ssh command timed out".to_string())?
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    Ok(SshStdinOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        success: out.status.success(),
+    })
 }
 
 /// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
@@ -4713,10 +4852,19 @@ const REMOTE_URL_KEY: &str = "remote_relay_url";
 const REMOTE_MAC_ID_KEY: &str = "remote_mac_id";
 const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
 const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
+/// C11: this Mac's node display name (`{type:"set_label"}`, PROTOCOL.md §4).
+const REMOTE_MAC_LABEL_KEY: &str = "remote_mac_label";
 
 /// Load the remote-access config, minting (and persisting) the stable mac id, the
 /// mac secret and the phone pairing token on first use so Settings always has a QR
 /// to show. Best-effort on read errors (then it starts disabled with defaults).
+///
+/// Also loads two things that never round-trip through the front: the node
+/// label (C11, `remote_mac_label`, defaulting to
+/// [`crate::appmcp::DEFAULT_MAC_LABEL`]) and every phone token still queued for
+/// `{type:"revoke_phone"}` on this Mac's own relay connection
+/// (`Store::pending_relay_phone_revocations`, C10's critical fix) — both feed
+/// `appmcp::relay::post_connect_frames` on the next (re)connect.
 pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
     let mint = |key: &str| -> String {
@@ -4739,6 +4887,10 @@ pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
         mac_id: mint(REMOTE_MAC_ID_KEY),
         mac_token: mint(REMOTE_MAC_TOKEN_KEY),
         phone_token: mint(REMOTE_PHONE_TOKEN_KEY),
+        mac_label: read(REMOTE_MAC_LABEL_KEY)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::appmcp::DEFAULT_MAC_LABEL.to_string()),
+        revoke_phone_tokens: store.pending_relay_phone_revocations().unwrap_or_default(),
     }
 }
 
@@ -4752,10 +4904,19 @@ pub fn remote_status(
     hub.remote_status()
 }
 
-/// Change the remote-access config (enable, relay URL, regenerate the pairing
-/// token), persist it, and (re)connect or disconnect accordingly. Regenerating
-/// the pairing token revokes every previously-paired phone. Returns the honest
-/// post-apply status.
+/// Change the remote-access config (enable, relay URL, this Mac's node label,
+/// regenerate the pairing token), persist it, and (re)connect or disconnect
+/// accordingly. Returns the honest post-apply status.
+///
+/// Regenerating the pairing token mints a fresh one AND revokes the old one
+/// everywhere it was ever authorized (C10's critical fix — see the inline
+/// comments below): before this fix, `regenerate_pairing` only ever minted +
+/// authorized the new token, so a lost phone's OLD token stayed valid forever
+/// (verified against this file's history: nothing anywhere called
+/// `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
+/// token on every paired daemon when access just turned on or the token just
+/// changed (C10 hook (b)) — both run in the background so Settings never blocks
+/// on N ssh round trips.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_remote(
@@ -4763,11 +4924,14 @@ pub async fn set_remote(
     enabled: Option<bool>,
     relay_url: Option<String>,
     regenerate_pairing: bool,
+    mac_label: Option<String>,
 ) -> Result<crate::appmcp::RemoteStatus, String> {
     let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
-    let cfg = {
+    let (cfg, was_enabled, old_phone_token) = {
         let store = app.state::<Store>();
         let mut cfg = load_remote_config(&store);
+        let was_enabled = cfg.enabled;
+        let old_phone_token = cfg.phone_token.clone();
         if let Some(enabled) = enabled {
             cfg.enabled = enabled;
         }
@@ -4777,8 +4941,28 @@ pub async fn set_remote(
                 cfg.relay_url = url;
             }
         }
+        if let Some(label) = mac_label {
+            // The relay strips control/format chars and caps at 64 code points
+            // itself (PROTOCOL.md §4) — trim here too so an all-whitespace edit
+            // reads as "leave it", not "clear the label".
+            let label = label.trim().to_string();
+            if !label.is_empty() {
+                cfg.mac_label = label;
+            }
+        }
         if regenerate_pairing {
             cfg.phone_token = uuid::Uuid::new_v4().to_string();
+            // Queue the OLD token for `{type:"revoke_phone"}` on THIS Mac's own
+            // relay connection — the Mac-side half of the critical fix. Queued
+            // rather than sent directly here: there may be no live connection at
+            // all right now (remote access could be off), and this durable queue
+            // is what `apply_remote`'s next (re)connect drains (see
+            // `load_remote_config`'s doc and `appmcp::relay::post_connect_frames`).
+            if !old_phone_token.is_empty() {
+                store
+                    .queue_relay_phone_revocation(&old_phone_token, now_ms())
+                    .map_err(|e| e.to_string())?;
+            }
         }
         store
             .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
@@ -4786,11 +4970,108 @@ pub async fn set_remote(
             .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &cfg.mac_id))
             .and_then(|_| store.set_config(REMOTE_MAC_TOKEN_KEY, &cfg.mac_token))
             .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
+            .and_then(|_| store.set_config(REMOTE_MAC_LABEL_KEY, &cfg.mac_label))
             .map_err(|e| e.to_string())?;
-        cfg
+        // Reload so `cfg.revoke_phone_tokens` carries the entry just queued above
+        // (if any) — `apply_remote`, right below, hands this exact cfg to the new
+        // connection.
+        let cfg = load_remote_config(&store);
+        (cfg, was_enabled, old_phone_token)
     };
-    hub.apply_remote(cfg).await;
+    hub.apply_remote(cfg.clone()).await;
+
+    if regenerate_pairing && cfg.enabled && !old_phone_token.is_empty() {
+        // Best-effort: the connection `apply_remote` just (re)started will carry
+        // this queued token via `post_connect_frames` — there is no delivery ack
+        // on the wire (see that function's doc), so "handed to a live connection
+        // attempt" is treated as done, mirroring `authorize_phone`'s own
+        // fire-and-forget semantics. When remote access is OFF, the entry is left
+        // queued (no connection will ever carry it) for a future `set_remote` call
+        // to pick back up.
+        let store = app.state::<Store>();
+        let _ = store.clear_relay_phone_revocation(&old_phone_token);
+    }
+
+    // CRITICAL FIX (C10): a regenerated token must also be forgotten by every
+    // daemon it was ever authorized on — otherwise "I lost my phone → regenerate
+    // the QR" leaves the lost phone able to reach every paired server forever.
+    // Backgrounded (never blocks this command on N ssh round trips); an
+    // unreachable daemon is queued and retried the next time it's successfully
+    // contacted (`appmcp::provision::revoke_phone_on_machine`'s `Queued` case).
+    if regenerate_pairing && !old_phone_token.is_empty() {
+        let app2 = app.clone();
+        let token = old_phone_token.clone();
+        tokio::spawn(async move {
+            let store = app2.state::<Store>();
+            let known_hosts = remote_known_hosts_path(&app2);
+            crate::appmcp::provision::revoke_phone_on_all_machines(&store, known_hosts.as_deref(), &token).await;
+        });
+    }
+
+    // C10 hook (b): remote access just turned on, or the phone token just
+    // changed — every paired daemon needs to hear about it too, not just the
+    // relay. Backgrounded for the same reason as the revoke above.
+    if cfg.enabled && (!was_enabled || regenerate_pairing) {
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            let store = app2.state::<Store>();
+            let known_hosts = remote_known_hosts_path(&app2);
+            crate::appmcp::provision::provision_phone_on_all_machines(&store, known_hosts.as_deref()).await;
+        });
+    }
+
     Ok(hub.remote_status())
+}
+
+/// Where this Mac's TOFU `known_hosts` for paired servers lives — the same path
+/// every other remote-server ssh call in this crate uses (e.g.
+/// [`list_remote_repos`]), factored out for C10's background provisioning hooks.
+fn remote_known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned())
+}
+
+/// Every paired server's last phone-provisioning outcome this app run knows about
+/// (C10/C11) — Settings' per-server status row reads this back, joined against
+/// its own machine list by `machine_id`. A machine absent from the result has
+/// simply not been attempted yet this run (e.g. app just launched, remote access
+/// is off) — not a failure.
+#[tauri::command]
+#[specta::specta]
+pub fn phone_provisioning_status(
+    registry: tauri::State<'_, Arc<crate::appmcp::provision::ProvisionRegistry>>,
+) -> Vec<crate::appmcp::provision::MachineProvisionStatus> {
+    registry.all()
+}
+
+/// Settings' "Retry" button: (re)attempt provisioning the current phone token on
+/// one server, synchronously — unlike the background hooks in [`set_remote`] /
+/// [`add_machine`], a manual retry click should show immediate feedback. Records
+/// `Pending` the moment it starts (so the row updates right away even though the
+/// ssh round trip itself takes a beat), then the real outcome.
+#[tauri::command]
+#[specta::specta]
+pub async fn retry_phone_provisioning(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<crate::appmcp::provision::MachineProvisionStatus, String> {
+    let registry = (*app.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>()).clone();
+    registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Pending);
+    let store = app.state::<Store>();
+    let known_hosts = remote_known_hosts_path(&app);
+    let state = crate::appmcp::provision::provision_phone_on_machine(&store, known_hosts.as_deref(), &machine_id)
+        .await
+        .map_err(|e| {
+            // Even the "unrelated to the daemon" error path (unknown machine id, a
+            // store error) must still leave a row behind, not a request that
+            // silently never resolved — the honest-status principle every other
+            // core-backed Settings card follows here too.
+            registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Failed { reason: e.clone() });
+            e
+        })?;
+    Ok(registry.record(&machine_id, state))
 }
 
 #[tauri::command]
@@ -5518,6 +5799,113 @@ mod tests {
 
         // Nor when the record doesn't even exist (already-deleted / bad id).
         super::delete_machine_and_key(&store, "no-such-machine").unwrap();
+    }
+
+    // ---- delete_machine_core: revoke-before-delete (C10 hook (c)) -------------
+
+    fn provisioned_machine(id: &str) -> crate::store::MachineRecord {
+        crate::store::MachineRecord {
+            id: id.into(),
+            label: id.into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            user: "tester".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: Some(1),
+        }
+    }
+
+    /// The ordering half of C10 hook (c): `flightdeckd remove-phone` runs with
+    /// the machine's own connection details BEFORE the local row is deleted —
+    /// provable because `delete_machine_core` only reaches the revoke round trip
+    /// through `store.machine_by_id(id)`, which is impossible once
+    /// `delete_machine_and_key` has already removed that row. The token rides on
+    /// stdin only, never argv.
+    #[tokio::test]
+    async fn delete_machine_core_revokes_before_deleting_and_never_leaks_the_token_to_argv() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-ok");
+        let argv_log = std::env::temp_dir().join(format!("fakessh-argv-{}", uuid::Uuid::new_v4()));
+        let stdin_log = std::env::temp_dir().join(format!("fakessh-stdin-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&provisioned_machine("m1")).unwrap();
+        store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
+
+        super::delete_machine_core(&store, None, "m1").await.unwrap();
+
+        assert!(store.machine_by_id("m1").unwrap().is_none(), "the local row must be gone");
+        let stdin = std::fs::read_to_string(&stdin_log).unwrap();
+        assert_eq!(stdin, "super-secret-phone-token", "the token must have been delivered on stdin");
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        assert!(
+            !argv.contains("super-secret-phone-token"),
+            "the token must NEVER appear in argv: {argv}"
+        );
+        assert!(argv.contains("remove-phone --token -"), "argv: {argv}");
+
+        std::fs::remove_file(&argv_log).ok();
+        std::fs::remove_file(&stdin_log).ok();
+    }
+
+    /// The independent-failure half of C10 hook (c): an unreachable daemon at
+    /// delete time (revoke → `Queued`, never an `Err`) must NOT block the local
+    /// delete — the user asked to remove a server, not to be stuck because it's
+    /// offline. The queued revocation itself is still recorded (so a future
+    /// contact — moot for a deleted machine, but proves the plumbing worked).
+    #[tokio::test]
+    async fn delete_machine_core_still_deletes_when_revoke_is_unreachable() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-unreachable");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_EXIT", "255");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", "");
+
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&provisioned_machine("m1")).unwrap();
+        store.set_config("remote_phone_token", "tok").unwrap();
+
+        super::delete_machine_core(&store, None, "m1").await.unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none(), "delete must proceed regardless");
+    }
+
+    /// A machine that was never provisioned (no phone token ever authorized on
+    /// it) has nothing to revoke — `delete_machine_core` must not pay an ssh
+    /// round trip for it, and the delete still happens.
+    #[tokio::test]
+    async fn delete_machine_core_skips_revoke_for_a_never_provisioned_machine() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-skip");
+        // No FAKE_SSH_REMOVEPHONE_* set: if the fake script's `remove-phone`
+        // branch were hit, the default `{}` (parsed as neither ok:true nor
+        // ok:false — see `parse_daemon_reply`) would be a harmless no-op here,
+        // so absence of a crash alone wouldn't prove skip. Force a hard ssh
+        // failure instead — the test then fails loudly if revoke ran at all.
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_EXIT", "1");
+
+        let mut machine = provisioned_machine("m1");
+        machine.phone_provisioned_at = None;
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine).unwrap();
+        store.set_config("remote_phone_token", "tok").unwrap();
+
+        // delete_machine_core's own Result is Ok regardless of how revoke went
+        // (its outcome is never propagated as a delete failure), so success
+        // alone would not prove the ssh call was skipped. The real proof is
+        // `pending_daemon_phone_revocations` staying empty: had revoke actually
+        // run against the forced-failing fake ssh above, it would have QUEUED
+        // this token (see `revoke_phone_on_machine`'s `Queued` case).
+        super::delete_machine_core(&store, None, "m1").await.unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none());
+        assert_eq!(
+            store.pending_daemon_phone_revocations("m1").unwrap(),
+            Vec::<String>::new(),
+            "revoke must have been skipped entirely — never provisioned, nothing to revoke"
+        );
     }
 
     // ---- Orphaned pairing-key sweep (A7) --------------------------------------

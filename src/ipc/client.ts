@@ -35,6 +35,8 @@ export type {
   ForkOutcome,
   GeneratedKey,
   MachineRecord,
+  MachineProvisionStatus,
+  ProvisionState,
   FsChangeEvent,
   FsEntry,
   FsWatchErrorEvent,

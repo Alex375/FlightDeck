@@ -297,6 +297,7 @@ const mockRemote: RemoteStatus = {
   relay_url: "https://relay-production-8fd4.up.railway.app",
   mac_id: "mock-mac-id",
   phone_token: "mock-phone-token",
+  mac_label: "This Mac",
   pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
   pairing_qr_svg: null,
   error: null,
@@ -1846,9 +1847,11 @@ export const mockCommands = {
     enabled: boolean | null,
     relayUrl: string | null,
     regeneratePairing: boolean,
+    macLabel: string | null,
   ): Promise<Result<RemoteStatus, string>> {
     if (enabled !== null) mockRemote.enabled = enabled;
     if (relayUrl !== null && relayUrl.trim()) mockRemote.relay_url = relayUrl.trim();
+    if (macLabel !== null && macLabel.trim()) mockRemote.mac_label = macLabel.trim();
     if (regeneratePairing) mockRemote.phone_token = `mock-pt-${Date.now()}`;
     mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockRemote.phone_token}`;
     mockRemote.connected = mockRemote.enabled;
