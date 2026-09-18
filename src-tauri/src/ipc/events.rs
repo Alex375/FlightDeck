@@ -344,6 +344,30 @@ pub struct BootstrapStepEvent {
     pub detail: Option<String>,
 }
 
+/// B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
+/// pipeline (`bootstrap_server` / `bootstrap_resume`) — unlike [`BootstrapStepEvent`]
+/// (one event per command, per B8/B9's three separate commands), this carries the
+/// WHOLE step list on every emit, so a listener never has to reconstruct progress by
+/// accumulating a stream of partial deltas: the latest event alone is the complete
+/// picture. `steps[].status` is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/
+/// `"failed"`/`"needs_input"` (see `orchestrator::StepStatus::wire_str`, the one place
+/// that owns this exact wording). `session_id` is the opaque handle
+/// `bootstrap_server`'s own response carries — the SAME id `bootstrap_resume`/
+/// `bootstrap_cancel` take back.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct BootstrapProgressStep {
+    pub id: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct BootstrapProgressEvent {
+    pub session_id: String,
+    pub host: String,
+    pub steps: Vec<BootstrapProgressStep>,
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {

@@ -335,8 +335,10 @@ fn parse_host_key_fingerprint(stdout: &str) -> Option<String> {
 
 /// Whether `(host, port)` already has a pinned entry in `known_hosts` — read BEFORE a
 /// connection attempt. [`bootstrap_install_key`] compares this against a fresh read
-/// AFTER the attempt to decide [`HostKeyFingerprintEvent::known`].
-async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) -> bool {
+/// AFTER the attempt to decide [`HostKeyFingerprintEvent::known`]. `pub(crate)` so
+/// `bootstrap::orchestrator` (B11) reuses this same before/after dance for its own
+/// install-key pipeline step instead of duplicating it.
+pub(crate) async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) -> bool {
     read_pinned_fingerprint(known_hosts, host, port).await.is_some()
 }
 
@@ -344,7 +346,8 @@ async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) -> bool {
 /// `None` when nothing is pinned there (including a `known_hosts` file that doesn't
 /// exist yet). Never an error either way — this rides along a successful connection as
 /// a nicety, never a gate on it (per Armand's display-only, non-blocking decision).
-async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port: u16) -> Option<String> {
+/// `pub(crate)` — see [`host_key_pinned`]'s doc.
+pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port: u16) -> Option<String> {
     if !Path::new(known_hosts).exists() {
         return None;
     }
@@ -553,8 +556,9 @@ fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
 }
 
 /// Emit [`crate::ipc::events::HostKeyFingerprintEvent`], logging (never swallowing) a
-/// failed emit, mirroring every other event in this crate.
-fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port: u16, fingerprint: &str, known: bool) {
+/// failed emit, mirroring every other event in this crate. `pub(crate)` — see
+/// [`host_key_pinned`]'s doc.
+pub(crate) fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port: u16, fingerprint: &str, known: bool) {
     use tauri_specta::Event;
     let ev = crate::ipc::events::HostKeyFingerprintEvent {
         host: host.to_string(),

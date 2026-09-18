@@ -81,13 +81,16 @@ use ipc::commands::{
 };
 use bootstrap::connect::{bootstrap_forget_host_key, bootstrap_install_key, bootstrap_probe};
 use bootstrap::install::{bootstrap_escalate_persistence, bootstrap_install_service, bootstrap_upload_daemon};
+use bootstrap::orchestrator::{
+    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
+};
 use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, BootstrapStepEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, BootstrapStepEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent, TickEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
@@ -373,6 +376,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             bootstrap_upload_daemon,
             bootstrap_install_service,
             bootstrap_escalate_persistence,
+            bootstrap_server,
+            bootstrap_resume,
+            bootstrap_cancel,
+            machine_diagnose,
+            machine_repair,
         ])
         .events(collect_events![
             TickEvent,
@@ -401,6 +409,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapStepEvent,
+            BootstrapProgressEvent,
         ])
 }
 
@@ -658,6 +667,10 @@ pub fn run() {
         // An Arc so `start_claude_login`'s spawned actor can hold it beyond the
         // spawning command's own lifetime.
         .manage(std::sync::Arc::new(bootstrap::server_setup::LoginSessions::new()))
+        // In-flight / paused B11 bootstrap-pipeline runs (`bootstrap_server`/
+        // `bootstrap_resume`/`bootstrap_cancel`). An Arc for the same reason as
+        // `LoginSessions` just above.
+        .manage(std::sync::Arc::new(BootstrapSessions::new()))
         // C10: last known phone-provisioning outcome per paired daemon, for
         // Settings' per-server status row. An Arc so the background hooks
         // (`add_machine`, `set_remote`) can record into it after their spawning

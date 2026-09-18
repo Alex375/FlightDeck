@@ -3705,7 +3705,7 @@ pub(crate) fn keyed_ssh_options(
 }
 
 /// [`keyed_ssh_options`] with an explicit `ssh` program instead of [`ssh_binary`]'s
-/// resolution. Only [`run_ssh_on_machine_with_stdin`]'s test seam passes something
+/// resolution. Only [`run_ssh_on_machine_stdin`]'s test seam passes something
 /// other than [`ssh_binary`]: a test that hands it a fake-`ssh` directory must get
 /// THAT fake, not whatever process-wide `TOSSE_TEST_SSH_BIN` another concurrently
 /// running test family (appmcp::provision) happens to have set at that instant.
@@ -3737,6 +3737,40 @@ pub(crate) fn keyed_ssh_options_with_bin(
         cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
     }
     cmd
+}
+
+/// Shell expression that resolves the `flightdeckd` binary on a remote host the SAME
+/// way everywhere a non-interactive ssh call needs to run it: `PATH` (as that shell
+/// sees it) first, then the two common non-PATH install spots, `~/.local/bin` and
+/// `/usr/local/bin` — mirrors `bootstrap::connect::PROBE_SCRIPT`'s own search order.
+/// Evaluates (via a `$(...)` command substitution) to the resolved path, or, when
+/// nothing is found, the bare name itself — so a caller that runs it still gets ssh's
+/// own "command not found" rather than an empty command line.
+///
+/// The ONE shared resolver behind what used to be FOUR independent copies of this same
+/// search (`bootstrap::connect::PROBE_SCRIPT`, `bootstrap::install`'s
+/// `DAEMON_STATUS_CMD`, `supervisor::transport::resolve_remote_daemon_bin`, and two
+/// bare, unresolved `"flightdeckd ..."` calls in `bootstrap::server_setup::run_init` +
+/// three more in `appmcp::provision`) — the bare ones broke on a user-level install
+/// (the binary lands in `~/.local/bin`, which a non-interactive ssh shell never has on
+/// `PATH`), VERIFIED live against `verify_daemon_running`'s own doc for the identical
+/// trap on the upload side. Every call site now builds its remote command through
+/// this.
+///
+/// `bin_name` is expected to be a bare command name (`"flightdeckd"` at every
+/// production call site) — an explicit path (containing `/`) is returned unsearched,
+/// shell-quoted, for any future override that already names a full path.
+pub(crate) fn resolve_daemon_bin_expr(bin_name: &str) -> String {
+    if bin_name.contains('/') {
+        return shq(bin_name);
+    }
+    let name = shq(bin_name);
+    format!(
+        "$(FLIGHTDECKD_NAME={name}; command -v \"$FLIGHTDECKD_NAME\" 2>/dev/null || \
+         {{ [ -x \"$HOME/.local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"$HOME/.local/bin/$FLIGHTDECKD_NAME\"; }} || \
+         {{ [ -x \"/usr/local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"/usr/local/bin/$FLIGHTDECKD_NAME\"; }} || \
+         printf %s \"$FLIGHTDECKD_NAME\")"
+    )
 }
 
 /// Verify we can SSH into a server AND check the two binaries pairing needs —
@@ -4201,7 +4235,7 @@ async fn claim_pending_key_locked(
 /// `host` keeps its discovered kind (e.g. `Lan`) when it matches one of `addresses`
 /// by value, and is recorded as `Manual` otherwise (typed by hand, or edited away
 /// from every discovered candidate). Pure.
-fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
+pub(crate) fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
     let discovered = addresses.unwrap_or_default();
     let host_kind = discovered
         .iter()
@@ -4275,7 +4309,51 @@ pub async fn add_machine(
         format!("Could not pair — every address failed. {}", failures.join(" — "))
     })?;
 
-    let machine_id = uuid::Uuid::new_v4().to_string();
+    // `add_machine` always mints a fresh id here — a manual "Add a server" pairing is
+    // never deduplicated by host (see `persist_paired_machine`'s own doc for the ONE
+    // caller that IS: the B11 bootstrap orchestrator, which looks up an existing
+    // [`MachineRecord`] itself and passes its id through instead).
+    persist_paired_machine(&app, None, label, working_host, port, user, identity_file, candidates).await
+}
+
+/// Persist an ALREADY-VERIFIED pairing (reachable, `identity_file` either already
+/// accepted or about to be claimed) as a [`MachineRecord`] — the shared tail of
+/// [`add_machine`]'s own probing loop AND
+/// [`crate::bootstrap::orchestrator::step_add_machine`] (B11 review finding: the
+/// orchestrator pipeline used to reuse [`add_machine`] VERBATIM, which routes every
+/// pairing through [`probe_remote`]'s own `claude`/`flightdeckd`-gated probe — so the
+/// WHOLE pipeline failed, rather than reaching `NeedsClaudeSignIn`, on every server
+/// that doesn't have `claude` installed yet, i.e. every one of the brief's own
+/// fixtures and the primary "bootstrap a fresh box" use case. The pipeline verifies
+/// reachability itself, via its own `StepId::Probe`, and handles "claude missing" as
+/// its own, later, non-blocking `StepId::ClaudeAuth` step, so it calls this directly
+/// instead).
+///
+/// `existing_machine_id`: `Some` reuses that id — [`Store::upsert_machine`]'s
+/// `ON CONFLICT(id) DO UPDATE` then updates the SAME row instead of inserting a
+/// second one (the orchestrator's own idempotency fix: it looks up a
+/// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline and
+/// threads the id through here on every later, converging re-run). `None` — every
+/// `add_machine` call — always mints a fresh uuid, unchanged from before this
+/// refactor.
+///
+/// Claims the pending key (a no-op when `identity_file` is already a per-machine
+/// path, e.g. the orchestrator reusing a PREVIOUSLY claimed key — see
+/// [`claim_pending_key`]), builds/upserts the record, and fires the SAME C10
+/// "provision this Mac's phone, if one is already configured" hook `add_machine`
+/// always has.
+pub(crate) async fn persist_paired_machine(
+    app: &tauri::AppHandle,
+    existing_machine_id: Option<String>,
+    label: String,
+    working_host: String,
+    port: u16,
+    user: String,
+    identity_file: Option<String>,
+    addresses: Vec<AddressCandidate>,
+) -> Result<MachineRecord, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let machine_id = existing_machine_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let identity_file =
         claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
 
@@ -4287,7 +4365,7 @@ pub async fn add_machine(
         user,
         identity_file,
         added_at: now_ms(),
-        addresses: candidates,
+        addresses,
         daemon_mac_id: None,
         daemon_relay_url: None,
         daemon_label: None,
@@ -4427,37 +4505,73 @@ pub(crate) async fn run_ssh_on_machine(
     }
 }
 
+/// The raw outcome of [`run_ssh_on_machine_stdin`] — stdout/stderr/exit-success,
+/// all three, rather than collapsing to a single `Result<String, String>` like its
+/// sibling [`run_ssh_on_machine`]. Both this crate's stdin-bearing remote calls need
+/// this shape: `flightdeckd add-phone`/`remove-phone` (C10) can answer a well-formed
+/// JSON verdict (including a business-logic refusal, e.g. "too many authorized
+/// phones") on stdout regardless of the ssh command's own exit code — mirroring why
+/// `bootstrap::server_setup::probe_auth_status` reads `claude auth status --json`'s
+/// stdout "regardless of the ssh command's exit status" (see that function's doc for
+/// the same trap this avoids) — and B8/B9's own upload/unit-install markers likewise
+/// live in stdout/stderr on BOTH outcomes, not just a failure's last stderr line. The
+/// caller decides what a non-zero exit with unparsable stdout means either way.
+pub(crate) struct SshStdinOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
 /// [`run_ssh_on_machine`]'s sibling for a remote command that reads bytes off its OWN
-/// stdin — a systemd unit file, a daemon binary — rather than one that just runs and
-/// reports (see that function's doc for the shared option base). `stdin_payload` is
-/// written to the spawned ssh process's stdin and the pipe is then closed (EOF), giving
-/// the remote command a clean signal that the payload is complete; mirrors
+/// stdin — a systemd unit file, a daemon binary, a secret (`flightdeckd add-phone
+/// --token -`) — rather than one that just runs and reports (see that function's doc
+/// for the shared option base). `stdin_payload` is written to the spawned ssh
+/// process's stdin and the pipe is then closed (EOF), giving the remote command a
+/// clean signal that the payload is complete; mirrors
 /// `bootstrap::askpass::run_with_password`'s own `stdin_payload` parameter for the
 /// SAME reason, just over this crate's normal KEYED path instead of the first-contact
-/// password relay. Returns the raw `(success, stdout, stderr)` triple rather than
-/// collapsing a failure to a single line — callers here (B8's upload self-verification,
-/// B9's unit install) need to parse markers out of stdout/stderr on BOTH outcomes, not
-/// just the last stderr line [`run_ssh_on_machine`] returns on failure.
+/// password relay.
+///
+/// This is the ONE unification point for what used to be two near-identical helpers
+/// (`bootstrap::install`'s own `run_ssh_on_machine_with_stdin` and `appmcp::
+/// provision`'s `run_ssh_on_machine_stdin`) — same option base, same stdin-then-EOF
+/// shape, drifted apart only in incidental ways (a raw tuple vs. [`SshStdinOutput`], a
+/// hardcoded 20s timeout vs. none, a write failure short-circuiting vs. tolerated).
+/// Reunified here with BOTH callers' test seams intact (see `ssh_bin_override`'s doc)
+/// and a caller-supplied `timeout` (B8's daemon upload can legitimately take longer
+/// than C10's short phone-token round trip) — a write failure is tolerated rather than
+/// an early return (the caller still wants whatever stdout/stderr/exit-status the
+/// process produced, to classify exactly WHAT went wrong — a truncated transfer looks
+/// different from a clean early exit — rather than a bare "could not write" that
+/// discards that evidence), matching `bootstrap::install`'s prior, more informative
+/// behavior for every caller.
 ///
 /// `ssh_bin_override`, when `Some`, is prepended to the CHILD PROCESS's own `PATH` (via
 /// `Command::env`, which only affects this one spawn — never the app's own process-wide
-/// environment) — the seam that lets `bootstrap::install`'s unit tests point `ssh` at a
+/// environment) — the seam `bootstrap::install`'s unit tests use to point `ssh` at a
 /// throwaway fake script instead of a real connection, without a live server. `None`
-/// (every production call site) leaves the child's `PATH` exactly as inherited, same as
-/// every other ssh invocation in this crate.
+/// falls through to [`keyed_ssh_options`], which itself honors `appmcp::provision`'s
+/// OWN, independent test seam (the thread-local `TEST_SSH_BIN` — see [`ssh_binary`]'s
+/// doc for why that one is thread-local rather than a `Command`-scoped override): both
+/// seams keep working side by side, neither one able to leak into the other's tests.
 ///
-/// `pub(crate)` so `bootstrap::install` (B8/B9) reuses this SAME keyed invoker for its
-/// own stdin-bearing calls (the daemon binary upload, a systemd unit file) instead of
-/// growing a second one — this crate's "ONE ssh invoker" discipline (see
-/// `bootstrap::server_setup`'s own module doc) extends to this sibling, not just
-/// [`run_ssh_on_machine`] itself.
-pub(crate) async fn run_ssh_on_machine_with_stdin(
+/// `Err` only for a failure to even run the ssh process itself (couldn't spawn, or it
+/// never exited within `timeout`) — never for a non-zero exit, which is carried in
+/// [`SshStdinOutput::success`] instead so a caller that wants stdout regardless of exit
+/// code (see that struct's doc) can still get it. Bounded by `timeout`, distinct from
+/// ssh's own `ConnectTimeout` (that one only covers the TCP/SSH handshake, not the
+/// remote command actually running) — a wedged remote `flightdeckd` must not hang the
+/// caller forever.
+pub(crate) async fn run_ssh_on_machine_stdin(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
     remote_cmd: &str,
     stdin_payload: &[u8],
     ssh_bin_override: Option<&Path>,
-) -> Result<(bool, String, String), String> {
+    timeout: std::time::Duration,
+) -> Result<SshStdinOutput, String> {
+    use tokio::io::AsyncWriteExt as _;
+
     let mut cmd = match ssh_bin_override {
         // Test seam: run THIS fake `ssh` explicitly (and keep its dir first on the
         // child's PATH), so the process-wide `TOSSE_TEST_SSH_BIN` another test family
@@ -4484,83 +4598,13 @@ pub(crate) async fn run_ssh_on_machine_with_stdin(
     cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt as _;
         // A write failure here (broken pipe — the remote side, or the connection
         // itself, died before consuming everything) is deliberately NOT an early
-        // return: the caller still wants whatever stdout/stderr/exit-status the
-        // process produced, to classify exactly WHAT went wrong (a truncated
-        // transfer looks different from a clean early exit) rather than a bare
-        // "could not write" that discards that evidence.
+        // return — see this function's own doc.
         let _ = stdin.write_all(stdin_payload).await;
         drop(stdin); // EOF
     }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("could not read ssh's output: {e}"))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
-}
-
-/// The raw outcome of [`run_ssh_on_machine_stdin`] — stdout/stderr/exit-success,
-/// all three, rather than collapsing to a single `Result<String, String>` like its
-/// sibling [`run_ssh_on_machine`]. `flightdeckd add-phone`/`remove-phone` (C10) can
-/// answer a well-formed JSON verdict (including a business-logic refusal, e.g. "too
-/// many authorized phones") on stdout regardless of the ssh command's own exit
-/// code — mirroring why `bootstrap::server_setup::probe_auth_status` reads `claude
-/// auth status --json`'s stdout "regardless of the ssh command's exit status" (see
-/// that function's doc for the same trap this avoids). The caller decides what a
-/// non-zero exit with unparsable stdout means.
-pub(crate) struct SshStdinOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub success: bool,
-}
-
-/// Run a command on a server over SSH (batch, never-prompting) with `stdin_payload`
-/// piped to the remote command's stdin and then closed (EOF) — the SAME keyed ssh
-/// path as [`run_ssh_on_machine`] (see its doc), extended with a stdin pipe for a
-/// remote subcommand that reads a secret from stdin rather than argv
-/// (`flightdeckd add-phone --token -` / `remove-phone --token -`, C10) so the
-/// secret never appears in `ps` output or shell history on the far end.
-///
-/// `Err` only for a failure to even run the ssh process itself (couldn't spawn,
-/// couldn't write to its stdin, or it never exited within the bound below) — never
-/// for a non-zero exit, which is carried in [`SshStdinOutput::success`] instead so
-/// a caller that wants stdout regardless of exit code (see that struct's doc) can
-/// still get it.
-///
-/// Bounded by an overall timeout distinct from `ssh`'s own `ConnectTimeout` (that
-/// one only covers the TCP/SSH handshake, not the remote command actually
-/// running) — a wedged remote `flightdeckd` must not hang provisioning forever.
-pub(crate) async fn run_ssh_on_machine_stdin(
-    m: &crate::store::MachineRecord,
-    known_hosts: Option<&str>,
-    remote_cmd: &str,
-    stdin_payload: &[u8],
-) -> Result<SshStdinOutput, String> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T")
-        .arg(format!("{}@{}", m.user, m.host))
-        .arg(remote_cmd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(stdin_payload).await {
-            return Err(format!("could not write to ssh's stdin: {e}"));
-        }
-        // Drop to close (EOF) — the remote command's own read is waiting on exactly
-        // this to know the payload is complete.
-        drop(stdin);
-    }
-    let out = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+    let out = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| "ssh command timed out".to_string())?
         .map_err(|e| format!("could not run ssh: {e}"))?;

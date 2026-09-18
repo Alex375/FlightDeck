@@ -4,7 +4,8 @@
 //! the app's key, pin/read the host key, probe for install-mode facts (`connect`,
 //! B7) — and — once the server is already PAIRED (a key is installed) — actually
 //! running `flightdeckd init` and driving the server-side `claude` sign-in
-//! (`server_setup`).
+//! (`server_setup`) — and, chaining all of the above into ONE resumable pipeline plus
+//! a standalone health model (`diagnose`/`repair`), `orchestrator` (B11).
 //!
 //! `templates` and `askpass` are pure/self-contained on purpose: `templates` never
 //! touches a process or the filesystem (golden-string tested), and `askpass` never
@@ -23,5 +24,6 @@
 pub mod askpass;
 pub mod connect;
 pub mod install;
+pub mod orchestrator;
 pub mod server_setup;
 pub mod templates;

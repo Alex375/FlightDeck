@@ -2607,6 +2607,73 @@ async bootstrapEscalatePersistence(machineId: string, password: string | null, m
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start (or, on retry, re-run from scratch — every step is idempotent) the full
+ * bootstrap pipeline. See the module doc.
+ * 
+ * Looks up a [`MachineRecord`] ALREADY paired at this exact (`host`, `port`, `user`)
+ * BEFORE running anything (see [`run_pipeline_and_register`]'s own doc) — the
+ * convergence a bare re-run needs (B11 review finding): without it, a second call
+ * against an already-fully-paired server would generate and try to install a brand
+ * new key (the shared "pending" one was already claimed/renamed by the first run's
+ * `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
+ * host under a fresh uuid, rather than converging on the one that already exists.
+ */
+async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
+ * needing a sudo password) — re-runs the same, idempotent pipeline with
+ * `sudo_password` now available.
+ * 
+ * Runs the SAME idempotency lookup [`bootstrap_server`] does (rather than assuming
+ * the paused session is the only in-progress state that matters): a completely
+ * separate, already-finished pairing for this exact host could exist by the time a
+ * resume happens (e.g. the same host paired again through a different session while
+ * this one sat paused) — reusing it here keeps `bootstrap_resume` exactly as
+ * convergent as a fresh `bootstrap_server` call.
+ */
+async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_resume", { sessionId, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`].
+ */
+async bootstrapCancel(sessionId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_cancel", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineDiagnose(machineId: string) : Promise<Result<ServerDiagnosis, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_diagnose", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineRepair(machineId: string, action: RepairAction, sudoPassword: string | null) : Promise<Result<RepairOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_repair", { machineId, action, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2616,6 +2683,7 @@ async bootstrapEscalatePersistence(machineId: string, password: string | null, m
 export const events = __makeEvents__<{
 accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
+bootstrapProgressEvent: BootstrapProgressEvent,
 bootstrapStepEvent: BootstrapStepEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
@@ -2643,6 +2711,7 @@ workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
+bootstrapProgressEvent: "bootstrap-progress-event",
 bootstrapStepEvent: "bootstrap-step-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
@@ -2926,6 +2995,29 @@ export type BackgroundTaskStatus =
  * Cancelled via `TaskStop` / session end (`"stopped"`/`"cancelled"`).
  */
 "stopped"
+export type BootstrapProgressEvent = { session_id: string; host: string; steps: BootstrapProgressStep[] }
+/**
+ * B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
+ * pipeline (`bootstrap_server` / `bootstrap_resume`) — unlike [`BootstrapStepEvent`]
+ * (one event per command, per B8/B9's three separate commands), this carries the
+ * WHOLE step list on every emit, so a listener never has to reconstruct progress by
+ * accumulating a stream of partial deltas: the latest event alone is the complete
+ * picture. `steps[].status` is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/
+ * `"failed"`/`"needs_input"` (see `orchestrator::StepStatus::wire_str`, the one place
+ * that owns this exact wording). `session_id` is the opaque handle
+ * `bootstrap_server`'s own response carries — the SAME id `bootstrap_resume`/
+ * `bootstrap_cancel` take back.
+ */
+export type BootstrapProgressStep = { id: string; status: string; detail: string | null }
+/**
+ * The full outcome of one `bootstrap_server`/`bootstrap_resume` call.
+ */
+export type BootstrapReport = { session_id: string; host: string; steps: StepState[]; 
+/**
+ * `Some(step)` only when the run is PAUSED and resumable at `step` — see the
+ * module doc's "two different kinds of needs-input".
+ */
+needs_input: StepId | null; machine_id: string | null; diagnosis: ServerDiagnosis | null }
 /**
  * Progress notice for `bootstrap::install`'s three commands (B8/B9:
  * `bootstrap_upload_daemon` / `bootstrap_install_service` /
@@ -3480,6 +3572,10 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * The single headline verdict [`collapse_state`] reduces every independent fact to.
+ */
+export type DiagnosisState = { kind: "ready" } | { kind: "needs_claude_sign_in" } | { kind: "running_not_reboot_safe" } | { kind: "failed"; reason: string }
+/**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
  * names are snake_case to match the other IPC payloads; the front consumes this
@@ -3844,6 +3940,10 @@ export type InitOutcome =
  * step, a re-added machine) should find.
  */
 { AlreadyInitialized: { identity: ServerIdentity | null } }
+/**
+ * See [`StepId::AddMachine`]'s doc — probes BOTH unit locations, never assumes.
+ */
+export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Outcome of [`install_key`]'s idempotent append: whether the app's public key was
@@ -4472,6 +4572,20 @@ export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: st
  */
 mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
 /**
+ * Every fix `machine_repair` can apply — see the module doc.
+ */
+export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_service" | "enable_linger" | "mask_sleep" | "run_init" | "sign_in_claude" | "provision_phone"
+/**
+ * One `machine_repair` outcome: what changed, plus a FRESH [`diagnose`] (never a stale
+ * one from before the fix).
+ */
+export type RepairOutcome = { action: RepairAction; 
+/**
+ * See [`repair_action_label`] — the same "what this repair does" text a UI can
+ * show alongside `summary` without hardcoding its own copy of these 8 strings.
+ */
+label: string; summary: string; diagnosis: ServerDiagnosis }
+/**
  * A working folder a conversation can be opened in.
  */
 export type RepoRecord = { id: string; 
@@ -4636,6 +4750,30 @@ group: string | null; window: UsageWindow }
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
 export type SearchHit = { session_id: string; score: number; snippet: string }
+/**
+ * One `machine_diagnose` result — every field besides [`Self::state`]/
+ * [`Self::restart_pending`] is TRI-STATE (`Option<...>`): a missing/garbled marker in
+ * [`diagnose`]'s own accumulating script degrades to `None` ("unknown"), never a
+ * false `Some(false)` — see [`parse_diagnosis_fields`].
+ */
+export type ServerDiagnosis = { state: DiagnosisState; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+/**
+ * `true` only when BOTH versions are known and differ — an upload landed new
+ * bytes that the currently-running process hasn't picked up yet.
+ */
+restart_pending: boolean; reboot_safe: boolean | null; 
+/**
+ * The RAW `loginctl show-user -p Linger` marker — a sub-fact
+ * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
+ * (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
+ * `EnableLinger` summary can report "already enabled" precisely instead of a
+ * fixed claim (B11 review finding). Read unconditionally by [`diagnose_script`]
+ * regardless of [`installed_as`](Self::installed_as) — like
+ * [`sleep_masked`](Self::sleep_masked), it is meaningful only for a User-level
+ * install, but is never itself gated on that (never a false `Some(false)`
+ * manufactured for an install kind it doesn't apply to).
+ */
+linger: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null }
 /**
  * This node's relay identity, straight off `flightdeckd whoami` (`{mac_id, relay_url,
  * label}` — see that subcommand's own doc in `flightdeckd/src/main.rs`). Field names
@@ -4974,6 +5112,21 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
+ * see the module doc's overview.
+ */
+export type StepId = "install_key" | "probe" | "upload_daemon" | "install_service" | "escalate_persistence" | "run_init" | "claude_auth" | "add_machine" | "diagnose"
+/**
+ * One step's current/final state, as carried on [`BootstrapReport`] and (via
+ * [`StepState::to_wire`]) on every [`crate::ipc::events::BootstrapProgressEvent`].
+ */
+export type StepState = { id: StepId; status: StepStatus; detail: string | null }
+/**
+ * One step's status, as the brief specs it: `pending|running|ok|skipped|failed|
+ * needs_input`.
+ */
+export type StepStatus = "pending" | "running" | "ok" | "skipped" | "failed" | "needs_input"
 /**
  * What the two sub-agent env vars currently say, read straight from
  * `~/.claude/settings.json`.

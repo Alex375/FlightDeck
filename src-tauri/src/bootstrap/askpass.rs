@@ -103,6 +103,14 @@ pub enum BootstrapError {
     /// what a real administrator on that box would need to do; never silently falls
     /// back to a fallback that might not actually survive.
     AdminRequired(String),
+    /// (B11) [`crate::bootstrap::orchestrator::restart_daemon`] refused to restart
+    /// `flightdeckd` because a fresh diagnosis could not confirm zero busy
+    /// conversations — `Some(n)` for `n` confirmed-busy conversations, `None` when the
+    /// count itself couldn't be confirmed (never treated as safe-to-restart either
+    /// way). Never silently proceeding here is the whole point (B11 review finding):
+    /// this is what stands between `repair(RestartDaemon)` — reachable directly from a
+    /// future wizard UI — and killing a live Claude Code session on that server.
+    DaemonBusy(Option<u32>),
     /// Anything else — the ssh/askpass plumbing itself failing, not the login
     /// outcome. Carries a short, already-scrubbed-of-secrets diagnostic.
     Other(String),
@@ -129,6 +137,12 @@ impl std::fmt::Display for BootstrapError {
                 write!(f, "this server needs a sudo password to continue")
             }
             Self::AdminRequired(reason) => write!(f, "{reason}"),
+            Self::DaemonBusy(Some(n)) => {
+                write!(f, "won't restart flightdeckd while {n} conversation(s) are busy")
+            }
+            Self::DaemonBusy(None) => {
+                write!(f, "won't restart flightdeckd — could not confirm no conversations are busy")
+            }
             Self::Other(d) => write!(f, "{d}"),
         }
     }
