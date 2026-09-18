@@ -27,7 +27,9 @@ et le téléphone passait par le Mac. Maintenant :
   conversation. Quitter l'app **détache** (la session vit) ; le bouton Stop
   envoie `fd_stop` (arrêt réel côté serveur).
 - **Chemin téléphone** : le démon se présente au relais comme un nœud (macId
-  propre), répond aux RPC du PWA (list/read/send/create/interrupt/stop/pending/
+  propre ; à chaque connexion : re-révocation des tombstones, autorisation des
+  téléphones, puis `set_label` = son label ; un téléphone ajouté/retiré à chaud
+  part sur la connexion en cours), répond aux RPC du PWA (list/read/send/create/interrupt/stop/pending/
   answer/browse) et pousse `turn_completed`/`needs_attention` (⇒ Web Push). Le
   PWA étant en *pull*, une coupure téléphone se résorbe à la reconnexion.
 - **Visibilité croisée** : une conversation ouverte du Mac est visible/pilotable
