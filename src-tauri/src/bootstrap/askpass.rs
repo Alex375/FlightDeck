@@ -394,7 +394,10 @@ pub async fn run_with_password(
 /// otherwise forward untouched) to include whatever it just read, including our
 /// password reflected back. Redacting any literal occurrence of `password` here closes
 /// that reflection path without weakening the diagnostic value of the rest of the line.
-fn classify_output(out: std::process::Output, password: &str) -> Result<std::process::Output, BootstrapError> {
+pub(crate) fn classify_output(
+    out: std::process::Output,
+    password: &str,
+) -> Result<std::process::Output, BootstrapError> {
     if out.status.code().is_none() {
         return Err(BootstrapError::Other(format!(
             "ssh exited abnormally: {}",

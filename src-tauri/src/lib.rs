@@ -79,12 +79,14 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
+use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    SessionTaskEvent, SessionTitleEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    TerminalExitEvent, TerminalOutputEvent, TickEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -350,6 +352,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            bootstrap_run_init,
+            start_claude_login,
+            submit_claude_login_code,
+            cancel_claude_login,
         ])
         .events(collect_events![
             TickEvent,
@@ -374,6 +380,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             TerminalExitEvent,
             AppControlRequestEvent,
             WakeWordEvent,
+            ServerLoginPromptEvent,
+            ServerLoginResultEvent,
         ])
 }
 
@@ -627,6 +635,10 @@ pub fn run() {
         // The wake-word detector: sole owner of the always-on mic capture +
         // on-device inference. An Arc so a blocking `apply` can run off-thread.
         .manage(std::sync::Arc::new(wake::WakeController::new()))
+        // In-flight server-side `claude auth login` drives (bootstrap::server_setup).
+        // An Arc so `start_claude_login`'s spawned actor can hold it beyond the
+        // spawning command's own lifetime.
+        .manage(std::sync::Arc::new(bootstrap::server_setup::LoginSessions::new()))
         .setup(move |app| {
             use tauri::Manager;
 

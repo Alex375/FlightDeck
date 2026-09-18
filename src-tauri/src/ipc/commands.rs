@@ -3411,6 +3411,46 @@ fn extract_marker(stdout: &str, marker: &str) -> Option<String> {
     stdout.lines().find_map(|l| l.strip_prefix(marker)).map(|v| v.trim().to_string())
 }
 
+/// The shared option-only base of every SSH call this crate makes to an ALREADY-PAIRED
+/// machine: batch (never prompts — the whole point of pairing first), its dedicated
+/// `known_hosts` (never the user's real `~/.ssh/known_hosts`, TOFU-pinned once at
+/// `add_machine` time), and its own identity file (or the default key/agent when
+/// `None`). This is "the keyed ssh path" — [`probe_remote`] and [`run_ssh_on_machine`]
+/// both build on it, and so does `bootstrap::server_setup` for the same already-paired
+/// machine (see that module's doc: it deliberately does NOT invent a second ssh
+/// invoker). Mirrors `bootstrap::askpass::bootstrap_ssh_options` in shape — that one is
+/// the deliberate FIRST-contact, password-only exception (no key yet); this one is the
+/// keyed norm every other ssh call in the crate uses.
+///
+/// Does not set `-T`/`-tt` (pty mode differs per caller: batch calls use `-T`, an
+/// interactive drive needs neither since the remote CLI itself doesn't require a pty —
+/// see `bootstrap::server_setup`'s doc) nor the destination/remote command (appended
+/// last by the caller, exactly like `bootstrap_ssh_options`'s own doc explains for its
+/// sibling — ssh's own argv grammar stops parsing options once it sees the
+/// destination).
+pub(crate) fn keyed_ssh_options(
+    port: u16,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(id) = identity {
+        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd
+}
+
 /// Verify we can SSH into a server AND check the two binaries pairing needs —
 /// `claude` and `flightdeckd` — with a single fast, batch (never-prompting) probe.
 ///
@@ -3436,22 +3476,8 @@ async fn probe_remote(
     identity: Option<&str>,
     known_hosts: Option<&str>,
 ) -> Result<RemoteProbeResult, String> {
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = known_hosts {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(id) = identity {
-        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
-    }
+    let mut cmd = keyed_ssh_options(port, identity, known_hosts);
+    cmd.arg("-T");
     // Findings ride on stdout as `MARKER:value` lines (parsed below via
     // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
     // with the old single-tool probe and for anyone reading raw ssh output by hand.
@@ -3783,27 +3809,17 @@ pub fn delete_machine(store: tauri::State<'_, Store>, id: String) -> Result<(), 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
 /// success or the last stderr line on failure. The connection coordinates come from
 /// the [`MachineRecord`]; `known_hosts` is Flight Deck's own file (TOFU pinning).
-async fn run_ssh_on_machine(
+///
+/// `pub(crate)` so `bootstrap::server_setup` reuses this SAME round-trip for its own
+/// batch calls (`flightdeckd init` / `flightdeckd whoami`) instead of building a second
+/// one — see that module's doc.
+pub(crate) async fn run_ssh_on_machine(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
     remote_cmd: &str,
 ) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(m.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = known_hosts {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(id) = &m.identity_file {
-        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
-    }
+    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
+    cmd.arg("-T");
     cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
     let out = cmd
         .output()

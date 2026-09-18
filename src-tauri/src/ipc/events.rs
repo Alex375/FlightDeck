@@ -264,6 +264,28 @@ pub struct TerminalExitEvent {
     pub id: String,
 }
 
+/// A `bootstrap::server_setup::start_claude_login` session recognized the remote
+/// `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
+/// per session; a session that was ALREADY signed in never emits this (it jumps
+/// straight to [`ServerLoginResultEvent`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct ServerLoginPromptEvent {
+    pub machine_id: String,
+    pub url: String,
+}
+
+/// Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
+/// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
+/// otherwise. NEVER emitted for a session the front itself cancelled (see
+/// `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct ServerLoginResultEvent {
+    pub machine_id: String,
+    pub ok: bool,
+    pub email: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {
