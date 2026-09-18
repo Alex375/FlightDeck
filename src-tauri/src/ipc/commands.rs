@@ -9,7 +9,7 @@ use tauri::Manager;
 
 use crate::ipc::events::TauriEmitter;
 use crate::store::{
-    validate_address_value, AddressCandidate, AddressKind, ConversationRecord, MachineRecord,
+    validate_address_value, validate_ssh_user, AddressCandidate, AddressKind, ConversationRecord, MachineRecord,
     PersistedState, RepoRecord, Store,
 };
 use crate::supervisor::codex::{self, CodexServer};
@@ -304,6 +304,25 @@ pub async fn spawn_session(
                  set this conversation back to the default account."
                     .to_string(),
             );
+        }
+        // A `MachineRecord` on disk could predate `validate_ssh_user`/`validate_ssh_port`
+        // (an older app version, or a manual DB edit) — refuse here, BEFORE this
+        // `RemoteTarget` is built or any of the ssh round trips below run, with a clear,
+        // typed, actionable error rather than letting an invalid value ride all the way
+        // to `Transport::spawn`'s own (later, lazy) last-resort check. The machine row
+        // itself is untouched and stays listed — see `crate::store::validate_ssh_user`'s
+        // doc (CRM holistic-review blocker #3, chantier A `bd7ca709`). The error text
+        // deliberately omits the underlying validator's message (which embeds the raw
+        // offending value) — same discipline as `TransportError::InvalidRemoteTarget`'s
+        // `Display` impl.
+        if validate_ssh_user(&machine.user).is_err() {
+            return Err("This server's saved user name is not valid — remove and re-add it.".to_string());
+        }
+        if validate_address_value(&machine.host).is_err() {
+            return Err("This server's saved address is not valid — remove and re-add it.".to_string());
+        }
+        if crate::store::validate_ssh_port(machine.port).is_err() {
+            return Err("This server's saved port is not valid — remove and re-add it.".to_string());
         }
         // A dedicated known_hosts under the app data dir, so pinning a server's host
         // key never touches the user's ~/.ssh/known_hosts.
@@ -3699,7 +3718,10 @@ thread_local! {
 /// see `bootstrap::server_setup`'s doc) nor the destination/remote command (appended
 /// last by the caller, exactly like `bootstrap_ssh_options`'s own doc explains for its
 /// sibling — ssh's own argv grammar stops parsing options once it sees the
-/// destination).
+/// destination). ⚠️ Every caller MUST append the destination via [`push_ssh_destination`]
+/// (`-l <user> -- <host>`), never a hand-built `format!("{{user}}@{{host}}")` — see that
+/// function's doc for the ssh-option-injection class this closes (CRM holistic-review
+/// blocker #3, chantier A `bd7ca709`).
 pub(crate) fn keyed_ssh_options(
     port: u16,
     identity: Option<&str>,
@@ -3741,6 +3763,33 @@ pub(crate) fn keyed_ssh_options_with_bin(
         cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
     }
     cmd
+}
+
+/// Appends this connection's login and destination to `cmd` the SAFE way, and is the
+/// ONE place every ssh-argv builder in this crate funnels the (`user`, `host`) pair
+/// through (CRM holistic-review blocker #3, chantier A `bd7ca709`: an unvalidated
+/// `user` let `format!("{user}@{host}")` smuggle an ssh OPTION — e.g.
+/// `-oProxyCommand=<cmd>` — past every caller that only ever validated `host`).
+///
+/// Two independent defenses, not one:
+/// 1. `-l <user>` for the login, never concatenated into a single `user@host`
+///    positional argument — a value starting with `-` can no longer be parsed as an
+///    option just by riding along in that string.
+/// 2. `--` (which OpenSSH honours as "end of options") immediately before `host`, so
+///    even `host` itself starting with `-` can't be misread as a flag either.
+///
+/// ALSO re-validates both values itself, via [`crate::store::validate_ssh_user`] /
+/// [`crate::store::validate_address_value`] — belt and suspenders: every caller listed
+/// on those functions' own docs already validates before it gets here, but this is the
+/// LAST line of defense inside the shared builder itself, so a future call site that
+/// forgets to validate upstream still can't spawn anything built from an unchecked
+/// value. Appends NOTHING to `cmd` and returns `Err` on failure — the caller must never
+/// fall through to spawning `cmd` in that case.
+pub(crate) fn push_ssh_destination(cmd: &mut tokio::process::Command, user: &str, host: &str) -> Result<(), String> {
+    validate_ssh_user(user)?;
+    validate_address_value(host)?;
+    cmd.arg("-l").arg(user).arg("--").arg(host);
+    Ok(())
 }
 
 /// Shell expression that resolves the `flightdeckd` binary on a remote host the SAME
@@ -3845,7 +3894,8 @@ if [ -n "$MISSING" ]; then
 fi
 exit 0
 "#;
-    cmd.arg(format!("{user}@{host}")).arg(script);
+    push_ssh_destination(&mut cmd, user, host)?;
+    cmd.arg(script);
     let out = cmd
         .output()
         .await
@@ -4285,6 +4335,14 @@ pub async fn add_machine(
         return Err(err);
     }
 
+    // Validated BEFORE any candidate is probed (CRM holistic-review blocker #3,
+    // chantier A `bd7ca709`): `user` is shared by EVERY candidate probed below, and
+    // — unlike `host` — was never validated at all before this fix, so a value
+    // shaped like an ssh option (`-oProxyCommand=...`) reached `probe_remote` for
+    // every one of them.
+    validate_ssh_user(&user)?;
+    crate::store::validate_ssh_port(port)?;
+
     let candidates = probe_candidates(host.trim(), addresses);
     for c in &candidates {
         validate_address_value(&c.value)?;
@@ -4492,7 +4550,8 @@ pub(crate) async fn run_ssh_on_machine(
 ) -> Result<String, String> {
     let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
     cmd.arg("-T");
-    cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
+    push_ssh_destination(&mut cmd, &m.user, &m.host)?;
+    cmd.arg(remote_cmd);
     let out = cmd
         .output()
         .await
@@ -4599,7 +4658,8 @@ pub(crate) async fn run_ssh_on_machine_stdin(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
+    push_ssh_destination(&mut cmd, &m.user, &m.host)?;
+    cmd.arg(remote_cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         // A write failure here (broken pipe — the remote side, or the connection
@@ -4819,6 +4879,19 @@ pub async fn push_remote_conversation_title(
             return false;
         }
     };
+    // A `MachineRecord` on disk could predate `validate_ssh_user`/`validate_ssh_port`
+    // (older app version, manual DB edit) — refuse here, BEFORE any ssh round trip
+    // (including the capability probe below) runs, same discipline as `spawn_session`'s
+    // own early check. `push_remote_title` re-validates internally too (belt and
+    // suspenders), but every keyed helper should refuse up front rather than rely
+    // solely on a deeper builder (CRM holistic-review blocker #3, chantier A
+    // `bd7ca709`).
+    if validate_ssh_user(&machine.user).is_err()
+        || validate_address_value(&machine.host).is_err()
+        || crate::store::validate_ssh_port(machine.port).is_err()
+    {
+        return false;
+    }
     let known_hosts_file = app
         .path()
         .app_data_dir()
@@ -5876,6 +5949,168 @@ mod tests {
         assert!(super::validate_address_value("has\nnewline").is_err());
         assert!(super::validate_address_value("box.tailnet.ts.net").is_ok());
         assert!(super::validate_address_value("192.168.1.5").is_ok());
+    }
+
+    // ---- push_ssh_destination — the shared builder every ssh-argv call site in this
+    // crate funnels the (user, host) pair through (CRM holistic-review blocker #3,
+    // chantier A `bd7ca709`) ----
+
+    #[test]
+    fn push_ssh_destination_rejects_an_option_injection_user_and_appends_nothing() {
+        let mut cmd = tokio::process::Command::new("ssh");
+        let err = push_ssh_destination(&mut cmd, "-oProxyCommand=touch /tmp/pwned", "example.com")
+            .expect_err("an ssh-option-shaped user must be refused");
+        assert!(!err.is_empty());
+        let args: Vec<String> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.is_empty(), "a rejected destination must append NOTHING to cmd: {args:?}");
+    }
+
+    #[test]
+    fn push_ssh_destination_rejects_an_option_injection_host_and_appends_nothing() {
+        let mut cmd = tokio::process::Command::new("ssh");
+        let err = push_ssh_destination(&mut cmd, "deploy", "-oProxyCommand=touch /tmp/pwned")
+            .expect_err("an ssh-option-shaped host must be refused");
+        assert!(!err.is_empty());
+        let args: Vec<String> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.is_empty(), "a rejected destination must append NOTHING to cmd: {args:?}");
+    }
+
+    /// The actual argv shape: `-l <user>` then `-- <host>`, host last — never a
+    /// concatenated `user@host` positional argument.
+    #[test]
+    fn push_ssh_destination_appends_dash_l_then_dash_dash_host() {
+        let mut cmd = tokio::process::Command::new("ssh");
+        push_ssh_destination(&mut cmd, "deploy", "example.com").unwrap();
+        let args: Vec<String> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["-l", "deploy", "--", "example.com"]);
+    }
+
+    /// Full exploit-string table from the CRM holistic review, run through the actual
+    /// builder every ssh call in this crate funnels through — every one must be
+    /// refused, none may ever reach a spawned argv.
+    #[test]
+    fn push_ssh_destination_rejects_every_known_exploit_user() {
+        for bad_user in [
+            "-oProxyCommand=touch /tmp/pwned",
+            "-F/etc/x",
+            " user",
+            "a b",
+            "root@evil",
+            "",
+        ] {
+            let mut cmd = tokio::process::Command::new("ssh");
+            assert!(
+                push_ssh_destination(&mut cmd, bad_user, "example.com").is_err(),
+                "{bad_user:?} must be rejected"
+            );
+        }
+        let too_long = "a".repeat(65);
+        let mut cmd = tokio::process::Command::new("ssh");
+        assert!(push_ssh_destination(&mut cmd, &too_long, "example.com").is_err());
+    }
+
+    #[test]
+    fn push_ssh_destination_accepts_legitimate_users() {
+        for good_user in ["deploy", "josty", "first.last", "svc_build-2", "WORKGROUP$"] {
+            let mut cmd = tokio::process::Command::new("ssh");
+            assert!(
+                push_ssh_destination(&mut cmd, good_user, "example.com").is_ok(),
+                "{good_user:?} should be accepted"
+            );
+        }
+    }
+
+    // ---- run_ssh_on_machine / run_ssh_on_machine_stdin — given an exploit
+    // user/host, they must return Err and NEVER actually spawn `ssh` (proven with a
+    // fake `ssh` that would leave a marker file behind if it were ever invoked). ----
+
+    fn machine_with_user_and_host(user: &str, host: &str) -> MachineRecord {
+        let mut m = cache_test_machine("m-exploit");
+        m.user = user.to_string();
+        m.host = host.to_string();
+        m
+    }
+
+    /// Writes a fake `ssh` that touches `marker` the instant it is invoked, in a
+    /// fresh scratch dir — mirrors the fake-`ssh` seams used elsewhere in this crate
+    /// (`appmcp::provision::FakeSsh`, `bootstrap::install`'s own fixtures).
+    fn install_marker_fake_ssh(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "tosse-neverspawn-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("invoked.marker");
+        let script = dir.join("ssh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nexit 0\n", shq(&marker.to_string_lossy())))
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, marker)
+    }
+
+    #[tokio::test]
+    async fn run_ssh_on_machine_rejects_an_exploit_user_without_ever_spawning_ssh() {
+        let (dir, marker) = install_marker_fake_ssh("run-ssh-on-machine-user");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let machine = machine_with_user_and_host("-oProxyCommand=touch /tmp/pwned", "example.com");
+        let result = run_ssh_on_machine(&machine, None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        assert!(result.is_err(), "an exploit user must be refused");
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_ssh_on_machine_rejects_an_exploit_host_without_ever_spawning_ssh() {
+        let (dir, marker) = install_marker_fake_ssh("run-ssh-on-machine-host");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let machine = machine_with_user_and_host("deploy", "-oProxyCommand=touch /tmp/pwned");
+        let result = run_ssh_on_machine(&machine, None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        assert!(result.is_err(), "an exploit host must be refused");
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_rejects_an_exploit_user_without_ever_spawning_ssh() {
+        let (dir, marker) = install_marker_fake_ssh("run-ssh-on-machine-stdin-user");
+        let machine = machine_with_user_and_host("-oProxyCommand=touch /tmp/pwned", "example.com");
+        let result = run_ssh_on_machine_stdin(
+            &machine,
+            None,
+            "true",
+            b"",
+            Some(&dir),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err(), "an exploit user must be refused");
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_rejects_an_exploit_host_without_ever_spawning_ssh() {
+        let (dir, marker) = install_marker_fake_ssh("run-ssh-on-machine-stdin-host");
+        let machine = machine_with_user_and_host("deploy", "-oProxyCommand=touch /tmp/pwned");
+        let result = run_ssh_on_machine_stdin(
+            &machine,
+            None,
+            "true",
+            b"",
+            Some(&dir),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err(), "an exploit host must be refused");
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

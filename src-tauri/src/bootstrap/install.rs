@@ -2342,7 +2342,8 @@ mod tests {
                  chmod 600 ~/.ssh/authorized_keys",
                 crate::ipc::commands::shq(&key.public)
             );
-            let cmd = bootstrap_ssh_command(&format!("ssh://{user}@127.0.0.1:{port}"), None, None, &remote);
+            let cmd = bootstrap_ssh_command(user, "127.0.0.1", port, None, None, &remote)
+                .expect("a fixed literal test user/host must always validate");
             let out = run_with_password(cmd, password, None, Duration::from_secs(15))
                 .await
                 .expect("installing the throwaway key over the fixture's documented password must succeed");

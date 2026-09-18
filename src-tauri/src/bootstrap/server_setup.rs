@@ -312,9 +312,12 @@ fn parse_auth_status(stdout: &str) -> Option<AuthStatus> {
 /// answer — both already mean "could not confirm" to every caller here.
 pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
     let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T")
-        .arg(format!("{}@{}", machine.user, machine.host))
-        .arg("claude auth status --json");
+    cmd.arg("-T");
+    // A saved `MachineRecord` that fails validation (older app version, manual DB
+    // edit) degrades to "could not confirm" here, exactly like every other ssh-level
+    // failure this function already treats that way — never a spawn built from it.
+    crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
+    cmd.arg("claude auth status --json");
     let output = cmd.output().await.ok()?;
     parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
@@ -674,7 +677,14 @@ async fn drive_claude_login(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    cmd.arg(format!("{}@{}", machine.user, machine.host)).arg("claude auth login");
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
+        // The `Err` is deliberately discarded — see `diagnose`'s identical guard in
+        // `orchestrator.rs` for why (it embeds the raw offending value).
+        return LoginOutcome::Failed {
+            reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
+        };
+    }
+    cmd.arg("claude auth login");
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1582,7 +1592,8 @@ mod tests {
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo {} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
             crate::ipc::commands::shq(&key.public)
         );
-        let cmd = bootstrap_ssh_command(&format!("ssh://{user}@127.0.0.1:{port}"), None, None, &remote);
+        let cmd = bootstrap_ssh_command(user, "127.0.0.1", port, None, None, &remote)
+            .expect("a fixed literal test user/host must always validate");
         let out = run_with_password(cmd, password, None, Duration::from_secs(15))
             .await
             .expect("installing the throwaway key over the fixture's documented password must succeed");
@@ -1689,7 +1700,9 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        cmd.arg(format!("{}@{}", machine.user, machine.host)).arg(write_cmd);
+        crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host)
+            .expect("a fixed literal test user/host must always validate");
+        cmd.arg(write_cmd);
         let mut child = cmd.spawn().expect("spawn the base64 upload");
         {
             use tokio::io::AsyncWriteExt as _;

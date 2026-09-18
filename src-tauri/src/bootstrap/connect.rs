@@ -45,23 +45,14 @@ use crate::ipc::commands::{keyed_ssh_options, parse_probe_output, RemoteProbeRes
 pub struct BootstrapTarget {
     pub host: String,
     pub port: u16,
+    /// SSH login name — POSSIBLY ATTACKER-CONTROLLED: a pairing ticket
+    /// (`fdpair:<base64 json>`, see `ControlSection.tsx::parseTicket`) is printed by
+    /// the SERVER, so a hostile or compromised server can hand back a ticket that
+    /// pre-fills a malicious `user`. Every ssh call this module makes from a
+    /// `BootstrapTarget` goes through [`crate::ipc::commands::push_ssh_destination`] /
+    /// [`askpass::bootstrap_ssh_command`], which validate it (and `host`) before ever
+    /// building a destination argument — never trust this field un-validated.
     pub user: String,
-}
-
-impl BootstrapTarget {
-    /// The ssh DESTINATION string [`install_key`]'s password step dials: `user@host`
-    /// for the default port 22 ([`askpass::bootstrap_ssh_command`]'s own unit tests
-    /// use exactly this shape), or the `ssh://user@host:port` URI form for any other
-    /// port — a plain `user@host:port` destination does NOT parse the trailing
-    /// `:port` (documented and exercised in `askpass.rs`'s own live test); OpenSSH's
-    /// URI form does.
-    fn ssh_destination(&self) -> String {
-        if self.port == 22 {
-            format!("{}@{}", self.user, self.host)
-        } else {
-            format!("ssh://{}@{}:{}", self.user, self.host, self.port)
-        }
-    }
 }
 
 // ============================================================================
@@ -199,8 +190,15 @@ pub async fn install_key(
     known_hosts: &str,
 ) -> Result<KeyInstallOutcome, BootstrapError> {
     let _guard = INSTALL_KEY_LOCK.lock().await;
-    let dest = target.ssh_destination();
-    let cmd = askpass::bootstrap_ssh_command(&dest, None, Some(known_hosts), INSTALL_KEY_SCRIPT);
+    let cmd = askpass::bootstrap_ssh_command(
+        &target.user,
+        &target.host,
+        target.port,
+        None,
+        Some(known_hosts),
+        INSTALL_KEY_SCRIPT,
+    )
+    .map_err(BootstrapError::Other)?;
     let out = askpass::run_with_password(cmd, password, Some(public_key.as_bytes()), INSTALL_KEY_DEADLINE).await?;
     let outcome = parse_install_key_output(
         out.status.success(),
@@ -228,9 +226,10 @@ async fn verify_key_accepted(
     known_hosts: &str,
 ) -> Result<(), BootstrapError> {
     let mut cmd = keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
-    cmd.arg("-T")
-        .arg(format!("{}@{}", target.user, target.host))
-        .arg("true");
+    cmd.arg("-T");
+    crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
+        .map_err(BootstrapError::Other)?;
+    cmd.arg("true");
     let out = cmd
         .output()
         .await
@@ -348,6 +347,13 @@ pub(crate) async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) ->
 /// a nicety, never a gate on it (per Armand's display-only, non-blocking decision).
 /// `pub(crate)` — see [`host_key_pinned`]'s doc.
 pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port: u16) -> Option<String> {
+    // Last line of defense (item 5 of the CRM holistic-review blocker fix): never
+    // hand `ssh-keygen` a pattern built from a `host` that failed the SAME rule every
+    // other ssh-argv builder in this crate enforces, even though `-F`'s own argument
+    // grammar already isn't vulnerable to the `user@host` injection class this rule
+    // exists for (see `bootstrap_install_key`'s doc). Degrades to "nothing pinned"
+    // rather than an error — this function is display-only/non-blocking by design.
+    crate::store::validate_address_value(host).ok()?;
     if !Path::new(known_hosts).exists() {
         return None;
     }
@@ -374,6 +380,8 @@ pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port:
 /// either way — there is nothing to forget in both cases, and `ssh-keygen -R` itself
 /// already treats "not pinned, but the file exists" as success (VERIFIED live).
 pub async fn forget_host_key(known_hosts: &str, host: &str, port: u16) -> Result<(), BootstrapError> {
+    // Last line of defense — see `read_pinned_fingerprint`'s own doc for why.
+    crate::store::validate_address_value(host).map_err(BootstrapError::Other)?;
     if !Path::new(known_hosts).exists() {
         return Ok(());
     }
@@ -525,9 +533,10 @@ pub async fn probe(
     known_hosts: &str,
 ) -> Result<RemoteProbeResult, BootstrapError> {
     let mut cmd = keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
-    cmd.arg("-T")
-        .arg(format!("{}@{}", target.user, target.host))
-        .arg(PROBE_SCRIPT);
+    cmd.arg("-T");
+    crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
+        .map_err(BootstrapError::Other)?;
+    cmd.arg(PROBE_SCRIPT);
     let out = cmd
         .output()
         .await
@@ -600,6 +609,14 @@ pub async fn bootstrap_install_key(
     password: String,
     label: String,
 ) -> Result<KeyInstallOutcome, String> {
+    // Validated BEFORE anything else — this is the FIRST-CONTACT entry point, and
+    // `user`/`host` can both arrive from a hostile pairing ticket's pre-fill (see
+    // `ControlSection.tsx::parseTicket`'s doc), so this must reject before even the
+    // `ssh-keygen -F` lookup below runs (item 5 of the CRM holistic-review blocker
+    // fix, chantier A `bd7ca709`), let alone [`install_key`]'s own ssh call.
+    crate::store::validate_ssh_user(&user)?;
+    crate::store::validate_address_value(&host)?;
+    crate::store::validate_ssh_port(port)?;
     use tauri::Manager;
     let ssh_keys_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("ssh_keys");
     let key = crate::ipc::commands::generate_or_reuse_pending_key(&ssh_keys_dir, &label)
@@ -636,6 +653,9 @@ pub async fn bootstrap_probe(
     user: String,
     identity_file: String,
 ) -> Result<RemoteProbeResult, String> {
+    crate::store::validate_ssh_user(&user)?;
+    crate::store::validate_address_value(&host)?;
+    crate::store::validate_ssh_port(port)?;
     let known_hosts =
         known_hosts_path(&app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
     let target = BootstrapTarget { host, port, user };
@@ -648,6 +668,14 @@ pub async fn bootstrap_probe(
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_forget_host_key(app: tauri::AppHandle, host: String, port: u16) -> Result<(), String> {
+    // See `bootstrap_install_key`'s own doc — same discipline (item 5 of the CRM
+    // holistic-review blocker fix): `ssh-keygen -R`'s own argument grammar already
+    // consumes the token right after `-F`/`-R` as that option's value regardless of a
+    // leading `-`, so this isn't the SAME injection class as `user@host`, but a
+    // pattern built from an unvalidated `host` has no business reaching `ssh-keygen`
+    // either.
+    crate::store::validate_address_value(&host)?;
+    crate::store::validate_ssh_port(port)?;
     let known_hosts =
         known_hosts_path(&app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
     forget_host_key(&known_hosts, &host, port).await.map_err(|e| e.to_string())
@@ -657,18 +685,33 @@ pub async fn bootstrap_forget_host_key(app: tauri::AppHandle, host: String, port
 mod tests {
     use super::*;
 
-    // ---- BootstrapTarget::ssh_destination ----
+    // ---- install_key rejects an ssh-option-injection user/host before ever
+    // spawning (blocker fix — CRM chantier A bd7ca709) ----
 
-    #[test]
-    fn ssh_destination_uses_plain_form_on_the_default_port() {
-        let t = BootstrapTarget { host: "example.com".to_string(), port: 22, user: "deploy".to_string() };
-        assert_eq!(t.ssh_destination(), "deploy@example.com");
+    #[tokio::test]
+    async fn install_key_rejects_an_option_injection_user_without_spawning_ssh() {
+        let target = BootstrapTarget {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "-oProxyCommand=touch /tmp/pwned".to_string(),
+        };
+        let err = install_key(&target, "irrelevant", "/tmp/nonexistent-key", "ssh-ed25519 AAAA test", "/tmp/kh")
+            .await
+            .expect_err("an ssh-option-shaped user must be refused");
+        assert!(matches!(err, BootstrapError::Other(_)));
     }
 
-    #[test]
-    fn ssh_destination_uses_the_uri_form_on_a_non_default_port() {
-        let t = BootstrapTarget { host: "127.0.0.1".to_string(), port: 2231, user: "deploy".to_string() };
-        assert_eq!(t.ssh_destination(), "ssh://deploy@127.0.0.1:2231");
+    #[tokio::test]
+    async fn install_key_rejects_an_option_injection_host_without_spawning_ssh() {
+        let target = BootstrapTarget {
+            host: "-oProxyCommand=touch /tmp/pwned".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+        };
+        let err = install_key(&target, "irrelevant", "/tmp/nonexistent-key", "ssh-ed25519 AAAA test", "/tmp/kh")
+            .await
+            .expect_err("an ssh-option-shaped host must be refused");
+        assert!(matches!(err, BootstrapError::Other(_)));
     }
 
     // ---- INSTALL_KEY_SCRIPT (golden string) ----
@@ -1003,11 +1046,14 @@ fi
             // --- (1) symlink refusal, on the PRISTINE (no ~/.ssh yet) node ---
             let poison = "rm -rf ~/.ssh /tmp/b7-evil-ssh-dir; mkdir -p /tmp/b7-evil-ssh-dir; ln -s /tmp/b7-evil-ssh-dir ~/.ssh";
             let poison_cmd = askpass::bootstrap_ssh_command(
-                &target.ssh_destination(),
+                &target.user,
+                &target.host,
+                target.port,
                 None,
                 Some(kh.path()),
                 poison,
-            );
+            )
+            .expect("a fixed literal test user/host must always validate");
             let out = askpass::run_with_password(poison_cmd, FIXTURE_A_PASSWORD, None, Duration::from_secs(15))
                 .await
                 .expect("poisoning ~/.ssh on the fixture must succeed");
@@ -1021,11 +1067,14 @@ fi
 
             // Clean up the poison before the real flow below.
             let cleanup = askpass::bootstrap_ssh_command(
-                &target.ssh_destination(),
+                &target.user,
+                &target.host,
+                target.port,
                 None,
                 Some(kh.path()),
                 "rm -rf ~/.ssh /tmp/b7-evil-ssh-dir",
-            );
+            )
+            .expect("a fixed literal test user/host must always validate");
             let out = askpass::run_with_password(cleanup, FIXTURE_A_PASSWORD, None, Duration::from_secs(15))
                 .await
                 .expect("cleaning up the poison must succeed");
@@ -1069,10 +1118,10 @@ fi
 
             // The key genuinely works: a fresh, independent BatchMode reconnect with it.
             let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path()));
-            verify
-                .arg("-T")
-                .arg(format!("{}@{}", target.user, target.host))
-                .arg("echo REMOTE_OK");
+            verify.arg("-T");
+            crate::ipc::commands::push_ssh_destination(&mut verify, &target.user, &target.host)
+                .expect("a fixed literal test user/host must always validate");
+            verify.arg("echo REMOTE_OK");
             let out = verify.output().await.expect("could not run ssh");
             assert!(out.status.success(), "key login must work: {}", String::from_utf8_lossy(&out.stderr));
             assert!(String::from_utf8_lossy(&out.stdout).contains("REMOTE_OK"));
@@ -1106,7 +1155,8 @@ fi
             let setup = "rm -rf ~/.ssh ~/dotfiles; mkdir -p ~/dotfiles/ssh; \
                           printf '# pre-existing\\n' > ~/dotfiles/ssh/authorized_keys; \
                           ln -s ~/dotfiles/ssh ~/.ssh";
-            let setup_cmd = askpass::bootstrap_ssh_command(&target.ssh_destination(), None, Some(kh.path()), setup);
+            let setup_cmd = askpass::bootstrap_ssh_command(&target.user, &target.host, target.port, None, Some(kh.path()), setup)
+                .expect("a fixed literal test user/host must always validate");
             let out = askpass::run_with_password(setup_cmd, FIXTURE_A_PASSWORD, None, Duration::from_secs(15))
                 .await
                 .expect("setting up the dotfiles-style ~/.ssh symlink must succeed");
@@ -1125,10 +1175,10 @@ fi
             // symlink instead of through it) — a genuine BatchMode reconnect using it
             // must work, exactly like the ordinary (no-symlink) case.
             let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path()));
-            verify
-                .arg("-T")
-                .arg(format!("{}@{}", target.user, target.host))
-                .arg("echo REMOTE_OK");
+            verify.arg("-T");
+            crate::ipc::commands::push_ssh_destination(&mut verify, &target.user, &target.host)
+                .expect("a fixed literal test user/host must always validate");
+            verify.arg("echo REMOTE_OK");
             let out = verify.output().await.expect("could not run ssh");
             assert!(
                 out.status.success(),

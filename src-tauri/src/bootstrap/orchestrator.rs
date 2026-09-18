@@ -449,7 +449,13 @@ async fn step_context(
 /// password path entirely on a resume/re-run once the key already works.
 async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str, known_hosts: &str) -> bool {
     let mut cmd = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
-    cmd.arg("-T").arg(format!("{}@{}", target.user, target.host)).arg("true");
+    cmd.arg("-T");
+    // Never spawns anything for an ssh-option-shaped user/host — see
+    // `push_ssh_destination`'s own doc.
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host).is_err() {
+        return false;
+    }
+    cmd.arg("true");
     matches!(tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await, Ok(Ok(out)) if out.status.success())
 }
 
@@ -1013,6 +1019,15 @@ pub async fn bootstrap_server(
     mask_sleep: bool,
     sudo_password: Option<String>,
 ) -> Result<BootstrapReport, String> {
+    // Validated BEFORE anything else — this is the very first place `host`/`user`
+    // arrive from untrusted input (the wizard form, or a hostile pairing ticket's
+    // pre-fill — see `ControlSection.tsx::parseTicket`'s doc) and BEFORE any ssh
+    // process the pipeline's own steps spawn (CRM holistic-review blocker #3,
+    // chantier A `bd7ca709`: `user` was validated NOWHERE before this fix). `port`
+    // is a `u16` at this boundary already, but `0` is never a real listener.
+    crate::store::validate_ssh_user(&user)?;
+    crate::store::validate_address_value(&host)?;
+    crate::store::validate_ssh_port(port)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let req = StoredBootstrapRequest { label, host, port, user, mask_sleep };
     let password = password.map(SecretString::new);
@@ -1383,7 +1398,23 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 /// module doc.
 async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
     let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T").arg(format!("{}@{}", machine.user, machine.host)).arg(diagnose_script());
+    cmd.arg("-T");
+    // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
+    // version, or a manual DB edit) — degrade to a clear, typed failure instead of
+    // spawning ssh with it (or, worse, panicking): the machine stays listed, this
+    // is just what any attempt to actually reach it now reports.
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
+        // The `Err` is deliberately discarded — it embeds the raw offending value (see
+        // `validate_ssh_user`/`validate_address_value`'s own docs) and this reason
+        // string is user-facing. Same discipline as `TransportError::InvalidRemoteTarget`.
+        return ServerDiagnosis {
+            state: DiagnosisState::Failed {
+                reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
+            },
+            ..ServerDiagnosis::unreachable()
+        };
+    }
+    cmd.arg(diagnose_script());
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
     // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
     match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
@@ -2187,7 +2218,8 @@ mod tests {
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo {} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
                 shq(&key.public)
             );
-            let cmd = bootstrap_ssh_command(&format!("ssh://{user}@127.0.0.1:{port}"), None, None, &remote);
+            let cmd = bootstrap_ssh_command(user, "127.0.0.1", port, None, None, &remote)
+                .expect("a fixed literal test user/host must always validate");
             let out = run_with_password(cmd, password, None, Duration::from_secs(15))
                 .await
                 .expect("installing the throwaway key over the fixture's documented password must succeed");
