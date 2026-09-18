@@ -2095,6 +2095,31 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
 }
 },
 /**
+ * Best-effort push of a REMOTE conversation's CURRENT title to its daemon's
+ * authoritative record (C9) — the idle-rename path, for when the LOCAL rename
+ * (`upsert_conversation`) happens while this Mac isn't the one driving the
+ * conversation. `title` is passed explicitly rather than re-read from the store, so
+ * this never races that same rename's own `upsertConversation` write landing first.
+ * 
+ * See [`crate::supervisor::transport::push_remote_title`] for the wire mechanics and
+ * its SAFETY CONTRACT — most importantly: the caller (`renameConversation` in
+ * `conversationsStore.ts`) MUST have already confirmed this Mac holds no live
+ * session for `conversation_id` before ever calling this; that liveness
+ * (`conv.handle`) is front-end-only state this command cannot see, let alone check
+ * on its own.
+ * 
+ * Infallible from the caller's point of view (mirrors [`crate::supervisor::
+ * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * whenever there's nothing useful to do (unknown conversation, local repo, no
+ * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
+ * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+ * which already landed — the next real spawn carries the title anyway (see
+ * `spawn_session`'s `conversation_title` wiring).
+ */
+async pushRemoteConversationTitle(conversationId: string, title: string) : Promise<boolean> {
+    return await TAURI_INVOKE("push_remote_conversation_title", { conversationId, title });
+},
+/**
  * Forget a conversation's metadata.
  */
 async deleteConversation(id: string) : Promise<Result<null, string>> {
@@ -2217,10 +2242,27 @@ async appControlRespond(requestId: string, result: JsonValue | null, error: stri
 }
 },
 /**
- * Publish one fleet event into the journal `wait_for_events` long-polls (the
- * voice bridge). The FRONT calls this from its settled notification point
- * (`fireAgentNotification`), so the voice agent hears exactly what the human
- * would have been pinged about.
+ * Publish one fleet event into the journal `wait_for_events` long-polls (the voice
+ * bridge) AND the phone relay's push (`appmcp::relay`'s `events_task` — the SAME
+ * journal feeds both). The FRONT calls this from its settled notification point
+ * (`fireAgentNotification`), so the voice agent (and the phone) hear exactly what
+ * the human would have been pinged about.
+ * 
+ * C9 gate: a conversation this Mac only RELAYS (its repo is remote — `machine_id`
+ * set) has its OWN host `flightdeckd` daemon emitting these SAME phone-facing
+ * events independently (it runs the actual session; the Mac here is just an SSH
+ * spectator) — publishing them HERE too would double the phone's push per turn.
+ * This is the SINGLE entry point every phone-facing journal event passes through
+ * (`turn_completed` / `needs_attention` / `attention_cleared` / `task_finished`,
+ * from every call site in `useGlobalSessionEvents.ts` / `appControl.ts` /
+ * `conversationsStore.ts`), so gating it here covers all of them without touching
+ * any of those call sites individually. The DESKTOP's own OS notifications and
+ * in-app voice announcements are UNCHANGED — both are fed from a SEPARATE point in
+ * `useGlobalSessionEvents.ts` that never goes through this journal at all, remote
+ * conversation or not; only the phone-facing paths (voice bridge + relay) are
+ * gated. `unwrap_or(false)` degrades toward PUBLISHING on a lookup error — a
+ * missed suppression is, at worst, one duplicate push; a wrongly-swallowed event
+ * for a conversation this couldn't even confirm as remote would be a silent loss.
  */
 async publishControlEvent(kind: string, conversationId: string, title: string, detail: JsonValue) : Promise<void> {
     await TAURI_INVOKE("publish_control_event", { kind, conversationId, title, detail });
@@ -4861,7 +4903,17 @@ appControl: boolean;
 /**
  * Which Claude account to authenticate as; `None` = the default, un-scoped store.
  */
-claudeAccountId: string | null }
+claudeAccountId: string | null; 
+/**
+ * The conversation's CURRENT title (C9), so a REMOTE spawn's `attach --title`
+ * carries it from the very first attach — see
+ * [`crate::supervisor::transport::SpawnConfig::conversation_title`]. Ignored for
+ * a local conversation (Claude has no daemon-side title). The front omits this
+ * (or sends `None`) for a conversation that is still on its placeholder name, so
+ * an untitled conversation never stamps that placeholder as the daemon's
+ * authoritative title (see `spawn_session`'s wiring).
+ */
+conversationTitle: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

@@ -92,6 +92,18 @@ pub struct SpawnConfig {
     /// the first spawn; the session actor fills it from the daemon's
     /// `fd_attach` handshake to reconnect after a drop without losing stream.
     pub attach: Option<AttachPoint>,
+    /// The conversation's CURRENT title, threaded to a REMOTE daemon's `attach --title`
+    /// (C9) so it has a real name from the very first spawn instead of sitting on
+    /// `""`/its own placeholder until a rename explicitly pushes one (see
+    /// `ipc::commands::push_remote_conversation_title`). Ignored locally (Claude has no
+    /// daemon-side title to set) and ignored remotely too unless the paired machine's
+    /// `flightdeckd` is new enough (gated in `ipc::commands::spawn_session`, exactly
+    /// like [`AttachPoint::supports_skip`] — an older daemon's clap REJECTS the unknown
+    /// `--title` flag outright, so this must never be guessed). Blank/`None` omits the
+    /// flag entirely (see [`build_remote_command`]) — the daemon's own title (an earlier
+    /// authoritative rename, or its ai-title backfill for a still-untitled one) is left
+    /// alone rather than being overwritten with an empty string.
+    pub conversation_title: Option<String>,
     /// WHICH Claude account this session runs on. The default slot contributes no
     /// environment at all, so a single-account setup spawns byte-for-byte as before.
     ///
@@ -183,6 +195,7 @@ impl SpawnConfig {
             allow_bypass_permissions: false,
             remote: None,
             attach: None,
+            conversation_title: None,
             // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
             claude_account: crate::accounts::AccountSlot::default_slot(),
         }
@@ -203,6 +216,22 @@ fn default_claude_bin() -> PathBuf {
 fn resolve_ssh_bin() -> String {
     std::env::var("TOSSE_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
 }
+
+/// Serialises EVERY test in the crate that mutates the process-wide `TOSSE_SSH_BIN`
+/// env var [`resolve_ssh_bin`] reads — shared across `transport::tests` (which spawns
+/// [`push_remote_title`]/[`run_remote_stop`] directly) AND `session::tests` (which
+/// drives real reconnects through the SAME env var via `run_actor`'s remote spawns),
+/// so their tests can never race each other's mutation of the ONE real process
+/// environment, even though the default test runner runs different modules'
+/// tests concurrently on different threads. A single, crate-visible lock — NOT two
+/// independent per-module ones — is the only way two different modules' tests can
+/// serialise against a variable neither of them owns exclusively; a std `Mutex`
+/// that panics while held gets POISONED, and each module's fake-ssh scripts are
+/// exercised often enough that two independent locks silently let one module's
+/// `set_var` stomp the other's mid-test (a real bug this fixes, not a hypothetical
+/// one — see the C9 task report).
+#[cfg(test)]
+pub(crate) static SSH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build the `claude` argv (everything after the binary) from a [`SpawnConfig`].
 /// Shared verbatim by the local and remote launchers: the SAME flags must run
@@ -326,6 +355,18 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     if attach.supports_skip {
         s.push_str(" --supports-skip");
     }
+    // C9: the conversation's title, ONLY through `shell_quote` and joined with `=`
+    // (never a separate token) — `--title '-foo'` would let clap parse `-foo` as a
+    // new flag instead of the value; `--title='-foo'` cannot be misread that way
+    // regardless of what the title starts with. Blank/`None` omits the flag so an
+    // untitled conversation never overwrites the daemon's own title (its ai-title
+    // backfill, or an earlier authoritative rename) with nothing.
+    if let Some(title) = cfg.conversation_title.as_deref() {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            s.push_str(&format!(" --title={}", shell_quote(trimmed)));
+        }
+    }
     s.push_str(" --");
     for arg in args {
         s.push(' ');
@@ -377,6 +418,177 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
             false
         }
     }
+}
+
+/// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
+/// record (C9), for a rename that happens while this Mac is NOT the one driving the
+/// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
+/// `--title` as an `attach` flag (see flightdeck-server `attach.rs`/`main.rs`,
+/// `program/wave2`) — so this borrows `attach` itself for a bounded, ONE-SHOT ssh
+/// round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
+/// success/failure — never a persistent bridge like a real live session).
+///
+/// The title write happens SYNCHRONOUSLY on the daemon's side, in its connection
+/// handler, strictly BEFORE it ever writes back the `fd_attach` acknowledgement (see
+/// `attach.rs::handle_conn`) — but that acknowledgement itself is NOT a reliable
+/// success signal to wait on: it is only queued once the daemon's actor reaches
+/// `on_attach`, which for the ONLY case this function is ever used for — an IDLE
+/// conversation — means cold-starting `claude --resume <id>` first, a spawn
+/// LIVE-VERIFIED (m1 fixture, C9 task) to sometimes take many seconds or never
+/// complete at all, while the title write itself never waits on it. See the grace
+/// window's doc on the read below for exactly how this is handled. This never sends
+/// `fd_stop` (that would ALSO stop the remote `claude` process, which a mere title
+/// push has no business doing). `--cursor` is set to `u64::MAX` purely defensively
+/// (see [`build_remote_command`]'s doc — without a matching `--epoch` it can never
+/// actually be honoured, but there's no reason to send a false "start from nothing"
+/// bound either).
+///
+/// ⚠️ SAFETY (caller contract): only call this when THIS Mac holds no live session for
+/// the conversation — `on_attach` on the daemon UNCONDITIONALLY `detach_current
+/// ("replaced", …)`s whoever is CURRENTLY attached, and `"replaced"` is a TERMINAL
+/// [`super::session`]`::reconnect_policy_for_reason` here: stealing this Mac's own
+/// live link out from under itself would kill it (until the conversation is reopened)
+/// rather than merely rename it. A live session's own next reattach already carries
+/// the current title forward (see [`SpawnConfig::conversation_title`]), so skipping
+/// this while live loses nothing. That liveness check is front-end-only state
+/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here.
+///
+/// ⚠️ KNOWN LIMITATION: a conversation the daemon has no RUNNING actor for right now
+/// still triggers the daemon's normal cold-start (`--resume-session`) as a side effect
+/// of merely attaching — a real, if mild, side effect (a resumed but message-less
+/// `claude` process left running server-side) this helper does not eliminate. A
+/// dedicated, title-only `set-title` verb (no session semantics at all) is the clean
+/// fix; see the C9 task report for the precise ask.
+pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
+    if title.trim().is_empty() {
+        return false;
+    }
+    let mut cmd = Command::new(resolve_ssh_bin());
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = &remote.known_hosts_file {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(identity) = &remote.identity_file {
+        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+        "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
+        resolve_remote_daemon_bin(&remote.daemon_bin),
+        shell_quote(session_id),
+        shell_quote(cwd),
+        shell_quote(title.trim()),
+        u64::MAX,
+    ));
+    // ⚠️ LOAD-BEARING, live-verified: stdin must stay OPEN, never `Stdio::null()`. A
+    // null stdin puts ssh's local side at EOF instantly, which it forwards to the
+    // remote channel right away — `attach_client`'s stdin pump then closes its
+    // write-half to the daemon's unix socket almost immediately, and against a real
+    // daemon this consistently raced the daemon's own client-gone handling ahead of
+    // it ever sending anything: the reply (built and queued correctly — the title
+    // write itself, per the doc above, had ALREADY landed by then) was silently
+    // never flushed, and our read saw a clean EOF with zero bytes. Piping stdin
+    // instead and simply never writing to (or dropping) it keeps ssh's local side
+    // from ever signalling EOF, so the daemon gets the normal amount of time a real
+    // client would.
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[transport] remote title push failed to launch ssh: {e}");
+            return false;
+        }
+    };
+    // Held for the rest of this function so its pipe write-end stays open (see the
+    // doc above) — dropped only at the very end, alongside tearing the child down.
+    let _stdin_open = child.stdin.take();
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return false;
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    // Race three outcomes:
+    //  - a reply line arrives: an `fd_detach` is a real failure, anything else
+    //    (normally `fd_attach`) a real success;
+    //  - a CLEAN EOF (0 bytes, no error) with no line ever arriving: read as
+    //    SUCCESS, not failure, PROVIDED the child hasn't already exited non-zero
+    //    — see the load-bearing note below AND the `Ok(0)` arm's own comment
+    //    (a same-instant ssh connection failure closes its stdout pipe at
+    //    essentially the same instant it exits non-zero, so a bare EOF cannot
+    //    be trusted on its own without checking the child's exit status first);
+    //  - the ssh CHILD exits on its own before either: its own exit status is
+    //    the verdict (a connection-level failure — daemon down, host
+    //    unreachable, auth refused — makes `attach_client` return `Err` and the
+    //    process exit non-zero);
+    //  - none of the above within `ACK_GRACE`: the daemon's write is already
+    //    durable by then regardless (see the doc above), so this is read as
+    //    success too — never a timeout-as-failure the way a naive "wait for the
+    //    ack" read would.
+    // ⚠️ LOAD-BEARING, live-verified against a real daemon (m1 fixture, C9 task):
+    // resuming an IDLE conversation — the ONLY case this function is ever used
+    // for — cold-starts `claude --resume <id>` server-side. Against the real
+    // daemon this consistently produced a clean, fast (well under `ACK_GRACE`)
+    // EOF with ZERO bytes and no `fd_attach` ever sent — yet a `flightdeckd
+    // status` check straight after showed the title HAD landed every single
+    // time. The title write is a plain SQL statement run synchronously in the
+    // connection handler the instant `manager.attach()` returns — it does not
+    // wait on the daemon ever managing to reply, and neither does this. An
+    // earlier version of this function read a clean EOF (and a timeout) as
+    // failure — a false negative on a write that had, provably, already landed.
+    const ACK_GRACE: Duration = Duration::from_secs(3);
+    // How long to wait, right after observing a clean EOF, for the child's exit
+    // status to become available before falling back to the optimistic "still
+    // alive" reading. This is NOT a general grace window (see `ACK_GRACE` above)
+    // — it exists purely to disambiguate a same-instant EOF from a same-instant
+    // process exit; see the `Ok(0)` arm below.
+    const EOF_REAP_GRACE: Duration = Duration::from_millis(200);
+    let ok = tokio::select! {
+        res = reader.read_line(&mut first_line) => match res {
+            Ok(0) => {
+                // A clean EOF with zero bytes does NOT by itself mean success: a
+                // real connection failure (bad host/port/key, daemon down) makes
+                // ssh exit non-zero writing nothing to stdout (stderr is
+                // `Stdio::null()`), and closing a process's stdout pipe happens
+                // essentially AT process exit — so this branch and the sibling
+                // `child.wait()` branch below can become ready at the same
+                // instant, and `tokio::select!` would otherwise pick one at
+                // random (verified: ~50% false-positive "success" on a child
+                // that exits 1 with no output). Disambiguate by checking whether
+                // the child has ALREADY exited: if it has, its exit status is
+                // authoritative (mirrors the `child.wait()` branch's verdict,
+                // just reached from the other future); only when the child is
+                // still alive — the genuine "daemon accepted the attach, wrote
+                // the title, but `claude --resume` hasn't replied yet" case this
+                // redesign targets — does EOF read as the documented optimistic
+                // success.
+                match tokio::time::timeout(EOF_REAP_GRACE, child.wait()).await {
+                    Ok(status) => matches!(status, Ok(s) if s.success()),
+                    Err(_) => true,
+                }
+            }
+            Ok(_) => !first_line.contains("\"type\":\"fd_detach\""),
+            Err(_) => false,
+        },
+        status = child.wait() => matches!(status, Ok(s) if s.success()),
+        _ = tokio::time::sleep(ACK_GRACE) => true,
+    };
+    // Tear the ssh process down explicitly (never `fd_stop`) rather than relying on
+    // `kill_on_drop`'s best-effort background reap — same "no orphans" discipline as
+    // every other process this crate spawns.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    ok
 }
 
 /// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
@@ -1353,6 +1565,89 @@ mod tests {
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
+
+        // C9: an unset/blank title omits the flag entirely (never overwrite the
+        // daemon's own title with an empty string).
+        assert!(!cmd.contains("--title"), "no title set: {cmd}");
+        cfg.conversation_title = Some("   ".into());
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(!cmd.contains("--title"), "a blank title must still omit the flag: {cmd}");
+
+        // A real title rides `=`-joined and shell-quoted, right after the reattach
+        // coordinates and before the claude argv separator.
+        cfg.conversation_title = Some("My Feature".into());
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--title='My Feature'"), "cmd was: {cmd}");
+        assert!(cmd.find("--title=").unwrap() < cmd.find(" -- ").unwrap(), "title precedes claude argv: {cmd}");
+    }
+
+    /// C9 regression: `--title` MUST be `=`-joined (never a separate token) so a title
+    /// starting with `-` can never be misparsed as a new flag by clap — and every
+    /// interpolated value must survive a REAL POSIX shell's parsing of the whole
+    /// composed command byte-for-byte, since that is exactly what `ssh` hands the
+    /// remote shell. Runs the built command through a real local `sh -c`, with the
+    /// resolved "daemon binary" replaced by a tiny script that just echoes back the
+    /// `--title=` value verbatim (no trailing newline, so even a title that itself
+    /// ends in whitespace round-trips exactly).
+    #[cfg(unix)]
+    #[test]
+    fn build_remote_command_title_survives_a_real_shell_round_trip() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-quote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let echo_title = dir.join("echo-title.sh");
+        fs::write(
+            &echo_title,
+            r#"#!/bin/sh
+for a; do
+    case "$a" in
+        --title=*) printf '%s' "${a#--title=}" ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&echo_title, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            // An EXPLICIT path (contains '/') is used unsearched — see
+            // `resolve_remote_daemon_bin`'s doc — so `attach` execs our script.
+            daemon_bin: echo_title.to_string_lossy().into_owned(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        };
+
+        let adversarial = [
+            "simple",
+            "embedded 'single' quotes",
+            "embedded \"double\" quotes",
+            "$(rm -rf /)",
+            "`whoami`",
+            "line one\nline two",
+            "-looks-like-a-flag",
+            &"x".repeat(4096),
+        ];
+        for title in adversarial {
+            let mut cfg = SpawnConfig::new("/work/demo");
+            cfg.conversation_title = Some(title.to_string());
+            let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+                .expect("sh should run");
+            let got = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(got.as_ref(), title, "title round-trip broke for {title:?} — cmd was: {cmd}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// [`resolve_remote_daemon_bin`] must search the remote host the SAME way
@@ -1398,6 +1693,340 @@ mod tests {
         assert!(!is_replayable_line(r#"{"type":"fd_skip","from":1,"to":2}"#));
         assert!(!is_replayable_line("not json"));
         assert!(!is_replayable_line(r#"{"no_type":true}"#));
+    }
+
+    fn test_remote_target(daemon_bin: impl Into<String>) -> RemoteTarget {
+        RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: daemon_bin.into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        }
+    }
+
+    /// A blank/whitespace-only title is rejected up front — no ssh is even spawned
+    /// (nothing to prove: `TOSSE_SSH_BIN` is deliberately left unset/invalid).
+    #[tokio::test]
+    async fn push_remote_title_rejects_a_blank_title_without_touching_ssh() {
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
+        let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        assert!(!ok, "a blank title must be rejected before ever spawning ssh");
+    }
+
+    /// The race this whole EOF-disambiguation exists for: an ssh process that fails
+    /// IMMEDIATELY (connection refused, auth rejected, daemon down — nothing written
+    /// to stdout, since stderr is `Stdio::null()`) and exits non-zero at essentially
+    /// the same instant its stdout pipe closes. Before the fix, `tokio::select!`
+    /// raced a bare `Ok(0)` EOF (read as unconditional success) against
+    /// `child.wait()` (correctly `false`) and picked the winner at random —
+    /// reproduced standalone at a ~50% false-positive rate. Run several iterations
+    /// so a reintroduced race shows up as a flake rather than being masked by
+    /// getting lucky once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_when_ssh_exits_immediately_with_no_output() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-failfast-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        // Exits non-zero writing NOTHING to stdout — the exact shape of a real ssh
+        // connection-level failure.
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        for i in 0..50 {
+            let ok = tokio::time::timeout(
+                Duration::from_secs(10),
+                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            )
+            .await
+            .expect("push_remote_title must not hang");
+            assert!(!ok, "iteration {i}: an ssh that exits non-zero with no output must never read as success");
+        }
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A title containing an embedded NUL byte can never survive to the remote shell
+    /// at all: `std::process::Command::spawn()` rejects any argument containing an
+    /// interior NUL byte before the process is even spawned (verified independently:
+    /// `Command::new("echo").arg("hello\0world").spawn()` errors with
+    /// `InvalidInput`/"nul byte found in provided data"). This proves the already-safe
+    /// behavior — graceful `false`, no panic, no hang — rather than a shell-injection
+    /// risk, since `push_remote_title`'s own `cmd.arg(format!(...))` construction hits
+    /// the same guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_for_a_title_containing_a_nul_byte() {
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+        )
+        .await
+        .expect("push_remote_title must not hang on a NUL-containing title");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        assert!(!ok, "a NUL-containing title must fail gracefully (Command::spawn rejects it), never panic or hang");
+    }
+
+    /// A clean daemon-side `fd_attach` acknowledgement (title already written by the
+    /// time it's sent — see the doc on [`push_remote_title`]) reads as success, and the
+    /// ssh child is torn down rather than left attached (fake daemon sleeps forever
+    /// after the ack; the test's own bounded timeout is the "no lingering" assertion).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_true_on_a_clean_ack() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang on a daemon that never closes its side");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(ok, "a clean fd_attach ack should read as success");
+    }
+
+    /// An error reply (`fd_detach`, e.g. the daemon rejecting the attach) reads as
+    /// failure — never mistaken for a successful title push. Exits non-zero AFTER
+    /// printing it (rather than just falling off the end at 0) so the assertion
+    /// holds regardless of which side of the `tokio::select!` race wins — reading
+    /// the `fd_detach` line, or observing the script's own exit status — both must
+    /// agree this is a failure; a script that exited 0 would make the exit-status
+    /// branch (mis)read as success if it happened to win.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_on_an_error_reply() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"fd_detach\",\"reason\":\"error\",\"message\":\"no such conversation\"}'\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!ok, "an fd_detach error reply must not read as success");
+    }
+
+    /// The grace-window regression this whole redesign exists for (see
+    /// `push_remote_title`'s doc): a daemon that stays connected but sends NOTHING
+    /// back within the grace window (exactly what a slow/hung `claude --resume`
+    /// cold-start looks like — live-verified against a real daemon, see the C9
+    /// report) must read as SUCCESS, not a timeout-shaped failure. An earlier
+    /// version of this function got this wrong.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_is_optimistic_when_the_daemon_stays_silent() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-silent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        // Connects (this process stays alive) but never writes a byte — exactly a
+        // daemon that accepted the attach (and already wrote the title, per the
+        // doc) but whose `claude --resume` cold-start hasn't reached `on_attach` yet.
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let started = std::time::Instant::now();
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang past its own grace window");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(ok, "silence within the grace window must read as success, not a timeout failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "must return promptly once the grace window elapses, not hang for the outer test timeout",
+        );
+    }
+
+    /// Live M1 acceptance check (C9): [`push_remote_title`] against a REAL daemon,
+    /// end to end — spawn a throwaway conversation, fully STOP it (so the daemon has
+    /// no live actor for it — the "idle rename" case this helper exists for), push a
+    /// fresh title, and confirm `flightdeckd status` shows it.
+    ///
+    /// ALSO documents the KNOWN LIMITATION this helper's doc already calls out: since
+    /// the daemon had no running actor, `attach()`'s cold-start path spawns a new
+    /// `claude` process as an inherent side effect of merely attaching to set a
+    /// title — this test asserts that is EXACTLY what happens (`running` flips to
+    /// `true`), as evidence for the C9 report's request for a real title-only verb.
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (flightdeck-server: `m1-daemon/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored push_remote_title_against_the_m1_daemon --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    async fn push_remote_title_against_the_m1_daemon() {
+        let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+            format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
+        });
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(identity),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        };
+
+        // 1. A throwaway live conversation, to learn a real session_id.
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(remote.clone());
+        let (mut transport, mut rx) = Transport::spawn(cfg).expect("remote spawn should start");
+        transport
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .expect("send should queue");
+        let mut attach: Option<crate::supervisor::protocol::FdAttachMsg> = None;
+        let mut session_id: Option<String> = None;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(msg) = rx.recv().await {
+                match &msg {
+                    CliMessage::FdAttach(a) => attach = Some(a.clone()),
+                    CliMessage::System(crate::supervisor::protocol::SystemMsg::Init(i)) => {
+                        session_id = i.session_id.clone();
+                    }
+                    CliMessage::Result(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the throwaway turn should complete");
+        let attach = attach.expect("expected fd_attach");
+        let session_id = session_id.expect("expected a session_id from system/init");
+
+        // 2. Fully STOP it (daemon-side too) — no live actor left for it.
+        transport.shutdown(true).await;
+        // `flightdeckd stop` inside `shutdown` races the daemon actually tearing the
+        // claude process down; give it a moment before we check "not running".
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let status_line = |out: &str| -> serde_json::Value {
+            serde_json::from_str(out.trim()).expect("status should be valid JSON")
+        };
+        let run_status = || {
+            let remote = remote.clone();
+            async move {
+                let out = tokio::process::Command::new(resolve_ssh_bin())
+                    .arg("-T")
+                    .arg("-p")
+                    .arg(remote.port.to_string())
+                    .arg("-o")
+                    .arg("BatchMode=yes")
+                    .arg("-o")
+                    .arg("ConnectTimeout=10")
+                    .arg("-o")
+                    .arg("StrictHostKeyChecking=accept-new")
+                    .arg("-o")
+                    .arg("UserKnownHostsFile=/dev/null")
+                    .arg("-i")
+                    .arg(remote.identity_file.as_deref().unwrap_or_default())
+                    .arg("-o")
+                    .arg("IdentitiesOnly=yes")
+                    .arg(format!("{}@{}", remote.user, remote.host))
+                    .arg("exec flightdeckd status")
+                    .output()
+                    .await
+                    .expect("ssh status should run");
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+        let row_for = |status: &serde_json::Value, conv: &str| -> serde_json::Value {
+            status["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["conversation"] == conv)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let before = status_line(&run_status().await);
+        let row_before = row_for(&before, &attach.conversation);
+        eprintln!("[live] before push_remote_title: {row_before}");
+        assert_eq!(row_before["running"], false, "expected the stopped conversation to be idle");
+
+        // 3. Push a fresh title while idle.
+        let title = format!("tosse-c9-idle-push-{}", uuid::Uuid::new_v4());
+        let ok = push_remote_title(&remote, &session_id, "/work/demo", &title).await;
+        assert!(ok, "push_remote_title should report success against a real daemon");
+
+        let after = status_line(&run_status().await);
+        let row_after = row_for(&after, &attach.conversation);
+        eprintln!("[live] after push_remote_title: {row_after}");
+        assert_eq!(row_after["title"], title, "the daemon should now carry the pushed title");
+        // KNOWN LIMITATION (documented on `push_remote_title`): attaching to set the
+        // title, on a conversation with no live actor, cold-starts one as a side
+        // effect — this is what a real title-only verb would avoid.
+        assert_eq!(
+            row_after["running"], true,
+            "documents the known limitation: an idle push_remote_title cold-starts the claude process",
+        );
+
+        // Cleanup: stop the process this test's push incidentally started.
+        run_remote_stop(&remote, &attach.conversation).await;
     }
 
     /// The bug this guards against: a replayable-typed line that fails to parse

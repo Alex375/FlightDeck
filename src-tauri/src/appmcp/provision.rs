@@ -600,14 +600,15 @@ exit \"$ec\"
                 std::env::remove_var(var);
             }
             let fake = FakeSsh::install(tag);
-            std::env::set_var("TOSSE_TEST_SSH_BIN", fake.dir.join("ssh"));
+            crate::ipc::commands::TEST_SSH_BIN
+                .with(|b| *b.borrow_mut() = Some(fake.dir.join("ssh").to_string_lossy().into_owned()));
             Self { _lock: lock, _fake: fake }
         }
     }
 
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            std::env::remove_var("TOSSE_TEST_SSH_BIN");
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
             for var in FAKE_SSH_VARS {
                 std::env::remove_var(var);
             }

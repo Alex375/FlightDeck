@@ -123,6 +123,26 @@ function senderOf(conv: Conversation): AgentMessageSender {
   };
 }
 
+/**
+ * The label of the REMOTE machine actually hosting `conv`, when this Mac only relays
+ * it (its repo carries a `machineId`) — `null` for a local conversation. Additive
+ * field for `list_conversations`/`read_conversation` (C9): lets the phone relay
+ * (flightdeck-remote) fold a conversation the Mac lists with one its host
+ * `flightdeckd` daemon ALSO lists into a single row (see PROTOCOL.md §5/§5.3) —
+ * `flightdeckd` never emits this itself (its own conversations are always local to
+ * it), so its presence here is what tells the phone "this row is a relay, prefer the
+ * daemon's own row instead". Falls back to the machine's id if it somehow has no
+ * label (never happens in practice — `add_machine` always sets one) rather than
+ * silently reporting local.
+ */
+function hostedOnFor(conv: Conversation): string | null {
+  const s = useConversationsStore.getState();
+  const repo = s.repos.find((r) => r.id === conv.repoId);
+  if (!repo?.machineId) return null;
+  const machine = s.machines.find((m) => m.id === repo.machineId);
+  return machine ? machine.label || machine.id : repo.machineId;
+}
+
 /** Only the app attributes a message to a conversation. A caller with no conversation (voice,
  *  phone relay, external MCP client) handing in a ready-made envelope would pass its text off
  *  as another conversation's — on screen and to the recipient model alike. */
@@ -286,6 +306,10 @@ function listConversations(session: string | null): unknown {
       // exists in `backgrounding`, so a remote client could not otherwise tell that a
       // `running` / `needs_*` conversation also has background work going on.
       background_tasks: runningBackgroundCount(c),
+      // Additive (C9): the join key across hosts (§5) + the relay-vs-local marker
+      // (§5.3) the phone relay uses to fold a Mac-relayed row into its daemon's own.
+      session_id: c.sessionId,
+      hosted_on: hostedOnFor(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
     };
   });
@@ -322,6 +346,9 @@ async function readConversation(args: Record<string, unknown>, session: string |
     model: conv.model,
     effort: conv.ultracode ? "ultracode" : conv.effort,
     turns,
+    // Additive (C9) — same meaning as in list_conversations, see `hostedOnFor`.
+    session_id: conv.sessionId,
+    hosted_on: hostedOnFor(conv),
   };
 }
 

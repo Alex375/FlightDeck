@@ -24,6 +24,8 @@ vi.mock("../ipc/client", () => {
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
+      // C9: renameConversation's best-effort idle-rename push for a remote conv.
+      pushRemoteConversationTitle: vi.fn(() => Promise.resolve(false)),
     },
   };
 });
@@ -34,6 +36,7 @@ import { usePermissionPrefs } from "./permissions";
 import { useAppControlPrefs } from "./appControl";
 import {
   acknowledgeConversation,
+  conversationTitleForSpawn,
   createConversationInRepo,
   createConversationInWorktree,
   DEFAULT_CONV_NAME,
@@ -41,6 +44,7 @@ import {
   demoteBypassConversations,
   detachClaudeAccount,
   ensureConversationSession,
+  isSpawning,
   loadConversationHistory,
   reactivateDiskConversation,
   conversationForTask,
@@ -451,6 +455,120 @@ describe("conversationsStore — auto title (VS Code style)", () => {
   });
 });
 
+describe("conversationsStore — C9 remote title push", () => {
+  const store = () => useConversationsStore.getState();
+
+  function seedRemote(over: Partial<Conversation> = {}) {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/work/demo", addedAt: 1, machineId: "m1" }],
+      machines: [
+        {
+          id: "m1",
+          label: "build-server",
+          host: "h.example",
+          port: 22,
+          user: "agent",
+          addedAt: 1,
+          addresses: [],
+        },
+      ],
+      conversations: [baseConv({ sessionId: "sid-1", ...over })],
+      activeId: "c1",
+    });
+  }
+
+  it("pushes the new title when the repo is remote and this Mac has no live session", () => {
+    seedRemote({ handle: null });
+    store().renameConversation("c1", "New name");
+    expect(commands.pushRemoteConversationTitle).toHaveBeenCalledWith("c1", "New name");
+  });
+
+  it("logs a warning when the push does not land — its own best-effort failure path, not just an IPC exception", async () => {
+    // `push_remote_conversation_title` is infallible from the caller's point of view:
+    // it resolves `false` (never rejects) for every documented failure — server
+    // unreachable, daemon too old, ssh round trip failed. A `.catch()` alone would
+    // never see this, so the "log it" contract needs its own `.then()` branch.
+    seedRemote({ handle: null });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store().renameConversation("c1", "New name");
+    // pushRemoteConversationTitle is mocked to resolve `false` (see the mock at the
+    // top of this file) and is fired-and-forgotten (never awaited) by the store —
+    // flush the microtask queue so its `.then()` has run.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("did not land"), "c1");
+    warnSpy.mockRestore();
+  });
+
+  it("never pushes while THIS Mac holds a live session for the conversation", () => {
+    seedRemote({ handle: "session-7" });
+    store().renameConversation("c1", "New name");
+    // The rename itself still lands locally…
+    expect(conv0().name).toBe("New name");
+    // …but nothing is pushed: the live session's own next reattach carries it, and
+    // an ad hoc attach here would evict this Mac's OWN live link (see
+    // `push_remote_conversation_title`'s safety contract).
+    expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled();
+  });
+
+  it("never pushes for a conversation that has never run on the daemon (no session_id)", () => {
+    seedRemote({ handle: null, sessionId: null });
+    store().renameConversation("c1", "New name");
+    expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled();
+  });
+
+  it("never pushes for a LOCAL conversation (no machineId)", () => {
+    seed(baseConv({ sessionId: "sid-1", handle: null }));
+    store().renameConversation("c1", "New name");
+    expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled();
+  });
+
+  it("never pushes while a resume-spawn of the same idle remote conversation is in flight", async () => {
+    // `conv.handle` stays null for the whole duration `ensureConversationSession`'s
+    // spawn is pending (set only once it resolves) — so a rename racing that window
+    // must be caught by `isSpawning`, not `conv.handle` alone, or it would push mid-
+    // attach and evict the just-landed live session.
+    seedRemote({ handle: null, sessionId: "sid-1" });
+    let resolveSpawn: (v: { status: "ok"; data: string }) => void = () => {};
+    vi.mocked(commands.spawnSession).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSpawn = resolve;
+      }),
+    );
+    const spawnDone = ensureConversationSession("c1");
+    // The spawn promise is registered synchronously (before its first await), so by
+    // this point `isSpawning("c1")` is already true.
+    expect(isSpawning("c1")).toBe(true);
+    store().renameConversation("c1", "New name");
+    expect(conv0().name).toBe("New name"); // the local rename still lands…
+    expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled(); // …but nothing is pushed
+    resolveSpawn({ status: "ok", data: "session-42" });
+    await spawnDone;
+    expect(isSpawning("c1")).toBe(false);
+  });
+
+  it("conversationTitleForSpawn omits the still-untitled placeholder but threads a real name", () => {
+    expect(conversationTitleForSpawn(DEFAULT_CONV_NAME)).toBeNull();
+    expect(conversationTitleForSpawn("My Feature")).toBe("My Feature");
+  });
+
+  it("spawnSession threads the conversation's current title in its flags", async () => {
+    seedRemote({ name: "My Feature", handle: null, sessionId: null });
+    await ensureConversationSession("c1");
+    const call = vi.mocked(commands.spawnSession).mock.calls[0];
+    const flags = call[6] as { conversationTitle?: string | null };
+    expect(flags.conversationTitle).toBe("My Feature");
+  });
+
+  it("spawnSession omits the title for a still-untitled conversation", async () => {
+    seedRemote({ name: DEFAULT_CONV_NAME, handle: null, sessionId: null });
+    await ensureConversationSession("c1");
+    const call = vi.mocked(commands.spawnSession).mock.calls[0];
+    const flags = call[6] as { conversationTitle?: string | null };
+    expect(flags.conversationTitle).toBeNull();
+  });
+});
+
 describe("conversationsStore — persisted reminder", () => {
   it("setReminder stores the kind and persists it", () => {
     useConversationsStore.getState().setReminder("c1", "review");
@@ -746,6 +864,9 @@ describe("conversationsStore — controls applied at spawn", () => {
         allowBypassPermissions: false,
         appControl: true,
         claudeAccountId: null,
+        // C9: the conversation's current title ("x", `baseConv`'s default name —
+        // not the untitled placeholder, so it threads through).
+        conversationTitle: "x",
       },
     );
   });

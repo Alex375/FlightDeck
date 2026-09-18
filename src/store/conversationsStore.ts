@@ -90,6 +90,20 @@ import { useMemo } from "react";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
+/**
+ * C9: the title to thread into a REMOTE spawn's `attach --title` (Rust
+ * `SpawnFlags.conversationTitle`) — `null` while the conversation is still on its
+ * own untitled placeholder ({@link DEFAULT_CONV_NAME}). The daemon writes whatever
+ * non-blank title it's given AUTHORITATIVELY (overwrites), including its own
+ * ai-title backfill for a still-untitled conversation — stamping the placeholder
+ * there at every spawn would permanently poison that backfill with a string no more
+ * useful than what it already shows for an empty title. Exported for its own unit
+ * test.
+ */
+export function conversationTitleForSpawn(name: string): string | null {
+  return name === DEFAULT_CONV_NAME ? null : name;
+}
+
 // Product defaults for a conversation's controls — also the spawn defaults the
 // Rust core falls back to. A conversation seeds these at creation; the composer
 // uses the same values as its display fallback, so UI and stream never disagree.
@@ -891,6 +905,41 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     syncToCore("upsertConversation(rename)", () =>
       commands.upsertConversation(convToRecord(updated)),
     );
+    // C9 — idle-rename push: best-effort, only when this Mac ISN'T the one driving
+    // the conversation right now. A LIVE session's own next reattach already
+    // carries the current title forward (see `conversationTitleForSpawn`'s callers
+    // in `ensureConversationSession`), so pushing here too would be redundant —
+    // and, per `push_remote_conversation_title`'s safety contract, actively unsafe
+    // (a fresh attach would evict the Mac's OWN live link). `sessionId` gates on
+    // "the daemon has ever heard of this conversation" (nothing to `--resume`
+    // otherwise); `repo.machineId` gates on "remote at all" (a local Claude has no
+    // daemon-side title to push). `isSpawning` gates on "a resume-spawn for THIS
+    // conversation is under way right now" — `conv.handle` stays null for the whole
+    // duration `ensureConversationSession`'s spawn is in flight (set only once it
+    // resolves), so without this a rename racing that window would pass the
+    // `!conv.handle` check and could evict the just-landed live session. Never
+    // awaited — a failure here must never block or fail the LOCAL rename, which has
+    // already landed above.
+    if (!conv.handle && !isSpawning(id) && conv.sessionId) {
+      const repo = get().repos.find((r) => r.id === conv.repoId);
+      if (repo?.machineId) {
+        void commands
+          .pushRemoteConversationTitle(id, trimmed)
+          .then((ok) => {
+            // `push_remote_conversation_title` is infallible from the caller's point
+            // of view — it resolves `false` (never rejects) for every documented
+            // best-effort failure path (server unreachable, daemon too old, ssh
+            // round trip failed). The `.catch()` below only ever fires on a genuine
+            // Tauri IPC-level exception, so the common failure case needs its own
+            // log here or it vanishes silently. Never blocking: the next spawn
+            // carries the title anyway (see the doc above).
+            if (!ok) {
+              console.warn("pushRemoteConversationTitle: push did not land (daemon unreachable or too old)", id);
+            }
+          })
+          .catch((e) => console.error("pushRemoteConversationTitle failed:", e));
+      }
+    }
   },
 
   noteFirstMessage: (id, text) => {
@@ -1662,6 +1711,12 @@ export async function ensureConversationSession(
     // Which Claude account this process authenticates as. Read at spawn — the ONLY moment
     // it can be applied, since the CLI reads its credentials once at startup.
     const claudeAccountId = atSpawn.kind === "claude" ? (atSpawn.claudeAccountId ?? null) : null;
+    // C9: the conversation's CURRENT title, so a REMOTE spawn's `attach --title`
+    // carries it from the very first attach (gated + applied Rust-side — see
+    // `spawn_session`). Omitted while the conversation is still on its own
+    // placeholder name, so an untitled conversation never stamps that placeholder
+    // as the daemon's authoritative title (see `conversationTitleForSpawn`'s doc).
+    const conversationTitle = conversationTitleForSpawn(atSpawn.name);
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1670,7 +1725,13 @@ export async function ensureConversationSession(
       atSpawn.permissionMode,
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
-      { ultracode: atSpawn.ultracode, allowBypassPermissions: allowBypass, appControl, claudeAccountId },
+      {
+        ultracode: atSpawn.ultracode,
+        allowBypassPermissions: allowBypass,
+        appControl,
+        claudeAccountId,
+        conversationTitle,
+      },
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1710,6 +1771,7 @@ export async function ensureConversationSession(
             appControl,
             // Same account too: a lost worktree must not silently change identity.
             claudeAccountId,
+            conversationTitle,
           },
         );
       }

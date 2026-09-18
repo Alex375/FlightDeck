@@ -770,6 +770,79 @@ impl Store {
             .optional()
     }
 
+    /// For a conversation whose repo is REMOTE and which has already run there at
+    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), and
+    /// the machine it runs on — everything [`crate::ipc::commands::
+    /// push_remote_conversation_title`] (C9) needs to reach that daemon over SSH.
+    /// `None` when the conversation is unknown, its repo isn't remote, or it has no
+    /// `session_id` yet (never spawned there — nothing for the daemon to `--resume`).
+    /// Mirrors [`Self::machine_for_repo_path`]'s shape, joined one hop further.
+    pub fn remote_session_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> rusqlite::Result<Option<(String, String, MachineRecord)>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT c.cwd, c.session_id,
+                        m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
+                        m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 JOIN machines m ON m.id = r.machine_id
+                 WHERE c.id = ?1 AND r.machine_id IS NOT NULL AND c.session_id IS NOT NULL
+                 LIMIT 1",
+                params![conversation_id],
+                |row| {
+                    let cwd: String = row.get(0)?;
+                    let session_id: String = row.get(1)?;
+                    let machine = MachineRecord {
+                        id: row.get(2)?,
+                        label: row.get(3)?,
+                        host: row.get(4)?,
+                        port: row.get(5)?,
+                        user: row.get(6)?,
+                        identity_file: row.get(7)?,
+                        added_at: row.get(8)?,
+                        addresses: decode_addresses(row.get(9)?),
+                        daemon_mac_id: row.get(10)?,
+                        daemon_relay_url: row.get(11)?,
+                        daemon_label: row.get(12)?,
+                        phone_provisioned_at: row.get(13)?,
+                    };
+                    Ok((cwd, session_id, machine))
+                },
+            )
+            .optional()
+    }
+
+    /// Whether `conversation_id`'s repo is REMOTE (`machine_id` set) — cheaper and
+    /// looser than [`Self::remote_session_for_conversation`] (no `session_id`
+    /// requirement): used by [`crate::ipc::commands::publish_control_event`] (C9) to
+    /// gate the app-control journal, which must never double-publish a phone-facing
+    /// event for a conversation this Mac only RELAYS (its host `flightdeckd` daemon
+    /// emits the same event on its own). `false` for an unknown conversation id —
+    /// never silently drop an event for a conversation this call can't even place;
+    /// only a CONFIRMED-remote one is gated.
+    pub fn conversation_repo_is_remote(&self, conversation_id: &str) -> rusqlite::Result<bool> {
+        let hit: Option<i64> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 WHERE c.id = ?1 AND r.machine_id IS NOT NULL
+                 LIMIT 1",
+                params![conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
     /// One remote server by id, or `None`.
     pub fn machine_by_id(&self, id: &str) -> rusqlite::Result<Option<MachineRecord>> {
         self.conn
@@ -1460,6 +1533,95 @@ mod tests {
         assert!(after.machines.is_empty());
         assert!(after.repos.iter().all(|r| r.id != "r-remote"), "remote repo gone with its server");
         assert!(after.repos.iter().any(|r| r.id == "r-local"), "local repo stays");
+    }
+
+    /// C9: [`Store::remote_session_for_conversation`] resolves a conversation's
+    /// (cwd, session_id, machine) triple ONLY when all three conditions hold — remote
+    /// repo, known session_id, conversation exists — and stays `None` for every other
+    /// combination (local repo, never-spawned conversation, unknown id).
+    #[test]
+    fn remote_session_for_conversation_requires_a_remote_repo_and_a_known_session() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: Some("/keys/id".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let mut remote = repo_at("r-remote", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+
+        // Remote repo, but no session_id yet (never spawned there): None.
+        s.upsert_conversation(&conv("c-fresh", "r-remote", None)).unwrap();
+        assert!(s.remote_session_for_conversation("c-fresh").unwrap().is_none());
+
+        // Remote repo AND a session_id: resolves.
+        s.upsert_conversation(&conv("c-live", "r-remote", Some("sid-1"))).unwrap();
+        let (cwd, sid, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        assert_eq!(cwd, "/tmp/r-remote");
+        assert_eq!(sid, "sid-1");
+        assert_eq!(machine.id, "m1");
+        assert_eq!(machine.host, "h.example");
+
+        // Local repo, even WITH a session_id: None (nothing remote to push to).
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
+        assert!(s.remote_session_for_conversation("c-local").unwrap().is_none());
+
+        // Unknown conversation id: None, no error.
+        assert!(s.remote_session_for_conversation("no-such-conv").unwrap().is_none());
+    }
+
+    /// C9 journal gate: [`Store::conversation_repo_is_remote`] is looser than
+    /// [`Store::remote_session_for_conversation`] — no `session_id` required, since
+    /// even a conversation that hasn't produced one yet must still be gated the
+    /// moment it's remote. Unknown ids read as `false` (never silently drop an
+    /// event for a conversation this can't even place).
+    #[test]
+    fn conversation_repo_is_remote_needs_no_session_id() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        let mut remote = repo_at("r-remote", 1);
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+
+        s.upsert_conversation(&conv("c-fresh", "r-remote", None)).unwrap();
+        assert!(
+            s.conversation_repo_is_remote("c-fresh").unwrap(),
+            "remote even with no session_id yet",
+        );
+
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
+        assert!(!s.conversation_repo_is_remote("c-local").unwrap());
+
+        assert!(!s.conversation_repo_is_remote("no-such-conv").unwrap());
     }
 
     /// v12 — a machine's full candidate address list round-trips through every reader
