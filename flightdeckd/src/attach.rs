@@ -308,20 +308,33 @@ pub async fn attach_client(
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
     write_half.flush().await?;
 
-    // stdin → socket
-    let stdin_pump = tokio::spawn(async move {
-        let mut stdin = BufReader::new(tokio::io::stdin());
+    // stdin → socket. Read on a plain detached thread, NOT tokio::io::stdin:
+    // tokio reads stdin on its blocking pool, whose uncancellable read the
+    // runtime shutdown waits on — once the daemon closed the stream the
+    // process would linger with stdout open (ssh never sees EOF, the Mac never
+    // learns the link is gone) until the client wrote another line. A
+    // detached thread dies with the process.
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut stdin = std::io::stdin().lock();
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         loop {
             buf.clear();
-            match stdin.read_until(b'\n', &mut buf).await {
-                Ok(0) => break,
+            match stdin.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if write_half.write_all(&buf).await.is_err() || write_half.flush().await.is_err() {
+                    if stdin_tx.blocking_send(buf.clone()).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+            }
+        }
+    });
+    let stdin_pump = tokio::spawn(async move {
+        while let Some(chunk) = stdin_rx.recv().await {
+            if write_half.write_all(&chunk).await.is_err() || write_half.flush().await.is_err() {
+                break;
             }
         }
         write_half.shutdown().await.ok();

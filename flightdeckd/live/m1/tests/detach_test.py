@@ -8,17 +8,27 @@ Runs `flightdeckd attach` THROUGH REAL SSH against the M1 container:
      reattach with the saved cursor and check the replay carries everything
      missed, including the result frame;
   C: `flightdeckd status` still shows the session alive.
+  D: (independent, own throwaway conversation) STALLED-BUT-ALIVE link: SIGSTOP
+     the local ssh mid-burst, let the daemon run into its attach write timeout
+     (ATTACH_WRITE_TIMEOUT), SIGCONT — the stalled stream must END after the
+     kernel/ssh-buffered prefix (+ best-effort fd_detach{stalled}), never dump
+     the outage backlog; a reattach from the cursor then replays the rest.
 
-Usage:  python3 m1-daemon/tests/detach_test.py
+Usage:  python3 m1-daemon/tests/detach_test.py [abc] [d]    (default: all)
 Env:    TARGET (agent@127.0.0.1), PORT (2224), KEY (~/.ssh/flightdeck_m0_ed25519),
         CWD (/work/demo) — point TARGET/PORT/KEY/CWD at a real server to run it there.
+        WRITE_TIMEOUT (20) — the daemon's ATTACH_WRITE_TIMEOUT, in seconds.
+Scenario D needs sshd to tolerate a silent client for ~2 min
+(ClientAliveInterval 0, or Interval x CountMax above that): if sshd drops the
+link instead, the stream also ends and D passes for the wrong reason.
 """
-import json, os, signal, subprocess, sys, threading, time, queue
+import json, os, random, signal, struct, subprocess, sys, threading, time, queue, zlib
 
 TARGET = os.environ.get("TARGET", "agent@127.0.0.1")
 PORT = os.environ.get("PORT", "2224")
 KEY = os.path.expanduser(os.environ.get("KEY", "~/.ssh/flightdeck_m0_ed25519"))
 CWD = os.environ.get("CWD", "/work/demo")
+WRITE_TIMEOUT = float(os.environ.get("WRITE_TIMEOUT", "20"))
 SSH = ["ssh", "-T", "-p", PORT, "-i", KEY, "-o", "IdentitiesOnly=yes",
        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
        TARGET]
@@ -46,15 +56,41 @@ class Attach:
                                   stderr=subprocess.DEVNULL, text=True)
         self.q = queue.Queue()
         self.cursor = cursor
+        self.bytes = 0  # bytes received on this link (stdout of the ssh child)
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
         for line in self.p.stdout:
+            self.bytes += len(line)
             line = line.rstrip("\n")
             if not line: continue
             if eligible(line): self.cursor += 1
             self.q.put(line)
         self.q.put(None)
+
+    # The local ssh child: SIGSTOP = the link stalls but stays alive (TCP up,
+    # zero window) — unlike kill(), which is a clean cut the daemon sees at once.
+    @property
+    def pid(self):
+        return self.p.pid
+
+    def pause(self):
+        os.kill(self.p.pid, signal.SIGSTOP)
+
+    def resume(self):
+        os.kill(self.p.pid, signal.SIGCONT)
+
+    def drain_until_eof(self, timeout):
+        """Every line until the stream ends. Returns (lines, ended)."""
+        t0, got = time.time(), []
+        while time.time() - t0 < timeout:
+            try:
+                line = self.q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if line is None: return got, True
+            got.append(line)
+        return got, False
 
     def send_user(self, text):
         frame = {"type": "user", "uuid": f"py-{time.time()}",
@@ -82,7 +118,110 @@ class Attach:
 
 def jtype(v): return v.get("type")
 
-def main():
+def noise_png(w, h, seed):
+    """An incompressible PNG. The M1 path buffers ~2.2 MB between the daemon and
+    a stopped ssh client (measured: mostly the 2 MB ssh channel window), so
+    the burst must outgrow that for the daemon's write to block at all; an
+    image Read costs ~1.5k tokens but emits a ~1.3 MB stream-json line."""
+    r = random.Random(seed)
+    raw = b"".join(b"\x00" + r.randbytes(w * 3) for _ in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+
+def status_of(conv):
+    out = subprocess.run(SSH + ["flightdeckd", "status"], capture_output=True, text=True, timeout=15)
+    st = json.loads(out.stdout)
+    return next((c for c in st["conversations"] if c["conversation"] == conv), None)
+
+def scenario_d():
+    print(f"== D: stalled-but-alive link (SIGSTOP ssh) — daemon must give up after {WRITE_TIMEOUT:.0f}s")
+    burst_dir = f"/tmp/fdd-scenario-d-{os.getpid()}"
+    images = 4
+    subprocess.run(SSH + [f"mkdir -p {burst_dir}"], check=True, timeout=15)
+    for i in range(images):
+        subprocess.run(SSH + [f"cat > {burst_dir}/noise{i}.png"], input=noise_png(1000, 1000, i),
+                       check=True, timeout=60)
+    steps = []
+    for i in range(images):
+        steps.append(f"Bash: echo step-{2 * i}")
+        steps.append(f"Read: {burst_dir}/noise{i}.png")
+    steps.append("Bash: echo last-step")
+    prompt = ("Do these steps strictly in order, ONE tool call per step, no commentary between them:\n"
+              + "\n".join(f"{n + 1}. {st}" for n, st in enumerate(steps))
+              + "\nThen reply with exactly the single word DONE_D.")
+
+    d = Attach(cwd=CWD)  # a FRESH conversation — independent of A/B/C
+    try:
+        _, att = d.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
+        assert att, "no fd_attach"
+        conv, epoch = att["conversation"], att["epoch"]
+        d.cursor = att["replay_from"]
+        print(f"   attached conv={conv}")
+        d.send_user(prompt)
+        _, first = d.read_until(lambda v: jtype(v) == "assistant", timeout=90)
+        assert first, "burst never started"
+        d.pause()
+        cut_cursor, cut_bytes = d.cursor, d.bytes
+        print(f"   ssh SIGSTOPped mid-burst (pid {d.pid}) at cursor={cut_cursor}")
+
+        # Let the whole burst land daemon-side (the daemon's write blocks once
+        # the in-flight buffers are full), then outlast the write timeout.
+        t0 = time.time()
+        while time.time() - t0 < 300:
+            st = status_of(conv)
+            if st and not st["busy"]:
+                break
+            time.sleep(2)
+        else:
+            raise AssertionError("burst turn did not finish within 300s")
+        print(f"   turn finished daemon-side after {time.time() - t0:.0f}s paused; "
+              f"waiting {WRITE_TIMEOUT + 5:.0f}s more")
+        time.sleep(WRITE_TIMEOUT + 5)
+
+        d.resume()
+        got, ended = d.drain_until_eof(timeout=60)
+        after = d.bytes - cut_bytes
+        print(f"   SIGCONT: {len(got)} lines / {after / 1e6:.2f} MB delivered after resume, stream ended={ended}")
+        assert ended, "the stalled stream never ended — the daemon kept the stalled client attached (pre-D1 behaviour)"
+        frames = []
+        for line in got:
+            try:
+                frames.append(json.loads(line))
+            except Exception:
+                frames.append(None)  # the torn tail of a line cut by EOF
+        detach = [f for f in frames if f and jtype(f) == "fd_detach"]
+        assert all(f.get("reason") == "stalled" for f in detach), f"unexpected detach: {detach}"
+        if detach:
+            assert frames[-1] is detach[-1], "fd_detach{stalled} must be the last frame"
+        assert not any(f and jtype(f) == "result" for f in frames), \
+            "the outage backlog (up to the turn's result) was dumped on the stalled link"
+        print(f"   fd_detach{{stalled}} delivered: {bool(detach)} (best effort — usually not, the link is full)")
+
+        e = Attach(conversation=conv, epoch=epoch, cursor=d.cursor)
+        try:
+            _, att2 = e.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
+            assert att2 and att2["epoch"] == epoch, "reattach epoch mismatch"
+            assert att2["replay_from"] == d.cursor, f"replay_from {att2['replay_from']} != cursor {d.cursor}"
+            backlog = att2["seq"] - d.cursor
+            assert backlog > 0, "no backlog was withheld — the daemon never blocked (burst too small?)"
+            replay, res = e.read_until(lambda v: jtype(v) == "result", timeout=60)
+            assert res, "the withheld backlog was not replayed"
+            assert "DONE_D" in "\n".join(replay), "assistant reply missing from replay"
+            print(f"   withheld backlog {backlog} lines, replayed from cursor {d.cursor} up to the result")
+        finally:
+            e.p.stdin.close(); time.sleep(0.3); e.kill()
+        subprocess.run(SSH + ["flightdeckd", "stop", "--conversation", conv], capture_output=True, timeout=15)
+    finally:
+        try:
+            d.resume(); d.kill()
+        except ProcessLookupError:
+            pass
+        subprocess.run(SSH + [f"rm -rf {burst_dir}"], capture_output=True, timeout=15)
+    print("D GOOD — a stalled link is given up on, not fed the outage")
+
+def scenarios_abc():
     print(f"== A: attach over ssh (port {PORT}), one full turn, clean detach")
     a = Attach(cwd=CWD)
     _, att = a.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
@@ -125,7 +264,15 @@ def main():
     assert alive, f"session not alive in status: {out.stdout}"
     print(f"   session alive: {alive[0]['session_id']}")
     c.p.stdin.close(); time.sleep(0.3); c.kill()
-    print("ALL GOOD — detachment over real SSH proven")
+    print("ABC GOOD — detachment over real SSH proven")
+
+def main():
+    which = "".join(sys.argv[1:]).lower() or "abcd"
+    if "a" in which or "b" in which or "c" in which:
+        scenarios_abc()
+    if "d" in which:
+        scenario_d()
+    print("ALL GOOD")
 
 if __name__ == "__main__":
     main()
