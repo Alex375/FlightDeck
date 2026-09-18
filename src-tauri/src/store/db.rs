@@ -873,6 +873,46 @@ impl Store {
             .optional()
     }
 
+    /// One remote server whose (`host`, `port`, `user`) triple matches exactly, or
+    /// `None` — the idempotency lookup [`crate::bootstrap::orchestrator::bootstrap_server`]
+    /// runs BEFORE minting a fresh session/key, so re-running the bootstrap pipeline
+    /// against an ALREADY-paired server updates that same row (reusing its `id` and
+    /// `identity_file`) instead of duplicating it under a brand-new uuid every time
+    /// (B11 review finding). Matches `host` literally (no DNS/IP normalization,
+    /// exactly the string `add_machine`/the pipeline persisted it as) and returns the
+    /// most recently added match when more than one somehow exists. Never used by
+    /// `add_machine`'s own manual "Add a server" flow, which is deliberately left
+    /// free to mint a fresh record every time (see that function's doc).
+    pub fn machine_by_address(&self, host: &str, port: u16, user: &str) -> rusqlite::Result<Option<MachineRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                        daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+                 FROM machines WHERE host = ?1 AND port = ?2 AND user = ?3
+                 ORDER BY added_at DESC LIMIT 1",
+                params![host, port, user],
+                |row| {
+                    Ok(MachineRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        host: row.get(2)?,
+                        port: row.get(3)?,
+                        user: row.get(4)?,
+                        identity_file: row.get(5)?,
+                        added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     /// Insert or update a remote server (idempotent by id). Connection coordinates
     /// only — never key material (see [`MachineRecord`]). `addresses` round-trips
     /// through [`encode_addresses`]/[`decode_addresses`] as a JSON blob (see
@@ -1671,6 +1711,41 @@ mod tests {
         cleared.addresses = Vec::new();
         s.upsert_machine(&cleared).unwrap();
         assert!(s.machine_by_id("m1").unwrap().unwrap().addresses.is_empty());
+    }
+
+    /// [`Store::machine_by_address`] — the B11 orchestrator idempotency lookup —
+    /// matches the exact (host, port, user) triple, ignores an unrelated machine, and
+    /// reports `None` for a host never paired.
+    #[test]
+    fn machine_by_address_matches_the_exact_triple() {
+        let s = Store::open_in_memory().unwrap();
+        let m1 = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            user: "deploy".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        let mut m2 = m1.clone();
+        m2.id = "m2".into();
+        m2.port = 2222; // same host, different port — must NOT match.
+        s.upsert_machine(&m1).unwrap();
+        s.upsert_machine(&m2).unwrap();
+
+        let found = s.machine_by_address("1.2.3.4", 22, "deploy").unwrap().expect("must find m1");
+        assert_eq!(found.id, "m1");
+        assert_eq!(found.identity_file.as_deref(), Some("/keys/m1"));
+
+        assert!(s.machine_by_address("1.2.3.4", 2222, "deploy").unwrap().is_some());
+        assert!(s.machine_by_address("1.2.3.4", 22, "someone-else").unwrap().is_none());
+        assert!(s.machine_by_address("never-paired.example", 22, "deploy").unwrap().is_none());
     }
 
     /// The ssh-option-injection guard belongs to the persistence boundary, not just

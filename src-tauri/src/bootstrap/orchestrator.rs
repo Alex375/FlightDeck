@@ -97,9 +97,20 @@ use tokio::sync::Mutex;
 use crate::bootstrap::askpass::{BootstrapError, SecretString};
 use crate::bootstrap::{connect, install, server_setup};
 use crate::ipc::commands::{
-    resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, shq, RemoteProbeResult,
+    persist_paired_machine, probe_candidates, resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin,
+    shq, RemoteProbeResult,
 };
 use crate::store::{MachineRecord, Store};
+
+/// Bounded timeout for a single ssh round trip this module makes OUTSIDE the
+/// password/sudo flows (which already have their own, e.g. [`run_sudo`]'s 15s/30s) —
+/// [`diagnose`], [`verify_key_works`], and the plain [`run_ssh_on_machine`] calls in
+/// [`fetch_busy_conversations`]/[`run_plain`]. `ConnectTimeout=10` (baked into
+/// [`crate::ipc::commands::keyed_ssh_options`]) only bounds the TCP/SSH HANDSHAKE, not
+/// a remote shell that hangs after connecting (a stuck lock, a wedged `flightdeckd`) —
+/// without this, `machine_diagnose`/the pipeline's own `Diagnose` step/the RESTART
+/// RULE's busy check could hang the caller forever (B11 review finding).
+const SSH_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ============================================================================
 // Steps — ids, status, the generic (fake-step-testable) pipeline runner
@@ -439,7 +450,7 @@ async fn step_context(
 async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str, known_hosts: &str) -> bool {
     let mut cmd = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
     cmd.arg("-T").arg(format!("{}@{}", target.user, target.host)).arg("true");
-    matches!(cmd.output().await, Ok(out) if out.status.success())
+    matches!(tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await, Ok(Ok(out)) if out.status.success())
 }
 
 /// [`StepId::InstallKey`] — connect + install the app's dedicated key (B4/B7), with the
@@ -452,6 +463,28 @@ async fn step_install_key(
     password: Option<&SecretString>,
     ctx: &Arc<Mutex<PipelineCtx>>,
 ) -> StepOutcome {
+    let Some(known_hosts) = known_hosts_path(app) else {
+        return StepOutcome::Failed("could not resolve the app's data directory".to_string());
+    };
+    let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
+
+    // Re-run convergence (B11 review finding): when `ctx.identity_file` is ALREADY
+    // seeded — `bootstrap_server`/`bootstrap_resume` found a previously-paired
+    // `MachineRecord` for this exact (host, port, user) and pre-filled it — that key
+    // was already claimed (renamed off the shared "pending" path, see
+    // `claim_pending_key`) and will never be handed out by
+    // `generate_or_reuse_pending_key` again. Check THAT key first; only fall through
+    // to minting/reusing the shared pending key (and, if needed, the password path)
+    // when it no longer works (rotated away, file removed, server reimaged). Without
+    // this, a bare re-run of `bootstrap_server` against an already-fully-paired
+    // server would silently generate and try to install a second, unrelated key
+    // every time instead of converging.
+    if let Some(known_identity) = ctx.lock().await.identity_file.clone() {
+        if verify_key_works(&target, &known_identity, &known_hosts).await {
+            return StepOutcome::Skipped(Some("the previously paired key already works".to_string()));
+        }
+    }
+
     let ssh_keys_dir = match app.path().app_data_dir() {
         Ok(d) => d.join("ssh_keys"),
         Err(e) => return StepOutcome::Failed(format!("could not resolve the app's data directory: {e}")),
@@ -460,10 +493,6 @@ async fn step_install_key(
         Ok(k) => k,
         Err(e) => return StepOutcome::Failed(e),
     };
-    let Some(known_hosts) = known_hosts_path(app) else {
-        return StepOutcome::Failed("could not resolve the app's data directory".to_string());
-    };
-    let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
 
     if verify_key_works(&target, &key.identity_file, &known_hosts).await {
         ctx.lock().await.identity_file = Some(key.identity_file.clone());
@@ -516,7 +545,10 @@ async fn step_probe(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &
 /// it off the SAME accumulating [`diagnose`] round trip instead of a second one).
 async fn fetch_busy_conversations(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<u32> {
     let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
-    let out = run_ssh_on_machine(machine, known_hosts, &cmd).await.ok()?;
+    let out = tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, run_ssh_on_machine(machine, known_hosts, &cmd))
+        .await
+        .ok()? // outer timeout elapsed -> unknown, never assumed zero
+        .ok()?; // the ssh round trip itself failed -> unknown
     count_busy_conversations(&out)
 }
 
@@ -533,12 +565,24 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// this is never called on a hot path). See the module doc's `repair` section for why
 /// a non-root system-unit ADOPTION (fixture C's shape) is the one case that can still
 /// need a sudo password here.
+///
+/// Refuses — never silently proceeds — when this SAME fresh diagnosis can't confirm
+/// zero busy conversations (B11 review finding): [`step_upload_daemon`]'s own RESTART
+/// RULE already runs its own preflight busy check before ever calling this, but
+/// [`repair`]'s `RestartDaemon` arm did not, and is reachable directly (a future
+/// wizard UI clearing a `restart_pending` flag) with no such preflight — this makes
+/// the guard unconditional for EVERY caller instead of relying on each one to
+/// remember it, at no extra ssh round trip (the busy count rides the SAME
+/// [`diagnose`] call this function already makes for `installed_as`).
 async fn restart_daemon(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     sudo_password: Option<&SecretString>,
 ) -> Result<(), BootstrapError> {
     let diagnosis = diagnose(machine, known_hosts).await;
+    if diagnosis.busy_conversations != Some(0) {
+        return Err(BootstrapError::DaemonBusy(diagnosis.busy_conversations));
+    }
     match diagnosis.installed_as {
         InstalledAs::System if machine.user == "root" => {
             run_plain(machine, known_hosts, "systemctl restart flightdeckd").await
@@ -569,7 +613,28 @@ async fn restart_daemon(
 }
 
 async fn run_plain(machine: &MachineRecord, known_hosts: Option<&str>, script: &str) -> Result<(), BootstrapError> {
-    run_ssh_on_machine(machine, known_hosts, script).await.map(|_| ()).map_err(BootstrapError::Other)
+    tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, run_ssh_on_machine(machine, known_hosts, script))
+        .await
+        .map_err(|_| BootstrapError::Other("ssh command timed out".to_string()))?
+        .map(|_| ())
+        .map_err(BootstrapError::Other)
+}
+
+/// Scrubs every literal occurrence of `password` out of `text` — the escape hatch a
+/// caller that must surface a remote command's own stderr (e.g. [`run_sudo`]'s
+/// wrong-password branch, which cannot know in advance whether `sudo`'s own prompt
+/// wording echoes it back) uses before that text can ever become a [`BootstrapError`].
+/// Guarded on non-empty so an empty password (never a real one, but worth being
+/// defensive about) can't turn this into a replace-everything-with-redacted mess.
+/// Mirrors `askpass::classify_output`'s own scrub for the SAME reason, in this
+/// module's own sudo path — see `bootstrap_report_json_never_contains_the_test_sudo_password`
+/// below.
+fn scrub_password(text: &str, password: &SecretString) -> String {
+    if password.expose().is_empty() {
+        text.to_string()
+    } else {
+        text.replace(password.expose(), "[redacted]")
+    }
 }
 
 /// `sudo`-wrapped remote command — passwordless first (never prompts when it isn't
@@ -612,12 +677,21 @@ async fn run_sudo(
         return Err(BootstrapError::NeedsSudoPassword);
     }
     let last = out.stderr.trim().lines().last().unwrap_or("sudo restart failed").to_string();
-    let last = if password.expose().is_empty() { last } else { last.replace(password.expose(), "[redacted]") };
-    Err(BootstrapError::Other(last))
+    Err(BootstrapError::Other(scrub_password(&last, password)))
 }
 
-/// [`StepId::UploadDaemon`] — see the module doc's RESTART RULE.
-async fn step_upload_daemon(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &Arc<Mutex<PipelineCtx>>) -> StepOutcome {
+/// [`StepId::UploadDaemon`] — see the module doc's RESTART RULE. `sudo_password`: the
+/// SAME optional password [`bootstrap_server`]'s caller may have supplied UP FRONT —
+/// threaded through so a restart that needs sudo (a non-root login that only ADOPTED
+/// a pre-existing system unit, e.g. fixture C's shape) can use it on the very first
+/// run instead of always degrading to `NeedsInputContinue` even when the caller
+/// already gave everything it needed (B11 review finding).
+async fn step_upload_daemon(
+    app: &tauri::AppHandle,
+    req: &StoredBootstrapRequest,
+    sudo_password: Option<&SecretString>,
+    ctx: &Arc<Mutex<PipelineCtx>>,
+) -> StepOutcome {
     let probe = match ctx.lock().await.probe.clone() {
         Some(p) => p,
         None => return StepOutcome::Failed("no probe result available yet".to_string()),
@@ -642,7 +716,7 @@ async fn step_upload_daemon(app: &tauri::AppHandle, req: &StoredBootstrapRequest
         let n = busy.map(|b| b.to_string()).unwrap_or_else(|| "an unknown number of".to_string());
         return StepOutcome::NeedsInputContinue(format!("restart pending — {n} conversation(s) running"));
     }
-    match restart_daemon(&machine, Some(&known_hosts), None).await {
+    match restart_daemon(&machine, Some(&known_hosts), sudo_password).await {
         Ok(()) => StepOutcome::Ok(Some(format!("{outcome:?}; restarted"))),
         Err(e) => StepOutcome::NeedsInputContinue(format!("restart pending — could not restart automatically: {e}")),
     }
@@ -715,22 +789,44 @@ async fn step_claude_auth(app: &tauri::AppHandle, req: &StoredBootstrapRequest, 
     }
 }
 
-/// [`StepId::AddMachine`] — reuses the EXISTING, already-tested
-/// [`crate::ipc::commands::add_machine`] verbatim (its own success hook already
-/// provisions the phone token, C10) rather than a second, parallel pairing path.
+/// [`StepId::AddMachine`] — persists the [`crate::store::MachineRecord`] via
+/// [`persist_paired_machine`] (its own success hook already provisions the phone
+/// token, C10), reusing `ctx.machine_id` when a previous step already seeded it (see
+/// [`bootstrap_server`]'s own idempotency lookup) so a converging re-run updates the
+/// SAME row instead of minting a duplicate.
+///
+/// Deliberately does NOT call [`crate::ipc::commands::add_machine`] (B11 review
+/// finding): that function's own pairing probe hard-requires `claude` to already be
+/// installed on the target, so routing through it verbatim FAILED the whole pipeline
+/// — never reaching `NeedsClaudeSignIn` — on every server that doesn't have `claude`
+/// yet, which is every one of the brief's own fixtures and the primary "bootstrap a
+/// fresh box" use case. By this point in the pipeline, reachability is ALREADY proven
+/// ([`StepId::Probe`] succeeded) and "claude missing" is ALREADY handled as its own,
+/// separate, non-blocking [`StepId::ClaudeAuth`] step — gating pairing on it again
+/// here would just re-fail what that step deliberately lets through.
 async fn step_add_machine(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &Arc<Mutex<PipelineCtx>>) -> StepOutcome {
     let identity_file = match ctx.lock().await.identity_file.clone() {
         Some(i) => i,
         None => return StepOutcome::Failed("no key available".to_string()),
     };
-    match crate::ipc::commands::add_machine(
-        app.clone(),
+    let existing_machine_id = ctx.lock().await.machine_id.clone();
+    let candidates = probe_candidates(&req.host, None);
+    // Same ssh-option-injection guard `add_machine` runs before ever persisting —
+    // `Store::upsert_machine` re-checks this too (belt and suspenders), but failing
+    // here gives the SAME friendly message `add_machine` would rather than a raw SQL
+    // conversion error surfacing from the store layer instead.
+    if let Err(e) = candidates.iter().try_for_each(|c| crate::store::validate_address_value(&c.value)) {
+        return StepOutcome::Failed(e);
+    }
+    match persist_paired_machine(
+        app,
+        existing_machine_id,
         req.label.clone(),
         req.host.clone(),
         req.port,
         req.user.clone(),
         Some(identity_file),
-        None,
+        candidates,
     )
     .await
     {
@@ -786,7 +882,12 @@ fn build_pipeline(
         },
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
-            PipelineStep::new(StepId::UploadDaemon, move || async move { step_upload_daemon(&app, &req, &ctx).await })
+            // Cloned (not moved) — `EscalatePersistence`'s own closure below is the
+            // LAST user of `sudo_password` and takes ownership of it.
+            let upload_sudo_password = sudo_password.clone();
+            PipelineStep::new(StepId::UploadDaemon, move || async move {
+                step_upload_daemon(&app, &req, upload_sudo_password.as_ref(), &ctx).await
+            })
         },
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
@@ -844,6 +945,14 @@ fn emit_progress(app: &tauri::AppHandle, session_id: &str, host: &str, states: &
     }
 }
 
+/// `existing_machine`: a [`MachineRecord`] ALREADY paired against this exact
+/// (host, port, user) — see [`bootstrap_server`]'s own lookup — pre-seeds the
+/// pipeline's [`PipelineCtx`] with its id/identity file so a converging re-run
+/// ([`step_install_key`] reuses the already-working key, [`step_add_machine`] updates
+/// the SAME row) never mints a second, duplicate [`MachineRecord`] for a server this
+/// Mac already bootstrapped (B11 review finding). `None` for a genuinely first-contact
+/// host, or when the caller (`bootstrap_resume`) has no fresher match than what its
+/// own paused session already carries forward through the (unaffected) resume path.
 async fn run_pipeline_and_register(
     app: &tauri::AppHandle,
     sessions: &BootstrapSessions,
@@ -851,8 +960,13 @@ async fn run_pipeline_and_register(
     req: StoredBootstrapRequest,
     password: Option<SecretString>,
     sudo_password: Option<SecretString>,
+    existing_machine: Option<MachineRecord>,
 ) -> BootstrapReport {
-    let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+    let ctx = Arc::new(Mutex::new(PipelineCtx {
+        identity_file: existing_machine.as_ref().and_then(|m| m.identity_file.clone()),
+        machine_id: existing_machine.as_ref().map(|m| m.id.clone()),
+        ..Default::default()
+    }));
     let steps = build_pipeline(app.clone(), req.clone(), password, sudo_password.clone(), ctx.clone());
     let app_for_progress = app.clone();
     let host = req.host.clone();
@@ -878,6 +992,14 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 
 /// Start (or, on retry, re-run from scratch — every step is idempotent) the full
 /// bootstrap pipeline. See the module doc.
+///
+/// Looks up a [`MachineRecord`] ALREADY paired at this exact (`host`, `port`, `user`)
+/// BEFORE running anything (see [`run_pipeline_and_register`]'s own doc) — the
+/// convergence a bare re-run needs (B11 review finding): without it, a second call
+/// against an already-fully-paired server would generate and try to install a brand
+/// new key (the shared "pending" one was already claimed/renamed by the first run's
+/// `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
+/// host under a fresh uuid, rather than converging on the one that already exists.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_server(
@@ -895,12 +1017,21 @@ pub async fn bootstrap_server(
     let req = StoredBootstrapRequest { label, host, port, user, mask_sleep };
     let password = password.map(SecretString::new);
     let sudo_password = sudo_password.map(SecretString::new);
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, password, sudo_password).await)
+    let existing_machine =
+        app.state::<Store>().machine_by_address(&req.host, req.port, &req.user).map_err(|e| e.to_string())?;
+    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, password, sudo_password, existing_machine).await)
 }
 
 /// Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
 /// needing a sudo password) — re-runs the same, idempotent pipeline with
 /// `sudo_password` now available.
+///
+/// Runs the SAME idempotency lookup [`bootstrap_server`] does (rather than assuming
+/// the paused session is the only in-progress state that matters): a completely
+/// separate, already-finished pairing for this exact host could exist by the time a
+/// resume happens (e.g. the same host paired again through a different session while
+/// this one sat paused) — reusing it here keeps `bootstrap_resume` exactly as
+/// convergent as a fresh `bootstrap_server` call.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_resume(
@@ -911,7 +1042,9 @@ pub async fn bootstrap_resume(
 ) -> Result<BootstrapReport, String> {
     let sudo_password = sudo_password.map(SecretString::new);
     let (req, resolved_password) = sessions.resume(&session_id, sudo_password).await?;
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password).await)
+    let existing_machine =
+        app.state::<Store>().machine_by_address(&req.host, req.port, &req.user).map_err(|e| e.to_string())?;
+    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password, existing_machine).await)
 }
 
 /// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`].
@@ -962,6 +1095,16 @@ pub struct ServerDiagnosis {
     /// bytes that the currently-running process hasn't picked up yet.
     pub restart_pending: bool,
     pub reboot_safe: Option<bool>,
+    /// The RAW `loginctl show-user -p Linger` marker — a sub-fact
+    /// [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
+    /// (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
+    /// `EnableLinger` summary can report "already enabled" precisely instead of a
+    /// fixed claim (B11 review finding). Read unconditionally by [`diagnose_script`]
+    /// regardless of [`installed_as`](Self::installed_as) — like
+    /// [`sleep_masked`](Self::sleep_masked), it is meaningful only for a User-level
+    /// install, but is never itself gated on that (never a false `Some(false)`
+    /// manufactured for an install kind it doesn't apply to).
+    pub linger: Option<bool>,
     pub sleep_masked: Option<bool>,
     pub claude_installed: Option<bool>,
     pub claude_logged_in: Option<bool>,
@@ -983,6 +1126,7 @@ impl ServerDiagnosis {
             daemon_version_running: None,
             restart_pending: false,
             reboot_safe: None,
+            linger: None,
             sleep_masked: None,
             claude_installed: None,
             claude_logged_in: None,
@@ -1153,6 +1297,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         daemon_version_running,
         restart_pending,
         reboot_safe,
+        linger,
         sleep_masked,
         claude_installed,
         claude_logged_in,
@@ -1218,9 +1363,11 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
     let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
     cmd.arg("-T").arg(format!("{}@{}", machine.user, machine.host)).arg(diagnose_script());
-    match cmd.output().await {
-        Ok(out) => parse_diagnosis(&String::from_utf8_lossy(&out.stdout), out.status.success()),
-        Err(_) => parse_diagnosis("", false),
+    // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
+    // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
+    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => parse_diagnosis(&String::from_utf8_lossy(&out.stdout), out.status.success()),
+        Ok(Err(_)) | Err(_) => parse_diagnosis("", false),
     }
 }
 
@@ -1294,6 +1441,15 @@ async fn repair(
         .identity_file
         .as_deref()
         .ok_or_else(|| BootstrapError::Other("this server has no dedicated key on record".to_string()))?;
+    // `install::escalate_persistence` reports no idempotency signal of its own (`()`
+    // whether it changed anything or the server was already in that state) — captured
+    // BEFORE dispatch so `EnableLinger`/`MaskSleep`'s summaries below can say "already
+    // enabled/masked" instead of a fixed string that claims a change even on a no-op
+    // re-run (B11 review finding).
+    let before = match action {
+        RepairAction::EnableLinger | RepairAction::MaskSleep => Some(diagnose(machine, known_hosts).await),
+        _ => None,
+    };
     let summary = match action {
         RepairAction::ReuploadDaemon => {
             let target =
@@ -1318,11 +1474,19 @@ async fn repair(
         }
         RepairAction::EnableLinger => {
             install::escalate_persistence(machine, known_hosts, sudo_password, false).await?;
-            "linger enabled".to_string()
+            if before.as_ref().and_then(|d| d.linger) == Some(true) {
+                "linger was already enabled".to_string()
+            } else {
+                "linger enabled".to_string()
+            }
         }
         RepairAction::MaskSleep => {
             install::escalate_persistence(machine, known_hosts, sudo_password, true).await?;
-            "sleep targets masked".to_string()
+            if before.as_ref().and_then(|d| d.sleep_masked) == Some(true) {
+                "sleep targets were already masked".to_string()
+            } else {
+                "sleep targets masked".to_string()
+            }
         }
         RepairAction::RunInit => {
             let outcome = server_setup::run_init(machine, known_hosts, &machine.label).await?;
@@ -1441,6 +1605,7 @@ mod tests {
         assert_eq!(d.daemon_version_running.as_deref(), Some("0.2.0"));
         assert!(!d.restart_pending);
         assert_eq!(d.reboot_safe, Some(true));
+        assert_eq!(d.linger, Some(false), "healthy_stdout's FLIGHTDECK_LINGER:no must read as Some(false)");
         assert_eq!(d.sleep_masked, Some(true));
         assert_eq!(d.claude_installed, Some(true));
         assert_eq!(d.claude_logged_in, Some(true));
@@ -1568,6 +1733,7 @@ mod tests {
             daemon_version_running: Some("0.2.0".into()),
             restart_pending: false,
             reboot_safe: Some(true),
+            linger: Some(false),
             sleep_masked: Some(true),
             claude_installed: Some(true),
             claude_logged_in: Some(true),
@@ -1787,6 +1953,66 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(!debug.contains("super-secret-sudo-password"), "debug leaked the password: {debug}");
         assert!(debug.contains("redacted"), "debug should show SecretString's own redaction: {debug}");
+    }
+
+    /// [`scrub_password`] — the pure helper [`run_sudo`]'s own wrong-password branch
+    /// runs a captured sudo error through before it can ever become a
+    /// [`BootstrapError`] — removes every literal occurrence, mirroring
+    /// `askpass::classify_output`'s own scrub for the same reason.
+    #[test]
+    fn scrub_password_removes_every_literal_occurrence() {
+        const SECRET: &str = "sUp3r-s3cr3t-sudo-p4ssw0rd-9f3c";
+        let stderr = format!(
+            "[sudo] password for u: \nSorry, try again.\n[sudo] password for u: {SECRET}\n\
+             sudo: 1 incorrect password attempt"
+        );
+        let scrubbed = scrub_password(&stderr, &SecretString::new(SECRET.to_string()));
+        assert!(!scrubbed.contains(SECRET), "scrub left the password in: {scrubbed}");
+        assert!(scrubbed.contains("[redacted]"));
+
+        // Guarded on non-empty — must never turn into a replace-everything mess.
+        assert_eq!(scrub_password("unchanged", &SecretString::new(String::new())), "unchanged");
+    }
+
+    /// Crate-wide discipline mirrored from `askpass::
+    /// askpass_errors_never_contain_the_test_password` (see this module's own doc,
+    /// and the `tosse/mod.rs` precedent it in turn mirrors) — every wire-facing shape
+    /// a bootstrap run can hand a caller ([`BootstrapReport`], the
+    /// [`crate::ipc::events::BootstrapProgressEvent`] steps it's built from) must
+    /// never carry a real password, even when a step's own detail text is built from
+    /// remote output that happened to mention it. Exercises [`scrub_password`] — the
+    /// SAME function [`run_sudo`]'s wrong-password branch calls — against a step
+    /// outcome shaped exactly like that branch's own `Err(BootstrapError::Other(_))`,
+    /// then serializes the full [`BootstrapReport`] (and the wire `StepState`s a live
+    /// run actually emits) to JSON and asserts the secret is gone from both.
+    #[tokio::test]
+    async fn bootstrap_report_and_progress_event_json_never_contain_the_test_sudo_password() {
+        const SECRET: &str = "sUp3r-s3cr3t-sudo-p4ssw0rd-9f3c";
+        let raw_sudo_stderr = format!("[sudo] password for u: {SECRET}\nSorry, try again.");
+        let scrubbed_detail = scrub_password(&raw_sudo_stderr, &SecretString::new(SECRET.to_string()));
+        assert!(!scrubbed_detail.contains(SECRET), "the scrub itself must remove the secret before this test proceeds");
+
+        let steps = vec![
+            PipelineStep::new(StepId::InstallKey, || async { StepOutcome::Ok(None) }),
+            PipelineStep::new(StepId::EscalatePersistence, move || async move { StepOutcome::Failed(scrubbed_detail) }),
+        ];
+        let (states, needs_input) = run_steps(steps, &mut |_| {}).await;
+
+        let report = BootstrapReport {
+            session_id: "s1".to_string(),
+            host: "h".to_string(),
+            steps: states.clone(),
+            needs_input,
+            machine_id: None,
+            diagnosis: None,
+        };
+        let report_json = serde_json::to_string(&report).expect("BootstrapReport must serialize");
+        assert!(!report_json.contains(SECRET), "BootstrapReport JSON leaked the sudo password: {report_json}");
+
+        // The wire shape `emit_progress` actually sends on every transition.
+        let event_steps: Vec<_> = states.iter().map(StepState::to_wire).collect();
+        let event_json = serde_json::to_string(&event_steps).expect("BootstrapProgressStep must serialize");
+        assert!(!event_json.contains(SECRET), "BootstrapProgressEvent JSON leaked the sudo password: {event_json}");
     }
 
     // ========================================================================

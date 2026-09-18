@@ -3705,7 +3705,7 @@ pub(crate) fn keyed_ssh_options(
 }
 
 /// [`keyed_ssh_options`] with an explicit `ssh` program instead of [`ssh_binary`]'s
-/// resolution. Only [`run_ssh_on_machine_with_stdin`]'s test seam passes something
+/// resolution. Only [`run_ssh_on_machine_stdin`]'s test seam passes something
 /// other than [`ssh_binary`]: a test that hands it a fake-`ssh` directory must get
 /// THAT fake, not whatever process-wide `TOSSE_TEST_SSH_BIN` another concurrently
 /// running test family (appmcp::provision) happens to have set at that instant.
@@ -4235,7 +4235,7 @@ async fn claim_pending_key_locked(
 /// `host` keeps its discovered kind (e.g. `Lan`) when it matches one of `addresses`
 /// by value, and is recorded as `Manual` otherwise (typed by hand, or edited away
 /// from every discovered candidate). Pure.
-fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
+pub(crate) fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
     let discovered = addresses.unwrap_or_default();
     let host_kind = discovered
         .iter()
@@ -4309,7 +4309,51 @@ pub async fn add_machine(
         format!("Could not pair — every address failed. {}", failures.join(" — "))
     })?;
 
-    let machine_id = uuid::Uuid::new_v4().to_string();
+    // `add_machine` always mints a fresh id here — a manual "Add a server" pairing is
+    // never deduplicated by host (see `persist_paired_machine`'s own doc for the ONE
+    // caller that IS: the B11 bootstrap orchestrator, which looks up an existing
+    // [`MachineRecord`] itself and passes its id through instead).
+    persist_paired_machine(&app, None, label, working_host, port, user, identity_file, candidates).await
+}
+
+/// Persist an ALREADY-VERIFIED pairing (reachable, `identity_file` either already
+/// accepted or about to be claimed) as a [`MachineRecord`] — the shared tail of
+/// [`add_machine`]'s own probing loop AND
+/// [`crate::bootstrap::orchestrator::step_add_machine`] (B11 review finding: the
+/// orchestrator pipeline used to reuse [`add_machine`] VERBATIM, which routes every
+/// pairing through [`probe_remote`]'s own `claude`/`flightdeckd`-gated probe — so the
+/// WHOLE pipeline failed, rather than reaching `NeedsClaudeSignIn`, on every server
+/// that doesn't have `claude` installed yet, i.e. every one of the brief's own
+/// fixtures and the primary "bootstrap a fresh box" use case. The pipeline verifies
+/// reachability itself, via its own `StepId::Probe`, and handles "claude missing" as
+/// its own, later, non-blocking `StepId::ClaudeAuth` step, so it calls this directly
+/// instead).
+///
+/// `existing_machine_id`: `Some` reuses that id — [`Store::upsert_machine`]'s
+/// `ON CONFLICT(id) DO UPDATE` then updates the SAME row instead of inserting a
+/// second one (the orchestrator's own idempotency fix: it looks up a
+/// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline and
+/// threads the id through here on every later, converging re-run). `None` — every
+/// `add_machine` call — always mints a fresh uuid, unchanged from before this
+/// refactor.
+///
+/// Claims the pending key (a no-op when `identity_file` is already a per-machine
+/// path, e.g. the orchestrator reusing a PREVIOUSLY claimed key — see
+/// [`claim_pending_key`]), builds/upserts the record, and fires the SAME C10
+/// "provision this Mac's phone, if one is already configured" hook `add_machine`
+/// always has.
+pub(crate) async fn persist_paired_machine(
+    app: &tauri::AppHandle,
+    existing_machine_id: Option<String>,
+    label: String,
+    working_host: String,
+    port: u16,
+    user: String,
+    identity_file: Option<String>,
+    addresses: Vec<AddressCandidate>,
+) -> Result<MachineRecord, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let machine_id = existing_machine_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let identity_file =
         claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
 
@@ -4321,7 +4365,7 @@ pub async fn add_machine(
         user,
         identity_file,
         added_at: now_ms(),
-        addresses: candidates,
+        addresses,
         daemon_mac_id: None,
         daemon_relay_url: None,
         daemon_label: None,

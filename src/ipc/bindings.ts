@@ -2611,6 +2611,14 @@ async bootstrapEscalatePersistence(machineId: string, password: string | null, m
 /**
  * Start (or, on retry, re-run from scratch — every step is idempotent) the full
  * bootstrap pipeline. See the module doc.
+ * 
+ * Looks up a [`MachineRecord`] ALREADY paired at this exact (`host`, `port`, `user`)
+ * BEFORE running anything (see [`run_pipeline_and_register`]'s own doc) — the
+ * convergence a bare re-run needs (B11 review finding): without it, a second call
+ * against an already-fully-paired server would generate and try to install a brand
+ * new key (the shared "pending" one was already claimed/renamed by the first run's
+ * `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
+ * host under a fresh uuid, rather than converging on the one that already exists.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -2624,6 +2632,13 @@ async bootstrapServer(label: string, host: string, port: number, user: string, p
  * Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
  * needing a sudo password) — re-runs the same, idempotent pipeline with
  * `sudo_password` now available.
+ * 
+ * Runs the SAME idempotency lookup [`bootstrap_server`] does (rather than assuming
+ * the paused session is the only in-progress state that matters): a completely
+ * separate, already-finished pairing for this exact host could exist by the time a
+ * resume happens (e.g. the same host paired again through a different session while
+ * this one sat paused) — reusing it here keeps `bootstrap_resume` exactly as
+ * convergent as a fresh `bootstrap_server` call.
  */
 async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -4746,7 +4761,19 @@ export type ServerDiagnosis = { state: DiagnosisState; installed_as: InstalledAs
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
  */
-restart_pending: boolean; reboot_safe: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null }
+restart_pending: boolean; reboot_safe: boolean | null; 
+/**
+ * The RAW `loginctl show-user -p Linger` marker — a sub-fact
+ * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
+ * (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
+ * `EnableLinger` summary can report "already enabled" precisely instead of a
+ * fixed claim (B11 review finding). Read unconditionally by [`diagnose_script`]
+ * regardless of [`installed_as`](Self::installed_as) — like
+ * [`sleep_masked`](Self::sleep_masked), it is meaningful only for a User-level
+ * install, but is never itself gated on that (never a false `Some(false)`
+ * manufactured for an install kind it doesn't apply to).
+ */
+linger: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null }
 /**
  * This node's relay identity, straight off `flightdeckd whoami` (`{mac_id, relay_url,
  * label}` — see that subcommand's own doc in `flightdeckd/src/main.rs`). Field names
