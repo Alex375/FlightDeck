@@ -287,8 +287,16 @@ pub struct TerminalExitEvent {
 /// `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
 /// per session; a session that was ALREADY signed in never emits this (it jumps
 /// straight to [`ServerLoginResultEvent`]).
+///
+/// ⚠️ `session_id` (added for the B-finding #4 single-flight fix's own follow-up
+/// review) is what lets a listener tell THIS session apart from one it has already
+/// moved past for the same `machine_id` — at most one session is ever live per
+/// machine, but a just-superseded session's belated event can still arrive after a
+/// `restart_claude_login` replacement is already known. See `ClaudeSignInInline`'s and
+/// `claudeLoginSessions.ts`'s own filtering docs.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct ServerLoginPromptEvent {
+    pub session_id: String,
     pub machine_id: String,
     pub url: String,
 }
@@ -297,8 +305,15 @@ pub struct ServerLoginPromptEvent {
 /// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
 /// otherwise. NEVER emitted for a session the front itself cancelled (see
 /// `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+///
+/// ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
+/// has no way to distinguish this session's OWN terminal event from a stale one
+/// belonging to a session it has already moved past (the exact "Restart sign-in"
+/// race a follow-up review of B-finding #4 caught: the just-superseded session's
+/// belated `superseded` result clobbering the brand-new session's state).
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct ServerLoginResultEvent {
+    pub session_id: String,
     pub machine_id: String,
     pub ok: bool,
     pub email: Option<String>,
@@ -325,35 +340,19 @@ pub struct HostKeyFingerprintEvent {
     pub known: bool,
 }
 
-/// Progress notice for `bootstrap::install`'s three commands (B8/B9:
-/// `bootstrap_upload_daemon` / `bootstrap_install_service` /
-/// `bootstrap_escalate_persistence`) — `step` names which one (`"upload_daemon"` /
-/// `"install_service"` / `"escalate_persistence"`), `status` is `"started"` / `"ok"` /
-/// `"failed"`, and `detail` carries the outcome (debug-formatted) or error text on a
-/// terminal status. Carries BOTH `machine_id` and `host` (never just one or the other):
-/// every caller of these three commands already has a paired [`crate::store::
-/// MachineRecord`] in hand (unlike B7's first-contact probe, which only has a host), so
-/// there is no reason to make a listener choose — it can key off whichever it already
-/// has.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
-pub struct BootstrapStepEvent {
-    pub machine_id: String,
-    pub host: String,
-    pub step: String,
-    pub status: String,
-    pub detail: Option<String>,
-}
-
 /// B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
-/// pipeline (`bootstrap_server` / `bootstrap_resume`) — unlike [`BootstrapStepEvent`]
-/// (one event per command, per B8/B9's three separate commands), this carries the
-/// WHOLE step list on every emit, so a listener never has to reconstruct progress by
-/// accumulating a stream of partial deltas: the latest event alone is the complete
-/// picture. `steps[].status` is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/
-/// `"failed"`/`"needs_input"` (see `orchestrator::StepStatus::wire_str`, the one place
-/// that owns this exact wording). `session_id` is the opaque handle
-/// `bootstrap_server`'s own response carries — the SAME id `bootstrap_resume`/
-/// `bootstrap_cancel` take back.
+/// pipeline (`bootstrap_server` / `bootstrap_resume`) — carries the WHOLE step list on
+/// every emit, so a listener never has to reconstruct progress by accumulating a stream
+/// of partial deltas: the latest event alone is the complete picture. `steps[].status`
+/// is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/`"failed"`/`"needs_input"` (see
+/// `orchestrator::StepStatus::wire_str`, the one place that owns this exact wording).
+/// `session_id` is the opaque handle `bootstrap_server`'s own response carries — the
+/// SAME id `bootstrap_resume`/`bootstrap_cancel` take back.
+///
+/// (B8/B9's earlier, per-command `BootstrapStepEvent` — one event per `bootstrap_
+/// upload_daemon`/`bootstrap_install_service`/`bootstrap_escalate_persistence` call —
+/// was removed once B11's orchestrator superseded those granular commands and nothing
+/// in the front end listened to it any more; see B-finding #5.)
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct BootstrapProgressStep {
     pub id: String,

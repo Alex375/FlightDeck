@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => {
     machineRepair: vi.fn(),
     machineDiagnose: vi.fn(),
     startClaudeLogin: vi.fn(),
+    restartClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
     generateMachineKey: vi.fn(),
@@ -63,6 +64,7 @@ vi.mock("../../ipc/client", () => ({
     machineRepair: mocks.machineRepair,
     machineDiagnose: mocks.machineDiagnose,
     startClaudeLogin: mocks.startClaudeLogin,
+    restartClaudeLogin: mocks.restartClaudeLogin,
     submitClaudeLoginCode: mocks.submitClaudeLoginCode,
     cancelClaudeLogin: mocks.cancelClaudeLogin,
     generateMachineKey: mocks.generateMachineKey,
@@ -81,6 +83,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { useSettingsUi } from "../../store/settingsUi";
 import sharedStyles from "./SettingsPanel.module.css";
+import { useClaudeLoginSessions } from "./claudeLoginSessions";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -178,6 +181,7 @@ beforeEach(() => {
   loadPersistedState.mockReset();
   loadPersistedState.mockResolvedValue({ status: "ok", data: { machines: [], repos: [], conversations: [], active_id: null } });
   useSettingsUi.setState({ bootstrapGuard: null });
+  useClaudeLoginSessions.setState({ active: {} });
 });
 
 afterEach(() => {
@@ -409,6 +413,49 @@ describe("ServerBootstrapWizard — needs_input states", () => {
 
     expect(container.textContent).toContain("isn't signed in to Claude Code yet");
     expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start Claude sign-in")).toBe(true);
+  });
+
+  // B-finding #2: `onSignedIn` used to be a no-op shallow array copy — the
+  // `claude_auth` step's own `status` never actually flipped off `needs_input`, so
+  // this panel kept showing "isn't signed in to Claude Code yet" forever, directly
+  // above `ClaudeSignInInline`'s own "Signed in as …" success line, even after a
+  // confirmed sign-in.
+  it("Claude sign-in: a confirmed inline sign-in flips the stale 'isn't signed in' panel to the success state", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-claude-ok",
+        host: "claude-ok.example.com",
+        steps: allOk({ claude_auth: { status: "needs_input", detail: "Needs Claude sign-in" } }),
+        needs_input: null,
+        machine_id: "m-claude-ok",
+        diagnosis: { state: { kind: "needs_claude_sign_in" } },
+      },
+    });
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "login-1", machine_id: "m-claude-ok", owned: true } });
+
+    mount();
+    fill("Address", "claude-ok.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+    expect(container.textContent).toContain("isn't signed in to Claude Code yet");
+
+    clickButtonWithText("Start Claude sign-in");
+    await settle();
+
+    // The confirmed result — exactly what a real successful sign-in emits.
+    act(() =>
+      mocks.serverLoginResultEvent.emit({ session_id: "login-1", machine_id: "m-claude-ok", ok: true, email: "armand@example.com", error: null }),
+    );
+    await settle();
+
+    // The whole stale panel (header + `ClaudeSignInInline`) is gone — `claudeStep`
+    // stops matching once `claude_auth`'s status is no longer `needs_input` — and the
+    // checklist row itself now shows the confirmed email as its `ok` detail.
+    expect(container.textContent).not.toContain("isn't signed in to Claude Code yet");
+    expect(container.textContent).not.toContain("Signed in as");
+    expect(container.textContent).toContain("armand@example.com");
   });
 
   it("host key mismatch: offers to forget the old key and retry, then re-submits", async () => {

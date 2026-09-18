@@ -593,7 +593,18 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
       {claudeStep && machineId && (
         <div className={wStyles.actionPanel}>
           <div>This server isn&apos;t signed in to Claude Code yet.</div>
-          <ClaudeSignInInline machineId={machineId} onSignedIn={() => setSteps((cur) => [...cur])} />
+          <ClaudeSignInInline
+            machineId={machineId}
+            // Flip `claude_auth` to `ok` on a CONFIRMED sign-in — a shallow `[...cur]`
+            // copy here (the previous version's bug) keeps the same step object, so
+            // `claudeSignInStep(steps)` (gated on `status === "needs_input"`) never
+            // stops matching and this panel kept showing "isn't signed in yet" forever
+            // directly above `ClaudeSignInInline`'s own "Signed in as …" (B-finding
+            // #2). Mapping the ACTUAL step to `ok` here is what makes it disappear.
+            onSignedIn={(email) =>
+              setSteps((cur) => cur.map((s) => (s.id === "claude_auth" ? { ...s, status: "ok", detail: email } : s)))
+            }
+          />
         </div>
       )}
 

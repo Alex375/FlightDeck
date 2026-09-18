@@ -38,7 +38,7 @@ use specta::Type;
 use crate::bootstrap::askpass::{self, BootstrapError, SecretString};
 use crate::bootstrap::templates;
 use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, RemoteProbeResult};
-use crate::store::{MachineRecord, Store};
+use crate::store::MachineRecord;
 
 /// Default bound for this module's stdin-bearing ssh calls — every one here except the
 /// daemon binary upload itself is a short script with no meaningful payload (a unit
@@ -1098,114 +1098,6 @@ pub(crate) async fn escalate_persistence_with_override(
     run_sudo_with_password(machine, known_hosts, ssh_bin_override, &script, password).await
 }
 
-// ============================================================================
-// Tauri commands
-// ============================================================================
-
-/// Resolve the app's dedicated `known_hosts` path — mirrors
-/// `bootstrap::connect::known_hosts_path` / `bootstrap::server_setup::known_hosts_path`,
-/// each module's own tiny, App-Handle-only copy of this same resolution rather than a
-/// shared helper (established convention in this directory already).
-fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
-    use tauri::Manager;
-    app.path()
-        .app_data_dir()
-        .ok()
-        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned())
-}
-
-/// Emit a [`crate::ipc::events::BootstrapStepEvent`], logging (never swallowing) a
-/// failed emit — mirrors `ipc::events::emit_logged`'s discipline for every other event
-/// in this crate. Coarse-grained on purpose (one `started` + one `ok`/`failed` per
-/// command, not per internal ssh round trip): the three commands below are each already
-/// a single bounded operation from the UI's point of view, and `detail` on the terminal
-/// event carries the actual outcome/error text.
-fn emit_step(app: &tauri::AppHandle, machine: &MachineRecord, step: &str, status: &str, detail: Option<String>) {
-    use tauri_specta::Event;
-    let ev = crate::ipc::events::BootstrapStepEvent {
-        machine_id: machine.id.clone(),
-        host: machine.host.clone(),
-        step: step.to_string(),
-        status: status.to_string(),
-        detail,
-    };
-    if let Err(e) = ev.emit(app) {
-        eprintln!("[bootstrap::install] failed to emit bootstrap_step event: {e}");
-    }
-}
-
-fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineRecord, String> {
-    use tauri::Manager;
-    app.state::<Store>()
-        .machine_by_id(machine_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "unknown server".to_string())
-}
-
-/// Upload the static musl `flightdeckd` binary for `arch` onto `machine_id`. See
-/// [`upload_daemon`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_upload_daemon(
-    app: tauri::AppHandle,
-    machine_id: String,
-    arch: String,
-) -> Result<UploadOutcome, String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    emit_step(&app, &machine, "upload_daemon", "started", None);
-    let result = upload_daemon(&app, &machine, &arch, known_hosts.as_deref()).await;
-    match &result {
-        Ok(outcome) => emit_step(&app, &machine, "upload_daemon", "ok", Some(format!("{outcome:?}"))),
-        Err(e) => emit_step(&app, &machine, "upload_daemon", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
-}
-
-/// Set up `flightdeckd` to persist on `machine_id`, given B7's `probe`. See
-/// [`install_service`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_install_service(
-    app: tauri::AppHandle,
-    machine_id: String,
-    probe: RemoteProbeResult,
-) -> Result<ServiceOutcome, String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    emit_step(&app, &machine, "install_service", "started", None);
-    let result = install_service(&machine, &probe, known_hosts.as_deref()).await;
-    match &result {
-        Ok(outcome) => emit_step(&app, &machine, "install_service", "ok", Some(format!("{outcome:?}"))),
-        Err(e) => emit_step(&app, &machine, "install_service", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
-}
-
-/// Escalate persistence (linger + optional sleep-target masking) on `machine_id`. See
-/// [`escalate_persistence`]. `password`, when given, is the ALREADY-CAPTURED server
-/// login password from earlier in the wizard (never re-typed here) — held only long
-/// enough to build a [`SecretString`] for this one call.
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_escalate_persistence(
-    app: tauri::AppHandle,
-    machine_id: String,
-    password: Option<String>,
-    mask_sleep: bool,
-) -> Result<(), String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    let secret = password.map(SecretString::new);
-    emit_step(&app, &machine, "escalate_persistence", "started", None);
-    let result = escalate_persistence(&machine, known_hosts.as_deref(), secret.as_ref(), mask_sleep).await;
-    match &result {
-        Ok(()) => emit_step(&app, &machine, "escalate_persistence", "ok", None),
-        Err(e) => emit_step(&app, &machine, "escalate_persistence", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1730,6 +1622,89 @@ mod tests {
     /// NOT need this lock (they use `ssh_bin_override`, a per-Command env
     /// override, never a process-wide `std::env::set_var`).
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // ---- live::pick_dist_dir — the B8/B9 live tests' dist-dir resolution ----
+    //
+    // B-finding #9: `mod live`'s own `with_real_dist_dir` used to hardcode a single
+    // path (`flightdeckd/target/deploy/wave2-089a8f2-0.2.0`) that is neither committed
+    // (this repo's `target/` gitignore rule covers it, and `flightdeckd/docs/
+    // MONOREPO-MOVE.md` documents these binaries as intentionally outside git) nor
+    // produced by any script — so every test using it panicked on its own `assert!`
+    // before ever touching Docker or SSH, on any machine, ever. Fixed to resolve the
+    // SAME way production does, plus the one documented dev output one step further
+    // back in the pipeline (`pnpm daemon:build`'s own two stages — see
+    // `scripts/build-daemon.mjs`): env override, then the packaged resources dir, then
+    // the raw musl-build output. The PRIORITY logic is pulled out here, pure, so it's
+    // unit-testable without depending on this checkout's real files existing (mirrors
+    // this file's own [`resolve_daemon_binary_path`]/[`daemon_resource_dir`] "pure
+    // core, thin I/O shell" split).
+
+    /// Picks the dist dir the live tests below should point `$TOSSE_FLIGHTDECKD_
+    /// BIN_DIR` at, in PRODUCTION'S OWN priority order plus one documented dev-only
+    /// fallback:
+    ///   1. `env_override` — an already-set `$TOSSE_FLIGHTDECKD_BIN_DIR`, respected
+    ///      verbatim, exactly like [`daemon_resource_dir`] always lets an explicit
+    ///      override win over everything else.
+    ///   2. `resources_dir` (`src-tauri/resources/flightdeckd`), if it has a
+    ///      `manifest.json` — the SAME directory production resolves to when no env
+    ///      override is set (see [`daemon_resource_dir`]), and what `pnpm daemon:build`
+    ///      fills.
+    ///   3. `musl_dist_dir` (`flightdeckd/target/musl/dist`), if it holds at least one
+    ///      binary — `build-musl.sh`'s own raw output, one step before packaging (no
+    ///      `manifest.json` here, but every live test below drives
+    ///      [`upload_daemon_from_path`] directly, which never reads one).
+    /// `None` when nothing was found anywhere — the caller must fail loudly, never
+    /// silently skip (see [`with_real_dist_dir`]).
+    fn pick_dist_dir(
+        env_override: Option<PathBuf>,
+        resources_dir: &Path,
+        resources_has_manifest: bool,
+        musl_dist_dir: &Path,
+        musl_dist_has_a_binary: bool,
+    ) -> Option<PathBuf> {
+        if let Some(dir) = env_override {
+            return Some(dir);
+        }
+        if resources_has_manifest {
+            return Some(resources_dir.to_path_buf());
+        }
+        if musl_dist_has_a_binary {
+            return Some(musl_dist_dir.to_path_buf());
+        }
+        None
+    }
+
+    #[test]
+    fn pick_dist_dir_prefers_an_explicit_env_override_over_everything_else() {
+        let resources = PathBuf::from("/resources");
+        let musl_dist = PathBuf::from("/musl-dist");
+        let got = pick_dist_dir(Some(PathBuf::from("/custom")), &resources, true, &musl_dist, true);
+        assert_eq!(got, Some(PathBuf::from("/custom")));
+    }
+
+    #[test]
+    fn pick_dist_dir_falls_back_to_the_packaged_resources_dir_when_it_has_a_manifest() {
+        let resources = PathBuf::from("/resources");
+        let musl_dist = PathBuf::from("/musl-dist");
+        let got = pick_dist_dir(None, &resources, true, &musl_dist, true);
+        assert_eq!(got, Some(resources), "the packaged dir (with a manifest) must win over the raw musl-build output");
+    }
+
+    #[test]
+    fn pick_dist_dir_falls_back_to_the_raw_musl_dist_when_resources_has_no_manifest() {
+        let resources = PathBuf::from("/resources");
+        let musl_dist = PathBuf::from("/musl-dist");
+        let got = pick_dist_dir(None, &resources, false, &musl_dist, true);
+        assert_eq!(got, Some(musl_dist));
+    }
+
+    #[test]
+    fn pick_dist_dir_is_none_when_nothing_was_found_anywhere() {
+        let resources = PathBuf::from("/resources");
+        let musl_dist = PathBuf::from("/musl-dist");
+        let got = pick_dist_dir(None, &resources, false, &musl_dist, false);
+        assert_eq!(got, None, "must never silently invent a directory — the caller fails loudly instead");
+    }
 
     /// A scratch dir on the CHILD's own `PATH` (never this process's) holding a fake
     /// `ssh` executable — `script`'s literal text, already carrying whatever
@@ -2413,23 +2388,55 @@ mod tests {
             }
         }
 
-        /// Points `$TOSSE_FLIGHTDECKD_BIN_DIR` at this repo's real, committed dist
-        /// binaries (see the module doc + `daemon_binary_path`'s own doc) for the
-        /// duration of the closure, serialized via `ENV_LOCK` against every other test
-        /// in this file that touches the same process-wide var — restored afterward
-        /// regardless of how the closure returns.
+        /// This crate's own resource dir (`src-tauri/resources/flightdeckd`) — the SAME
+        /// directory [`daemon_resource_dir`] resolves to in production when no env
+        /// override is set, and what `pnpm daemon:build` fills. `CARGO_MANIFEST_DIR`
+        /// for `tosse-code` (this crate) is `<repo root>/src-tauri`.
+        fn resources_dir() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/flightdeckd")
+        }
+
+        /// Resolves — and points `$TOSSE_FLIGHTDECKD_BIN_DIR` at — the dist dir these
+        /// live tests should read binaries from, for the duration of the closure,
+        /// serialized via `ENV_LOCK` against every other test in this file that
+        /// touches the same process-wide var. Restored afterward regardless of how the
+        /// closure returns.
+        ///
+        /// See [`pick_dist_dir`]'s own doc for the exact priority order (env override →
+        /// packaged resources dir → raw musl-build output). Nothing found anywhere:
+        /// this FAILS LOUDLY, naming the exact command to run — never silently skips
+        /// (B-finding #9 — the whole point of the fix: these live tests must be
+        /// runnable, not just present in the source).
         async fn with_real_dist_dir<F, Fut, T>(f: F) -> T
         where
             F: FnOnce(PathBuf) -> Fut,
             Fut: std::future::Future<Output = T>,
         {
             let _guard = super::ENV_LOCK.lock().await;
-            let dist = flightdeckd_crate_dir().join("target/deploy/wave2-089a8f2-0.2.0");
-            assert!(
-                dist.is_dir(),
-                "expected the committed dist binaries at {} — build/commit them first",
-                dist.display()
-            );
+
+            let env_override = std::env::var("TOSSE_FLIGHTDECKD_BIN_DIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from);
+            let resources = resources_dir();
+            let resources_has_manifest = resources.join("manifest.json").is_file();
+            let musl_dist = flightdeckd_crate_dir().join("target/musl/dist");
+            let musl_dist_has_a_binary = std::fs::read_dir(&musl_dist)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+
+            let dist = pick_dist_dir(env_override, &resources, resources_has_manifest, &musl_dist, musl_dist_has_a_binary)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no flightdeckd dist binaries found anywhere — checked $TOSSE_FLIGHTDECKD_BIN_DIR \
+                         (unset), {} (no manifest.json) and {} (empty or missing). Run `pnpm daemon:build` \
+                         first (needs Docker — `colima start`), then re-run \
+                         `cargo test --lib -- --ignored --nocapture live_`.",
+                        resources.display(),
+                        musl_dist.display(),
+                    )
+                });
+
             let previous = std::env::var("TOSSE_FLIGHTDECKD_BIN_DIR").ok();
             std::env::set_var("TOSSE_FLIGHTDECKD_BIN_DIR", &dist);
             let result = f(dist).await;

@@ -517,28 +517,83 @@ fn next_deadline(
 enum DriverCommand {
     SubmitCode(String),
     Cancel,
+    /// An explicit "Restart sign-in" ([`restart_claude_login`]) superseded this
+    /// session — distinct from `Cancel` so [`run_login_actor`] can tell the two apart:
+    /// a same-caller `Cancel` stays silent (see its own doc), but a supersession must
+    /// tell the REPLACED surface (`ServerLoginResultEvent{ok:false, error:"superseded
+    /// …"}`), since that surface did not itself initiate the cancellation and would
+    /// otherwise be left waiting forever with no signal anything happened (B-finding
+    /// #4: this is exactly what "starting a second sign-in silently kills the first"
+    /// used to do for EVERY new start, not just an explicit restart).
+    Supersede,
 }
 
 /// A handle to an in-flight `claude auth login` drive, held in [`LoginSessions`].
 struct ActiveLoginSession {
     machine_id: String,
     cmd_tx: mpsc::UnboundedSender<DriverCommand>,
+    /// The last sign-in URL [`run_login_actor`] recognized (`None` until then, or for
+    /// a session that resolved instantly via "already signed in"). A plain
+    /// `std::sync::Mutex`, not the crate's usual `tokio::sync::Mutex`: `drive_claude_
+    /// login`'s `on_url` callback is a SYNC `FnMut` (called from inside a `tokio::
+    /// select!` arm, never itself `.await`ed), so it needs a lock it can take without
+    /// an async context. Read back by [`LoginSessions::attach_or_reserve`] so a
+    /// late-joining second surface can be told the URL immediately instead of having
+    /// missed the one-shot event that already fired before it started listening.
+    last_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Opaque handle [`start_claude_login`] returns, threaded back through
-/// [`submit_claude_login_code`] / [`cancel_claude_login`].
+/// Opaque handle [`start_claude_login`]/[`restart_claude_login`] return, threaded back
+/// through [`submit_claude_login_code`] / [`cancel_claude_login`].
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct LoginSession {
     pub session_id: String,
     pub machine_id: String,
+    /// ⚠️ Added by a follow-up review of the B-finding #4 single-flight fix: `true`
+    /// only when THIS call actually reserved (originated) the session —
+    /// `start_claude_login` finding nothing live and spawning a fresh
+    /// [`run_login_actor`], or `restart_claude_login` (which always supersedes and
+    /// registers itself as the replacement). `false` when this call merely ATTACHED to
+    /// a session another surface already started ([`AttachOutcome::Attached`]).
+    ///
+    /// The front MUST gate `cancel_claude_login` on this: only the owner may actually
+    /// kill the underlying session on Cancel/unmount. An attached surface's
+    /// Cancel/unmount is a local-only detach that leaves the session running for
+    /// whoever still owns it — see `ClaudeSignInInline`'s own doc. Before this field
+    /// existed, EVERY holder's Cancel/unmount killed the shared session unconditionally,
+    /// reproducing the exact "second sign-in silently kills the first, zero UI
+    /// feedback" bug class the single-flight fix was written to close in the first
+    /// place, just via an attached surface's teardown instead of a competing Start.
+    pub owned: bool,
+}
+
+/// What [`LoginSessions::attach_or_reserve`] found for a given machine.
+enum AttachOutcome {
+    /// A live session for this machine already existed — its handle (always
+    /// `owned: false`, see [`LoginSession::owned`]'s own doc), plus whatever URL it has
+    /// recognized so far (`None` if it hasn't gotten that far yet). The
+    /// freshly-minted `session_id`/`cmd_tx` the caller offered were never registered —
+    /// there is nothing for the caller to spawn or clean up.
+    Attached { session: LoginSession, last_url: Option<String> },
+    /// Nothing existed for this machine — the offered `session_id`/`cmd_tx` are now the
+    /// registered entry; the caller must spawn [`run_login_actor`] for it, and its
+    /// returned [`LoginSession`] must be `owned: true`.
+    Reserved,
 }
 
 /// Tauri-managed registry of in-flight server logins, keyed by `session_id`. At most
-/// ONE entry per `machine_id` at a time — [`start_claude_login`] cancels any previous
-/// session for the SAME machine before starting a new one, mirroring
-/// `accounts::login_start`'s "a new start kills the previous child" (a stale session
-/// left running would otherwise both waste a paired connection and let a code meant for
-/// the new attempt land on the old, abandoned one).
+/// ONE entry per `machine_id` at a time.
+///
+/// ⚠️ Single-flight semantics (B-finding #4 fix): an ordinary [`start_claude_login`]
+/// call for a machine that already has a live session ATTACHES to it
+/// ([`Self::attach_or_reserve`]) rather than killing it — two surfaces starting a
+/// sign-in for the SAME freshly-bootstrapped machine at once (the wizard's inline step
+/// and the status panel's own action) must never silently orphan whichever one got
+/// there first. Only an explicit "Restart sign-in" ([`restart_claude_login`])
+/// supersedes — via [`Self::supersede_and_insert`] — and the replaced session is told
+/// (`ServerLoginResultEvent{ok:false, error:"superseded…"}`, via `DriverCommand::
+/// Supersede` rather than `Cancel`), unlike a same-caller `Cancel`, which stays silent
+/// (the caller who cancelled already knows).
 #[derive(Default)]
 pub struct LoginSessions {
     inner: Mutex<HashMap<String, ActiveLoginSession>>,
@@ -549,16 +604,42 @@ impl LoginSessions {
         Self::default()
     }
 
+    /// Attach to an existing session for `machine_id` if one is already live,
+    /// otherwise register the offered `session_id`/`cmd_tx`/`last_url` as the new one
+    /// — a SINGLE atomic check-then-insert under one lock acquisition (never two
+    /// separate ones, which would race two concurrent callers both seeing "nothing
+    /// yet" and both inserting their own session for the same machine).
+    async fn attach_or_reserve(
+        &self,
+        session_id: String,
+        machine_id: String,
+        cmd_tx: mpsc::UnboundedSender<DriverCommand>,
+        last_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) -> AttachOutcome {
+        let mut guard = self.inner.lock().await;
+        if let Some((id, existing)) = guard.iter().find(|(_, s)| s.machine_id == machine_id) {
+            return AttachOutcome::Attached {
+                session: LoginSession { session_id: id.clone(), machine_id: existing.machine_id.clone(), owned: false },
+                last_url: existing.last_url.lock().unwrap().clone(),
+            };
+        }
+        guard.insert(session_id, ActiveLoginSession { machine_id, cmd_tx, last_url });
+        AttachOutcome::Reserved
+    }
+
     /// Cancel (kill) any existing session for `machine_id`, then register `session_id`
-    /// as the new one. Returns the just-superseded session's command sender, if any,
-    /// so the caller can send it a `Cancel` AFTER releasing this lock (never inside
-    /// it — the superseded actor's own teardown must not be able to deadlock on a lock
-    /// this call still holds).
+    /// as the new one — UNCONDITIONALLY, unlike [`Self::attach_or_reserve`] above.
+    /// Called ONLY by the explicit "Restart sign-in" path ([`restart_claude_login`]),
+    /// never by the ordinary [`start_claude_login`] attach path. Returns the
+    /// just-superseded session's command sender, if any, so the caller can send it a
+    /// `Supersede` AFTER releasing this lock (never inside it — the superseded actor's
+    /// own teardown must not be able to deadlock on a lock this call still holds).
     async fn supersede_and_insert(
         &self,
         session_id: String,
         machine_id: String,
         cmd_tx: mpsc::UnboundedSender<DriverCommand>,
+        last_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> Option<mpsc::UnboundedSender<DriverCommand>> {
         let mut guard = self.inner.lock().await;
         let superseded = guard
@@ -567,7 +648,7 @@ impl LoginSessions {
             .map(|(id, _)| id.clone())
             .and_then(|id| guard.remove(&id))
             .map(|s| s.cmd_tx);
-        guard.insert(session_id, ActiveLoginSession { machine_id, cmd_tx });
+        guard.insert(session_id, ActiveLoginSession { machine_id, cmd_tx, last_url });
         superseded
     }
 
@@ -613,18 +694,18 @@ impl LoginSessions {
 
 /// Emit [`ServerLoginResultEvent`], logging (never swallowing) a failed emit — mirrors
 /// `ipc::events::emit_logged`'s discipline for every OTHER terminal event in the crate.
-fn emit_result(app: &tauri::AppHandle, machine_id: &str, ok: bool, email: Option<String>, error: Option<String>) {
+fn emit_result(app: &tauri::AppHandle, session_id: &str, machine_id: &str, ok: bool, email: Option<String>, error: Option<String>) {
     use tauri_specta::Event;
-    let ev = ServerLoginResultEvent { machine_id: machine_id.to_string(), ok, email, error };
+    let ev = ServerLoginResultEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), ok, email, error };
     if let Err(e) = ev.emit(app) {
         eprintln!("[bootstrap] failed to emit server_login_result event: {e}");
     }
 }
 
 /// Emit [`ServerLoginPromptEvent`], logging a failed emit the same way.
-fn emit_prompt(app: &tauri::AppHandle, machine_id: &str, url: &str) {
+fn emit_prompt(app: &tauri::AppHandle, session_id: &str, machine_id: &str, url: &str) {
     use tauri_specta::Event;
-    let ev = ServerLoginPromptEvent { machine_id: machine_id.to_string(), url: url.to_string() };
+    let ev = ServerLoginPromptEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), url: url.to_string() };
     if let Err(e) = ev.emit(app) {
         eprintln!("[bootstrap] failed to emit server_login_prompt event: {e}");
     }
@@ -638,6 +719,9 @@ enum LoginOutcome {
     /// A `DriverCommand::Cancel` arrived (or the command channel was dropped) before a
     /// terminal state was reached.
     Cancelled,
+    /// A `DriverCommand::Supersede` arrived — an explicit "Restart sign-in" replaced
+    /// this session before it reached a terminal state.
+    Superseded,
 }
 
 /// The actual I/O drive, Tauri-FREE: pre-check `claude auth status`, then (if not
@@ -723,6 +807,7 @@ async fn drive_claude_login(
     let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
     let mut submit_deadline: Option<tokio::time::Instant> = None;
     let mut cancelled = false;
+    let mut superseded = false;
 
     'read: loop {
         if stdout_done && stderr_done {
@@ -736,6 +821,10 @@ async fn drive_claude_login(
                 match cmd {
                     None | Some(DriverCommand::Cancel) => {
                         cancelled = true;
+                        break 'read;
+                    }
+                    Some(DriverCommand::Supersede) => {
+                        superseded = true;
                         break 'read;
                     }
                     Some(DriverCommand::SubmitCode(code)) => {
@@ -809,6 +898,9 @@ async fn drive_claude_login(
     if cancelled {
         return LoginOutcome::Cancelled;
     }
+    if superseded {
+        return LoginOutcome::Superseded;
+    }
 
     if let LoginState::Failed { reason } = &driver.state {
         return LoginOutcome::Failed { reason: reason.clone() };
@@ -830,13 +922,18 @@ async fn drive_claude_login(
 }
 
 /// The Tauri-aware shell around [`drive_claude_login`]: wires its `on_url` callback to
-/// an emitted [`ServerLoginPromptEvent`], turns its [`LoginOutcome`] into exactly one
+/// an emitted [`ServerLoginPromptEvent`] (and records it into `last_url`, so a
+/// late-joining second surface can be told immediately — see [`LoginSessions::
+/// attach_or_reserve`]), turns its [`LoginOutcome`] into at most one
 /// [`ServerLoginResultEvent`], and removes this session from `sessions` on every exit
 /// path.
 ///
-/// Cancellation is SILENT by design: the caller who cancelled already knows, and this
-/// is not a failure the user needs surfaced as one (mirrors `accounts::login_cancel`,
-/// which likewise reports nothing back beyond the command's own `Ok(())`).
+/// A same-caller `Cancel` is SILENT by design: the caller who cancelled already knows,
+/// and this is not a failure the user needs surfaced as one (mirrors `accounts::
+/// login_cancel`, which likewise reports nothing back beyond the command's own
+/// `Ok(())`). A `Supersede` (an explicit "Restart sign-in" elsewhere) is NOT silent —
+/// the replaced surface did not initiate it and would otherwise be left waiting forever
+/// with no signal anything happened (B-finding #4).
 async fn run_login_actor(
     app: tauri::AppHandle,
     sessions: std::sync::Arc<LoginSessions>,
@@ -844,17 +941,27 @@ async fn run_login_actor(
     machine: MachineRecord,
     known_hosts: Option<String>,
     cmd_rx: mpsc::UnboundedReceiver<DriverCommand>,
+    last_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let outcome = drive_claude_login(&machine, known_hosts.as_deref(), cmd_rx, |url| {
-        emit_prompt(&app, &machine.id, url);
+        emit_prompt(&app, &session_id, &machine.id, url);
+        *last_url.lock().unwrap() = Some(url.to_string());
     })
     .await;
 
     sessions.finish(&session_id).await;
     match outcome {
-        LoginOutcome::Done { email } => emit_result(&app, &machine.id, true, email, None),
-        LoginOutcome::Failed { reason } => emit_result(&app, &machine.id, false, None, Some(reason)),
+        LoginOutcome::Done { email } => emit_result(&app, &session_id, &machine.id, true, email, None),
+        LoginOutcome::Failed { reason } => emit_result(&app, &session_id, &machine.id, false, None, Some(reason)),
         LoginOutcome::Cancelled => {}
+        LoginOutcome::Superseded => emit_result(
+            &app,
+            &session_id,
+            &machine.id,
+            false,
+            None,
+            Some("superseded by another sign-in for this server".to_string()),
+        ),
     }
 }
 
@@ -873,34 +980,25 @@ fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
 // Tauri commands
 // ============================================================================
 
-/// Run `flightdeckd init --label <label>` on a paired server. See [`run_init`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_run_init(
-    app: tauri::AppHandle,
-    machine_id: String,
-    label: String,
-) -> Result<InitOutcome, String> {
-    use tauri::Manager;
-    let machine = app
-        .state::<Store>()
-        .machine_by_id(&machine_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "unknown server".to_string())?;
-    let known_hosts = known_hosts_path(&app);
-    run_init(&machine, known_hosts.as_deref(), &label)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Start driving the server-side `claude` sign-in for `machine_id`. Returns
-/// immediately with an opaque [`LoginSession`] handle — the actual URL (or an
-/// immediate "already signed in" completion) arrives asynchronously as
-/// [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
+/// Start driving the server-side `claude` sign-in for `machine_id` — or, if another
+/// surface already has one live for the SAME machine, ATTACH to it instead of starting
+/// a competing one (B-finding #4: a second start used to silently kill the first, with
+/// zero UI feedback). Returns immediately with an opaque [`LoginSession`] handle — the
+/// actual URL (or an immediate "already signed in" completion) arrives asynchronously
+/// as [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
 /// async login flow in this crate (`account_claude_login_start` is a synchronous
 /// exception only because ITS wait for the URL is bounded to a couple of seconds
 /// against a LOCAL process; this one crosses the network twice before it can even
 /// begin, so it does not block the caller on that).
+///
+/// On attach, the already-recognized URL (if any) is re-emitted as a fresh
+/// [`ServerLoginPromptEvent`] — a late-joining caller's own listener is registered by
+/// the time this returns (both `ClaudeSignInInline` call sites subscribe before
+/// calling this), but the ORIGINAL prompt may have already fired before that listener
+/// existed, so without this re-emit a second surface attaching to an in-progress
+/// session could be stuck showing "waiting for the sign-in link" even though one
+/// already exists. To replace, rather than attach to, an existing session, use
+/// [`restart_claude_login`] instead.
 #[tauri::command]
 #[specta::specta]
 pub async fn start_claude_login(
@@ -918,20 +1016,63 @@ pub async fn start_claude_login(
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let last_url = std::sync::Arc::new(std::sync::Mutex::new(None));
+    match sessions.attach_or_reserve(session_id.clone(), machine_id.clone(), cmd_tx, last_url.clone()).await {
+        AttachOutcome::Attached { session, last_url } => {
+            if let Some(url) = last_url {
+                emit_prompt(&app, &session.session_id, &session.machine_id, &url);
+            }
+            Ok(session)
+        }
+        AttachOutcome::Reserved => {
+            let sessions_arc = sessions.inner().clone();
+            tokio::spawn(run_login_actor(app, sessions_arc, session_id.clone(), machine, known_hosts, cmd_rx, last_url));
+            Ok(LoginSession { session_id, machine_id, owned: true })
+        }
+    }
+}
+
+/// Explicitly REPLACE any live sign-in session for `machine_id` with a fresh one — the
+/// only thing in this module that supersedes rather than attaches (see
+/// [`LoginSessions`]'s own doc). The replaced session, if any, is told via a
+/// [`ServerLoginResultEvent`] (`ok:false`, a "superseded" reason) — unlike
+/// [`cancel_claude_login`] on a session the SAME caller started, which stays silent on
+/// purpose. Used by the "Restart sign-in" action once a sign-in is already in flight.
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_claude_login(
+    app: tauri::AppHandle,
+    sessions: tauri::State<'_, std::sync::Arc<LoginSessions>>,
+    machine_id: String,
+) -> Result<LoginSession, String> {
+    use tauri::Manager;
+    let machine = app
+        .state::<Store>()
+        .machine_by_id(&machine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "unknown server".to_string())?;
+    let known_hosts = known_hosts_path(&app);
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let last_url = std::sync::Arc::new(std::sync::Mutex::new(None));
     let superseded = sessions
-        .supersede_and_insert(session_id.clone(), machine_id.clone(), cmd_tx)
+        .supersede_and_insert(session_id.clone(), machine_id.clone(), cmd_tx, last_url.clone())
         .await;
-    // Cancel the superseded session AFTER releasing the registry lock (see
+    // Tell the superseded session AFTER releasing the registry lock (see
     // `supersede_and_insert`'s doc) — a `send` failing here just means it had already
     // finished on its own, which is fine.
     if let Some(old_tx) = superseded {
-        let _ = old_tx.send(DriverCommand::Cancel);
+        let _ = old_tx.send(DriverCommand::Supersede);
     }
 
     let sessions_arc = sessions.inner().clone();
-    tokio::spawn(run_login_actor(app, sessions_arc, session_id.clone(), machine, known_hosts, cmd_rx));
+    tokio::spawn(run_login_actor(app, sessions_arc, session_id.clone(), machine, known_hosts, cmd_rx, last_url));
 
-    Ok(LoginSession { session_id, machine_id })
+    // Always `owned: true` — an explicit restart never merely attaches, it always
+    // supersedes and registers itself as the fresh owner (see `LoginSession::owned`'s
+    // own doc).
+    Ok(LoginSession { session_id, machine_id, owned: true })
 }
 
 /// Submit the code the user pasted for an in-flight [`start_claude_login`] session.
@@ -1373,15 +1514,21 @@ mod tests {
 
     // ---- LoginSessions registry ----
 
+    /// A fresh, empty `last_url` handle — every registry call below needs one; nothing
+    /// in these tests cares about its contents unless explicitly noted.
+    fn no_url() -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
     #[tokio::test]
     async fn sessions_supersede_returns_the_old_sender_for_the_same_machine() {
         let sessions = LoginSessions::new();
         let (tx1, _rx1) = mpsc::unbounded_channel();
-        let old = sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1).await;
+        let old = sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
         assert!(old.is_none(), "nothing to supersede on the first insert");
 
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        let old = sessions.supersede_and_insert("s2".to_string(), "m1".to_string(), tx2).await;
+        let old = sessions.supersede_and_insert("s2".to_string(), "m1".to_string(), tx2, no_url()).await;
         assert!(old.is_some(), "the second session for the SAME machine must supersede the first");
         // s1 must be gone from the registry now.
         assert!(sessions.send("s1", DriverCommand::Cancel).await.is_err());
@@ -1395,8 +1542,8 @@ mod tests {
         let sessions = LoginSessions::new();
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
-        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1).await;
-        let old = sessions.supersede_and_insert("s2".to_string(), "m2".to_string(), tx2).await;
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
+        let old = sessions.supersede_and_insert("s2".to_string(), "m2".to_string(), tx2, no_url()).await;
         assert!(old.is_none(), "a different machine must not supersede anything");
         assert!(sessions.send("s1", DriverCommand::Cancel).await.is_ok());
         assert!(sessions.send("s2", DriverCommand::Cancel).await.is_ok());
@@ -1406,7 +1553,7 @@ mod tests {
     async fn sessions_finish_removes_the_entry() {
         let sessions = LoginSessions::new();
         let (tx, _rx) = mpsc::unbounded_channel();
-        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx).await;
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx, no_url()).await;
         sessions.finish("s1").await;
         assert!(sessions.send("s1", DriverCommand::Cancel).await.is_err());
     }
@@ -1427,8 +1574,8 @@ mod tests {
         let sessions = LoginSessions::new();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1).await;
-        sessions.supersede_and_insert("s2".to_string(), "m2".to_string(), tx2).await;
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
+        sessions.supersede_and_insert("s2".to_string(), "m2".to_string(), tx2, no_url()).await;
 
         assert!(!sessions.is_empty().await);
         sessions.cancel_all().await;
@@ -1442,10 +1589,104 @@ mod tests {
         let sessions = LoginSessions::new();
         assert!(sessions.is_empty().await);
         let (tx, _rx) = mpsc::unbounded_channel();
-        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx).await;
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx, no_url()).await;
         assert!(!sessions.is_empty().await);
         sessions.finish("s1").await;
         assert!(sessions.is_empty().await);
+    }
+
+    // ---- LoginSessions::attach_or_reserve — single-flight semantics (B-finding #4) ----
+
+    /// The FIRST `start_claude_login` for a machine reserves — nothing to attach to
+    /// yet, so the caller must spawn the actor for the session it offered.
+    #[tokio::test]
+    async fn attach_or_reserve_reserves_when_nothing_exists_for_the_machine() {
+        let sessions = LoginSessions::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outcome = sessions.attach_or_reserve("s1".to_string(), "m1".to_string(), tx, no_url()).await;
+        assert!(matches!(outcome, AttachOutcome::Reserved));
+        // The offered session really was registered.
+        sessions.send("s1", DriverCommand::Cancel).await.expect("s1 must now be reachable");
+    }
+
+    /// A SECOND `start_claude_login` for the SAME machine attaches to the live session
+    /// instead of superseding it — the core of the fix: two surfaces starting a
+    /// sign-in for the same freshly-bootstrapped machine must never race each other.
+    #[tokio::test]
+    async fn attach_or_reserve_attaches_to_an_existing_session_for_the_same_machine() {
+        let sessions = LoginSessions::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        sessions.attach_or_reserve("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let outcome = sessions.attach_or_reserve("s2".to_string(), "m1".to_string(), tx2, no_url()).await;
+        match outcome {
+            AttachOutcome::Attached { session, .. } => {
+                assert_eq!(session.session_id, "s1", "must hand back the EXISTING session's id, not a new one");
+                assert_eq!(session.machine_id, "m1");
+                assert!(
+                    !session.owned,
+                    "an attached caller must never be told it owns the session — only the \
+                     originator may cancel it (see `LoginSession::owned`'s own doc)"
+                );
+            }
+            AttachOutcome::Reserved => panic!("must attach, not reserve, for a machine that already has a session"),
+        }
+        // s1 (the original) must still be the one and only live session — untouched,
+        // never cancelled: attaching must not kill it.
+        sessions.send("s1", DriverCommand::Cancel).await.expect("s1 must remain live and reachable");
+        assert!(matches!(rx1.recv().await, Some(DriverCommand::Cancel)));
+        // s2 was never registered — nothing to find under that id.
+        assert!(sessions.send("s2", DriverCommand::Cancel).await.is_err());
+    }
+
+    /// The attach path hands back whatever URL the live session has already
+    /// recognized, so a late-joining second surface can render it immediately.
+    #[tokio::test]
+    async fn attach_or_reserve_returns_the_existing_sessions_last_url() {
+        let sessions = LoginSessions::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let url_slot = no_url();
+        sessions.attach_or_reserve("s1".to_string(), "m1".to_string(), tx1, url_slot.clone()).await;
+        *url_slot.lock().unwrap() = Some("https://claude.ai/example".to_string());
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let outcome = sessions.attach_or_reserve("s2".to_string(), "m1".to_string(), tx2, no_url()).await;
+        match outcome {
+            AttachOutcome::Attached { last_url, .. } => {
+                assert_eq!(last_url.as_deref(), Some("https://claude.ai/example"));
+            }
+            AttachOutcome::Reserved => panic!("must attach"),
+        }
+    }
+
+    /// Per-machine isolation: attaching for machine `m2` must never find/return
+    /// machine `m1`'s session.
+    #[tokio::test]
+    async fn attach_or_reserve_does_not_attach_across_different_machines() {
+        let sessions = LoginSessions::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        sessions.attach_or_reserve("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let outcome = sessions.attach_or_reserve("s2".to_string(), "m2".to_string(), tx2, no_url()).await;
+        assert!(matches!(outcome, AttachOutcome::Reserved), "a different machine must reserve its own session");
+        sessions.send("s1", DriverCommand::Cancel).await.expect("m1's session must be untouched");
+        sessions.send("s2", DriverCommand::Cancel).await.expect("m2's own session must be reachable");
+    }
+
+    /// Once a session finishes (`finish`), the NEXT `start_claude_login` for that
+    /// machine reserves again rather than attaching to a dead entry.
+    #[tokio::test]
+    async fn attach_or_reserve_reserves_again_after_the_live_session_finished() {
+        let sessions = LoginSessions::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        sessions.attach_or_reserve("s1".to_string(), "m1".to_string(), tx1, no_url()).await;
+        sessions.finish("s1").await;
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let outcome = sessions.attach_or_reserve("s2".to_string(), "m1".to_string(), tx2, no_url()).await;
+        assert!(matches!(outcome, AttachOutcome::Reserved));
     }
 
     // ========================================================================
@@ -1872,5 +2113,49 @@ mod tests {
         let url = url.expect("must have recognized the sign-in URL before cancelling");
         assert!(url.starts_with("https://"), "got {url:?}");
         assert!(url.to_ascii_lowercase().contains("oauth"), "got {url:?}");
+    }
+
+    /// B-finding #4's `Supersede` sibling of the test above: an explicit "Restart
+    /// sign-in" arriving mid-drive must resolve as `LoginOutcome::Superseded`, NOT
+    /// `Cancelled` — the two must stay distinguishable end to end (`run_login_actor`
+    /// only emits a `ServerLoginResultEvent` for the former), never just at the
+    /// `DriverCommand` enum level.
+    #[tokio::test]
+    #[ignore = "needs Docker (colima start)"]
+    async fn live_claude_login_supersede_resolves_as_superseded_not_cancelled() {
+        let _guard = LIVE_FIXTURE_LOCK.lock().await;
+        fixture_up("a");
+        let key = ThrowawayKey::generate("claude-login-supersede");
+        install_key_via_password(FIXTURE_A_PORT, FIXTURE_A_USER, FIXTURE_A_PASSWORD, &key).await;
+        let machine = fixture_machine(FIXTURE_A_PORT, FIXTURE_A_USER, &key);
+        let kh = ScratchKnownHosts::new("claude-login-supersede");
+        install_claude_on_fixture_a(&machine, kh.path()).await;
+
+        let status = probe_auth_status(&machine, kh.path()).await;
+        assert_ne!(
+            status.map(|s| s.logged_in),
+            Some(true),
+            "fixture A's claude must be signed out for this test to be meaningful"
+        );
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<DriverCommand>();
+        let cmd_tx_cb = cmd_tx.clone();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            drive_claude_login(&machine, kh.path(), cmd_rx, move |_url| {
+                // Mirrors `restart_claude_login`'s own `Supersede` send — a session
+                // being explicitly replaced, never a same-caller `Cancel`.
+                let _ = cmd_tx_cb.send(DriverCommand::Supersede);
+            }),
+        )
+        .await;
+        drop(cmd_tx);
+
+        match outcome {
+            Ok(LoginOutcome::Superseded) => {}
+            Ok(other) => panic!("expected Superseded once the URL was seen, got {other:?}"),
+            Err(_) => panic!("drive_claude_login did not reach UrlReady within the test's own 20s bound"),
+        }
     }
 }

@@ -2262,12 +2262,50 @@ export const mockCommands = {
   },
 
   async startClaudeLogin(machineId: string): Promise<Result<LoginSession, string>> {
+    // Mirrors the real single-flight semantics (B-finding #4): a second start for a
+    // machine that already has a live mock session ATTACHES to it (owned:false)
+    // instead of minting a competing one — only `restartClaudeLogin` below replaces
+    // it. `owned` mirrors `AttachOutcome`/`LoginSession::owned` on the real backend —
+    // see that struct's own doc for why the front needs it.
+    for (const [sessionId, mId] of mockLoginSessions) {
+      if (mId === machineId) return ok({ session_id: sessionId, machine_id: machineId, owned: false });
+    }
     const sessionId = `mock-login-${++mockLoginCounter}`;
     mockLoginSessions.set(sessionId, machineId);
     setTimeout(() => {
-      serverLoginPromptEvent.emit({ machine_id: machineId, url: "https://claude.ai/oauth/authorize?mock=1" });
+      serverLoginPromptEvent.emit({ session_id: sessionId, machine_id: machineId, url: "https://claude.ai/oauth/authorize?mock=1" });
     }, 260);
-    return ok({ session_id: sessionId, machine_id: machineId });
+    return ok({ session_id: sessionId, machine_id: machineId, owned: true });
+  },
+
+  async restartClaudeLogin(machineId: string): Promise<Result<LoginSession, string>> {
+    const oldSessionId = Array.from(mockLoginSessions).find(([, mId]) => mId === machineId)?.[0];
+    const sessionId = `mock-login-${++mockLoginCounter}`;
+    // The NEW session is registered and handed back FIRST, exactly like the real
+    // backend's `restart_claude_login` (`supersede_and_insert` + the immediate
+    // `Ok(LoginSession{owned:true, ...})` return, well before the old actor's own
+    // kill+wait completes) — the OLD session's "superseded" result only arrives
+    // asynchronously afterward. A follow-up review of B-finding #4 caught an earlier
+    // version of this mock getting that ordering BACKWARDS (emitting the superseded
+    // result synchronously, before minting the new session), which accidentally
+    // self-healed a race the real backend does not, and let it go untested.
+    if (oldSessionId !== undefined) mockLoginSessions.delete(oldSessionId);
+    mockLoginSessions.set(sessionId, machineId);
+    if (oldSessionId !== undefined) {
+      setTimeout(() => {
+        serverLoginResultEvent.emit({
+          session_id: oldSessionId,
+          machine_id: machineId,
+          ok: false,
+          email: null,
+          error: "superseded by another sign-in for this server",
+        });
+      }, 50);
+    }
+    setTimeout(() => {
+      serverLoginPromptEvent.emit({ session_id: sessionId, machine_id: machineId, url: "https://claude.ai/oauth/authorize?mock=1" });
+    }, 260);
+    return ok({ session_id: sessionId, machine_id: machineId, owned: true });
   },
 
   async submitClaudeLoginCode(session: LoginSession, code: string): Promise<Result<null, string>> {
@@ -2276,6 +2314,7 @@ export const mockCommands = {
       mockLoginSessions.delete(session.session_id);
       const accepted = code.trim().length >= 4;
       serverLoginResultEvent.emit({
+        session_id: session.session_id,
         machine_id: session.machine_id,
         ok: accepted,
         email: accepted ? "demo@example.com" : null,

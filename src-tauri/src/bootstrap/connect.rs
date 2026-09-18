@@ -580,96 +580,14 @@ pub(crate) fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port
     }
 }
 
-/// Install the app's dedicated key on `host:port` (first contact, password-only — see
-/// [`install_key`]), reusing [`crate::ipc::commands::generate_or_reuse_pending_key`]
-/// for the key itself (A3's lookup-or-generate primitive — never mints a key here).
-///
-/// On SUCCESS ONLY — [`install_key`] returns `Ok`, whether the outcome is `Installed`
-/// or `AlreadyPresent` — emits [`crate::ipc::events::HostKeyFingerprintEvent`] with the
-/// fingerprint TOFU-pinned in the app's dedicated `known_hosts` and whether it was
-/// ALREADY pinned before THIS call — display-only, NON-BLOCKING (Armand's decision: no
-/// confirmation gate). The emit is gated on the OVERALL `Result`, never on "some
-/// fingerprint happens to be readable": TOFU pinning happens at the transport layer,
-/// before auth, so a fingerprint can be readable even after a FAILED call (a wrong
-/// password still pins a fresh host key; a stale pin is still readable right after a
-/// [`BootstrapError::HostKeyMismatch`]) — without this gate a caller could mistake
-/// receipt of the event for a successful pairing step. Concretely: a wrong password on
-/// a brand-new host pins the key but does NOT emit here; the fingerprint becomes
-/// visible on the next, successful call instead (at which point `known` correctly
-/// reads `true`). A host key that CHANGED since a previous pin never reaches
-/// `Ok` at all — it fails as [`BootstrapError::HostKeyMismatch`] — so no event fires
-/// for that call either.
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_install_key(
-    app: tauri::AppHandle,
-    host: String,
-    port: u16,
-    user: String,
-    password: String,
-    label: String,
-) -> Result<KeyInstallOutcome, String> {
-    // Validated BEFORE anything else — this is the FIRST-CONTACT entry point, and
-    // `user`/`host` can both arrive from a hostile pairing ticket's pre-fill (see
-    // `ControlSection.tsx::parseTicket`'s doc), so this must reject before even the
-    // `ssh-keygen -F` lookup below runs (item 5 of the CRM holistic-review blocker
-    // fix, chantier A `bd7ca709`), let alone [`install_key`]'s own ssh call.
-    crate::store::validate_ssh_user(&user)?;
-    crate::store::validate_address_value(&host)?;
-    crate::store::validate_ssh_port(port)?;
-    use tauri::Manager;
-    let ssh_keys_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("ssh_keys");
-    let key = crate::ipc::commands::generate_or_reuse_pending_key(&ssh_keys_dir, &label)
-        .await
-        .map_err(|e| e.to_string())?;
-    let known_hosts =
-        known_hosts_path(&app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
-    let target = BootstrapTarget { host: host.clone(), port, user };
-
-    let known_before = host_key_pinned(&known_hosts, &host, port).await;
-    let result = install_key(&target, &password, &key.identity_file, &key.public_key, &known_hosts).await;
-
-    // Gated on success (see this function's own doc): the TOFU pin itself happens at
-    // the transport layer, before auth, so a fingerprint can be readable here even
-    // after a FAILED call (a wrong password still pins a fresh host; a stale pin is
-    // still readable after a `HostKeyMismatch`) — emitting unconditionally would let a
-    // caller mistake receipt of this event for a successful pairing step.
-    if result.is_ok() {
-        if let Some(fingerprint) = read_pinned_fingerprint(&known_hosts, &host, port).await {
-            emit_host_key_fingerprint(&app, &host, port, &fingerprint, known_before);
-        }
-    }
-
-    result.map_err(|e| e.to_string())
-}
-
-/// Probe an already-keyed server for the full install-mode picture. See [`probe`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_probe(
-    app: tauri::AppHandle,
-    host: String,
-    port: u16,
-    user: String,
-    identity_file: String,
-) -> Result<RemoteProbeResult, String> {
-    crate::store::validate_ssh_user(&user)?;
-    crate::store::validate_address_value(&host)?;
-    crate::store::validate_ssh_port(port)?;
-    let known_hosts =
-        known_hosts_path(&app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
-    let target = BootstrapTarget { host, port, user };
-    probe(&target, &identity_file, &known_hosts).await.map_err(|e| e.to_string())
-}
-
 /// Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
 /// the user has confirmed the change is expected) so the next connection re-pins it
 /// TOFU. See [`forget_host_key`].
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_forget_host_key(app: tauri::AppHandle, host: String, port: u16) -> Result<(), String> {
-    // See `bootstrap_install_key`'s own doc — same discipline (item 5 of the CRM
-    // holistic-review blocker fix): `ssh-keygen -R`'s own argument grammar already
+    // Same discipline as every ssh entry point (item 5 of the CRM holistic-review
+    // blocker fix, chantier A `bd7ca709`): `ssh-keygen -R`'s own argument grammar already
     // consumes the token right after `-F`/`-R` as that option's value regardless of a
     // leading `-`, so this isn't the SAME injection class as `user@host`, but a
     // pattern built from an unvalidated `host` has no business reaching `ssh-keygen`
