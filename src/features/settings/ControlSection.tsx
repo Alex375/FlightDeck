@@ -7,7 +7,7 @@
 //    interleaved between these by SettingsPanel.
 // Every core-backed card follows the honest-toggle rule: what it shows is the
 // post-apply READ-BACK from the core, so a failure shows instead of a switch that lies.
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   commands,
   type AddressCandidate,
@@ -27,6 +27,8 @@ import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
+import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
+import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -205,8 +207,6 @@ export function VoiceBridgeGroup() {
   );
 }
 
-type PairStage = "command" | "confirm" | "manual";
-
 /** A ticket's decoded address candidates, plus the pre-fill fields carried
  *  alongside them. `addresses` is always non-empty: an old-format ticket (no
  *  `addresses` field) synthesizes a single "manual" candidate from `host`. */
@@ -286,10 +286,11 @@ export function buildServerCommand(publicKey: string): string {
 }
 
 /** Pair remote SSH servers and open conversations that run on them (the alpha
- *  "machine boundary"). Primary flow: run one command on the server — it authorizes a
- *  Flight-Deck-generated key, checks Claude, and prints a ticket that carries the
- *  connection details back, so the user never has to recall a hostname/user/port.
- *  Typing the details by hand is the last-resort fallback. */
+ *  "machine boundary"). Primary flow (B12): `ServerBootstrapWizard` — type the
+ *  connection details once, Flight Deck installs and configures everything else, no
+ *  terminal required. Its own secondary link keeps the OLD ticket/command flow
+ *  reachable for a server this Mac can only reach with a pre-authorized key.
+ *  Each paired server renders as a `ServerStatusPanel` (live diagnosis + repairs). */
 export function RemoteServersGroup() {
   const machines = useMachines();
 
@@ -344,111 +345,14 @@ export function RemoteServersGroup() {
       });
   }, []);
 
-  // ---- Add-a-server (pairing) flow ----
-  const [adding, setAdding] = useState(false);
-  const [stage, setStage] = useState<PairStage>("command");
-  const [genKey, setGenKey] = useState<{ identityFile: string; publicKey: string } | null>(null);
-  const [ticket, setTicket] = useState("");
-  const [label, setLabel] = useState("");
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("22");
-  const [user, setUser] = useState("");
-  // Every address candidate the ticket discovered (Tailscale / LAN / hostname) — kept
-  // alongside `host` so the confirm screen can offer them and thread the full set
-  // through to `addMachine`. Reset to empty outside the "confirm" stage.
-  const [addresses, setAddresses] = useState<AddressCandidate[]>([]);
-  const [copied, setCopied] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // ---- Add-a-server (B12 wizard) ----
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
-  const resetAdd = useCallback(() => {
-    setAdding(false);
-    setStage("command");
-    setGenKey(null);
-    setTicket("");
-    setLabel("");
-    setHost("");
-    setPort("22");
-    setUser("");
-    setAddresses([]);
-    setCopied(false);
-    setBusy(false);
-    setError(null);
-  }, []);
-
-  const startAdd = useCallback(async () => {
-    setConvFor(null);
-    setAdding(true);
-    setStage("command");
-    setError(null);
-    setGenKey(null);
-    setTicket("");
-    // Generate Flight Deck's dedicated key up front so the command (which embeds its
-    // PUBLIC key) is ready immediately — nothing to fill in first. Re-entering the
-    // wizard (close Settings, reopen, "+ Add a server" again) calls this again too —
-    // the core reuses the SAME not-yet-claimed pending key rather than minting a new
-    // one, so the command stays valid to re-paste until it's actually claimed.
-    const res = await useConversationsStore.getState().generateMachineKey("server");
-    if (res.ok) setGenKey({ identityFile: res.key.identity_file, publicKey: res.key.public_key });
-    else setError(res.error);
-  }, []);
-
-  const serverCommand = genKey ? buildServerCommand(genKey.publicKey) : "";
-
-  const copyCmd = useCallback(() => {
-    void navigator.clipboard.writeText(serverCommand);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }, [serverCommand]);
-
-  const continueFromTicket = useCallback(() => {
-    const t = parseTicket(ticket);
-    if (!t) {
-      setError("Couldn't read that ticket — copy the whole fdpair:… line the command printed.");
-      return;
-    }
-    // Prefer a discovered Tailscale name over a raw IP by default — it survives NAT
-    // and IP changes the way a LAN/SSH-derived IP doesn't. Falls back to whichever
-    // candidate the ticket led with (LAN, then hostname) when none was found.
-    const preferred = t.addresses.find((a) => a.kind === "tailscale") ?? t.addresses[0];
-    setLabel(t.label);
-    setHost(preferred?.value || t.host);
-    setPort(t.port || "22");
-    setUser(t.user);
-    setAddresses(t.addresses);
-    setError(null);
-    setStage("confirm");
-  }, [ticket]);
-
-  const pair = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    const res = await useConversationsStore.getState().addMachine({
-      label: label.trim() || host.trim(),
-      host: host.trim(),
-      port: Number(port) || 22,
-      user: user.trim(),
-      identityFile: genKey?.identityFile ?? null,
-      addresses: addresses.length > 0 ? addresses : null,
-    });
-    setBusy(false);
-    if (res.ok) {
-      // Null this out FIRST (not just via resetAdd, below): the core renames this
-      // pending key to the new machine's id on a successful pair, so a stale
-      // genKey.identityFile must never be resubmitted for a SECOND server — e.g. the
-      // same pairing command pasted onto two boxes before either was paired here.
-      setGenKey(null);
-      resetAdd();
-    } else {
-      setError(res.error);
-    }
-  }, [label, host, port, user, genKey, addresses, resetAdd]);
-
   const toggleConv = useCallback((machineId: string) => {
-    setAdding(false);
+    setWizardOpen(false);
     setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
 
@@ -463,64 +367,23 @@ export function RemoteServersGroup() {
 
   return (
     <SettingsGroup title="Remote servers (SSH)" icon="globe">
-      {machines.length === 0 && !adding && (
+      {machines.length === 0 && !wizardOpen && (
         <div className={styles.remoteEmpty}>
           No remote server yet. Pair a Linux box and run conversations on it, over SSH.
         </div>
       )}
 
-      {machines.map((m) => {
-        const provisionLabel = describeProvisionStatus(provisionStatuses.get(m.id), now);
-        const revokeLabel = describeRevokeStatus(revokeStatuses.get(m.id), now);
-        const isRetrying = retrying.has(m.id);
-        return (
-        <Fragment key={m.id}>
-          <div className={styles.remoteRow}>
-            <div className={styles.remoteMain}>
-              <span className={styles.remoteName}>{m.label}</span>
-              <span className={styles.mono}>
-                {m.user}@{m.host}:{m.port}
-              </span>
-              {m.daemonLabel ? (
-                <span className={styles.remoteStatusText}>daemon: {m.daemonLabel}</span>
-              ) : null}
-              <span
-                className={provisionLabel.isProblem ? styles.dangerText : styles.remoteStatusText}
-              >
-                phone access: {isRetrying ? "pending…" : provisionLabel.text}
-              </span>
-              {/* Only shown after a "regenerate pairing" actually attempted a
-                  revoke against this server this run — absent otherwise, per
-                  `describeRevokeStatus`'s doc (nothing to report, not a problem). */}
-              {revokeLabel ? (
-                <span className={revokeLabel.isProblem ? styles.dangerText : styles.remoteStatusText}>
-                  {revokeLabel.text}
-                </span>
-              ) : null}
-            </div>
-            {provisionLabel.canRetry && !isRetrying && (
-              <button
-                className={`${styles.btn} ${styles.ghost}`}
-                onClick={() => retryProvisioning(m.id)}
-                title="Retry granting this server phone access"
-              >
-                Retry
-              </button>
-            )}
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => void toggleConv(m.id)}
-            >
-              New conversation…
-            </button>
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => useConversationsStore.getState().removeMachine(m.id)}
-            >
-              Remove
-            </button>
-          </div>
-
+      {machines.map((m) => (
+        <ServerStatusPanel
+          key={m.id}
+          machine={m}
+          provisionLabel={describeProvisionStatus(provisionStatuses.get(m.id), now)}
+          revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
+          isRetrying={retrying.has(m.id)}
+          onRetryProvisioning={() => retryProvisioning(m.id)}
+          onNewConversation={() => toggleConv(m.id)}
+          onRemove={() => useConversationsStore.getState().removeMachine(m.id)}
+        >
           {convFor === m.id && (
             <div className={styles.remotePanel}>
               <RemoteFolderPicker
@@ -536,172 +399,23 @@ export function RemoteServersGroup() {
               </div>
             </div>
           )}
-        </Fragment>
-        );
-      })}
+        </ServerStatusPanel>
+      ))}
 
-      {!adding ? (
+      {!wizardOpen ? (
         <div className={styles.remoteFooter}>
-          <button className={`${styles.btn} ${styles.primary}`} onClick={() => void startAdd()}>
+          <button
+            className={`${styles.btn} ${styles.primary}`}
+            onClick={() => {
+              setConvFor(null);
+              setWizardOpen(true);
+            }}
+          >
             + Add a server
           </button>
         </div>
       ) : (
-        <div className={styles.remotePanel}>
-          {stage === "command" && (
-            <>
-              <div className={styles.remoteStep}>
-                <b>1 · Run this once on your server.</b> Open a shell on it (over SSH, or on the
-                machine itself) and paste. It authorizes Flight Deck, checks Claude, and prints a
-                pairing ticket. Nothing to type here — Flight Deck already made a dedicated key.
-              </div>
-              {serverCommand ? (
-                <>
-                  <pre className={styles.codeBlock}>{serverCommand}</pre>
-                  <div className={styles.btnRow}>
-                    <button className={`${styles.btn} ${styles.ghost}`} onClick={copyCmd}>
-                      {copied ? "Copied" : "Copy command"}
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className={styles.remoteStep}>{error ? "" : "Preparing the command…"}</div>
-              )}
-              <div className={styles.remoteStep}>
-                <b>2 · Paste the ticket</b> it printed (the <b>fdpair:…</b> line):
-              </div>
-              <input
-                className={styles.field}
-                placeholder="fdpair:…"
-                value={ticket}
-                onChange={(e) => setTicket(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") continueFromTicket();
-                }}
-              />
-              {error && <div className={styles.errorMsg}>{error}</div>}
-              <div className={styles.btnRow}>
-                <button
-                  className={`${styles.btn} ${styles.primary}`}
-                  disabled={!ticket.trim()}
-                  onClick={continueFromTicket}
-                >
-                  Continue
-                </button>
-                <button
-                  className={`${styles.btn} ${styles.ghost}`}
-                  onClick={() => {
-                    setError(null);
-                    // Manual entry has no ticket-discovered addresses of its own — a
-                    // leftover set from a PREVIOUSLY parsed ticket must not ride along
-                    // to whatever host the user types here.
-                    setAddresses([]);
-                    setStage("manual");
-                  }}
-                >
-                  Enter details manually
-                </button>
-                <span className={styles.spacer} />
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={resetAdd}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-
-          {(stage === "confirm" || stage === "manual") && (
-            <>
-              <div className={styles.remoteStep}>
-                {stage === "confirm" ? (
-                  <>
-                    <b>3 · Confirm the connection</b> — the server filled these in. Fix anything that
-                    looks off (e.g. the host/port if it's behind a NAT or a port mapping).
-                  </>
-                ) : (
-                  <>
-                    <b>Enter the server's details.</b> A last resort — prefer the pairing command
-                    above when you can.
-                  </>
-                )}
-              </div>
-              <input
-                className={styles.field}
-                placeholder="Name (e.g. my-vps)"
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
-              />
-              <input
-                className={styles.field}
-                placeholder="Host or IP (reachable from this Mac)"
-                value={host}
-                onChange={(e) => setHost(e.target.value)}
-              />
-              {stage === "confirm" && addresses.length > 1 && (
-                <div className={styles.remoteStep}>
-                  Discovered addresses — pick one:
-                  <div className={styles.btnRow}>
-                    {addresses.map((a) => (
-                      <button
-                        key={`${a.kind}-${a.value}`}
-                        type="button"
-                        className={`${styles.btn} ${host === a.value ? styles.primary : styles.ghost}`}
-                        onClick={() => setHost(a.value)}
-                      >
-                        {a.kind === "tailscale" ? "Tailscale" : a.kind === "lan" ? "LAN" : "Hostname"}:{" "}
-                        {a.value}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <div className={styles.fieldRow}>
-                <input
-                  className={styles.field}
-                  style={{ flex: "0 0 96px" }}
-                  inputMode="numeric"
-                  placeholder="Port"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
-                />
-                <input
-                  className={styles.field}
-                  placeholder="User (e.g. root)"
-                  value={user}
-                  onChange={(e) => setUser(e.target.value)}
-                />
-              </div>
-              {error && <div className={styles.errorMsg}>{error}</div>}
-              <div className={styles.btnRow}>
-                <button
-                  className={`${styles.btn} ${styles.primary}`}
-                  disabled={busy || !host.trim() || !user.trim()}
-                  onClick={() => void pair()}
-                >
-                  {busy ? "Testing…" : "Test & pair"}
-                </button>
-                {stage === "confirm" && (
-                  <button
-                    className={`${styles.btn} ${styles.ghost}`}
-                    onClick={() => {
-                      setError(null);
-                      // Re-pasting a NEW ticket re-populates this from scratch (or a
-                      // manual host synthesizes none) — a stale set from THIS ticket
-                      // must not survive back to a re-edited host/step 2 round-trip.
-                      setAddresses([]);
-                      setStage("command");
-                    }}
-                  >
-                    Back
-                  </button>
-                )}
-                <span className={styles.spacer} />
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={resetAdd}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-        </div>
+        <ServerBootstrapWizard onClose={() => setWizardOpen(false)} />
       )}
     </SettingsGroup>
   );

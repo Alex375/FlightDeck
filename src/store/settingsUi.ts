@@ -50,6 +50,17 @@ interface SettingsUiState {
    * that no longer exists can never leave a highlight armed forever.
    */
   highlight: string | null;
+  /**
+   * Non-null while `ServerBootstrapWizard` is paused on a BLOCKING `needs_input`
+   * (today: only the sudo-password prompt for `escalate_persistence`) — the app's
+   * only case where the panel simply closing would silently abandon in-progress work
+   * a backend command can't yet resume without (the paused session's id lives only
+   * in that component's memory; there is no "list paused sessions" IPC to recover it
+   * from). The panel's own close paths (✕, Escape, the scrim) read this and confirm
+   * before closing instead of discarding it — see `SettingsPanel`'s `requestClose`.
+   * The value is the human-readable reason shown in that confirm.
+   */
+  bootstrapGuard: string | null;
   /** Open the panel, optionally jumping straight to `section` (and one of its sub-tabs). */
   openSettings: (section?: SettingsSection, sub?: string) => void;
   closeSettings: () => void;
@@ -60,6 +71,7 @@ interface SettingsUiState {
   /** Jump to a setting found in search: its section, its sub-tab, and the row to flash. */
   revealSetting: (target: { section: SettingsSection; sub?: string; title: string }) => void;
   clearHighlight: () => void;
+  setBootstrapGuard: (reason: string | null) => void;
 }
 
 /** How long a search highlight may wait for a row to claim it. A row that matches flashes
@@ -74,6 +86,7 @@ export const useSettingsUi = create<SettingsUiState>((set, get) => ({
   section: "general",
   subs: {},
   highlight: null,
+  bootstrapGuard: null,
   openSettings: (section, sub) =>
     set((s) =>
       section
@@ -103,4 +116,5 @@ export const useSettingsUi = create<SettingsUiState>((set, get) => ({
     }, HIGHLIGHT_ARM_MS);
   },
   clearHighlight: () => set({ highlight: null }),
+  setBootstrapGuard: (reason) => set({ bootstrapGuard: reason }),
 }));

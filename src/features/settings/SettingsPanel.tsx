@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
@@ -189,6 +190,11 @@ function SearchResults({
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const section = useSettingsUi((s) => s.section);
   const setSection = useSettingsUi((s) => s.setSection);
+  // Set by `ServerBootstrapWizard` while paused on a blocking `needs_input` (the
+  // sudo-password prompt) — see the store field's own doc. Non-null → closing must
+  // confirm first instead of silently abandoning that install.
+  const bootstrapGuard = useSettingsUi((s) => s.bootstrapGuard);
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
   // The Claude tab follows the last SUCCESSFUL status read: it appears on a positive
   // "logged in", goes away on a successful "signed out", and does NOT disappear on a
   // failed read — a Keychain hiccup must not evaporate a tab the user is standing in
@@ -241,7 +247,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   // preventDefaults Escape, so gating on `defaultPrevented` here would mean the panel
   // NEVER closes — that signal is now the guard's, not a "higher layer consumed it"
   // marker. One-Escape-one-layer is upheld instead by any ConfirmDialog mounted inside
-  // calling stopPropagation, so its Escape never reaches this window-level handler.
+  // calling stopPropagation, so its Escape never reaches this window-level handler
+  // (including the "close while a bootstrap install is paused" one rendered below).
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -252,12 +259,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
         setQuery("");
         return;
       }
-      close();
+      requestClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, busy, query]);
+  }, [open, busy, query, bootstrapGuard]);
 
   if (!open) return null;
 
@@ -274,14 +281,27 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
     }
   }
 
-  function close() {
-    if (busy) return;
+  /** Actually closes — bypasses the bootstrap-paused guard, since by the time this
+   *  runs the guard has either been cleared or the user already confirmed through it. */
+  function finishClose() {
+    setConfirmCloseOpen(false);
     setConfirming(false);
     onClose();
   }
 
+  /** Every close affordance (✕, Escape, the scrim) goes through this — never
+   *  `finishClose`/`onClose` directly — so none of them can bypass the confirm. */
+  function requestClose() {
+    if (busy) return;
+    if (bootstrapGuard) {
+      setConfirmCloseOpen(true);
+      return;
+    }
+    finishClose();
+  }
+
   return (
-    <div className={styles.scrim} onClick={close}>
+    <div className={styles.scrim} onClick={requestClose}>
       <div className={styles.panel} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal>
         <div className={styles.head}>
           <span className={styles.headIcon}>
@@ -299,7 +319,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               aria-label="Search settings"
             />
           </span>
-          <button className={styles.close} onClick={close} title="Close" aria-label="Close">
+          <button className={styles.close} onClick={requestClose} title="Close" aria-label="Close">
             ✕
           </button>
         </div>
@@ -544,6 +564,18 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmCloseOpen}
+        title="A server install is paused"
+        confirmLabel="Close anyway"
+        cancelLabel="Keep installing"
+        onCancel={() => setConfirmCloseOpen(false)}
+        onConfirm={finishClose}
+      >
+        {bootstrapGuard ?? "This server needs a sudo password to finish setting up."} Closing Settings now
+        abandons that install — you&apos;ll need to start over from Control → Remote.
+      </ConfirmDialog>
     </div>
   );
 }
