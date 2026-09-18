@@ -43,6 +43,7 @@ import { useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
+import { looksLikeQuestion } from "../agent/status";
 import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
@@ -220,6 +221,10 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
         ? {
             outcome: meta?.isError ? "error" : "success",
             ...(meta?.subtype ? { subtype: meta.subtype } : {}),
+            // Read on the FULL text: `last_assistant_text` below is clipped from the
+            // end, where the "?" would be. The remote relay files the push under
+            // "Questions" instead of "Ready for review" on it (flightdeck-remote §8).
+            open_question: looksLikeQuestion(lastAssistantText(entry)),
             last_assistant_text: clipForEvent(lastAssistantText(entry)),
             repository: repo ? repoName(repo.path) : null,
           }

@@ -19,6 +19,7 @@ vi.mock("../ipc/client", () => {
       readDir: vi.fn(() => ok([])),
       answerPermission: vi.fn(() => ok()),
       publishControlEvent: vi.fn(() => Promise.resolve()),
+      tosseTaskDetail: vi.fn(() => ok(null)),
     },
   };
 });
@@ -53,7 +54,8 @@ import type { Turn } from "../store/types";
 import { useDisplay } from "../store/display";
 import { useToasts } from "../store/toasts";
 import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
-import type { PermissionRequestPayload } from "../ipc/client";
+import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
+import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -113,6 +115,25 @@ const conv = (over: Partial<Conversation> = {}): Conversation => ({
   ...over,
 });
 
+const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
+  task_id: "b1",
+  kind: "bash",
+  tool_use_id: null,
+  label: "build the app",
+  command: null,
+  subagent_type: null,
+  model: null,
+  agent_id: null,
+  status: "running",
+  progress: null,
+  tokens: null,
+  tool_uses: null,
+  duration_ms: null,
+  summary: null,
+  output_file: null,
+  ...over,
+});
+
 function seed(...convs: Conversation[]) {
   useConversationsStore.setState({
     repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }],
@@ -159,6 +180,7 @@ const helpers = (tosseAvailable = true): AppControlHelpers & { views: string[] }
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationStore.setState({ sessions: {} });
+  useBackgroundTasksStore.setState({ sessions: {} });
   useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
   seed(conv());
 });
@@ -210,6 +232,80 @@ describe("appControl — conversations", () => {
     expect((out[0].status as { kind: string }).kind).toBe("idle");
     expect((out[1].status as { kind: string }).kind).toBe("off");
     expect((out[0].repository as { name: string }).name).toBe("r1");
+  });
+
+  it("list_conversations counts RUNNING background tasks whatever the status", async () => {
+    seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta", handle: null }));
+    useConversationStore.getState().ensureSession("c1");
+    const entry = useConversationStore.getState().sessions.c1;
+    useConversationStore.setState({ sessions: { c1: { ...entry, bgAgentIds: ["tu-bg"] } } });
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          b1: bgTask({ task_id: "b1", status: "running" }),
+          b2: bgTask({ task_id: "b2", kind: "agent", tool_use_id: "tu-bg" }), // detached
+          b3: bgTask({ task_id: "b3", kind: "agent", tool_use_id: "tu-fg" }), // foreground: part of the turn
+          b4: bgTask({ task_id: "b4", status: "completed" }), // finished: not counted
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_conversations",
+      {},
+      null,
+      helpers(),
+    )) as Array<Record<string, unknown>>;
+    expect(out[0].background_tasks).toBe(2);
+    expect(out[1].background_tasks).toBe(0);
+  });
+
+  it("list_background_tasks keeps finished tasks and carries what the bars print", async () => {
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          b1: bgTask({ task_id: "b1", label: null, command: "npm run build" }),
+          b2: bgTask({
+            task_id: "b2",
+            kind: "agent",
+            status: "failed",
+            label: "Explore",
+            command: null,
+            subagent_type: "Explore",
+            model: "claude-sonnet-5",
+            tokens: 1200,
+            tool_uses: 7,
+            duration_ms: 42000,
+          }),
+          b3: bgTask({ task_id: "b3", kind: "workflow", label: "release", progress: "Review: diff" }),
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_background_tasks",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { tasks: Array<Record<string, unknown>> };
+    const none = { subagent_type: null, model: null, progress: null, tokens: null, tool_uses: null, duration_ms: null };
+    expect(out.tasks).toEqual([
+      { task_id: "b1", kind: "bash", status: "running", label: null, command: "npm run build", ...none },
+      // No bgAgentIds entry: a foreground sub-agent, flagged so a client can leave it out.
+      {
+        task_id: "b2",
+        kind: "agent",
+        status: "failed",
+        label: "Explore",
+        command: null,
+        subagent_type: "Explore",
+        model: "claude-sonnet-5",
+        progress: null,
+        tokens: 1200,
+        tool_uses: 7,
+        duration_ms: 42000,
+        foreground: true,
+      },
+      { task_id: "b3", kind: "workflow", status: "running", label: "release", command: null, ...none, progress: "Review: diff" },
+    ]);
   });
 
   it("read_conversation serializes the dialogue and skips sub-agent turns", async () => {
@@ -574,5 +670,171 @@ describe("answer_request — questions vs permissions", () => {
       behavior: "deny",
       message: "no",
     });
+  });
+});
+
+describe("appControl — link_tosse_task / unlink_tosse_task", () => {
+  /** A CRM task detail as `tosse_task_detail` returns it. */
+  const detail = (id: string, title: string, status: string, parentTaskId: string | null = null) => ({
+    task: {
+      id,
+      title,
+      status,
+      priority: null,
+      kind: null,
+      assignedTo: null,
+      dueDate: null,
+      notes: null,
+      subtaskCount: 0,
+      subtaskDone: 0,
+    },
+    projectId: "p1",
+    projectName: "Tosse Code",
+    parentTaskId,
+    context: null,
+    content: null,
+    subtasks: [],
+    blockedBy: [],
+    blocks: [],
+  });
+  const crmOk = (d: ReturnType<typeof detail>) =>
+    Promise.resolve({ status: "ok" as const, data: d });
+  const crmErr = (error: string) => Promise.resolve({ status: "error" as const, error });
+  const linked = () => useConversationsStore.getState().conversations.find((c) => c.id === "c1")!;
+
+  beforeEach(() => {
+    vi.mocked(commands.tosseTaskDetail).mockReset();
+    useDisplay.getState().set({ tosseTasksView: true });
+    seed(conv({ handle: "session-7" }));
+  });
+
+  it("links the CALLING conversation with the task as the CRM has it", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail("t1", "Real title", "En cours")));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      // The agent's title is ignored when the CRM can be read — the CRM is the truth.
+      { task_id: "t1", title: "agent's guess" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.source).toBe("tosse");
+    expect(linked()).toMatchObject({
+      tosseTaskId: "t1",
+      tosseTaskTitle: "Real title",
+      tosseTaskStatus: "En cours",
+    });
+    expect(vi.mocked(commands.upsertConversation)).toHaveBeenCalled(); // persisted
+  });
+
+  it("links a subtask's PARENT", async () => {
+    vi.mocked(commands.tosseTaskDetail)
+      .mockReturnValueOnce(crmOk(detail("sub", "A step", "À faire", "parent")))
+      .mockReturnValueOnce(crmOk(detail("parent", "The work", "En cours")));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: "sub" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(linked().tosseTaskId).toBe("parent");
+    expect(linked().tosseTaskTitle).toBe("The work");
+    expect(String(out.note)).toMatch(/subtask/);
+  });
+
+  // The CRM answered and does not know the id: an error to the agent, never a link to a
+  // guess — even when the agent supplied a title.
+  it("refuses a task the CRM does not know", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(
+      crmErr("TOSSE answered HTTP 404: Task not found"),
+    );
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: "nope", title: "x" }, "session-7", helpers()),
+    ).rejects.toThrow(/HTTP 404/);
+    expect(linked().tosseTaskId).toBeNull();
+  });
+
+  // No usable TOSSE session: the app can't check, so the agent's own title is used — and
+  // is required.
+  it("falls back to the agent's title when the app is not signed in", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmErr("not connected to TOSSE"));
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: "t1" }, "session-7", helpers()),
+    ).rejects.toThrow(/pass the task's 'title'/);
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: "t1", title: "From the agent", status: "En cours" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.source).toBe("agent");
+    expect(linked()).toMatchObject({ tosseTaskTitle: "From the agent", tosseTaskStatus: "En cours" });
+  });
+
+  // The TOSSE tab turned off means the app makes NO CRM request at all.
+  it("makes no CRM request when the TOSSE tab is off", async () => {
+    useDisplay.getState().set({ tosseTasksView: false });
+    await executeAppControlTool("link_tosse_task", { task_id: "t1", title: "T" }, "session-7", helpers());
+    expect(vi.mocked(commands.tosseTaskDetail)).not.toHaveBeenCalled();
+    expect(linked().tosseTaskId).toBe("t1");
+    expect(linked().tosseTaskStatus).toBeNull(); // unknown, not invented
+  });
+
+  it("never moves an existing link to another task without replace", async () => {
+    seed(conv({ handle: "session-7", tosseTaskId: "old", tosseTaskTitle: "Old task", tosseTaskStatus: "Review" }));
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmOk(detail("t1", "New task", "En cours")));
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: "t1" }, "session-7", helpers()),
+    ).rejects.toThrow(/already linked to another task — 'Old task'.*replace: true/);
+    expect(linked().tosseTaskId).toBe("old");
+
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: "t1", replace: true },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(linked().tosseTaskId).toBe("t1");
+    expect(out.replaced).toEqual({ task_id: "old", title: "Old task" });
+  });
+
+  it("is idempotent on the task already linked", async () => {
+    seed(conv({ handle: "session-7", tosseTaskId: "t1", tosseTaskTitle: "Stale", tosseTaskStatus: "À faire" }));
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail("t1", "Fresh", "En cours")));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: "t1" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.already_linked).toBe(true);
+    expect(out.replaced).toBeUndefined();
+    expect(linked()).toMatchObject({ tosseTaskTitle: "Fresh", tosseTaskStatus: "En cours" }); // re-stamped
+  });
+
+  // Scoped to the caller: a caller with no conversation (voice bridge, phone relay) has
+  // nothing to link.
+  it("refuses a caller with no conversation", async () => {
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: "t1", title: "T" }, null, helpers()),
+    ).rejects.toThrow(/only a conversation can call this/);
+    await expect(executeAppControlTool("unlink_tosse_task", {}, null, helpers())).rejects.toThrow(
+      /only a conversation can call this/,
+    );
+  });
+
+  it("unlinks the calling conversation", async () => {
+    seed(conv({ handle: "session-7", tosseTaskId: "t1", tosseTaskTitle: "T", tosseTaskStatus: "En cours" }));
+    const out = (await executeAppControlTool("unlink_tosse_task", {}, "session-7", helpers())) as Record<
+      string,
+      unknown
+    >;
+    expect(out).toMatchObject({ unlinked: true, previous: { task_id: "t1", title: "T" } });
+    expect(linked()).toMatchObject({ tosseTaskId: null, tosseTaskTitle: null, tosseTaskStatus: null });
+
+    const again = (await executeAppControlTool("unlink_tosse_task", {}, "session-7", helpers())) as Record<
+      string,
+      unknown
+    >;
+    expect(again.unlinked).toBe(false);
   });
 });

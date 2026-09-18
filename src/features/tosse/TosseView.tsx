@@ -38,7 +38,11 @@ import { ProjectFolderChip } from "./ProjectFolderChip";
 import { TaskLaunchProvider, useTaskLaunch } from "./TaskLaunch";
 import { launchTask } from "./taskPrompts";
 import type { LaunchMode } from "./taskConversation";
-import { useConversationsForTask, type Conversation } from "../../store/conversationsStore";
+import {
+  useConversationsForTask,
+  useConversationsStore,
+  type Conversation,
+} from "../../store/conversationsStore";
 import {
   GENERAL_FOLD_KEY,
   offBoardFold,
@@ -512,22 +516,47 @@ function StartWithNote({ onStart }: { onStart: (note: string) => void }) {
 function TaskConversations({ taskId }: { taskId: string }) {
   const api = useTaskLaunch();
   const convs = useConversationsForTask(taskId);
+  // The conversation whose link is about to go — confirmed first, because nothing in the
+  // UI puts a link BACK (only "Start" on a new conversation, or the agent's own tool).
+  const [unlinking, setUnlinking] = useState<Conversation | null>(null);
   if (convs.length === 0) return null;
   return (
     <section>
       <div className={s.detailKey}>Conversations {convs.length}</div>
       {convs.map((c) => (
-        <button
-          key={c.id}
-          className={s.convRow}
-          title={`Open « ${c.name} »`}
-          onClick={() => api?.open(c.id)}
-        >
-          <ConvStateDot convId={c.id} />
-          <span className={s.convName}>{c.name}</span>
-          <Ico name="arrow" className={`sm ${s.convGo}`} />
-        </button>
+        <div key={c.id} className={s.convItem}>
+          <button
+            className={s.convRow}
+            title={`Open « ${c.name} »`}
+            onClick={() => api?.open(c.id)}
+          >
+            <ConvStateDot convId={c.id} />
+            <span className={s.convName}>{c.name}</span>
+            <Ico name="arrow" className={`sm ${s.convGo}`} />
+          </button>
+          <button
+            className={s.convUnlink}
+            title={`Unlink « ${c.name} » from this task`}
+            aria-label={`Unlink « ${c.name} » from this task`}
+            onClick={() => setUnlinking(c)}
+          >
+            <Ico name="x" className="sm" />
+          </button>
+        </div>
       ))}
+      <ConfirmDialog
+        open={unlinking != null}
+        title={`Unlink « ${unlinking?.name ?? ""} » from this task?`}
+        confirmLabel="Unlink"
+        onCancel={() => setUnlinking(null)}
+        onConfirm={() => {
+          if (unlinking) useConversationsStore.getState().linkConversationToTask(unlinking.id, null);
+          setUnlinking(null);
+        }}
+      >
+        The conversation and the task both stay as they are — only the link between them goes:
+        the task leaves the conversation's header, and the conversation leaves this list.
+      </ConfirmDialog>
     </section>
   );
 }

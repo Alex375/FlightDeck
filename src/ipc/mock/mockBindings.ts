@@ -1135,6 +1135,7 @@ export const mockCommands = {
       },
       projectId: found.projectId,
       projectName: found.projectName,
+      parentTaskId: null,
       context:
         "## Périmètre\n\nListe des projets **groupés par client**, tâches triées par statut.\n\n- Écriture : statut + création\n- États dégradés : hors-ligne, session expirée",
       content: null,
