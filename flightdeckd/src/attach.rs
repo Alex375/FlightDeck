@@ -86,6 +86,25 @@ fn peer_is_owner(conn: &UnixStream) -> std::result::Result<(), String> {
     }
 }
 
+/// Tell a refused peer why (instead of a bare "broken pipe"), then close:
+/// its request is read and discarded first so its write does not fail
+/// before it can read the answer. Bounded — a silent peer is dropped.
+async fn refuse(conn: UnixStream, who: String) {
+    let (read_half, mut write_half) = conn.into_split();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut request = String::new();
+        let _ = BufReader::new(read_half).read_line(&mut request).await;
+        let line = json!({
+            "type": "fd_detach",
+            "reason": "error",
+            "message": format!("refused: flightdeckd only accepts its own user, not {who} — run this as that user"),
+        });
+        let _ = write_half.write_all(format!("{line}\n").as_bytes()).await;
+        let _ = write_half.shutdown().await;
+    })
+    .await;
+}
+
 pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
     if socket.exists() {
         std::fs::remove_file(socket).ok();
@@ -102,7 +121,8 @@ pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
             Ok((conn, _)) => {
                 if let Err(who) = peer_is_owner(&conn) {
                     warn!("attach connection refused: {who}");
-                    continue; // dropping `conn` closes it
+                    tokio::spawn(refuse(conn, who));
+                    continue;
                 }
                 let manager = manager.clone();
                 tokio::spawn(async move {
@@ -547,7 +567,8 @@ async fn one_shot_checked(socket: &Path, request: serde_json::Value) -> Result<S
     let v: serde_json::Value = serde_json::from_str(&line)
         .with_context(|| format!("unexpected reply from flightdeckd: {line:?}"))?;
     if v["ok"] != json!(true) {
-        anyhow::bail!("{}", v["error"].as_str().unwrap_or("flightdeckd refused the request"));
+        let why = v["error"].as_str().or_else(|| v["message"].as_str());
+        anyhow::bail!("{}", why.unwrap_or("flightdeckd refused the request"));
     }
     Ok(line)
 }
@@ -837,6 +858,18 @@ mod tests {
         stop_tx.send(()).unwrap();
         let err = pump_stdin(&mut ours, &mut rx, stop_rx, Duration::from_millis(50)).await.unwrap_err();
         assert!(err.to_string().contains("3 stdin line(s) could not be delivered"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_peer_is_told_why() {
+        let (daemon_end, mut client) = UnixStream::pair().unwrap();
+        tokio::spawn(refuse(daemon_end, "uid 0 (the daemon runs as uid 1000)".into()));
+        client.write_all(b"{\"status\":{}}\n").await.unwrap(); // the request still goes through
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "fd_detach");
+        assert!(v["message"].as_str().unwrap().contains("only accepts its own user, not uid 0"), "{line}");
     }
 
     #[tokio::test]
