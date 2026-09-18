@@ -17,7 +17,9 @@ import {
   type DiskConversation,
   type JsonValue,
   type PermissionDecision,
+  type TosseTaskDetail,
 } from "../ipc/client";
+import { isSessionGone } from "../ipc/tosseErrors";
 import {
   useConversationsStore,
   loadConversationHistory,
@@ -26,6 +28,7 @@ import {
   reactivateDiskConversation,
   stopConversationSession,
   type Conversation,
+  type LinkedTosseTask,
 } from "../store/conversationsStore";
 import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
 import { useConversationStore } from "../store/conversationStore";
@@ -845,6 +848,107 @@ function notifyUser(args: Record<string, unknown>) {
   };
 }
 
+/** The calling conversation, for tools that only ever act on the caller's OWN
+ *  conversation — never on another one by id. */
+function callerOnly(tool: string, session: string | null): Conversation {
+  const conv = convBySession(session);
+  if (!conv)
+    throw new Error(`${tool}: only a conversation can call this (it acts on the calling conversation)`);
+  return conv;
+}
+
+/** One task read from the CRM, or `null` when the app has no usable TOSSE session.
+ *
+ *  Only a GONE session (never signed in, revoked) is `null` — the same reading the tasks view
+ *  gives it (`isSessionGone`), and the case where the agent's own title is the best we have.
+ *  Any other failure — an unknown id (HTTP 404), a malformed one (HTTP 400), an outage — is
+ *  thrown: the agent named a task we could not confirm, and saying so beats linking a
+ *  conversation to a guess. */
+async function readTosseTask(tool: string, taskId: string): Promise<TosseTaskDetail | null> {
+  const res = await commands.tosseTaskDetail(taskId);
+  if (res.status === "ok") return res.data;
+  if (isSessionGone(res.error)) return null;
+  throw new Error(`${tool}: couldn't read TOSSE task '${taskId}' — ${res.error}`);
+}
+
+/** Resolve the task to link: from the CRM when the app can read it (a subtask resolving to
+ *  its parent), else from what the agent passed. */
+async function resolveLinkTarget(
+  args: Record<string, unknown>,
+  taskId: string,
+): Promise<{ task: LinkedTosseTask; source: "tosse" | "agent"; subtask?: LinkedTosseTask }> {
+  const tool = "link_tosse_task";
+  // The TOSSE tab's own gate: with it off, the app makes NO CRM requests at all
+  // (LinkedTaskSync reads the same preference).
+  const detail = useDisplay.getState().tosseTasksView ? await readTosseTask(tool, taskId) : null;
+  if (detail) {
+    const own = { id: detail.task.id, title: detail.task.title, status: detail.task.status };
+    if (!detail.parentTaskId) return { task: own, source: "tosse" };
+    // A subtask is a step of its parent's work: the conversation carries the PARENT, the
+    // unit the tasks view opens, reviews and counts conversations for.
+    const parent = await readTosseTask(tool, detail.parentTaskId);
+    if (!parent) throw new Error(`${tool}: couldn't read the parent of subtask '${taskId}'`);
+    return {
+      task: { id: parent.task.id, title: parent.task.title, status: parent.task.status },
+      source: "tosse",
+      subtask: own,
+    };
+  }
+  const title = typeof args.title === "string" ? args.title.trim() : "";
+  if (!title)
+    throw new Error(
+      `${tool}: this app can't read TOSSE right now (not signed in, or the TOSSE tab is off) — ` +
+        "pass the task's 'title' (and 'status')",
+    );
+  const status = typeof args.status === "string" && args.status.trim() ? args.status.trim() : null;
+  return { task: { id: taskId, title, status }, source: "agent" };
+}
+
+/** Link the CALLING conversation to the TOSSE task it works on — the same link the tasks
+ *  view's "Start" writes (`linkConversationToTask`), for work picked up from inside the
+ *  conversation. Never silently moves an existing link to a different task: that takes an
+ *  explicit `replace`, and the result names what was replaced. */
+async function linkTosseTask(args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly("link_tosse_task", session);
+  const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+  if (!taskId) throw new Error("link_tosse_task: 'task_id' is required");
+  const { task, source, subtask } = await resolveLinkTarget(args, taskId);
+
+  // Re-read AFTER the awaits: the link may have moved while the CRM was being read.
+  const conv = useConversationsStore.getState().conversations.find((c) => c.id === caller.id);
+  if (!conv) throw new Error("link_tosse_task: the calling conversation no longer exists");
+  const previous =
+    conv.tosseTaskId && conv.tosseTaskId !== task.id
+      ? { id: conv.tosseTaskId, title: conv.tosseTaskTitle }
+      : null;
+  if (previous && args.replace !== true)
+    throw new Error(
+      `link_tosse_task: this conversation is already linked to another task — ` +
+        `'${previous.title ?? previous.id}' (${previous.id}). Pass replace: true to move the link.`,
+    );
+  useConversationsStore.getState().linkConversationToTask(conv.id, task);
+  return {
+    conversation_id: conv.id,
+    task: { task_id: task.id, title: task.title, status: task.status },
+    source,
+    ...(conv.tosseTaskId === task.id ? { already_linked: true } : {}),
+    ...(subtask
+      ? { note: `'${subtask.title}' is a subtask — linked its parent task instead` }
+      : {}),
+    ...(previous ? { replaced: { task_id: previous.id, title: previous.title } } : {}),
+  };
+}
+
+/** Remove the CALLING conversation's task link. The CRM task itself is untouched. */
+function unlinkTosseTask(session: string | null) {
+  const conv = callerOnly("unlink_tosse_task", session);
+  if (!conv.tosseTaskId)
+    return { conversation_id: conv.id, unlinked: false, note: "not linked to any task" };
+  const previous = { task_id: conv.tosseTaskId, title: conv.tosseTaskTitle };
+  useConversationsStore.getState().linkConversationToTask(conv.id, null);
+  return { conversation_id: conv.id, unlinked: true, previous };
+}
+
 // ---- Dispatch ----------------------------------------------------------------
 
 /**
@@ -911,6 +1015,10 @@ export async function executeAppControlTool(
       return openPanel(args, session, helpers);
     case "notify_user":
       return notifyUser(args);
+    case "link_tosse_task":
+      return linkTosseTask(args, session);
+    case "unlink_tosse_task":
+      return unlinkTosseTask(session);
     default:
       // A tool listed in the Rust catalogue with no case here — a wiring bug,
       // surfaced to the caller rather than swallowed.

@@ -218,8 +218,9 @@ export interface Conversation {
    */
   pendingReminder: ReminderKind | null;
   /**
-   * The TOSSE task this conversation was started on (from the tasks view's "Start" /
-   * "Discuss"), or null for every conversation created any other way. PERSISTED.
+   * The TOSSE task this conversation carries — written by the tasks view's "Start" /
+   * "Discuss", or by the agent itself (the `link_tosse_task` app-control tool, e.g. from
+   * `/pickup`); null otherwise. PERSISTED.
    *
    * It is what makes a second click on that task REOPEN this conversation instead of
    * starting a second agent on the same work — the thing the tasks view exists to
@@ -272,7 +273,9 @@ export interface Conversation {
 export interface LinkedTosseTask {
   id: string;
   title: string;
-  status: string;
+  /** Null only when an agent linked the task without the CRM to read it from and did not
+   *  say — unknown, until the next CRM read re-stamps it. */
+  status: string | null;
 }
 
 /** Coerce a persisted (untyped) reminder string back to the union, defaulting any
@@ -595,9 +598,10 @@ interface ConversationsState {
    * Link this conversation to a TOSSE task (or unlink it with null). Persisted with
    * the task's title and status alongside its id — see {@link Conversation.tosseTaskTitle}.
    *
-   * Written once, when the tasks view opens a conversation on a task. A conversation
-   * is never re-linked to a DIFFERENT task afterwards: the view reopens the existing
-   * one instead, so one task keeps one agent.
+   * Written when the tasks view opens a conversation on a task, or when the agent links
+   * its own conversation (`link_tosse_task`, which refuses to move a link to a DIFFERENT
+   * task unless asked to explicitly). Null unlinks — the agent's `unlink_tosse_task`, or
+   * the task panel's per-conversation unlink.
    */
   linkConversationToTask: (id: string, task: LinkedTosseTask | null) => void;
 }

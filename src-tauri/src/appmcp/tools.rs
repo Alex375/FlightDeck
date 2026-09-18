@@ -356,6 +356,38 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     schema: obj(json!({}), &[]),
                 },
                 ToolSpec {
+                    name: "link_tosse_task",
+                    description: "Link the CALLING conversation to the TOSSE (CRM) task it is \
+                        working on, so the app shows that task on the conversation (header chip, \
+                        Flight Deck card, the task's own list of conversations). Call it right \
+                        after picking up or creating the task. When the app is signed in to \
+                        TOSSE the task is read from the CRM (an unknown id is an error, a \
+                        subtask links its parent task); otherwise pass `title` (and `status`) — \
+                        they are required then. Refuses if the conversation is already linked \
+                        to a DIFFERENT task, unless `replace` is true.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "task_id": { "type": "string", "description": "The TOSSE task id (UUID)." },
+                            "title": { "type": "string",
+                                "description": "The task's title — used only when the app cannot read the CRM itself." },
+                            "status": { "type": "string",
+                                "description": "The task's current status (e.g. 'En cours') — same fallback as title." },
+                            "replace": { "type": "boolean",
+                                "description": "Move an existing link to a different task onto this one (default false)." },
+                        }),
+                        &["task_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "unlink_tosse_task",
+                    description: "Remove the CALLING conversation's link to its TOSSE task (the \
+                        reverse of link_tosse_task). Touches only the app's association — the \
+                        task itself is left unchanged in the CRM.",
+                    kind: ToolKind::Front,
+                    schema: obj(json!({}), &[]),
+                },
+                ToolSpec {
                     name: "add_repo",
                     description: "Register a repository/folder in the app's sidebar so \
                         conversations can be created in it. Idempotent by path.",
@@ -489,7 +521,8 @@ mod tests {
             assert!(app.contains(&shared), "app missing {shared}");
             assert!(voice.contains(&shared), "voice missing {shared}");
         }
-        for app_only in ["whoami", "open_file", "open_view", "open_panel", "notify_user", "add_repo"] {
+        for app_only in ["whoami", "open_file", "open_view", "open_panel", "notify_user", "add_repo",
+                         "link_tosse_task", "unlink_tosse_task"] {
             assert!(app.contains(&app_only), "app missing {app_only}");
             assert!(!voice.contains(&app_only), "voice must not expose {app_only}");
         }
