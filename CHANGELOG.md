@@ -12,6 +12,8 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 ## v2.3.1
 
 - Fix: **artifacts published by Claude open again** — inline artifact cards no longer show "Unavailable", and artifact links in Claude's replies are back to clickable cards (Claude Code 2.1.272 changed the artifact link format).
+- Fix: with Caffeinate in **Light** mode, the Mac no longer falls asleep in the short gap between a background task finishing and Claude picking the work back up — it now waits 60 s before letting the Mac sleep.
+- Change: **Settings have fewer tabs** — **General** (Accounts · System), a new **Display** tab (appearance, thread, durations, composer, models, ordering) and **Claude Code** (instructions, behavior, helpers). Nothing changes in what the settings do; use the settings search to find one that moved.
 
 ## v2.3.0
 
