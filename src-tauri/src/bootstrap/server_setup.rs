@@ -21,16 +21,25 @@
 //! spike against a live, not-logged-in `claude` before committing to an approach. That
 //! spike (a throwaway Ubuntu 20.04 Docker fixture, `claude` 2.1.276, driven exactly the
 //! way this module drives a real server) found the OPPOSITE: a plain batch ssh call —
-//! `Stdio::piped()` stdin/stdout, no `-tt`, no `script` — reproduces the exact same
-//! prompt/failure text as a `-tt` run, just WITHOUT the OSC-8 terminal-hyperlink
-//! wrapping a real tty gets (`claude` only emits that wrapping when it detects a tty on
-//! its stdout). This is the SAME shape the crate's own LOCAL Claude sign-in already
-//! uses (`accounts::login_start`/`login_submit_code`, driving the CLI directly with no
-//! pty) — so this module mirrors that proven design instead of introducing a pty
-//! dependency the CLI turns out not to need. [`strip_ansi`] is kept anyway (cheap, and
-//! explicitly asked for) as defense-in-depth for whatever a REAL non-headless server
-//! shell might still inject (a wrapper's own banner colors, etc.) — not because the pty
-//! path is expected to be hit in practice.
+//! `Stdio::piped()` on stdin/stdout/stderr, no `-tt`, no `script` — reproduces the
+//! exact same prompt/failure text as a `-tt` run, just WITHOUT the OSC-8
+//! terminal-hyperlink wrapping a real tty gets (`claude` only emits that wrapping when
+//! it detects a tty on its stdout). This is the SAME shape the crate's own LOCAL Claude
+//! sign-in already uses (`accounts::login_start`/`login_submit_code`, driving the CLI
+//! directly with no pty) — so this module mirrors that proven design instead of
+//! introducing a pty dependency the CLI turns out not to need. [`strip_ansi`] is kept
+//! anyway (cheap, and explicitly asked for) as defense-in-depth for whatever a REAL
+//! non-headless server shell might still inject (a wrapper's own banner colors, etc.)
+//! — not because the pty path is expected to be hit in practice.
+//!
+//! ⚠️ **The URL/prompt and the failure text are on DIFFERENT streams**: `claude auth
+//! login` writes "Opening browser…"/the OAuth URL/the "Paste code here if prompted"
+//! prompt to STDOUT, but its own "Login failed: …" verdict to STDERR — VERIFIED live
+//! against the same fixture/version above with the two streams captured on separate
+//! file descriptors. `drive_claude_login` therefore pipes and reads BOTH (never
+//! `Stdio::null()`s stderr away) and feeds both into the same [`ClaudeLoginDriver`] —
+//! see that function's doc for why interleaving them into one accumulated buffer is
+//! safe.
 //!
 //! ## Fixtures
 //! `fixtures/claude_auth_status_logged_out.json` and
@@ -285,6 +294,25 @@ fn parse_auth_status(stdout: &str) -> Option<AuthStatus> {
     Some(AuthStatus { logged_in: raw.logged_in, email: raw.email })
 }
 
+/// Runs `claude auth status --json` on `machine` and parses its stdout REGARDLESS of
+/// the ssh command's exit status — deliberately NOT `run_ssh_on_machine`, which treats
+/// any non-zero exit as failure and discards stdout entirely. VERIFIED live: the real
+/// CLI exits non-zero when the answer is "not logged in" (the JSON on stdout is
+/// correct either way), so routing this through `run_ssh_on_machine` silently turned
+/// every "not logged in" answer into "could not confirm" — the exact trap the crate's
+/// own LOCAL analog, `accounts::status()`, already avoids for this same command by
+/// never gating on `output.status.success()`. This mirrors that: read stdout, parse
+/// it, done. `None` on an ssh-level failure (couldn't connect, etc.) or an unparseable
+/// answer — both already mean "could not confirm" to every caller here.
+async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
+    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    cmd.arg("-T")
+        .arg(format!("{}@{}", machine.user, machine.host))
+        .arg("claude auth status --json");
+    let output = cmd.output().await.ok()?;
+    parse_auth_status(&String::from_utf8_lossy(&output.stdout))
+}
+
 // ============================================================================
 // claude_login — state machine
 // ============================================================================
@@ -446,6 +474,36 @@ const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(30);
 /// submitted (the OAuth code exchange itself) before giving up and killing it.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The deadline used in place of `RECOGNITION_TIMEOUT`/`SUBMIT_TIMEOUT` while the
+/// driver is at `AwaitingCode` — i.e. no real deadline at all. [`ClaudeLoginDriver::
+/// timed_out`]'s own doc promises the human is "free to take as long as they like
+/// pasting a code" once the prompt is recognized; `submit_deadline` is `None` for the
+/// WHOLE `AwaitingCode` phase (it only starts once a code is actually submitted), so
+/// falling back to `recognize_deadline` there — as this module used to — silently
+/// re-armed the 30s recognition timeout for the human's entire wait, contradicting
+/// that promise. Ten years is simply "never, in practice" without needing an `Option`-
+/// shaped select branch.
+const AWAITING_CODE_NO_DEADLINE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+
+/// The deadline `drive_claude_login`'s read loop races on this iteration, given the
+/// driver's current state — pure so the fix for the bug `AWAITING_CODE_NO_DEADLINE`'s
+/// doc describes (AwaitingCode silently inheriting the stale 30s recognition deadline)
+/// is directly unit-tested without spawning a process. `AwaitingCode` alone gets the
+/// effectively-unbounded deadline; every other state races the real one —
+/// `recognize_deadline` before a code is submitted, `submit_deadline` (armed the
+/// instant it is) after.
+fn next_deadline(
+    state: &LoginState,
+    recognize_deadline: tokio::time::Instant,
+    submit_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    if matches!(state, LoginState::AwaitingCode) {
+        tokio::time::Instant::now() + AWAITING_CODE_NO_DEADLINE
+    } else {
+        submit_deadline.unwrap_or(recognize_deadline)
+    }
+}
+
 /// A command sent from the Tauri layer into a running [`run_login_actor`] task.
 enum DriverCommand {
     SubmitCode(String),
@@ -521,6 +579,27 @@ impl LoginSessions {
     async fn finish(&self, session_id: &str) {
         self.inner.lock().await.remove(session_id);
     }
+
+    /// Cancel every in-flight session — called at app quit so a server-side sign-in
+    /// never survives past it, mirroring `terminal::Terminals::kill_all()`'s treatment
+    /// of the integrated-terminal shells (and every other long-lived remote/child-
+    /// process registry torn down on `RunEvent::Exit`). Only QUEUES the cancellations
+    /// (each session's own actor task does the actual `child.start_kill()` once it
+    /// processes its `Cancel`) — callers that need the sessions to actually be gone
+    /// poll [`Self::is_empty`] with a bound afterwards, the same way the app-quit
+    /// handler already drains `Sessions`.
+    pub async fn cancel_all(&self) {
+        let guard = self.inner.lock().await;
+        for session in guard.values() {
+            let _ = session.cmd_tx.send(DriverCommand::Cancel);
+        }
+    }
+
+    /// Whether any session is still registered — used to poll for drain after
+    /// [`Self::cancel_all`] at app quit.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
 }
 
 /// Emit [`ServerLoginResultEvent`], logging (never swallowing) a failed emit — mirrors
@@ -579,17 +658,15 @@ async fn drive_claude_login(
     // confirmed logged in" and falls through to the real attempt below, which will
     // surface the SAME underlying connectivity problem with a much more specific error
     // if it's real.
-    if let Ok(stdout) = run_ssh_on_machine(machine, known_hosts, "claude auth status --json").await {
-        if let Some(AuthStatus { logged_in: true, email }) = parse_auth_status(&stdout) {
-            return LoginOutcome::Done { email };
-        }
+    if let Some(AuthStatus { logged_in: true, email }) = probe_auth_status(machine, known_hosts).await {
+        return LoginOutcome::Done { email };
     }
 
     let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
     cmd.arg("-T")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd.arg(format!("{}@{}", machine.user, machine.host)).arg("claude auth login");
 
@@ -600,20 +677,43 @@ async fn drive_claude_login(
     let Some(mut stdin) = child.stdin.take() else {
         return LoginOutcome::Failed { reason: "login stdin unavailable".to_string() };
     };
-    let Some(stdout) = child.stdout.take() else {
+    let Some(mut stdout_reader) = child.stdout.take() else {
         return LoginOutcome::Failed { reason: "login stdout unavailable".to_string() };
+    };
+    // The CLI's own failure text ("Login failed: ...") lands on STDERR, not stdout —
+    // VERIFIED live, contradicting what this module's doc used to claim about a plain
+    // batch ssh call reproducing the "exact same" text: that's true of stdout alone
+    // only for the URL/prompt, not the failure line. Captured here (not `Stdio::
+    // null()`'d away) and fed into the SAME driver as stdout: `ClaudeLoginDriver::
+    // feed` only looks for URL/prompt text while `Start`/`UrlReady` (stdout-only in
+    // practice at that point) and failure text while `Submitting` (stderr-only in
+    // practice by then), so interleaving the two streams into one accumulated buffer
+    // is safe — `extract_login_failure`'s substring search doesn't care what else
+    // surrounds the message.
+    let Some(mut stderr_reader) = child.stderr.take() else {
+        return LoginOutcome::Failed { reason: "login stderr unavailable".to_string() };
     };
 
     let mut driver = ClaudeLoginDriver::new();
-    let mut reader = stdout;
-    let mut buf = [0u8; 4096];
+    let mut stdout_buf = [0u8; 4096];
+    let mut stderr_buf = [0u8; 4096];
+    // Each stream gets its own "done" latch instead of the loop `break`ing the instant
+    // ONE of them hits EOF — otherwise, with `biased` polling stdout before stderr, a
+    // stdout EOF arriving in the same tick as a still-unread "Login failed: ..." on
+    // stderr could win the race and the failure text would never be read at all.
+    let mut stdout_done = false;
+    let mut stderr_done = false;
     let mut url_reported = false;
     let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
     let mut submit_deadline: Option<tokio::time::Instant> = None;
     let mut cancelled = false;
 
     'read: loop {
-        let sleep_until = submit_deadline.unwrap_or(recognize_deadline);
+        if stdout_done && stderr_done {
+            // Both streams closed — the process is done producing output.
+            break 'read;
+        }
+        let sleep_until = next_deadline(&driver.state, recognize_deadline, submit_deadline);
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
@@ -634,11 +734,11 @@ async fn drive_claude_login(
                     }
                 }
             }
-            n = reader.read(&mut buf) => {
+            n = stdout_reader.read(&mut stdout_buf), if !stdout_done => {
                 match n {
-                    Ok(0) => break 'read, // EOF — the process is done producing output
+                    Ok(0) => stdout_done = true, // EOF — stdout is done producing output
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let chunk = String::from_utf8_lossy(&stdout_buf[..n]).into_owned();
                         driver.feed(&chunk);
                         if let LoginState::UrlReady { url } = &driver.state {
                             if !url_reported {
@@ -650,7 +750,28 @@ async fn drive_claude_login(
                             break 'read;
                         }
                     }
-                    Err(_e) => break 'read,
+                    Err(e) => {
+                        driver.state = LoginState::Failed {
+                            reason: format!("lost the ssh connection: {e}"),
+                        };
+                        break 'read;
+                    }
+                }
+            }
+            n = stderr_reader.read(&mut stderr_buf), if !stderr_done => {
+                match n {
+                    Ok(0) => stderr_done = true, // EOF — stderr is done producing output
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&stderr_buf[..n]).into_owned();
+                        driver.feed(&chunk);
+                        if matches!(driver.state, LoginState::Failed { .. }) {
+                            break 'read;
+                        }
+                    }
+                    // Best-effort: losing the stderr stream alone doesn't kill the
+                    // whole drive — stdout (and the authoritative status confirm
+                    // afterwards) still resolve the outcome. Just stop polling it.
+                    Err(_e) => stderr_done = true,
                 }
             }
             _ = tokio::time::sleep_until(sleep_until) => {
@@ -681,10 +802,7 @@ async fn drive_claude_login(
     // state) with no failure text recognized: resolve authoritatively via a fresh
     // `claude auth status`, per the brief's contract (see `resolve_login_outcome`'s
     // doc) — never trust the login process's bare exit code alone.
-    let confirm = run_ssh_on_machine(machine, known_hosts, "claude auth status --json")
-        .await
-        .ok()
-        .and_then(|s| parse_auth_status(&s));
+    let confirm = probe_auth_status(machine, known_hosts).await;
     let process_succeeded = wait_result.map(|s| s.success()).unwrap_or(false);
     driver.resolve(process_succeeded, confirm);
 
@@ -1188,6 +1306,55 @@ mod tests {
         assert_eq!(ClaudeLoginDriver::default().state, LoginState::Start);
     }
 
+    // ---- next_deadline — regression coverage for the AwaitingCode timeout bug ----
+    //
+    // Before the fix, `AwaitingCode` fell back to `recognize_deadline` (the SAME fixed
+    // 30s-from-spawn deadline `Start`/`UrlReady` race) for as long as `submit_deadline`
+    // stayed `None` — which is the ENTIRE `AwaitingCode` phase, since it's only armed
+    // once a code is actually submitted. So a human who hadn't pasted a code within
+    // 30s of the ssh connection opening (not 30s after the prompt even appeared) had
+    // the login killed out from under them, contradicting `ClaudeLoginDriver::
+    // timed_out`'s own documented "free to take as long as they like" contract.
+
+    #[test]
+    fn next_deadline_is_effectively_unbounded_while_awaiting_code() {
+        let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
+        let sleep_until = next_deadline(&LoginState::AwaitingCode, recognize_deadline, None);
+        // Proves `AwaitingCode` no longer inherits the stale `recognize_deadline` — it
+        // now lands centuries past even a hugely generous bound on how long a human
+        // could plausibly take to paste a code.
+        assert!(
+            sleep_until > recognize_deadline + Duration::from_secs(3600),
+            "AwaitingCode must not race a deadline anywhere near recognize_deadline"
+        );
+    }
+
+    #[test]
+    fn next_deadline_still_races_recognize_deadline_before_a_code_is_submitted() {
+        let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
+        assert_eq!(next_deadline(&LoginState::Start, recognize_deadline, None), recognize_deadline);
+        assert_eq!(
+            next_deadline(
+                &LoginState::UrlReady { url: "https://example.com".to_string() },
+                recognize_deadline,
+                None
+            ),
+            recognize_deadline,
+            "UrlReady must still be bounded by recognize_deadline — only AwaitingCode is unbounded"
+        );
+    }
+
+    #[test]
+    fn next_deadline_uses_submit_deadline_once_a_code_is_submitted() {
+        let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
+        let submit_deadline = tokio::time::Instant::now() + SUBMIT_TIMEOUT;
+        assert_eq!(
+            next_deadline(&LoginState::Submitting, recognize_deadline, Some(submit_deadline)),
+            submit_deadline,
+            "Submitting must race the SEPARATE post-submission deadline, not recognize_deadline"
+        );
+    }
+
     // ---- LoginSessions registry ----
 
     #[tokio::test]
@@ -1233,6 +1400,36 @@ mod tests {
         let sessions = LoginSessions::new();
         let err = sessions.send("nope", DriverCommand::Cancel).await.unwrap_err();
         assert!(err.contains("no sign-in in progress"));
+    }
+
+    /// [`LoginSessions::cancel_all`] — the app-quit teardown this module was missing
+    /// (a login session used to be the one long-lived remote/child-process registry in
+    /// the crate `RunEvent::Exit` never touched) — queues a `Cancel` for EVERY
+    /// registered session, regardless of which machine it belongs to.
+    #[tokio::test]
+    async fn cancel_all_sends_cancel_to_every_registered_session() {
+        let sessions = LoginSessions::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx1).await;
+        sessions.supersede_and_insert("s2".to_string(), "m2".to_string(), tx2).await;
+
+        assert!(!sessions.is_empty().await);
+        sessions.cancel_all().await;
+
+        assert!(matches!(rx1.recv().await, Some(DriverCommand::Cancel)));
+        assert!(matches!(rx2.recv().await, Some(DriverCommand::Cancel)));
+    }
+
+    #[tokio::test]
+    async fn is_empty_reflects_finish() {
+        let sessions = LoginSessions::new();
+        assert!(sessions.is_empty().await);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        sessions.supersede_and_insert("s1".to_string(), "m1".to_string(), tx).await;
+        assert!(!sessions.is_empty().await);
+        sessions.finish("s1").await;
+        assert!(sessions.is_empty().await);
     }
 
     // ========================================================================
@@ -1607,10 +1804,11 @@ mod tests {
         // (nothing in this repo's setup ever signs it in), asserted up front so a
         // stale/reused fixture fails LOUDLY here instead of masquerading as a bug in
         // this module.
-        let status = run_ssh_on_machine(&machine, kh.path(), "claude auth status --json")
-            .await
-            .ok()
-            .and_then(|s| parse_auth_status(&s));
+        // `probe_auth_status`, not `run_ssh_on_machine` — the real CLI exits non-zero
+        // for "not logged in" too, which `run_ssh_on_machine` would treat as a failed
+        // call and silently discard the (perfectly valid) JSON on stdout, turning this
+        // precondition check into a no-op `assert_ne!(None, Some(true))`.
+        let status = probe_auth_status(&machine, kh.path()).await;
         assert_ne!(
             status.map(|s| s.logged_in),
             Some(true),

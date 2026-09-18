@@ -803,6 +803,20 @@ pub fn run() {
                 // the child also self-terminates via `-w <pid>` if we somehow don't reach
                 // here — see `power::Caffeinate::hold`.)
                 let _ = app_handle.state::<power::Caffeinate>().set_awake(false);
+                // Cancel every in-flight server-side claude sign-in, so quitting Flight
+                // Deck never leaves the local ssh process — and the remote `claude auth
+                // login` it's driving, possibly still blocked on the "paste code" prompt
+                // — orphaned. Bounded the same way the session/Codex teardowns below are.
+                let login_sessions = app_handle
+                    .state::<std::sync::Arc<bootstrap::server_setup::LoginSessions>>();
+                tauri::async_runtime::block_on(async {
+                    login_sessions.cancel_all().await;
+                    let deadline = Duration::from_secs(6);
+                    let start = Instant::now();
+                    while !login_sessions.is_empty().await && start.elapsed() < deadline {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
                 let sessions = app_handle.state::<Sessions>();
                 let handles = sessions.handles();
                 if !handles.is_empty() {
