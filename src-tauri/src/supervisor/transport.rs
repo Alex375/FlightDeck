@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use super::protocol::CliMessage;
@@ -529,9 +529,18 @@ pub struct Transport {
     reader_err: ErrSlot,
     /// Set if the stdin writer died on a write/flush/serialize failure.
     writer_err: ErrSlot,
-    /// Count of REPLAYABLE stdout lines received (see [`is_replayable_line`]) —
-    /// the reattach cursor for remote sessions. Always 0-based per transport.
+    /// Count of REPLAYABLE stdout lines successfully parsed and forwarded (see
+    /// [`is_replayable_line`]) — the reattach cursor for remote sessions. Always
+    /// 0-based per transport. ⚠️ Deliberately excludes a replayable line that
+    /// failed to parse (see [`Self::unparseable_replayable`]): counting it here
+    /// would tell the daemon we received a message we actually dropped, so it
+    /// would never be replayed again — permanently lost.
     lines_seen: Arc<AtomicU64>,
+    /// Count of REPLAYABLE stdout lines that failed `serde_json` parsing this
+    /// connection (excluded from [`Self::lines_seen`] on purpose — see there).
+    /// The session actor watches this across reconnects to bound how long it
+    /// keeps asking the daemon to replay something it can never parse.
+    unparseable_replayable: Arc<AtomicU64>,
     /// Whether this transport is an ssh→flightdeckd attach stream (drives the
     /// `fd_stop` escalation in [`Transport::shutdown`]).
     is_remote: bool,
@@ -644,9 +653,16 @@ impl Transport {
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable_replayable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         let pumps = vec![
-            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone(), lines_seen.clone())),
+            tokio::spawn(reader_loop(
+                stdout,
+                msg_tx,
+                reader_err.clone(),
+                lines_seen.clone(),
+                unparseable_replayable.clone(),
+            )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
         ];
@@ -661,6 +677,7 @@ impl Transport {
                 reader_err,
                 writer_err,
                 lines_seen,
+                unparseable_replayable,
                 is_remote: cfg.remote.is_some(),
             },
             msg_rx,
@@ -672,6 +689,14 @@ impl Transport {
     /// the daemon's `replay_from` base).
     pub fn lines_seen(&self) -> u64 {
         self.lines_seen.load(Ordering::Relaxed)
+    }
+
+    /// How many replayable stream lines this connection could NOT be parsed
+    /// (and so are missing from [`Self::lines_seen`]). The session actor uses
+    /// this to bound retrying a line it can never parse across reconnects —
+    /// see `session.rs::malformed_replay_step`.
+    pub fn unparseable_replayable(&self) -> u64 {
+        self.unparseable_replayable.load(Ordering::Relaxed)
     }
 
     /// OS process id, while the child is alive.
@@ -821,11 +846,22 @@ impl Transport {
 /// Read stdout as newline-delimited JSON. Each non-empty line is parsed into a
 /// [`CliMessage`]; parse failures are logged and skipped, never fatal (spec
 /// §2.1). Ends when the stream closes or the consumer drops the receiver.
-async fn reader_loop(
-    stdout: ChildStdout,
+///
+/// Generic over the reader so this can be driven by a [`tokio::io::duplex`] half
+/// in tests, not just a real [`ChildStdout`].
+///
+/// ⚠️ `lines_seen` is incremented ONLY on a successful parse — see its doc on
+/// [`Transport`] for why counting an unparseable line there would silently and
+/// permanently drop it. A replayable line that fails to parse instead bumps
+/// `unparseable_replayable`, so the actor knows to ask the daemon to replay it
+/// again on the next reattach (and to bound that across reconnects — see
+/// `session.rs::malformed_replay_step`).
+async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
     tx: mpsc::UnboundedSender<CliMessage>,
     reader_err: ErrSlot,
     lines_seen: Arc<AtomicU64>,
+    unparseable_replayable: Arc<AtomicU64>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -835,18 +871,23 @@ async fn reader_loop(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if is_replayable_line(trimmed) {
-                    lines_seen.fetch_add(1, Ordering::Relaxed);
-                }
+                let replayable = is_replayable_line(trimmed);
                 match serde_json::from_str::<CliMessage>(trimmed) {
                     Ok(msg) => {
+                        if replayable {
+                            lines_seen.fetch_add(1, Ordering::Relaxed);
+                        }
                         if tx.send(msg).is_err() {
                             break; // consumer gone
                         }
                     }
                     Err(e) => {
+                        if replayable {
+                            unparseable_replayable.fetch_add(1, Ordering::Relaxed);
+                        }
                         eprintln!(
-                            "[transport] skipping unparseable stdout line: {e}: {}",
+                            "[transport] skipping unparseable {} stdout line: {e}: {}",
+                            message_type_hint(trimmed),
                             truncate(trimmed, 160)
                         );
                     }
@@ -864,6 +905,16 @@ async fn reader_loop(
             }
         }
     }
+}
+
+/// Best-effort `"type"` field of an unparseable line, for the skip log —
+/// pulled with a generic `Value` parse (which tolerates a shape `CliMessage`
+/// itself rejected) so the log names WHAT we dropped, not just that we did.
+fn message_type_hint(line: &str) -> String {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Drain the outbound queue onto stdin, one full JSON line at a time, flushing
@@ -1042,6 +1093,57 @@ mod tests {
         assert!(!is_replayable_line(r#"{"type":"fd_detach"}"#));
         assert!(!is_replayable_line("not json"));
         assert!(!is_replayable_line(r#"{"no_type":true}"#));
+    }
+
+    /// The bug this guards against: a replayable-typed line that fails to parse
+    /// must NOT bump `lines_seen`, or the app tells the daemon "I got that" for a
+    /// message it actually dropped — never replayed again, permanently lost. Feeds
+    /// `reader_loop` directly over a `tokio::io::duplex` pipe (no process spawn
+    /// needed): one well-formed replayable line, then one that has a replayable
+    /// `"type"` but a body `CliMessage` cannot parse.
+    #[tokio::test]
+    async fn unparseable_replayable_line_is_not_counted_as_seen() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+        ));
+
+        // Well-formed and replayable: a bare `result` message parses with every
+        // field defaulted.
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .await
+            .unwrap();
+        // Replayable-TYPED ("result") but malformed: missing the required
+        // `subtype` field — `is_replayable_line` only probes `"type"`, so this
+        // still counts as replayable, but `CliMessage`'s Deserialize rejects it
+        // (a bad "type" tag would fall through to `Unknown` instead; this is a
+        // parse failure on an otherwise-recognized type).
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 1, "only the parseable line counts");
+        assert_eq!(
+            unparseable.load(Ordering::Relaxed),
+            1,
+            "the malformed replayable line is tracked separately, not silently dropped"
+        );
+        // The good message still reached the consumer; the bad one did not (and
+        // never will, under this name — see CliMessage's Deserialize impl).
+        let msg = rx.recv().await.expect("the well-formed line should be forwarded");
+        assert!(matches!(msg, CliMessage::Result(_)));
+        assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real

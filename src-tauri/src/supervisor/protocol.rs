@@ -63,8 +63,11 @@ pub enum CliMessage {
     /// `claude` itself; local sessions never see it.
     FdAttach(FdAttachMsg),
     /// flightdeckd goodbye: the daemon is closing this attach stream. The
-    /// `reason` decides whether the actor may auto-reconnect ("replaced",
-    /// "stopped", "exited" and "error" all mean NO).
+    /// `reason` decides whether the actor may auto-reconnect: `"stalled"` is
+    /// the ONLY reconnect-eligible reason — `"replaced"`, `"stopped"`,
+    /// `"exited"`, `"error"` and any other/unknown reason all mean NO. See
+    /// `session.rs::reconnect_policy_for_reason`, the single table this is
+    /// decided by (keep this comment in sync with it).
     FdDetach(FdDetachMsg),
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
