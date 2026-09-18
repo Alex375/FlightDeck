@@ -287,8 +287,16 @@ pub struct TerminalExitEvent {
 /// `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
 /// per session; a session that was ALREADY signed in never emits this (it jumps
 /// straight to [`ServerLoginResultEvent`]).
+///
+/// ⚠️ `session_id` (added for the B-finding #4 single-flight fix's own follow-up
+/// review) is what lets a listener tell THIS session apart from one it has already
+/// moved past for the same `machine_id` — at most one session is ever live per
+/// machine, but a just-superseded session's belated event can still arrive after a
+/// `restart_claude_login` replacement is already known. See `ClaudeSignInInline`'s and
+/// `claudeLoginSessions.ts`'s own filtering docs.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct ServerLoginPromptEvent {
+    pub session_id: String,
     pub machine_id: String,
     pub url: String,
 }
@@ -297,8 +305,15 @@ pub struct ServerLoginPromptEvent {
 /// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
 /// otherwise. NEVER emitted for a session the front itself cancelled (see
 /// `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+///
+/// ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
+/// has no way to distinguish this session's OWN terminal event from a stale one
+/// belonging to a session it has already moved past (the exact "Restart sign-in"
+/// race a follow-up review of B-finding #4 caught: the just-superseded session's
+/// belated `superseded` result clobbering the brand-new session's state).
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct ServerLoginResultEvent {
+    pub session_id: String,
     pub machine_id: String,
     pub ok: bool,
     pub email: Option<String>,

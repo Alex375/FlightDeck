@@ -3946,7 +3946,25 @@ visited: number; elapsedMs: number }
  * Opaque handle [`start_claude_login`]/[`restart_claude_login`] return, threaded back
  * through [`submit_claude_login_code`] / [`cancel_claude_login`].
  */
-export type LoginSession = { session_id: string; machine_id: string }
+export type LoginSession = { session_id: string; machine_id: string; 
+/**
+ * ⚠️ Added by a follow-up review of the B-finding #4 single-flight fix: `true`
+ * only when THIS call actually reserved (originated) the session —
+ * `start_claude_login` finding nothing live and spawning a fresh
+ * [`run_login_actor`], or `restart_claude_login` (which always supersedes and
+ * registers itself as the replacement). `false` when this call merely ATTACHED to
+ * a session another surface already started ([`AttachOutcome::Attached`]).
+ * 
+ * The front MUST gate `cancel_claude_login` on this: only the owner may actually
+ * kill the underlying session on Cancel/unmount. An attached surface's
+ * Cancel/unmount is a local-only detach that leaves the session running for
+ * whoever still owns it — see `ClaudeSignInInline`'s own doc. Before this field
+ * existed, EVERY holder's Cancel/unmount killed the shared session unconditionally,
+ * reproducing the exact "second sign-in silently kills the first, zero UI
+ * feedback" bug class the single-flight fix was written to close in the first
+ * place, just via an attached surface's teardown instead of a competing Start.
+ */
+owned: boolean }
 /**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
@@ -4631,15 +4649,28 @@ daemon_outdated: boolean }
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
  * per session; a session that was ALREADY signed in never emits this (it jumps
  * straight to [`ServerLoginResultEvent`]).
+ * 
+ * ⚠️ `session_id` (added for the B-finding #4 single-flight fix's own follow-up
+ * review) is what lets a listener tell THIS session apart from one it has already
+ * moved past for the same `machine_id` — at most one session is ever live per
+ * machine, but a just-superseded session's belated event can still arrive after a
+ * `restart_claude_login` replacement is already known. See `ClaudeSignInInline`'s and
+ * `claudeLoginSessions.ts`'s own filtering docs.
  */
-export type ServerLoginPromptEvent = { machine_id: string; url: string }
+export type ServerLoginPromptEvent = { session_id: string; machine_id: string; url: string }
 /**
  * Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
  * `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
  * otherwise. NEVER emitted for a session the front itself cancelled (see
  * `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+ * 
+ * ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
+ * has no way to distinguish this session's OWN terminal event from a stale one
+ * belonging to a session it has already moved past (the exact "Restart sign-in"
+ * race a follow-up review of B-finding #4 caught: the just-superseded session's
+ * belated `superseded` result clobbering the brand-new session's state).
  */
-export type ServerLoginResultEvent = { machine_id: string; ok: boolean; email: string | null; error: string | null }
+export type ServerLoginResultEvent = { session_id: string; machine_id: string; ok: boolean; email: string | null; error: string | null }
 /**
  * The Codex backend's subscription rate-limit % (5h + weekly windows) changed. Codex
  * pushes this over the live app-server (`account/rateLimits/updated`) — there is no

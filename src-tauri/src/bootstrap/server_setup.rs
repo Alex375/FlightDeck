@@ -546,17 +546,35 @@ struct ActiveLoginSession {
 pub struct LoginSession {
     pub session_id: String,
     pub machine_id: String,
+    /// ⚠️ Added by a follow-up review of the B-finding #4 single-flight fix: `true`
+    /// only when THIS call actually reserved (originated) the session —
+    /// `start_claude_login` finding nothing live and spawning a fresh
+    /// [`run_login_actor`], or `restart_claude_login` (which always supersedes and
+    /// registers itself as the replacement). `false` when this call merely ATTACHED to
+    /// a session another surface already started ([`AttachOutcome::Attached`]).
+    ///
+    /// The front MUST gate `cancel_claude_login` on this: only the owner may actually
+    /// kill the underlying session on Cancel/unmount. An attached surface's
+    /// Cancel/unmount is a local-only detach that leaves the session running for
+    /// whoever still owns it — see `ClaudeSignInInline`'s own doc. Before this field
+    /// existed, EVERY holder's Cancel/unmount killed the shared session unconditionally,
+    /// reproducing the exact "second sign-in silently kills the first, zero UI
+    /// feedback" bug class the single-flight fix was written to close in the first
+    /// place, just via an attached surface's teardown instead of a competing Start.
+    pub owned: bool,
 }
 
 /// What [`LoginSessions::attach_or_reserve`] found for a given machine.
 enum AttachOutcome {
-    /// A live session for this machine already existed — its handle, plus whatever URL
-    /// it has recognized so far (`None` if it hasn't gotten that far yet). The
+    /// A live session for this machine already existed — its handle (always
+    /// `owned: false`, see [`LoginSession::owned`]'s own doc), plus whatever URL it has
+    /// recognized so far (`None` if it hasn't gotten that far yet). The
     /// freshly-minted `session_id`/`cmd_tx` the caller offered were never registered —
     /// there is nothing for the caller to spawn or clean up.
     Attached { session: LoginSession, last_url: Option<String> },
     /// Nothing existed for this machine — the offered `session_id`/`cmd_tx` are now the
-    /// registered entry; the caller must spawn [`run_login_actor`] for it.
+    /// registered entry; the caller must spawn [`run_login_actor`] for it, and its
+    /// returned [`LoginSession`] must be `owned: true`.
     Reserved,
 }
 
@@ -598,7 +616,7 @@ impl LoginSessions {
         let mut guard = self.inner.lock().await;
         if let Some((id, existing)) = guard.iter().find(|(_, s)| s.machine_id == machine_id) {
             return AttachOutcome::Attached {
-                session: LoginSession { session_id: id.clone(), machine_id: existing.machine_id.clone() },
+                session: LoginSession { session_id: id.clone(), machine_id: existing.machine_id.clone(), owned: false },
                 last_url: existing.last_url.lock().unwrap().clone(),
             };
         }
@@ -673,18 +691,18 @@ impl LoginSessions {
 
 /// Emit [`ServerLoginResultEvent`], logging (never swallowing) a failed emit — mirrors
 /// `ipc::events::emit_logged`'s discipline for every OTHER terminal event in the crate.
-fn emit_result(app: &tauri::AppHandle, machine_id: &str, ok: bool, email: Option<String>, error: Option<String>) {
+fn emit_result(app: &tauri::AppHandle, session_id: &str, machine_id: &str, ok: bool, email: Option<String>, error: Option<String>) {
     use tauri_specta::Event;
-    let ev = ServerLoginResultEvent { machine_id: machine_id.to_string(), ok, email, error };
+    let ev = ServerLoginResultEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), ok, email, error };
     if let Err(e) = ev.emit(app) {
         eprintln!("[bootstrap] failed to emit server_login_result event: {e}");
     }
 }
 
 /// Emit [`ServerLoginPromptEvent`], logging a failed emit the same way.
-fn emit_prompt(app: &tauri::AppHandle, machine_id: &str, url: &str) {
+fn emit_prompt(app: &tauri::AppHandle, session_id: &str, machine_id: &str, url: &str) {
     use tauri_specta::Event;
-    let ev = ServerLoginPromptEvent { machine_id: machine_id.to_string(), url: url.to_string() };
+    let ev = ServerLoginPromptEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), url: url.to_string() };
     if let Err(e) = ev.emit(app) {
         eprintln!("[bootstrap] failed to emit server_login_prompt event: {e}");
     }
@@ -916,18 +934,19 @@ async fn run_login_actor(
     last_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let outcome = drive_claude_login(&machine, known_hosts.as_deref(), cmd_rx, |url| {
-        emit_prompt(&app, &machine.id, url);
+        emit_prompt(&app, &session_id, &machine.id, url);
         *last_url.lock().unwrap() = Some(url.to_string());
     })
     .await;
 
     sessions.finish(&session_id).await;
     match outcome {
-        LoginOutcome::Done { email } => emit_result(&app, &machine.id, true, email, None),
-        LoginOutcome::Failed { reason } => emit_result(&app, &machine.id, false, None, Some(reason)),
+        LoginOutcome::Done { email } => emit_result(&app, &session_id, &machine.id, true, email, None),
+        LoginOutcome::Failed { reason } => emit_result(&app, &session_id, &machine.id, false, None, Some(reason)),
         LoginOutcome::Cancelled => {}
         LoginOutcome::Superseded => emit_result(
             &app,
+            &session_id,
             &machine.id,
             false,
             None,
@@ -991,14 +1010,14 @@ pub async fn start_claude_login(
     match sessions.attach_or_reserve(session_id.clone(), machine_id.clone(), cmd_tx, last_url.clone()).await {
         AttachOutcome::Attached { session, last_url } => {
             if let Some(url) = last_url {
-                emit_prompt(&app, &session.machine_id, &url);
+                emit_prompt(&app, &session.session_id, &session.machine_id, &url);
             }
             Ok(session)
         }
         AttachOutcome::Reserved => {
             let sessions_arc = sessions.inner().clone();
             tokio::spawn(run_login_actor(app, sessions_arc, session_id.clone(), machine, known_hosts, cmd_rx, last_url));
-            Ok(LoginSession { session_id, machine_id })
+            Ok(LoginSession { session_id, machine_id, owned: true })
         }
     }
 }
@@ -1040,7 +1059,10 @@ pub async fn restart_claude_login(
     let sessions_arc = sessions.inner().clone();
     tokio::spawn(run_login_actor(app, sessions_arc, session_id.clone(), machine, known_hosts, cmd_rx, last_url));
 
-    Ok(LoginSession { session_id, machine_id })
+    // Always `owned: true` — an explicit restart never merely attaches, it always
+    // supersedes and registers itself as the fresh owner (see `LoginSession::owned`'s
+    // own doc).
+    Ok(LoginSession { session_id, machine_id, owned: true })
 }
 
 /// Submit the code the user pasted for an in-flight [`start_claude_login`] session.
@@ -1592,6 +1614,11 @@ mod tests {
             AttachOutcome::Attached { session, .. } => {
                 assert_eq!(session.session_id, "s1", "must hand back the EXISTING session's id, not a new one");
                 assert_eq!(session.machine_id, "m1");
+                assert!(
+                    !session.owned,
+                    "an attached caller must never be told it owns the session — only the \
+                     originator may cancel it (see `LoginSession::owned`'s own doc)"
+                );
             }
             AttachOutcome::Reserved => panic!("must attach, not reserve, for a machine that already has a session"),
         }

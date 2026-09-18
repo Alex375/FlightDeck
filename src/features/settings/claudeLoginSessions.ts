@@ -20,13 +20,36 @@ interface ClaudeLoginSessionsState {
    *  via `startClaudeLogin` or `restartClaudeLogin`, not yet resolved/cancelled).
    *  Absent (not just `false`) for a machine nothing has ever touched. */
   active: Record<string, boolean>;
-  setActive: (machineId: string, value: boolean) => void;
+  /** `machine_id -> session_id` of the session currently backing `active` for that
+   *  machine — added alongside `ServerLogin*Event.session_id` by a follow-up review of
+   *  B-finding #4: without it, the terminal-event listener below can't tell a
+   *  session's OWN result apart from a STALE one belonging to a session this machine
+   *  has already moved past. Concretely: `restart_claude_login` registers its NEW
+   *  session (via `ClaudeSignInInline.restart()` calling `setActive` below) well
+   *  before the OLD, just-superseded session's own belated `ServerLoginResultEvent`
+   *  can arrive — without this map, that late event would incorrectly flip `active`
+   *  back to `false` even though the NEW session is still very much live. Left stale
+   *  (never explicitly cleared) once a machine's session ends — harmless, since the
+   *  next real session for that machine overwrites it before its own terminal event
+   *  could possibly arrive. */
+  sessionIds: Record<string, string>;
+  /** `sessionId` should always be given when `value` is `true` (there is no such thing
+   *  as an active session with no id) — it's optional only because a `false` clear
+   *  never needs one, and because tests drive this store directly without one. */
+  setActive: (machineId: string, value: boolean, sessionId?: string) => void;
 }
 
 export const useClaudeLoginSessions = create<ClaudeLoginSessionsState>((set) => ({
   active: {},
-  setActive: (machineId, value) =>
-    set((s) => (s.active[machineId] === value ? s : { active: { ...s.active, [machineId]: value } })),
+  sessionIds: {},
+  setActive: (machineId, value, sessionId) =>
+    set((s) => {
+      if (s.active[machineId] === value && (sessionId === undefined || s.sessionIds[machineId] === sessionId)) return s;
+      return {
+        active: { ...s.active, [machineId]: value },
+        sessionIds: sessionId !== undefined ? { ...s.sessionIds, [machineId]: sessionId } : s.sessionIds,
+      };
+    }),
 }));
 
 // Wired ONCE regardless of how many `ClaudeSignInInline` instances mount/unmount over
@@ -42,9 +65,16 @@ export function ensureClaudeLoginSessionsWired(): void {
   if (wired) return;
   wired = true;
   void events.serverLoginPromptEvent.listen((e) => {
-    useClaudeLoginSessions.getState().setActive(e.payload.machine_id, true);
+    useClaudeLoginSessions.getState().setActive(e.payload.machine_id, true, e.payload.session_id);
   });
   void events.serverLoginResultEvent.listen((e) => {
+    const known = useClaudeLoginSessions.getState().sessionIds[e.payload.machine_id];
+    // A terminal event for a session this machine has already moved past (the OLD,
+    // superseded session's own belated result — see `sessionIds`'s own doc) must NOT
+    // clear `active`: the new session is still live. `known === undefined` (nothing
+    // ever recorded for this machine, e.g. a test driving this store directly) falls
+    // through and clears, matching the pre-existing behavior.
+    if (known !== undefined && known !== e.payload.session_id) return;
     useClaudeLoginSessions.getState().setActive(e.payload.machine_id, false);
   });
 }

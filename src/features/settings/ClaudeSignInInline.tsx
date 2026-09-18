@@ -23,6 +23,30 @@
 // on ANY `ServerLoginResultEvent` for this machine) is what lets a SECOND surface
 // (`ServerStatusPanel`) show "Sign-in in progress…" instead of its own Start button
 // before ever needing to call `start()` itself.
+//
+// ⚠️ Ownership (follow-up review of B-finding #4): ATTACHING to a session you did not
+// start is not the same as OWNING it. `LoginSession.owned` (`false` on attach, `true`
+// on reserve/restart) is tracked in `ownsSessionRef` below and gates every place this
+// component would otherwise tear the session down (`cancel()`, unmount cleanup): an
+// attached instance's Cancel/unmount only detaches LOCALLY (clears its own `session`/
+// `url` state) and never calls `cancelClaudeLogin` or flips the shared `active` flag —
+// leaving the session running for whoever still owns it. Before this existed, ANY
+// holder's Cancel/unmount silently killed the shared session out from under every
+// other surface watching it, reproducing the exact "silently killed, zero UI feedback"
+// bug class the single-flight fix was meant to close, just via teardown instead of a
+// competing Start.
+//
+// ⚠️ Stale-event filtering (same follow-up review): both listeners below ignore an
+// event whose `session_id` doesn't match the session THIS instance currently tracks
+// (`sessionRef.current`) — except when it tracks none yet, so a late subscriber can
+// still adopt a freshly (re-)emitted prompt/result for its own just-started/attached
+// session (see `start_claude_login`'s re-emit-on-attach doc). This is what closes the
+// "Restart sign-in" race: `restart()` sets `session` to the NEW session synchronously
+// once its own IPC call resolves — which observed evidence shows happens BEFORE the
+// OLD, just-superseded session's own belated terminal event arrives — so by the time
+// that stale event is processed, its `session_id` no longer matches and it is dropped
+// instead of clobbering the new session's state with a false "Sign-in failed:
+// superseded…".
 import { useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { commands, events, type LoginSession } from "../../ipc/client";
@@ -50,11 +74,18 @@ export function ClaudeSignInInline({
   const [result, setResult] = useState<{ ok: boolean; email: string | null; error: string | null } | null>(null);
 
   // Tracks the live session for the unmount-only cleanup effect below (which can't
-  // close over `session` directly without re-subscribing on every change).
+  // close over `session` directly without re-subscribing on every change) AND for the
+  // event listeners' stale-event filtering (see the module doc).
   const sessionRef = useRef<LoginSession | null>(null);
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  // Whether THIS instance owns (reserved/restarted) the current session, as opposed to
+  // merely attaching to one another surface started — see `LoginSession.owned`'s own
+  // doc and the module doc above. Only an owner's Cancel/unmount may actually tear the
+  // session down.
+  const ownsSessionRef = useRef(false);
 
   // The shared "is a sign-in live for this machine" flag other surfaces read (see
   // `claudeLoginSessions.ts`'s own doc) — wiring is idempotent, so every mounted
@@ -67,13 +98,20 @@ export function ClaudeSignInInline({
     let disposed = false;
     const unPrompt = events.serverLoginPromptEvent.listen((e) => {
       if (disposed || e.payload.machine_id !== machineId) return;
+      // Ignore a stale event for a session we've already moved past (e.g. our own
+      // just-superseded predecessor) — but adopt one when we don't yet track a
+      // session ourselves, since a late subscriber attaching to (or being told about)
+      // a live session has no other way to learn its id. See the module doc.
+      if (sessionRef.current && sessionRef.current.session_id !== e.payload.session_id) return;
       setUrl(e.payload.url);
     });
     const unResult = events.serverLoginResultEvent.listen((e) => {
       if (disposed || e.payload.machine_id !== machineId) return;
+      if (sessionRef.current && sessionRef.current.session_id !== e.payload.session_id) return;
       setSession(null);
       setUrl(null);
       setResult({ ok: e.payload.ok, email: e.payload.email, error: e.payload.error });
+      ownsSessionRef.current = false;
       if (e.payload.ok) onSignedIn?.(e.payload.email);
     });
     return () => {
@@ -86,13 +124,19 @@ export function ClaudeSignInInline({
 
   // Unmount: cancel any session still in flight rather than leaving it dangling —
   // mirrors the wizard's own cancel discipline. Intentionally the ONLY place this
-  // fires (empty deps), reading the live value through the ref above. Also clears the
-  // shared `active` flag: a same-caller Cancel (this IS one — the actor's own
+  // fires (empty deps), reading the live values through the refs above. Also clears
+  // the shared `active` flag: a same-caller Cancel (this IS one — the actor's own
   // `Cancel` handling stays silent, see `run_login_actor`'s doc) is the one case
   // nothing else will ever clear it for us, since no `ServerLoginResultEvent` follows.
+  //
+  // ⚠️ Gated on `ownsSessionRef` (see the module doc): an instance that merely
+  // ATTACHED to another surface's session must NOT cancel it or clear the shared flag
+  // on unmount — that would silently kill the session for whoever still owns it, with
+  // no `ServerLoginResultEvent` to tell them (the actor's `Cancel` handling is silent
+  // by design, on the assumption only the true owner ever sends it).
   useEffect(() => {
     return () => {
-      if (sessionRef.current) {
+      if (sessionRef.current && ownsSessionRef.current) {
         void commands.cancelClaudeLogin(sessionRef.current);
         useClaudeLoginSessions.getState().setActive(machineId, false);
       }
@@ -109,7 +153,8 @@ export function ClaudeSignInInline({
     setStarting(false);
     if (res.status === "ok") {
       setSession(res.data);
-      useClaudeLoginSessions.getState().setActive(machineId, true);
+      ownsSessionRef.current = res.data.owned;
+      useClaudeLoginSessions.getState().setActive(machineId, true, res.data.session_id);
     } else {
       setError(res.error);
     }
@@ -128,8 +173,12 @@ export function ClaudeSignInInline({
     const res = await commands.restartClaudeLogin(machineId);
     setRestarting(false);
     if (res.status === "ok") {
+      // Always `owned: true` (see `LoginSession.owned`'s own doc) — set from the
+      // response rather than hardcoded here so a backend change would surface as a
+      // visible behavior change instead of silently going stale.
       setSession(res.data);
-      useClaudeLoginSessions.getState().setActive(machineId, true);
+      ownsSessionRef.current = res.data.owned;
+      useClaudeLoginSessions.getState().setActive(machineId, true, res.data.session_id);
     } else {
       setError(res.error);
     }
@@ -163,14 +212,21 @@ export function ClaudeSignInInline({
   }, [session, code]);
 
   const cancel = useCallback(() => {
-    if (session) void commands.cancelClaudeLogin(session);
+    // ⚠️ Only the OWNER actually tears the session down — an attached instance's
+    // Cancel is a local-only detach (see the module doc): it resets this component's
+    // own view without touching the backend session or the shared `active` flag,
+    // leaving both alone for whoever still owns it.
+    if (session && ownsSessionRef.current) {
+      void commands.cancelClaudeLogin(session);
+      // A same-caller Cancel — the backend stays silent on it (see the module doc), so
+      // this is the only place that will ever clear the shared flag for it.
+      useClaudeLoginSessions.getState().setActive(machineId, false);
+    }
     setSession(null);
     setUrl(null);
     setCode("");
     setError(null);
-    // A same-caller Cancel — the backend stays silent on it (see the module doc), so
-    // this is the only place that will ever clear the shared flag for it.
-    useClaudeLoginSessions.getState().setActive(machineId, false);
+    ownsSessionRef.current = false;
   }, [session, machineId]);
 
   if (result) {

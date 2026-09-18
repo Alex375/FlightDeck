@@ -349,7 +349,7 @@ describe("ServerBootstrapWizard — needs_input states", () => {
         diagnosis: { state: { kind: "needs_claude_sign_in" } },
       },
     });
-    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "login-1", machine_id: "m-claude-ok" } });
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "login-1", machine_id: "m-claude-ok", owned: true } });
 
     mount();
     fill("Address", "claude-ok.example.com");
@@ -362,7 +362,9 @@ describe("ServerBootstrapWizard — needs_input states", () => {
     await settle();
 
     // The confirmed result — exactly what a real successful sign-in emits.
-    act(() => mocks.serverLoginResultEvent.emit({ machine_id: "m-claude-ok", ok: true, email: "armand@example.com", error: null }));
+    act(() =>
+      mocks.serverLoginResultEvent.emit({ session_id: "login-1", machine_id: "m-claude-ok", ok: true, email: "armand@example.com", error: null }),
+    );
     await settle();
 
     // The whole stale panel (header + `ClaudeSignInInline`) is gone — `claudeStep`
