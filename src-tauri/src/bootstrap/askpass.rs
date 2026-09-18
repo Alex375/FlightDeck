@@ -76,6 +76,33 @@ pub enum BootstrapError {
     /// sshd itself refuses). Carries a hint built from the verification failure, so
     /// this is never reported as a bare, unexplained "it didn't work".
     KeyInstalledButNotAccepted(String),
+    /// (B8) [`crate::bootstrap::install::daemon_binary_path`] could not find a static
+    /// musl binary for this arch — either the arch itself isn't one this app ships for
+    /// (`x86_64`/`aarch64`), or it IS, but neither `$TOSSE_FLIGHTDECKD_BIN_DIR` (dev/
+    /// tests) nor the app's bundled resource dir actually has the file. Carries the arch
+    /// string so the message names what's missing rather than a generic IO error — the
+    /// brief's own requirement.
+    DaemonBinaryNotBundled(String),
+    /// (B8) [`crate::bootstrap::install::upload_daemon`]'s remote self-verification
+    /// (size AND sha256 of the temp file, BEFORE it is ever promoted over the real
+    /// target) found a mismatch, or the transfer never finished at all (the ssh
+    /// connection died mid-stream). `got` is the byte count the remote side actually
+    /// reports having received — `0` when nothing recognizable came back at all (a
+    /// connection that died before the remote script could report anything). The temp
+    /// file is always removed (best-effort) before this is returned — this is never a
+    /// false success.
+    UploadTruncated { expected: u64, got: u64 },
+    /// (B9) [`crate::bootstrap::install::escalate_persistence`] found passwordless
+    /// `sudo` unavailable (`sudo -n true` failed) and was given no
+    /// [`crate::bootstrap::install::SecretString`] to fall back to piping — the caller
+    /// (a wizard step) should prompt for the server's login password and retry with it.
+    NeedsSudoPassword,
+    /// (B9) [`crate::bootstrap::install::install_service`] ran out of automatable
+    /// options (no systemd at all with `KillUserProcesses` unknown/`yes`, or linger
+    /// refused with no `sudo` to escalate through) — carries a human explanation of
+    /// what a real administrator on that box would need to do; never silently falls
+    /// back to a fallback that might not actually survive.
+    AdminRequired(String),
     /// Anything else — the ssh/askpass plumbing itself failing, not the login
     /// outcome. Carries a short, already-scrubbed-of-secrets diagnostic.
     Other(String),
@@ -91,12 +118,51 @@ impl std::fmt::Display for BootstrapError {
                 write!(f, "the server's host key does not match what was expected")
             }
             Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
+            Self::DaemonBinaryNotBundled(arch) => {
+                write!(f, "no bundled flightdeckd binary for arch \"{arch}\"")
+            }
+            Self::UploadTruncated { expected, got } => write!(
+                f,
+                "the daemon upload was truncated: expected {expected} bytes, the server received {got}"
+            ),
+            Self::NeedsSudoPassword => {
+                write!(f, "this server needs a sudo password to continue")
+            }
+            Self::AdminRequired(reason) => write!(f, "{reason}"),
             Self::Other(d) => write!(f, "{d}"),
         }
     }
 }
 
 impl std::error::Error for BootstrapError {}
+
+/// A password held only long enough to pipe it to a remote `sudo -S`'s stdin (see
+/// [`crate::bootstrap::install::escalate_persistence`]) — never argv, env, or disk. No
+/// `secrecy` crate is in this tree (nothing else in the crate needed one yet); this is
+/// a minimal stand-in with the ONE property that actually matters here: an accidental
+/// `{:?}`/panic/log message never prints the password. [`Self::expose`] is the single,
+/// deliberately-named escape hatch — every call site of it should be somewhere that
+/// genuinely needs the plaintext (feeding a pipe), never a log line.
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// The plaintext password. Named loudly on purpose — `grep`-able, unlike a `Deref`
+    /// or `AsRef` impl that would let it slip out through an ordinary-looking call.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
+}
 
 /// Builds the bootstrap-flow `ssh` invocation: the ONE call site in this codebase that
 /// deliberately OMITS `BatchMode=yes` (see the module doc) so a password prompt is
@@ -890,5 +956,21 @@ mod tests {
         for r in &rendered {
             assert!(!r.contains(SECRET), "a BootstrapError rendering leaked the password: {r:?}");
         }
+    }
+
+    // ---- SecretString ----
+
+    #[test]
+    fn secret_string_debug_never_prints_the_password() {
+        let s = SecretString::new("hunter2-sudo-pw".to_string());
+        let rendered = format!("{s:?}");
+        assert_eq!(rendered, "SecretString(<redacted>)");
+        assert!(!rendered.contains("hunter2-sudo-pw"));
+    }
+
+    #[test]
+    fn secret_string_expose_returns_the_plaintext() {
+        let s = SecretString::new("hunter2-sudo-pw".to_string());
+        assert_eq!(s.expose(), "hunter2-sudo-pw");
     }
 }

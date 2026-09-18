@@ -150,21 +150,117 @@ pub fn render_system_unit(user: &str, home: &str) -> Result<String, UnsafeUnitVa
 
 /// The ONE command in the whole bootstrap flow that needs `sudo` on the target host:
 /// linger (so `flightdeckd` keeps running after the SSH session that installed it
-/// closes, without waiting for an interactive login) and masking every sleep/suspend
-/// target (so a rebooted or GUI-driven box never suspends itself out from under the
-/// daemon — the exact trap hit on `josty-cc`, see the `flightdeck-server-test-box`
-/// memory). Installing the daemon binary/unit itself needs no `sudo`; only THIS one
-/// step, scoped to exactly these two commands, does.
+/// closes, without waiting for an interactive login) and — when `mask_sleep` — masking
+/// every sleep/suspend target (so a rebooted or GUI-driven box never suspends itself
+/// out from under the daemon — the exact trap hit on `josty-cc`, see the
+/// `flightdeck-server-test-box` memory). Installing the daemon binary/unit itself needs
+/// no `sudo`; only THIS one step, scoped to exactly these commands, does.
 ///
-/// Returns the bare command text (no `sudo` prefix baked in): a later task pipes a
-/// captured password to `sudo -S` over the already-open SSH session and runs this
-/// string as that `sudo`'s argument, mirroring how [`crate::bootstrap::askpass`]
-/// itself never touches `sudo` — it only unblocks the ssh client's OWN login prompt.
-pub fn render_persistence_escalation(user: &str) -> String {
+/// `mask_sleep` is Armand's product decision (B9): an opt-out checkbox, DEFAULT ON,
+/// applied to root logins too — this is a genuine, deliberate behavior CHANGE (masking
+/// sleep targets is not something every box wants, e.g. a laptop dev box someone still
+/// wants to suspend by hand), which is exactly why it is a parameter here rather than
+/// baked in unconditionally the way it used to be.
+///
+/// Returns the bare command text (no `sudo` prefix baked in):
+/// [`crate::bootstrap::install::escalate_persistence`] pipes a captured password to
+/// `sudo -S` over the already-open SSH session and runs this string as that `sudo`'s
+/// argument, mirroring how [`crate::bootstrap::askpass`] itself never touches `sudo` —
+/// it only unblocks the ssh client's OWN login prompt.
+pub fn render_persistence_escalation(user: &str, mask_sleep: bool) -> String {
+    let linger = format!("loginctl enable-linger {u}", u = shq(user));
+    if mask_sleep {
+        format!(
+            "{linger} && \
+             systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target"
+        )
+    } else {
+        linger
+    }
+}
+
+/// (B8) The remote script that resolves where the daemon binary already lives (or
+/// should live) on a server, mirroring `bootstrap::connect::PROBE_SCRIPT`'s own
+/// CONFLICT precedence: an existing root-owned system unit, or a pre-existing
+/// `/usr/local/bin/flightdeckd`, or a `flightdeckd` resolved from `PATH` OUTSIDE
+/// `~/.local/bin`, all mean "adopt whatever is already there" — reported back as the
+/// TARGET path itself (this script needs the actual path, not just a human sentence,
+/// so it is NOT literally shared with `PROBE_SCRIPT`, just kept in lockstep with its
+/// CONFLICT logic). Otherwise the target is the plain fresh-install default: for ROOT
+/// (`id -u` = 0) that is `/usr/local/bin/flightdeckd` — matching what
+/// [`render_system_unit`]'s (fixed, unparameterized) `ExecStart=` line ALWAYS expects,
+/// so a fresh root install's unit is never pointed at a binary that was actually
+/// uploaded somewhere else (root has no meaningful "user-level" install distinct from
+/// a system one — VERIFIED live against fixture B: without this branch a fresh root
+/// install crash-loops with `code=exited, status=203/EXEC`, systemd's own wording for
+/// "the file named in `ExecStart=` does not exist") — for anyone else it is
+/// `~/.local/bin/flightdeckd`. Reports the target's CURRENT sha256 too (empty when
+/// nothing is there yet) so [`crate::bootstrap::install::upload_daemon`] can decide
+/// `AlreadyCurrent` without ever touching the network for the bytes themselves. No
+/// interpolation, so this is a fixed constant.
+pub const RESOLVE_DAEMON_TARGET_SCRIPT: &str = r#"set -e
+if [ -f /etc/systemd/system/flightdeckd.service ]; then
+    TARGET=/usr/local/bin/flightdeckd
+elif [ -x /usr/local/bin/flightdeckd ]; then
+    TARGET=/usr/local/bin/flightdeckd
+elif command -v flightdeckd >/dev/null 2>&1; then
+    FDD=$(command -v flightdeckd)
+    case "$FDD" in
+        "$HOME"/.local/bin/flightdeckd) TARGET="$HOME/.local/bin/flightdeckd" ;;
+        *) TARGET="$FDD" ;;
+    esac
+elif [ "$(id -u)" = "0" ]; then
+    TARGET=/usr/local/bin/flightdeckd
+else
+    TARGET="$HOME/.local/bin/flightdeckd"
+fi
+echo "FLIGHTDECK_TARGET:$TARGET"
+if [ -f "$TARGET" ]; then
+    SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    echo "FLIGHTDECK_TARGET_SHA256:$SHA"
+else
+    echo "FLIGHTDECK_TARGET_SHA256:"
+fi
+"#;
+
+/// (B8) Streams a new daemon binary into place at `target`: a private (mode 600, via
+/// `umask 077`) temp file `.flightdeckd.upload.$$` in the SAME directory (so the final
+/// `mv` below is an atomic same-filesystem rename — replacing a RUNNING daemon's binary
+/// this way is safe because the process keeps its old inode open, unlike an in-place
+/// truncate-and-rewrite), read back and verified by SIZE **and** SHA256 before it is
+/// EVER promoted over `target` — a truncated transfer (a dropped connection, a short
+/// write) looks like an ordinary, successful `cat` to the shell (EOF is EOF, not an
+/// error), so this never trusts the write's own exit code alone. On any mismatch the
+/// temp file is removed and the script fails loudly (`FLIGHTDECK_UPLOAD_MISMATCH`) —
+/// never a false success. See [`crate::bootstrap::install::upload_daemon`]'s own doc.
+///
+/// `target` is `shq()`-escaped here (mirroring every other real-path interpolation in
+/// this module). `expected_size`/`expected_sha256` come from THIS Mac's own read of the
+/// exact bytes about to be piped in over stdin — never off the wire — so they are safe
+/// to interpolate as plain digits / a 64-char lowercase hex digest without further
+/// escaping.
+pub fn render_upload_script(target: &str, expected_size: u64, expected_sha256: &str) -> String {
+    let target = shq(target);
     format!(
-        "loginctl enable-linger {u} && \
-         systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target",
-        u = shq(user)
+        "set -e\n\
+         TARGET={target}\n\
+         DIR=$(dirname \"$TARGET\")\n\
+         mkdir -p -m 755 \"$DIR\" 2>/dev/null || {{ echo FLIGHTDECK_MKDIR_FAILED >&2; exit 5; }}\n\
+         TMP=\"$DIR/.flightdeckd.upload.$$\"\n\
+         umask 077\n\
+         cat > \"$TMP\" 2>/dev/null || {{ rm -f \"$TMP\" 2>/dev/null; echo FLIGHTDECK_WRITE_FAILED >&2; exit 5; }}\n\
+         GOT_SIZE=$(wc -c < \"$TMP\" 2>/dev/null | tr -d ' ')\n\
+         GOT_SHA=$(sha256sum \"$TMP\" 2>/dev/null | awk '{{print $1}}')\n\
+         echo \"FLIGHTDECK_GOT_SIZE:$GOT_SIZE\"\n\
+         echo \"FLIGHTDECK_GOT_SHA256:$GOT_SHA\"\n\
+         if [ \"$GOT_SIZE\" != \"{expected_size}\" ] || [ \"$GOT_SHA\" != \"{expected_sha256}\" ]; then\n\
+         \x20   rm -f \"$TMP\" 2>/dev/null\n\
+         \x20   echo FLIGHTDECK_UPLOAD_MISMATCH >&2\n\
+         \x20   exit 6\n\
+         fi\n\
+         chmod 755 \"$TMP\"\n\
+         mv -f \"$TMP\" \"$TARGET\"\n\
+         echo FLIGHTDECK_UPLOAD_OK\n"
     )
 }
 
@@ -253,10 +349,17 @@ mod tests {
 
     #[test]
     fn persistence_escalation_golden_string() {
-        let got = render_persistence_escalation("josty");
+        let got = render_persistence_escalation("josty", true);
         let want = "loginctl enable-linger 'josty' && \
                      systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target";
         assert_eq!(got, want);
+    }
+
+    /// (B9) `mask_sleep: false` is the opt-out — linger alone, no sleep-target masking.
+    #[test]
+    fn persistence_escalation_without_mask_sleep_is_linger_only() {
+        let got = render_persistence_escalation("josty", false);
+        assert_eq!(got, "loginctl enable-linger 'josty'");
     }
 
     /// A username carrying shell metacharacters (a space, and a command substitution)
@@ -266,7 +369,7 @@ mod tests {
     #[test]
     fn persistence_escalation_shell_metacharacter_username_is_shq_safe() {
         let evil = "al $(rm -rf /) ex";
-        let got = render_persistence_escalation(evil);
+        let got = render_persistence_escalation(evil, true);
 
         // Matches exactly what `shq()` produces for this input: single-quoted, with
         // the whole malicious payload inert INSIDE the quotes (no unescaped `'`
@@ -299,7 +402,7 @@ mod tests {
     #[test]
     fn persistence_escalation_embedded_single_quote_is_shq_safe() {
         let evil = "o'brien";
-        let got = render_persistence_escalation(evil);
+        let got = render_persistence_escalation(evil, true);
         let want = "loginctl enable-linger 'o'\\''brien' && \
                      systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target";
         assert_eq!(got, want);
@@ -309,5 +412,102 @@ mod tests {
     fn user_unit_home_with_space_is_shq_safe() {
         let got = render_user_unit("/home/jos ty").expect("a space is not a line break");
         assert!(got.contains("ExecStart='/home/jos ty'/.local/bin/flightdeckd run"));
+    }
+
+    // ---- RESOLVE_DAEMON_TARGET_SCRIPT / render_upload_script (B8) ----
+
+    /// Independent literal copy — proves the shipped text hasn't drifted, mirroring
+    /// `connect.rs`'s own `install_key_script_is_the_reviewed_golden_string` discipline
+    /// for its fixed, no-interpolation sibling script.
+    #[test]
+    fn resolve_daemon_target_script_is_the_reviewed_golden_string() {
+        let expected = r#"set -e
+if [ -f /etc/systemd/system/flightdeckd.service ]; then
+    TARGET=/usr/local/bin/flightdeckd
+elif [ -x /usr/local/bin/flightdeckd ]; then
+    TARGET=/usr/local/bin/flightdeckd
+elif command -v flightdeckd >/dev/null 2>&1; then
+    FDD=$(command -v flightdeckd)
+    case "$FDD" in
+        "$HOME"/.local/bin/flightdeckd) TARGET="$HOME/.local/bin/flightdeckd" ;;
+        *) TARGET="$FDD" ;;
+    esac
+elif [ "$(id -u)" = "0" ]; then
+    TARGET=/usr/local/bin/flightdeckd
+else
+    TARGET="$HOME/.local/bin/flightdeckd"
+fi
+echo "FLIGHTDECK_TARGET:$TARGET"
+if [ -f "$TARGET" ]; then
+    SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    echo "FLIGHTDECK_TARGET_SHA256:$SHA"
+else
+    echo "FLIGHTDECK_TARGET_SHA256:"
+fi
+"#;
+        assert_eq!(RESOLVE_DAEMON_TARGET_SCRIPT, expected);
+    }
+
+    /// A fresh root login (nothing pre-existing at all) must resolve to
+    /// `/usr/local/bin/flightdeckd`, NEVER `~/.local/bin/flightdeckd` — the exact
+    /// live-verified regression this branch exists to prevent (see this constant's
+    /// own doc): `render_system_unit`'s `ExecStart=` is a fixed literal that only ever
+    /// points at `/usr/local/bin/flightdeckd`, so a fresh root install uploaded
+    /// anywhere else would crash-loop on `status=203/EXEC`. Runs the REAL, unmodified
+    /// script text through a real `sh`, with a local `id() { echo 0; }` shadowing the
+    /// real `id` builtin/binary to simulate root WITHOUT needing to actually be root
+    /// or edit the script text at all.
+    #[test]
+    fn resolve_daemon_target_script_sends_a_fresh_root_login_to_usr_local_bin() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("id() {{ echo 0; }}\nHOME=/root\n{RESOLVE_DAEMON_TARGET_SCRIPT}"))
+            .output()
+            .expect("sh must be available to exercise this golden script directly");
+        assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("FLIGHTDECK_TARGET:/usr/local/bin/flightdeckd"),
+            "expected the root fallback target, got: {stdout}"
+        );
+    }
+
+    /// The same fresh-install case for a NON-root login stays at the plain
+    /// `~/.local/bin/flightdeckd` default — proves the new root branch didn't widen
+    /// beyond root.
+    #[test]
+    fn resolve_daemon_target_script_sends_a_fresh_non_root_login_to_local_bin() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("HOME=/home/deploy; {RESOLVE_DAEMON_TARGET_SCRIPT}"))
+            .output()
+            .expect("sh must be available to exercise this golden script directly");
+        assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("FLIGHTDECK_TARGET:/home/deploy/.local/bin/flightdeckd"),
+            "expected the plain non-root default, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn upload_script_interpolates_target_size_and_sha() {
+        let got = render_upload_script("/home/deploy/.local/bin/flightdeckd", 12345, "a".repeat(64).as_str());
+        assert!(got.contains("TARGET='/home/deploy/.local/bin/flightdeckd'"));
+        assert!(got.contains(r#"[ "$GOT_SIZE" != "12345" ]"#));
+        assert!(got.contains(&format!(r#"[ "$GOT_SHA" != "{}" ]"#, "a".repeat(64))));
+        assert!(got.contains("umask 077"));
+        assert!(got.contains(r#"TMP="$DIR/.flightdeckd.upload.$$""#));
+        assert!(got.contains("mv -f \"$TMP\" \"$TARGET\""));
+        assert!(got.contains("echo FLIGHTDECK_UPLOAD_OK"));
+    }
+
+    /// A target path carrying a shell metacharacter comes out `shq()`-quoted, same
+    /// discipline as every other real-path interpolation in this module.
+    #[test]
+    fn upload_script_target_is_shq_safe() {
+        let evil = "/home/al $(rm -rf /) ex/.local/bin/flightdeckd";
+        let got = render_upload_script(evil, 1, "b".repeat(64).as_str());
+        assert!(got.contains(&format!("TARGET='{evil}'")));
     }
 }

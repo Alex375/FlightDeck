@@ -307,6 +307,25 @@ pub struct HostKeyFingerprintEvent {
     pub known: bool,
 }
 
+/// Progress notice for `bootstrap::install`'s three commands (B8/B9:
+/// `bootstrap_upload_daemon` / `bootstrap_install_service` /
+/// `bootstrap_escalate_persistence`) — `step` names which one (`"upload_daemon"` /
+/// `"install_service"` / `"escalate_persistence"`), `status` is `"started"` / `"ok"` /
+/// `"failed"`, and `detail` carries the outcome (debug-formatted) or error text on a
+/// terminal status. Carries BOTH `machine_id` and `host` (never just one or the other):
+/// every caller of these three commands already has a paired [`crate::store::
+/// MachineRecord`] in hand (unlike B7's first-contact probe, which only has a host), so
+/// there is no reason to make a listener choose — it can key off whichever it already
+/// has.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct BootstrapStepEvent {
+    pub machine_id: String,
+    pub host: String,
+    pub step: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {
