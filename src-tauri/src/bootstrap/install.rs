@@ -365,9 +365,19 @@ async fn cleanup_upload_temp(
     }
 }
 
-/// The testable core of [`upload_daemon`]: everything except resolving `arch` to a
-/// local file path (already proven separately by [`resolve_daemon_binary_path`]'s own
-/// tests) and the app-handle plumbing. See the module doc for `ssh_bin_override`.
+/// A direct, UNVERIFIED path-to-upload primitive — no manifest, no sha256 check
+/// against anything but the remote's own existing binary. Production code no longer
+/// calls this directly (see [`upload_daemon_verified`], which verifies-then-uploads a
+/// single read); it remains `pub(crate)` as the escape hatch this module's own
+/// `$TOSSE_FLIGHTDECKD_BIN_DIR`-pointed dev/live tests use to push a bare pair of
+/// binaries with no manifest at all, plus the fake-ssh unit tests that exercise the
+/// resolve/stream/cleanup sequence in isolation. `#[allow(dead_code)]` outside tests
+/// because of exactly that: nothing in the non-test binary calls it any more.
+///
+/// Reads `local_binary_path` itself (this is the ONLY read of the path in this call —
+/// see [`upload_daemon_bytes`]'s own doc for why that matters) and uploads exactly
+/// those bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn upload_daemon_from_path(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
@@ -377,7 +387,29 @@ pub(crate) async fn upload_daemon_from_path(
     let bytes = tokio::fs::read(local_binary_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    let local_sha = sha256_hex(&bytes);
+    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+}
+
+/// Shared core of [`upload_daemon_from_path`] and [`upload_daemon_verified`]: hashes
+/// `bytes`, resolves the remote target + its existing sha256, and — unless they
+/// already match — streams exactly `bytes` (never re-reading anything off disk).
+///
+/// ⚠️ This is the ONE place that decides what actually goes over the wire.
+/// [`upload_daemon`] used to verify one read of the binary's sha256 and then call
+/// (what was then) `upload_daemon_from_path` with a PATH, which did its own,
+/// completely separate `tokio::fs::read` for the upload itself — so the
+/// manifest-verified buffer was discarded and a file that changed on disk between
+/// the two reads would upload unverified bytes with zero manifest protection. Taking
+/// `bytes: &[u8]` here instead of a path closes that gap structurally: a caller that
+/// has already read-and-verified a buffer (like [`upload_daemon_verified`]) passes
+/// that SAME buffer straight through, with no way to accidentally re-read the path.
+async fn upload_daemon_bytes(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    bytes: &[u8],
+    ssh_bin_override: Option<&Path>,
+) -> Result<UploadOutcome, BootstrapError> {
+    let local_sha = sha256_hex(bytes);
 
     let (target, existing_sha) = resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
 
@@ -386,7 +418,7 @@ pub(crate) async fn upload_daemon_from_path(
     }
     let restart_required = existing_sha.is_some();
 
-    match stream_upload(machine, known_hosts, ssh_bin_override, &target, &bytes, &local_sha).await {
+    match stream_upload(machine, known_hosts, ssh_bin_override, &target, bytes, &local_sha).await {
         Ok(()) => Ok(UploadOutcome::Uploaded { restart_required }),
         Err(e) => {
             cleanup_upload_temp(machine, known_hosts, ssh_bin_override, &target).await;
@@ -407,10 +439,10 @@ pub(crate) async fn upload_daemon_from_path(
 /// against [`bundled_daemon_manifest`] ([`verify_daemon_binary_sha256`]) — a mismatch
 /// (or no manifest to check against at all) returns
 /// [`BootstrapError::DaemonBinaryTampered`]/[`BootstrapError::DaemonManifestMissing`]
-/// and NOTHING is uploaded. [`upload_daemon_from_path`] (the low-level, directly-tested
-/// core this calls) intentionally has no manifest of its own to check — it's also the
-/// escape hatch `$TOSSE_FLIGHTDECKD_BIN_DIR`-pointed live tests use with a bare pair of
-/// binaries and no manifest at all.
+/// and NOTHING is uploaded. Only the app-handle plumbing (resolving `arch` to a
+/// bundled path + manifest) lives here — the actual read-verify-upload sequence is
+/// [`upload_daemon_verified`], so it can be driven directly in tests without a real
+/// `tauri::AppHandle`.
 pub async fn upload_daemon(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
@@ -419,11 +451,27 @@ pub async fn upload_daemon(
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_path = daemon_binary_path(app, arch)?;
     let manifest = bundled_daemon_manifest(app)?;
-    let bytes = tokio::fs::read(&local_path)
+    upload_daemon_verified(machine, arch, &local_path, &manifest, known_hosts, None).await
+}
+
+/// The testable core of [`upload_daemon`]: reads `local_path` **exactly once**,
+/// verifies that single buffer's sha256 against `manifest` ([`verify_daemon_binary_sha256`]),
+/// and — only if that passes — uploads that SAME buffer via [`upload_daemon_bytes`],
+/// which never re-reads the path. A mismatch returns before [`upload_daemon_bytes`] is
+/// even called, so a tampered binary never reaches the network.
+pub(crate) async fn upload_daemon_verified(
+    machine: &MachineRecord,
+    arch: &str,
+    local_path: &Path,
+    manifest: &DaemonManifest,
+    known_hosts: Option<&str>,
+    ssh_bin_override: Option<&Path>,
+) -> Result<UploadOutcome, BootstrapError> {
+    let bytes = tokio::fs::read(local_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    verify_daemon_binary_sha256(arch, &bytes, &manifest)?;
-    upload_daemon_from_path(machine, known_hosts, &local_path, None).await
+    verify_daemon_binary_sha256(arch, &bytes, manifest)?;
+    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
 }
 
 // ============================================================================
@@ -1841,6 +1889,107 @@ mod tests {
             log_text.contains("CLEANUP_INVOKED"),
             "a failed upload must trigger the best-effort temp-file cleanup reconnect: {log_text:?}"
         );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// Fake `ssh` for [`upload_daemon_verified`]'s composition tests: resolves to a
+    /// fresh target (no existing sha, so the upload always proceeds), then
+    /// unconditionally succeeds the upload call — but first saves whatever bytes
+    /// arrived on stdin to `<log>.bytes`, so a test can assert EXACTLY which buffer
+    /// was streamed over the wire, not just that some upload happened.
+    fn fake_ssh_upload_success(log: &Path, target: &str) -> String {
+        format!(
+            "#!/bin/bash\n\
+             LOG={log}\n\
+             last=\"${{@: -1}}\"\n\
+             case \"$last\" in\n\
+             \x20   *FLIGHTDECK_UPLOAD_OK*)\n\
+             \x20       echo UPLOAD_INVOKED >> \"$LOG\"\n\
+             \x20       cat > \"$LOG.bytes\"\n\
+             \x20       echo FLIGHTDECK_UPLOAD_OK\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             \x20   *)\n\
+             \x20       echo RESOLVE_INVOKED >> \"$LOG\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET:{target}\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET_SHA256:\"\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             esac\n",
+            log = crate::ipc::commands::shq(&log.to_string_lossy()),
+        )
+    }
+
+    /// A manifest whose single entry (for `arch`) expects `sha256` — built directly,
+    /// bypassing [`bundled_daemon_manifest`]/`resolve_daemon_manifest` (which need a
+    /// resource dir / app handle this unit test has neither of).
+    fn manifest_for(arch: &str, sha256: &str, size: u64) -> DaemonManifest {
+        let triple = daemon_target_triple(arch).expect("test arch must map to a known triple").to_string();
+        DaemonManifest {
+            version: "0.2.0-test".to_string(),
+            built_at: "test".to_string(),
+            targets: std::collections::HashMap::from([(
+                triple,
+                DaemonManifestTarget { sha256: sha256.to_string(), size },
+            )]),
+        }
+    }
+
+    /// Regression test for the composition bug the review flagged: [`upload_daemon`]
+    /// (via its testable core, [`upload_daemon_verified`], since it needs no
+    /// `tauri::AppHandle`) must upload the EXACT byte buffer it just verified against
+    /// the manifest — never a second, independent read of the path. Proven here by
+    /// capturing what actually hit the wire (via [`fake_ssh_upload_success`]'s stdin
+    /// capture) and asserting it equals the on-disk bytes the sha256 was computed
+    /// from, closing the "verified one read, uploaded a different one" gap.
+    #[tokio::test]
+    async fn upload_daemon_verified_uploads_exactly_the_bytes_it_verified() {
+        let bin = FakeBinary::new("verified-upload", 4096);
+        let manifest = manifest_for("aarch64", &sha256_hex(&bin.bytes), bin.bytes.len() as u64);
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/home/deploy/.local/bin/flightdeckd"));
+        let machine = test_machine();
+
+        let result =
+            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+        assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: false }));
+
+        let bytes_path = format!("{}.bytes", log.display());
+        let sent = std::fs::read(&bytes_path).expect("the uploaded bytes must have been captured on the wire");
+        assert_eq!(
+            sent, bin.bytes,
+            "must upload exactly the sha256-verified buffer, never a fresh re-read of the path"
+        );
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&bytes_path);
+    }
+
+    /// The other half of the same regression test: a binary whose sha256 does NOT
+    /// match its manifest entry (simulating either real tampering, or the disk
+    /// changing between an earlier read and this one) is refused — and, crucially,
+    /// this happens BEFORE any ssh call at all (the log file stays empty), proving
+    /// [`upload_daemon_verified`] never uploads unverified bytes on a mismatch.
+    #[tokio::test]
+    async fn upload_daemon_verified_refuses_a_tampered_binary_and_never_touches_the_network() {
+        let bin = FakeBinary::new("tampered-upload", 4096);
+        let manifest = manifest_for("aarch64", &"f".repeat(64), bin.bytes.len() as u64);
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/home/deploy/.local/bin/flightdeckd"));
+        let machine = test_machine();
+
+        let result =
+            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+        assert!(
+            matches!(result, Err(BootstrapError::DaemonBinaryTampered { .. })),
+            "expected DaemonBinaryTampered, got {result:?}"
+        );
+
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.is_empty(), "a tampered binary must never invoke ssh at all: {log_text:?}");
+        let bytes_path = format!("{}.bytes", log.display());
+        assert!(!Path::new(&bytes_path).exists(), "nothing must ever have been streamed");
+
         let _ = std::fs::remove_file(&log);
     }
 

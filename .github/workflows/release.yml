@@ -72,6 +72,12 @@ jobs:
   daemon:
     needs: authorize
     runs-on: ubuntu-latest
+    # Least privilege: this job only checks out the repo (read), builds via Docker,
+    # and uploads a workflow artifact (its own permission model, not `contents`) —
+    # it never writes to the repo, so it does not need the workflow-level `contents:
+    # write` the `build`/publish job below actually requires.
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
