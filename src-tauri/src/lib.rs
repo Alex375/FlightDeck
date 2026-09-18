@@ -74,7 +74,7 @@ use ipc::commands::{
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
-    remote_status, set_remote, phone_provisioning_status, retry_phone_provisioning,
+    remote_status, set_remote, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
     add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -359,6 +359,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             remote_status,
             set_remote,
             phone_provisioning_status,
+            phone_revocation_status,
             retry_phone_provisioning,
             bootstrap_run_init,
             start_claude_login,
@@ -656,6 +657,10 @@ pub fn run() {
         // (`add_machine`, `set_remote`) can record into it after their spawning
         // command has already returned.
         .manage(std::sync::Arc::new(appmcp::provision::ProvisionRegistry::new()))
+        // Same idea, revoke-side (C10's critical fix): last known outcome of
+        // forgetting the OLD phone token per daemon, populated by `set_remote`'s
+        // regenerate-pairing sweep.
+        .manage(std::sync::Arc::new(appmcp::provision::RevokeRegistry::new()))
         .setup(move |app| {
             use tauri::Manager;
 
@@ -757,14 +762,20 @@ pub fn run() {
             );
             app.manage(store);
 
-            // App-control hub: install its front outlet, then start the voice
-            // bridge if it was left enabled (the honest outcome — including a
-            // failed bind — lands in `voice_bridge_status` for the Settings UI).
+            // App-control hub: install its front outlet AND its revocation sink
+            // (C10's critical fix — `relay::connect_once` clears a queued phone
+            // revocation only once it has actually sent that frame, so the sink
+            // must be installed before `apply_remote` below can ever connect),
+            // then start the voice bridge if it was left enabled (the honest
+            // outcome — including a failed bind — lands in `voice_bridge_status`
+            // for the Settings UI).
             {
                 let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
-                hub.set_sink(std::sync::Arc::new(ipc::events::AppControlEmitter {
+                let emitter = std::sync::Arc::new(ipc::events::AppControlEmitter {
                     app: app.handle().clone(),
-                }));
+                });
+                hub.set_sink(emitter.clone());
+                hub.set_revocation_sink(emitter);
                 let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });

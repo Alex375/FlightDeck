@@ -12,6 +12,7 @@ import {
   commands,
   type AddressCandidate,
   type MachineProvisionStatus,
+  type MachineRevokeStatus,
   type RemoteStatus,
   type VoiceBridgeStatus,
 } from "../../ipc/client";
@@ -24,7 +25,7 @@ import {
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
-import { describeProvisionStatus } from "./provisionStatus";
+import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -294,18 +295,26 @@ export function RemoteServersGroup() {
 
   // ---- Per-server phone-provisioning status (C10/C11) ----
   const [provisionStatuses, setProvisionStatuses] = useState<Map<string, MachineProvisionStatus>>(new Map());
+  // ---- Per-server phone-REVOCATION status (C10's critical fix) — whether the
+  // OLD token from the last "regenerate pairing" was actually forgotten here. ----
+  const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
   const [retrying, setRetrying] = useState<Set<string>>(new Set());
   const now = useNow(30_000);
 
-  // Poll the registry so a background provisioning attempt (triggered elsewhere —
-  // pairing a server, enabling remote access, regenerating pairing) shows up here
-  // without the user having to leave and reopen Settings.
+  // Poll both registries so a background provisioning/revocation attempt
+  // (triggered elsewhere — pairing a server, enabling remote access,
+  // regenerating pairing) shows up here without the user having to leave and
+  // reopen Settings.
   useEffect(() => {
     let disposed = false;
-    const read = () =>
+    const read = () => {
       void commands.phoneProvisioningStatus().then((rows) => {
         if (!disposed) setProvisionStatuses(new Map(rows.map((r) => [r.machine_id, r])));
       });
+      void commands.phoneRevocationStatus().then((rows) => {
+        if (!disposed) setRevokeStatuses(new Map(rows.map((r) => [r.machine_id, r])));
+      });
+    };
     read();
     const id = setInterval(read, 4000);
     return () => {
@@ -462,6 +471,7 @@ export function RemoteServersGroup() {
 
       {machines.map((m) => {
         const provisionLabel = describeProvisionStatus(provisionStatuses.get(m.id), now);
+        const revokeLabel = describeRevokeStatus(revokeStatuses.get(m.id), now);
         const isRetrying = retrying.has(m.id);
         return (
         <Fragment key={m.id}>
@@ -479,6 +489,14 @@ export function RemoteServersGroup() {
               >
                 phone access: {isRetrying ? "pending…" : provisionLabel.text}
               </span>
+              {/* Only shown after a "regenerate pairing" actually attempted a
+                  revoke against this server this run — absent otherwise, per
+                  `describeRevokeStatus`'s doc (nothing to report, not a problem). */}
+              {revokeLabel ? (
+                <span className={revokeLabel.isProblem ? styles.dangerText : styles.remoteStatusText}>
+                  {revokeLabel.text}
+                </span>
+              ) : null}
             </div>
             {provisionLabel.canRetry && !isRetrying && (
               <button

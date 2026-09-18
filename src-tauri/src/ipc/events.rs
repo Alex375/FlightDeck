@@ -206,6 +206,24 @@ impl crate::appmcp::ToolSink for AppControlEmitter {
     }
 }
 
+/// C10's critical fix, closed for real: `appmcp::relay::connect_once` calls
+/// this the moment a `revoke_phone` frame for `token` is actually written to a
+/// live, connected relay socket — never merely because a reconnect task was
+/// spawned (see `crate::appmcp::RevocationSink`'s doc for the bug this
+/// closes). Reuses `AppControlEmitter` rather than a dedicated struct — it
+/// already holds the `AppHandle` this needs, the same "least-invasive Store
+/// bridge" `TauriEmitter::emit_preferred_host` (below) uses for the
+/// supervisor's own analogous case. Best-effort persist, logged: a failure
+/// here just means the token stays queued and is sent — and this called —
+/// again on the next reconnect (harmless, idempotent).
+impl crate::appmcp::RevocationSink for AppControlEmitter {
+    fn relay_revocation_sent(&self, token: &str) {
+        if let Err(e) = self.app.state::<crate::store::Store>().clear_relay_phone_revocation(token) {
+            eprintln!("[appmcp] failed to clear relay phone revocation after sending it: {e}");
+        }
+    }
+}
+
 /// The wake word was heard by the on-device detector (`crate::wake`). The front
 /// reacts like a spoken push-to-talk — arm the voice session and open the mic (see
 /// `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeProvisionStatus } from "./provisionStatus";
+import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 
 const NOW = 1_800_000_000_000;
 
@@ -49,5 +49,49 @@ describe("describeProvisionStatus", () => {
     expect(label.text).toBe("daemon too old — update flightdeckd");
     expect(label.isProblem).toBe(true);
     expect(label.canRetry).toBe(true);
+  });
+});
+
+describe("describeRevokeStatus", () => {
+  it("returns null (nothing to show) when no revoke was ever attempted against this machine", () => {
+    expect(describeRevokeStatus(undefined, NOW)).toBeNull();
+  });
+
+  it("confirms a removed old token, not as a problem", () => {
+    const label = describeRevokeStatus(
+      { machine_id: "m1", outcome: { kind: "removed" }, checked_at_ms: NOW - 60_000 },
+      NOW,
+    );
+    expect(label?.text).toBe("old access revoked 1 min ago");
+    expect(label?.isProblem).toBe(false);
+    expect(label?.canRetry).toBe(false);
+  });
+
+  it("flags an unreachable server as a problem, without offering its own retry button", () => {
+    const label = describeRevokeStatus(
+      { machine_id: "m1", outcome: { kind: "queued" }, checked_at_ms: NOW },
+      NOW,
+    );
+    expect(label?.text).toBe("old access: server unreachable — will revoke automatically once it's back");
+    expect(label?.isProblem).toBe(true);
+    expect(label?.canRetry).toBe(false);
+  });
+
+  it("surfaces a daemon's own revoke refusal reason verbatim, as a problem", () => {
+    const label = describeRevokeStatus(
+      { machine_id: "m1", outcome: { kind: "failed", reason: "disk full" }, checked_at_ms: NOW },
+      NOW,
+    );
+    expect(label?.text).toBe("old access: revoke failed: disk full");
+    expect(label?.isProblem).toBe(true);
+  });
+
+  it("names a too-old daemon distinctly from a generic revoke failure", () => {
+    const label = describeRevokeStatus(
+      { machine_id: "m1", outcome: { kind: "daemon_too_old" }, checked_at_ms: NOW },
+      NOW,
+    );
+    expect(label?.text).toBe("old access: daemon too old to revoke — update flightdeckd");
+    expect(label?.isProblem).toBe(true);
   });
 });

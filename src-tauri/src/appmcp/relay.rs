@@ -126,11 +126,15 @@ pub(crate) async fn serve(hub: Arc<ControlHub>, cfg: RemoteConfig, mut stop: wat
 /// pumping begins — in order: authorize the current phone token, publish this
 /// Mac's node label (C11), then flush every phone token still awaiting revocation
 /// on this connection (C10's critical fix). Pure so the exact shape/order is
-/// unit-tested without a live socket; [`connect_once`] just sends each of these in
-/// turn. Best-effort by construction — none of `authorize_phone`/`set_label`/
-/// `revoke_phone` has a delivery ack on the wire (PROTOCOL.md §4), so a dropped
-/// send is indistinguishable here from one the relay never got; the caller treats
-/// "handed to a live connection" as done (see `ipc::commands::set_remote`'s doc).
+/// unit-tested without a live socket; [`connect_once`] sends each of these in
+/// turn and, for a `revoke_phone` frame specifically, only reports it to
+/// [`ControlHub::notify_relay_revocation_sent`] once THAT frame's own
+/// `write.send().await` actually succeeded on this live, connected socket —
+/// never merely because a reconnect task was spawned (see that method's doc
+/// for the bug this closes). `authorize_phone`/`set_label` stay pure
+/// fire-and-forget either way — neither has a delivery ack on the wire
+/// (PROTOCOL.md §4), and re-sending them on the next reconnect is harmless
+/// (idempotent).
 pub(crate) fn post_connect_frames(cfg: &RemoteConfig) -> Vec<Value> {
     let mut frames = vec![
         json!({ "type": "authorize_phone", "phoneToken": cfg.phone_token }),
@@ -142,6 +146,19 @@ pub(crate) fn post_connect_frames(cfg: &RemoteConfig) -> Vec<Value> {
             .map(|token| json!({ "type": "revoke_phone", "phoneToken": token })),
     );
     frames
+}
+
+/// `Some(token)` when `frame` is a `{type:"revoke_phone", phoneToken}` frame —
+/// what [`connect_once`] checks after each successful send to know whether to
+/// call [`ControlHub::notify_relay_revocation_sent`]. Pulled out as its own
+/// pure function (rather than inlined in the send loop) purely so the
+/// "which frames trigger the durable clear" logic is unit-tested without a
+/// live socket, same spirit as [`post_connect_frames`] itself.
+fn revoke_token_from_frame(frame: &Value) -> Option<&str> {
+    if frame.get("type").and_then(Value::as_str) != Some("revoke_phone") {
+        return None;
+    }
+    frame.get("phoneToken").and_then(Value::as_str)
 }
 
 /// One connection lifetime: connect, authorize our phone token, then pump phone
@@ -165,9 +182,20 @@ async fn connect_once(
 
     let (mut write, mut read) = ws.split();
     // Authorize the current phone pairing token, publish this Mac's node label, and
-    // flush any revocation still owed — see `post_connect_frames`'s doc.
+    // flush any revocation still owed — see `post_connect_frames`'s doc. A
+    // `revoke_phone` frame is reported to the hub — which durably clears it
+    // from `pending_relay_phone_revocations` — ONLY once its own send actually
+    // succeeded on THIS connected socket, never merely because this function
+    // was reached (that was the bug: `ipc::commands::set_remote` used to clear
+    // the queue the instant `apply_remote` had merely SPAWNED a reconnect
+    // attempt, before it had even dialed, let alone sent anything).
     for frame in post_connect_frames(cfg) {
-        let _ = write.send(Message::Text(frame.to_string())).await;
+        let sent = write.send(Message::Text(frame.to_string())).await.is_ok();
+        if sent {
+            if let Some(token) = revoke_token_from_frame(&frame) {
+                hub.notify_relay_revocation_sent(token);
+            }
+        }
     }
 
     // A single writer drains this channel, so RPC replies, event pushes and the
@@ -374,6 +402,31 @@ mod tests {
                 json!({ "type": "revoke_phone", "phoneToken": "old-b" }),
             ]
         );
+    }
+
+    // ---- revoke_token_from_frame (pure) — the fix's own trigger logic --------
+
+    /// Review-fix coverage: ONLY a `revoke_phone` frame reports back a token —
+    /// `authorize_phone`/`set_label` (and anything unrecognized) must never be
+    /// mistaken for a revocation, or `ControlHub::notify_relay_revocation_sent`
+    /// would clear the wrong row (or clear on a non-token, which is a no-op that
+    /// would still be a bug to have wired at all).
+    #[test]
+    fn revoke_token_from_frame_only_matches_revoke_phone_frames() {
+        assert_eq!(
+            revoke_token_from_frame(&json!({ "type": "revoke_phone", "phoneToken": "old-a" })),
+            Some("old-a")
+        );
+        assert_eq!(
+            revoke_token_from_frame(&json!({ "type": "authorize_phone", "phoneToken": "current" })),
+            None,
+            "authorize_phone must never be mistaken for a revocation"
+        );
+        assert_eq!(
+            revoke_token_from_frame(&json!({ "type": "set_label", "label": "MacBook Pro" })),
+            None
+        );
+        assert_eq!(revoke_token_from_frame(&json!({})), None);
     }
 
     /// The common case (no pending revocation) sends exactly the two frames every

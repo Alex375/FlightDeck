@@ -2364,7 +2364,14 @@ async remoteStatus() : Promise<RemoteStatus> {
  * `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
  * token on every paired daemon when access just turned on or the token just
  * changed (C10 hook (b)) — both run in the background so Settings never blocks
- * on N ssh round trips.
+ * on N ssh round trips, and every per-machine outcome is recorded into its
+ * registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
+ * 
+ * The relay-side half of the revoke (THIS Mac's own connection) is NOT
+ * resolved synchronously here — see the inline comment right after
+ * `apply_remote` below for why clearing it here was the original bug, and
+ * where it is actually cleared now (`appmcp::relay::connect_once`, only once
+ * the frame has genuinely gone out on a live socket).
  */
 async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean, macLabel: string | null) : Promise<Result<RemoteStatus, string>> {
     try {
@@ -2383,6 +2390,19 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
  */
 async phoneProvisioningStatus() : Promise<MachineProvisionStatus[]> {
     return await TAURI_INVOKE("phone_provisioning_status");
+},
+/**
+ * Every paired server's last phone-REVOCATION outcome this app run knows about
+ * — the revoke-side counterpart of [`phone_provisioning_status`], populated by
+ * [`set_remote`]'s regenerate-pairing revoke sweep (C10's critical fix). A
+ * machine absent from the result has simply never had a revoke attempted this
+ * run (most machines, most of the time) — not evidence it still holds a stale
+ * token. Settings reads this to flag a server that refused, was too old, or
+ * is still unreachable (queued for automatic retry) rather than silently
+ * assuming the old token is gone everywhere once `set_remote` returns.
+ */
+async phoneRevocationStatus() : Promise<MachineRevokeStatus[]> {
+    return await TAURI_INVOKE("phone_revocation_status");
 },
 /**
  * Settings' "Retry" button: (re)attempt provisioning the current phone token on
@@ -3919,6 +3939,15 @@ daemon_label?: string | null;
  */
 phone_provisioned_at?: number | null }
 /**
+ * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
+ * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
+ * token actually get forgotten here". A machine absent from
+ * [`RevokeRegistry::all`] has simply never had a revocation attempted this
+ * run (most machines, most of the time — a revoke only runs when
+ * `regenerate_pairing` fires) — not evidence it still holds a stale token.
+ */
+export type MachineRevokeStatus = { machine_id: string; outcome: RevokeOutcome; checked_at_ms: number }
+/**
  * What the instructions file looks like right now.
  */
 export type ManagedMemory = { 
@@ -4379,6 +4408,41 @@ max: number | null;
  * Short human reason ("Connection error."), when one is available.
  */
 reason: string | null }
+/**
+ * One `revoke_phone_on_machine` outcome, as Settings reads it back
+ * (`ipc::commands::phone_revocation_status`) — the revoke-side counterpart of
+ * [`ProvisionState`].
+ */
+export type RevokeOutcome = 
+/**
+ * The daemon confirmed the token is gone (or was never authorized — `ok:true`
+ * either way).
+ */
+{ kind: "removed" } | 
+/**
+ * The daemon was unreachable right now, refused the removal, or is too old
+ * to understand `remove-phone` (see below) — in every one of these cases
+ * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
+ * retry the next time this machine is successfully contacted (see
+ * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * "genuinely could not reach it at all" case, so Settings can tell that
+ * apart from a business-logic refusal or an old daemon that answered but
+ * declined.
+ */
+{ kind: "queued" } | 
+/**
+ * The daemon answered `fd_detach` — too old to understand `remove-phone` at
+ * all. Still queued for retry (see `Queued`'s doc): a later `flightdeckd`
+ * update on that box makes the retry succeed for free.
+ */
+{ kind: "daemon_too_old" } | 
+/**
+ * The daemon answered `ok:false` — its own refusal, verbatim. Still queued
+ * for retry (see `Queued`'s doc): re-attempting a removal is idempotent, so
+ * queuing it even for a refusal that might be permanent costs nothing but
+ * an occasional extra ssh round trip.
+ */
+{ kind: "failed"; reason: string }
 /**
  * Outcome of a `rewind_files` request — the binary restoring the files it edited
  * since a given user message, from its own checkpoints. Also the shape of a

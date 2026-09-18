@@ -3621,23 +3621,6 @@ pub(crate) fn parse_yes_no_marker(v: Option<String>) -> Option<bool> {
     }
 }
 
-/// The shared option-only base of every SSH call this crate makes to an ALREADY-PAIRED
-/// machine: batch (never prompts — the whole point of pairing first), its dedicated
-/// `known_hosts` (never the user's real `~/.ssh/known_hosts`, TOFU-pinned once at
-/// `add_machine` time), and its own identity file (or the default key/agent when
-/// `None`). This is "the keyed ssh path" — [`probe_remote`] and [`run_ssh_on_machine`]
-/// both build on it, and so does `bootstrap::server_setup` for the same already-paired
-/// machine (see that module's doc: it deliberately does NOT invent a second ssh
-/// invoker). Mirrors `bootstrap::askpass::bootstrap_ssh_options` in shape — that one is
-/// the deliberate FIRST-contact, password-only exception (no key yet); this one is the
-/// keyed norm every other ssh call in the crate uses.
-///
-/// Does not set `-T`/`-tt` (pty mode differs per caller: batch calls use `-T`, an
-/// interactive drive needs neither since the remote CLI itself doesn't require a pty —
-/// see `bootstrap::server_setup`'s doc) nor the destination/remote command (appended
-/// last by the caller, exactly like `bootstrap_ssh_options`'s own doc explains for its
-/// sibling — ssh's own argv grammar stops parsing options once it sees the
-/// destination).
 /// Test-only override for which `ssh` binary [`keyed_ssh_options`] spawns — an
 /// ABSOLUTE PATH to a stand-in script, read ONCE per call. This exists so C10's
 /// `appmcp::provision` tests can intercept every keyed ssh call end-to-end
@@ -3656,6 +3639,23 @@ fn ssh_binary() -> String {
         .unwrap_or_else(|| "ssh".to_string())
 }
 
+/// The shared option-only base of every SSH call this crate makes to an ALREADY-PAIRED
+/// machine: batch (never prompts — the whole point of pairing first), its dedicated
+/// `known_hosts` (never the user's real `~/.ssh/known_hosts`, TOFU-pinned once at
+/// `add_machine` time), and its own identity file (or the default key/agent when
+/// `None`). This is "the keyed ssh path" — [`probe_remote`] and [`run_ssh_on_machine`]
+/// both build on it, and so does `bootstrap::server_setup` for the same already-paired
+/// machine (see that module's doc: it deliberately does NOT invent a second ssh
+/// invoker). Mirrors `bootstrap::askpass::bootstrap_ssh_options` in shape — that one is
+/// the deliberate FIRST-contact, password-only exception (no key yet); this one is the
+/// keyed norm every other ssh call in the crate uses.
+///
+/// Does not set `-T`/`-tt` (pty mode differs per caller: batch calls use `-T`, an
+/// interactive drive needs neither since the remote CLI itself doesn't require a pty —
+/// see `bootstrap::server_setup`'s doc) nor the destination/remote command (appended
+/// last by the caller, exactly like `bootstrap_ssh_options`'s own doc explains for its
+/// sibling — ssh's own argv grammar stops parsing options once it sees the
+/// destination).
 pub(crate) fn keyed_ssh_options(
     port: u16,
     identity: Option<&str>,
@@ -4916,7 +4916,14 @@ pub fn remote_status(
 /// `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
 /// token on every paired daemon when access just turned on or the token just
 /// changed (C10 hook (b)) — both run in the background so Settings never blocks
-/// on N ssh round trips.
+/// on N ssh round trips, and every per-machine outcome is recorded into its
+/// registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
+///
+/// The relay-side half of the revoke (THIS Mac's own connection) is NOT
+/// resolved synchronously here — see the inline comment right after
+/// `apply_remote` below for why clearing it here was the original bug, and
+/// where it is actually cleared now (`appmcp::relay::connect_once`, only once
+/// the frame has genuinely gone out on a live socket).
 #[tauri::command]
 #[specta::specta]
 pub async fn set_remote(
@@ -4980,17 +4987,20 @@ pub async fn set_remote(
     };
     hub.apply_remote(cfg.clone()).await;
 
-    if regenerate_pairing && cfg.enabled && !old_phone_token.is_empty() {
-        // Best-effort: the connection `apply_remote` just (re)started will carry
-        // this queued token via `post_connect_frames` — there is no delivery ack
-        // on the wire (see that function's doc), so "handed to a live connection
-        // attempt" is treated as done, mirroring `authorize_phone`'s own
-        // fire-and-forget semantics. When remote access is OFF, the entry is left
-        // queued (no connection will ever carry it) for a future `set_remote` call
-        // to pick back up.
-        let store = app.state::<Store>();
-        let _ = store.clear_relay_phone_revocation(&old_phone_token);
-    }
+    // NOTE: the relay-side half of the critical fix (forgetting `old_phone_token`
+    // on THIS Mac's own relay connection) is NOT finished here. `apply_remote`
+    // only *spawns* a reconnect task and returns — it does not wait for that
+    // socket to connect, let alone send anything. `pending_relay_phone_revocations`
+    // is only cleared once `appmcp::relay::connect_once` actually WRITES the
+    // `revoke_phone` frame to a live socket (`ControlHub::notify_relay_revocation_sent`
+    // → `RevocationSink::relay_revocation_sent` → `Store::clear_relay_phone_revocation`)
+    // — never merely because this command reached this point. Clearing it here,
+    // right after `apply_remote`, was the original bug: an app restart or a
+    // superseding `set_remote` call (a label edit, a second regenerate) before
+    // that first connection ever succeeded would silently drop the queued
+    // revocation forever. The durable queue (and `load_remote_config`'s reload
+    // of it into every future `RemoteConfig`) is what makes this safe to leave
+    // unresolved here — the next successful connect always retries it.
 
     // CRITICAL FIX (C10): a regenerated token must also be forgotten by every
     // daemon it was ever authorized on — otherwise "I lost my phone → regenerate
@@ -4998,25 +5008,42 @@ pub async fn set_remote(
     // Backgrounded (never blocks this command on N ssh round trips); an
     // unreachable daemon is queued and retried the next time it's successfully
     // contacted (`appmcp::provision::revoke_phone_on_machine`'s `Queued` case).
+    // Every outcome — including a refusal/unreachable/too-old daemon — is
+    // recorded into `RevokeRegistry` (never discarded) so Settings can show
+    // exactly which nodes still hold the old token instead of silent success.
     if regenerate_pairing && !old_phone_token.is_empty() {
         let app2 = app.clone();
         let token = old_phone_token.clone();
         tokio::spawn(async move {
             let store = app2.state::<Store>();
             let known_hosts = remote_known_hosts_path(&app2);
-            crate::appmcp::provision::revoke_phone_on_all_machines(&store, known_hosts.as_deref(), &token).await;
+            let registry = (*app2.state::<Arc<crate::appmcp::provision::RevokeRegistry>>()).clone();
+            let results =
+                crate::appmcp::provision::revoke_phone_on_all_machines(&store, known_hosts.as_deref(), &token).await;
+            for (machine_id, outcome) in results {
+                registry.record(&machine_id, outcome);
+            }
         });
     }
 
     // C10 hook (b): remote access just turned on, or the phone token just
     // changed — every paired daemon needs to hear about it too, not just the
-    // relay. Backgrounded for the same reason as the revoke above.
+    // relay. Backgrounded for the same reason as the revoke above. Every
+    // outcome is recorded into `ProvisionRegistry` — the SAME registry
+    // `add_machine`'s hook (a) and `retry_phone_provisioning` write to — so a
+    // server that's unreachable or refuses shows up in Settings instead of
+    // leaving its row stuck at "not checked yet".
     if cfg.enabled && (!was_enabled || regenerate_pairing) {
         let app2 = app.clone();
         tokio::spawn(async move {
             let store = app2.state::<Store>();
             let known_hosts = remote_known_hosts_path(&app2);
-            crate::appmcp::provision::provision_phone_on_all_machines(&store, known_hosts.as_deref()).await;
+            let registry = (*app2.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>()).clone();
+            let results =
+                crate::appmcp::provision::provision_phone_on_all_machines(&store, known_hosts.as_deref()).await;
+            for m in results {
+                registry.record(&m.machine_id, m.state);
+            }
         });
     }
 
@@ -5043,6 +5070,22 @@ fn remote_known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
 pub fn phone_provisioning_status(
     registry: tauri::State<'_, Arc<crate::appmcp::provision::ProvisionRegistry>>,
 ) -> Vec<crate::appmcp::provision::MachineProvisionStatus> {
+    registry.all()
+}
+
+/// Every paired server's last phone-REVOCATION outcome this app run knows about
+/// — the revoke-side counterpart of [`phone_provisioning_status`], populated by
+/// [`set_remote`]'s regenerate-pairing revoke sweep (C10's critical fix). A
+/// machine absent from the result has simply never had a revoke attempted this
+/// run (most machines, most of the time) — not evidence it still holds a stale
+/// token. Settings reads this to flag a server that refused, was too old, or
+/// is still unreachable (queued for automatic retry) rather than silently
+/// assuming the old token is gone everywhere once `set_remote` returns.
+#[tauri::command]
+#[specta::specta]
+pub fn phone_revocation_status(
+    registry: tauri::State<'_, Arc<crate::appmcp::provision::RevokeRegistry>>,
+) -> Vec<crate::appmcp::provision::MachineRevokeStatus> {
     registry.all()
 }
 

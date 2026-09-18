@@ -139,6 +139,63 @@ impl ProvisionRegistry {
     }
 }
 
+/// [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
+/// of [`MachineProvisionStatus`], Settings' per-server row for "did the old
+/// token actually get forgotten here". A machine absent from
+/// [`RevokeRegistry::all`] has simply never had a revocation attempted this
+/// run (most machines, most of the time — a revoke only runs when
+/// `regenerate_pairing` fires) — not evidence it still holds a stale token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+pub struct MachineRevokeStatus {
+    pub machine_id: String,
+    pub outcome: RevokeOutcome,
+    pub checked_at_ms: i64,
+}
+
+/// In-memory, per-app-run registry of the last revoke outcome per machine —
+/// see [`ProvisionRegistry`]'s doc for why this is its own module-owned type
+/// rather than folded into `ControlHub`. Exists so `ipc::commands::set_remote`'s
+/// regenerate-pairing revoke sweep (C10's critical fix) has somewhere durable
+/// (for this run) to put each daemon's outcome instead of discarding the
+/// `Vec<(String, RevokeOutcome)>` it used to throw away — the review finding
+/// this closes: "regenerate-pairing must report which nodes still hold the OLD
+/// token when a revoke failed".
+#[derive(Default)]
+pub struct RevokeRegistry {
+    status: Mutex<HashMap<String, MachineRevokeStatus>>,
+}
+
+impl RevokeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every machine a revoke was attempted against this run — see
+    /// [`ProvisionRegistry::all`]'s doc for the same ordering caveat.
+    pub fn all(&self) -> Vec<MachineRevokeStatus> {
+        self.status
+            .lock()
+            .expect("revoke registry lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Record `outcome` for `machine_id`, stamped with the current time.
+    pub fn record(&self, machine_id: &str, outcome: RevokeOutcome) -> MachineRevokeStatus {
+        let row = MachineRevokeStatus {
+            machine_id: machine_id.to_string(),
+            outcome,
+            checked_at_ms: now_ms(),
+        };
+        self.status
+            .lock()
+            .expect("revoke registry lock")
+            .insert(machine_id.to_string(), row.clone());
+        row
+    }
+}
+
 /// One daemon's parsed answer to `add-phone`/`remove-phone` — see the module doc
 /// for the three wire shapes this covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,18 +363,33 @@ pub async fn provision_phone_on_all_machines(
     results
 }
 
-/// One `revoke_phone_on_machine` outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `revoke_phone_on_machine` outcome, as Settings reads it back
+/// (`ipc::commands::phone_revocation_status`) — the revoke-side counterpart of
+/// [`ProvisionState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevokeOutcome {
     /// The daemon confirmed the token is gone (or was never authorized — `ok:true`
     /// either way).
     Removed,
-    /// The daemon was unreachable right now; the token was queued
-    /// (`Store::queue_daemon_phone_revocation`) for a retry the next time this
-    /// machine is successfully contacted (see [`drain_pending_daemon_revocations`]).
+    /// The daemon was unreachable right now, refused the removal, or is too old
+    /// to understand `remove-phone` (see below) — in every one of these cases
+    /// the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
+    /// retry the next time this machine is successfully contacted (see
+    /// [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+    /// "genuinely could not reach it at all" case, so Settings can tell that
+    /// apart from a business-logic refusal or an old daemon that answered but
+    /// declined.
     Queued,
+    /// The daemon answered `fd_detach` — too old to understand `remove-phone` at
+    /// all. Still queued for retry (see `Queued`'s doc): a later `flightdeckd`
+    /// update on that box makes the retry succeed for free.
     DaemonTooOld,
-    Failed(String),
+    /// The daemon answered `ok:false` — its own refusal, verbatim. Still queued
+    /// for retry (see `Queued`'s doc): re-attempting a removal is idempotent, so
+    /// queuing it even for a refusal that might be permanent costs nothing but
+    /// an occasional extra ssh round trip.
+    Failed { reason: String },
 }
 
 /// Revoke ONE phone token on ONE paired server: `flightdeckd remove-phone
@@ -339,8 +411,20 @@ pub async fn revoke_phone_on_machine(
             let _ = store.clear_daemon_phone_revocation(&machine.id, token);
             RevokeOutcome::Removed
         }
-        Ok(DaemonReply::Refused(reason)) => RevokeOutcome::Failed(reason),
-        Ok(DaemonReply::TooOld) => RevokeOutcome::DaemonTooOld,
+        // A REACHABLE daemon can still refuse (`ok:false`) or be too old to
+        // understand `remove-phone` at all — both are queued for automatic
+        // retry, same as the unreachable case below (see `RevokeOutcome`'s
+        // doc): a reachable-but-refused daemon is exactly as real a case as
+        // `add-phone`'s own 33rd-token refusal, and leaving it un-queued would
+        // strand the old token with no automatic path back to actually gone.
+        Ok(DaemonReply::Refused(reason)) => {
+            let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
+            RevokeOutcome::Failed { reason }
+        }
+        Ok(DaemonReply::TooOld) => {
+            let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
+            RevokeOutcome::DaemonTooOld
+        }
         Err(_unreachable) => {
             let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
             RevokeOutcome::Queued
@@ -591,6 +675,34 @@ mod tests {
         assert_eq!(parse_daemon_reply(""), None);
     }
 
+    // ---- RevokeRegistry (pure) --------------------------------------------------
+
+    /// Review fix coverage: `RevokeRegistry` is the observable place a
+    /// per-machine revoke outcome lands instead of being discarded by
+    /// `set_remote`'s background sweep — a later `record` for the same machine
+    /// replaces the row (the latest outcome always wins), and a machine never
+    /// recorded is simply absent, not a fabricated "ok" entry.
+    #[test]
+    fn revoke_registry_records_the_latest_outcome_per_machine() {
+        let registry = RevokeRegistry::new();
+        assert_eq!(registry.all(), Vec::<MachineRevokeStatus>::new());
+
+        registry.record("m1", RevokeOutcome::Queued);
+        registry.record("m2", RevokeOutcome::Removed);
+        let mut all = registry.all();
+        all.sort_by(|a, b| a.machine_id.cmp(&b.machine_id));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].machine_id, "m1");
+        assert_eq!(all[0].outcome, RevokeOutcome::Queued);
+        assert_eq!(all[1].machine_id, "m2");
+        assert_eq!(all[1].outcome, RevokeOutcome::Removed);
+
+        // A later outcome for the SAME machine replaces the row, not accumulates.
+        registry.record("m1", RevokeOutcome::Removed);
+        let row = registry.all().into_iter().find(|r| r.machine_id == "m1").unwrap();
+        assert_eq!(row.outcome, RevokeOutcome::Removed);
+    }
+
     // ---- provision_phone_on_machine --------------------------------------------
 
     /// The full happy-path provision flow against a fake daemon: `whoami`
@@ -770,6 +882,52 @@ mod tests {
         let outcome = revoke_phone_on_machine(&store, None, &m, "old-tok").await;
         assert_eq!(outcome, RevokeOutcome::Queued);
         assert_eq!(store.pending_daemon_phone_revocations("m1").unwrap(), vec!["old-tok".to_string()]);
+    }
+
+    /// Review fix: a REACHABLE daemon that explicitly refuses `remove-phone`
+    /// (`ok:false`) must be queued for automatic retry too, not just the
+    /// network-unreachable case — a reachable-but-refused daemon is exactly as
+    /// real a case as `add-phone`'s own 33rd-token refusal, and leaving it
+    /// un-queued would strand the old token with no automatic path back.
+    #[tokio::test]
+    async fn revoke_queues_the_token_when_the_daemon_reachably_refuses() {
+        let _guard = PathGuard::install("revoke-refused");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"ok":false,"error":"disk full"}"#);
+
+        let store = Store::open_in_memory().unwrap();
+        let m = machine("m1");
+        store.upsert_machine(&m).unwrap();
+
+        let outcome = revoke_phone_on_machine(&store, None, &m, "old-tok").await;
+        assert_eq!(outcome, RevokeOutcome::Failed { reason: "disk full".to_string() });
+        assert_eq!(
+            store.pending_daemon_phone_revocations("m1").unwrap(),
+            vec!["old-tok".to_string()],
+            "a reachable-but-refused revoke must still be queued for automatic retry"
+        );
+    }
+
+    /// Same fix, for the `DaemonTooOld` case: a later `flightdeckd` update on
+    /// that box should make the queued retry succeed for free.
+    #[tokio::test]
+    async fn revoke_queues_the_token_when_the_daemon_is_too_old() {
+        let _guard = PathGuard::install("revoke-too-old");
+        std::env::set_var(
+            "FAKE_SSH_REMOVEPHONE_OUT",
+            r#"{"type":"fd_detach","reason":"error","message":"missing attach, status or stop"}"#,
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        let m = machine("m1");
+        store.upsert_machine(&m).unwrap();
+
+        let outcome = revoke_phone_on_machine(&store, None, &m, "old-tok").await;
+        assert_eq!(outcome, RevokeOutcome::DaemonTooOld);
+        assert_eq!(
+            store.pending_daemon_phone_revocations("m1").unwrap(),
+            vec!["old-tok".to_string()],
+            "a too-old daemon's revoke must still be queued for automatic retry"
+        );
     }
 
     /// The core of C10's regression coverage: a queued (unreachable-at-the-time)

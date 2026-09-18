@@ -80,6 +80,27 @@ pub trait ToolSink: Send + Sync {
     fn request(&self, request_id: &str, tool: &str, args: &Value, session: Option<&str>);
 }
 
+/// The hub's outlet for "a phone token's `{type:"revoke_phone"}` frame was just
+/// written to a live, CONNECTED relay socket" — the trigger for durably
+/// forgetting it from `Store::pending_relay_phone_revocations` (C10's critical
+/// fix). Implemented over `Store::clear_relay_phone_revocation` in
+/// `ipc::events` (kept as a trait for the same reason as [`ToolSink`]: this
+/// module stays free of Tauri/Store types — `RemoteConfig`'s doc: "the hub
+/// never touches the store").
+///
+/// This exists because the FIRST version of the critical fix cleared the
+/// durable queue the moment `ControlHub::apply_remote` merely *spawned* a
+/// reconnect task — before the socket even connected, let alone sent the
+/// frame — so an app restart or a superseding `set_remote` call (a label
+/// edit, a second regenerate) could silently drop the queued revocation
+/// forever, reproducing the exact bug this fix exists to close. Routing the
+/// "actually sent" moment through this sink (called from
+/// [`relay::connect_once`]) closes that window: the row survives until a live
+/// socket has genuinely carried the frame.
+pub trait RevocationSink: Send + Sync {
+    fn relay_revocation_sent(&self, token: &str);
+}
+
 /// The live state of the voice bridge, as reported to the Settings UI. This is
 /// the honest read-back: `running`/`error` reflect what the listener actually
 /// did, never what the toggle optimistically hoped (a failed bind must show).
@@ -184,6 +205,7 @@ struct RemoteRuntime {
 /// (`Arc`) and managed as Tauri state for the IPC commands.
 pub struct ControlHub {
     sink: OnceLock<Arc<dyn ToolSink>>,
+    revocation_sink: OnceLock<Arc<dyn RevocationSink>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     next_req: AtomicU64,
     pub events: events::EventJournal,
@@ -201,6 +223,7 @@ impl ControlHub {
     pub fn new() -> Self {
         Self {
             sink: OnceLock::new(),
+            revocation_sink: OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
             events: events::EventJournal::new(),
@@ -237,6 +260,27 @@ impl ControlHub {
     /// point fail cleanly ("app UI not ready").
     pub fn set_sink(&self, sink: Arc<dyn ToolSink>) {
         let _ = self.sink.set(sink);
+    }
+
+    /// Install the [`RevocationSink`] (once, at app setup — mirrors
+    /// [`Self::set_sink`]).
+    pub fn set_revocation_sink(&self, sink: Arc<dyn RevocationSink>) {
+        let _ = self.revocation_sink.set(sink);
+    }
+
+    /// Called by [`relay::connect_once`] the moment a `revoke_phone` frame for
+    /// `token` is actually written to a connected socket — never merely
+    /// because a reconnect task was spawned or attempted. A missing sink (a
+    /// relay reconnect racing app setup, vanishingly unlikely) is logged and
+    /// otherwise harmless: the token stays queued and is simply sent — and
+    /// this called again — on the next connect.
+    pub(crate) fn notify_relay_revocation_sent(&self, token: &str) {
+        match self.revocation_sink.get() {
+            Some(sink) => sink.relay_revocation_sent(token),
+            None => eprintln!(
+                "[appmcp] relay revocation sent before the revocation sink was installed; will resend on next connect"
+            ),
+        }
     }
 
     /// Handle one MCP JSON-RPC message for a surface/caller. `None` means the
@@ -474,6 +518,42 @@ mod tests {
                 session.map(str::to_string),
             ));
         }
+    }
+
+    /// A [`RevocationSink`] that just records every token it was told about.
+    struct RecordingRevocationSink {
+        seen: Mutex<Vec<String>>,
+    }
+    impl RevocationSink for RecordingRevocationSink {
+        fn relay_revocation_sent(&self, token: &str) {
+            self.seen.lock().unwrap().push(token.to_string());
+        }
+    }
+
+    /// Review-fix coverage: once a [`RevocationSink`] is installed,
+    /// `notify_relay_revocation_sent` reaches it (verbatim token, no
+    /// transformation) — the path `relay::connect_once` drives after actually
+    /// sending a `revoke_phone` frame.
+    #[test]
+    fn notify_relay_revocation_sent_reaches_the_installed_sink() {
+        let hub = ControlHub::new();
+        let sink = Arc::new(RecordingRevocationSink { seen: Mutex::new(Vec::new()) });
+        hub.set_revocation_sink(sink.clone());
+
+        hub.notify_relay_revocation_sent("old-token-1");
+        hub.notify_relay_revocation_sent("old-token-2");
+
+        assert_eq!(*sink.seen.lock().unwrap(), vec!["old-token-1", "old-token-2"]);
+    }
+
+    /// REGRESSION (silent error, inverse direction): calling
+    /// `notify_relay_revocation_sent` before a sink is installed must not
+    /// panic — a relay reconnect that (implausibly) races app setup degrades to
+    /// "resend next connect", never a crash.
+    #[test]
+    fn notify_relay_revocation_sent_without_a_sink_does_not_panic() {
+        let hub = ControlHub::new();
+        hub.notify_relay_revocation_sent("old-token");
     }
 
     /// ACCEPTANCE: a bridged call reaches the sink with the caller's session and
