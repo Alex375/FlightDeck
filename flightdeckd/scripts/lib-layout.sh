@@ -2,25 +2,60 @@
 # any) and the musl outputs live. The same scripts work for a STANDALONE crate
 # (flightdeck-server/flightdeckd, or tosse-code/flightdeckd imported as its own
 # package) and for a WORKSPACE MEMBER (tosse-code's Cargo workspace): the
-# workspace is detected like cargo does — the nearest ancestor Cargo.toml with a
-# [workspace] table — or forced with WORKSPACE_ROOT=<dir>.
+# workspace is the nearest ancestor Cargo.toml with a [workspace] table WITHIN
+# the crate's git repository that really lists the crate as a member (like
+# cargo); anything else means standalone. WORKSPACE_ROOT=<dir> forces it.
 #
 # Sets: FD_CRATE_DIR, FD_ROOT (what is mounted in the builder: the workspace
 # root, or the crate itself), FD_WORKSPACE (1/0), FD_CRATE_REL, FD_PROFILE,
 # FD_PROFILE_DIR, FD_TARGET_DIR, FD_DIST_DIR, FD_TARGETS.
+# The TOML array `key = [ ... ]` of the [workspace] table in $1/Cargo.toml,
+# one entry per line, quotes and trailing slashes stripped. Multi-line arrays
+# are fine; `default-members` never matches `members`.
+fd_workspace_list() {
+  awk '/^\[workspace\][[:space:]]*$/ { w = 1; next } /^\[/ { w = 0 } w' "$1/Cargo.toml" | tr '\n' ' ' \
+    | sed -nE "s/^(.*[[:space:]])?$2[[:space:]]*=[[:space:]]*\[([^]]*)\].*$/\2/p" \
+    | tr ',' '\n' | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//; s#/$##' | grep -v '^$' || true
+}
+
+# Is the crate at $2 (relative to $1) a member of the workspace in
+# $1/Cargo.toml? Same rules as cargo: listed in `members` (globs allowed) and
+# not in `exclude`. No cargo needed on the host.
+fd_is_member() {
+  local pat hit=1
+  while IFS= read -r pat; do
+    # shellcheck disable=SC2053  # unquoted on purpose: glob match
+    if [[ "$2" == $pat ]]; then hit=0; break; fi
+  done < <(fd_workspace_list "$1" members)
+  [ "$hit" = 0 ] || return 1
+  while IFS= read -r pat; do
+    # shellcheck disable=SC2053
+    if [[ "$2" == $pat ]]; then return 1; fi
+  done < <(fd_workspace_list "$1" exclude)
+  return 0
+}
+
 fd_layout() {
   FD_CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   FD_ROOT=""
   if [ -n "${WORKSPACE_ROOT:-}" ]; then
     FD_ROOT="$(cd "$WORKSPACE_ROOT" && pwd)"
   else
-    local d; d="$(dirname "$FD_CRATE_DIR")"
-    while [ "$d" != "/" ]; do
-      if [ -f "$d/Cargo.toml" ] && grep -q '^\[workspace\]' "$d/Cargo.toml"; then
-        FD_ROOT="$d"
+    # The nearest ancestor with a [workspace] table, never above the git
+    # repository the crate lives in, and only if it really lists the crate —
+    # an unrelated workspace higher up is ignored (standalone build).
+    local d="$FD_CRATE_DIR" rel
+    while [ ! -e "$d/.git" ] && [ "$d" != "/" ]; do
+      d="$(dirname "$d")"
+      if [ -f "$d/Cargo.toml" ] && grep -qs '^\[workspace\]' "$d/Cargo.toml"; then
+        rel="${FD_CRATE_DIR#"$d"/}"
+        if fd_is_member "$d" "$rel"; then
+          FD_ROOT="$d"
+        else
+          echo "· ignoring the Cargo workspace at $d: flightdeckd ($rel) is not one of its members — building it standalone" >&2
+        fi
         break
       fi
-      d="$(dirname "$d")"
     done
   fi
   if [ -n "$FD_ROOT" ] && [ "$FD_ROOT" != "$FD_CRATE_DIR" ]; then

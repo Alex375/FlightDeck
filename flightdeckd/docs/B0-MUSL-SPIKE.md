@@ -40,8 +40,11 @@ flightdeckd/scripts/build-musl.sh --print-dist-dir     # où atterrissent les bi
 TARGETS=aarch64-unknown-linux-musl flightdeckd/scripts/build-musl.sh   # une seule arch
 ```
 
-`<racine>` est détectée (`scripts/lib-layout.sh`, comme cargo : le plus proche
-ancêtre dont le `Cargo.toml` a une table `[workspace]`, ou `WORKSPACE_ROOT=`) :
+`<racine>` est détectée (`scripts/lib-layout.sh` : le plus proche ancêtre dont
+le `Cargo.toml` a une table `[workspace]`, **sans sortir du dépôt git** du crate
+et **seulement s'il liste vraiment le crate** — `members`, globs compris, hors
+`exclude` ; sinon mode autonome avec un avis sur stderr ; `WORKSPACE_ROOT=`
+force ; testé par `scripts/test-lib-layout.sh`, lancé par `cargo test`) :
 le crate lui-même quand il est **autonome** (aujourd'hui, et après un import
 dans tosse-code comme paquet autonome), la racine du **workspace** quand il en
 est membre — c'est elle qui est montée dans le builder (son `Cargo.lock`,
