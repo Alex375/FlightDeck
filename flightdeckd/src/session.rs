@@ -153,6 +153,14 @@ struct SessionEntry {
 
 type SessionsMap = HashMap<String, SessionEntry>;
 
+/// What became of a live push to the relay (see `SessionManager::send_relay`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum LiveSend {
+    Queued,
+    Offline,
+    Failed,
+}
+
 /// The phones this node authorizes on the relay — the LIVE copy of the
 /// config's `phone_tokens` / `revoked_phone_tokens` (the config file on disk
 /// stays the durable one).
@@ -242,11 +250,24 @@ impl SessionManager {
         Ok(true)
     }
 
-    /// Queue one frame on the live relay link; false when offline.
-    fn send_relay(&self, frame: Value) -> bool {
+    /// Queue one frame on the live relay link. Never retried here, and never
+    /// acknowledged by the relay (which may even drop it past its rate budget):
+    /// the next connect's burst replays the whole phone access anyway — so a
+    /// frame that could not go out is logged, not fatal.
+    fn send_relay(&self, frame: Value) -> LiveSend {
+        let kind = frame["type"].as_str().unwrap_or("frame").to_string();
         match self.relay_out.lock().expect("relay_out lock").as_ref() {
-            Some(tx) => tx.send(Message::Text(frame.to_string())).is_ok(),
-            None => false,
+            Some(tx) => match tx.send(Message::Text(frame.to_string())) {
+                Ok(()) => LiveSend::Queued,
+                Err(_) => {
+                    warn!("relay link closing: {kind} not sent live — the next connect's burst replays it");
+                    LiveSend::Failed
+                }
+            },
+            None => {
+                info!("relay offline: {kind} will go out with the next connect's burst");
+                LiveSend::Offline
+            }
         }
     }
 
@@ -1170,6 +1191,18 @@ mod tests {
         assert_eq!(m.phones.lock().unwrap().tokens.len(), config::MAX_PHONE_TOKENS);
         assert!(m.remove_phone_token("pt-1").unwrap());
         assert!(m.add_phone_token("one-too-many", "").unwrap(), "a freed slot can be reused");
+    }
+
+    #[test]
+    fn a_live_push_that_cannot_go_out_is_reported_not_swallowed() {
+        let (_dir, _path, m, rx) = phone_manager(true);
+        assert_eq!(m.send_relay(json!({"type": "authorize_phone"})), LiveSend::Queued);
+        drop(rx); // the link's writer is gone
+        assert_eq!(m.send_relay(json!({"type": "revoke_phone"})), LiveSend::Failed);
+        *m.relay_out.lock().unwrap() = None;
+        assert_eq!(m.send_relay(json!({"type": "revoke_phone"})), LiveSend::Offline);
+        // the change itself still persists and applies
+        assert!(m.remove_phone_token("seed").unwrap());
     }
 
     #[test]

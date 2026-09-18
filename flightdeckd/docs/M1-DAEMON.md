@@ -108,7 +108,10 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   `ok:false`, « too many authorized phones (max 32) — remove one first »).
   La rafale de connexion est **cadencée** (lots de ≤ 20 frames, 1 s d'écart,
   `set_label` en dernier) : le relais jette en silence au-delà de 60 frames
-  (recharge 30/s).
+  (recharge 30/s). Un ajout/retrait à chaud part tout de suite sur la liaison
+  en cours, sans accusé ni nouvelle tentative : s'il ne peut pas partir
+  (relais hors ligne, liaison en train de tomber), c'est journalisé et la
+  rafale de la prochaine connexion rejoue l'état complet.
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `bypassPermissions` pour les sessions créées
