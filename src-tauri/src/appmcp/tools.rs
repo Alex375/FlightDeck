@@ -423,11 +423,12 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 ToolSpec {
                     name: "open_view",
                     description: "Switch the app's main view: 'conversation' (the active \
-                        thread), 'flightdeck' (the fleet overview) or 'tosse' (the CRM tasks \
-                        board, only when signed in).",
+                        thread), 'flightdeck' (the fleet overview), 'tosse' (the CRM tasks \
+                        board, only when signed in) or 'ide' (folders opened as workspaces: \
+                        file explorer, editor, terminals and docked conversations).",
                     kind: ToolKind::Front,
                     schema: obj(
-                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse"] } }),
+                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse", "ide"] } }),
                         &["view"],
                     ),
                 },

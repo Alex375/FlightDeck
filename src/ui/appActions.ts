@@ -17,6 +17,7 @@ import { slotFor, useManualOrder } from "../store/manualOrder";
 import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
+import { openConversationInIde } from "../features/ide/openInIde";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
 import type { ShortcutAction, View } from "./shortcuts";
 
@@ -78,6 +79,11 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
         session: conv.id,
       });
       return true;
+    case "open-in-ide":
+      // Switches the view through the IDE store's request (App listens), not `changeView`:
+      // the composer calls this without one. False when refused — a remote repository, or
+      // the IDE view switched off in Settings.
+      return conv ? openConversationInIde(conv.id) : false;
     case "new-conversation": {
       const repoPath =
         (conv && store.repos.find((r) => r.id === conv.repoId)?.path) ?? store.repos[0]?.path ?? null;

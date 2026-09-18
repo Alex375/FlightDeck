@@ -179,6 +179,12 @@ export interface DisplayPrefs {
    *  worse than no tab, per the feature's spec). Read by {@link App}. */
   tosseTasksView: boolean;
 
+  /** Offer the IDE view — the top-level view (⌘4) that opens a folder as a workspace, and
+   *  every "Open in IDE" entry point leading to it (sidebar, title bar, composer action,
+   *  ⌘⇧I). ON by default. Off → the tab and those entry points disappear and the view is
+   *  never mounted; open workspaces are kept for when it comes back. Read by {@link App}. */
+  ideView: boolean;
+
   /** Keep the window on the TASKS view after pressing « Start » on a task — the conversation
    *  opens and its first message goes out, but the app does not follow it. ON by default:
    *  starting is a HAND-OFF (the agent picks the task up on its own), so being thrown into a
@@ -303,6 +309,7 @@ const DEFAULTS: DisplayPrefs = {
   clickableFileMentions: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
+  ideView: true,
   tosseStartStaysOnTasks: true,
   tosseTaskDeleteWarning: true,
   // ON, though it is the only preference here that sends CRM data to a third party: the
@@ -376,6 +383,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        ideView: patch.ideView ?? s.ideView,
         tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,

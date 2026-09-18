@@ -13,7 +13,9 @@ import {
   useMachines,
   type Conversation,
   type Machine,
+  type Repo,
 } from "../../store/conversationsStore";
+import { ideBlockedReason, openRepoInIde } from "../ide/openInIde";
 import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
@@ -243,11 +245,13 @@ function RepoGroup({
   items,
   activeId,
 }: {
-  repo: { id: string; path: string };
+  repo: Repo;
   items: Conversation[];
   activeId: string | null;
 }) {
   const collapsed = useRepoCollapsed(repo.id);
+  const ideEnabled = useDisplay((s) => s.ideView);
+  const ideBlocked = ideBlockedReason(repo);
   const toggleFold = useSidebarFold((s) => s.toggle);
   const openManager = useWorktreeUi((s) => s.openManager);
   const openExtensions = useExtensionsUi((s) => s.openManager);
@@ -314,6 +318,21 @@ function RepoGroup({
         >
           <Ico name="layers" className="sm" />
         </button>
+        {/* Open the folder in the IDE view — explorer, editor, terminals and this
+            repository's conversations docked under them. Disabled WITH the reason for a
+            remote repository: the IDE reads this Mac's disk. */}
+        {ideEnabled ? (
+          <button
+            type="button"
+            className="cv-repo-act cv-repo-reveal"
+            title={ideBlocked ?? "Open this repository in the IDE"}
+            aria-label="Open in IDE"
+            disabled={!!ideBlocked}
+            onClick={() => openRepoInIde(repo)}
+          >
+            <Ico name="ide" className="sm" />
+          </button>
+        ) : null}
         {/* Delete the whole repo section — revealed on hover like the other secondary tools,
             but danger-tinted and gated behind a confirm. Unlike the per-conversation × (which
             is friction-free and ⌘Z-undoable), removing a repo drops every conversation under it

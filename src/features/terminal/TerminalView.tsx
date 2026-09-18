@@ -20,10 +20,14 @@ export default function TerminalView({
   convId,
   cwd,
   stacked,
+  flush = false,
 }: {
+  /** The terminal's id — a conversation's stable id, or an IDE terminal's own id. */
   convId: string;
   cwd: string;
   stacked: boolean;
+  /** No separator edge: the host (the IDE dock) already draws its own. */
+  flush?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Latest cwd, read only when (lazily) creating the shell — never a re-attach trigger.
@@ -38,6 +42,11 @@ export default function TerminalView({
   }, [convId]);
 
   return (
-    <div className={styles.term + (stacked ? " " + styles.termStacked : "")} ref={containerRef} />
+    <div
+      className={
+        styles.term + (stacked ? " " + styles.termStacked : "") + (flush ? " " + styles.termFlush : "")
+      }
+      ref={containerRef}
+    />
   );
 }

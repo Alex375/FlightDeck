@@ -44,6 +44,7 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "IDE view", section: "display", sub: "appearance", group: "Appearance", keywords: "ide editor explorer files folder workspace terminals dock tab onglet dossier fichiers vs code display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },

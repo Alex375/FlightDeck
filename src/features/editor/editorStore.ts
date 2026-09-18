@@ -266,6 +266,11 @@ interface EditorState {
   // ---- Tree ----
   /** Initialise a conversation's tree at `root`, resetting it if the root moved. */
   ensureConv: (convId: string, root: string) => void;
+  /** Forget a whole slice (tree + tabs + buffers) — a closed IDE workspace. Unsaved edits
+   *  are flushed to disk FIRST: their autosave timer would otherwise fire against a slice
+   *  that no longer exists, and the last second of typing would vanish without a word.
+   *  Resolves false — slice KEPT — when one of them could not be saved. */
+  dropConv: (convId: string) => Promise<boolean>;
   toggleDir: (convId: string, path: string) => Promise<void>;
 
   // ---- Explorer mutations (context menu) ----
@@ -845,6 +850,33 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           : emptyConv(root);
         return { byConv: { ...s.byConv, [convId]: next } };
       });
+    },
+
+    dropConv: async (convId) => {
+      const conv = get().byConv[convId];
+      if (!conv) return true;
+      for (const path of conv.tabs) {
+        const b = conv.buffers[path];
+        if (!b?.dirty || b.binary || b.tooLarge) continue;
+        await get().saveBuffer(convId, path);
+        // `saveBuffer` reports a failure on the BUFFER — which is about to be deleted, so
+        // nobody would ever read it. Refuse the drop instead: the edits stay on screen,
+        // and the banner says which file is holding the workspace open.
+        if (get().byConv[convId]?.buffers[path]?.dirty) {
+          useAppErrors
+            .getState()
+            .pushError(`Could not save ${baseName(path)} — the workspace was kept open.`, path);
+          return false;
+        }
+      }
+      for (const path of conv.tabs) clearAutosave(convId, path);
+      set((s) => {
+        if (!s.byConv[convId]) return s;
+        const byConv = { ...s.byConv };
+        delete byConv[convId];
+        return { byConv };
+      });
+      return true;
     },
 
     toggleDir: async (convId, path) => {

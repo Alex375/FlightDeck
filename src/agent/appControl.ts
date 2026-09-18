@@ -821,12 +821,14 @@ async function openFile(
 
 function openView(args: Record<string, unknown>, helpers: AppControlHelpers) {
   const view = args.view;
-  if (view !== "conversation" && view !== "flightdeck" && view !== "tosse")
-    throw new Error("open_view: 'view' must be conversation | flightdeck | tosse");
+  if (view !== "conversation" && view !== "flightdeck" && view !== "tosse" && view !== "ide")
+    throw new Error("open_view: 'view' must be conversation | flightdeck | tosse | ide");
   // `changeView` silently no-ops on an unavailable view; a TOOL must report the
   // refusal instead of returning a success that did nothing.
   if (view === "tosse" && !helpers.tosseAvailable)
     throw new Error("open_view: the TOSSE view is unavailable (not signed in to the CRM)");
+  if (view === "ide" && !useDisplay.getState().ideView)
+    throw new Error("open_view: the IDE view is switched off (Settings → General → Display)");
   helpers.changeView(view);
   return { view };
 }

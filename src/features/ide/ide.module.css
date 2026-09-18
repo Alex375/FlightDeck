@@ -1,0 +1,548 @@
+/* The IDE view. Global theme tokens (--wf-*) throughout, and the editor panel's own
+   metrics where the two meet (40px tab bars, --wf-bg-2 chrome over --wf-bg content), so
+   the dock reads as a continuation of the editor above it rather than a second design. */
+
+.root {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-bg);
+}
+
+/* ---- Open folders ---- */
+.strip {
+  flex: 0 0 34px;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 6px;
+  background: var(--wf-bg-2);
+  border-bottom: 1px solid var(--wf-line);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.strip::-webkit-scrollbar {
+  display: none;
+}
+.wsTab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 240px;
+  margin-top: 5px;
+  padding: 0 6px 0 11px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wsTab:hover {
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+}
+/* The open folder's tab joins the content below it: same surface, no bottom edge. */
+.wsTabOn,
+.wsTabOn:hover {
+  background: var(--wf-bg);
+  border-color: var(--wf-line);
+  color: var(--wf-tx-hi);
+  margin-bottom: -1px;
+}
+.wsTabName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.stripAdd {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.stripAdd:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Attention pips (folder tabs, the Conversations switch, the status bar) ---- */
+.pips {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.pips:empty {
+  display: none;
+}
+.pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wf-att);
+}
+.pip[data-attn="review"] {
+  background: var(--wf-wait);
+}
+.pip[data-attn="error"] {
+  background: var(--wf-err);
+}
+
+/* ---- Workspace body ---- */
+.main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.split {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.editorSlot {
+  min-width: 0;
+  min-height: 90px;
+}
+.dockSlot {
+  min-width: 0;
+  display: flex;
+}
+
+/* ---- Dock ---- */
+.dock {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-bg);
+}
+.dockHead {
+  flex: 0 0 36px;
+  display: flex;
+  align-items: stretch;
+  background: var(--wf-bg-2);
+  border-bottom: 1px solid var(--wf-line);
+}
+.modeSwitch {
+  flex: 0 0 auto;
+  align-self: center;
+  display: inline-flex;
+  gap: 2px;
+  margin: 0 8px;
+  padding: 2px;
+  border: 1px solid var(--wf-line);
+  border-radius: 7px;
+  background: var(--wf-panel);
+}
+.modeBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.modeBtn:hover {
+  color: var(--wf-tx);
+}
+.modeBtn[data-on] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+/* Beside the editor the dock is narrow (it holds to the composer's floor), and the tabs
+   are what the width is for: the switch falls back to its icons, which the counts and the
+   tooltips keep readable. */
+.dock[data-position="right"] .modeLabel {
+  display: none;
+}
+.count {
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  color: var(--wf-tx-lo);
+}
+.modeBtn[data-on] .count {
+  color: var(--wf-tx);
+}
+
+.tabStrip {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  border-left: 1px solid var(--wf-line);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.tabStrip::-webkit-scrollbar {
+  display: none;
+}
+.tab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 300px;
+  padding: 0 6px 0 12px;
+  border: 0;
+  border-right: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tab:hover {
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+}
+.tab[data-on] {
+  background: var(--wf-bg);
+  color: var(--wf-tx-hi);
+  box-shadow: inset 0 -2px 0 var(--wf-accent);
+}
+.convTab {
+  padding-right: 12px;
+}
+/* A conversation that wants the user tints its tab in its status colour — the sidebar
+   row's language, so "amber = it is waiting for you" means the same thing here. */
+.convTab[data-attn="input"] {
+  --ide-attn: var(--wf-att);
+  --ide-attn-bg: var(--wf-att-bg);
+}
+.convTab[data-attn="review"] {
+  --ide-attn: var(--wf-wait);
+  --ide-attn-bg: var(--wf-wait-bg);
+}
+.convTab[data-attn="error"] {
+  --ide-attn: var(--wf-err);
+  --ide-attn-bg: var(--wf-err-bg);
+}
+.convTab[data-attn] {
+  background: var(--ide-attn-bg);
+  color: var(--wf-tx-hi);
+}
+.convTab[data-attn][data-on] {
+  background: color-mix(in srgb, var(--ide-attn) 18%, var(--ide-attn-bg));
+  box-shadow: inset 0 -2px 0 var(--ide-attn);
+}
+.tabName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tabState {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+}
+.tabState[data-s="work"],
+.tabState[data-s="bg"] {
+  color: var(--wf-run);
+}
+.tabState[data-s="ask"] {
+  color: var(--wf-att);
+}
+.tabState[data-s="review"] {
+  color: var(--wf-wait);
+}
+.tabState[data-s="err"] {
+  color: var(--wf-err);
+}
+.tabEdit {
+  width: 110px;
+  padding: 1px 5px;
+  border: 1px solid var(--wf-accent);
+  border-radius: 4px;
+  background: var(--wf-bg);
+  color: var(--wf-tx-hi);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.tabClose {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.tab:hover .tabClose,
+.tab[data-on] .tabClose,
+.wsTab:hover .tabClose,
+.wsTabOn .tabClose {
+  opacity: 1;
+}
+.tabClose:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.tabAdd {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.tabAdd:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+.dockActions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 6px;
+  border-left: 1px solid var(--wf-line);
+}
+.headBtn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.headBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.headBtn[data-on] {
+  color: var(--wf-accent);
+}
+/* The kit's chevron points down; "maximize" wants it pointing up. */
+.flip {
+  transform: rotate(180deg);
+}
+
+.dockBody {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.bodyFill {
+  flex: 1;
+  background: var(--wf-bg);
+}
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--wf-tx-lo);
+  font-size: 12.5px;
+}
+.empty p {
+  margin: 0;
+}
+
+/* ---- Status bar ---- */
+.status {
+  flex: 0 0 24px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  background: var(--wf-bg-2);
+  border-top: 1px solid var(--wf-line);
+  color: var(--wf-tx-lo);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.statusItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px;
+  color: var(--wf-tx);
+}
+.statusDim {
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  color: var(--wf-tx-lo);
+}
+.statusPath {
+  min-width: 0;
+  padding: 0 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Truncate from the LEFT: the end of a path is the part that tells folders apart. */
+  direction: rtl;
+  text-align: left;
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+}
+.statusSpacer {
+  flex: 1;
+}
+.statusBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.statusBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.statusBtn[data-on] {
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Welcome (no folder open) ---- */
+.welcome {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: auto;
+}
+.welcomeCard {
+  width: min(460px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+}
+.welcomeMark {
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 12px;
+  background: var(--wf-panel);
+  color: var(--wf-accent);
+}
+.welcomeTitle {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+.welcomeText {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--wf-tx-lo);
+}
+.welcomeList {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r-l);
+  background: var(--wf-panel);
+  overflow: hidden;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.welcomeRepo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.welcomeRepo:last-child {
+  border-bottom: 0;
+}
+.welcomeRepo:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.welcomeRepo:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.welcomeRepoName {
+  flex: 0 0 auto;
+  font-weight: 500;
+}
+.welcomeRepoPath {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: right;
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+}

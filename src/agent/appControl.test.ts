@@ -552,6 +552,21 @@ describe("appControl — UI actions", () => {
     expect(h.views).toEqual([]);
   });
 
+  it("open_view opens the IDE view, and refuses it when the preference is off", async () => {
+    const h = helpers();
+    useDisplay.getState().set({ ideView: true });
+    await executeAppControlTool("open_view", { view: "ide" }, null, h);
+    expect(h.views).toEqual(["ide"]);
+    // `changeView` no-ops on a switched-off view; the TOOL must say so rather than report
+    // a success that changed nothing.
+    useDisplay.getState().set({ ideView: false });
+    await expect(executeAppControlTool("open_view", { view: "ide" }, null, h)).rejects.toThrow(
+      /switched off/,
+    );
+    expect(h.views).toEqual(["ide"]);
+    useDisplay.getState().set({ ideView: true });
+  });
+
   it("open_file refuses '~' paths and nonexistent files", async () => {
     seed(conv({ handle: "session-7" }));
     await expect(

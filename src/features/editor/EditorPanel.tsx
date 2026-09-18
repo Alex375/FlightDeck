@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { FileTree } from "./FileTree";
 import { EditorPane } from "./EditorPane";
 import { Splitter } from "./Splitter";
@@ -14,18 +14,47 @@ import styles from "./editor.module.css";
  * re-points the live watch. Kept mounted across conversation switches (props
  * change instead of remounting) so Monaco isn't torn down and rebuilt each time.
  */
+/**
+ * A host-owned file-tree layout, replacing the editor store's global one. The IDE view
+ * passes it so its explorer keeps its own width and visibility: the global flags belong to
+ * the conversation view's side panel, where a clicked file mention deliberately COLLAPSES
+ * the tree (focus on the file) — a side effect the IDE must not inherit.
+ */
+export interface TreeLayout {
+  width: number;
+  collapsed: boolean;
+  setWidth: (w: number) => void;
+  setCollapsed: (collapsed: boolean) => void;
+}
+
 export function EditorPanel({
   convId,
   cwd,
   stacked,
+  treeLayout,
+  flush = false,
+  wrapEditor,
 }: {
+  /** The editor slice's key — a conversation's stable id, or an IDE workspace's key. */
   convId: string;
   cwd: string;
   stacked: boolean;
+  treeLayout?: TreeLayout;
+  /** Drop the conversation-separator border: the panel is the host's root, not a side region. */
+  flush?: boolean;
+  /** Lay the editor out inside something larger — the IDE view puts its dock under (or
+   *  beside) the EDITOR only, leaving the tree full-height as an IDE's explorer is. A
+   *  wrapper rather than a sibling slot, so the tree | editor split stays owned here. */
+  wrapEditor?: (editor: ReactNode) => ReactNode;
 }) {
-  const treeWidth = useEditorStore((s) => s.treeWidth);
-  const setTreeWidth = useEditorStore((s) => s.setTreeWidth);
-  const treeCollapsed = useEditorStore((s) => s.treeCollapsed);
+  const globalTreeWidth = useEditorStore((s) => s.treeWidth);
+  const setGlobalTreeWidth = useEditorStore((s) => s.setTreeWidth);
+  const globalTreeCollapsed = useEditorStore((s) => s.treeCollapsed);
+  const setGlobalTreeCollapsed = useEditorStore((s) => s.setTreeCollapsed);
+  const treeWidth = treeLayout?.width ?? globalTreeWidth;
+  const setTreeWidth = treeLayout?.setWidth ?? setGlobalTreeWidth;
+  const treeCollapsed = treeLayout?.collapsed ?? globalTreeCollapsed;
+  const setTreeCollapsed = treeLayout?.setCollapsed ?? setGlobalTreeCollapsed;
   const ensureConv = useEditorStore((s) => s.ensureConv);
   const loadIcons = useFileIconStore((s) => s.load);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -67,15 +96,35 @@ export function EditorPanel({
     if (rect) setTreeWidth(clientX - rect.left);
   };
 
+  const editor = (
+    <EditorPane
+      convId={convId}
+      treeCollapsed={treeCollapsed}
+      onToggleTree={() => setTreeCollapsed(!treeCollapsed)}
+    />
+  );
+
   return (
-    <div ref={panelRef} className={styles.panel + (stacked ? " " + styles.panelStacked : "")}>
+    <div
+      ref={panelRef}
+      className={
+        styles.panel +
+        (stacked ? " " + styles.panelStacked : "") +
+        (flush ? " " + styles.panelFlush : "")
+      }
+    >
       {treeCollapsed ? null : (
         <>
-          <FileTree convId={convId} root={cwd} width={treeWidth} />
+          <FileTree
+            convId={convId}
+            root={cwd}
+            width={treeWidth}
+            onCollapse={() => setTreeCollapsed(true)}
+          />
           <Splitter axis="x" onMove={(x) => onTreeDrag(x)} />
         </>
       )}
-      <EditorPane convId={convId} />
+      {wrapEditor ? wrapEditor(editor) : editor}
     </div>
   );
 }

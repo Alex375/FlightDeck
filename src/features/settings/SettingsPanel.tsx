@@ -563,6 +563,7 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
  *  "how does the app itself look", as opposed to the thread ({@link ThreadPrefs}). */
 function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
+  const ideView = useDisplay((s) => s.ideView);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
   const set = useDisplay((s) => s.set);
@@ -580,6 +581,23 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+        />
+        <ToggleRow
+          title="IDE view"
+          hint={
+            <>
+              A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
+              way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
+              <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
+              — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
+              buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
+              the tab and those buttons disappear; your open folders are kept for when you turn
+              it back on. <strong>On by default.</strong>
+            </>
+          }
+          checked={ideView}
+          onChange={(v) => set({ ideView: v })}
+          label="Show the IDE view"
         />
         <ToggleRow
           title="Live workflow on the Flight Deck card"

@@ -119,7 +119,18 @@ function EditRow({
  * store — never re-renders it. Right-click opens a VS Code-style context menu
  * (new / rename / delete / cut / copy / paste / reveal).
  */
-export function FileTree({ convId, root, width }: { convId: string; root: string; width: number }) {
+export function FileTree({
+  convId,
+  root,
+  width,
+  onCollapse,
+}: {
+  convId: string;
+  root: string;
+  width: number;
+  /** Hide the tree — the panel decides which layout (the global one or a host's own) flips. */
+  onCollapse: () => void;
+}) {
   const { dirs, expanded, loadingDirs, dirErrors, activeTab, editing } = useEditorStore(
     useShallow((s) => {
       const c = s.byConv[convId];
@@ -135,7 +146,6 @@ export function FileTree({ convId, root, width }: { convId: string; root: string
   );
   const toggleDir = useEditorStore((s) => s.toggleDir);
   const openFile = useEditorStore((s) => s.openFile);
-  const setTreeCollapsed = useEditorStore((s) => s.setTreeCollapsed);
   const startCreate = useEditorStore((s) => s.startCreate);
   const startRename = useEditorStore((s) => s.startRename);
   const cancelEdit = useEditorStore((s) => s.cancelEdit);
@@ -259,7 +269,7 @@ export function FileTree({ convId, root, width }: { convId: string; root: string
         <button
           type="button"
           className={styles.treeClose}
-          onClick={() => setTreeCollapsed(true)}
+          onClick={onCollapse}
           title="Hide file tree"
           aria-label="Hide file tree"
         >

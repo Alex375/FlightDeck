@@ -55,7 +55,7 @@ function keystrokesFor(spec: ChordSpec): ChordEvent[] {
 }
 
 describe("viewForShortcut", () => {
-  it("⌘1 → conversation, ⌘2 → flight deck, ⌘3 → TOSSE", () => {
+  it("⌘1 → conversation, ⌘2 → flight deck, ⌘3 → TOSSE, ⌘4 → IDE", () => {
     expect(viewForShortcut(ev({ metaKey: true, code: "Digit1" }))).toBe("conversation");
     expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit1" }))).toBe("conversation");
     expect(viewForShortcut(ev({ metaKey: true, code: "Digit2" }))).toBe("flightdeck");
@@ -64,12 +64,16 @@ describe("viewForShortcut", () => {
     // tab is conditional on being signed in, and App is what ignores an unavailable target.
     expect(viewForShortcut(ev({ metaKey: true, code: "Digit3" }))).toBe("tosse");
     expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit3" }))).toBe("tosse");
+    // The IDE sits on ⌘4 whether or not the conditional TOSSE tab is showing — it never
+    // slides down to ⌘3, which would re-bind a chord under the user's fingers.
+    expect(viewForShortcut(ev({ metaKey: true, code: "Digit4" }))).toBe("ide");
+    expect(viewForShortcut(ev({ ctrlKey: true, code: "Digit4" }))).toBe("ide");
   });
 
   it("keys off the PHYSICAL e.code, so other digits/codes don't match (AZERTY safety)", () => {
     // On AZERTY ⌘1 fires with e.key="&" but e.code="Digit1"; matching e.code is what
-    // makes the chord layout-independent. A code outside Digit1-3 never matches.
-    expect(viewForShortcut(ev({ metaKey: true, code: "Digit4" }))).toBeNull();
+    // makes the chord layout-independent. A code outside Digit1-4 never matches.
+    expect(viewForShortcut(ev({ metaKey: true, code: "Digit5" }))).toBeNull();
     expect(viewForShortcut(ev({ metaKey: true, code: "Numpad1" }))).toBeNull();
     expect(viewForShortcut(ev({ metaKey: true, code: "KeyA" }))).toBeNull();
   });

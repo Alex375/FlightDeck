@@ -4,7 +4,7 @@ import { ConductorComposer, type ComposerHandle } from "./ConductorComposer";
 import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
 import { ConversationMinimap } from "./MessageMinimap";
-import { FileMentionProvider } from "./FileMention";
+import { FileMentionProvider, type MentionOpener } from "./FileMention";
 import { ReviewBar } from "./ReviewBar";
 import { AuthWarningBar } from "./AuthWarningBar";
 import { AgentBar } from "./AgentBar";
@@ -33,6 +33,8 @@ export function ConversationPane({
   onBackgroundClick,
   inertMentions = false,
   disableMessageControls = false,
+  onOpenMention,
+  hasPanels,
 }: {
   session: string;
   cwd: string;
@@ -46,6 +48,14 @@ export function ConversationPane({
    *  modal: a destructive rewind or a background conversation-switching fork is never
    *  intended from that lightweight surface (and fork's switch is invisible there). */
   disableMessageControls?: boolean;
+  /** Open clicked file mentions in the HOST's editor instead of the conversation view's
+   *  side region. Set by the IDE view, whose editor is the workspace's, not this
+   *  conversation's. */
+  onOpenMention?: MentionOpener;
+  /** Whether the host has the conversation view's side panels (editor / terminal / Git)
+   *  for the composer's buttons to toggle. Defaults to "yes unless mentions are inert"
+   *  (the reply modal); the IDE view passes false — its panels are its own. */
+  hasPanels?: boolean;
 }) {
   // Toggling "clean output" folds/unfolds every round → big height change. Pass the
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
@@ -73,7 +83,12 @@ export function ConversationPane({
       <ConversationMinimap session={session} hostRef={paneRef} scrollRef={scrollEl} />
       {/* Provide the conversation id + live cwd so file mentions in the thread
           resolve + open in this conversation's editor. */}
-      <FileMentionProvider convId={session} cwd={cwd} inert={inertMentions}>
+      <FileMentionProvider
+        convId={session}
+        cwd={cwd}
+        inert={inertMentions}
+        onOpen={onOpenMention ?? null}
+      >
         <ConductorThread
           session={session}
           scrollRef={scrollRef}
@@ -92,7 +107,7 @@ export function ConversationPane({
           ref={composerRef}
           session={session}
           onSent={scrollToBottom}
-          hasPanels={!inertMentions}
+          hasPanels={hasPanels ?? !inertMentions}
         />
     </div>
   );

@@ -15,6 +15,11 @@
   border-left: 0;
   border-top: 1px solid var(--wf-line);
 }
+/* The panel IS the host's main area (IDE view): nothing to be separated from. */
+.panelFlush {
+  border-left: 0;
+  border-top: 0;
+}
 
 /* ---- File tree ---- */
 .tree {

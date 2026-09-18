@@ -14,13 +14,21 @@ const MonacoView = lazy(() => import("./MonacoView"));
 const PdfViewer = lazy(() => import("./PdfViewer"));
 
 /** Tab bar + the active file's content (Monaco / markdown preview / a guard). */
-export function EditorPane({ convId }: { convId: string }) {
+export function EditorPane({
+  convId,
+  treeCollapsed,
+  onToggleTree,
+}: {
+  convId: string;
+  /** Tree visibility + its toggle, owned by the panel — which knows whether the layout is
+   *  the global one or a host's own (see `TreeLayout` in EditorPanel). */
+  treeCollapsed: boolean;
+  onToggleTree: () => void;
+}) {
   const conv = useConvEditor(convId);
   const selectTab = useEditorStore((s) => s.selectTab);
   const closeTab = useEditorStore((s) => s.closeTab);
   const pinTab = useEditorStore((s) => s.pinTab);
-  const toggleTree = useEditorStore((s) => s.toggleTree);
-  const treeCollapsed = useEditorStore((s) => s.treeCollapsed);
   const iconMap = useFileIcons();
 
   if (!conv) return null;
@@ -33,7 +41,7 @@ export function EditorPane({ convId }: { convId: string }) {
           type="button"
           className={styles.treeToggle}
           data-on={!treeCollapsed ? "" : undefined}
-          onClick={toggleTree}
+          onClick={onToggleTree}
           title={treeCollapsed ? "Show file tree" : "Hide file tree"}
           aria-label="Show/hide file tree"
         >

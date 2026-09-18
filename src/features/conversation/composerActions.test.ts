@@ -29,6 +29,7 @@ const env = (over: Partial<ActionEnv> = {}): ActionEnv => ({
   currentModel: "opus",
   bypassBlocked: null,
   hostHasPanels: true,
+  ideBlocked: null,
   ...over,
 });
 
@@ -174,9 +175,19 @@ describe("availability", () => {
 
   it("still allows panel-less actions in such a host", () => {
     // Extensions and History open their own overlay, so they work anywhere.
-    for (const id of ["open-extensions", "open-history", "new-conversation"]) {
+    for (const id of ["open-extensions", "open-history", "new-conversation", "open-ide"]) {
       expect(availability(btn({ action: id }), env({ hostHasPanels: false })).ok, id).toBe(true);
     }
+  });
+
+  it("greys the IDE button out WITH the reason when the IDE cannot open this conversation", () => {
+    // A remote repository (the IDE reads this Mac's disk) or the view switched off: the
+    // click would do nothing, so the button has to say why instead of looking available.
+    const reason = "The IDE browses this Mac's files — this repository lives on a remote server.";
+    const a = availability(btn({ action: "open-ide" }), env({ ideBlocked: reason }));
+    expect(a).toEqual({ ok: false, reason });
+    // …and it blocks nothing else.
+    expect(availability(btn({ action: "open-extensions" }), env({ ideBlocked: reason })).ok).toBe(true);
   });
 });
 

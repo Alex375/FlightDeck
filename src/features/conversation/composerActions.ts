@@ -28,6 +28,7 @@ export type ComposerActionId =
   | "open-terminal"
   | "open-git"
   | "open-extensions"
+  | "open-ide"
   | "open-history"
   | "new-conversation";
 
@@ -91,6 +92,7 @@ export const COMPOSER_ACTIONS: readonly ComposerActionDescriptor[] = [
   { id: "open-terminal", group: "Open", label: "Terminal", hint: "Same as ⌘J.", arg: "none", appAction: "toggle-terminal" },
   { id: "open-git", group: "Open", label: "Git panel", hint: "Same as ⌘⇧G.", arg: "none", appAction: "toggle-git" },
   { id: "open-extensions", group: "Open", label: "Extensions", hint: "Same as ⌘E.", arg: "none", appAction: "open-extensions" },
+  { id: "open-ide", group: "Open", label: "IDE view", hint: "Continue this conversation in the IDE view. Same as ⌘⇧I.", arg: "none", appAction: "open-in-ide" },
   { id: "open-history", group: "Open", label: "History", hint: "Same as ⌘⇧O.", arg: "none", appAction: "open-history" },
   { id: "new-conversation", group: "Open", label: "New conversation", hint: "Same as ⌘N.", arg: "none", appAction: "new-conversation" },
 ] as const;
@@ -170,6 +172,9 @@ export interface ActionEnv {
   currentModel: string;
   /** Why bypass is refused right now, if it is (see permissions store). */
   bypassBlocked: string | null;
+  /** Why "Open in the IDE view" is refused for this conversation, if it is: a remote
+   *  repository (the IDE reads this Mac's disk), or the view switched off in Settings. */
+  ideBlocked: string | null;
 }
 
 export interface Availability {
@@ -243,6 +248,8 @@ export function availability(button: CustomButton, env: ActionEnv): Availability
 
   if (PANEL_ACTIONS.has(desc.id) && !env.hostHasPanels)
     return { ok: false, reason: "This view has no side panel — open the conversation in full." };
+
+  if (desc.id === "open-ide" && env.ideBlocked) return { ok: false, reason: env.ideBlocked };
 
   return OK;
 }
