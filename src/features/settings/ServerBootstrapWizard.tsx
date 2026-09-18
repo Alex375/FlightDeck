@@ -29,6 +29,7 @@ import { ToggleRow } from "./SettingsKit";
 import {
   claudeSignInStep,
   isHostKeyMismatch,
+  isServerBusyError,
   isSudoPasswordError,
   needsSudoPassword,
   restartPendingCount,
@@ -59,6 +60,15 @@ function initialSteps(): StepState[] {
  *  generated binding's own `catch`, which re-throws a real `Error` verbatim. */
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** `errorMsg`'s discreet sibling for a `server_busy_error` collision (review finding:
+ *  `isServerBusyError` was defined and tested but never actually called anywhere) —
+ *  it isn't a failure of THIS attempt, just another operation already running against
+ *  the same server, so it reads as a transient "wait and retry" notice rather than a
+ *  hard red error. */
+function errorBoxClass(message: string | null): string {
+  return isServerBusyError(message) ? sharedStyles.hintWarn : sharedStyles.errorMsg;
 }
 
 function StepChecklist({ steps }: { steps: StepState[] }) {
@@ -343,6 +353,15 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   const claudeStep = claudeSignInStep(steps);
   const pipelineSettled = started && !busy && !sudoBusy && needsInput === null;
 
+  // Mirrors `paused`/`sessionId` for the unmount cleanup below, whose closure (an
+  // empty-deps `useEffect`'s returned cleanup) only ever sees the FIRST render's
+  // values otherwise — this ref is what lets that cleanup act on the LATEST pause
+  // state instead of "never paused, no session yet".
+  const pausedSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    pausedSessionIdRef.current = paused ? sessionId : null;
+  }, [paused, sessionId]);
+
   // Guards `SettingsPanel`'s close paths (✕, Escape, the scrim) against silently
   // discarding this exact pause — see the store field's own doc. `paused` is the
   // ONLY case a fresh Settings reopen can't recover from (no session-listing IPC to
@@ -355,7 +374,31 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   // Unconditional on unmount, regardless of `paused`'s last value — leaving this view
   // (Settings actually closing, or the parent tearing the wizard down after a Cancel/
   // Done) always means there is nothing left here for the guard to protect.
-  useEffect(() => () => useSettingsUi.getState().setBootstrapGuard(null), []);
+  //
+  // Also releases the paused run's own backend `ServerLocks` claim (review finding):
+  // `SettingsPanel`'s ✕/Escape/scrim close path (its "Close anyway" confirm dialog)
+  // unmounts this component WITHOUT ever going through `cancelPaused`'s own explicit
+  // `bootstrapCancel` call — before this fix that left the per-server lock
+  // (`orchestrator.rs`'s `ServerLocks`) claimed for the rest of the app's life, since
+  // only `bootstrap_resume`'s own completion or `bootstrap_cancel` ever releases a
+  // paused run's claim. Every later `bootstrap_server`/`bootstrap_resume`/
+  // `machine_repair` against that same host then got `server_busy_error` forever, even
+  // though nothing was actually running. `cancelPaused` (this wizard's own Cancel
+  // button) already resets `sessionId`/`needsInput` synchronously before its own
+  // `bootstrapCancel` call, so by the time THIS cleanup runs afterward,
+  // `pausedSessionIdRef.current` is already `null` — no double-cancel.
+  useEffect(
+    () => () => {
+      useSettingsUi.getState().setBootstrapGuard(null);
+      const id = pausedSessionIdRef.current;
+      if (id) {
+        void commands.bootstrapCancel(id).catch((e) => {
+          console.error(`bootstrapCancel(${id}) on unmount failed:`, errorMessage(e));
+        });
+      }
+    },
+    [],
+  );
 
   if (!started) {
     return (
@@ -419,7 +462,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
           onChange={setKeepAwake}
         />
         {fieldError && <div className={sharedStyles.errorMsg}>{fieldError}</div>}
-        {topError && <div className={sharedStyles.errorMsg}>{topError}</div>}
+        {topError && <div className={errorBoxClass(topError)}>{topError}</div>}
         <div className={sharedStyles.btnRow}>
           <button
             className={`${sharedStyles.btn} ${sharedStyles.primary}`}
@@ -557,7 +600,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
       {failedStep && !installKeyMismatch && (
         <div className={sharedStyles.errorMsg}>{failedStep.detail ?? "This step failed."}</div>
       )}
-      {topError && <div className={sharedStyles.errorMsg}>{topError}</div>}
+      {topError && <div className={errorBoxClass(topError)}>{topError}</div>}
 
       <div className={sharedStyles.btnRow}>
         {failedStep && (
@@ -575,7 +618,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   );
 }
 
-type LegacyStage = "command" | "confirm" | "manual";
+type LegacyStage = "command" | "confirm" | "manual" | "done";
 
 /** The OLD ticket/paste flow, moved here verbatim from ControlSection.tsx (its own
  *  `buildServerCommand`/`parseTicket` stay put — their regression tests import them
@@ -593,6 +636,10 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set only when a pairing converged on an ALREADY-paired server (see `addMachine`'s
+  // `matchedExisting`) — the label to say "Updated the existing server ..." about,
+  // instead of the panel just closing as if a second server had silently appeared.
+  const [updatedExistingLabel, setUpdatedExistingLabel] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -652,7 +699,15 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
     setBusy(false);
     if (res.ok) {
       setGenKey(null);
-      onClose();
+      if (res.matchedExisting) {
+        // This host (or one of its other recorded addresses) was already paired —
+        // the row was UPDATED, not added. Say so rather than closing silently, which
+        // would read as a second server having appeared.
+        setUpdatedExistingLabel(res.machine.label);
+        setStage("done");
+      } else {
+        onClose();
+      }
     } else {
       setError(res.error);
     }
@@ -706,7 +761,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             aria-label="Pairing ticket"
             autoComplete="off"
           />
-          {error && <div className={sharedStyles.errorMsg}>{error}</div>}
+          {error && <div className={errorBoxClass(error)}>{error}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
@@ -805,7 +860,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             />
           </div>
           {fieldError && <div className={sharedStyles.errorMsg}>{fieldError}</div>}
-          {error && <div className={sharedStyles.errorMsg}>{error}</div>}
+          {error && <div className={errorBoxClass(error)}>{error}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
@@ -829,6 +884,20 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             <span className={sharedStyles.spacer} />
             <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onClose}>
               Cancel
+            </button>
+          </div>
+        </>
+      )}
+
+      {stage === "done" && (
+        <>
+          <div className={sharedStyles.remoteStep}>
+            Updated the existing server &ldquo;{updatedExistingLabel}&rdquo; — this host was already
+            paired, so nothing new was added.
+          </div>
+          <div className={sharedStyles.btnRow}>
+            <button className={`${sharedStyles.btn} ${sharedStyles.primary}`} onClick={onClose}>
+              Done
             </button>
           </div>
         </>

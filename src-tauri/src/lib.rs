@@ -83,6 +83,7 @@ use bootstrap::connect::{bootstrap_forget_host_key, bootstrap_install_key, boots
 use bootstrap::install::{bootstrap_escalate_persistence, bootstrap_install_service, bootstrap_upload_daemon};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
+    ServerLocks,
 };
 use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
@@ -671,6 +672,10 @@ pub fn run() {
         // `bootstrap_resume`/`bootstrap_cancel`). An Arc for the same reason as
         // `LoginSessions` just above.
         .manage(std::sync::Arc::new(BootstrapSessions::new()))
+        // B_lifecycle-#7: per-server serialization for `bootstrap_server`/
+        // `bootstrap_resume`/`machine_repair` — an Arc so a `ServerLockGuard` can
+        // outlive the spawning command's own lifetime across a paused pipeline run.
+        .manage(std::sync::Arc::new(ServerLocks::new()))
         // C10: last known phone-provisioning outcome per paired daemon, for
         // Settings' per-server status row. An Arc so the background hooks
         // (`add_machine`, `set_remote`) can record into it after their spawning

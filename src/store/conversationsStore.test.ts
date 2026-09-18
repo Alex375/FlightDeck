@@ -20,6 +20,8 @@ vi.mock("../ipc/client", () => {
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),
       deleteConversation: vi.fn(() => ok()),
+      deleteRepo: vi.fn(() => ok()),
+      deleteMachine: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
@@ -52,6 +54,7 @@ import {
   refreshLinkedTaskMeta,
   useConversationsStore,
   type Conversation,
+  type Machine,
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
@@ -712,6 +715,82 @@ describe("conversationsStore — friction-free delete + undo", () => {
     applyItem.mockRestore();
     applyContextFill.mockRestore();
     markSeen.mockRestore();
+  });
+});
+
+// B_lifecycle-#0: removeMachine used to drop a server's repos/conversations from the
+// store WITHOUT stopping their live `claude` sessions — unlike removeRepo/removeConversation
+// in this same file. These lock in the fix: every live handle on the removed server is
+// stopped, repos/conversations on OTHER servers (and local repos) are left alone, and the
+// active selection is re-derived the same way removeRepo already does.
+describe("conversationsStore — removeMachine stops every live session on the server", () => {
+  const store = () => useConversationsStore.getState();
+
+  function machine(id: string, label: string): Machine {
+    return { id, label, host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] };
+  }
+
+  function seedTwoServers() {
+    useConversationsStore.setState({
+      machines: [machine("m1", "box one"), machine("m2", "box two")],
+      repos: [
+        { id: "r1", path: "/remote/r1", addedAt: 1, machineId: "m1" },
+        { id: "r2", path: "/remote/r2", addedAt: 1, machineId: "m2" }, // different server
+        { id: "r3", path: "/local", addedAt: 1 }, // local repo, no machineId
+      ],
+      conversations: [
+        baseConv({ id: "c1", repoId: "r1", handle: "session-a" }),
+        baseConv({ id: "c2", repoId: "r1", handle: null }), // no live process to stop
+        baseConv({ id: "c3", repoId: "r2", handle: "session-b" }), // must survive
+        baseConv({ id: "c4", repoId: "r3", handle: "session-c" }), // must survive
+      ],
+      activeId: "c1",
+    });
+  }
+
+  it("stops every live handle anchored to the removed server and nothing else", () => {
+    seedTwoServers();
+    store().removeMachine("m1");
+
+    // Only the removed server's live session was stopped — not the surviving servers'.
+    expect(commands.stopSession).toHaveBeenCalledTimes(1);
+    expect(commands.stopSession).toHaveBeenCalledWith("session-a");
+  });
+
+  it("drops the machine + its repos/conversations, leaving other servers and local repos untouched", () => {
+    seedTwoServers();
+    store().removeMachine("m1");
+
+    expect(store().machines.map((m) => m.id)).toEqual(["m2"]);
+    expect(store().repos.map((r) => r.id).sort()).toEqual(["r2", "r3"]);
+    expect(store().conversations.map((c) => c.id).sort()).toEqual(["c3", "c4"]);
+    expect(commands.deleteMachine).toHaveBeenCalledWith("m1");
+  });
+
+  it("re-derives the active selection when the active conversation was on the removed server", () => {
+    seedTwoServers();
+    store().removeMachine("m1");
+    // c1 (the old active id) is gone — the store must not keep pointing at a dropped row.
+    expect(store().activeId).not.toBe("c1");
+    expect(["c3", "c4", null]).toContain(store().activeId);
+  });
+
+  it("leaves the active selection alone when it wasn't on the removed server", () => {
+    seedTwoServers();
+    useConversationsStore.setState({ activeId: "c3" });
+    store().removeMachine("m1");
+    expect(store().activeId).toBe("c3");
+  });
+
+  it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", () => {
+    seedTwoServers();
+    useConversationsStore.setState({
+      machines: [...store().machines, machine("m3", "empty box")],
+    });
+    store().removeMachine("m3");
+    expect(commands.stopSession).not.toHaveBeenCalled();
+    expect(store().conversations.map((c) => c.id).sort()).toEqual(["c1", "c2", "c3", "c4"]);
+    expect(commands.deleteMachine).toHaveBeenCalledWith("m3");
   });
 });
 

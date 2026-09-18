@@ -32,9 +32,12 @@ const mocks = vi.hoisted(() => {
     startClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
+    // Defaults to "nothing running on this server" — the Remove-confirm tests below
+    // override this per-case to drive the gate.
+    useMachineActiveConversationIds: vi.fn(() => [] as string[]),
   };
 });
-const { machineDiagnose, machineRepair } = mocks;
+const { machineDiagnose, machineRepair, useMachineActiveConversationIds } = mocks;
 
 vi.mock("../../ipc/client", () => ({
   commands: {
@@ -50,6 +53,12 @@ vi.mock("../../ipc/client", () => ({
   },
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
+// Real `useMachineActiveConversationIds` pulls from the live conversations/message
+// stores (repos, sessions, background-task counts) — irrelevant plumbing for this
+// component's own tests, which only care how the count it returns gates Remove.
+vi.mock("../../agent/fleet", () => ({
+  useMachineActiveConversationIds: mocks.useMachineActiveConversationIds,
+}));
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -57,6 +66,7 @@ import { DiagnosisSummary, ServerStatusPanel } from "./ServerStatusPanel";
 import type { Machine } from "../../store/conversationsStore";
 import type { RepairAction, ServerDiagnosis } from "../../ipc/client";
 import type { ProvisionStatusLabel } from "./provisionStatus";
+import sharedStyles from "./SettingsPanel.module.css";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -101,6 +111,8 @@ beforeEach(() => {
   root = createRoot(container);
   machineDiagnose.mockReset();
   machineRepair.mockReset();
+  useMachineActiveConversationIds.mockReset();
+  useMachineActiveConversationIds.mockReturnValue([]);
 });
 
 afterEach(() => {
@@ -196,7 +208,7 @@ function baseMachine(over: Partial<Machine> = {}): Machine {
 
 const NEUTRAL_LABEL: ProvisionStatusLabel = { text: "not checked yet", canRetry: false, isProblem: false };
 
-function mountPanel(machine: Machine = baseMachine()) {
+function mountPanel(machine: Machine = baseMachine(), onRemove: () => void = () => {}) {
   act(() => {
     root.render(
       createElement(ServerStatusPanel, {
@@ -206,7 +218,7 @@ function mountPanel(machine: Machine = baseMachine()) {
         isRetrying: false,
         onRetryProvisioning: () => {},
         onNewConversation: () => {},
-        onRemove: () => {},
+        onRemove,
       }),
     );
   });
@@ -216,6 +228,15 @@ function clickButtonWithText(text: string) {
   const btn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === text);
   if (!btn) throw new Error(`no button with text "${text}" — saw: ${Array.from(container.querySelectorAll("button")).map((b) => b.textContent)}`);
   act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+/** The innermost `<div>` containing `text` — every ancestor of the real element also
+ *  matches a plain `textContent.includes` check (it's a substring of theirs too), and
+ *  `querySelectorAll` returns them in document (pre-)order, ancestors before
+ *  descendants, so the LAST match is the actual, most specific element. */
+function mostSpecificDivWithText(text: string): HTMLElement | undefined {
+  const matches = Array.from(container.querySelectorAll("div")).filter((d) => d.textContent?.includes(text));
+  return matches[matches.length - 1];
 }
 
 describe("ServerStatusPanel — fetching machine_diagnose", () => {
@@ -287,5 +308,115 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
     expect(container.querySelector('input[placeholder="Sudo password"]')).toBeNull();
     // Never submitted with the typed password.
     expect(machineRepair).toHaveBeenCalledTimes(1);
+  });
+
+  // Review finding: `isServerBusyError` was defined and unit-tested in
+  // `serverBootstrapModel.ts` but never actually called from either UI component, so a
+  // `ServerLocks` collision (e.g. the "+ Add a server" wizard already running against
+  // this same host) only ever rendered as a raw, indistinguishable red error here too.
+  it("gives a server_busy_error repair collision a distinct, non-error treatment", async () => {
+    machineDiagnose.mockResolvedValueOnce({
+      status: "ok",
+      data: baseDiagnosis({ sleep_masked: false }),
+    });
+    mountPanel();
+    await settle();
+
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error: 'Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
+    });
+    const maskSleepBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Mask sleep / suspend"))!;
+    act(() => maskSleepBtn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await settle();
+
+    const busyBox = mostSpecificDivWithText("is already running on this server");
+    expect(busyBox).toBeTruthy();
+    expect(busyBox?.className).toBe(sharedStyles.hintWarn);
+    expect(busyBox?.className).not.toBe(sharedStyles.errorMsg);
+  });
+});
+
+// B_lifecycle-#0: the Remove button used to have no isActivelyRunning gate at all,
+// unlike ConductorSidebar/StreamCard's conversation delete. These lock in the confirm
+// gate: friction-free when the server is idle, a ConfirmDialog naming how many live
+// conversations will be stopped otherwise, and onRemove only fires on the explicit
+// "Remove anyway" (never on the bare click, never on Cancel).
+//
+// `ConfirmDialog` portals to `document.body` (not into `container`), so these query/
+// click the whole document rather than the mount `container`, mirroring
+// DeleteConversationDialog.test.ts's own discipline for the same reason.
+function confirmDialog(): HTMLElement | null {
+  return document.querySelector('[role="alertdialog"]');
+}
+function clickDocumentButtonWithText(text: string) {
+  const btn = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === text);
+  if (!btn) throw new Error(`no button with text "${text}" anywhere in the document`);
+  act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+describe("ServerStatusPanel — Remove confirm gate", () => {
+  it("nothing running on this server: Remove calls onRemove immediately, no dialog", async () => {
+    useMachineActiveConversationIds.mockReturnValue([]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(confirmDialog()).toBeNull();
+  });
+
+  it("one live conversation on this server: Remove asks first and does not call onRemove yet", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine({ label: "prod box" }), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(onRemove).not.toHaveBeenCalled();
+    const dlg = confirmDialog();
+    expect(dlg).not.toBeNull();
+    expect(dlg!.textContent).toContain('Remove "prod box"?');
+    expect(dlg!.textContent).toContain("1 conversation on this server is actively running");
+  });
+
+  it("names how many conversations will be stopped when more than one is running", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1", "c2", "c3"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    mountPanel();
+    await settle();
+
+    clickButtonWithText("Remove");
+    expect(confirmDialog()!.textContent).toContain(
+      "3 conversations on this server are actively running",
+    );
+  });
+
+  it("Cancel closes the confirm without ever calling onRemove", async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    clickDocumentButtonWithText("Cancel");
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(confirmDialog()).toBeNull();
+  });
+
+  it('"Remove anyway" confirms — onRemove fires exactly once', async () => {
+    useMachineActiveConversationIds.mockReturnValue(["c1"]);
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    const onRemove = vi.fn();
+    mountPanel(baseMachine(), onRemove);
+    await settle();
+
+    clickButtonWithText("Remove");
+    clickDocumentButtonWithText("Remove anyway");
+    expect(onRemove).toHaveBeenCalledTimes(1);
   });
 });

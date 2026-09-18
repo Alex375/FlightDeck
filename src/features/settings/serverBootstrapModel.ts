@@ -120,6 +120,17 @@ export function isSudoPasswordError(message: string | null): boolean {
   return !!message && message.includes("needs a sudo password");
 }
 
+/** Whether a `bootstrap_server`/`bootstrap_resume`/`machine_repair` error string is
+ *  the backend's per-server lock rejection (`server_busy_error`, `orchestrator.rs`) —
+ *  another one of the three is already running against this same server. Wording
+ *  contract with the Rust side's `server_busy_error`: keep the two in sync (same
+ *  discipline as `isSudoPasswordError` above, or TOSSE's `SESSION_GONE_MARKERS`) — a
+ *  reworded message here silently stops this from being told apart from any other
+ *  failure. */
+export function isServerBusyError(message: string | null): boolean {
+  return !!message && message.includes("is already running on this server");
+}
+
 /** https + one of Claude's own sign-in domains (exact host or a subdomain) — the
  *  wizard's gate before ever calling `openUrl` on a URL the remote server handed back
  *  over SSH via [`ServerLoginPromptEvent`]. Anything else (a plain host mismatch, an

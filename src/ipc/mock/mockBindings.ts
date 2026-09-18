@@ -2073,14 +2073,24 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
-  ): Promise<Result<MachineRecord, string>> {
+  ): Promise<Result<{ machine: MachineRecord; matched_existing: boolean }, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
-    const machine = findOrCreateMockMachine(label || host, host, port, user);
+    // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on
+    // (port, user) plus host OR any already-recorded address, not just an exact
+    // (host, port, user) triple — a re-pair can legitimately resolve a different
+    // working address for the same physical server.
+    const matched = mockMachines.find(
+      (m) =>
+        m.port === port &&
+        m.user === user &&
+        (m.host === host || (m.addresses ?? []).some((a) => a.value === host)),
+    );
+    const machine = matched ?? findOrCreateMockMachine(label || host, host, port, user);
     machine.label = label || host;
     machine.identity_file = identityFile ?? machine.identity_file;
     if (addresses && addresses.length > 0) machine.addresses = addresses;
     mockDiagnoses.set(machine.id, readyDiagnosis());
-    return ok(machine);
+    return ok({ machine, matched_existing: matched != null });
   },
 
   async deleteMachine(id: string): Promise<Result<null, string>> {

@@ -80,6 +80,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { useSettingsUi } from "../../store/settingsUi";
+import sharedStyles from "./SettingsPanel.module.css";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -142,6 +143,15 @@ function passwordInput(): HTMLInputElement | null {
   return container.querySelector('input[type="password"]');
 }
 
+/** The innermost `<div>` containing `text` — every ancestor of the real element also
+ *  matches a plain `textContent.includes` check (it's a substring of theirs too), and
+ *  `querySelectorAll` returns them in document (pre-)order, ancestors before
+ *  descendants, so the LAST match is the actual, most specific element. */
+function mostSpecificDivWithText(text: string): HTMLElement | undefined {
+  const matches = Array.from(container.querySelectorAll("div")).filter((d) => d.textContent?.includes(text));
+  return matches[matches.length - 1];
+}
+
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
@@ -151,6 +161,13 @@ beforeEach(() => {
   bootstrapServer.mockReset();
   bootstrapResume.mockReset();
   bootstrapCancel.mockReset();
+  // Default to a plain success — a real IPC binding always resolves to SOMETHING
+  // (`Promise<Result<null, string>>`), and the new unmount-while-paused cleanup below
+  // now calls this unconditionally whenever a test happens to end paused, so a bare
+  // unconfigured mock (which returns `undefined`, not a `Promise`) would crash on the
+  // `.catch` call rather than exercising the real "did it get called" assertions.
+  // Individual tests still override this per-case where the resolution itself matters.
+  bootstrapCancel.mockResolvedValue({ status: "ok", data: null });
   bootstrapForgetHostKey.mockReset();
   machineRepair.mockReset();
   machineDiagnose.mockReset();
@@ -236,6 +253,40 @@ describe("ServerBootstrapWizard — form", () => {
     expect(installBtn.disabled).toBe(true);
     expect(container.textContent).toMatch(/Address cannot start with/);
     expect(bootstrapServer).not.toHaveBeenCalled();
+  });
+
+  // Review finding: `isServerBusyError` was defined and unit-tested in
+  // `serverBootstrapModel.ts` but never actually called from either UI component, so
+  // a `ServerLocks` collision (another bootstrap/repair already running against the
+  // same server) only ever rendered as a raw, indistinguishable red error.
+  it("gives a server_busy_error collision a distinct, non-error treatment", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "error",
+      error: 'Another operation ("Repair: restart") is already running on this server. Wait for it to finish, then try again.',
+    });
+    mount();
+    fill("Address", "busy.example.com");
+    fill("User", "root");
+    clickButtonWithText("Install");
+    await settle();
+
+    const busyBox = mostSpecificDivWithText("is already running on this server");
+    expect(busyBox).toBeTruthy();
+    expect(busyBox?.className).toBe(sharedStyles.hintWarn);
+    expect(busyBox?.className).not.toBe(sharedStyles.errorMsg);
+  });
+
+  it("still gives an ordinary bootstrap failure the normal error treatment", async () => {
+    bootstrapServer.mockResolvedValue({ status: "error", error: "Could not connect: connection refused" });
+    mount();
+    fill("Address", "unreachable.example.com");
+    fill("User", "root");
+    clickButtonWithText("Install");
+    await settle();
+
+    const errorBox = mostSpecificDivWithText("connection refused");
+    expect(errorBox).toBeTruthy();
+    expect(errorBox?.className).toBe(sharedStyles.errorMsg);
   });
 });
 
@@ -635,7 +686,7 @@ describe("ServerBootstrapWizard — Settings-close guard while paused", () => {
     expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
   });
 
-  it("clears the guard on unmount even if it was still paused", async () => {
+  it("clears the guard on unmount even if it was still paused, and releases the paused session's server lock", async () => {
     bootstrapServer.mockResolvedValue({
       status: "ok",
       data: {
@@ -654,8 +705,48 @@ describe("ServerBootstrapWizard — Settings-close guard while paused", () => {
     await settle();
     expect(useSettingsUi.getState().bootstrapGuard).not.toBeNull();
 
+    // Unmounting here simulates `SettingsPanel`'s force-close path (the "Close
+    // anyway" confirm dialog's `finishClose` → `onClose`), NOT this wizard's own
+    // Cancel button — `cancelPaused` (tested above) already covers that path and
+    // already called `bootstrapCancel` itself. Before the fix, this exact path left
+    // the backend's per-server `ServerLocks` claim held forever (only
+    // `bootstrap_resume`'s own completion or an explicit `bootstrap_cancel` ever
+    // releases a paused run's claim), so every later `bootstrap_server`/
+    // `bootstrap_resume`/`machine_repair` against the same host got `server_busy_error`
+    // even though nothing was actually running.
     act(() => root.unmount());
     expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+    expect(bootstrapCancel).toHaveBeenCalledWith("sess-guard-unmount");
+  });
+
+  it("does not double-cancel on unmount after the wizard's own Cancel button already did", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-guard-cancel-then-unmount",
+        host: "guard-cancel-then-unmount.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "guard-cancel-then-unmount.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    clickButtonWithText("Cancel");
+    await settle();
+    expect(bootstrapCancel).toHaveBeenCalledTimes(1);
+    expect(bootstrapCancel).toHaveBeenCalledWith("sess-guard-cancel-then-unmount");
+
+    // The form is back to its empty, un-paused state — a later unmount (Settings
+    // actually closing) must not fire a second, stale `bootstrapCancel` for a session
+    // that's already been explicitly cancelled.
+    act(() => root.unmount());
+    expect(bootstrapCancel).toHaveBeenCalledTimes(1);
   });
 });
 

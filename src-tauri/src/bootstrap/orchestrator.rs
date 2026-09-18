@@ -97,8 +97,8 @@ use tokio::sync::Mutex;
 use crate::bootstrap::askpass::{BootstrapError, SecretString};
 use crate::bootstrap::{connect, install, server_setup};
 use crate::ipc::commands::{
-    persist_paired_machine, probe_candidates, resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin,
-    shq, RemoteProbeResult,
+    invalidate_daemon_version_cache, persist_paired_machine, probe_candidates, resolve_daemon_bin_expr,
+    run_ssh_on_machine, run_ssh_on_machine_stdin, shq, RemoteProbeResult,
 };
 use crate::store::{MachineRecord, Store};
 
@@ -301,6 +301,23 @@ struct StoredSession {
     /// this module's `stored_session_debug_never_contains_the_sudo_password` test):
     /// [`SecretString`]'s own `Debug` impl redacts it.
     sudo_password: Option<SecretString>,
+    /// The [`ServerLocks`] key this run claimed when it started (B_lifecycle-#7 review
+    /// finding) — carried here so a PAUSED run's claim can outlive the async call that
+    /// paused it: `bootstrap_resume`'s own eventual completion, or `bootstrap_cancel`,
+    /// is what releases it, neither of which has any other way to recover the exact
+    /// key an earlier call claimed (re-deriving it from `request` could drift if the
+    /// machine's preferred host rotates while this session sits paused — see
+    /// B_lifecycle-#8).
+    lock_key: String,
+    /// The already-paired [`MachineRecord`]'s id, when the ORIGINAL `bootstrap_server`
+    /// call converged on one at the very start (B_lifecycle-#8 review finding) — `None`
+    /// for a genuinely first-contact host that paused before `StepId::AddMachine` had
+    /// ever run once. `bootstrap_resume` looks the machine up BY THIS ID
+    /// (`resolve_resume_machine`), never by re-deriving `(host, port, user)` from
+    /// `request`, which A6's live address-rotation (`Store::set_machine_preferred_host`)
+    /// can rewrite out from under a session sitting paused — losing this id-based
+    /// lookup would make a resume proceed as if pairing a brand-new host.
+    machine_id: Option<String>,
 }
 
 /// Tauri-managed registry of paused/in-flight bootstrap runs, keyed by `session_id`.
@@ -323,34 +340,58 @@ impl BootstrapSessions {
         Self::default()
     }
 
-    /// Register (or re-register — a resumed run calls this again) `session_id`.
-    async fn start(&self, session_id: String, request: StoredBootstrapRequest, sudo_password: Option<SecretString>) {
-        self.inner.lock().await.insert(session_id, StoredSession { request, sudo_password });
+    /// Register (or re-register — a resumed run calls this again) `session_id`,
+    /// carrying the [`ServerLocks`] key it claimed (see [`StoredSession::lock_key`])
+    /// and the machine id it already converged on, if any (see
+    /// [`StoredSession::machine_id`]).
+    async fn start(
+        &self,
+        session_id: String,
+        request: StoredBootstrapRequest,
+        sudo_password: Option<SecretString>,
+        lock_key: String,
+        machine_id: Option<String>,
+    ) {
+        self.inner
+            .lock()
+            .await
+            .insert(session_id, StoredSession { request, sudo_password, lock_key, machine_id });
     }
 
     /// Look up a paused session, merging in a freshly supplied `sudo_password` (or, when
     /// `None`, keeping whatever was captured before — a caller retrying without
     /// re-typing a password that was already accepted should not have to). `Err` when
     /// nothing is paused under this id (already finished, cancelled, or never existed).
+    /// Also returns the session's own `lock_key` — `bootstrap_resume` REUSES this
+    /// (never re-derives, never re-claims) since it is already held by this very
+    /// session — and `machine_id`, for `resolve_resume_machine` (B_lifecycle-#8).
     async fn resume(
         &self,
         session_id: &str,
         sudo_password: Option<SecretString>,
-    ) -> Result<(StoredBootstrapRequest, Option<SecretString>), String> {
+    ) -> Result<(StoredBootstrapRequest, Option<SecretString>, String, Option<String>), String> {
         let mut guard = self.inner.lock().await;
         let session =
             guard.get_mut(session_id).ok_or_else(|| "no bootstrap run is paused under this session id".to_string())?;
         if sudo_password.is_some() {
             session.sudo_password = sudo_password;
         }
-        Ok((session.request.clone(), session.sudo_password.clone()))
+        Ok((
+            session.request.clone(),
+            session.sudo_password.clone(),
+            session.lock_key.clone(),
+            session.machine_id.clone(),
+        ))
     }
 
     /// Abandon a paused session — removes it (and, with it, the sudo password it was
     /// holding: see this module's own `cancel_drops_the_sudo_password` test) entirely.
-    /// A no-op if the session already finished or never existed.
-    async fn cancel(&self, session_id: &str) {
-        self.inner.lock().await.remove(session_id);
+    /// A no-op if the session already finished or never existed. Returns the removed
+    /// session's `lock_key`, when there was one to remove, so the caller
+    /// (`bootstrap_cancel`) can release the [`ServerLocks`] claim a paused run left
+    /// behind (see [`StoredSession::lock_key`]) — nothing else can recover that key.
+    async fn cancel(&self, session_id: &str) -> Option<String> {
+        self.inner.lock().await.remove(session_id).map(|s| s.lock_key)
     }
 
     /// Remove a session that reached a TERMINAL outcome (`Ok` or `Failed` — never
@@ -360,19 +401,169 @@ impl BootstrapSessions {
     }
 }
 
-/// Registers `session_id`, runs `steps` to completion (or a blocking pause), and clears
-/// the registration again UNLESS the run paused at a blocking step — the one place that
-/// ties [`run_steps`]'s generic state machine to [`BootstrapSessions`]'s own
-/// bookkeeping, exercised directly by this module's fake-step tests.
+// ============================================================================
+// Per-server lock (B_lifecycle-#7 review finding)
+// ============================================================================
+
+/// Per-server serialization for `bootstrap_server`/`bootstrap_resume`/`machine_repair`.
+/// Before this, nothing stopped two of these running concurrently against the SAME
+/// host — each one runs several real ssh round trips (key install, probe, daemon
+/// upload, unit install, persistence, restarts), so two interleaved runs could race
+/// each other's writes; the loser typically failed opaquely at its very last step
+/// (`AddMachine`'s pending-key rename already claimed by the winner) with no
+/// explanation that another run had raced it.
+///
+/// Keyed by [`server_lock_key`] — the machine id when one is already known (repair
+/// always has one; a bootstrap attempt has one when it converges on an existing
+/// pairing), else the raw `(host, port, user)` triple. A claim is TRY-ONLY (see
+/// [`ServerLocks::claim`]): it never blocks or waits, because a silent wait would
+/// leave a caller's spinner running with no way to tell the user anything is
+/// contended — see [`server_busy_error`].
+pub struct ServerLocks {
+    inner: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl Default for ServerLocks {
+    fn default() -> Self {
+        Self { inner: std::sync::Mutex::new(HashMap::new()) }
+    }
+}
+
+impl ServerLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim `key` for `op` (a short label of what is about to run — `"Add a server"`
+    /// or a [`repair_action_label`]). `Err` — the label of whatever ALREADY holds this
+    /// key — when it's already claimed; never blocks. Prefer [`ServerLockGuard::acquire`]
+    /// over calling this directly: the guard is what actually guarantees the release.
+    fn claim(&self, key: &str, op: &str) -> Result<(), String> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(running) = guard.get(key) {
+            return Err(running.clone());
+        }
+        guard.insert(key.to_string(), op.to_string());
+        Ok(())
+    }
+
+    fn release(&self, key: &str) {
+        self.inner.lock().unwrap().remove(key);
+    }
+}
+
+/// The [`ServerLocks`] key for one bootstrap/repair attempt against `(host, port,
+/// user)`: the machine id when one is ALREADY known, else the triple folded into one
+/// string. Literal string matching, same discipline as [`crate::store::Store::
+/// machine_by_address`] (no DNS/case normalization) — a host typed two different but
+/// equivalent ways is treated as a different key, same as everywhere else addresses
+/// are compared in this crate.
+///
+/// `pub(crate)`: also the key [`crate::ipc::commands::add_machine`] claims with
+/// (B_lifecycle-#addmachinelock review finding — the legacy/manual pairing command
+/// used to never claim this lock at all, so it could interleave ssh writes with a
+/// `bootstrap_server`/`bootstrap_resume`/`machine_repair` run already in flight
+/// against the exact same host).
+pub(crate) fn server_lock_key(existing_machine_id: Option<&str>, host: &str, port: u16, user: &str) -> String {
+    match existing_machine_id {
+        Some(id) => id.to_string(),
+        None => format!("{host}:{port}:{user}"),
+    }
+}
+
+/// Wording contract with the front's `isServerBusyError` (`serverBootstrapModel.ts`) —
+/// keep the two in sync, same discipline as this crate's other Rust/TS wording
+/// contracts (e.g. TOSSE's `SESSION_GONE_MARKERS`): reformulating this silently breaks
+/// the front's "this is a ServerBusy, not just any failure" detection.
+///
+/// `pub(crate)`: also used by [`crate::ipc::commands::add_machine`] — see
+/// [`server_lock_key`]'s own doc.
+pub(crate) fn server_busy_error(running_op: String) -> String {
+    format!(
+        "Another operation (\"{running_op}\") is already running on this server. \
+         Wait for it to finish, then try again."
+    )
+}
+
+/// One [`ServerLocks`] claim, RELEASED ON DROP — covers every exit path a hand-
+/// maintained "call `.release()` before each `return`" discipline would miss (an
+/// early `?`, or the async task holding this being dropped/cancelled by its own
+/// caller), EXCEPT the one case that must outlive this async call entirely: a
+/// bootstrap run that PAUSES ([`StepOutcome::NeedsInputBlocking`]) keeps its claim
+/// alive across the whole pause, via [`Self::into_forgotten_key`] — the raw key is
+/// then handed to [`BootstrapSessions`] ([`StoredSession::lock_key`]) to release
+/// later, from `bootstrap_resume`'s own eventual completion or `bootstrap_cancel`.
+///
+/// `pub(crate)`: [`crate::ipc::commands::add_machine`] also acquires one directly —
+/// see [`server_lock_key`]'s own doc. It never pauses, so it only ever uses
+/// [`Self::acquire`] and lets the guard drop normally at the end of the call, the same
+/// way [`machine_repair`] does.
+pub(crate) struct ServerLockGuard {
+    locks: Arc<ServerLocks>,
+    key: String,
+    /// Set by [`Self::into_forgotten_key`] — `Drop` checks this flag rather than
+    /// consuming `self` via `std::mem::forget`, so a field added to this struct later
+    /// is never silently leaked along with the lock.
+    released: bool,
+}
+
+impl ServerLockGuard {
+    /// Claim `key` for `op` and wrap it in a guard. `Err` — [`server_busy_error`]'s
+    /// input — when another operation already holds this key.
+    pub(crate) fn acquire(locks: &Arc<ServerLocks>, key: String, op: &str) -> Result<Self, String> {
+        locks.claim(&key, op)?;
+        Ok(Self { locks: locks.clone(), key, released: false })
+    }
+
+    /// Wrap an ALREADY-claimed key without claiming it again — `bootstrap_resume`
+    /// picking a paused run back up (its own earlier `bootstrap_server`/
+    /// `bootstrap_resume` call is what claimed it, and left it claimed via
+    /// [`Self::into_forgotten_key`] when it paused). Same drop/forget bookkeeping as
+    /// [`Self::acquire`]'s result from here on.
+    fn adopt(locks: &Arc<ServerLocks>, key: String) -> Self {
+        Self { locks: locks.clone(), key, released: false }
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Skip the release-on-drop — the claim must OUTLIVE this async call (the run
+    /// PAUSED mid-pipeline). Returns the raw key for [`StoredSession::lock_key`] to
+    /// carry until `bootstrap_resume`/`bootstrap_cancel` releases it.
+    fn into_forgotten_key(mut self) -> String {
+        self.released = true;
+        self.key.clone()
+    }
+}
+
+impl Drop for ServerLockGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.locks.release(&self.key);
+        }
+    }
+}
+
+/// Registers `session_id` (carrying `lock_key` — see [`StoredSession::lock_key`] —
+/// and `machine_id` — see [`StoredSession::machine_id`]), runs `steps` to completion
+/// (or a blocking pause), and clears the registration again UNLESS the run paused at a
+/// blocking step — the one place that ties [`run_steps`]'s generic state machine to
+/// [`BootstrapSessions`]'s own bookkeeping, exercised directly by this module's
+/// fake-step tests. Does NOT itself touch [`ServerLocks`] — releasing the claim
+/// `lock_key` names is [`run_pipeline_and_register`]'s job (its caller), which alone
+/// holds the [`ServerLockGuard`] that can actually do so.
 async fn drive_and_register(
     sessions: &BootstrapSessions,
     session_id: String,
     request: StoredBootstrapRequest,
     sudo_password: Option<SecretString>,
+    lock_key: String,
+    machine_id: Option<String>,
     steps: Vec<PipelineStep>,
     mut on_progress: impl FnMut(&[StepState]),
 ) -> (Vec<StepState>, Option<StepId>) {
-    sessions.start(session_id.clone(), request, sudo_password).await;
+    sessions.start(session_id.clone(), request, sudo_password, lock_key, machine_id).await;
     let (states, needs_input) = run_steps(steps, &mut on_progress).await;
     if needs_input.is_none() {
         sessions.finish(&session_id).await;
@@ -959,6 +1150,12 @@ fn emit_progress(app: &tauri::AppHandle, session_id: &str, host: &str, states: &
 /// Mac already bootstrapped (B11 review finding). `None` for a genuinely first-contact
 /// host, or when the caller (`bootstrap_resume`) has no fresher match than what its
 /// own paused session already carries forward through the (unaffected) resume path.
+///
+/// `lock_guard`: this run's [`ServerLockGuard`] (B_lifecycle-#7 review finding) —
+/// `bootstrap_server` freshly [`ServerLockGuard::acquire`]d it, `bootstrap_resume`
+/// [`ServerLockGuard::adopt`]ed the SAME key an earlier paused call already claimed.
+/// Released normally (drop) once the run actually FINISHES; kept claimed (see
+/// [`ServerLockGuard::into_forgotten_key`]) when it pauses again instead.
 async fn run_pipeline_and_register(
     app: &tauri::AppHandle,
     sessions: &BootstrapSessions,
@@ -967,6 +1164,7 @@ async fn run_pipeline_and_register(
     password: Option<SecretString>,
     sudo_password: Option<SecretString>,
     existing_machine: Option<MachineRecord>,
+    lock_guard: ServerLockGuard,
 ) -> BootstrapReport {
     let ctx = Arc::new(Mutex::new(PipelineCtx {
         identity_file: existing_machine.as_ref().and_then(|m| m.identity_file.clone()),
@@ -977,11 +1175,58 @@ async fn run_pipeline_and_register(
     let app_for_progress = app.clone();
     let host = req.host.clone();
     let session_id_for_progress = session_id.clone();
-    let (states, needs_input) = drive_and_register(sessions, session_id.clone(), req.clone(), sudo_password, steps, |states| {
-        emit_progress(&app_for_progress, &session_id_for_progress, &host, states);
-    })
+    let lock_key = lock_guard.key().to_string();
+    // B_lifecycle-#8: the id [`StoredSession::machine_id`] carries forward for a
+    // resume, if this run pauses — the INITIAL `existing_machine` (the SAME value
+    // `PipelineCtx.machine_id` above was just seeded with), not `final_ctx.machine_id`
+    // below: a pause always happens BEFORE `StepId::AddMachine` runs (see the module
+    // doc's step order), so the two only ever differ for a run that DIDN'T pause,
+    // where this field goes unused anyway (the session is deregistered instead).
+    let machine_id_for_session = existing_machine.as_ref().map(|m| m.id.clone());
+    let (states, needs_input) = drive_and_register(
+        sessions,
+        session_id.clone(),
+        req.clone(),
+        sudo_password,
+        lock_key,
+        machine_id_for_session,
+        steps,
+        |states| {
+            emit_progress(&app_for_progress, &session_id_for_progress, &host, states);
+        },
+    )
     .await;
     let final_ctx = ctx.lock().await;
+    // B_lifecycle-#6 review finding: a completed run (`needs_input: None` — paused
+    // sessions haven't finished anything yet) may have uploaded/upgraded this
+    // machine's `flightdeckd` (`step_upload_daemon`'s own RESTART RULE), so drop
+    // whatever `crate::ipc::commands::DAEMON_VERSION_CACHE` still holds for it from an
+    // earlier spawn THIS SAME APP RUN — same reasoning as `repair`'s own invalidation,
+    // for the guided-install path instead of the Repair buttons. Harmless (a plain
+    // cache miss) when nothing was ever cached, or nothing changed.
+    //
+    // Review fix (lock-order): this MUST run before the [`ServerLocks`] release just
+    // below, not after — `ctx.lock().await` above is a genuine yield point, so
+    // releasing the per-server lock first and invalidating the cache after it would
+    // let a second run claim the freshly-freed lock and re-probe a FRESH daemon
+    // version in that window, only for this call's now-late invalidation to wipe that
+    // fresh entry right back out.
+    if needs_input.is_none() {
+        if let Some(id) = &final_ctx.machine_id {
+            invalidate_daemon_version_cache(id);
+        }
+    }
+    // B_lifecycle-#7 review finding: release the per-server lock now the run has
+    // actually FINISHED (`needs_input.is_none()` — the same condition
+    // `drive_and_register` itself uses to decide the session is done, Ok or Failed
+    // alike); a PAUSED run keeps its claim alive across the whole pause instead —
+    // `bootstrap_resume`'s own eventual completion, or `bootstrap_cancel`, releases it
+    // later (`StoredSession::lock_key`, already stored above via `sessions.start`).
+    if needs_input.is_none() {
+        drop(lock_guard);
+    } else {
+        lock_guard.into_forgotten_key();
+    }
     BootstrapReport {
         session_id,
         host: req.host,
@@ -1006,11 +1251,20 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 /// new key (the shared "pending" one was already claimed/renamed by the first run's
 /// `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
 /// host under a fresh uuid, rather than converging on the one that already exists.
+///
+/// Claims this host's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+/// running a single ssh round trip — `Err` with [`server_busy_error`] when
+/// `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+/// against the same server, rather than racing it (the previous behaviour: two
+/// concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
+/// against the same host, the loser typically failing opaquely at its very last
+/// step). Never blocks/waits.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_server(
     app: tauri::AppHandle,
     sessions: tauri::State<'_, Arc<BootstrapSessions>>,
+    locks: tauri::State<'_, Arc<ServerLocks>>,
     label: String,
     host: String,
     port: u16,
@@ -1034,39 +1288,86 @@ pub async fn bootstrap_server(
     let sudo_password = sudo_password.map(SecretString::new);
     let existing_machine =
         app.state::<Store>().machine_by_address(&req.host, req.port, &req.user).map_err(|e| e.to_string())?;
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, password, sudo_password, existing_machine).await)
+    let lock_key = server_lock_key(existing_machine.as_ref().map(|m| m.id.as_str()), &req.host, req.port, &req.user);
+    let guard = ServerLockGuard::acquire(&locks, lock_key, "Add a server").map_err(server_busy_error)?;
+    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, password, sudo_password, existing_machine, guard).await)
+}
+
+/// The [`MachineRecord`] `bootstrap_resume` continues against (B_lifecycle-#8 review
+/// finding) — BY ID when `machine_id` is `Some` (the paused session's own
+/// [`StoredSession::machine_id`]), which survives a live address rotation the frozen
+/// `(host, port, user)` tuple would not. Falls back to the address lookup ONLY when no
+/// id was ever recorded (a genuinely first-contact host). A recorded id that no longer
+/// resolves (the machine was removed while this session sat paused) is `Ok(None)` —
+/// NOT a fallback to the address lookup, which could otherwise silently latch onto an
+/// unrelated machine that happens to occupy that address now. Takes `&Store` rather
+/// than an `AppHandle` so this policy is unit-tested directly (`Store::open_in_memory`)
+/// without a full Tauri app.
+fn resolve_resume_machine(
+    store: &Store,
+    machine_id: Option<&str>,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<Option<MachineRecord>, String> {
+    match machine_id {
+        Some(id) => store.machine_by_id(id).map_err(|e| e.to_string()),
+        None => store.machine_by_address(host, port, user).map_err(|e| e.to_string()),
+    }
 }
 
 /// Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
 /// needing a sudo password) — re-runs the same, idempotent pipeline with
 /// `sudo_password` now available.
 ///
-/// Runs the SAME idempotency lookup [`bootstrap_server`] does (rather than assuming
-/// the paused session is the only in-progress state that matters): a completely
-/// separate, already-finished pairing for this exact host could exist by the time a
-/// resume happens (e.g. the same host paired again through a different session while
-/// this one sat paused) — reusing it here keeps `bootstrap_resume` exactly as
-/// convergent as a fresh `bootstrap_server` call.
+/// Re-finds the [`MachineRecord`] the paused session already converged on via
+/// [`resolve_resume_machine`] — BY ID when the ORIGINAL `bootstrap_server` call found
+/// one (`StoredSession::machine_id`), never by re-deriving `(host, port, user)` from
+/// the FROZEN request the session was paused under (B_lifecycle-#8 review finding: A6's
+/// live address-rotation, `Store::set_machine_preferred_host`, can rewrite that same
+/// row's `host` column WHILE this session sits paused — an address lookup would then
+/// find nothing and this resume would proceed as if pairing a brand-new host, which,
+/// with B_lifecycle-#1 unfixed, minted a duplicate). Falls back to the address lookup
+/// [`bootstrap_server`] itself uses ONLY when no id was ever recorded — a genuinely
+/// first-contact host, paused before [`StepId::AddMachine`] had ever run once — which
+/// also covers a completely separate, already-finished pairing for that host existing
+/// by the time this resume happens (e.g. the same host paired again through a
+/// different session while this one sat paused).
+///
+/// [`ServerLocks`]: REUSES (never re-claims) the [`ServerLockGuard`] the original
+/// `bootstrap_server` call claimed and left held across the pause (B_lifecycle-#7) —
+/// see [`BootstrapSessions::resume`]'s own `lock_key`. A fresh `claim` here would
+/// simply collide with this very session's own still-held lock.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_resume(
     app: tauri::AppHandle,
     sessions: tauri::State<'_, Arc<BootstrapSessions>>,
+    locks: tauri::State<'_, Arc<ServerLocks>>,
     session_id: String,
     sudo_password: Option<String>,
 ) -> Result<BootstrapReport, String> {
     let sudo_password = sudo_password.map(SecretString::new);
-    let (req, resolved_password) = sessions.resume(&session_id, sudo_password).await?;
+    let (req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
     let existing_machine =
-        app.state::<Store>().machine_by_address(&req.host, req.port, &req.user).map_err(|e| e.to_string())?;
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password, existing_machine).await)
+        resolve_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &req.host, req.port, &req.user)?;
+    let guard = ServerLockGuard::adopt(&locks, lock_key);
+    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password, existing_machine, guard).await)
 }
 
-/// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`].
+/// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
+/// releases the [`ServerLocks`] claim that paused run left held (B_lifecycle-#7 review
+/// finding) — no-op when nothing was paused under this id.
 #[tauri::command]
 #[specta::specta]
-pub async fn bootstrap_cancel(sessions: tauri::State<'_, Arc<BootstrapSessions>>, session_id: String) -> Result<(), String> {
-    sessions.cancel(&session_id).await;
+pub async fn bootstrap_cancel(
+    sessions: tauri::State<'_, Arc<BootstrapSessions>>,
+    locks: tauri::State<'_, Arc<ServerLocks>>,
+    session_id: String,
+) -> Result<(), String> {
+    if let Some(lock_key) = sessions.cancel(&session_id).await {
+        locks.release(&lock_key);
+    }
     Ok(())
 }
 
@@ -1506,6 +1807,16 @@ pub struct RepairOutcome {
     pub diagnosis: ServerDiagnosis,
 }
 
+/// Whether `action` can have changed the remote `flightdeckd` binary/process the
+/// cached probe behind `crate::ipc::commands::DAEMON_VERSION_CACHE` describes
+/// (B_lifecycle-#6 review finding) — pulled into its own named, directly-testable gate
+/// (rather than an inline `matches!` in [`repair`]'s body) so "the cache is invalidated
+/// after each of the three daemon-changing repair kinds, and NOT after the other five"
+/// is a regression test on its own.
+fn repair_action_invalidates_daemon_version_cache(action: RepairAction) -> bool {
+    matches!(action, RepairAction::ReuploadDaemon | RepairAction::RestartDaemon | RepairAction::InstallService)
+}
+
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
 /// re-diagnose. `sudo_password` beyond the brief's own shorthand signature — see the
 /// module doc.
@@ -1588,22 +1899,47 @@ async fn repair(
             format!("{state:?}")
         }
     };
+
+    // B_lifecycle-#6 review finding: `crate::ipc::commands::DAEMON_VERSION_CACHE` is
+    // per-app-run and, before this, was invalidated ONLY on a clap-rejection downgrade
+    // (`session.rs::run_actor`) — a same-run UPGRADE via one of these three repairs left
+    // the stale OLD version cached, so `--supports-skip`/`--title` stayed silently off
+    // for every later spawn until the app restarted. Drop the entry unconditionally for
+    // any repair that changed (or could have changed) the remote `flightdeckd`
+    // binary/process the cached probe describes (a `?` above already returned early on
+    // failure — reaching here means the action succeeded), and let the very next call
+    // to `daemon_version_for_machine` re-probe for real.
+    if repair_action_invalidates_daemon_version_cache(action) {
+        invalidate_daemon_version_cache(&machine.id);
+    }
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
 }
 
+/// Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+/// running anything — `Err` with [`server_busy_error`] when a `bootstrap_server`/
+/// `bootstrap_resume`/another `machine_repair` is already in flight against it (the
+/// previous behaviour: the Settings UI kept every paired machine's Repair buttons
+/// clickable regardless of what else was running against that same host, including
+/// the "+ Add a server" wizard). Always released before this returns — `repair` itself
+/// never pauses across separate calls the way the bootstrap pipeline can.
 #[tauri::command]
 #[specta::specta]
 pub async fn machine_repair(
     app: tauri::AppHandle,
+    locks: tauri::State<'_, Arc<ServerLocks>>,
     machine_id: String,
     action: RepairAction,
     sudo_password: Option<String>,
 ) -> Result<RepairOutcome, String> {
     let machine = machine_by_id(&app, &machine_id)?;
+    let guard = ServerLockGuard::acquire(&locks, machine.id.clone(), repair_action_label(action))
+        .map_err(server_busy_error)?;
     let known_hosts = known_hosts_path(&app);
     let sudo_password = sudo_password.map(SecretString::new);
-    repair(&app, &machine, known_hosts.as_deref(), action, sudo_password.as_ref()).await.map_err(|e| e.to_string())
+    let result = repair(&app, &machine, known_hosts.as_deref(), action, sudo_password.as_ref()).await.map_err(|e| e.to_string());
+    drop(guard);
+    result
 }
 
 // ============================================================================
@@ -1933,6 +2269,33 @@ mod tests {
         }
     }
 
+    // ---- repair_action_invalidates_daemon_version_cache (B_lifecycle-#6) ----
+
+    #[test]
+    fn repair_action_invalidates_daemon_version_cache_covers_exactly_the_daemon_changing_kinds() {
+        for action in
+            [RepairAction::ReuploadDaemon, RepairAction::RestartDaemon, RepairAction::InstallService]
+        {
+            assert!(
+                repair_action_invalidates_daemon_version_cache(action),
+                "{action:?} can change the remote flightdeckd — the cache must be invalidated",
+            );
+        }
+        for action in [
+            RepairAction::EnableLinger,
+            RepairAction::MaskSleep,
+            RepairAction::RunInit,
+            RepairAction::SignInClaude,
+            RepairAction::ProvisionPhone,
+        ] {
+            assert!(
+                !repair_action_invalidates_daemon_version_cache(action),
+                "{action:?} never touches flightdeckd itself — invalidating for it would just \
+                 force a needless re-probe on the next spawn",
+            );
+        }
+    }
+
     // ---- pipeline state machine (fake steps) ----
 
     fn stored_request() -> StoredBootstrapRequest {
@@ -2003,9 +2366,17 @@ mod tests {
             ]
         };
 
-        let (states, needs_input) =
-            drive_and_register(&sessions, "s1".to_string(), stored_request(), None, make_steps(attempt.clone()), |_| {})
-                .await;
+        let (states, needs_input) = drive_and_register(
+            &sessions,
+            "s1".to_string(),
+            stored_request(),
+            None,
+            "m1".to_string(),
+            Some("m1".to_string()),
+            make_steps(attempt.clone()),
+            |_| {},
+        )
+        .await;
         assert_eq!(needs_input, Some(StepId::EscalatePersistence));
         assert_eq!(states[1].status, StepStatus::NeedsInput);
         // Every step is still LISTED (a UI needs to show what's left), but nothing
@@ -2022,6 +2393,8 @@ mod tests {
             "s1".to_string(),
             stored_request(),
             Some(SecretString::new("pw".to_string())),
+            "m1".to_string(),
+            Some("m1".to_string()),
             make_steps(attempt.clone()),
             |_| {},
         )
@@ -2036,11 +2409,185 @@ mod tests {
     #[tokio::test]
     async fn cancel_drops_the_sudo_password() {
         let sessions = BootstrapSessions::new();
-        sessions.start("s1".to_string(), stored_request(), Some(SecretString::new("super-secret-pw".to_string()))).await;
+        sessions
+            .start(
+                "s1".to_string(),
+                stored_request(),
+                Some(SecretString::new("super-secret-pw".to_string())),
+                "m1".to_string(),
+                Some("m1".to_string()),
+            )
+            .await;
         sessions.cancel("s1").await;
         assert!(
             sessions.resume("s1", None).await.is_err(),
             "cancel must drop the whole session — password included"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_the_paused_sessions_lock_key() {
+        let sessions = BootstrapSessions::new();
+        sessions.start("s1".to_string(), stored_request(), None, "m1".to_string(), Some("m1".to_string())).await;
+        assert_eq!(
+            sessions.cancel("s1").await,
+            Some("m1".to_string()),
+            "cancel must hand back the lock_key a paused run left claimed, so the caller can release it",
+        );
+        // Already gone — a second cancel of the same id finds nothing left to release.
+        assert_eq!(sessions.cancel("s1").await, None);
+    }
+
+    // ---- resolve_resume_machine (B_lifecycle-#8) ----
+
+    fn machine_record(id: &str, host: &str) -> MachineRecord {
+        MachineRecord {
+            id: id.to_string(),
+            label: "l".into(),
+            host: host.to_string(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        }
+    }
+
+    #[test]
+    fn resolve_resume_machine_by_id_survives_a_host_rotation_between_pause_and_resume() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine_record("m1", "old-host.example.com")).unwrap();
+
+        // The session paused while `req.host` was still "old-host.example.com" — then,
+        // while it sat paused, A6's live address rotation rewrote the SAME row's `host`
+        // column (`Store::set_machine_preferred_host`, e.g. a Tailscale IP change).
+        store.set_machine_preferred_host("m1", "new-host.example.com").unwrap();
+
+        // The frozen (host, port, user) this session was captured under no longer
+        // matches ANY row — an address-only lookup would find nothing.
+        assert!(
+            store.machine_by_address("old-host.example.com", 22, "u").unwrap().is_none(),
+            "sanity: the rotation must have actually broken the address match",
+        );
+
+        // But resolving BY THE RECORDED ID still finds it, under its NEW host.
+        let resolved =
+            resolve_resume_machine(&store, Some("m1"), "old-host.example.com", 22, "u").unwrap();
+        assert_eq!(resolved.map(|m| m.host), Some("new-host.example.com".to_string()));
+    }
+
+    #[test]
+    fn resolve_resume_machine_falls_back_to_address_only_when_no_id_was_recorded() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine_record("m1", "h")).unwrap();
+
+        let resolved = resolve_resume_machine(&store, None, "h", 22, "u").unwrap();
+        assert_eq!(resolved.map(|m| m.id), Some("m1".to_string()));
+
+        // A host this address lookup doesn't match, with no id to fall back on: not found.
+        assert!(resolve_resume_machine(&store, None, "unknown-host", 22, "u").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_resume_machine_with_a_recorded_id_that_no_longer_resolves_never_falls_back_to_address() {
+        let store = Store::open_in_memory().unwrap();
+        // A different machine now happens to occupy the SAME address the removed one
+        // (id "m1", never persisted here) used to have — falling back to the address
+        // lookup would silently latch onto this UNRELATED machine instead.
+        store.upsert_machine(&machine_record("m2", "h")).unwrap();
+
+        let resolved = resolve_resume_machine(&store, Some("m1"), "h", 22, "u").unwrap();
+        assert_eq!(resolved, None, "an id that doesn't resolve must never fall back to guessing by address");
+    }
+
+    // ---- ServerLocks / ServerLockGuard (B_lifecycle-#7) ----
+
+    #[test]
+    fn server_lock_key_prefers_the_machine_id_when_known() {
+        assert_eq!(server_lock_key(Some("m1"), "h", 22, "u"), "m1");
+        assert_eq!(server_lock_key(None, "h", 22, "u"), "h:22:u");
+        // A different port or user is a genuinely different key even with the same host —
+        // never folded together (a different login is a different machine).
+        assert_ne!(server_lock_key(None, "h", 22, "u"), server_lock_key(None, "h", 2222, "u"));
+        assert_ne!(server_lock_key(None, "h", 22, "u"), server_lock_key(None, "h", 22, "other"));
+    }
+
+    #[test]
+    fn server_busy_error_names_the_running_operation() {
+        let msg = server_busy_error("Re-upload the flightdeckd binary".to_string());
+        assert!(msg.contains("Re-upload the flightdeckd binary"), "must name what's running: {msg}");
+    }
+
+    #[test]
+    fn server_locks_claim_twice_is_rejected_with_the_running_ops_label() {
+        let locks = ServerLocks::new();
+        assert!(locks.claim("m1", "Add a server").is_ok());
+        let err = locks.claim("m1", "Repair: restart").unwrap_err();
+        assert_eq!(err, "Add a server", "the SECOND claim must fail — never silently wait — and name the FIRST op");
+        // A DIFFERENT key is unaffected — this is per-server, not a global lock.
+        assert!(locks.claim("m2", "Add a server").is_ok());
+    }
+
+    #[test]
+    fn server_locks_release_frees_the_key_for_a_fresh_claim() {
+        let locks = ServerLocks::new();
+        locks.claim("m1", "Add a server").unwrap();
+        locks.release("m1");
+        assert!(locks.claim("m1", "Repair: restart").is_ok(), "release must actually free the key");
+    }
+
+    #[test]
+    fn server_lock_guard_releases_on_drop() {
+        let locks = Arc::new(ServerLocks::new());
+        {
+            let _guard = ServerLockGuard::acquire(&locks, "m1".to_string(), "Add a server").unwrap();
+            assert!(
+                ServerLockGuard::acquire(&locks, "m1".to_string(), "Add a server").is_err(),
+                "held while the guard is alive"
+            );
+        } // guard dropped here
+        assert!(
+            ServerLockGuard::acquire(&locks, "m1".to_string(), "Repair: restart").is_ok(),
+            "Drop must release the claim — no exit path (including an early return via `?`, or the \
+             owning task being dropped/cancelled) may leave it held forever",
+        );
+    }
+
+    #[test]
+    fn server_lock_guard_into_forgotten_key_keeps_the_claim_held_past_the_guards_own_lifetime() {
+        let locks = Arc::new(ServerLocks::new());
+        let guard = ServerLockGuard::acquire(&locks, "m1".to_string(), "Add a server").unwrap();
+        let key = guard.into_forgotten_key(); // simulates a run that PAUSED mid-pipeline
+        assert_eq!(key, "m1");
+        // Still claimed — a concurrent bootstrap_server/machine_repair against the same
+        // host while this one sits paused must still be refused.
+        assert!(
+            ServerLockGuard::acquire(&locks, "m1".to_string(), "Repair: restart").is_err(),
+            "into_forgotten_key must NOT release — the paused session still owns this claim",
+        );
+        // Only an explicit release (bootstrap_resume's own completion, or
+        // bootstrap_cancel) frees it.
+        locks.release(&key);
+        assert!(ServerLockGuard::acquire(&locks, "m1".to_string(), "Repair: restart").is_ok());
+    }
+
+    #[test]
+    fn server_lock_guard_adopt_does_not_re_claim_and_still_releases_on_drop() {
+        let locks = Arc::new(ServerLocks::new());
+        // Simulate a paused run's claim (as `into_forgotten_key` would leave it).
+        locks.claim("m1", "Add a server").unwrap();
+        {
+            // bootstrap_resume picking the paused run back up — must NOT try to claim
+            // again (it would collide with its own still-held lock) …
+            let _resumed = ServerLockGuard::adopt(&locks, "m1".to_string());
+        } // … and dropping the adopted guard (the resumed run finished) releases it.
+        assert!(
+            ServerLockGuard::acquire(&locks, "m1".to_string(), "Repair: restart").is_ok(),
+            "adopt's guard must release on drop exactly like acquire's",
         );
     }
 
@@ -2051,6 +2598,8 @@ mod tests {
         let session = StoredSession {
             request: stored_request(),
             sudo_password: Some(SecretString::new("super-secret-sudo-password".to_string())),
+            lock_key: "m1".to_string(),
+            machine_id: Some("m1".to_string()),
         };
         let debug = format!("{session:?}");
         assert!(!debug.contains("super-secret-sudo-password"), "debug leaked the password: {debug}");

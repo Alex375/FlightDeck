@@ -4305,6 +4305,37 @@ pub(crate) fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidat
     candidates
 }
 
+/// Merge a fresh pairing attempt's probed candidates with an already-paired machine's
+/// previously recorded addresses (B_lifecycle-#1 review finding): naively overwriting
+/// `addresses` with only what THIS attempt discovered would silently drop every other
+/// address recorded on an earlier pairing — e.g. re-pairing the same server manually,
+/// with no ticket this time, against a machine whose Tailscale/LAN candidates were
+/// discovered on its original pairing. `new` keeps priority (its `host` stays first,
+/// per [`probe_candidates`]'s own contract) — deduplicated by value against
+/// `existing`, whose entries are appended, in their own recorded order, for whatever
+/// `new` doesn't already cover. Pure.
+fn merge_address_candidates(new: &[AddressCandidate], existing: &[AddressCandidate]) -> Vec<AddressCandidate> {
+    let mut seen: std::collections::HashSet<&str> = new.iter().map(|c| c.value.as_str()).collect();
+    let mut merged: Vec<AddressCandidate> = new.to_vec();
+    for c in existing {
+        if seen.insert(c.value.as_str()) {
+            merged.push(c.clone());
+        }
+    }
+    merged
+}
+
+/// The result of [`add_machine`]: the saved [`MachineRecord`], plus whether it
+/// UPDATED an already-paired server (`matched_existing: true`) rather than adding a
+/// brand-new one — see [`add_machine`]'s own doc (B_lifecycle-#1 review finding). The
+/// UI uses this to say "Updated the existing server …" instead of implying a second
+/// server was added.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AddMachineOutcome {
+    pub machine: MachineRecord,
+    pub matched_existing: bool,
+}
+
 /// Pair a remote server: probe the confirmed `host` first, then fall back through the
 /// rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
 /// then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
@@ -4320,17 +4351,40 @@ pub(crate) fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidat
 /// `addresses`, carried for a later task (A6) to rotate through on a failed
 /// reconnect; the transport itself still only ever dials `host` today. When every
 /// candidate fails, the returned error names each one tried and why.
+///
+/// Converges on an already-paired server the SAME way the B11 bootstrap orchestrator
+/// does (B_lifecycle-#1 review finding — this used to always mint a fresh id, so
+/// pairing a server already paired by the wizard, or by an earlier legacy pairing of
+/// the same host, minted a DUPLICATE [`MachineRecord`]): before persisting, every
+/// candidate this attempt probed is checked against every OTHER machine's own
+/// `host`/`addresses` via [`crate::store::Store::machine_by_any_address`] — a
+/// different working address this time (a rotated Tailscale IP, or simply a different
+/// candidate answering first) still converges on the same row, keyed by (port, user).
+/// A different port or user is a different machine (a different login) and is never
+/// folded together.
+///
+/// Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
+/// finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
+/// `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+/// against the same server. Before this fix, this legacy/manual pairing command was
+/// the ONE entry point of the four that never claimed the lock at all, so it could
+/// still interleave ssh writes (key install, `AddMachine`'s pending-key rename) with
+/// one of the other three targeting the exact same host — precisely the race
+/// [`ServerLocks`] exists to prevent. Never blocks/waits; never pauses across separate
+/// calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
+/// the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
 #[tauri::command]
 #[specta::specta]
 pub async fn add_machine(
     app: tauri::AppHandle,
+    locks: tauri::State<'_, Arc<crate::bootstrap::orchestrator::ServerLocks>>,
     label: String,
     host: String,
     port: u16,
     user: String,
     identity_file: Option<String>,
     addresses: Option<Vec<AddressCandidate>>,
-) -> Result<MachineRecord, String> {
+) -> Result<AddMachineOutcome, String> {
     if let Some(err) = stale_identity_file_error(&identity_file) {
         return Err(err);
     }
@@ -4347,6 +4401,26 @@ pub async fn add_machine(
     for c in &candidates {
         validate_address_value(&c.value)?;
     }
+
+    // Same convergence rule `bootstrap_server`/`bootstrap_resume` already run, applied
+    // to every candidate this attempt is willing to accept as "this host" (not just
+    // the one that happened to answer first this time) — see this function's own doc.
+    // Computed BEFORE probing (it only needs the candidate list, not a live probe) so
+    // the [`ServerLocks`] claim right below can use the SAME key those three other
+    // entry points would use for this exact server.
+    let candidate_values: Vec<String> = candidates.iter().map(|c| c.value.clone()).collect();
+    let existing = app
+        .state::<Store>()
+        .machine_by_any_address(&candidate_values, port, &user)
+        .map_err(|e| e.to_string())?;
+    let lock_key = crate::bootstrap::orchestrator::server_lock_key(
+        existing.as_ref().map(|m| m.id.as_str()),
+        host.trim(),
+        port,
+        &user,
+    );
+    let guard = crate::bootstrap::orchestrator::ServerLockGuard::acquire(&locks, lock_key, "Add a server")
+        .map_err(crate::bootstrap::orchestrator::server_busy_error)?;
 
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
@@ -4371,11 +4445,22 @@ pub async fn add_machine(
         format!("Could not pair — every address failed. {}", failures.join(" — "))
     })?;
 
-    // `add_machine` always mints a fresh id here — a manual "Add a server" pairing is
-    // never deduplicated by host (see `persist_paired_machine`'s own doc for the ONE
-    // caller that IS: the B11 bootstrap orchestrator, which looks up an existing
-    // [`MachineRecord`] itself and passes its id through instead).
-    persist_paired_machine(&app, None, label, working_host, port, user, identity_file, candidates).await
+    let matched_existing = existing.is_some();
+    // Merge in the matched machine's own recorded addresses (see
+    // `merge_address_candidates`'s own doc) BEFORE consuming `existing` for its id —
+    // an already-paired server keeps every address it has ever answered on, not just
+    // the ones this particular re-pairing attempt happened to (re)discover.
+    let candidates = match &existing {
+        Some(ex) => merge_address_candidates(&candidates, &ex.addresses),
+        None => candidates,
+    };
+    let existing_id = existing.map(|m| m.id);
+
+    let machine =
+        persist_paired_machine(&app, existing_id, label, working_host, port, user, identity_file, candidates)
+            .await?;
+    drop(guard);
+    Ok(AddMachineOutcome { machine, matched_existing })
 }
 
 /// Persist an ALREADY-VERIFIED pairing (reachable, `identity_file` either already
@@ -4393,11 +4478,13 @@ pub async fn add_machine(
 ///
 /// `existing_machine_id`: `Some` reuses that id — [`Store::upsert_machine`]'s
 /// `ON CONFLICT(id) DO UPDATE` then updates the SAME row instead of inserting a
-/// second one (the orchestrator's own idempotency fix: it looks up a
-/// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline and
-/// threads the id through here on every later, converging re-run). `None` — every
-/// `add_machine` call — always mints a fresh uuid, unchanged from before this
-/// refactor.
+/// second one. The orchestrator resolves this via a
+/// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline;
+/// `add_machine` resolves it via the broader
+/// [`crate::store::Store::machine_by_any_address`] (B_lifecycle-#1 review finding —
+/// it used to always pass `None` here, minting a fresh uuid on every call, which
+/// duplicated the row for a server already paired). `None` when no existing machine
+/// converged — a genuinely new server.
 ///
 /// Claims the pending key (a no-op when `identity_file` is already a per-machine
 /// path, e.g. the orchestrator reusing a PREVIOUSLY claimed key — see
@@ -6135,6 +6222,83 @@ mod tests {
     fn probe_candidates_with_no_discovered_addresses_falls_back_to_the_typed_host() {
         let candidates = super::probe_candidates("my-typed-host", None);
         assert_eq!(candidates, vec![addr(AddressKind::Manual, "my-typed-host")]);
+    }
+
+    // ---- merge_address_candidates (B_lifecycle-#1) ----
+
+    #[test]
+    fn merge_address_candidates_keeps_new_first_and_appends_unseen_existing_ones() {
+        let new = vec![addr(AddressKind::Manual, "1.2.3.4")];
+        let existing = vec![
+            addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            addr(AddressKind::Lan, "192.168.1.5"),
+        ];
+        let merged = super::merge_address_candidates(&new, &existing);
+        assert_eq!(
+            merged.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            vec!["1.2.3.4", "box.tailnet.ts.net", "192.168.1.5"],
+            "this attempt's own candidates lead; every OTHER address the machine has \
+             ever recorded is still carried, not dropped",
+        );
+    }
+
+    #[test]
+    fn merge_address_candidates_does_not_duplicate_a_value_present_in_both() {
+        let new = vec![addr(AddressKind::Manual, "1.2.3.4"), addr(AddressKind::Lan, "192.168.1.5")];
+        let existing = vec![addr(AddressKind::Lan, "192.168.1.5")]; // same value, re-probed this time too
+        let merged = super::merge_address_candidates(&new, &existing);
+        assert_eq!(merged.len(), 2, "a value present in both lists must appear exactly once: {merged:?}");
+    }
+
+    #[test]
+    fn merge_address_candidates_with_empty_existing_is_just_new() {
+        let new = vec![addr(AddressKind::Manual, "1.2.3.4")];
+        assert_eq!(super::merge_address_candidates(&new, &[]), new);
+    }
+
+    // ---- add_machine's ServerLocks claim (B_lifecycle review finding: `add_machine`
+    // used to never claim the per-server lock at all, so the legacy/manual pairing
+    // flow could interleave ssh writes with a `bootstrap_server`/`bootstrap_resume`/
+    // `machine_repair` run already in flight against the exact same host) ----
+    //
+    // There is no Tauri mock-app test harness anywhere in this crate to invoke the
+    // `#[tauri::command]` wrapper itself (the `tauri` dependency doesn't even enable
+    // the `test` feature) — every other `ServerLocks`/`ServerLockGuard` test in
+    // `bootstrap::orchestrator` exercises the same primitives directly rather than a
+    // full command call, so this follows that same convention: it proves `add_machine`
+    // computes the SAME lock key its three siblings do (see its body — this test
+    // mirrors that exact call) and that a claim under that key collides as expected.
+    #[test]
+    fn add_machine_computes_the_same_lock_key_machine_repair_and_bootstrap_server_use() {
+        use crate::bootstrap::orchestrator::{server_lock_key, ServerLockGuard, ServerLocks};
+
+        let locks = Arc::new(ServerLocks::new());
+
+        // machine_repair's own claim for an already-paired machine is keyed by its id.
+        let repair_guard = ServerLockGuard::acquire(&locks, "m1".to_string(), "Repair: restart").unwrap();
+        // add_machine converging on that SAME machine (an `existing` match) computes
+        // the identical key — its own claim must collide, not silently proceed.
+        let add_machine_key = server_lock_key(Some("m1"), "irrelevant-host", 22, "irrelevant-user");
+        assert_eq!(add_machine_key, "m1");
+        // Not `.unwrap_err()`: it requires the `Ok` side (`ServerLockGuard`) to
+        // implement `Debug`, which it doesn't — same as every other test in
+        // `orchestrator.rs` above that checks this via `.is_err()` instead.
+        let err = ServerLockGuard::acquire(&locks, add_machine_key, "Add a server").err().unwrap();
+        assert_eq!(err, "Repair: restart", "a concurrent add_machine must be told what's already running");
+        drop(repair_guard);
+
+        // A genuinely first-contact host: bootstrap_server's own claim is keyed by the
+        // bare (host, port, user) triple — add_machine pairing the exact same triple
+        // (no `existing` match yet) collides the same way.
+        let bootstrap_key = server_lock_key(None, "fresh.example.com", 22, "deploy");
+        let bootstrap_guard = ServerLockGuard::acquire(&locks, bootstrap_key, "Add a server").unwrap();
+        let add_machine_key = server_lock_key(None, "fresh.example.com", 22, "deploy");
+        assert!(
+            ServerLockGuard::acquire(&locks, add_machine_key, "Add a server").is_err(),
+            "add_machine pairing the exact same first-contact host bootstrap_server is already \
+             installing onto must be refused, not race it",
+        );
+        drop(bootstrap_guard);
     }
 
     /// Regression for the confirm screen's "Discovered addresses — pick one" buttons
