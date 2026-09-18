@@ -3489,7 +3489,11 @@ pub async fn list_remote_repos(
 
 /// POSIX single-quote escaping so a user-supplied remote path can't break out of the
 /// remote shell command (wrap in single quotes; rewrite each embedded quote as `'\''`).
-fn shq(s: &str) -> String {
+///
+/// `pub(crate)` so `bootstrap::templates` (a real shell-script generator, not just a
+/// path-in-a-command helper like the call sites below) can reuse the one escaping
+/// helper this crate already has instead of growing a second one.
+pub(crate) fn shq(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
