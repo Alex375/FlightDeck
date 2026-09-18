@@ -105,6 +105,20 @@ pub fn registry_path() -> PathBuf {
 /// silently drops a node's frames beyond a 60-frame burst.
 pub const MAX_REVOKED_PHONE_TOKENS: usize = 16;
 
+/// How many phones a node authorizes at most. Every one is re-authorized on
+/// each relay connect (paced, but the relay's budget is finite) — a hard cap
+/// with an explicit error beats frames silently dropped by the relay.
+pub const MAX_PHONE_TOKENS: usize = 32;
+
+/// Refuse a NEW phone once MAX_PHONE_TOKENS are authorized (relabeling an
+/// authorized one is always fine).
+pub fn check_phone_capacity(tokens: &[PhoneToken], token: &str) -> Result<()> {
+    if tokens.len() >= MAX_PHONE_TOKENS && !tokens.iter().any(|p| p.token == token) {
+        bail!("too many authorized phones (max {MAX_PHONE_TOKENS}) — remove one first");
+    }
+    Ok(())
+}
+
 /// How long a writer waits for the config lock before giving up.
 pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(10);
 

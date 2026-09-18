@@ -206,9 +206,17 @@ impl SessionManager {
             bail!("phone token is empty");
         }
         let mut phones = self.phones.lock().expect("phones lock");
-        Config::update(&self.config_path, |c| {
-            config::upsert_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, token, label)
+        config::check_phone_capacity(&phones.tokens, token)?;
+        let (_, on_disk) = Config::update(&self.config_path, |c| {
+            config::check_phone_capacity(&c.phone_tokens, token)?;
+            Ok::<_, anyhow::Error>(config::upsert_phone_token(
+                &mut c.phone_tokens,
+                &mut c.revoked_phone_tokens,
+                token,
+                label,
+            ))
         })?;
+        on_disk?;
         let PhoneAccess { tokens, revoked } = &mut *phones;
         let added = config::upsert_phone_token(tokens, revoked, token, label);
         self.send_relay(json!({"type": "authorize_phone", "phoneToken": token, "label": label}));
@@ -1147,6 +1155,21 @@ mod tests {
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
         assert_eq!(frame(&mut rx).unwrap()["label"], "Pixel 9");
         assert!(m.add_phone_token("  ", "x").is_err());
+    }
+
+    #[test]
+    fn a_phone_past_the_cap_is_refused_explicitly() {
+        let (_dir, path, m, _rx) = phone_manager(true); // holds "seed"
+        for i in 1..config::MAX_PHONE_TOKENS {
+            assert!(m.add_phone_token(&format!("pt-{i}"), "").unwrap());
+        }
+        let err = m.add_phone_token("one-too-many", "").unwrap_err();
+        assert_eq!(err.to_string(), "too many authorized phones (max 32) — remove one first");
+        assert!(!m.add_phone_token("pt-5", "relabel at the cap is fine").unwrap());
+        assert_eq!(Config::load(&path).unwrap().phone_tokens.len(), config::MAX_PHONE_TOKENS);
+        assert_eq!(m.phones.lock().unwrap().tokens.len(), config::MAX_PHONE_TOKENS);
+        assert!(m.remove_phone_token("pt-1").unwrap());
+        assert!(m.add_phone_token("one-too-many", "").unwrap(), "a freed slot can be reused");
     }
 
     #[test]

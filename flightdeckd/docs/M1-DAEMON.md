@@ -104,7 +104,11 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   doit prendre le même verrou : `flock ~/.flightdeckd/config.json.lock -c '…'`.
   Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`,
   16 max) re-révoquées à chaque connexion au relais, qui, lui, persiste les
-  autorisations.
+  autorisations. Au plus **32 téléphones autorisés** (`add-phone` au-delà :
+  `ok:false`, « too many authorized phones (max 32) — remove one first »).
+  La rafale de connexion est **cadencée** (lots de ≤ 20 frames, 1 s d'écart,
+  `set_label` en dernier) : le relais jette en silence au-delà de 60 frames
+  (recharge 30/s).
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `bypassPermissions` pour les sessions créées

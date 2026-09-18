@@ -79,18 +79,19 @@ async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -
         }
     });
 
-    // Replay phone access and publish this link — as ONE critical section
-    // under the phones lock, so a concurrent add/remove lands either in this
-    // burst or live on this link, never in neither (nor a stale authorize
-    // after a revoke). The guard unpublishes the link however this returns.
-    let _published = {
+    // Publish this link and snapshot the phone access in ONE critical
+    // section: a concurrent add/remove then lands live on this link or in the
+    // snapshot. The burst replays the snapshot PACED (the relay drops frames
+    // past its 60-frame bucket), re-checking every frame against the live
+    // state as it goes out — so a phone removed meanwhile is never
+    // re-authorized after its live revoke. The guard unpublishes the link
+    // however this returns.
+    let (_published, keys) = {
         let phones = manager.phones.lock().expect("phones lock");
         *manager.relay_out.lock().expect("relay_out lock") = Some(out_tx.clone());
-        for frame in connect_burst(&phones, &cfg.label) {
-            let _ = out_tx.send(Message::Text(frame.to_string()));
-        }
-        RelayOutGuard { manager, tx: out_tx.clone() }
+        (RelayOutGuard { manager, tx: out_tx.clone() }, burst_keys(&phones))
     };
+    let burst = tokio::spawn(send_burst(manager.clone(), out_tx.clone(), keys, cfg.label.clone(), BURST_PAUSE));
 
     // Heartbeat: a dead relay makes the write fail → reconnect.
     let hb = {
@@ -125,6 +126,7 @@ async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -
     };
 
     let result = read_loop(manager, &out_tx, &mut stream).await;
+    burst.abort();
     hb.abort();
     events.abort();
     drop(out_tx);
@@ -132,24 +134,66 @@ async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -
     result
 }
 
-/// What every (re)connect sends first: revocations of the tombstoned tokens
-/// (the relay keeps authorizations across reconnects, so a revoke that never
+/// Frames per burst batch, and the pause between batches: the relay allows
+/// a node a 60-frame burst refilled at 30/s and SILENTLY drops the rest, and
+/// the burst shares that budget with RPC replies and events.
+const BURST_BATCH: usize = 20;
+const BURST_PAUSE: Duration = Duration::from_secs(1);
+
+/// One frame of the connect burst, resolved against the live phone access
+/// only when it goes out.
+#[derive(Debug, Clone, PartialEq)]
+enum BurstKey {
+    Revoke(String),
+    Authorize(String),
+    Label,
+}
+
+/// What every (re)connect sends: revocations of the tombstoned tokens (the
+/// relay keeps authorizations across reconnects, so a revoke that never
 /// landed must be retried), authorizations of the live ones, then the node's
-/// label. Kept small — the relay drops a node's frames beyond a 60-frame burst.
-fn connect_burst(phones: &PhoneAccess, label: &str) -> Vec<Value> {
-    let mut frames: Vec<Value> = phones
-        .revoked
-        .iter()
-        .map(|t| json!({"type": "revoke_phone", "phoneToken": t}))
-        .collect();
-    frames.extend(
-        phones
-            .tokens
-            .iter()
-            .map(|p| json!({"type": "authorize_phone", "phoneToken": p.token, "label": p.label})),
-    );
-    frames.push(json!({"type": "set_label", "label": label}));
-    frames
+/// label — last.
+fn burst_keys(phones: &PhoneAccess) -> Vec<BurstKey> {
+    let mut keys: Vec<BurstKey> = phones.revoked.iter().map(|t| BurstKey::Revoke(t.clone())).collect();
+    keys.extend(phones.tokens.iter().map(|p| BurstKey::Authorize(p.token.clone())));
+    keys.push(BurstKey::Label);
+    keys
+}
+
+/// Send the burst in batches of at most BURST_BATCH frames, `pause` apart.
+/// Each frame is re-checked against the live phone access under its lock
+/// (the same lock live add/remove send under): a token revoked meanwhile is
+/// not authorized, a tombstone cleared by a re-add is not revoked, and the
+/// current label is used.
+async fn send_burst(
+    manager: Arc<SessionManager>,
+    out: mpsc::UnboundedSender<Message>,
+    keys: Vec<BurstKey>,
+    label: String,
+    pause: Duration,
+) {
+    for (i, batch) in keys.chunks(BURST_BATCH).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(pause).await;
+        }
+        let phones = manager.phones.lock().expect("phones lock");
+        for key in batch {
+            let frame = match key {
+                BurstKey::Revoke(t) if phones.revoked.contains(t) => {
+                    json!({"type": "revoke_phone", "phoneToken": t})
+                }
+                BurstKey::Authorize(t) => match phones.tokens.iter().find(|p| &p.token == t) {
+                    Some(p) => json!({"type": "authorize_phone", "phoneToken": p.token, "label": p.label}),
+                    None => continue,
+                },
+                BurstKey::Label => json!({"type": "set_label", "label": label}),
+                BurstKey::Revoke(_) => continue,
+            };
+            if out.send(Message::Text(frame.to_string())).is_err() {
+                return; // the link is gone
+            }
+        }
+    }
 }
 
 /// Unpublishes a connection's writer from `manager.relay_out` when the
@@ -237,19 +281,77 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn connect_burst_revokes_then_authorizes_then_labels() {
+    fn burst_revokes_then_authorizes_then_labels() {
         let phones = PhoneAccess {
             tokens: vec![PhoneToken { token: "a".into(), label: "iPhone".into() }],
             revoked: vec!["gone".into()],
         };
         assert_eq!(
-            connect_burst(&phones, "node-x"),
-            vec![
-                json!({"type": "revoke_phone", "phoneToken": "gone"}),
-                json!({"type": "authorize_phone", "phoneToken": "a", "label": "iPhone"}),
-                json!({"type": "set_label", "label": "node-x"}),
-            ]
+            burst_keys(&phones),
+            vec![BurstKey::Revoke("gone".into()), BurstKey::Authorize("a".into()), BurstKey::Label]
         );
+    }
+
+    fn crowded_manager(revoked: usize, tokens: usize) -> Arc<SessionManager> {
+        let m = crate::testutil::test_manager(crate::testutil::test_cfg());
+        {
+            let mut p = m.phones.lock().unwrap();
+            p.revoked = (0..revoked).map(|i| format!("r{i}")).collect();
+            p.tokens = (0..tokens).map(|i| PhoneToken { token: format!("t{i}"), label: String::new() }).collect();
+        }
+        m
+    }
+
+    async fn collect_burst(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<(tokio::time::Instant, Value)> {
+        let mut got = Vec::new();
+        loop {
+            let Some(Message::Text(t)) = rx.recv().await else { panic!("burst ended without set_label") };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            let done = v["type"] == "set_label";
+            got.push((tokio::time::Instant::now(), v));
+            if done {
+                return got;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_large_burst_never_exceeds_twenty_frames_a_second() {
+        let m = crowded_manager(10, 40);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let keys = burst_keys(&m.phones.lock().unwrap());
+        tokio::spawn(send_burst(m.clone(), tx, keys, "node".into(), BURST_PAUSE));
+        let got = collect_burst(&mut rx).await;
+        assert_eq!(got.len(), 51);
+        for (i, (t, _)) in got.iter().enumerate() {
+            let in_window = got[i..].iter().take_while(|(u, _)| *u < *t + Duration::from_secs(1)).count();
+            assert!(in_window <= BURST_BATCH, "{in_window} frames within 1 s of frame {i}");
+        }
+        let kinds: Vec<&str> = got.iter().map(|(_, v)| v["type"].as_str().unwrap()).collect();
+        assert!(kinds[..10].iter().all(|k| *k == "revoke_phone"));
+        assert!(kinds[10..50].iter().all(|k| *k == "authorize_phone"));
+        assert_eq!(kinds[50], "set_label");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_phone_removed_mid_burst_is_not_reauthorized() {
+        let m = crowded_manager(0, 30);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let keys = burst_keys(&m.phones.lock().unwrap());
+        tokio::spawn(send_burst(m.clone(), tx, keys, "node".into(), BURST_PAUSE));
+        for _ in 0..BURST_BATCH {
+            rx.recv().await.unwrap(); // first batch: t0..t19
+        }
+        {
+            // during the pause: t25 is revoked live
+            let mut p = m.phones.lock().unwrap();
+            p.tokens.retain(|t| t.token != "t25");
+            p.revoked.push("t25".into());
+        }
+        let rest = collect_burst(&mut rx).await;
+        let tokens: Vec<&str> = rest.iter().filter_map(|(_, v)| v["phoneToken"].as_str()).collect();
+        assert!(!tokens.contains(&"t25"), "a revoked phone was re-authorized by a stale burst");
+        assert_eq!(tokens.len(), 9);
     }
 
     /// A minimal relay: accepts /mac websockets and reports every text frame
