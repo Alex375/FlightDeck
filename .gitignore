@@ -36,3 +36,16 @@ screenshots/
 
 # === tauri-specta bindings: COMMITTED on purpose, do NOT ignore ===
 # src/ipc/bindings.ts
+
+# === flightdeckd (imported from flightdeck-server) — local env / secrets ===
+# Its own tests/live fixtures generate real-looking SSH keys, tokens and env
+# files; these patterns were already in flightdeck-server's .gitignore and are
+# ported here so nothing there gets committed by accident now that it lives
+# in this repo. `target/` above already covers `flightdeckd/target/`.
+.env
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+pairing-ticket*.json
+.colima/
