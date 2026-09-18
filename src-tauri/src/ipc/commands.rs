@@ -320,6 +320,9 @@ pub async fn spawn_session(
             daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
                 .unwrap_or_else(|_| "flightdeckd".to_string()),
             addresses,
+            // Which machine row `host` came from, so a later successful address
+            // rotation (A6) knows what to persist the winning address back to.
+            machine_id: Some(machine.id),
         });
         // Pre-mint the daemon-side conversation id so retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the

@@ -752,6 +752,34 @@ impl Store {
         Ok(())
     }
 
+    /// A6: persist the address a live session's reconnect loop just rotated onto and
+    /// proved working (`fd_attach` confirmed) as this machine's new preferred `host` —
+    /// so the NEXT spawn (a fresh conversation, a Mac restart, …) dials it FIRST
+    /// instead of re-trying the dead one and re-paying the backoff every single time.
+    /// A simple `UPDATE`, not the full `upsert_machine` (the caller — the session
+    /// actor, via the IPC-layer emitter that owns the `Store` — has no other machine
+    /// fields to hand and must not clobber them with stale/absent data).
+    ///
+    /// Re-validated through [`validate_address_value`] — the SAME ssh-option-injection
+    /// guard every other write of `host`/`addresses` goes through (see
+    /// [`Self::upsert_machine`]) — even though this value only ever comes from a
+    /// machine's OWN already-validated `addresses` list, never fresh user input: a
+    /// persistence-layer invariant should not depend on every caller upholding it.
+    /// Returns the number of rows touched (0 if the machine was deleted concurrently),
+    /// mirroring [`Self::set_repo_tosse_link`] — never an error for "nothing to update".
+    pub fn set_machine_preferred_host(&self, id: &str, host: &str) -> rusqlite::Result<usize> {
+        validate_address_value(host).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE machines SET host = ?2 WHERE id = ?1", params![id, host])
+    }
+
     /// Remove a remote server and everything anchored to it. Deletes its repos first
     /// (which cascades to their conversations via the repos→conversations FK), then
     /// the machine row — the machine→repos cascade enforced in code (see
@@ -1264,6 +1292,68 @@ mod tests {
             "an unsafe value inside `addresses` must be rejected too, not just `host`"
         );
         assert!(s.machine_by_id("m1").unwrap().is_none());
+    }
+
+    /// A6: a rotation that wins persists the new `host`, round-tripping through
+    /// `machine_by_id` — and other fields (`label`, `port`, `addresses`, …) are left
+    /// untouched, since this is a targeted `UPDATE`, not a full `upsert_machine`.
+    #[test]
+    fn set_machine_preferred_host_round_trips_through_machine_by_id() {
+        let s = Store::open_in_memory().unwrap();
+        let addresses = vec![
+            AddressCandidate { kind: AddressKind::Manual, value: "203.0.113.1".into() },
+            AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+        ];
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "203.0.113.1".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: addresses.clone(),
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let touched = s.set_machine_preferred_host("m1", "192.168.1.5").unwrap();
+        assert_eq!(touched, 1);
+        let after = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(after.host, "192.168.1.5");
+        // Untouched: label/port/addresses survive the targeted UPDATE.
+        assert_eq!(after.label, "vps");
+        assert_eq!(after.port, 22);
+        assert_eq!(after.addresses, addresses);
+
+        // A machine that no longer exists: 0 rows touched, never an error.
+        assert_eq!(s.set_machine_preferred_host("gone", "10.0.0.1").unwrap(), 0);
+    }
+
+    /// A6: the same ssh-option-injection guard `upsert_machine` enforces on `host`
+    /// applies to this narrower write too — a targeted `UPDATE` is still a write path
+    /// that could otherwise reintroduce the injection class [`validate_address_value`]
+    /// closes.
+    #[test]
+    fn set_machine_preferred_host_rejects_an_unsafe_value() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+        };
+        s.upsert_machine(&m).unwrap();
+
+        assert!(s.set_machine_preferred_host("m1", "-oProxyCommand=evil").is_err());
+        assert_eq!(
+            s.machine_by_id("m1").unwrap().unwrap().host,
+            "h.example",
+            "the rejected value must not land in the db"
+        );
     }
 
     /// v12 — a row from BEFORE the `addresses` column existed (`ALTER TABLE ADD

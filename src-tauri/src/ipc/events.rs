@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::Manager;
 use tauri_specta::Event;
 
 use crate::supervisor::model::{
@@ -380,6 +381,30 @@ impl SessionEmitter for TauriEmitter {
             session: session.to_string(),
             area: area.to_string(),
         });
+    }
+
+    /// A6: NOT a front-facing event (no `Event` type, no bindings) — the supervisor
+    /// has no `Store` dependency (see the repo's encapsulation rule: `store/db.rs` is
+    /// the ONLY SQL service), so this is the least-invasive place to close the loop:
+    /// `TauriEmitter` already holds the `AppHandle` every other method here uses, and
+    /// through it the same Tauri-managed `Store` the IPC commands read/write. A
+    /// best-effort persist — logged, never surfaced to the conversation (the session
+    /// itself already reconnected fine; a failure here only means the NEXT spawn
+    /// re-tries the stale address, not that this one is broken).
+    fn emit_preferred_host(&self, _session: &str, machine_id: &str, host: &str) {
+        match self.app.state::<crate::store::Store>().set_machine_preferred_host(machine_id, host) {
+            Ok(0) => {
+                eprintln!(
+                    "[ipc] preferred-host persist: no machine row for id {machine_id} (deleted concurrently?)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "[ipc] failed to persist preferred host {host:?} for machine {machine_id}: {e}"
+                );
+            }
+        }
     }
 }
 
