@@ -151,6 +151,13 @@ beforeEach(() => {
   bootstrapServer.mockReset();
   bootstrapResume.mockReset();
   bootstrapCancel.mockReset();
+  // Default to a plain success — a real IPC binding always resolves to SOMETHING
+  // (`Promise<Result<null, string>>`), and the new unmount-while-paused cleanup below
+  // now calls this unconditionally whenever a test happens to end paused, so a bare
+  // unconfigured mock (which returns `undefined`, not a `Promise`) would crash on the
+  // `.catch` call rather than exercising the real "did it get called" assertions.
+  // Individual tests still override this per-case where the resolution itself matters.
+  bootstrapCancel.mockResolvedValue({ status: "ok", data: null });
   bootstrapForgetHostKey.mockReset();
   machineRepair.mockReset();
   machineDiagnose.mockReset();
@@ -603,7 +610,7 @@ describe("ServerBootstrapWizard — Settings-close guard while paused", () => {
     expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
   });
 
-  it("clears the guard on unmount even if it was still paused", async () => {
+  it("clears the guard on unmount even if it was still paused, and releases the paused session's server lock", async () => {
     bootstrapServer.mockResolvedValue({
       status: "ok",
       data: {
@@ -622,8 +629,48 @@ describe("ServerBootstrapWizard — Settings-close guard while paused", () => {
     await settle();
     expect(useSettingsUi.getState().bootstrapGuard).not.toBeNull();
 
+    // Unmounting here simulates `SettingsPanel`'s force-close path (the "Close
+    // anyway" confirm dialog's `finishClose` → `onClose`), NOT this wizard's own
+    // Cancel button — `cancelPaused` (tested above) already covers that path and
+    // already called `bootstrapCancel` itself. Before the fix, this exact path left
+    // the backend's per-server `ServerLocks` claim held forever (only
+    // `bootstrap_resume`'s own completion or an explicit `bootstrap_cancel` ever
+    // releases a paused run's claim), so every later `bootstrap_server`/
+    // `bootstrap_resume`/`machine_repair` against the same host got `server_busy_error`
+    // even though nothing was actually running.
     act(() => root.unmount());
     expect(useSettingsUi.getState().bootstrapGuard).toBeNull();
+    expect(bootstrapCancel).toHaveBeenCalledWith("sess-guard-unmount");
+  });
+
+  it("does not double-cancel on unmount after the wizard's own Cancel button already did", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "sess-guard-cancel-then-unmount",
+        host: "guard-cancel-then-unmount.example.com",
+        steps: allOk({ escalate_persistence: { status: "needs_input", detail: "this server needs a sudo password to continue" } }),
+        needs_input: "escalate_persistence",
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "guard-cancel-then-unmount.example.com");
+    fill("User", "deploy");
+    clickButtonWithText("Install");
+    await settle();
+
+    clickButtonWithText("Cancel");
+    await settle();
+    expect(bootstrapCancel).toHaveBeenCalledTimes(1);
+    expect(bootstrapCancel).toHaveBeenCalledWith("sess-guard-cancel-then-unmount");
+
+    // The form is back to its empty, un-paused state — a later unmount (Settings
+    // actually closing) must not fire a second, stale `bootstrapCancel` for a session
+    // that's already been explicitly cancelled.
+    act(() => root.unmount());
+    expect(bootstrapCancel).toHaveBeenCalledTimes(1);
   });
 });
 

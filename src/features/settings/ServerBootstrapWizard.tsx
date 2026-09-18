@@ -330,6 +330,15 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   const claudeStep = claudeSignInStep(steps);
   const pipelineSettled = started && !busy && !sudoBusy && needsInput === null;
 
+  // Mirrors `paused`/`sessionId` for the unmount cleanup below, whose closure (an
+  // empty-deps `useEffect`'s returned cleanup) only ever sees the FIRST render's
+  // values otherwise — this ref is what lets that cleanup act on the LATEST pause
+  // state instead of "never paused, no session yet".
+  const pausedSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    pausedSessionIdRef.current = paused ? sessionId : null;
+  }, [paused, sessionId]);
+
   // Guards `SettingsPanel`'s close paths (✕, Escape, the scrim) against silently
   // discarding this exact pause — see the store field's own doc. `paused` is the
   // ONLY case a fresh Settings reopen can't recover from (no session-listing IPC to
@@ -342,7 +351,31 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   // Unconditional on unmount, regardless of `paused`'s last value — leaving this view
   // (Settings actually closing, or the parent tearing the wizard down after a Cancel/
   // Done) always means there is nothing left here for the guard to protect.
-  useEffect(() => () => useSettingsUi.getState().setBootstrapGuard(null), []);
+  //
+  // Also releases the paused run's own backend `ServerLocks` claim (review finding):
+  // `SettingsPanel`'s ✕/Escape/scrim close path (its "Close anyway" confirm dialog)
+  // unmounts this component WITHOUT ever going through `cancelPaused`'s own explicit
+  // `bootstrapCancel` call — before this fix that left the per-server lock
+  // (`orchestrator.rs`'s `ServerLocks`) claimed for the rest of the app's life, since
+  // only `bootstrap_resume`'s own completion or `bootstrap_cancel` ever releases a
+  // paused run's claim. Every later `bootstrap_server`/`bootstrap_resume`/
+  // `machine_repair` against that same host then got `server_busy_error` forever, even
+  // though nothing was actually running. `cancelPaused` (this wizard's own Cancel
+  // button) already resets `sessionId`/`needsInput` synchronously before its own
+  // `bootstrapCancel` call, so by the time THIS cleanup runs afterward,
+  // `pausedSessionIdRef.current` is already `null` — no double-cancel.
+  useEffect(
+    () => () => {
+      useSettingsUi.getState().setBootstrapGuard(null);
+      const id = pausedSessionIdRef.current;
+      if (id) {
+        void commands.bootstrapCancel(id).catch((e) => {
+          console.error(`bootstrapCancel(${id}) on unmount failed:`, errorMessage(e));
+        });
+      }
+    },
+    [],
+  );
 
   if (!started) {
     return (
