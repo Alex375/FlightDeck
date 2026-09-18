@@ -259,12 +259,24 @@ describe("appControl — conversations", () => {
     expect(out[1].background_tasks).toBe(0);
   });
 
-  it("list_background_tasks keeps finished tasks and carries the Bash command", async () => {
+  it("list_background_tasks keeps finished tasks and carries what the bars print", async () => {
     useBackgroundTasksStore.setState({
       sessions: {
         c1: {
           b1: bgTask({ task_id: "b1", label: null, command: "npm run build" }),
-          b2: bgTask({ task_id: "b2", kind: "agent", status: "failed", label: "Explore", command: null }),
+          b2: bgTask({
+            task_id: "b2",
+            kind: "agent",
+            status: "failed",
+            label: "Explore",
+            command: null,
+            subagent_type: "Explore",
+            model: "claude-sonnet-5",
+            tokens: 1200,
+            tool_uses: 7,
+            duration_ms: 42000,
+          }),
+          b3: bgTask({ task_id: "b3", kind: "workflow", label: "release", progress: "Review: diff" }),
         },
       },
     });
@@ -274,10 +286,25 @@ describe("appControl — conversations", () => {
       null,
       helpers(),
     )) as { tasks: Array<Record<string, unknown>> };
+    const none = { subagent_type: null, model: null, progress: null, tokens: null, tool_uses: null, duration_ms: null };
     expect(out.tasks).toEqual([
-      { task_id: "b1", kind: "bash", status: "running", label: null, command: "npm run build" },
+      { task_id: "b1", kind: "bash", status: "running", label: null, command: "npm run build", ...none },
       // No bgAgentIds entry: a foreground sub-agent, flagged so a client can leave it out.
-      { task_id: "b2", kind: "agent", status: "failed", label: "Explore", command: null, foreground: true },
+      {
+        task_id: "b2",
+        kind: "agent",
+        status: "failed",
+        label: "Explore",
+        command: null,
+        subagent_type: "Explore",
+        model: "claude-sonnet-5",
+        progress: null,
+        tokens: 1200,
+        tool_uses: 7,
+        duration_ms: 42000,
+        foreground: true,
+      },
+      { task_id: "b3", kind: "workflow", status: "running", label: "release", command: null, ...none, progress: "Review: diff" },
     ]);
   });
 

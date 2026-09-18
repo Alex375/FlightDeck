@@ -370,7 +370,10 @@ function runningBackgroundCount(conv: Conversation): number {
 /** The conversation's background tasks (live-only registry). The registry KEEPS finished
  *  tasks (completed / failed / stopped), so callers that want what is running now must
  *  filter on `status`. `command` is the raw shell command of a Bash task — the readable
- *  fallback when the agent gave the task no `label` (what the desktop bar shows). */
+ *  fallback when the agent gave the task no `label` (what the desktop bar shows). The rest
+ *  is what the pinned bars print beside the name, so a remote client can draw the same
+ *  rows: a sub-agent's type + model (AgentBar), a workflow's latest "<phase>: <label>"
+ *  (WorkflowBar), and the usage roll-up when the wire has one (rare while running). */
 function listBackgroundTasksTool(args: Record<string, unknown>, session: string | null): unknown {
   const conv = resolveTarget(args, session);
   const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
@@ -382,6 +385,12 @@ function listBackgroundTasksTool(args: Record<string, unknown>, session: string 
       status: t.status,
       label: t.label ?? null,
       command: t.command ? clip(t.command, 400) : null,
+      subagent_type: t.subagent_type ?? null,
+      model: t.model ?? null,
+      progress: t.progress ?? null,
+      tokens: t.tokens ?? null,
+      tool_uses: t.tool_uses ?? null,
+      duration_ms: t.duration_ms ?? null,
       ...(isForegroundTask(t, conv) ? { foreground: true } : {}),
     })),
   };
