@@ -1246,6 +1246,51 @@
 .convRow:hover .convGo {
   opacity: 0.6;
 }
+/* A row = the open button + a hover-revealed unlink. The ROW carries the negative margin and
+   the hover wash, so the two hit areas read as one line. */
+.convItem {
+  display: flex;
+  align-items: center;
+  margin: 0 -8px;
+  border-radius: var(--wf-r-l);
+  transition: background 0.12s ease;
+}
+.convItem:hover {
+  background: var(--wf-panel-2);
+}
+.convItem .convRow {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  background: transparent;
+}
+/* display:none at rest, not opacity 0 — a flex icon button never collapses to zero width,
+   so a merely transparent one would still eat the title's room. */
+.convUnlink {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: 4px;
+  padding: 0;
+  border: none;
+  border-radius: var(--wf-r-l);
+  background: transparent;
+  color: var(--wf-tx);
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+.convItem:hover .convUnlink,
+.convUnlink:focus-visible {
+  display: inline-flex;
+}
+.convUnlink:hover {
+  opacity: 1;
+  color: var(--wf-tx-hi);
+}
 
 /* ---- "Start" as a split button ---------------------------------------- */
 /* The main action and its drop-down read as ONE control: they share a border, and only

@@ -5,7 +5,7 @@
 // Extracting it here (rather than importing from ConductorThread) avoids an import cycle:
 // ConductorThread already imports SubAgentTranscript.
 import { useState, type ReactNode } from "react";
-import type { JsonValue } from "../../ipc/client";
+import type { BackgroundTask, JsonValue } from "../../ipc/client";
 import { Ico } from "../../ui/kit";
 import styles from "./ConductorThread.module.css";
 
@@ -57,9 +57,54 @@ export const NOTICE_ERROR_HEADINGS: Record<string, string> = {
   protocol_error: "Protocol error",
   session_budget_exceeded: "Codex session budget exceeded",
   permission_error: "Unreadable permission request",
-  task_failed: "A background task failed",
   history_error: "Problem restoring history",
 };
+
+/** The `detail` payload of a `task_failed` notice, built from the failed background task's
+ *  snapshot. The producer (`onTask`) and the renderer (`NoticeBlock`) share this one shape:
+ *  `message` is the plain-text line (also what `read_conversation` hands other agents),
+ *  `label` the task's name, `detail` the collapsed technical detail. */
+export function taskFailedDetail(task: BackgroundTask): Record<string, JsonValue> {
+  const label = task.label?.trim() || null;
+  const parts: string[] = [];
+  if (task.summary) parts.push(task.summary);
+  if (task.output_file) parts.push(`output: ${task.output_file}`);
+  return {
+    message: label ? `Background task failed: ${label}` : "Background task failed",
+    label,
+    detail: parts.length ? parts.join("\n") : null,
+  };
+}
+
+/** A failed background task: a discreet inline line — the same weight as a failed tool step
+ *  (small alert glyph, muted text), NOT an error bubble. Such a failure is common and benign
+ *  (Claude gets it via its `<task-notification>` and handles it), so it must not read as the
+ *  conversation itself failing — but it stays visible, with its detail one click away. */
+function TaskFailedLine({ label, detail }: { label: string | null; detail: string | null }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={styles.taskFailed}>
+      <div className={styles.controlChange}>
+        <Ico name="alert" className={"sm " + styles.taskFailedIco} />
+        <span>
+          Background task failed{label ? ": " : ""}
+          {label ? <b>{label}</b> : null}
+        </span>
+        {detail ? (
+          <button
+            type="button"
+            className={styles.taskFailedToggle}
+            aria-expanded={open}
+            onClick={() => setOpen((o) => !o)}
+          >
+            {open ? "Hide details" : "Details"}
+          </button>
+        ) : null}
+      </div>
+      {open && detail ? <pre className={styles.taskFailedDetail}>{detail}</pre> : null}
+    </div>
+  );
+}
 
 /** Pull a human-readable detail string out of a notice's raw `detail` payload, for the
  *  collapsed "Technical details" disclosure. Prefers explicit `detail`, then any technical
@@ -79,6 +124,7 @@ export function noticeDetailText(d: Record<string, JsonValue> | null): string | 
  *  live notice (read from the store by `NoticeRow`) and one embedded in a settled transcript
  *  (the history preview). Mirrors the live thread's routing exactly:
  *   - `control_change`: a subtle inline "control: from → to" line.
+ *   - `task_failed`: a discreet inline line (failed background task) with a detail toggle.
  *   - `control_error` + every subtype in NOTICE_ERROR_HEADINGS (and the generic `error`):
  *     a visible red error bubble — never silent.
  *   - any other subtype: nothing (stays quiet). */
@@ -126,6 +172,11 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
         <span>{get("message")}</span>
       </div>
     );
+  }
+
+  if (subtype === "task_failed") {
+    const detailText = get("detail");
+    return <TaskFailedLine label={get("label") ?? null} detail={detailText?.trim() ? detailText : null} />;
   }
 
   if (subtype === "control_error") {

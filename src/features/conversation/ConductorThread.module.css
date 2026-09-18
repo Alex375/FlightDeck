@@ -142,6 +142,45 @@
   color: var(--wf-tx, inherit);
 }
 
+/* A failed background task: the controlChange line with a small alert glyph — the weight of
+   a failed tool step (cv-step-errico), never an error bubble. The detail opens below it. */
+.taskFailed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.taskFailedIco {
+  color: var(--wf-err);
+}
+.taskFailedToggle {
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: var(--wf-tx-lo);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.taskFailedToggle:hover {
+  color: var(--wf-tx);
+}
+.taskFailedDetail {
+  align-self: stretch;
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--wf-tx-hi) 5%, transparent);
+  font-family: var(--wf-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--wf-tx);
+}
+
 /* A message the user injected mid-work, shown inline inside the assistant round (clean
    output): a light note with a "wait"-toned rail, not a full user bubble, so it sits in
    place without cutting the work. */

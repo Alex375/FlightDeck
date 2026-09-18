@@ -5025,6 +5025,11 @@ export type TosseTaskDetail = {
  */
 task: TosseTask; projectId: string | null; projectName: string | null; 
 /**
+ * The parent task when this one is a SUBTASK (the CRM nests one level deep), else
+ * `None`. What lets an agent that names a subtask be linked to the work it belongs to.
+ */
+parentTaskId: string | null; 
+/**
  * The long-form fields the briefing omits — Markdown, rendered as-is.
  */
 context: string | null; content: string | null; subtasks: TosseTask[]; blockedBy: TosseTaskLink[]; blocks: TosseTaskLink[] }

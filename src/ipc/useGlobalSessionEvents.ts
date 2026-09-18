@@ -43,6 +43,7 @@ import { useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
+import { looksLikeQuestion } from "../agent/status";
 import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
@@ -70,6 +71,7 @@ import type { SessionStatePayload } from "./client";
 import { worktreesKey } from "./useWorktrees";
 import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
+import { taskFailedDetail } from "../features/conversation/noticeView";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
 function repoPathForConv(convId: string): string | null {
@@ -220,6 +222,10 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
         ? {
             outcome: meta?.isError ? "error" : "success",
             ...(meta?.subtype ? { subtype: meta.subtype } : {}),
+            // Read on the FULL text: `last_assistant_text` below is clipped from the
+            // end, where the "?" would be. The remote relay files the push under
+            // "Questions" instead of "Ready for review" on it (flightdeck-remote §8).
+            open_question: looksLikeQuestion(lastAssistantText(entry)),
             last_assistant_text: clipForEvent(lastAssistantText(entry)),
             repository: repo ? repoName(repo.path) : null,
           }
@@ -633,7 +639,7 @@ export function useGlobalSessionEvents(): void {
     // the pinned AgentBar and the Flight Deck badge; (2) surface a terminal `failed`
     // status in the owning conversation so a sub-agent that errored out isn't silently
     // lost. `stopped` is usually user/session-driven, so it's left quiet — only genuine
-    // failures alert. Routed by stable conversation id like every other session event.
+    // failures are surfaced. Routed by stable conversation id like every other session event.
     function onTask(payload: SessionTaskEvent) {
       const session = convIdForHandle(payload.session);
       if (!session) return;
@@ -669,17 +675,14 @@ export function useGlobalSessionEvents(): void {
       if (seenFailedTasks.has(task.task_id)) return; // re-emitted per transition
       seenFailedTasks.add(task.task_id);
       ensureOnce(session);
-      const label = task.label ? `: ${task.label}` : "";
-      const detailParts: string[] = [];
-      if (task.summary) detailParts.push(task.summary);
-      if (task.output_file) detailParts.push(`output: ${task.output_file}`);
+      // A discreet inline notice (same weight as a failed tool step), NOT an error turn: a
+      // background task failing is common and benign — Claude is told via its
+      // `<task-notification>` and handles it — so it must not read as the conversation
+      // itself failing. Nor may it clear the queued badges the way `addErrorTurn` does: a
+      // failed background task doesn't stop a queued message from being delivered.
       useConversationStore
         .getState()
-        .addErrorTurn(
-          session,
-          `A background task failed${label}.`,
-          detailParts.length ? detailParts.join("\n") : null,
-        );
+        .applyItem(session, { kind: "notice", subtype: "task_failed", detail: taskFailedDetail(task) });
     }
 
     // A running workflow's on-disk journal changed (the Rust watcher pushes its fresh
