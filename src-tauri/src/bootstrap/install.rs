@@ -188,8 +188,14 @@ async fn resolve_target_and_check(
 /// [`BootstrapError::UploadTruncated`], with `got` read from whatever `FLIGHTDECK_
 /// GOT_SIZE` marker made it back (`0` when nothing did) — never a false success. Pure —
 /// [`stream_upload`] is the (untestable without a real/fake ssh) shell around it.
+///
+/// The success check is a LINE-ANCHORED match (mirrors `extract_marker`'s own
+/// discipline for every other marker this module reads) rather than a bare substring
+/// search — a substring search could be satisfied by an unrelated banner/MOTD line (or
+/// leaked stderr text) that merely happens to CONTAIN the marker, which would defeat
+/// this function's own "never a false success" guarantee.
 fn parse_upload_output(stdout: &str, ssh_succeeded: bool, expected_size: u64) -> Result<(), BootstrapError> {
-    if ssh_succeeded && stdout.contains("FLIGHTDECK_UPLOAD_OK") {
+    if ssh_succeeded && stdout.lines().any(|l| l == "FLIGHTDECK_UPLOAD_OK") {
         return Ok(());
     }
     let got = crate::ipc::commands::extract_marker(stdout, "FLIGHTDECK_GOT_SIZE:")
@@ -368,6 +374,19 @@ pub(crate) enum ServicePlan {
     NeedsAdmin,
 }
 
+/// The "no systemd at all" arm of [`ServicePlan`]'s decision table, keyed purely on
+/// `kill_user_processes` — shared verbatim by [`plan_service_install`] (the general,
+/// exhaustively unit-tested decision table) and [`install_service`]'s own early
+/// no-systemd short-circuit (skipped ahead of a wasted [`attempt_self_linger`] round
+/// trip — see that call site's own doc), so the two identical match arms can never
+/// silently drift out of sync with each other.
+fn plan_without_systemd(kill_user_processes: Option<bool>) -> ServicePlan {
+    match kill_user_processes {
+        Some(false) => ServicePlan::DetachedProcess { survives_reboot: false },
+        _ => ServicePlan::NeedsAdmin,
+    }
+}
+
 /// See [`ServicePlan`]. Pure.
 pub(crate) fn plan_service_install(
     is_root: bool,
@@ -385,10 +404,7 @@ pub(crate) fn plan_service_install(
         return ServicePlan::SystemUnit;
     }
     if systemd != Some(true) {
-        return match kill_user_processes {
-            Some(false) => ServicePlan::DetachedProcess { survives_reboot: false },
-            _ => ServicePlan::NeedsAdmin,
-        };
+        return plan_without_systemd(kill_user_processes);
     }
     if linger_ok {
         return ServicePlan::UserUnit;
@@ -491,12 +507,58 @@ async fn install_user_unit(machine: &MachineRecord, known_hosts: Option<&str>) -
 /// at all — see the brief's own empirical table). No `Restart=` here (nothing manages
 /// it), and it does NOT survive a reboot — [`ServiceOutcome::DetachedProcess`] reports
 /// both honestly.
-async fn install_detached_process(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<(), BootstrapError> {
+///
+/// ⚠️ Idempotency guard: neither B7's probe nor B8's `RESOLVE_DAEMON_TARGET_SCRIPT`
+/// treat a detached-launched `~/.local/bin/flightdeckd` as a "conflict" (that path is
+/// deliberately the FRESH-INSTALL target, not something either script would ever flag),
+/// so a RETRIED [`install_service`] call — a transient [`verify_daemon_running`]
+/// timeout, a re-run of the bootstrap wizard — would otherwise reach this exact branch
+/// again and launch a SECOND, competing `flightdeckd` process, with nothing downstream
+/// able to detect it (both would answer `flightdeckd status` identically). Checked live
+/// against a fresh Docker fixture: running this function's own script twice left two
+/// live `flightdeckd run` processes. [`daemon_already_running`] closes that gap by
+/// checking first — never a bulletproof lock (there is still a narrow TOCTOU window
+/// between the check and the spawn), but it turns the routine "retry after a timeout"
+/// case, the one this is actually reachable from, into a genuine no-op.
+async fn install_detached_process(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    ssh_bin_override: Option<&Path>,
+) -> Result<(), BootstrapError> {
+    if daemon_already_running(machine, known_hosts, ssh_bin_override).await {
+        return Ok(());
+    }
     let script = "setsid nohup \"$HOME/.local/bin/flightdeckd\" run >/dev/null 2>&1 </dev/null &";
-    run_ssh_on_machine(machine, known_hosts, script)
-        .await
-        .map(|_| ())
-        .map_err(BootstrapError::Other)
+    let (success, _stdout, stderr) =
+        run_ssh_on_machine_with_stdin(machine, known_hosts, script, &[], ssh_bin_override)
+            .await
+            .map_err(BootstrapError::Other)?;
+    if success {
+        Ok(())
+    } else {
+        Err(BootstrapError::Other(
+            stderr.trim().lines().last().unwrap_or("could not launch the detached flightdeckd process").to_string(),
+        ))
+    }
+}
+
+/// Whether `flightdeckd status` already reports the daemon running, via
+/// [`DAEMON_STATUS_CMD`] — the SAME application-level check [`verify_daemon_running`]
+/// polls for (never a `pgrep`/`ps` cmdline match, which a renamed or re-exec'd process
+/// could dodge). Used by [`install_detached_process`] as its idempotency guard. A
+/// failure to even run the check (unreachable, no output) reads as "not confirmed
+/// running" — the safe default for a decision that only ever gates "should we launch
+/// one", never one that silently skips reporting a real failure to the caller.
+async fn daemon_already_running(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    ssh_bin_override: Option<&Path>,
+) -> bool {
+    let (success, stdout, _stderr) =
+        run_ssh_on_machine_with_stdin(machine, known_hosts, DAEMON_STATUS_CMD, &[], ssh_bin_override)
+            .await
+            .unwrap_or((false, String::new(), String::new()));
+    success && stdout.contains("fd_status")
 }
 
 /// Which `systemctl` scope (if any) governs the daemon — feeds
@@ -587,6 +649,19 @@ async fn verify_daemon_running(
 /// `probe` already found — see [`plan_service_install`] for the exact decision table.
 /// Every branch that installs something VERIFIES the daemon is actually up afterward
 /// (see [`verify_daemon_running`]) before returning `Ok`.
+///
+/// ⚠️ `probe` MUST be the SAME [`RemoteProbeResult`] a caller already had BEFORE
+/// calling [`upload_daemon`] — never a fresh re-probe taken after it. For a root
+/// install, B8's `RESOLVE_DAEMON_TARGET_SCRIPT` targets `/usr/local/bin/flightdeckd`,
+/// which IS one of the paths `bootstrap::connect::PROBE_SCRIPT`'s own conflict check
+/// looks for (unlike the non-root `~/.local/bin/flightdeckd` target, which that script
+/// deliberately excludes). A caller that re-probes in between (e.g. a UI wizard
+/// refreshing displayed state) would see B8's own freshly-uploaded binary and
+/// misreport it as a pre-existing conflict — this function would then return
+/// `Adopted` and write NOTHING, silently leaving a fresh install with a binary in
+/// place but no persistence at all while still reporting success (reproduced live
+/// while building this module's own tests — see `live_install_service_root_gets_a_
+/// system_unit`'s doc for how that test avoids it).
 pub async fn install_service(
     machine: &MachineRecord,
     probe: &RemoteProbeResult,
@@ -597,7 +672,26 @@ pub async fn install_service(
         return Ok(ServiceOutcome::Adopted { kind, unit_path });
     }
 
+    // Checked ahead of the root branch (not folded into `plan_service_install`,
+    // which a root call site never actually reaches — see the `unreachable!` arm
+    // below): a root login with no systemd would otherwise fall into
+    // `install_system_unit`'s raw `systemctl` invocation and surface an opaque,
+    // untyped ssh failure instead of the SAME typed `AdminRequired` the non-root
+    // no-systemd case already gets just below. It is deliberately NOT routed into
+    // the detached-process fallback either — that fallback's script hardcodes the
+    // NON-root install target (`$HOME/.local/bin/flightdeckd`), which is the wrong
+    // path for a root install (root's own target is `/usr/local/bin/flightdeckd`,
+    // per `RESOLVE_DAEMON_TARGET_SCRIPT`).
     let is_root = machine.user == "root";
+    if is_root && probe.systemd != Some(true) {
+        return Err(BootstrapError::AdminRequired(
+            "this server has no systemd — a root login has no automatable persistence \
+             path here (its non-root detached fallback targets a different binary path \
+             than a root install uses) — an administrator needs to set persistence up \
+             manually"
+                .to_string(),
+        ));
+    }
     if is_root {
         install_system_unit(machine, known_hosts).await?;
         verify_daemon_running(machine, known_hosts, Some(UnitScope::System)).await?;
@@ -605,17 +699,18 @@ pub async fn install_service(
     }
 
     if probe.systemd != Some(true) {
-        return match probe.kill_user_processes {
-            Some(false) => {
-                install_detached_process(machine, known_hosts).await?;
+        return match plan_without_systemd(probe.kill_user_processes) {
+            ServicePlan::DetachedProcess { survives_reboot } => {
+                install_detached_process(machine, known_hosts, None).await?;
                 verify_daemon_running(machine, known_hosts, None).await?;
-                Ok(ServiceOutcome::DetachedProcess { survives_reboot: false })
+                Ok(ServiceOutcome::DetachedProcess { survives_reboot })
             }
-            _ => Err(BootstrapError::AdminRequired(
+            ServicePlan::NeedsAdmin => Err(BootstrapError::AdminRequired(
                 "this server has no systemd and no confirmed way for a background process to \
                  survive logout — an administrator needs to set persistence up manually"
                     .to_string(),
             )),
+            _ => unreachable!("plan_without_systemd only ever returns DetachedProcess or NeedsAdmin"),
         };
     }
 
@@ -652,7 +747,7 @@ pub async fn install_service(
             Ok(ServiceOutcome::UserUnit)
         }
         ServicePlan::DetachedProcess { survives_reboot } => {
-            install_detached_process(machine, known_hosts).await?;
+            install_detached_process(machine, known_hosts, None).await?;
             verify_daemon_running(machine, known_hosts, None).await?;
             Ok(ServiceOutcome::DetachedProcess { survives_reboot })
         }
@@ -674,12 +769,31 @@ pub async fn install_service(
 /// `sudo -n true` on `machine` — whether passwordless `sudo` works RIGHT NOW (never
 /// trusted from a stale probe value: this is a security-relevant decision, checked live
 /// every time [`escalate_persistence`] runs).
-async fn sudo_dash_n_true(machine: &MachineRecord, known_hosts: Option<&str>, ssh_bin_override: Option<&Path>) -> bool {
-    let (success, ..) =
+///
+/// Returns `Err` for an ssh-level failure this crate already knows how to name
+/// specifically — a host-key mismatch, or the ssh child failing to spawn at all —
+/// rather than folding it into a plain `false`. An ordinary `sudo -n true` running and
+/// simply exiting non-zero (no passwordless sudo configured — the routine, expected
+/// case) is still `Ok(false)`: this only intercepts the failures that mean the ssh
+/// round trip itself did not really happen the way it looks like it did. Mirrors
+/// [`resolve_target_and_check`]'s / [`stream_upload`]'s own discipline (see their
+/// docs) — without it, a stale/changed host key or an unreachable machine at this
+/// exact call site would previously surface as [`BootstrapError::NeedsSudoPassword`]
+/// ("this server needs a sudo password") instead of the real, potentially
+/// security-relevant problem.
+async fn sudo_dash_n_true(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    ssh_bin_override: Option<&Path>,
+) -> Result<bool, BootstrapError> {
+    let (success, _stdout, stderr) =
         run_ssh_on_machine_with_stdin(machine, known_hosts, "sudo -n true", &[], ssh_bin_override)
             .await
-            .unwrap_or((false, String::new(), String::new()));
-    success
+            .map_err(BootstrapError::Other)?;
+    if !success && askpass::is_host_key_mismatch(&stderr) {
+        return Err(BootstrapError::HostKeyMismatch);
+    }
+    Ok(success)
 }
 
 /// Runs `script` under passwordless `sudo -n` — only ever called once
@@ -789,7 +903,7 @@ pub(crate) async fn escalate_persistence_with_override(
 ) -> Result<(), BootstrapError> {
     let script = templates::render_persistence_escalation(&machine.user, mask_sleep);
 
-    if sudo_dash_n_true(machine, known_hosts, ssh_bin_override).await {
+    if sudo_dash_n_true(machine, known_hosts, ssh_bin_override).await? {
         return run_sudo_passwordless(machine, known_hosts, ssh_bin_override, &script).await;
     }
 
@@ -1121,6 +1235,19 @@ mod tests {
         );
     }
 
+    /// A banner/MOTD (or leaked stderr) line that merely CONTAINS the marker as a
+    /// substring — never on its own line — must not satisfy the check; only a
+    /// line-anchored match does. Closes the review finding that this was a bare
+    /// substring search.
+    #[test]
+    fn parse_upload_output_rejects_the_marker_as_a_mere_substring() {
+        let stdout = "Welcome! FLIGHTDECK_UPLOAD_OK is not a real success line\nFLIGHTDECK_GOT_SIZE:42\n";
+        assert_eq!(
+            parse_upload_output(stdout, true, 12345),
+            Err(BootstrapError::UploadTruncated { expected: 12345, got: 42 })
+        );
+    }
+
     // ---- classify_conflict ----
 
     #[test]
@@ -1268,6 +1395,24 @@ mod tests {
                 unit_path: Some("/etc/systemd/system/flightdeckd.service".to_string())
             }
         );
+    }
+
+    /// A root login on a box with no systemd (a minimal container image, for
+    /// instance) must get the SAME typed `AdminRequired` the non-root no-systemd case
+    /// already gets — never fall through into `install_system_unit`'s raw `systemctl`
+    /// invocation and surface an opaque ssh failure. Proven with a non-resolvable host
+    /// (mirrors `install_service_conflict_adopts_without_any_ssh_call`'s own
+    /// discipline): this must return BEFORE any ssh call is even attempted.
+    #[tokio::test]
+    async fn install_service_root_without_systemd_is_a_typed_admin_required_error() {
+        let mut machine = test_machine();
+        machine.user = "root".to_string();
+        let p = probe(None, Some("Linux"), Some("aarch64"), Some(false), None, None, None);
+
+        let err = install_service(&machine, &p, None)
+            .await
+            .expect_err("a root login without systemd must never attempt the raw system-unit install");
+        assert!(matches!(err, BootstrapError::AdminRequired(_)), "expected AdminRequired, got {err:?}");
     }
 
     // ========================================================================
@@ -1448,6 +1593,79 @@ mod tests {
         let _ = std::fs::remove_file(&log);
     }
 
+    // ---- install_detached_process idempotency (fake ssh) ----
+
+    /// A fake `ssh` for [`install_detached_process`]'s idempotency guard: any call
+    /// whose LAST arg contains `setsid nohup` logs `SPAWN_INVOKED` (the actual launch);
+    /// every other call (the `flightdeckd status` idempotency check) logs
+    /// `STATUS_INVOKED` and either reports the daemon already up (`already_running`) or
+    /// fails the way a not-yet-running daemon does.
+    fn fake_ssh_detached_process(log: &Path, already_running: bool) -> String {
+        let status_body = if already_running {
+            "echo '{\"type\":\"fd_status\"}'\n\x20       exit 0"
+        } else {
+            "exit 1"
+        };
+        format!(
+            "#!/bin/bash\n\
+             LOG={log}\n\
+             last=\"${{@: -1}}\"\n\
+             case \"$last\" in\n\
+             \x20   *'setsid nohup'*)\n\
+             \x20       echo SPAWN_INVOKED >> \"$LOG\"\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             \x20   *)\n\
+             \x20       echo STATUS_INVOKED >> \"$LOG\"\n\
+             \x20       {status_body}\n\
+             \x20       ;;\n\
+             esac\n",
+            log = crate::ipc::commands::shq(&log.to_string_lossy()),
+        )
+    }
+
+    /// PROVES the B8/B9 review fix: a RETRIED `install_service` call (a transient
+    /// `verify_daemon_running` timeout, a re-run of the bootstrap wizard) reaching
+    /// `install_detached_process` a second time — while the daemon it already launched
+    /// is still up — must never spawn a SECOND, competing process.
+    #[tokio::test]
+    async fn detached_process_already_running_skips_the_spawn() {
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_detached_process(&log, true));
+        let machine = test_machine();
+
+        install_detached_process(&machine, None, Some(fake.path()))
+            .await
+            .expect("must succeed when the daemon is already confirmed running");
+
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.contains("STATUS_INVOKED"), "must check before launching: {log_text:?}");
+        assert!(
+            !log_text.contains("SPAWN_INVOKED"),
+            "an already-running daemon must never be launched a second time: {log_text:?}"
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The ordinary, fresh-install case: nothing is running yet, so the launch DOES
+    /// happen — the idempotency guard must never turn into a guard against ever
+    /// launching anything at all.
+    #[tokio::test]
+    async fn detached_process_not_running_launches_it() {
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_detached_process(&log, false));
+        let machine = test_machine();
+
+        install_detached_process(&machine, None, Some(fake.path()))
+            .await
+            .expect("must succeed on a fresh install with nothing running yet");
+
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.contains("STATUS_INVOKED"));
+        assert!(log_text.contains("SPAWN_INVOKED"), "a fresh install must actually launch the process: {log_text:?}");
+        let _ = std::fs::remove_file(&log);
+    }
+
     // ---- escalate_persistence ordering (fake sudo) ----
 
     /// Fake `ssh` for `escalate_persistence`'s ordering tests: answers `sudo -n true`
@@ -1567,6 +1785,39 @@ mod tests {
         assert!(log_text.contains("N_TRUE_INVOKED"));
         assert!(!log_text.contains("S_INVOKED"), "with no captured password at all, `sudo -S` must never even be tried");
         let _ = std::fs::remove_file(&log);
+    }
+
+    /// A fake `ssh` whose `sudo -n true` call fails the way a genuinely broken
+    /// ssh-level connection would (an ssh-itself failure carrying OpenSSH's own
+    /// host-key wording on stderr) — never a real `sudo` round trip at all.
+    fn fake_ssh_host_key_mismatch_on_sudo_n_true() -> String {
+        "#!/bin/bash\n\
+         last=\"${@: -1}\"\n\
+         case \"$last\" in\n\
+         \x20   \"sudo -n true\")\n\
+         \x20       echo 'Host key verification failed.' >&2\n\
+         \x20       exit 255\n\
+         \x20       ;;\n\
+         \x20   *)\n\
+         \x20       exit 1\n\
+         \x20       ;;\n\
+         esac\n"
+            .to_string()
+    }
+
+    /// PROVES the review fix: a host-key mismatch on the very first `sudo -n true`
+    /// probe must surface as `HostKeyMismatch`, never get collapsed into the ordinary
+    /// "no passwordless sudo, ask for a password" case — even with NO captured
+    /// password at all, which is exactly the state `bootstrap_escalate_persistence` is
+    /// normally first called in (so the OLD behavior would have reported the much more
+    /// misleading `NeedsSudoPassword` here).
+    #[tokio::test]
+    async fn escalate_sudo_n_true_host_key_mismatch_is_reported_not_needs_sudo_password() {
+        let fake = FakeSsh::new(&fake_ssh_host_key_mismatch_on_sudo_n_true());
+        let machine = test_machine();
+
+        let result = escalate_persistence_with_override(&machine, None, None, true, Some(fake.path())).await;
+        assert_eq!(result, Err(BootstrapError::HostKeyMismatch));
     }
 
     /// Mirrors `askpass.rs`'s own `askpass_errors_never_contain_the_test_password`
