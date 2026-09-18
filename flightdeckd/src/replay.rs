@@ -9,7 +9,9 @@
 //! that block's `content_block_stop`, all of them before `message_stop`.
 //!
 //! Compaction drops the deltas of messages that are COMPLETE in the ring
-//! (`message_stop` seen AND at least one `assistant` line with that id) and
+//! (`message_stop` seen AND at least one `assistant` line with that id, both
+//! under the same `parent_tool_use_id` — a message is identified by
+//! (parent, id), never by its id alone) and
 //! reports each dropped run as `fd_skip{from,to}` so the client's cursor still
 //! advances line for line. Anything uncertain is replayed: deltas of a message
 //! still streaming (or interrupted — no `message_stop`), of a message whose
@@ -34,8 +36,9 @@ pub enum ReplayTag {
     /// `parent_tool_use_id`s (the main thread, each sub-agent) can interleave;
     /// within one they are sequential.
     Stream { parent: Option<String>, start: Option<String>, stop: bool },
-    /// A complete `assistant` line (one content block of message `id`).
-    Assistant { id: String },
+    /// A complete `assistant` line (one content block of message `id`, in the
+    /// thread `parent`).
+    Assistant { parent: Option<String>, id: String },
 }
 
 #[derive(Deserialize)]
@@ -66,7 +69,7 @@ pub fn tag(kind: &str, line: &str) -> ReplayTag {
     let Ok(p) = serde_json::from_str::<TagProbe>(line) else { return ReplayTag::Other };
     if kind == "assistant" {
         return match p.message.and_then(|m| m.id) {
-            Some(id) => ReplayTag::Assistant { id },
+            Some(id) => ReplayTag::Assistant { parent: p.parent_tool_use_id, id },
             None => ReplayTag::Other,
         };
     }
@@ -116,14 +119,19 @@ pub fn plan(ring: &VecDeque<RingEntry>, from: u64, compact: bool) -> Vec<ReplayI
     out
 }
 
+/// A message, as compaction tracks it: its thread and its id. Ids are not
+/// trusted to be unique across threads — completeness seen under one parent
+/// must never make another parent's deltas skippable.
+type MessageKey = (Option<String>, String);
+
 /// Per ring entry: is it a delta of a message that is complete in the ring?
 /// Looks at the WHOLE ring — a message may have been completed before the
 /// client's cursor while some of its deltas lie after it.
 fn skippable(ring: &VecDeque<RingEntry>) -> Vec<bool> {
     let mut open: HashMap<Option<String>, String> = HashMap::new();
-    let mut member: Vec<Option<String>> = Vec::with_capacity(ring.len());
-    let mut stopped: HashSet<String> = HashSet::new();
-    let mut assembled: HashSet<String> = HashSet::new();
+    let mut member: Vec<Option<MessageKey>> = Vec::with_capacity(ring.len());
+    let mut stopped: HashSet<MessageKey> = HashSet::new();
+    let mut assembled: HashSet<MessageKey> = HashSet::new();
     for e in ring {
         match &e.tag {
             ReplayTag::Stream { parent, start, stop } => {
@@ -132,17 +140,17 @@ fn skippable(ring: &VecDeque<RingEntry>) -> Vec<bool> {
                     // deltas then never count as complete).
                     open.insert(parent.clone(), id.clone());
                 }
-                let m = open.get(parent).cloned();
+                let m = open.get(parent).map(|id| (parent.clone(), id.clone()));
                 if *stop {
-                    if let Some(id) = &m {
-                        stopped.insert(id.clone());
+                    if let Some(key) = &m {
+                        stopped.insert(key.clone());
                     }
                     open.remove(parent);
                 }
                 member.push(m);
             }
-            ReplayTag::Assistant { id } => {
-                assembled.insert(id.clone());
+            ReplayTag::Assistant { parent, id } => {
+                assembled.insert((parent.clone(), id.clone()));
                 member.push(None);
             }
             ReplayTag::Other => member.push(None),
@@ -150,7 +158,7 @@ fn skippable(ring: &VecDeque<RingEntry>) -> Vec<bool> {
     }
     member
         .into_iter()
-        .map(|m| m.is_some_and(|id| stopped.contains(&id) && assembled.contains(&id)))
+        .map(|m| m.is_some_and(|key| stopped.contains(&key) && assembled.contains(&key)))
         .collect()
 }
 
@@ -303,8 +311,45 @@ mod tests {
     }
 
     #[test]
+    fn a_message_id_complete_in_one_thread_never_skips_another_threads_deltas() {
+        // Same message.id under two parents (a forked binary, hostile input or
+        // a protocol change — never trust ids to be unique across threads):
+        // the main thread's copy completes, the sub-agent's is still streaming.
+        let p = Some("toolu_7");
+        let lines = vec![
+            start(p, "dup"),
+            delta(p, "still streaming 1"),
+            start(None, "dup"),
+            delta(None, "main"),
+            assistant(None, "dup", "main"),
+            ev(None, "message_stop"),
+            delta(p, "still streaming 2"),
+        ];
+        let ring = ring_of(&lines);
+        let (cursor, got) = client(&plan(&ring, 0, true), 0);
+        assert_eq!(cursor, lines.len() as u64);
+        // only the main thread's complete message loses its deltas
+        assert_eq!(got, vec![lines[0].clone(), lines[1].clone(), lines[4].clone(), lines[6].clone()]);
+
+        // and a sub-agent's complete message (assistant + stop under ITS
+        // parent) is still compacted
+        let mut lines2 = lines.clone();
+        lines2.extend(vec![assistant(p, "dup", "sub"), ev(p, "message_stop")]);
+        let ring2 = ring_of(&lines2);
+        let (_, got2) = client(&plan(&ring2, 0, true), 0);
+        assert!(!got2.iter().any(|l| l.contains("still streaming")), "the completed sub-agent message kept its deltas");
+    }
+
+    #[test]
     fn tags_are_read_from_real_shapes_and_never_guessed() {
-        assert_eq!(tag("assistant", &assistant(None, "msg_x", "t")), ReplayTag::Assistant { id: "msg_x".into() });
+        assert_eq!(
+            tag("assistant", &assistant(None, "msg_x", "t")),
+            ReplayTag::Assistant { parent: None, id: "msg_x".into() }
+        );
+        assert_eq!(
+            tag("assistant", &assistant(Some("toolu_2"), "msg_x", "t")),
+            ReplayTag::Assistant { parent: Some("toolu_2".into()), id: "msg_x".into() }
+        );
         assert_eq!(
             tag("stream_event", &start(Some("toolu_9"), "msg_y")),
             ReplayTag::Stream { parent: Some("toolu_9".into()), start: Some("msg_y".into()), stop: false }
