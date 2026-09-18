@@ -63,3 +63,32 @@ jobs:
       - name: Tests unitaires Rust
         working-directory: src-tauri
         run: cargo test --lib
+
+  # flightdeckd is a standalone Rust package (own Cargo.toml/Cargo.lock, not a
+  # workspace member of src-tauri — see flightdeckd/docs/MONOREPO-MOVE.md), so
+  # it gets its own job rather than folding into `test` above. ubuntu-latest
+  # on purpose: production flightdeckd instances run on Linux (systemd,
+  # SO_PEERCRED), and that's cheaper than macOS runners for a job that has no
+  # front-end/Tauri work to do.
+  flightdeckd:
+    name: flightdeckd
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./flightdeckd -> target
+          # Own cache key: this crate's Cargo.lock is independent of
+          # src-tauri's, and the two jobs must never share (or fight over) a
+          # cache entry.
+          shared-key: flightdeckd
+
+      - name: Tests (flightdeckd)
+        working-directory: flightdeckd
+        run: cargo test

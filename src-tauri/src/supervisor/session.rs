@@ -4497,7 +4497,7 @@ esac
     /// id (the daemon mints its own on a cold start).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
     ///   cargo test -p tosse-code --lib -- --ignored spawn_with_a_title_sets_it_on_the_m1_daemon --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
@@ -4593,7 +4593,7 @@ esac
     /// daemon kept the session alive and replayed what we missed).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored actor_survives_ssh_cut --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
@@ -4695,7 +4695,7 @@ esac
     /// and still carry a normal turn to completion on the winning candidate.
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored actor_rotates_to_a_live_address_on_the_m1_container --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
@@ -4851,7 +4851,7 @@ esac
     }
 
     /// A structurally VALID but incompressible PNG (`w`×`h`, 8-bit truecolor, random
-    /// noise) — the same technique and purpose as `flightdeck-server/m1-daemon/tests/
+    /// noise) — the same technique and purpose as `flightdeckd/live/m1/tests/
     /// detach_test.py`'s `noise_png` (ported to Rust so the D4 live test below runs
     /// through OUR actor, not the raw protocol), just with the zlib/DEFLATE stream
     /// built as STORED (uncompressed) blocks (RFC 1951 §3.2.4) instead of calling a
@@ -4926,7 +4926,7 @@ esac
     /// (this Mac's reconnect policy already treats `fd_detach{stalled}`/bare-EOF as
     /// reconnect-eligible) + the cursor math, driven through the REAL actor and a
     /// REAL `claude` turn instead of the raw protocol
-    /// (`flightdeck-server/m1-daemon/tests/detach_test.py`'s `scenario_d`, which this
+    /// (`flightdeckd/live/m1/tests/detach_test.py`'s `scenario_d`, which this
     /// ports: same technique, same daemon, now proving OUR client survives it too).
     ///
     /// Flow: attach, start a turn that interleaves small `Bash echo`s with `Read`s of
@@ -4942,7 +4942,7 @@ esac
     /// ids / the DONE marker).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Slow (uploads ~12 MB, pauses
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Slow (uploads ~12 MB, pauses
     /// ~25s+). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored actor_survives_stalled_link_and_replays --nocapture
     #[cfg(unix)]
@@ -4952,8 +4952,8 @@ esac
         use std::io::Write as _;
         use std::time::Duration;
 
-        // The daemon's ATTACH_WRITE_TIMEOUT (flightdeck-server/flightdeckd/src/
-        // session.rs) — how long it keeps trying to write to a stalled client before
+        // The daemon's ATTACH_WRITE_TIMEOUT (flightdeckd/src/session.rs) — how long
+        // it keeps trying to write to a stalled client before
         // dropping it. `+5` matches detach_test.py's own margin.
         const ATTACH_WRITE_TIMEOUT_SECS: u64 = 20;
 

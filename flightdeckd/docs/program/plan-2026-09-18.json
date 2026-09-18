@@ -1,0 +1,1180 @@
+{
+ "overview": "Four workstreams, ordered D \u2192 A \u2192 B \u2192 C per the brief's own priority (cursor bug + onboarding reliability first, installer next, phone last), maximizing parallelism inside that order via a dependency DAG (8 waves below). Every critique's BLOCKING finding is fixed in the plan; MISSING items are folded into the owning task's brief; CROSS_CONFLICTS are resolved by explicit sequencing (not parallel worktrees on the same function) \u2014 the two most dangerous ones: (1) migrate_v12 is owned EXCLUSIVELY by A5 (adds `machines.addresses`); C8's four daemon columns land as migrate_v13, built on top of A5. (2) tosse-code's `run_actor` FdDetach handling is refactored ONCE into a pure `reconnect_policy_for_reason` table by D2 (landing first); A2's \"daemon_missing\" reason and B/C's later work are just table entries added on top, never a second hand-edit of the match. flightdeck-server's `attach.rs`/`session.rs` are touched by D1 first, then B1 (tiny, version field only), then C1-C3 last \u2014 sequenced, not concurrent. Genuinely broken designs from the critiques are corrected, not just re-specified: B's SUDO_ASKPASS (can't run a Mac-local helper on the remote host) is replaced with piping the captured password to `sudo -S` over the same already-open SSH stdin; B's BatchMode=yes vs SSH_ASKPASS contradiction is resolved with a dedicated non-batch bootstrap SSH call (SSH_ASKPASS_REQUIRE=force); B's config.json race gets a real cross-process file lock, not an in-process mutex that can't span the separate `flightdeckd init` CLI process; C's relay POST /nodes gets its OWN rate limiter instead of poisoning the shared WS auth throttle on legitimate empty polls; C's regenerate-pairing flow now actually revokes the old token everywhere (today it's a silent no-op, verified); D's replay-compaction (fd_skip) is deliberately parked, built but permanently dead-switched-off, until A1's daemon-version probe exists to gate it safely. flightdeck-server is confirmed on Armand's PERSONAL `clousty8` GitHub account \u2014 B's private-binary-distribution design inherits the same bus-factor problem it explicitly rejected in the public-repo alternative; flagged as a real decision, not silently accepted. Estimated total: ~4 weeks D+A core reliability, ~2.5 weeks B installer, ~2 weeks C phone \u2014 with A/D/most of B parallelizable across 2-3 concurrent worktrees/conversations.",
+ "waves": [
+  [
+   "D1",
+   "D2",
+   "D5",
+   "A1",
+   "A3",
+   "A4",
+   "B0",
+   "B1",
+   "B4",
+   "B5",
+   "B6",
+   "C4",
+   "C5"
+  ],
+  [
+   "D3",
+   "D6",
+   "A2",
+   "A5",
+   "A7",
+   "B2",
+   "B7",
+   "B10",
+   "C1",
+   "C6"
+  ],
+  [
+   "D4",
+   "A6",
+   "B3",
+   "C2",
+   "C3",
+   "C8"
+  ],
+  [
+   "A8",
+   "B8",
+   "C7",
+   "C9",
+   "C10"
+  ],
+  [
+   "B9",
+   "C11",
+   "C12a"
+  ],
+  [
+   "B11",
+   "C12b"
+  ],
+  [
+   "B12",
+   "C12c"
+  ],
+  [
+   "B13",
+   "C13"
+  ]
+ ],
+ "tasks": [
+  {
+   "id": "D1",
+   "title": "Bounded attach write-timeout + fd_detach{stalled}",
+   "workstream": "D - cursor anomaly",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 1,
+   "brief": "Root cause of the cursor incident: attach.rs::handle_conn's writer (~146-161) does an unbounded write_all/flush to the attach client's socket, so a degraded-but-alive link blocks the write forever \u2014 self.attached stays Some, the daemon queues every new line, no fd_detach is ever sent, and byte-budget CLIENT_QUEUE_BYTES_MAX (128MiB) never trips on small stream_event deltas. Add `pub(crate) const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_secs(20)` near CLIENT_QUEUE_BYTES_MAX/RING_BYTES_MAX in session.rs. Wrap the writer's write_all/flush in `tokio::time::timeout(ATTACH_WRITE_TIMEOUT, ...)`. On timeout: best-effort ONE short (2s) write of `frames::fd_detach(\"stalled\", None)` (skip on a hard non-timeout write error \u2014 pipe's already gone), then break exactly as today's error path does \u2014 this naturally nulls self.attached via the actor's next push() failing, zero session.rs state-machine changes needed. Add `fd_skip`-adjacent doc: extend fd_detach's reason doc comment in frames.rs to document \"stalled\" = daemon gave up on a non-responsive write, session still alive, client should reconnect \u2014 and update tosse-code's mirrored FdDetachMsg doc comment (protocol.rs) in the SAME PR/commit since they're a matched pair (do this half here even though the Rust enum is in tosse-code \u2014 a one-line comment edit, list it as a note for whoever lands D2). Do NOT modify the client-facing wire shape of fd_detach itself.",
+   "tests": [
+    "Unit: tokio::net::UnixStream::pair() \u2014 feed the writer-task logic one end, never read the other, assert the write attempt errors/gives up within ATTACH_WRITE_TIMEOUT+slack instead of hanging (deterministic, no ssh/daemon/network, non-ignored).",
+    "Unit: fd_detach(\"stalled\", None) shape round-trips; is_replayable_line(fd_skip-adjacent stalled frame)==false already true by construction, add an explicit assertion.",
+    "Existing client_queue_kills_stalled_clients and other session.rs tests remain green unmodified."
+   ],
+   "acceptance": [
+    "A daemon-side attach write that cannot complete within 20s causes the daemon to give up on that client within one timeout window and best-effort send fd_detach{reason:\"stalled\"}.",
+    "No change to behavior for any write that completes normally."
+   ]
+  },
+  {
+   "id": "D2",
+   "title": "tosse-code: reconnect-policy refactor + reader_loop parse-order fix",
+   "workstream": "D - cursor anomaly",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 1,
+   "brief": "Two independent, bundled fixes in src-tauri/src/supervisor/session.rs and transport.rs. (1) Extract run_actor's inline FdDetach reason handling (session.rs ~576-619, the `match d.reason.as_str() {...}` plus the unconditional `no_reconnect = Some(d.reason)`) into a pure, unit-testable `fn reconnect_policy_for_reason(reason: &str) -> (Option<String> /*notice message*/, bool /*terminal \u2014 stop reconnecting*/)`. Table: \"exited\"->(Some(msg),true), \"replaced\"->(Some(\"Another client took over this remote session.\"),true), \"stopped\"->(None,true), \"stalled\"->(Some(\"Connection stalled \u2014 reconnecting\u2026\"),false), everything else incl. today's \"error\"->(Some(msg),true) \u2014 i.e. ONLY \"stalled\" is reconnect-eligible; every other/unknown reason keeps EXACT current terminal behavior. This table is the shared extension point later tasks (A2's \"daemon_missing\") add ONE line to, never a second hand-edit of run_actor's match. Wire it into run_actor exactly where the old inline match was. (2) reader_loop (transport.rs ~824-841) currently does `lines_seen.fetch_add(1,...)` for any is_replayable_line(trimmed) line BEFORE attempting `serde_json::from_str::<CliMessage>` \u2014 a replayable-typed line that fails to parse is silently counted as delivered but never actually forwarded/rendered, permanently lost (never replayed). Move the increment inside the `Ok(msg) => {...}` success arm only.",
+   "tests": [
+    "Table-driven unit test over reconnect_policy_for_reason: all 4 named reasons + one unknown reason, asserting exact (message, terminal) pairs \u2014 the direct regression test for 'stalled' becoming the first non-terminal reason.",
+    "transport.rs unit (tokio::io::duplex(), feed two lines: one well-formed replayable + one replayable-typed-but-malformed): assert lines_seen==1 not 2, no process spawn needed."
+   ],
+   "acceptance": [
+    "FdDetach{reason:\"stalled\"} does not stop the actor's reconnect loop; every other current reason (exited/replaced/stopped/error) is byte-for-byte unchanged.",
+    "A replayable-typed line that fails to deserialize is not counted toward lines_seen and is therefore replayed on next reconnect instead of lost."
+   ]
+  },
+  {
+   "id": "D3",
+   "title": "m1-daemon SIGSTOP Scenario D fixture + test",
+   "workstream": "D - cursor anomaly",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [
+    "D1"
+   ],
+   "estimate_days": 1,
+   "brief": "m1-daemon/tests/detach_test.py is ONE monolithic stateful main() sharing one conv/epoch/connection across print-labeled A/B/C sections (not independent pytest functions); its `Attach` helper only exposes kill() (SIGKILL). Extend `Attach` with access to the local ssh child's PID (or pause()/resume() wrapping os.kill(pid, SIGSTOP)/SIGCONT). Add Scenario D on its OWN, independent throwaway conversation (do NOT reuse A/B/C's shared conv/epoch \u2014 avoids interfering with Scenario C's end-of-run alive-check). Flow: attach normally, start a turn producing a rapid burst of small tool calls, SIGSTOP the ssh child mid-burst (link stalled-but-alive, not dead), wait ATTACH_WRITE_TIMEOUT+margin (~25s) while daemon-side output keeps accumulating, SIGCONT, read the next lines from the now-resuming stdout pipe. Assert the FIRST thing read after resume is fd_detach{reason:\"stalled\"}, not a giant buffered backlog dump \u2014 proves the daemon gave up early rather than queuing the whole outage.",
+   "tests": [
+    "Scenario D itself (see brief) \u2014 passes against D1's fix, and would hang/timeout against pre-D1 code (verify this negative case manually once, don't need to keep it in CI)."
+   ],
+   "acceptance": [
+    "Scenario D passes locally against the m1 container; existing Scenarios A/B/C remain green and unaffected by Scenario D's independent conversation."
+   ]
+  },
+  {
+   "id": "D4",
+   "title": "tosse-code live regression: actor survives a stalled (not dead) link",
+   "workstream": "D - cursor anomaly",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "D1",
+    "D2",
+    "D3"
+   ],
+   "estimate_days": 1,
+   "brief": "New #[ignore] live test in src-tauri/src/supervisor/session.rs, sibling to the existing actor_survives_ssh_cut_and_replays: actor_survives_stalled_link_and_replays. Against the real m1 test container (same fixture family D3 extends), start a bursty turn, SIGSTOP (not pkill -9) the local ssh attach child for ~25s while daemon-side output accumulates, SIGCONT it, assert the turn completes with the correct final result and no duplicate/garbled content in the assembled transcript. This is the end-to-end proof of D1 (daemon timeout+stalled) + D2 (Mac treats \"stalled\" as reconnect-eligible) + the pre-existing (already-correct, per investigation) cursor math working together.",
+   "tests": [
+    "actor_survives_stalled_link_and_replays (see brief)."
+   ],
+   "acceptance": [
+    "Full path (daemon write-timeout \u2192 fd_detach{stalled} \u2192 Mac reconnect-eligible handling \u2192 cursor math) verified end-to-end against a real container; zero duplicate/dropped lines in the final transcript."
+   ]
+  },
+  {
+   "id": "D5",
+   "title": "[PARKED \u2014 decision-gated] flightdeck-server: fd_skip replay compaction (dead-off by default)",
+   "workstream": "D - cursor anomaly",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 1.5,
+   "brief": "Bandwidth optimization, built but never wired live until A1's daemon-version probe exists (see decision). Add `supports_skip: bool` to AttachReq/attach's on_attach signature (session.rs ~840-881): when true, replay via a NEW pure `fn compact_replay(ring: &[(u64,String)], effective_from: u64) -> Vec<ReplayLine>` (ReplayLine = Line(u64,String) | Skip(u64)); when false (default, every current client), byte-for-byte identical to today. Algorithm: walk the ring tracking open stream_event spans keyed by parent_tool_use_id; forward message_start and content_block_start lines always (needed for tool_use id/name + the assembler's Skill-arm timing \u2014 never compact these); for a CLOSED span (message_stop seen at some LATER point in the ring, i.e. NOT the trailing still-open span at ring end), buffer content_block_delta/content_block_stop/message_delta/message_stop into ONE fd_skip(K) instead of forwarding them; a TRAILING open span (client joining mid-turn) is forwarded fully uncompacted, always. CRITICAL fix over the original design (flagged blocking by review): K must count ONLY elided lines with seq > effective_from, never the whole span \u2014 otherwise a reattach landing inside an already-partially-delivered closed span inflates the client's credited lines_seen past the daemon's true seq, and on_attach's `req.cursor.min(self.seq)` silently clamps it down on the NEXT reattach, causing a permanent silent gap (the exact bug class this workstream exists to fix). Add `pub fn fd_skip(lines: u64) -> String` to frames.rs. Add `--supports-skip` flag to `flightdeckd attach` CLI (main.rs) and `AttachParams.supports_skip` (attach.rs), but nothing in this task calls it with true \u2014 it lands fully inert.",
+   "tests": [
+    "compact_replay_elides_deltas_keeps_content_block_start_and_assistant \u2014 hand-built ring adapted from src-tauri/src/supervisor/fixtures/capture_text.jsonl, asserts message_start/content_block_start/assistant/result kept, deltas+stop lines collapsed into one fd_skip.",
+    "compact_replay_never_compacts_trailing_open_span \u2014 a ring ending mid-turn (no message_stop yet) is forwarded fully uncompacted.",
+    "compact_replay_effective_from_inside_closed_span \u2014 NEW, the boundary-fix test: reattach with effective_from landing strictly inside an already-partially-delivered closed span; assert the resulting fd_skip count equals only elided lines with seq>effective_from, and the post-replay cursor exactly equals the daemon's seq for that window (no drift)."
+   ],
+   "acceptance": [
+    "supports_skip=false path is byte-for-byte identical to pre-existing replay in every case.",
+    "No live wire path passes supports_skip=true yet \u2014 feature is dead code until D6+A1 wire it."
+   ]
+  },
+  {
+   "id": "D6",
+   "title": "[PARKED \u2014 decision-gated] tosse-code: FdSkip parsing + gate --supports-skip on A1's daemon-version probe",
+   "workstream": "D - cursor anomaly",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "D5",
+    "A1"
+   ],
+   "estimate_days": 0.5,
+   "brief": "Add `CliMessage::FdSkip(FdSkipMsg{lines:u64})` to protocol.rs (registered in the type-tag match/kind() like FdAttach/FdDetach). transport.rs reader_loop: on successful FdSkip parse, credit `lines_seen.fetch_add(msg.lines, Relaxed)` (same accounting as any replayable line) and forward it; session.rs run_actor: `Some(CliMessage::FdSkip(_)) => {}` (no-op \u2014 counting already happened in transport.rs, this just avoids core.on_message logging an unmodeled-message warning). ONLY pass `--supports-skip` to the remote `flightdeckd attach` invocation (build_remote_command) when A1's daemon-version probe (this program's task A1) has confirmed the target daemon is new enough to understand the flag \u2014 there is NO version negotiation on this wire, so passing it to an older daemon makes clap reject the whole attach command and breaks that server's sessions outright. Until that gate exists this task should NOT flip the flag on for anyone.",
+   "tests": [
+    "FdSkip parses `{\"type\":\"fd_skip\",\"lines\":7}` and reader_loop credits lines_seen by 7 (tokio::io::duplex fixture, no process spawn).",
+    "Gate test: build_remote_command never emits --supports-skip when the probed daemon version predates the flag; emits it when confirmed new enough."
+   ],
+   "acceptance": [
+    "Feature ships enabled ONLY against daemons whose version was explicitly confirmed via A1's probe; every other server keeps today's exact replay behavior."
+   ]
+  },
+  {
+   "id": "A1",
+   "title": "probe_remote: flightdeckd presence+version check, combined with the claude check",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 1,
+   "brief": "src-tauri/src/ipc/commands.rs::probe_remote (~3315-3359) today runs ONE ssh round-trip: `command -v claude >/dev/null 2>&1 && claude --version || { echo FLIGHTDECK_NO_CLAUDE >&2; exit 3; }`. That `exit 3` is NOT inside a subshell \u2014 it terminates the whole remote script \u2014 so simply appending a second flightdeckd check after it would never run when claude is ALSO missing (verified: this is the actual current script). Fix: restructure into an ACCUMULATING script \u2014 two independent `if ! command -v X >/dev/null 2>&1; then MISSING=\"$MISSING X\"; fi`-style checks feeding ONE final combined exit/stderr-marker report \u2014 so 'neither present' reports BOTH, not just claude. Add `command -v flightdeckd >/dev/null 2>&1 && flightdeckd --version` similarly, new exit code 4 / stderr marker FLIGHTDECK_NO_DAEMON. Add `const MIN_DAEMON_VERSION: &str = \"0.1.0\"` + pure `fn version_at_least(v: &str, min: &str) -> bool` (parse the LAST whitespace-separated token of clap's `<name> <version>` output \u2014 not a hardcoded prefix strip, so a future --version format tweak degrades to 'malformed \u2192 0.0.0 \u2192 outdated message' rather than a garbled panic). CHANGE probe_remote's return type from `Result<String,String>` to a new typed `pub struct RemoteProbeResult { claude_version: Option<String>, claude_missing: bool, flightdeckd_version: Option<String>, flightdeckd_missing: bool, flightdeckd_outdated: bool }` \u2014 deliberately designed as the exact base B7 later extends with one more field (`conflict`) rather than rewrites, avoiding a signature collision. Wire into add_machine: missing/outdated flightdeckd blocks pairing with a message naming it specifically (decision: hard-block default, see decisions_for_user \u2014 ships with this default).",
+   "tests": [
+    "version_at_least(\"0.1.0\",\"0.1.0\")==true; (\"0.0.9\",\"0.1.0\")==false; (\"0.2.0\",\"0.1.0\")==true; malformed strings default to 0-parts.",
+    "Integration (local test sshd fixture, existing m1 pattern): target with neither claude nor flightdeckd \u2192 error names BOTH; claude present+flightdeckd absent \u2192 error names flightdeckd; flightdeckd outdated \u2192 distinct version-specific message; both present+current \u2192 Ok."
+   ],
+   "acceptance": [
+    "Pairing a box missing BOTH claude and flightdeckd reports both in one shot, not a two-step surprise.",
+    "Pairing a box with an outdated flightdeckd fails with a version-specific message distinguishable from 'missing entirely'."
+   ]
+  },
+  {
+   "id": "A2",
+   "title": "run_actor: fast-fail when the remote daemon binary is missing",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "D2"
+   ],
+   "estimate_days": 0.75,
+   "brief": "Today, if flightdeckd simply isn't on PATH, run_actor's remote reconnect loop retries FOREVER on one generic 'Connection to the server lost \u2014 reconnecting\u2026' notice (no FdDetach is ever produced by a spawn failure, so the existing exit check never fires). Add a narrow, HARD-precondition classifier in session.rs: `fn looks_like_missing_daemon(exit_code: Option<i32>, stderr_tail: &[String]) -> bool` requires BOTH exit_code==Some(127) AND the last non-empty stderr line contains \"flightdeckd\" case-insensitively (anchored to the invoked command name, not a generic 'command not found'/'no such file' substring match \u2014 a review found the original looser design would false-positive on unrelated remote-shell noise like MOTD or dotfile errors on a real Ubuntu box, permanently killing a retryable blip). In run_actor: capture `had_attach` before the existing shutdown block; when `!had_attach`, call transport.wait_status()+stderr_tail(), and if looks_like_missing_daemon, add \"daemon_missing\" as ONE new entry to D2's `reconnect_policy_for_reason` table (message: \"flightdeckd isn't installed / isn't on PATH on the server \u2014 install it, then reopen this conversation\", terminal=true) instead of hand-editing run_actor's match again \u2014 this is the load-bearing reason D2 must land first.",
+   "tests": [
+    "looks_like_missing_daemon(Some(127), [\"bash: flightdeckd: command not found\"])==true.",
+    "looks_like_missing_daemon(Some(127), [\"sl: command not found\"]) (unrelated command, same exit code)==false \u2014 the direct regression test for the false-positive risk the review flagged.",
+    "looks_like_missing_daemon(None, [\"bash: flightdeckd: command not found\"])==false (no exit-code precondition met \u2014 required per the fix, not optional).",
+    "looks_like_missing_daemon(Some(255), [\"Permission denied (publickey)\"])==false."
+   ],
+   "acceptance": [
+    "A conversation whose remote daemon binary can't be found ends within a few seconds with one clear notice, instead of retrying forever with no explanation.",
+    "Every other failure mode (network blips, auth failures, unrelated shell noise) keeps today's infinite-backoff-with-generic-notice behavior exactly."
+   ]
+  },
+  {
+   "id": "A3",
+   "title": "One dedicated SSH key per server: reuse, claim-on-pair, cleanup-on-delete, concurrency-safe",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 1,
+   "brief": "generate_machine_key (commands.rs 3266-3310) currently mints a fresh `{slug}-{uuid4}` keypair on EVERY call \u2014 7 keys were generated pairing one server. Fix: write to a FIXED `ssh_keys/pending` / `pending.pub` path; if it already exists, read and return it instead of running ssh-keygen again (label only feeds the `-C` comment). Guard the whole function with a module-level `static PENDING_KEY_LOCK: tokio::sync::Mutex<()>` (or an atomic create_new-style check) to remove the concurrent-double-click race the fixed filename introduces (the old unique-filename design was accidentally immune to this; the new one isn't). On add_machine success (3367-3404): rename `pending`(`.pub`) to `ssh_keys/<machine_id>`(`.pub`), use as identity_file. delete_machine (3406-3411): read the MachineRecord BEFORE calling store.delete_machine, best-effort `std::fs::remove_file` both key files (fixes the permanent orphan leak \u2014 Store::delete_machine today is SQL-only). Front-end fix (ControlSection.tsx, the `genKey` React state set once per startAdd() ~268-269): clear it immediately after a successful pair() call, so a plausible 'paste the same command to two boxes before pairing either' workflow can't resubmit a now-claimed/renamed identity_file path; backend belt-and-suspenders: if add_machine's identity_file arg doesn't exist on disk, return a SPECIFIC error (\"This pairing command was already used \u2014 click + Add a server again for a fresh one.\") instead of a generic SSH failure.",
+   "tests": [
+    "generate_machine_key called twice with no add_machine in between returns byte-identical public_key both times, exactly one file pair created (tmp app-data-dir fixture).",
+    "Concurrent generate_machine_key calls (spawn two futures) \u2014 no ssh-keygen overwrite-prompt hang, both return the same result.",
+    "add_machine success renames pending(.pub) to <machine_id>(.pub); a SUBSEQUENT generate_machine_key call mints a FRESH pending pair.",
+    "delete_machine removes both key files when identity_file is Some; no-op/no-panic when None or already missing.",
+    "add_machine with a nonexistent identity_file path returns the specific 'already used' message, not a generic SSH error."
+   ],
+   "acceptance": [
+    "Reopening '+ Add a server' without pairing shows the IDENTICAL command (same pubkey); at most one new key file pair for the whole session.",
+    "'Remove' deletes both key files from disk (verified via ssh_keys/ listing before/after)."
+   ]
+  },
+  {
+   "id": "A4",
+   "title": "One-line pairing command + Tailscale/LAN address discovery in the ticket",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 0.75,
+   "brief": "src/features/settings/ControlSection.tsx. serverCommand (~276-286): change `.join(\"\\n\")` to `.join(\"; \")` \u2014 pure syntax-preserving (every statement already self-terminated, no set -e) \u2014 this is the likely root cause of 'never printed the ticket': a dumb/serial paste target submitting each newline-separated 'line' as its own Enter can leave an unterminated quote/subshell open, silently swallowing everything after. Add a flightdeckd-presence check to the script mirroring the existing claude one. Add address discovery: prefer `tailscale status --json`'s DNSName, fall back to existing LAN-IP/$SSH_CONNECTION logic, then hostname; embed the full discovered set as `addresses: [{kind,value}]` in the ticket JSON alongside the existing `host` (kept as addresses[0].value for back-compat with old parsers). parseTicket (~203-219): return `addresses` too, defaulting to `[{kind:\"manual\", value: t.host}]` when absent (old-ticket tolerance). pair() (~308-321): thread addresses through to addMachine (the addMachine call itself accepts it starting from A5 \u2014 this task should pass it as a prop/param even before A5's backend param lands, since the two are independent front/back halves of the same feature).",
+   "tests": [
+    "serverCommand's rendered string contains zero real `\\n` characters (only literal `\\\\n` inside printf format strings, which must not collapse) \u2014 direct regression test for the join fix.",
+    "parseTicket parses a ticket WITH addresses into the multi-candidate shape, and one WITHOUT it (old format) synthesizes a single manual candidate from host \u2014 no crash."
+   ],
+   "acceptance": [
+    "The command shown is one paste-able line, no line breaks except inside printf's own \\n escapes.",
+    "A machine paired on a box with active Tailscale stores its MagicDNS name ahead of its LAN IP in the discovered set."
+   ]
+  },
+  {
+   "id": "A5",
+   "title": "Schema + backend: persisted address list (owns migrate_v12)",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A1",
+    "A3"
+   ],
+   "estimate_days": 1.25,
+   "brief": "src-tauri/src/store/model.rs: add `pub enum AddressKind {Tailscale,Lan,Public,Manual}` + `pub struct AddressCandidate{kind,value}` (Serialize/Deserialize/Type); MachineRecord gains `pub addresses: Vec<AddressCandidate>` (defaults to vec![] on NULL/unparseable JSON, never an error). db.rs: NEW `migrate_v12` \u2014 `add_column_if_absent(conn,\"machines\",\"addresses\",\"ALTER TABLE machines ADD COLUMN addresses TEXT\")`; SCHEMA_VERSION 11\u219212; append to MIGRATIONS (the file's own `assert!(MIGRATIONS.len()==SCHEMA_VERSION as usize)` will fail to compile if these two drift \u2014 THIS TASK OWNS v12 EXCLUSIVELY; workstream C's later daemon-metadata columns land as migrate_v13 on top of this, never a competing v12). machine_by_id/machine_for_repo_path: SELECT+JSON-decode the column (empty vec on NULL/decode error). upsert_machine: JSON-encode addresses in both INSERT and ON CONFLICT UPDATE. commands.rs: new pure `fn address_probe_order(candidates) -> Vec<AddressCandidate>` (tailscale > lan > public > manual, stable/idempotent), add_machine gains an `addresses: Vec<AddressCandidate>` param, probes in that order via A1's extended probe (first success wins, persisted as `host`; full list as `addresses`); spawn_session builds `RemoteTarget.addresses` the SAME way, de-duplicated with `machine.host` kept first. CRITICAL invariant (review-flagged): the construction MUST guarantee `RemoteTarget.addresses` is never empty even for a pre-migration/NULL-addresses row \u2014 construct as `if addresses.is_empty() { vec![host.clone()] } else { addresses }` at this ONE site, not left to prose convention. Front: Machine interface (conversationsStore.ts ~125-135) gains `addresses`; recordToMachine/addMachine forward it. Regenerate bindings.ts.",
+   "tests": [
+    "address_probe_order sorts a shuffled input to [tailscale,lan,public,manual], stable/idempotent on a partial list.",
+    "upsert_machine with non-empty addresses round-trips through machine_by_id/machine_for_repo_path; a pre-migration NULL-addresses row reads back as empty Vec, never errors.",
+    "RemoteTarget.addresses has >=1 entry for a machine with zero recorded addresses (the review-flagged invariant test) \u2014 never indexes past a single-element list downstream."
+   ],
+   "acceptance": [
+    "A machine paired with a Tailscale name stores it ahead of its LAN IP.",
+    "No pre-existing machine row (empty addresses) can produce a RemoteTarget with zero candidate addresses."
+   ]
+  },
+  {
+   "id": "A6",
+   "title": "Runtime address rotation on sustained reconnect failure, persisted",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A5",
+    "A2"
+   ],
+   "estimate_days": 1,
+   "brief": "transport.rs: RemoteTarget gains `pub addresses: Vec<String>` (doc: priority-ordered candidates; build_remote_command/run_remote_stop/Transport::spawn's ssh invocation stay UNCHANGED \u2014 they only ever read `remote.host`, which the reconnect loop mutates before each retry). session.rs run_actor: track `addr_idx: usize` (init from cfg.remote.host's position in cfg.remote.addresses, else 0) and `sustained_failures: u32` alongside the existing `delay`; increment on every attempt that fails to reach fd_attach (mirrors the existing had_attach/Transport::spawn-Err signals); after crossing a small threshold (e.g. addresses.len() attempts against the SAME candidate) with a next candidate available, advance addr_idx and mutate `cfg2.remote.as_mut().unwrap().host = addresses[addr_idx].clone()`, reset the sub-counter. Touches the reconnect loop D2 already refactored and A2 already extended \u2014 land AFTER both (this task's dependency order) so it's one more incremental edit to an already-stabilized region, not a third concurrent hand-edit. FIX over the original design (review-flagged): a rotation that succeeds must PERSIST the winning address back to `machines.host` via a new `store.set_machine_preferred_host(id, host)` call (db.rs, simple UPDATE) \u2014 otherwise every future spawn for that machine keeps re-trying the dead preferred address first and re-paying the backoff before rotating, every single session, forever. Defense-in-depth: guard `addresses[addr_idx]` indexing against an empty list even though A5 already guarantees non-empty upstream.",
+   "tests": [
+    "RemoteTarget with addresses=[bad-host, real-host] against the real m1 container: actor eventually reconnects via the SECOND candidate; existing replay/dedup invariant holds (no duplicate/missing lines) \u2014 direct proof rotation doesn't corrupt cursor math (address-agnostic by construction: same daemon/conversation/seq regardless of which address reached it).",
+    "set_machine_preferred_host round-trips through machine_by_id.",
+    "A rotation never indexes past a single-element addresses list (defense-in-depth test)."
+   ],
+   "acceptance": [
+    "Killing reachability to the currently-preferred address (second candidate still reachable) reconnects via the second candidate after a bounded number of failed attempts, no duplicated/dropped lines in the transcript.",
+    "The NEXT spawn for that machine starts from the address that actually worked last time, not the original dead one."
+   ]
+  },
+  {
+   "id": "A7",
+   "title": "[Optional, decision-gated] orphan ssh_keys/ sweep",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A3"
+   ],
+   "estimate_days": 0.5,
+   "brief": "Cleans up the pre-existing 7-key leak (pre-A3 keys named `{slug}-{uuid}`) without a manual rm. On first generate_machine_key call per app run, list ssh_keys/ and remove any file that is neither pending/pending.pub nor referenced by any current machines.identity_file, with mtime older than 1h (grace window against a mid-flight rename race). Only build this if Armand confirms he wants it automated vs. a manual one-off cleanup on his machine (see decisions_for_user) \u2014 do not ship silently.",
+   "tests": [
+    "A directory with an unreferenced key older than 1h is swept; one younger than 1h is NOT swept; pending/pending.pub and every currently-referenced identity_file are NEVER touched regardless of age."
+   ],
+   "acceptance": [
+    "Old, unclaimed, unreferenced key files older than 1h are removed on the next app launch; nothing live is ever touched."
+   ]
+  },
+  {
+   "id": "A8",
+   "title": "Workstream A integration pass",
+   "workstream": "A - onboarding reliability",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6"
+   ],
+   "estimate_days": 0.5,
+   "brief": "Regenerate bindings.ts (cargo test --lib export_bindings_regenerates_ts_client), full cargo test --lib, vitest run, tsc --noEmit. Then a manual pairing run against the real test box (ssh -i ~/.ssh/flightdeck_box_ed25519 -o IdentitiesOnly=yes josty@josty-cc) to VERIFY the probe/version-check output shape and address discovery \u2014 READ-ONLY, never install/modify anything on that box.",
+   "tests": [
+    "Full test suite green across both languages.",
+    "Manual verification checklist against josty-cc, read-only."
+   ],
+   "acceptance": [
+    "All of workstream A's acceptance criteria hold together, not just per-task."
+   ]
+  },
+  {
+   "id": "B0",
+   "title": "Spike: cross-compile flightdeckd to musl (x86_64 + aarch64)",
+   "workstream": "B - installer",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 0.5,
+   "brief": "Gates the entire binary-distribution design (nothing today in this repo builds musl; only Docker is installed, no cross toolchain). Confirm `cross build --release --target x86_64-unknown-linux-musl` and `--target aarch64-unknown-linux-musl` link cleanly given rusqlite(bundled)+rustls/ring. Record binary sizes. If ring's asm fails on aarch64-musl, identify and record the fallback (e.g. a non-asm crypto provider swap) \u2014 this is a go/no-go spike, produce a written verdict + concrete next step either way.",
+   "tests": [
+    "Both target builds succeed and the resulting binaries' own `flightdeckd status`-style smoke commands run locally under an appropriate emulator/VM for the foreign arch."
+   ],
+   "acceptance": [
+    "A clear go/no-go verdict for musl cross-compilation exists before any downstream binary-distribution task starts."
+   ]
+  },
+  {
+   "id": "B1",
+   "title": "fd_status gains a version field",
+   "workstream": "B - installer",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 0.25,
+   "brief": "frames.rs `fd_status` + attach.rs `status_client`: add `version: String` = `env!(\"CARGO_PKG_VERSION\")`. Used later by bootstrap::diagnose (B11) for live version-skew detection over the Unix-socket attach protocol \u2014 distinct from A1's SSH-exec `flightdeckd --version` CLI check, no conflict.",
+   "tests": [
+    "fd_status JSON output's version field equals env!(\"CARGO_PKG_VERSION\"); round-trips through status_client."
+   ],
+   "acceptance": [
+    "A connected client can read the running daemon's version via fd_status."
+   ]
+  },
+  {
+   "id": "B2",
+   "title": "CI: cross-build + publish flightdeckd on this private repo's own releases",
+   "workstream": "B - installer",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [
+    "B0"
+   ],
+   "estimate_days": 0.5,
+   "brief": "New .github/workflows/build-daemon.yml (repo has no CI today): on a `flightdeckd-v*` tag, cross-build both musl targets (per B0's confirmed toolchain), strip+lto (existing [profile.release]), publish as assets on THIS SAME PRIVATE repo's own GitHub release \u2014 explicitly NOT a new public repo (rejected: supply-chain regression, contradicts 'server never needs GitHub' preference, and \u2014 per decision #14 \u2014 the repo is already on a personal account, a second one would compound that).",
+   "tests": [
+    "Manual: tag a test version, confirm the workflow produces two correctly-named release assets."
+   ],
+   "acceptance": [
+    "A tagged flightdeckd release produces both musl binaries as downloadable private-repo release assets."
+   ]
+  },
+  {
+   "id": "B3",
+   "title": "tosse-code: bundle prebuilt flightdeckd binaries into the app; verify signing",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B2"
+   ],
+   "estimate_days": 1,
+   "brief": "tauri.conf.json: add `bundle.resources` mapping `resources/flightdeckd/<target>/flightdeckd` for both targets. release.yml: new step before tauri-action build \u2014 fetch the two flightdeckd-<target> release assets from flightdeck-server's PRIVATE releases via a fine-grained PAT secret (ownership TBD, see decision #14 \u2014 this task can be built and spiked with a manually-placed binary before that's resolved) into src-tauri/resources/flightdeckd/<target>/flightdeckd; never committed to git. Run a REAL `tauri build` + `codesign --verify --deep` locally to clear the foreign-arch-ELF-inside-a-codesigned-bundle risk EARLY \u2014 this is empirically unverified in this repo and gates every later step that assumes bundled resources work.",
+   "tests": [
+    "A real local build with a manually-placed dummy flightdeckd binary in resources/ passes codesign --verify --deep."
+   ],
+   "acceptance": [
+    "A signed .app bundle containing both foreign-arch Linux ELF binaries passes macOS codesign verification."
+   ]
+  },
+  {
+   "id": "B4",
+   "title": "bootstrap/templates.rs: pure unit/service/sudo-escalation text generators",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 0.75,
+   "brief": "New src-tauri/src/bootstrap/templates.rs: pure fns `render_user_unit(home) -> String`, `render_system_unit() -> String`, `render_persistence_escalation(user) -> String` \u2014 single source of truth for every generated unit-file/shell text this workstream produces. render_persistence_escalation's scope is narrowed (per the resolved sudo design) to EXACTLY `loginctl enable-linger \"$user\" && systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target` \u2014 daemon install itself needs no sudo at all. Reuse the existing `shq()` shell-quoting helper for the username interpolation.",
+   "tests": [
+    "Golden-string tests for all three renderers.",
+    "A shell-metacharacter-in-username case (e.g. a user named with a space or `$()`) run through shq() and asserted safe."
+   ],
+   "acceptance": [
+    "Every generated unit/shell string in this workstream comes from these three pure functions, nowhere else."
+   ]
+  },
+  {
+   "id": "B5",
+   "title": "bootstrap/askpass.rs: local SSH_ASKPASS relay for the ONE interactive login password",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [],
+   "estimate_days": 1,
+   "brief": "SCOPED FIX (review-flagged): this module handles ONLY the local SSH client's own login-password prompt \u2014 a password entered locally in the Tauri GUI that the LOCAL ssh process needs, which is a legitimate SSH_ASKPASS use case. It does NOT attempt to relay a sudo password to the remote host (that's architecturally broken \u2014 sudo executes ON THE SERVER, a Mac-local helper program can't run there; see B9's stdin-piping design instead). Every other SSH call in this codebase hardcodes `-o BatchMode=yes`, which disables password prompts entirely \u2014 the bootstrap's FIRST connection (before a key is installed) needs the opposite. Implementation: per-call mkfifo-based SSH_ASKPASS relay (0700 dir, fifo removed on every exit path: success/error/timeout via Drop). The bootstrap's initial SSH invocation deliberately OMITS BatchMode=yes (documented as an intentional, isolated divergence from every other ssh call in this repo) and sets `SSH_ASKPASS_REQUIRE=force` (required because a Tauri GUI process has no DISPLAY, and OpenSSH only invokes SSH_ASKPASS when DISPLAY is set unless this override is present \u2014 verified against the installed OpenSSH 10.3p1). Password never touches argv, disk, or a regular file.",
+   "tests": [
+    "AskpassGuard/fifo removes its dir+fifo on Drop in every branch (success/error/timeout/early-return via ?).",
+    "grep every Result<_,String> error string this module can produce for the literal test password \u2014 must never appear (mirrors the repo's existing session_gone_errors_keep_the_wording_the_front_matches_on discipline)."
+   ],
+   "acceptance": [
+    "A real password-only SSH login succeeds through this path where every other BatchMode=yes call in the codebase would fail with 'Permission denied' and no prompt."
+   ]
+  },
+  {
+   "id": "B6",
+   "title": "4 live-test fixtures: non-root+sudo, root, pre-seeded conflict, no-sudo-at-all",
+   "workstream": "B - installer",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 1.5,
+   "brief": "The existing m0-ssh-remote/Dockerfile is deliberately hardened (PasswordAuthentication no, no sudo installed) \u2014 wrong base for password-driven fixtures; a materially different image is needed. Build FOUR Docker fixtures extending the m1-daemon family: (A) bare sshd, password auth ON, sudo-capable NON-root user with sudo installed+configured; (B) bare sshd, ROOT login; (C) a systemd-as-PID1-capable image (the existing m1 container execs flightdeckd directly today, not under systemd \u2014 new capability needed) pre-seeded with a root-owned system-level flightdeckd mirroring josty-cc's real state, to test conflict-detection/adoption; (D) NEW per review \u2014 bare sshd, non-root, password auth ON, NO sudo access at all. Fixture D exists specifically to answer an open empirical question (see decision/risk #10-15 area): without `loginctl enable-linger`, does a user-level systemd unit survive the bootstrapping SSH session closing at all? Determine this EMPIRICALLY here (not asserted) and record the answer for B9 to build against \u2014 if the unit dies with the session, B9's 'no sudo' fallback must be a raw setsid/nohup'd background process (not a systemd unit), not a systemd unit assumed to just be 'not reboot-safe'.",
+   "tests": [
+    "All 4 fixtures boot and accept the expected auth mode.",
+    "Fixture D's empirical finding (unit survives session end or not) is documented as a concrete, tested fact, not assumed."
+   ],
+   "acceptance": [
+    "Four working, documented fixtures exist, including a definitive answer to whether a no-sudo box can host a systemd --user unit that outlives the bootstrap session."
+   ]
+  },
+  {
+   "id": "B7",
+   "title": "bootstrap::probe + install_key + host-key fingerprint; extend RemoteProbeResult",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A1",
+    "A3",
+    "B5",
+    "B6"
+   ],
+   "estimate_days": 1.5,
+   "brief": "New src-tauri/src/bootstrap/mod.rs. `probe`: reuses/EXTENDS A1's `RemoteProbeResult` struct (adds a `conflict: Option<String>` field for install-mode detection \u2014 do NOT re-derive a parallel struct, this is the resolved fix for the A1/B probe_remote collision the review flagged). `install_key`: uses A3's dedicated-per-server-key design as its lookup-or-generate primitive (A3 must land first; if it hasn't for some reason, this task ships a minimal scoped fallback per the original spec's own contingency, flagged loudly in the PR description so it's reconciled later, not silently diverged). Surface the received host-key fingerprint on first connect via a new `HostKeyFingerprintEvent{machine_id,fingerprint,known}` \u2014 non-blocking display by default (see decision #12).",
+   "tests": [
+    "probe against fixture A/B/D returns the right RemoteProbeResult shape including conflict detection where relevant.",
+    "install_key against a fresh box installs the A3-style dedicated key and HostKeyFingerprintEvent fires exactly once per new connection."
+   ],
+   "acceptance": [
+    "Probing any of the 4 fixtures returns an accurate, typed diagnosis; a first-time host-key is surfaced non-blockingly in the wizard log."
+   ]
+  },
+  {
+   "id": "B8",
+   "title": "bootstrap::upload_daemon",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B3",
+    "B7"
+   ],
+   "estimate_days": 1,
+   "brief": "Stream the bundled (per-target) flightdeckd binary from B3's resources/ to the server over the existing Stdio::piped() ssh primitive. sha256 check first \u2014 skip the upload entirely if the remote binary already matches (fast no-op on re-run/repair). A deliberately truncated/killed-mid-write push must surface a clear 'upload truncated' error, never a false success.",
+   "tests": [
+    "Skip-if-sha256-matches path never re-uploads.",
+    "A simulated truncated write (kill the ssh child mid-transfer in a test) surfaces 'upload truncated', not a false success."
+   ],
+   "acceptance": [
+    "Re-running the installer against an already-current server is a fast no-op for this step."
+   ]
+  },
+  {
+   "id": "B9",
+   "title": "bootstrap::install_service + escalate_persistence (root/non-root branches, real sudo design)",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B4",
+    "B6",
+    "B8"
+   ],
+   "estimate_days": 1.5,
+   "brief": "install_service: root SSH login \u2192 direct SYSTEM unit at /etc/systemd/system/flightdeckd.service, NO sudo wrapper at all (its own tested branch). Non-root \u2192 USER unit at ~/.config/systemd/user/flightdeckd.service via `systemctl --user enable --now`, needing zero sudo for the unit itself. Detect+adopt an EXISTING install of either kind (never write a second competing unit \u2014 critical for josty-cc, which already runs a root-owned system unit and must be recognized/managed in place, never duplicated). escalate_persistence (RESOLVED per review, the SUDO_ASKPASS design was architecturally broken \u2014 sudo executes on the remote host, a Mac-local askpass helper can't run there): try `sudo -n` first (no password, may already be configured); on failure, pipe the ALREADY-CAPTURED SSH login password + newline directly onto the same piped ssh child's stdin as `sudo -S bash -c \"...\"` (reusing the exact Stdio::piped() mechanism Transport::spawn already uses everywhere in this codebase \u2014 no remote-executed helper program needed, password never touches argv/disk); if that ALSO fails (different sudo password than login password), fall back to ONE separate native 'sudo password' Settings-modal prompt (decision #15 \u2014 recommended default); skipped entirely when already root. For the NO-SUDO-AT-ALL case (fixture D from B6): build against B6's EMPIRICAL finding \u2014 if a --user unit dies with the SSH session, fall back to a raw `setsid nohup flightdeckd run </dev/null >log 2>&1 &`-style detached process (survives session end via setsid regardless of linger, does NOT survive reboot, does NOT restart on crash) rather than asserting an unverified 'Running, not reboot-safe' systemd state. Sleep-masking (decision #10/#11) applies to root too by default.",
+   "tests": [
+    "install_service branch selection: root\u2192system unit no sudo; non-root\u2192user unit no sudo; an already-present SYSTEM unit on a non-root probe\u2192'adopt existing', never a second user unit.",
+    "escalate_persistence ordering: sudo -n succeeds\u2192no password ever requested; sudo -n fails+captured password succeeds via stdin-piped sudo -S\u2192no second prompt; both fail\u2192UI-visible one-liner+recheck.",
+    "No-sudo fixture: daemon ends up running via whichever mechanism B6 determined actually survives session-close, verified against the real fixture, not assumed."
+   ],
+   "acceptance": [
+    "A fresh sudo-capable non-root box: after ONE password entry, flightdeckd runs as a user-level unit; linger+sleep-mask applied automatically or surfaced as one exact sudo line with a recheck action.",
+    "A root-SSH box skips sudo entirely, direct system unit.",
+    "A no-sudo box still ends with a genuinely-running daemon, its persistence properties matching what B6 actually verified \u2014 not an assumed state.",
+    "josty-cc's existing root-owned system unit is recognized and managed in place, never duplicated."
+   ]
+  },
+  {
+   "id": "B10",
+   "title": "bootstrap::run_init + claude_login (device-flow spike)",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B6"
+   ],
+   "estimate_days": 1,
+   "brief": "FIRST spike claude's real non-interactive/device-flow CLI invocation on a live, not-yet-logged-in claude binary (unverified today, regex-scraping it is coupled to the CLI's current UX). Then implement bootstrap::run_init (idempotent `flightdeckd init`, NEVER --force \u2014 and per C1's later cross-process file-lock requirement, this must acquire the SAME advisory lock C1 introduces around ~/.flightdeckd/config.json, coordinate with whoever lands C1) and claude_login, surfacing the sign-in URL+code via a new `ServerLoginPromptEvent{machine_id,url,code}` IN the app rather than requiring a separate terminal.",
+   "tests": [
+    "run_init is idempotent (second call is a no-op, never rewrites a working config).",
+    "claude_login's URL/code scraping verified against a real, not-yet-logged-in claude binary (manual/live checklist, re-verify on every claude CLI bump \u2014 not CI-automatable, document this explicitly)."
+   ],
+   "acceptance": [
+    "A fresh server's claude sign-in URL+code appear directly in the app, no separate terminal needed."
+   ]
+  },
+  {
+   "id": "B11",
+   "title": "bootstrap::verify_boot + diagnose + repair; IPC/event wiring; Keychain token",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B7",
+    "B8",
+    "B9",
+    "B10"
+   ],
+   "estimate_days": 1.5,
+   "brief": "diagnose: probes BOTH unit locations (system + user) to determine installed_as mode, maps canned multi-line probe output to exactly ONE of 4 states (Ready / Needs Claude sign-in / Running-not-reboot-safe / failure-with-reason) with daemon-running and reboot-safe as SEPARATE booleans \u2014 one failing sub-probe must never blank the others. repair: dispatches to the one matching step via an EXHAUSTIVE match over RepairAction (compile-time, no wildcard arm). mac_token: minted at run_init, stored in macOS Keychain \u2014 per decision #16, default to ONE SHARED Keychain item (\"Flight Deck servers\", JSON blob keyed by machine_id) rather than one item per server, to avoid N separate first-access prompts for N paired servers. Extend ipc/commands.rs with thin bootstrap_* command wrappers (bootstrap_probe, install_key, upload_daemon, install_service, escalate_persistence, run_init, claude_login, verify) plus machine_diagnose/machine_repair; add BootstrapProgressEvent{machine_id,steps} to ipc/events.rs; register everything in lib.rs's collect_commands!/collect_events!; regenerate bindings.ts.",
+   "tests": [
+    "diagnose's line-parser: canned probe output (daemon missing/outdated vs B1's fd_status.version, claude not installed/not logged in, linger unset, sleep unmasked, conflicting install) maps to the correct state + independent booleans; one failing sub-probe never blanks the others.",
+    "repair's dispatch match is exhaustive at compile time.",
+    "mac_token round-trips through the shared Keychain item across multiple machine_ids without one overwriting another.",
+    "cargo test --lib export_bindings_regenerates_ts_client after the new commands/events."
+   ],
+   "acceptance": [
+    "The status page always resolves to exactly one of the 4 states with independent daemon-running/reboot-safe facts.",
+    "Re-running any single repair action against an already-provisioned server is a fast no-op."
+   ]
+  },
+  {
+   "id": "B12",
+   "title": "Front: ServerBootstrapWizard + ServerStatusPanel; trim ticket fallback to one line",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B11",
+    "A4"
+   ],
+   "estimate_days": 1,
+   "brief": "ServerBootstrapWizard.tsx: native password field, step checklist consuming BootstrapProgressEvent, fingerprint line from HostKeyFingerprintEvent, inline claude URL/code from ServerLoginPromptEvent, second labelled 'sudo password' field shown only if auto-escalation failed. ServerStatusPanel.tsx: the 4-state display + independent daemon-running/reboot-safe rows + per-diagnosis repair buttons calling machine_repair. Trim the ticket/paste fallback (built ON TOP of A4's already-shipped one-liner, not re-deriving it) to exactly ONE line: an authorized_keys append only \u2014 everything after that key works runs through the SAME bootstrap:: step-function pipeline as the password path, eliminating any need for a second binary-hosting mechanism for this fallback.",
+   "tests": [
+    "ServerBootstrapWizard renders every BootstrapProgress/HostKeyFingerprint/ServerLoginPrompt event correctly; closing/reopening Settings mid-install falls back to a fresh machine_diagnose call rather than stale local stage.",
+    "ServerStatusPanel renders the correct one of 4 states + independent indicators per fixture, calls machine_repair with the right RepairAction."
+   ],
+   "acceptance": [
+    "Closing Settings mid-install and reopening shows correct partial state with a working repair button.",
+    "The ticket/paste fallback is exactly one line and runs the identical pipeline once its key works."
+   ]
+  },
+  {
+   "id": "B13",
+   "title": "Workstream B full live E2E + idempotency + conflict-detection across all 4 fixtures",
+   "workstream": "B - installer",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "B12"
+   ],
+   "estimate_days": 1.5,
+   "brief": "Run the full pipeline (probe\u2192install_key\u2192upload_daemon\u2192install_service\u2192escalate_persistence\u2192run_init\u2192verify_boot) twice against fixtures A/B/D (second run is a no-op: no restart, no duplicate authorized_keys line, no re-upload); against fixture C, assert bootstrap detects+adopts the existing root-owned unit and never writes a competing one (never run against real josty-cc, only the pre-seeded fixture). Reboot fixtures A/B, assert flightdeckd is active again unattended and sleep stays masked. Front vitest for the wizard/status panel. Full cargo test --lib / pnpm test / tsc --noEmit; bindings.ts committed.",
+   "tests": [
+    "All items in the brief.",
+    "cargo test --lib, pnpm test, tsc --noEmit all green."
+   ],
+   "acceptance": [
+    "Every acceptance criterion across B0-B12 holds together as one working pipeline."
+   ]
+  },
+  {
+   "id": "C1",
+   "title": "flightdeckd: phone-token add/remove primitives + authoritative title + real config lock",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [
+    "D1"
+   ],
+   "estimate_days": 1,
+   "brief": "config.rs: `Config::save(&self, path) -> Result<()>` (atomic write: tmp+rename). session.rs: SessionManager gains `phone_tokens: StdMutex<Vec<config::PhoneToken>>` (seeded from cfg.phone_tokens), `relay_out: StdMutex<Option<mpsc::UnboundedSender<Message>>>`, `config_path: PathBuf`; new(cfg,registry,config_path). `add_phone_token(token,label) -> Result<bool>` / `remove_phone_token(token) -> Result<bool>`: persist via Config::save, push authorize_phone/revoke_phone live via relay_out if connected (else picked up on next reconnect). registry.rs: new `set_title_authoritative(id,title)` \u2014 unconditional overwrite on a non-empty title (blank/whitespace is a no-op), distinct from the existing fill-only-if-empty `set_title` (unchanged, still backs ai-title backfill). CRITICAL FIX over the original design (review-flagged as genuinely broken): `~/.flightdeckd/config.json` is written by BOTH a live `flightdeckd run` process (via this task's Config::save) AND a SEPARATE `flightdeckd init` CLI invocation (workstream B's repair path) \u2014 an in-process mutex CANNOT serialize across two OS processes. Add a real cross-process advisory file lock (flock on a sidecar `.lock` file, or on the config file itself) that BOTH Config::save here AND the existing `Cmd::Init` write in main.rs (~133, currently a non-atomic plain std::fs::write \u2014 make it tmp+rename too, same fix) acquire before touching the file. Document this lock's existence clearly since B10's run_init must also take it when it shells out to `flightdeckd init` remotely.",
+   "tests": [
+    "Config::save round-trips through Config::load byte-for-byte, phone_tokens included.",
+    "add_phone_token: first call adds+persists+sends authorize_phone (fake relay_out channel); duplicate token updates label not dupes; relay_out=None still persists for next connect.",
+    "remove_phone_token removes+persists+sends revoke_phone when connected; removing an absent token returns Ok(false).",
+    "set_title_authoritative overwrites a non-empty existing title and an empty placeholder alike; blank/whitespace input is a no-op.",
+    "Concurrent-write test: two processes racing to write config.json via the new lock never produce a torn/partial file (simulate with two threads/processes both holding then releasing the lock)."
+   ],
+   "acceptance": [
+    "A concurrent `flightdeckd init` (repair) and a live daemon's add_phone_token can never corrupt config.json."
+   ]
+  },
+  {
+   "id": "C2",
+   "title": "flightdeckd: Unix-socket add_phone/remove_phone verbs; --title on attach",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [
+    "C1"
+   ],
+   "estimate_days": 1,
+   "brief": "attach.rs: FirstLine gains `add_phone: Option<{token,label}>` / `remove_phone: Option<{token}>`, handled in handle_conn as new one-shot branches (same shape as status/stop) replying fd_phone_added/fd_phone_removed. AttachParams gains `title: Option<String>`; once (conv_id,client_id) is resolved and BEFORE the pump starts, a non-empty title calls registry::set_title_authoritative. New client-side add_phone_client/remove_phone_client one-shot helpers mirroring stop_client. main.rs: new Cmd::AddPhone{token,label,socket} / Cmd::RemovePhone{token,socket}; new Cmd::Whoami{config} \u2014 loads Config directly (no running daemon needed), prints {mac_id,relay_url,label} JSON; Cmd::Attach gains --title.",
+   "tests": [
+    "Unix-socket integration (temp socket, no SSH/relay): drive add_phone_client/remove_phone_client/stop_client/status_client against a temp-socket attach::serve, assert fd_phone_added/fd_phone_removed and manager.phone_tokens state.",
+    "attach_client with --title \"My Feature\" on a fresh conversation sets the registry title; a subsequent attach with a different title overwrites it (unlike ai-title backfill)."
+   ],
+   "acceptance": [
+    "`flightdeckd whoami` works with no daemon running.",
+    "A --title'd attach sets an authoritative title that a later ai-title backfill can never override."
+   ]
+  },
+  {
+   "id": "C3",
+   "title": "flightdeckd relay.rs: live phone-token reads + set_label",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [
+    "C1"
+   ],
+   "estimate_days": 0.75,
+   "brief": "connect_once reads the authorize-phone burst from `manager.phone_tokens.lock()` instead of the effectively-static `cfg.phone_tokens`; stores the connection's out_tx clone into manager.relay_out, clears it on return; sends one new `{type:\"set_label\",label:cfg.label}` frame right after the authorize burst on every (re)connect.",
+   "tests": [
+    "Live/#[ignore] against a mock relay: set_label sent once per connect; a token added via add_phone_token mid-connection is authorized without a reconnect."
+   ],
+   "acceptance": [
+    "A phone token added while the daemon is already connected to the relay becomes authorized without restarting the daemon."
+   ]
+  },
+  {
+   "id": "C4",
+   "title": "flightdeckd rpc.rs: session_id in phone-RPC results",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-server",
+   "executor": "conversation:flightdeck-server",
+   "depends_on": [],
+   "estimate_days": 0.25,
+   "brief": "list_conversations and read_conversation results each gain a `session_id` field (existing ConversationRow.session_id / live StatusSnapshot.session_id \u2014 no new storage, just surfacing what's already tracked). This is the join key across the Mac's own conversations.id and the daemon's registry.conversations.id, which legitimately differ.",
+   "tests": [
+    "list_conversations/read_conversation results include session_id matching the row/live snapshot value."
+   ],
+   "acceptance": [
+    "A phone client can join a Mac-known conversation to a daemon-known one via session_id."
+   ]
+  },
+  {
+   "id": "C5",
+   "title": "flightdeck-remote: store.mjs node discovery primitives",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [],
+   "estimate_days": 0.5,
+   "brief": "New `setMacLabel(macId,label)`. New `nodesForToken(token) -> [{macId,label,lastSeen}]` scanning `macs` for a matching authorized-token hash; never reveals whether the token exists beyond an empty array. `revokePhone` already exists in this file (verified) \u2014 no change needed there, just make sure it's exercised by C6/C10's new call paths.",
+   "tests": [
+    "nodesForToken finds a token authorized on 2 of 3 macIds, returns exactly those with stored labels; an unauthorized token returns []."
+   ],
+   "acceptance": [
+    "Given a token authorized on N macIds, nodesForToken returns exactly those N with correct labels."
+   ]
+  },
+  {
+   "id": "C6",
+   "title": "flightdeck-remote: POST /nodes with its OWN dedicated rate limiter",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [
+    "C5"
+   ],
+   "estimate_days": 0.75,
+   "brief": "onMac message handler gains `set_label` \u2192 store.setMacLabel. New `POST /nodes {phoneToken}` route, merging store.nodesForToken with the live Map for `online`, always `200 {nodes:[...]}`. CRITICAL FIX over the original design (review-flagged as a real self-inflicted-DoS bug): do NOT call the shared `authThrottle.recordFailure` (the SAME IP-keyed bucket that already gates /mac and /phone WS auth, 8 fails/60s \u2192 5min block) on an empty-but-well-formed result \u2014 the design deliberately makes 'valid token, no nodes yet' indistinguishable from 'bad token' in the response, so a freshly-paired phone's normal onboarding polling would legitimately rack up 'failures' on the SAME counter that gates its own reconnects, and because the bucket is IP-keyed this can lock out an entire shared/NAT'd IP for 5 minutes. Give POST /nodes its own INDEPENDENT `nodesLimiter` (plain rate limit, not tied to auth-failure semantics); reserve any auth-failure-style throttling strictly for genuinely malformed requests (missing/non-string phoneToken), never for a well-formed-but-empty result.",
+   "tests": [
+    "node:test: two mock macs share one phoneToken; POST /nodes returns both with correct online/offline after one disconnects.",
+    "A burst of well-formed-but-empty-result calls does NOT touch authThrottle's bucket (verify /mac /phone auth for the same IP remains unaffected).",
+    "A burst of malformed requests DOES trip nodesLimiter, independently of authThrottle."
+   ],
+   "acceptance": [
+    "Routine onboarding polling can never lock a shared IP out of the relay's WS auth path."
+   ]
+  },
+  {
+   "id": "C7",
+   "title": "flightdeck-remote: PROTOCOL.md update",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [
+    "C2",
+    "C3",
+    "C4",
+    "C6"
+   ],
+   "estimate_days": 0.5,
+   "brief": "\u00a71 reframes 'mac' as 'a Flight Deck node \u2014 desktop OR a flightdeckd daemon, several per user, discoverable from one phoneToken'. \u00a72 documents POST /nodes (incl. the dedicated rate limiter, not authThrottle). \u00a73 documents the shared-token fan-out model + set_label. \u00a74 adds set_label/revoke_phone to mac\u2192relay frames. \u00a75 adds session_id to list_conversations/read_conversation shapes. Must land before the PWA rewrite (C12a+) and tosse-code's provisioning task (C10) start, so both codebases build against the same documented contract.",
+   "tests": [
+    "N/A \u2014 documentation task; reviewed against the actual shipped C1-C6 code for accuracy."
+   ],
+   "acceptance": [
+    "PROTOCOL.md is the single accurate source of truth for every wire change in this workstream."
+   ]
+  },
+  {
+   "id": "C8",
+   "title": "tosse-code: MachineRecord daemon-metadata columns (migrate_v13)",
+   "workstream": "C - phone multi-target",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A5"
+   ],
+   "estimate_days": 0.5,
+   "brief": "store/model.rs: MachineRecord gains `daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at: Option<i64>`. store/db.rs: NEW `migrate_v13` (add_column_if_absent \u00d74 on `machines`) \u2014 deliberately v13, NOT v12, since A5 already owns v12 for the `addresses` column; this task's migration is built explicitly on top of A5's already-landed schema, resolving the review-flagged A/C migration-slot collision. Extend upsert_machine/machine_by_id/machine_for_repo_path row mapping for the 4 new nullable fields.",
+   "tests": [
+    "Migration v13 idempotent; MachineRecord round-trips all 4 new fields through upsert_machine/machine_by_id.",
+    "A machine row pre-dating v13 reads back all 4 fields as None, never errors."
+   ],
+   "acceptance": [
+    "SCHEMA_VERSION reaches 13 cleanly on top of A5's v12, MIGRATIONS.len()==SCHEMA_VERSION assert still holds."
+   ]
+  },
+  {
+   "id": "C9",
+   "title": "tosse-code: push conversation titles to the daemon \u2014 spawn-time AND idle-rename",
+   "workstream": "C - phone multi-target",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A6",
+    "C2"
+   ],
+   "estimate_days": 1,
+   "brief": "supervisor/transport.rs: SpawnConfig gains `conversation_title: Option<String>`; build_remote_command appends `--title {shell_quote(title)}` (reusing the existing shell_quote helper \u2014 MUST go through it, an unescaped title reaching the remote shell is remote code execution on every daemon the user owns, the highest-severity item in this workstream). commands.rs::spawn_session threads it from the in-scope ConversationRecord \u2014 lands on top of A6's already-modified remote-target construction block in the same function, not a second concurrent edit. CRITICAL FIX over the original design (review-flagged as a real acceptance-breaking gap): tosse-code has NO rename_conversation command today \u2014 renaming is purely local SQLite (conversationsStore.ts renameConversation\u2192upsertConversation), nothing SSHes anywhere, so an IDLE remote conversation's rename would otherwise never reach the daemon until next spawn (breaking the stated acceptance 'a Mac-renamed conversation shows the new name on the phone... Mac fully quit afterward'). Add a SECOND, lightweight non-attach SSH round-trip (mirror transport.rs::run_remote_stop's existing pattern) triggered directly from renameConversation/upsertConversation when the conversation has a machine_id, pushing --title over a one-shot `flightdeckd attach --title ... --status-only`-style call (or reuse C2's add_phone-style one-shot verb pattern) rather than relying solely on the next spawn.",
+   "tests": [
+    "build_remote_command with an adversarial title (embedded quote, $(), backtick, newline) produces a shell-safe argument a POSIX shell parses back to the exact original string \u2014 adversarial test, not just happy-path.",
+    "Renaming an IDLE remote conversation (no live attach) triggers the standalone SSH round-trip and the daemon's title updates, verified via a subsequent status/read_conversation call."
+   ],
+   "acceptance": [
+    "A conversation's title set/changed on the Mac reaches the daemon whether or not that conversation is currently attached, and survives the Mac quitting afterward."
+   ]
+  },
+  {
+   "id": "C10",
+   "title": "tosse-code: provision/revoke phone tokens on daemons; fix regenerate-pairing's silent non-revocation",
+   "workstream": "C - phone multi-target",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "A3",
+    "C2",
+    "C8"
+   ],
+   "estimate_days": 1,
+   "brief": "New `provision_phone_on_machine(app,id)`: `flightdeckd whoami` over SSH \u2192 parse JSON \u2192 `flightdeckd add-phone --token <shared> --label <mac label>` \u2192 upsert C8's 4 fields + phone_provisioned_at. New `provision_phone_on_all_machines`. Hook into add_machine's success path and set_remote's regenerate_pairing branch. delete_machine becomes async (builds on A3's already-modified sync version, adding an AppHandle param for the known-hosts path), best-effort runs `flightdeckd remove-phone --token <shared>` over SSH before the local delete. CRITICAL FIX (review-verified, genuinely blocking): `set_remote`'s `regenerate_pairing` branch (commands.rs ~3982-4013, function name is `set_remote` not `set_remote_config`) TODAY only mints a new token and re-authorizes it \u2014 `store.mjs::authorizePhone` is purely additive, `grep -rn revoke src-tauri/src/` finds ZERO calls anywhere, so a 'lost my phone, regenerate the QR' action leaves the lost phone's token valid FOREVER, on the Mac's own relay identity AND (once this workstream ships) every daemon it was ever provisioned to \u2014 a larger blast radius than today's single-mac exposure. Add an explicit revoke step to regenerate_pairing: send revoke_phone for the OLD token to the Mac's own relay identity AND call remove_phone_token/SSH `flightdeckd remove-phone` for the OLD token on every currently-provisioned daemon, before or alongside provisioning the new one \u2014 do not rely on the add-only provision_phone_on_all_machines to cover this.",
+   "tests": [
+    "provision_phone_on_machine upserts all 4 fields + timestamp correctly.",
+    "delete_machine still performs A3's key-file cleanup AND best-effort revokes phone access, in that order, tolerating either step failing independently.",
+    "regenerate_pairing: the OLD token is revoked on the Mac's relay identity AND on every previously-provisioned daemon BEFORE/alongside the new token being authorized \u2014 direct regression test for the fixed bug.",
+    "Live (--ignored, josty-cc): provision_phone_on_machine against a real flightdeckd lands daemon_mac_id/label/phone_provisioned_at; a subsequent POST /nodes shows that macId authorized."
+   ],
+   "acceptance": [
+    "Regenerating the pairing token actually revokes the lost phone everywhere it was ever authorized, not just on the Mac.",
+    "Removing a server best-effort revokes its phone access rather than leaving it silently reachable forever."
+   ]
+  },
+  {
+   "id": "C11",
+   "title": "tosse-code Settings: Mac node label + per-machine provisioning status",
+   "workstream": "C - phone multi-target",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "C10"
+   ],
+   "estimate_days": 0.5,
+   "brief": "ControlSection.tsx: 'This Mac's name' text input feeding a new `meta` key `remote_mac_label` (appmcp/relay.rs sends it via C3's set_label frame), default 'This Mac' (decision #17) with the field still editable. Per-machine provisioning status row (daemon_label / phone_provisioned_at / Retry action) near the existing remote-access pairing UI.",
+   "tests": [
+    "Settings UI test: the name field persists to remote_mac_label and survives reload."
+   ],
+   "acceptance": [
+    "The Mac's own node label is visible/editable in Settings and reaches the phone via set_label."
+   ]
+  },
+  {
+   "id": "C12a",
+   "title": "flightdeck-remote PWA: pairing migration + discovery poll (single-node regression guard FIRST)",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [
+    "C7"
+   ],
+   "estimate_days": 1,
+   "brief": "web/app.js (1588 lines, touches nearly every function \u2014 ship this in stages to bound regression risk on the ONE thing shipped today, the single-node case). Stage 1 ONLY: `loadPairings()`/`migrateLegacyPairing()` (fdr.pairing localStorage \u2192 fdr.pairings array, one-time, non-destructive) + a discovery poll `refreshNodes()` (POST /nodes on load, visibilitychange, periodically) \u2014 with an EXPLICIT, tested guarantee of ZERO behavior change when discovery returns exactly one node. Do not touch state.convs/hash-routing/push in this task \u2014 that's C12b/c.",
+   "tests": [
+    "Install with an OLD-format fdr.pairing in localStorage, reload: becomes fdr.pairings=[<same>], behavior unchanged (manual/Playwright).",
+    "refreshNodes() returning exactly one node produces IDENTICAL app behavior to today's pre-change code (the direct regression guard)."
+   ],
+   "acceptance": [
+    "Every existing single-node PWA pairing keeps working unchanged after this ships."
+   ]
+  },
+  {
+   "id": "C12b",
+   "title": "flightdeck-remote PWA: multi-socket NodeConnection model + qualified conv lookups",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [
+    "C12a"
+   ],
+   "estimate_days": 1.5,
+   "brief": "Replace the singleton pairing/ws/backoff/pending model with `state.nodes: NodeConnection[]` (own ws/backoff/pending/status each). `state.convs` gains `macId`. Hash routing gains a node segment (`#conv=<macId>:<id>`). CRITICAL per review: there are 15+ ad hoc `state.convs.find(c => c.id === X)` call sites across app.js (verified at ~342,387,429,457,464,499,586,606,1006,1284,1560 and others) that ALL need to become (macId,id)-qualified \u2014 replace every one with ONE mandated `findConv(macId, id)` helper, and add a grep-based lint/test asserting no bare `.find(c => c.id ===` pattern remains anywhere in the file, so a missed call site (a silent wrong-node action, not a crash) can't ship undetected.",
+   "tests": [
+    "Grep/lint test: zero occurrences of the bare `.find(c => c.id ===` pattern remain in app.js.",
+    "Manual/Playwright: scan a pairing link with two nodes authorized server-side; two sockets open, convs from both listed without id collisions, killing one node's socket removes only that node's conversations."
+   ],
+   "acceptance": [
+    "Every conversation lookup in the PWA is macId-qualified with no exceptions, mechanically verified."
+   ]
+  },
+  {
+   "id": "C12c",
+   "title": "flightdeck-remote PWA: per-node push",
+   "workstream": "C - phone multi-target",
+   "repo": "flightdeck-remote",
+   "executor": "conversation:flightdeck-remote",
+   "depends_on": [
+    "C12b"
+   ],
+   "estimate_days": 0.75,
+   "brief": "enablePush/disablePush loop per node (one Web Push subscription per node). sw.js: notificationclick reads `data.macId` from the push payload, includes it in postMessage({type:\"navigate\",convId,macId}). Bump CACHE (e.g. fdr-v13) so the migration lands promptly on already-installed PWAs. index.html Settings sheet surfaces the list of currently-connected nodes (label + online dot) above 'Unpair this phone' \u2014 'Unpair' stays all-or-nothing for v1 (decision #19).",
+   "tests": [
+    "A push notification for a specific node's conversation navigates to that node+conversation, not a wrong one."
+   ],
+   "acceptance": [
+    "Each paired node has its own independent push subscription; a notification always lands on the right node's conversation."
+   ]
+  },
+  {
+   "id": "C13",
+   "title": "Cross-repo end-to-end acceptance: real Mac + 2 daemons + 1 PWA",
+   "workstream": "C - phone multi-target",
+   "repo": "tosse-code",
+   "executor": "tosse-code-worktree",
+   "depends_on": [
+    "C9",
+    "C10",
+    "C11",
+    "C12c"
+   ],
+   "estimate_days": 1,
+   "brief": "One QR scan grants the phone access to the Mac's local conversations AND every paired remote server, no per-server re-pairing. Verify: a newly-added server becomes phone-reachable without re-scanning (if the phone was already paired); every conversation streams from/sends to its OWN host directly (kill the Mac app mid-conversation, the phone conversation on a remote daemon is unaffected); the node/conversation list stays correct as machines are added/removed without re-pairing; a Mac-set title reaches the phone even for a conversation that lives entirely on a remote daemon (per C9's idle-rename fix); removing a server revokes its phone access (per C10's fix); an old single-node PWA pairing still works. Use josty-cc (read-only inspection only, never modify) plus a second locally-simulated node for the two-daemon scenario.",
+   "tests": [
+    "Full manual walkthrough per the brief's checklist, against josty-cc (read-only) + one simulated node."
+   ],
+   "acceptance": [
+    "All of workstream C's top-level acceptance criteria hold together in a real, cross-repo, cross-device run."
+   ]
+  }
+ ],
+ "decisions_for_user": [
+  {
+   "question": "MIN_DAEMON_VERSION policy: flightdeckd has no versioning/bump discipline yet against tosse-code. Ship the version comparator as dormant scaffolding (always passes until someone deliberately bumps it) or defer the 'outdated' half entirely until B's installer exists?",
+   "options": [
+    "Ship as dormant scaffolding now (A1's default)",
+    "Defer 'outdated' check until B ships an update mechanism"
+   ],
+   "recommendation": "Ship as dormant scaffolding \u2014 costs nothing, degrades safely, and is already wired for when versioning discipline starts.",
+   "blocks": []
+  },
+  {
+   "question": "Should a MISSING flightdeckd hard-block pairing entirely (consistent with today's missing-claude behavior), or should pairing succeed with a persistent warning, since no in-app installer exists until B ships?",
+   "options": [
+    "Hard-block (A1's default)",
+    "Allow pairing with a persistent warning"
+   ],
+   "recommendation": "Hard-block \u2014 consistent with existing behavior; revisit once B's installer can actually fix the gap in-app.",
+   "blocks": []
+  },
+  {
+   "question": "Should the bootstrap discover a 'public' address candidate via a 3rd-party 'what's my IP' service (adds a new external dependency + reveals the server's public IP to that service), or stay manual-entry-only?",
+   "options": [
+    "Call an external IP-lookup service",
+    "Manual-entry-only (A5's default)"
+   ],
+   "recommendation": "Manual-entry-only \u2014 matches the repo's own privacy-conscious precedent (tosseClientFavicons OFF by default).",
+   "blocks": []
+  },
+  {
+   "question": "Should the discovered/candidate address list be visible and editable in Settings, or stay fully automatic and invisible?",
+   "options": [
+    "Automatic/invisible (A5/A6's default)",
+    "Visible, editable per-server list"
+   ],
+   "recommendation": "Ship invisible first; add visibility as a follow-up if it turns out to matter in practice.",
+   "blocks": []
+  },
+  {
+   "question": "A2 deliberately leaves 'retry forever, one generic notice' unchanged for every ambiguous failure except exit-127 'flightdeckd: command not found'. Should that broader behavior also change (give up after N attempts with a clearer persistent banner)?",
+   "options": [
+    "Leave unchanged for now (A2's default)",
+    "Also add a give-up-after-N policy for ambiguous failures"
+   ],
+   "recommendation": "Leave unchanged \u2014 this is a separate, later decision; A2's narrow fix already closes the one unambiguous case.",
+   "blocks": []
+  },
+  {
+   "question": "Should the orphan ssh_keys/ sweep (A7) be automated, or is a manual one-off cleanup on your machine preferred?",
+   "options": [
+    "Automate (1h grace window, A7)",
+    "Manual one-off cleanup, skip A7"
+   ],
+   "recommendation": "Automate \u2014 the grace window makes it low-risk and it prevents recurrence.",
+   "blocks": [
+    "A7"
+   ]
+  },
+  {
+   "question": "D's fd_skip bandwidth-compaction optimization (D5/D6): build it now but permanently dead-switched-off until A1's version probe gates it, or drop it from this program entirely?",
+   "options": [
+    "Build now, dead-gated (D5/D6's plan)",
+    "Drop entirely for now"
+   ],
+   "recommendation": "Build now, dead-gated \u2014 the boundary-condition bug the review found is now fixed, and it's ready the moment A1 lands, at zero live risk in the meantime.",
+   "blocks": [
+    "D5",
+    "D6"
+   ]
+  },
+  {
+   "question": "Should a user-facing 'reconnecting, catching up\u2026' notice appear during a multi-minute silent gap (today shows nothing until a message arrives or hard disconnect)?",
+   "options": [
+    "Add the notice",
+    "Ship D1-D4 with no new UI (current plan)"
+   ],
+   "recommendation": "Skip for now \u2014 D1-D4 is a reliability fix, not a UX change; revisit if real-world stalls prove disruptive.",
+   "blocks": []
+  },
+  {
+   "question": "Should a Mac-side proactive staleness watchdog (reconnect sooner than SSH's own ~15s keepalive on literally zero bytes, not just zero replayable lines) be built? Investigation suggests fd_detach{stalled} may rarely reach the Mac in the real bandwidth-limited failure mode.",
+   "options": [
+    "Build it as a follow-up",
+    "Rely on D1-D4 alone for now"
+   ],
+   "recommendation": "Defer \u2014 observe D1-D4 in production first; this is a real behavior/timing change needing its own threshold decision.",
+   "blocks": []
+  },
+  {
+   "question": "Sleep-masking (B9): opt-out checkbox (default ON) vs always-on/non-negotiable? And should it apply to root-owned servers too, or only non-root+linger boxes?",
+   "options": [
+    "Opt-out checkbox, default ON, applies to root too (B9's default)",
+    "Always-on, non-negotiable",
+    "Skip masking for root logins"
+   ],
+   "recommendation": "Opt-out checkbox default ON, applied uniformly including root \u2014 it's a real machine-level behavior change per the repo's own reversibility principle, and sleep-masking is unrelated to linger (which root doesn't need).",
+   "blocks": [
+    "B9"
+   ]
+  },
+  {
+   "question": "Private SSH key custody: keep today's plain 0600 file (the ssh binary needs a file path via -i regardless) or move into Keychain like mac_token \u2014 bigger change, revisit later?",
+   "options": [
+    "Keep plain 0600 file for v1 (B7's default)",
+    "Move to Keychain now"
+   ],
+   "recommendation": "Keep as-is for v1; Keychain would still require writing a temp file per connection since ssh -i needs a path.",
+   "blocks": []
+  },
+  {
+   "question": "Host-key fingerprint on first connect: show for transparency only, non-blocking (B7's default), or require an explicit 'yes, this matches' confirmation click?",
+   "options": [
+    "Non-blocking display (B7's default)",
+    "Require explicit confirmation"
+   ],
+   "recommendation": "Non-blocking for v1 \u2014 lowest first-run friction; can be hardened later if needed.",
+   "blocks": [
+    "B7"
+   ]
+  },
+  {
+   "question": "Decoupled daemon-update channel (fetch a newer flightdeckd independent of a Mac app release): build now, or ship v1's 'update' repair action as 'just re-push whatever binary is bundled in the currently-installed Mac app'?",
+   "options": [
+    "Build decoupled fetch now",
+    "Re-push bundled binary only (B11's default)"
+   ],
+   "recommendation": "Defer \u2014 avoids adding new GitHub auth surface on the Mac; the simple re-push covers the common case.",
+   "blocks": []
+  },
+  {
+   "question": "flightdeck-server is confirmed to live on YOUR personal GitHub account (clousty8), private. B's binary-distribution design fetches release assets from it via a fine-grained PAT into tosse-code's release.yml \u2014 who owns/rotates that PAT, and should the repo move to an org/bot account first, given this is the exact bus-factor problem B's own design explicitly rejected when it ruled out a public repo?",
+   "options": [
+    "Move flightdeck-server to an org/bot-owned account or a scoped GitHub App/deploy key before wiring the PAT",
+    "Use a PAT on your personal account for now, revisit later"
+   ],
+   "recommendation": "Move ownership (or at minimum use a scoped deploy key/GitHub App, not a personal PAT) before wiring it into a release pipeline that only Alexandre can trigger \u2014 this is a real governance gap, not just a preference.",
+   "blocks": [
+    "B2",
+    "B3"
+   ]
+  },
+  {
+   "question": "Passwordless-sudo-unavailable fallback (B9): is a second native 'sudo password' prompt on first run acceptable, or should the wizard hard-require passwordless sudo be pre-configured and fail with copy-paste instructions otherwise?",
+   "options": [
+    "Second native prompt as fallback (B9's default)",
+    "Hard-require pre-configured passwordless sudo"
+   ],
+   "recommendation": "Second native prompt \u2014 lower friction for a first-run wizard; the copy-paste fallback still exists for anyone who prefers it.",
+   "blocks": [
+    "B9"
+   ]
+  },
+  {
+   "question": "Per-machine macOS Keychain UX: B11's fix consolidates every server's mac_token into ONE shared Keychain item (one first-access prompt total) instead of N items for N servers \u2014 confirm this is the right default versus N separate items (which would trigger N separate permission prompts, unlike every other feature's one-item-per-feature precedent in this app)?",
+   "options": [
+    "One shared Keychain item for all servers (B11's default)",
+    "One Keychain item per server"
+   ],
+   "recommendation": "One shared item \u2014 matches the repo's existing one-item-per-feature Keychain precedent and avoids a prompt storm as servers are added.",
+   "blocks": [
+    "B11"
+   ]
+  },
+  {
+   "question": "What should the Mac's own relay-node label default to in the phone's node list: a fixed generic string, the machine's hostname, or a free-text Settings field?",
+   "options": [
+    "Fixed default 'This Mac', still editable (C11's default)",
+    "Machine hostname",
+    "Free-text only, no default"
+   ],
+   "recommendation": "Fixed default 'This Mac' with the field editable \u2014 simple by default, flexible if wanted.",
+   "blocks": []
+  },
+  {
+   "question": "When the phone scans a SECOND, unrelated pairing link (different Mac/account, different phoneToken): should it ADD that as another independent pairing group, or REPLACE the existing pairing as today?",
+   "options": [
+    "Add as a new independent pairing group (C12a's assumption)",
+    "Replace the existing pairing"
+   ],
+   "recommendation": "Add \u2014 least surprising now that multi-node pairing is the normal case; replacing would be a silent, surprising loss of access.",
+   "blocks": [
+    "C12a"
+   ]
+  },
+  {
+   "question": "Should 'Unpair this phone' stay all-or-nothing (forgets every node under every pairing group), or should Settings gain a way to remove ONE node while keeping the rest? The former needs no new UI; the latter is real additional scope. Relatedly: should local unpair also proactively revoke server-side, or is 'forget locally, Mac separately manages revocation' (C10's approach) acceptable for v1?",
+   "options": [
+    "All-or-nothing unpair, local-only (C12c's default), server-side revocation handled separately by C10's Mac-initiated paths",
+    "Add per-node unpair + have local unpair also revoke server-side"
+   ],
+   "recommendation": "All-or-nothing + local-only for v1 \u2014 C10 already fixes the one genuinely broken revocation path (regenerate-pairing); per-node unpair is clean future scope, not required now.",
+   "blocks": []
+  },
+  {
+   "question": "When a conversation has both a Mac-set name and a daemon-side ai-title (e.g. phone-started, never opened on the Mac) \u2014 should the Mac's push always win once it has ever sent a non-empty title, or should ai-title be allowed to fill in when the Mac genuinely has none yet?",
+   "options": [
+    "Mac always wins once set (C1/C9's default, matches set_title_authoritative's design)",
+    "Allow ai-title to fill when Mac has none"
+   ],
+   "recommendation": "Mac always wins \u2014 matches the already-chosen set_title_authoritative semantics (unconditional overwrite), keep it consistent.",
+   "blocks": []
+  },
+  {
+   "question": "Does phone multi-target need its own Settings toggle separate from the existing remote-control enable switch, or is it implicitly covered by turning remote control on at all?",
+   "options": [
+    "No new toggle, implicit (C10/C11's default)",
+    "Add a dedicated toggle"
+   ],
+   "recommendation": "No new toggle \u2014 an unpaired server is unreachable regardless, a second switch would be redundant.",
+   "blocks": []
+  }
+ ],
+ "risks": [
+  "tosse-code's run_actor remote-reconnect loop (session.rs) is edited in sequence by D2 (refactor into a pure reconnect_policy_for_reason table), A2 (adds 'daemon_missing'), and A6 (adds address rotation) \u2014 sequencing via depends_on avoids concurrent edits, but this remains the single highest-review-risk region in the codebase per the repo's own admission (one ignored, thinly-covered live test today); each landing still deserves careful review against the two that came before it.",
+  "flightdeck-server's attach.rs/session.rs/main.rs are touched by D1 (write-timeout), B1 (version field, tiny), and C1-C3 (phone-token primitives) \u2014 sequenced D\u2192B\u2192C by wave, not concurrent, but a real rebase is still expected for whoever lands C1 last.",
+  "B0's musl cross-compile spike is unverified today (no cross/musl toolchain, only Docker) and gates the ENTIRE binary-distribution half of workstream B (B2 onward) \u2014 if ring's asm fails on aarch64-musl, a fallback (different crypto provider, or dropping aarch64 support) must be chosen before B2 can proceed.",
+  "B10's claude non-interactive/device-flow login invocation is unverified and coupled to the CLI's current UX \u2014 a future claude CLI upgrade could silently break claude_login's scraping; flagged as a recurring manual verification item, not a one-time fix.",
+  "D's own investigation found the fd_detach{stalled} best-effort notice writes over the SAME potentially-stalled local pipe that caused the original write to time out \u2014 in the real bandwidth-limited (not frozen-process) failure mode, it may rarely be delivered before the Mac's own hard disconnect fires anyway. D1-D4 are still a net improvement (they remove a provably-unbounded blocking path) even if the notification path underperforms in that specific scenario.",
+  "D's investigation found a SECOND, unremarked recurrence of the same under-delivery pattern on josty-cc immediately after the originally-reported incident (client 9\u219210, ~290 lines under-delivered over ~41 min) \u2014 strengthens the case this is systemic, not a one-off, but wasn't isolated by a clean SIGKILL the way the first incident was; worth a final confirmation once D1-D4 are live.",
+  "C's shared-token fan-out design gives the phone an all-or-nothing trust boundary: it cannot be authorized for the Mac but not a specific server without new selective-auth UI, which this program does not build.",
+  "C's new POST /nodes endpoint is a fresh brute-force target for phoneToken guessing even with its own dedicated rate limiter (C6) \u2014 needs explicit abuse-testing before shipping, since it removes the natural throttle a full WS handshake per guess previously provided.",
+  "C12a-c's PWA rewrite touches nearly every function in a 1588-line file assuming a singular ws/state \u2014 mitigated by shipping the single-node regression guard (C12a) FIRST and isolated, and by the mandated findConv() helper + lint test (C12b), but this remains the highest regression-risk piece of workstream C.",
+  "No decoupled version-negotiation exists on the flightdeckd attach wire \u2014 D6's --supports-skip flag would break an older daemon's attach command outright if ever passed without A1's version gate; D6's brief makes this gate a hard precondition, not optional.",
+  "B9's 'no sudo at all' fallback behavior depends entirely on B6's fixture-D empirical finding (whether a --user systemd unit survives the bootstrap SSH session closing without linger) \u2014 this genuinely isn't known yet and must be determined before B9's brief can be finalized as written; B6 is scheduled to answer it first.",
+  "C1's cross-process config.json lock (flock-based) is a new mechanism this codebase has never needed before (flightdeckd has no analogue of tosse-code's SETTINGS_WRITE_LOCK) \u2014 needs careful review, and B10's run_init must remember to acquire the SAME lock when it shells out to `flightdeckd init` remotely, or the fix is incomplete."
+ ],
+ "amended_specs": [
+  {
+   "workstream": "A - Onboarding reliability",
+   "amendments_applied": [
+    "Fixed probe_remote's short-circuit (accumulate both claude+flightdeckd checks instead of exit-inside-|| terminating the whole script)",
+    "Tightened looks_like_missing_daemon to require exit_code==127 as a hard precondition plus an anchored 'flightdeckd' string match, dropping the standalone unanchored string-only branch that could false-positive on unrelated remote-shell noise",
+    "Resolved migrate_v12 ownership: A5 owns it exclusively; C's daemon-metadata columns moved to v13 (see workstream C amendments)",
+    "Resolved A1/B probe_remote collision: A1 now returns a typed RemoteProbeResult B7 extends with one field, rather than two independently-designed shapes",
+    "Added a durable persist-winning-address-to-SQLite step to A6's runtime rotation, plus an explicit non-empty-addresses invariant enforced at construction, not just documented",
+    "Added concurrency guard (mutex) around generate_machine_key and a stale-genKey front-end fix + specific vanished-identity-file backend error, addressing the plausible paste-to-two-servers-before-pairing workflow",
+    "MIN_DAEMON_VERSION policy, missing-flightdeckd hard-block default, public-IP probing, and address-list visibility all flagged as decisions rather than silently decided"
+   ]
+  },
+  {
+   "workstream": "B - Installer",
+   "amendments_applied": [
+    "Replaced the broken SUDO_ASKPASS design (a Mac-local helper cannot execute on the remote host where sudo runs) with piping the captured password over the existing ssh child's Stdio::piped() stdin as sudo -S \u2014 architecturally sound, no remote helper needed",
+    "Resolved the BatchMode=yes vs SSH_ASKPASS contradiction by scoping askpass.rs to the ONE bootstrap login call, documented as an intentional isolated divergence, with SSH_ASKPASS_REQUIRE=force added since a GUI process has no DISPLAY",
+    "Added a 4th 'no sudo at all' live fixture (B6) and made B9's no-sudo behavior depend on that fixture's EMPIRICAL finding rather than asserting an unverified 'not reboot-safe' state",
+    "Flagged the flightdeck-server-on-personal-account PAT governance gap explicitly as a decision, rather than accepting B's own stated rationale for rejecting a public repo while missing that its own private-repo choice has the identical personal-account exposure",
+    "Added an explicit decision about per-machine Keychain UX and defaulted to one shared Keychain item instead of N per-server prompts",
+    "Sequenced B's probe_remote extension to build strictly on top of A1's already-landed typed struct instead of an independent rewrite"
+   ]
+  },
+  {
+   "workstream": "C - Phone multi-target",
+   "amendments_applied": [
+    "Fixed regenerate_pairing to actually revoke the OLD token everywhere (Mac relay identity + every provisioned daemon) \u2014 verified today it silently does not, a real security gap this workstream would otherwise have made larger by fanning the same non-revoked token out to N daemons",
+    "Gave POST /nodes its own dedicated rate limiter instead of sharing authThrottle, which the original design's own stated ambiguity (valid-but-empty vs invalid token) would have used to accidentally lock out legitimate shared/NAT'd IPs from unrelated WS auth",
+    "Added a standalone, non-attach SSH round-trip for conversation-title pushes so an IDLE remote conversation's rename actually reaches the daemon, closing a gap that would otherwise have silently broken the workstream's own stated acceptance criterion",
+    "Retargeted the daemon-metadata migration to v13 (A5 owns v12) and made it an explicit hard dependency on A5 rather than an independently-claimed v12",
+    "Replaced the in-process-mutex config-write-lock (which cannot span the separate `flightdeckd init` CLI process) with a real cross-process file lock shared between the live daemon and B's repair-path CLI invocation",
+    "Mandated a single findConv(macId,id) helper across the PWA's 15+ ad hoc conv-lookup call sites, backed by a grep-based lint test, instead of relying on two coarse Playwright scenarios to catch a missed site",
+    "Split the PWA rewrite into 3 staged tasks (C12a/b/c) with an explicit, tested single-node-behavior-unchanged regression guard shipped first, rather than one big-bang rewrite of a 1588-line file",
+    "Corrected function-name citations (set_remote, not set_remote_config; regenerate_pairing, not 'token-regenerate') so task briefs point implementers at code that actually exists"
+   ]
+  },
+  {
+   "workstream": "D - Cursor anomaly",
+   "amendments_applied": [
+    "Fixed compact_replay's under-specified elision count: K now counts only lines with seq > effective_from for a reattach landing inside an already-partially-delivered closed span, closing the exact silent-cursor-drift bug class this workstream exists to fix, with a dedicated boundary test",
+    "Split into a core reliability fix (D1-D4, ships now, no dependency on anything else) and a bandwidth-compaction optimization (D5-D6, built but permanently dead-switched-off, gated on A1's daemon-version probe) \u2014 taking the original spec's own offered scope choice rather than leaving it undecided",
+    "Extracted FdDetach reason-handling into one pure, shared reconnect_policy_for_reason table (D2) specifically so A2's 'daemon_missing' reason is a one-line table addition, not a second hand-edit of the same fragile match \u2014 resolves the flagged A/D cross-conflict",
+    "Extended the SIGSTOP-based Scenario D test to use an independent throwaway conversation (not the shared A/B/C conv/epoch) and to actually extend the Attach test harness with pid/pause/resume access, both missing from the original test-file assumptions",
+    "Folded in the second, unremarked recurrence found on josty-cc (client 9\u219210) into the risk writeup, strengthening but not overclaiming the systemic-vs-one-off diagnosis",
+    "Updated the FdDetachMsg doc comment alongside the code change so 'stalled' is documented as the one reconnect-eligible reason"
+   ]
+  }
+ ]
+}

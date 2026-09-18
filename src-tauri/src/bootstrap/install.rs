@@ -46,7 +46,7 @@ use crate::store::{MachineRecord, Store};
 
 /// Dev/test override for [`daemon_binary_path`]'s resolution: a directory holding the
 /// two static musl binaries directly (`flightdeckd-x86_64-unknown-linux-musl` /
-/// `flightdeckd-aarch64-unknown-linux-musl`) — e.g. `flightdeck-server`'s own
+/// `flightdeckd-aarch64-unknown-linux-musl`) — e.g. this repo's own
 /// `flightdeckd/target/deploy/<tag>/`. Always wins over the app's bundled resource dir
 /// (bundling itself is a later task — this is the ONLY way the binaries are found
 /// today).
@@ -1872,7 +1872,7 @@ mod tests {
 
     // ========================================================================
     // Live fixture tests (B8/B9) — need Docker (colima start) + the
-    // flightdeck-server repo's bootstrap-fixtures checked out as a sibling.
+    // `flightdeckd/live/bootstrap-fixtures` fixtures in this same repo.
     // `cargo test --lib -- --ignored --nocapture`.
     // ========================================================================
     mod live {
@@ -1886,23 +1886,25 @@ mod tests {
         /// letter would tear down state out from under each other.
         static LIVE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-        /// Locates the `flightdeck-server` repo as an ancestor sibling of this crate's
+        /// Locates the `flightdeckd` crate as an ancestor descendant of this crate's
         /// own checkout — mirrors `connect.rs`'s/`server_setup.rs`'s own helper of the
-        /// same name.
-        fn flightdeck_server_repo() -> PathBuf {
-            if let Ok(p) = std::env::var("FLIGHTDECK_SERVER_REPO") {
+        /// same name. `flightdeckd` moved into this repo (imported from
+        /// `flightdeck-server`, see `flightdeckd/docs/MONOREPO-MOVE.md`).
+        /// `FLIGHTDECKD_CRATE_DIR` overrides the search entirely.
+        fn flightdeckd_crate_dir() -> PathBuf {
+            if let Ok(p) = std::env::var("FLIGHTDECKD_CRATE_DIR") {
                 return PathBuf::from(p);
             }
             let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             loop {
-                let candidate = dir.join("flightdeck-server");
-                if candidate.join("bootstrap-fixtures").is_dir() {
+                let candidate = dir.join("flightdeckd");
+                if candidate.join("live/bootstrap-fixtures").is_dir() {
                     return candidate;
                 }
                 if !dir.pop() {
                     panic!(
-                        "could not locate the flightdeck-server repo as an ancestor sibling of {} \
-                         — check it out next to tosse-code, or set FLIGHTDECK_SERVER_REPO",
+                        "could not locate the flightdeckd crate as an ancestor of {} \
+                         — it should live at <repo root>/flightdeckd, or set FLIGHTDECKD_CRATE_DIR",
                         env!("CARGO_MANIFEST_DIR")
                     );
                 }
@@ -1910,7 +1912,7 @@ mod tests {
         }
 
         fn fixture_up(letter: &str) {
-            let script = flightdeck_server_repo().join("bootstrap-fixtures/fixture.sh");
+            let script = flightdeckd_crate_dir().join("live/bootstrap-fixtures/fixture.sh");
             let out = std::process::Command::new("bash")
                 .arg(&script)
                 .args(["up", letter])
@@ -1925,7 +1927,7 @@ mod tests {
         }
 
         fn fixture_down(letter: &str) {
-            let script = flightdeck_server_repo().join("bootstrap-fixtures/fixture.sh");
+            let script = flightdeckd_crate_dir().join("live/bootstrap-fixtures/fixture.sh");
             let _ = std::process::Command::new("bash").arg(&script).args(["down", letter]).output();
         }
 
@@ -2021,7 +2023,7 @@ mod tests {
             Fut: std::future::Future<Output = T>,
         {
             let _guard = super::ENV_LOCK.lock().await;
-            let dist = flightdeck_server_repo().join("flightdeckd/target/deploy/wave2-089a8f2-0.2.0");
+            let dist = flightdeckd_crate_dir().join("target/deploy/wave2-089a8f2-0.2.0");
             assert!(
                 dist.is_dir(),
                 "expected the committed dist binaries at {} — build/commit them first",
@@ -2063,7 +2065,7 @@ mod tests {
         /// before), a second upload of the SAME bytes is `AlreadyCurrent`, and the
         /// uploaded binary is real/executable on the server (`flightdeckd --version`).
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_upload_daemon_fresh_node_then_already_current() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("a");
@@ -2105,7 +2107,7 @@ mod tests {
         /// SSH user (`josty`, non-root) could not actually WRITE to without sudo
         /// (`/usr/local/bin` is root-owned) — proving upload never even attempts that.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_upload_daemon_against_fixture_c_is_already_current() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("c");
@@ -2167,7 +2169,7 @@ mod tests {
         /// OWN freshly-placed `/usr/local/bin/flightdeckd` and misreport it as a
         /// pre-existing conflict (reproduced while building this test).
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_install_service_root_gets_a_system_unit() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("b");
@@ -2223,7 +2225,7 @@ mod tests {
         /// positive) — then `escalate_persistence` WITH the fixture's real sudo
         /// password masks the sleep targets.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_install_service_fixture_a_user_unit_survives_session_close_then_escalate_masks_sleep() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("a");
@@ -2296,7 +2298,7 @@ mod tests {
         /// NOTHING and reports `Adopted`, and the pre-installed daemon is left running,
         /// untouched (same `MainPID` before and after).
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_install_service_fixture_c_is_adopted_and_untouched() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("c");
@@ -2353,7 +2355,7 @@ mod tests {
         /// cover the pure decision; this proves `install_service` actually reaches it
         /// end to end against a fixture with no `sudo` to fall back on.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_install_service_fixture_d_self_linger_works_and_refuses_when_forced_unsafe() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("d");

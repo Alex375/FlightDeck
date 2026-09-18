@@ -1099,7 +1099,7 @@ mod tests {
     /// `provision_phone_on_machine`/`revoke_phone_on_machine`, byte-for-byte the
     /// same code the fake-ssh tests above exercise) against a REAL daemon.
     /// Ignored by default — needs the container up
-    /// (flightdeck-server's `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored live_provision_and_revoke_round_trip_against_the_m1_container --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd (needs the flightdeck-m1 container)"]
