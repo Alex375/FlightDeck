@@ -63,4 +63,14 @@ expect "crate is a repo root" "0|$(real "$T/7/ws/flightdeckd")|.|release" "$(lay
 crate "$T/8/x/flightdeckd"
 expect "WORKSPACE_ROOT override" "1|$(real "$T/8/x")|flightdeckd|release" "$(layout "$T/8/x/flightdeckd" "$T/8/x")"
 
+# 9. THIS crate, at its real position in its real host repo (not a throwaway
+# tree, not a copy of lib-layout.sh) — imported into tosse-code as a
+# standalone package (docs/MONOREPO-MOVE.md's lower-risk variant): as long as
+# tosse-code has no root [workspace] Cargo.toml, this crate must self-report
+# standalone. Guards the actual regression this move could introduce: an
+# ancestor Cargo.toml (tosse-code's own, or something above the checkout) with
+# a stray [workspace] table being picked up by mistake.
+real_crate="$(cd "$(dirname "$LIB")/.." && pwd)"
+expect "real position: standalone in tosse-code" "0|$real_crate|.|release" "$(layout "$real_crate")"
+
 [ "$FAILED" = 0 ] && echo "lib-layout: all cases pass" || { echo "lib-layout: FAILURES"; exit 1; }

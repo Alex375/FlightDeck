@@ -2,8 +2,8 @@
 
 > Livré le 26/08/2026. Répond aux deux critères d'acceptation du
 > [cahier des charges](CDC-M1-DAEMON.md) §9. Le code du démon vit dans
-> [`flightdeckd/`](../flightdeckd/), l'image conteneur dans
-> [`m1-daemon/`](../m1-daemon/), les changements app sur la branche
+> [`../src/`](../src/), l'image conteneur dans
+> [`../live/m1/`](../live/m1/), les changements app sur la branche
 > tosse-code `feat/daemon-attach`.
 
 ## Ce qui change par rapport à l'alpha SSH (M0)
@@ -40,10 +40,10 @@ et le téléphone passait par le Mac. Maintenant :
 
 | Preuve | Où |
 |---|---|
-| Coupure ssh en plein tour → tour terminé sans client → réattache au curseur exact | `m1-daemon/tests/detach_test.py` |
+| Coupure ssh en plein tour → tour terminé sans client → réattache au curseur exact | `live/m1/tests/detach_test.py` |
 | Idem au niveau de l'ACTEUR de l'app (reconnexion auto + rejeu) | tosse-code `actor_survives_ssh_cut_and_replays` (`#[ignore]`, live) |
 | Transport app : handshake, tour, détache/réattache sans doublon ni trou | tosse-code `remote_transport_streams_over_ssh` (`#[ignore]`, live) |
-| Téléphone crée une conversation via le relais prod, coupure immédiate, tour fini seul, reconnexion → historique complet — **Mac éteint** | `m1-daemon/tests/phone-cut-test.mjs` |
+| Téléphone crée une conversation via le relais prod, coupure immédiate, tour fini seul, reconnexion → historique complet — **Mac éteint** | `live/m1/tests/phone-cut-test.mjs` |
 | 11 tests unitaires démon + 562 Rust app + 1536 front + tsc | `cargo test` (les deux repos), `vitest` |
 
 ## Démarrer / tester
@@ -52,13 +52,13 @@ et le téléphone passait par le Mac. Maintenant :
 # le conteneur M1 (sshd + claude + flightdeckd), clés + creds injectés, lien pairing affiché ;
 # construit le binaire musl statique depuis les sources courantes (build-musl.sh)
 # et garde les clés d'hôte SSH du conteneur précédent
-m1-daemon/scripts/up.sh                    # flightdeck-m1, ssh sur 127.0.0.1:2224
+flightdeckd/live/m1/scripts/up.sh          # flightdeck-m1, ssh sur 127.0.0.1:2224
 
 # critère Mac (headless, ssh réel)
-python3 m1-daemon/tests/detach_test.py
+python3 flightdeckd/live/m1/tests/detach_test.py
 
 # critère téléphone (relais de prod, Mac non impliqué)
-MAC_ID=<macId du conteneur> PHONE_TOKEN=<pt> node m1-daemon/tests/phone-cut-test.mjs
+MAC_ID=<macId du conteneur> PHONE_TOKEN=<pt> node flightdeckd/live/m1/tests/phone-cut-test.mjs
 # (macId/pt : docker exec -u agent flightdeck-m1 flightdeckd pairing)
 ```
 

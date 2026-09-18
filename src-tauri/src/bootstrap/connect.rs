@@ -845,7 +845,7 @@ fi
 
     // ========================================================================
     // Live fixture tests (B7) — need Docker (colima start) + the
-    // flightdeck-server repo's bootstrap-fixtures checked out as a sibling.
+    // `flightdeckd/live/bootstrap-fixtures` fixtures in this same repo.
     // `cargo test --lib -- --ignored --nocapture`.
     // ========================================================================
     mod live {
@@ -861,24 +861,28 @@ fi
         /// `--test-threads=1`) rather than interleaved with `server_setup.rs`'s.
         static LIVE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-        /// Locates the `flightdeck-server` repo as an ancestor sibling of this crate's
+        /// Locates the `flightdeckd` crate as an ancestor descendant of this crate's
         /// own checkout — mirrors `server_setup.rs`'s own helper of the same name
         /// (duplicated rather than shared: neither module has a place to put shared
-        /// test-only infra today).
-        fn flightdeck_server_repo() -> PathBuf {
-            if let Ok(p) = std::env::var("FLIGHTDECK_SERVER_REPO") {
+        /// test-only infra today). `flightdeckd` moved into this repo (imported from
+        /// `flightdeck-server`, see `flightdeckd/docs/MONOREPO-MOVE.md`); this walks
+        /// up from `CARGO_MANIFEST_DIR` (rather than a fixed relative path) so it
+        /// resolves correctly both from the main checkout and from a feature worktree
+        /// nested deeper. `FLIGHTDECKD_CRATE_DIR` overrides the search entirely.
+        fn flightdeckd_crate_dir() -> PathBuf {
+            if let Ok(p) = std::env::var("FLIGHTDECKD_CRATE_DIR") {
                 return PathBuf::from(p);
             }
             let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             loop {
-                let candidate = dir.join("flightdeck-server");
-                if candidate.join("bootstrap-fixtures").is_dir() {
+                let candidate = dir.join("flightdeckd");
+                if candidate.join("live/bootstrap-fixtures").is_dir() {
                     return candidate;
                 }
                 if !dir.pop() {
                     panic!(
-                        "could not locate the flightdeck-server repo as an ancestor sibling of {} \
-                         — check it out next to tosse-code, or set FLIGHTDECK_SERVER_REPO",
+                        "could not locate the flightdeckd crate as an ancestor of {} \
+                         — it should live at <repo root>/flightdeckd, or set FLIGHTDECKD_CRATE_DIR",
                         env!("CARGO_MANIFEST_DIR")
                     );
                 }
@@ -889,7 +893,7 @@ fi
         /// `docker run`s — never a state-preserving no-op reuse, verified against the
         /// script's own source). Panics with the script's own output on failure.
         fn fixture_up(letter: &str) {
-            let script = flightdeck_server_repo().join("bootstrap-fixtures/fixture.sh");
+            let script = flightdeckd_crate_dir().join("live/bootstrap-fixtures/fixture.sh");
             let out = std::process::Command::new("bash")
                 .arg(&script)
                 .args(["up", letter])
@@ -976,7 +980,7 @@ fi
         /// idempotence claim — `Installed` then `AlreadyPresent` — with the key
         /// genuinely usable afterwards (a real BatchMode reconnect using it succeeds).
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_a_install_key_end_to_end() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("a");
@@ -1082,7 +1086,7 @@ fi
         /// escaping-HOME attack produces — reproduced live against this very fixture
         /// while diagnosing the bug.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_a_tolerates_a_within_home_ssh_symlink_with_existing_authorized_keys() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("a");
@@ -1142,7 +1146,7 @@ fi
         /// surfaces LOUDLY as `KeyInstalledButNotAccepted` with the sshd hint, never a
         /// silent bare success.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_a_verify_failure_surfaces_as_key_installed_but_not_accepted() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("a");
@@ -1189,7 +1193,7 @@ fi
         /// even installed) — the "no sudo at all, but you ARE root" shape — and that
         /// [`probe`] reports a sane, no-conflict picture on a vanilla node.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_b_root_install_key_and_probe_work() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("b");
@@ -1215,7 +1219,7 @@ fi
         /// is ALREADY installed as a root-owned system unit (mirrors the real
         /// `josty-cc` test server) — the exact scenario B7's brief calls out by name.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_c_probe_reports_the_system_unit_conflict() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("c");
@@ -1244,7 +1248,7 @@ fi
         /// unknown), and `linger` reads the real default (`no`) via `loginctl`, which
         /// works fine here since every fixture — D included — boots systemd/logind.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_fixture_d_probe_reports_no_passwordless_sudo_and_no_linger() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("d");
@@ -1272,7 +1276,7 @@ fi
         /// reconnect against the STALE pin fails as `HostKeyMismatch`, and that
         /// [`forget_host_key`] recovers it.
         #[tokio::test]
-        #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+        #[ignore = "needs Docker (colima start)"]
         async fn live_host_key_change_is_detected_then_recoverable_via_forget_host_key() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("b");

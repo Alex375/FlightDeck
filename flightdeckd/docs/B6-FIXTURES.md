@@ -2,7 +2,7 @@
 
 > 18/09/2026. Quatre serveurs jetables pour tester en live l'installation de
 > `flightdeckd` depuis le Mac (« Ajouter un serveur ») par SSH **mot de passe**.
-> Code : [`bootstrap-fixtures/`](../bootstrap-fixtures/). Le conteneur
+> Code : [`live/bootstrap-fixtures/`](../live/bootstrap-fixtures/). Le conteneur
 > `m0-ssh-remote` reste tel quel (durci : pas de mot de passe, pas de sudo) —
 > mauvaise base pour ces tests.
 
@@ -20,12 +20,12 @@ polkit, `libpam-systemd`), base `ubuntu:20.04` par défaut = la distro du vrai
 serveur de test josty-cc (systemd 245). Écoute sur `127.0.0.1` uniquement.
 
 ```bash
-bootstrap-fixtures/fixture.sh up    all      # build + (re)start (a|b|c|d|all)
-bootstrap-fixtures/fixture.sh check all      # vérifs scriptées du mode d'auth
-bootstrap-fixtures/fixture.sh ssh   c 'flightdeckd status'
-bootstrap-fixtures/fixture.sh down  all
-BASE=ubuntu:24.04 bootstrap-fixtures/fixture.sh up d   # autre distro
-bootstrap-fixtures/d-linger-experiment.sh               # l'expérience du §D
+flightdeckd/live/bootstrap-fixtures/fixture.sh up    all      # build + (re)start (a|b|c|d|all)
+flightdeckd/live/bootstrap-fixtures/fixture.sh check all      # vérifs scriptées du mode d'auth
+flightdeckd/live/bootstrap-fixtures/fixture.sh ssh   c 'flightdeckd status'
+flightdeckd/live/bootstrap-fixtures/fixture.sh down  all
+BASE=ubuntu:24.04 flightdeckd/live/bootstrap-fixtures/fixture.sh up d   # autre distro
+flightdeckd/live/bootstrap-fixtures/d-linger-experiment.sh               # l'expérience du §D
 ```
 
 `fixture.sh ssh` / `check` se connectent par mot de passe **sans sshpass** :

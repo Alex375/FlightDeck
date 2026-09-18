@@ -1433,16 +1433,16 @@ mod tests {
     }
 
     // ========================================================================
-    // Live tests against the Docker bootstrap fixtures (flightdeck-server repo)
+    // Live tests against the Docker bootstrap fixtures (flightdeckd/live/bootstrap-fixtures)
     // ========================================================================
     //
     // Prerequisites (documented once here, not per-test): `colima start` (or Docker
-    // Desktop running), and the `flightdeck-server` repo checked out as a SIBLING of
-    // this one at `../../flightdeck-server` — its `bootstrap-fixtures/fixture.sh`
-    // brings up throwaway, password-auth Ubuntu 20.04 containers (see that repo's
-    // `docs/B6-FIXTURES.md`): fixture A (`deploy`/`deploy-pw`, sudo, port 2231, no
-    // `flightdeckd` — a FRESH node) and fixture C (`josty`/`josty-pw`, port 2233,
-    // `flightdeckd` pre-installed AND pre-initialized — an ALREADY-BOOTSTRAPPED node).
+    // Desktop running) — `flightdeckd/live/bootstrap-fixtures/fixture.sh`, in this
+    // same repo, brings up throwaway, password-auth Ubuntu 20.04 containers (see
+    // `flightdeckd/docs/B6-FIXTURES.md`): fixture A (`deploy`/`deploy-pw`, sudo, port
+    // 2231, no `flightdeckd` — a FRESH node) and fixture C (`josty`/`josty-pw`, port
+    // 2233, `flightdeckd` pre-installed AND pre-initialized — an ALREADY-BOOTSTRAPPED
+    // node).
     // `--ignore`d like every other live-spawn test in this crate; run with
     // `cargo test --lib -- --ignored --nocapture live_`.
     //
@@ -1478,28 +1478,30 @@ mod tests {
     /// `--test-threads=1` for the rest of the (parallel-safe) suite.
     static LIVE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Locates the `flightdeck-server` repo as an ancestor sibling of this crate's own
+    /// Locates the `flightdeckd` crate as an ancestor descendant of this crate's own
     /// checkout — walking up from `CARGO_MANIFEST_DIR` (rather than a fixed relative
     /// path) so this resolves correctly BOTH from the main `tosse-code` checkout
     /// (`…/repositories/tosse-code/src-tauri`) AND from a feature worktree nested
     /// several levels deeper (`…/repositories/tosse-code/.claude/worktrees/<slug>/
     /// src-tauri`) — a live test must work the same way regardless of which worktree
-    /// it runs from. `FLIGHTDECK_SERVER_REPO` overrides the search entirely, for a
-    /// checkout laid out differently.
-    fn flightdeck_server_repo() -> PathBuf {
-        if let Ok(p) = std::env::var("FLIGHTDECK_SERVER_REPO") {
+    /// it runs from. `flightdeckd` moved into this repo (imported from
+    /// `flightdeck-server`, see `flightdeckd/docs/MONOREPO-MOVE.md`).
+    /// `FLIGHTDECKD_CRATE_DIR` overrides the search entirely, for a checkout laid out
+    /// differently.
+    fn flightdeckd_crate_dir() -> PathBuf {
+        if let Ok(p) = std::env::var("FLIGHTDECKD_CRATE_DIR") {
             return PathBuf::from(p);
         }
         let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
-            let candidate = dir.join("flightdeck-server");
-            if candidate.join("bootstrap-fixtures").is_dir() {
+            let candidate = dir.join("flightdeckd");
+            if candidate.join("live/bootstrap-fixtures").is_dir() {
                 return candidate;
             }
             if !dir.pop() {
                 panic!(
-                    "could not locate the flightdeck-server repo as an ancestor sibling of {} \
-                     — check it out next to tosse-code, or set FLIGHTDECK_SERVER_REPO",
+                    "could not locate the flightdeckd crate as an ancestor of {} \
+                     — it should live at <repo root>/flightdeckd, or set FLIGHTDECKD_CRATE_DIR",
                     env!("CARGO_MANIFEST_DIR")
                 );
             }
@@ -1518,7 +1520,7 @@ mod tests {
     /// set up its fixture should say so loudly, not masquerade as a login/init
     /// assertion failure.
     fn fixture_up(letter: &str) {
-        let script = flightdeck_server_repo().join("bootstrap-fixtures/fixture.sh");
+        let script = flightdeckd_crate_dir().join("live/bootstrap-fixtures/fixture.sh");
         let out = std::process::Command::new("bash")
             .arg(&script)
             .args(["up", letter])
@@ -1659,13 +1661,13 @@ mod tests {
     }
 
     async fn install_flightdeckd_on_fixture_a(machine: &MachineRecord, known_hosts: Option<&str>) {
-        let dist = flightdeck_server_repo().join("flightdeckd/target/musl/dist");
+        let dist = flightdeckd_crate_dir().join("target/musl/dist");
         let aarch64 = dist.join("flightdeckd-aarch64-unknown-linux-musl");
         let bin_path = if aarch64.exists() { aarch64 } else { dist.join("flightdeckd-x86_64-unknown-linux-musl") };
         let bytes = std::fs::read(&bin_path).unwrap_or_else(|e| {
             panic!(
                 "could not read the fixture's flightdeckd musl binary at {}: {e} — build it first \
-                 (flightdeckd/scripts/build-musl.sh in the flightdeck-server repo)",
+                 (flightdeckd/scripts/build-musl.sh)",
                 bin_path.display()
             )
         });
@@ -1723,7 +1725,7 @@ mod tests {
     /// `AlreadyInitialized`; and the config file's bytes are IDENTICAL across both —
     /// never overwritten, because [`run_init`] never passes `--force`.
     #[tokio::test]
-    #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+    #[ignore = "needs Docker (colima start)"]
     async fn live_run_init_against_a_fresh_node_is_idempotent_and_leaves_config_untouched() {
         let _guard = LIVE_FIXTURE_LOCK.lock().await;
         fixture_up("a");
@@ -1764,7 +1766,7 @@ mod tests {
     /// re-run of the whole bootstrap flow against an already-bootstrapped node must
     /// still land on `AlreadyInitialized` with the config untouched.
     #[tokio::test]
-    #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+    #[ignore = "needs Docker (colima start)"]
     async fn live_run_init_against_a_pre_initialized_node_is_already_initialized() {
         let _guard = LIVE_FIXTURE_LOCK.lock().await;
         fixture_up("c");
@@ -1794,7 +1796,7 @@ mod tests {
     /// wording change in its sign-in prompt is exactly what `LOGIN_PROMPT_NOT_RECOGNIZED_MSG`
     /// exists to catch, but only a live run against the new binary proves it either way.
     #[tokio::test]
-    #[ignore = "needs Docker (colima start) + the flightdeck-server repo checked out as a sibling"]
+    #[ignore = "needs Docker (colima start)"]
     async fn live_claude_login_reaches_url_ready_against_the_docker_fixture() {
         let _guard = LIVE_FIXTURE_LOCK.lock().await;
         fixture_up("a");

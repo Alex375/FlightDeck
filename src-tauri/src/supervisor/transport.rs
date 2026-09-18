@@ -423,8 +423,8 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
 /// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
 /// record (C9), for a rename that happens while this Mac is NOT the one driving the
 /// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
-/// `--title` as an `attach` flag (see flightdeck-server `attach.rs`/`main.rs`,
-/// `program/wave2`) — so this borrows `attach` itself for a bounded, ONE-SHOT ssh
+/// `--title` as an `attach` flag (see `flightdeckd/src/attach.rs`/`main.rs`) — so
+/// this borrows `attach` itself for a bounded, ONE-SHOT ssh
 /// round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
 /// success/failure — never a persistent bridge like a real live session).
 ///
@@ -1911,7 +1911,7 @@ done
     /// `true`), as evidence for the C9 report's request for a real title-only verb.
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
     ///   cargo test -p tosse-code --lib -- --ignored push_remote_title_against_the_m1_daemon --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
@@ -2178,7 +2178,7 @@ done
     /// essentially never fires in practice): a NONZERO `attach_base`, learned from
     /// this connection's own `fd_attach.replay_from`, composes with the
     /// connection-relative `current`/`new_position` exactly like the daemon's own
-    /// `attach.rs` integration test (`flightdeck-server`, seeded from
+    /// `attach.rs` integration test (`flightdeckd/src/attach.rs`, seeded from
     /// `replay_from`, not 0). `attach_base + new_position` must equal the
     /// daemon's absolute `to` — the true wire position this connection has
     /// reached — which is what `session.rs::run_actor` composes into the next
@@ -2697,7 +2697,7 @@ done
     /// cursor, and expect NO duplicated stream (replay resumes exactly).
     ///
     /// Ignored by default: needs the `flightdeck-m1` container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored remote_transport_streams_over_ssh --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
