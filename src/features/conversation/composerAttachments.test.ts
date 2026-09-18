@@ -1,15 +1,20 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import {
+  appendMentions,
+  attachPaths,
   attachmentFromBlob,
   attachmentsFor,
   basename,
   imageDataUrl,
   MAX_ATTACH_BYTES,
+  mentionPath,
   normalizeWireMime,
   useComposerAttachments,
   wireImageMimeForPath,
   type ImageAttachmentDraft,
+  type PathAttachResult,
 } from "./composerAttachments";
+import { useComposerDrafts } from "../../store/composerDrafts";
 
 describe("wireImageMimeForPath", () => {
   it("maps model-attachable image extensions to their wire MIME", () => {
@@ -127,5 +132,122 @@ describe("attachmentFromBlob", () => {
     const res = await attachmentFromBlob(blob, "small.png");
     expect(res && !("error" in res) ? res.mediaType : null).toBe("image/png");
     expect(res && !("error" in res) ? res.dataBase64.length > 0 : false).toBe(true);
+  });
+});
+
+describe("attachments store — reads in flight + inline error", () => {
+  const conv = "conv-1";
+  beforeEach(() => {
+    useComposerAttachments.setState({ byConv: {}, reading: {}, errors: {} });
+  });
+
+  it("counts overlapping reads and forgets the key once they all settle", () => {
+    const s = useComposerAttachments.getState();
+    s.beginRead(conv);
+    s.beginRead(conv);
+    expect(useComposerAttachments.getState().reading[conv]).toBe(2);
+    s.endRead(conv);
+    expect(useComposerAttachments.getState().reading[conv]).toBe(1);
+    s.endRead(conv);
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+    // An unbalanced end never goes negative.
+    s.endRead(conv);
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+  });
+
+  it("clear drops the conversation's error with its attachments, not another's", () => {
+    const s = useComposerAttachments.getState();
+    s.setError(conv, "Image too large: a.png");
+    s.setError("other", "boom");
+    s.clear(conv);
+    expect(useComposerAttachments.getState().errors).toEqual({ other: "boom" });
+    s.clearAll();
+    expect(useComposerAttachments.getState().errors).toEqual({});
+  });
+});
+
+describe("mentionPath / appendMentions", () => {
+  it("makes a path under the cwd relative, keeps any other absolute", () => {
+    expect(mentionPath("/repo/src/a.ts", "/repo")).toBe("src/a.ts");
+    expect(mentionPath("/repo/src/a.ts", "/repo/")).toBe("src/a.ts");
+    expect(mentionPath("/elsewhere/doc.pdf", "/repo")).toBe("/elsewhere/doc.pdf");
+    // A sibling sharing the prefix is NOT under the cwd.
+    expect(mentionPath("/repo-2/x.md", "/repo")).toBe("/repo-2/x.md");
+    expect(mentionPath("/repo/x.md", null)).toBe("/repo/x.md");
+  });
+
+  it("appends space-separated mentions after the draft, with a trailing space", () => {
+    expect(appendMentions("", ["/repo/a.md"], "/repo")).toBe("a.md ");
+    expect(appendMentions("look at  \n", ["/repo/a.md", "/b.pdf"], "/repo")).toBe("look at a.md /b.pdf ");
+    expect(appendMentions("keep", [], "/repo")).toBe("keep");
+  });
+});
+
+describe("attachPaths (the + picker and a Finder drop)", () => {
+  const conv = "conv-drop";
+  const img = (name: string): ImageAttachmentDraft => ({
+    id: `id-${name}`,
+    name,
+    mediaType: "image/png",
+    dataBase64: "AAAA",
+  });
+
+  beforeEach(() => {
+    useComposerAttachments.setState({ byConv: {}, reading: {}, errors: {} });
+    useComposerDrafts.getState().setDraft(conv, "");
+  });
+
+  it("routes images to attachments and every other path to a draft mention", async () => {
+    useComposerDrafts.getState().setDraft(conv, "see");
+    const read = async (p: string): Promise<PathAttachResult> => img(basename(p));
+    const res = await attachPaths(conv, ["/repo/shot.png", "/repo/notes.md", "/repo/dir"], "/repo", read);
+    expect(res).toEqual({ mentions: 2 });
+    expect(attachmentsFor(conv).map((a) => a.name)).toEqual(["shot.png"]);
+    expect(useComposerDrafts.getState().drafts[conv]).toBe("see notes.md dir ");
+    expect(useComposerAttachments.getState().errors[conv]).toBeUndefined();
+  });
+
+  it("locks the send while images are read, and unlocks after", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const read = async (p: string): Promise<PathAttachResult> => {
+      await gate;
+      return img(basename(p));
+    };
+    const pending = attachPaths(conv, ["/a.png"], null, read);
+    expect(useComposerAttachments.getState().reading[conv]).toBe(1);
+    release();
+    await pending;
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+  });
+
+  it("surfaces every failure at once (deduplicated), keeping the successes", async () => {
+    const read = async (p: string): Promise<PathAttachResult> => {
+      if (p.endsWith("big.png")) return { error: "Image too large: big.png" };
+      if (p.endsWith("boom.png")) throw new Error("ipc down");
+      return img(basename(p));
+    };
+    await attachPaths(conv, ["/big.png", "/ok.png", "/boom.png", "/big.png"], null, read);
+    expect(attachmentsFor(conv).map((a) => a.name)).toEqual(["ok.png"]);
+    const err = useComposerAttachments.getState().errors[conv];
+    expect(err).toBe("Image too large: big.png · Failed to read image boom.png: ipc down");
+    // The lock is released even when a read threw.
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+  });
+
+  it("clears the previous error on a new attempt, even an empty one (cancelled picker)", async () => {
+    useComposerAttachments.getState().setError(conv, "old");
+    const res = await attachPaths(conv, [], null);
+    expect(res).toEqual({ mentions: 0 });
+    expect(useComposerAttachments.getState().errors[conv]).toBeUndefined();
+  });
+
+  it("appends to the draft as it is AFTER the reads (typing during a read is kept)", async () => {
+    const read = async (p: string): Promise<PathAttachResult> => {
+      useComposerDrafts.getState().setDraft(conv, "typed meanwhile");
+      return img(basename(p));
+    };
+    await attachPaths(conv, ["/a.png", "/b.txt"], null, read);
+    expect(useComposerDrafts.getState().drafts[conv]).toBe("typed meanwhile /b.txt ");
   });
 });

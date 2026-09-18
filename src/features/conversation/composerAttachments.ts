@@ -1,4 +1,4 @@
-// Composer image attachments — the "+" button and paste-an-image flows.
+// Composer image attachments — the "+" button, paste-an-image and drop-a-file flows.
 //
 // State is IN-MEMORY and per-conversation (keyed by the stable conv id), NOT
 // persisted: base64 image blobs would bloat localStorage, and an attachment is a
@@ -9,10 +9,16 @@
 // Only the four media types the model accepts as `image` blocks are attachable
 // (png / jpeg / gif / webp — verified against the `claude` binary). Any other file
 // picked via "+" is inserted as a path mention in the text instead (Claude reads it
-// with its own tools); see ConductorComposer.
+// with its own tools); see `attachPaths`.
+//
+// The in-flight read count and the last failure live here too, per conversation, rather
+// than in the composer: a file dropped on a Flight Deck card is attached to a conversation
+// whose composer is not mounted yet, and its send-lock and errors must still be there when
+// the reply modal opens on it.
 
 import { create } from "zustand";
 import { commands } from "../../ipc/client";
+import { useComposerDrafts } from "../../store/composerDrafts";
 import type { UserTurnImage } from "../../store/types";
 
 /** An attachment in the composer: a `UserTurnImage` plus a local id for list keys
@@ -24,15 +30,38 @@ export interface ImageAttachmentDraft extends UserTurnImage {
 interface AttachmentsState {
   /** Attachments per conversation stable id. */
   byConv: Record<string, ImageAttachmentDraft[]>;
+  /** In-flight image reads per conversation. While > 0 that conversation's send is
+   *  blocked, so a fast attach-then-Enter can't fire BEFORE the image lands (which would
+   *  send without it, then attach it to the NEXT message). Absent = 0. */
+  reading: Record<string, number>;
+  /** Last attach failure per conversation (unreadable / too large / unsupported), shown
+   *  inline in the attachment row until the next attach attempt or send. */
+  errors: Record<string, string>;
   add: (convId: string, att: ImageAttachmentDraft) => void;
   remove: (convId: string, id: string) => void;
+  /** Drop this conversation's attachments AND its error (a send consumed them, or the
+   *  conversation was deleted). In-flight reads are left alone: they settle on their own. */
   clear: (convId: string) => void;
-  /** Drop every conversation's attachments — for a full data wipe. */
+  /** Drop every conversation's attachments and errors — for a full data wipe. */
   clearAll: () => void;
+  beginRead: (convId: string) => void;
+  endRead: (convId: string) => void;
+  /** Set (or, with null, clear) this conversation's inline attach error. */
+  setError: (convId: string, message: string | null) => void;
+}
+
+/** A copy of `map` without `key` (the map itself when the key is absent). */
+function without<T>(map: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in map)) return map;
+  const next = { ...map };
+  delete next[key];
+  return next;
 }
 
 export const useComposerAttachments = create<AttachmentsState>((set) => ({
   byConv: {},
+  reading: {},
+  errors: {},
   add: (convId, att) =>
     set((s) => ({ byConv: { ...s.byConv, [convId]: [...(s.byConv[convId] ?? []), att] } })),
   remove: (convId, id) =>
@@ -41,12 +70,29 @@ export const useComposerAttachments = create<AttachmentsState>((set) => ({
     })),
   clear: (convId) =>
     set((s) => {
-      if (!s.byConv[convId]?.length) return s;
-      const next = { ...s.byConv };
-      delete next[convId];
-      return { byConv: next };
+      const byConv = s.byConv[convId]?.length ? without(s.byConv, convId) : s.byConv;
+      const errors = without(s.errors, convId);
+      return byConv === s.byConv && errors === s.errors ? s : { byConv, errors };
     }),
-  clearAll: () => set((s) => (Object.keys(s.byConv).length ? { byConv: {} } : s)),
+  clearAll: () =>
+    set((s) =>
+      Object.keys(s.byConv).length || Object.keys(s.errors).length ? { byConv: {}, errors: {} } : s,
+    ),
+  beginRead: (convId) =>
+    set((s) => ({ reading: { ...s.reading, [convId]: (s.reading[convId] ?? 0) + 1 } })),
+  endRead: (convId) =>
+    set((s) => {
+      const n = (s.reading[convId] ?? 0) - 1;
+      return { reading: n > 0 ? { ...s.reading, [convId]: n } : without(s.reading, convId) };
+    }),
+  setError: (convId, message) =>
+    set((s) => {
+      if (message === null) {
+        const errors = without(s.errors, convId);
+        return errors === s.errors ? s : { errors };
+      }
+      return s.errors[convId] === message ? s : { errors: { ...s.errors, [convId]: message } };
+    }),
 }));
 
 /** Forget one conversation's attachments — call when it's deleted so the in-memory
@@ -71,6 +117,16 @@ export function useConvAttachments(convId: string): ImageAttachmentDraft[] {
 /** Imperative read (for the send path). */
 export function attachmentsFor(convId: string): ImageAttachmentDraft[] {
   return useComposerAttachments.getState().byConv[convId] ?? EMPTY;
+}
+
+/** Reactive: whether this conversation has image reads in flight (its send is locked). */
+export function useAttachReading(convId: string): boolean {
+  return useComposerAttachments((s) => (s.reading[convId] ?? 0) > 0);
+}
+
+/** Reactive: this conversation's inline attach error, or null. */
+export function useAttachError(convId: string): string | null {
+  return useComposerAttachments((s) => s.errors[convId] ?? null);
 }
 
 // ---- media-type gating ------------------------------------------------------
@@ -167,6 +223,77 @@ export function attachmentFromBlob(blob: Blob, name: string): Promise<PathAttach
     reader.onerror = () => resolve(null);
     reader.readAsDataURL(blob);
   });
+}
+
+// ---- routing picked / dropped paths -----------------------------------------
+
+/** How a file path is written into the draft: relative to the conversation cwd when it
+ *  lives under it (a short mention that resolves to a clickable chip), else absolute
+ *  (still readable by Claude and by the mention resolver). */
+export function mentionPath(abs: string, cwd: string | null): string {
+  const base = cwd ? cwd.replace(/\/+$/, "") : "";
+  return base && abs.startsWith(base + "/") ? abs.slice(base.length + 1) : abs;
+}
+
+/** The draft with these file-path mentions appended (space-separated, trailing space so
+ *  the user can type straight on). */
+export function appendMentions(draft: string, paths: string[], cwd: string | null): string {
+  if (!paths.length) return draft;
+  const joined = paths.map((p) => mentionPath(p, cwd)).join(" ");
+  return draft.trim() ? `${draft.replace(/\s*$/, "")} ${joined} ` : `${joined} `;
+}
+
+/**
+ * Attach files to a conversation's composer — the ONE routine behind the "+" picker and a
+ * file dropped from the Finder, so both give exactly the same result: a model-attachable
+ * image becomes a base64 attachment, anything else (another file type, a folder) becomes
+ * a path mention appended to the draft, which Claude reads with its own tools.
+ *
+ * Works whether or not that conversation's composer is mounted (everything it touches is
+ * a per-conversation store). Locks the conversation's send while images are read, and
+ * surfaces every failure at once as its inline error — a later failure must not silently
+ * erase an earlier one. Returns how many mentions were appended, so a mounted composer
+ * can put the caret after them.
+ *
+ * `read` is injectable for tests; production reads through the fs service.
+ */
+export async function attachPaths(
+  convId: string,
+  paths: string[],
+  cwd: string | null,
+  read: (path: string) => Promise<PathAttachResult> = attachmentFromPath,
+): Promise<{ mentions: number }> {
+  const store = useComposerAttachments.getState;
+  store().setError(convId, null);
+  if (!paths.length) return { mentions: 0 };
+  const mentions: string[] = [];
+  const errs: string[] = [];
+  store().beginRead(convId);
+  try {
+    for (const p of paths) {
+      if (!wireImageMimeForPath(p)) {
+        mentions.push(p);
+        continue;
+      }
+      try {
+        const res = await read(p);
+        if (res && "error" in res) errs.push(res.error);
+        else if (res) store().add(convId, res);
+      } catch (e) {
+        // An IPC-level failure (not a typed fs error) must still reach the user.
+        errs.push(`Failed to read image ${basename(p)}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  } finally {
+    store().endRead(convId);
+  }
+  if (errs.length) store().setError(convId, [...new Set(errs)].join(" · "));
+  if (mentions.length) {
+    // Read the draft NOW, after the awaits: the user may have typed while images loaded.
+    const drafts = useComposerDrafts.getState();
+    drafts.setDraft(convId, appendMentions(drafts.drafts[convId] ?? "", mentions, cwd));
+  }
+  return { mentions: mentions.length };
 }
 
 /** A `data:` URL for rendering an attachment/turn image as a thumbnail. */
