@@ -1596,6 +1596,10 @@ mod tests {
             identity_file: Some(key.private.to_string_lossy().into_owned()),
             added_at: 0,
             addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         }
     }
 

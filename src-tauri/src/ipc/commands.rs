@@ -4063,6 +4063,10 @@ pub async fn add_machine(
         identity_file,
         added_at: now_ms(),
         addresses: candidates,
+        daemon_mac_id: None,
+        daemon_relay_url: None,
+        daemon_label: None,
+        phone_provisioned_at: None,
     };
     app.state::<Store>()
         .upsert_machine(&machine)
@@ -5315,6 +5319,10 @@ mod tests {
                 identity_file: Some(key.to_string_lossy().into_owned()),
                 added_at: 1,
                 addresses: Vec::new(),
+                daemon_mac_id: None,
+                daemon_relay_url: None,
+                daemon_label: None,
+                phone_provisioned_at: None,
             })
             .unwrap();
 
@@ -5337,6 +5345,10 @@ mod tests {
                 identity_file: None,
                 added_at: 1,
                 addresses: Vec::new(),
+                daemon_mac_id: None,
+                daemon_relay_url: None,
+                daemon_label: None,
+                phone_provisioned_at: None,
             })
             .unwrap();
         // Must not panic when there is no key to clean up.
@@ -5440,6 +5452,10 @@ mod tests {
             identity_file: Some(referenced.to_string_lossy().into_owned()),
             added_at: 1,
             addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         }];
 
         super::sweep_orphan_ssh_keys(dir.path(), Some(&machines));

@@ -3765,7 +3765,43 @@ added_at: number;
  * list must degrade to "just `host`", not break the machine (see
  * [`super::db::Store::machine_by_id`]).
  */
-addresses?: AddressCandidate[] }
+addresses?: AddressCandidate[]; 
+/**
+ * This node's relay identity, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::mac_id`] so a result from that
+ * probe can be stored directly, no reshaping. `None` until a `flightdeckd init` /
+ * `whoami` round trip has succeeded for this machine (every machine paired before
+ * the daemon flow existed, and any machine whose `whoami` hasn't run yet). By
+ * convention, only [`super::db::Store::set_machine_daemon_identity`] populates
+ * this field — [`super::db::Store::upsert_machine`]'s COALESCE keeps a `None`
+ * there from erasing it, but nothing in the type system stops a caller from
+ * constructing a record with this field set and passing it to `upsert_machine`
+ * directly; every existing caller (add/rename/probe) just happens to pass `None`.
+ */
+daemon_mac_id?: string | null; 
+/**
+ * This node's relay URL, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::relay_url`]. Same write/`None`
+ * convention as [`Self::daemon_mac_id`].
+ */
+daemon_relay_url?: string | null; 
+/**
+ * The label the daemon itself was initialized with (`flightdeckd init --label
+ * …`), straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::label`]. Deliberately a
+ * SEPARATE field from [`Self::label`] (the human-facing name Flight Deck shows for
+ * this server): the two can drift, and this one exists to compare against /
+ * display what the daemon believes its own identity is. Same write/`None`
+ * convention as [`Self::daemon_mac_id`].
+ */
+daemon_label?: string | null; 
+/**
+ * Unix ms timestamp the phone (mobile relay) was provisioned for this server, or
+ * `None` if it never has been. By convention, populated only by
+ * [`super::db::Store::set_machine_phone_provisioned_at`] — same non-erasure
+ * convention as the `daemon_*` fields above.
+ */
+phone_provisioned_at?: number | null }
 /**
  * What the instructions file looks like right now.
  */
