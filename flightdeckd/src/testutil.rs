@@ -43,3 +43,29 @@ pub async fn serve_attach(manager: Arc<SessionManager>, dir: &Path) -> PathBuf {
     }
     panic!("attach socket never came up at {}", socket.display());
 }
+
+/// An executable stand-in for claude: announces `session_id` in an init
+/// frame, then holds stdin open (a live session) until EOF.
+pub fn fake_claude(dir: &Path, session_id: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-claude");
+    let script = format!(
+        "#!/bin/sh\necho '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'\ncat >/dev/null\n"
+    );
+    std::fs::write(&path, script).expect("write fake claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// Wait until a conversation's live actor reports `session_id`.
+pub async fn wait_for_session_id(m: &Arc<SessionManager>, conv_id: &str, session_id: &str) {
+    for _ in 0..300 {
+        if let Some(st) = m.status(conv_id).await {
+            if st.session_id.as_deref() == Some(session_id) {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{conv_id} never reported session {session_id}");
+}

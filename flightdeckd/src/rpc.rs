@@ -5,7 +5,8 @@
 
 use crate::events::Event;
 use crate::frames;
-use crate::session::{PendingPermission, SessionManager, SessionMsg};
+use crate::registry::ConversationRow;
+use crate::session::{PendingPermission, SessionManager, SessionMsg, StatusSnapshot};
 use crate::transcript;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -110,8 +111,8 @@ fn pending_to_request(p: &PendingPermission) -> Value {
     })
 }
 
-async fn status_json(m: &Arc<SessionManager>, conv_id: &str) -> Value {
-    match m.status(conv_id).await {
+fn status_json(live: Option<&StatusSnapshot>) -> Value {
+    match live {
         Some(st) if st.running => {
             if let Some(first) = st.pending.first() {
                 json!({"kind": "needs_permission", "tool": first.tool_name})
@@ -125,11 +126,20 @@ async fn status_json(m: &Arc<SessionManager>, conv_id: &str) -> Value {
     }
 }
 
+/// The claude session id — the join key between a client's own conversation
+/// ids and this daemon's (they legitimately differ). The live actor's value
+/// (fresh from claude's init frame) wins over the registry's, which can lag
+/// on a brand-new conversation.
+fn session_id_of(row: &ConversationRow, live: Option<&StatusSnapshot>) -> Option<String> {
+    live.and_then(|s| s.session_id.clone()).or_else(|| row.session_id.clone())
+}
+
 async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
     let rows = m.with_registry(|r| r.list(false))?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let status = status_json(m, &row.id).await;
+        let live = m.status(&row.id).await;
+        let status = status_json(live.as_ref());
         let name = row
             .repo_path
             .rsplit('/')
@@ -139,6 +149,7 @@ async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
         let title = if row.title.is_empty() { "New conversation".to_string() } else { row.title.clone() };
         out.push(json!({
             "conversation_id": row.id,
+            "session_id": session_id_of(&row, live.as_ref()),
             "title": title,
             "repository": {"name": name, "path": row.repo_path},
             "backend": "claude",
@@ -162,14 +173,11 @@ async fn read_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<Va
     // The claude session id may only be known live (registry write races the
     // read on a brand-new conversation) — prefer the live one.
     let live = m.status(&id).await;
-    let sid = live
-        .as_ref()
-        .and_then(|s| s.session_id.clone())
-        .or(row.session_id.clone());
+    let sid = session_id_of(&row, live.as_ref());
     let mut title = row.title.clone();
     let mut turns: Vec<Value> = Vec::new();
-    if let Some(sid) = sid {
-        let t = transcript::load(&sid);
+    if let Some(sid) = &sid {
+        let t = transcript::load(sid);
         if title.is_empty() {
             if let Some(ai) = &t.title {
                 title = ai.clone();
@@ -182,13 +190,14 @@ async fn read_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<Va
             .map(|x| json!({"role": x.role, "text": x.text}))
             .collect();
     }
-    let status = status_json(m, &id).await;
+    let status = status_json(live.as_ref());
     // Frame budget: the relay closes the socket on frames over 256 KB
     // (maxPayload). 40 turns × 4000 chars can get there — drop the OLDEST
     // turns until the serialized result fits comfortably.
     const RESULT_BYTES_MAX: usize = 200_000;
     let mut result = json!({
         "conversation_id": id,
+        "session_id": sid,
         "title": if title.is_empty() { "New conversation".to_string() } else { title },
         "status": status,
         "turns": turns,
@@ -320,4 +329,61 @@ fn browse_folders(m: &Arc<SessionManager>, params: &Value) -> Result<Value> {
         "registered_repos": registered,
         "folders": folders,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    fn row(id: &str, session_id: Option<&str>, repo: &str) -> ConversationRow {
+        ConversationRow {
+            id: id.into(),
+            session_id: session_id.map(String::from),
+            title: "t".into(),
+            repo_path: repo.into(),
+            created_at: 1,
+            last_activity_at: 1,
+            archived: false,
+        }
+    }
+
+    fn listed<'a>(list: &'a Value, id: &str) -> &'a Value {
+        list.as_array().unwrap().iter().find(|c| c["conversation_id"] == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn phone_results_carry_the_registry_session_id_when_cold() {
+        let m = testutil::test_manager(testutil::test_cfg());
+        m.with_registry(|r| r.upsert(&row("cold", Some("row-sid"), "/tmp"))).unwrap();
+        m.with_registry(|r| r.upsert(&row("fresh", None, "/tmp"))).unwrap();
+        let list = handle(&m, "list_conversations", &json!({})).await.unwrap();
+        assert_eq!(listed(&list, "cold")["session_id"], "row-sid");
+        assert_eq!(listed(&list, "fresh")["session_id"], Value::Null);
+        let read = handle(&m, "read_conversation", &json!({"conversation_id": "cold"})).await.unwrap();
+        assert_eq!(read["session_id"], "row-sid");
+        let read = handle(&m, "read_conversation", &json!({"conversation_id": "fresh"})).await.unwrap();
+        assert_eq!(read["session_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn phone_results_prefer_the_live_session_id() {
+        let dir = testutil::short_tempdir();
+        let mut cfg = testutil::test_cfg();
+        cfg.claude_bin = testutil::fake_claude(dir.path(), "live-sid").to_string_lossy().into();
+        let m = testutil::test_manager(cfg);
+        let repo = dir.path().to_string_lossy().to_string();
+        m.with_registry(|r| r.upsert(&row("c1", Some("row-sid"), &repo))).unwrap();
+        m.ensure_running("c1").await.unwrap();
+        testutil::wait_for_session_id(&m, "c1", "live-sid").await;
+        let list = handle(&m, "list_conversations", &json!({})).await.unwrap();
+        assert_eq!(listed(&list, "c1")["session_id"], "live-sid");
+        let read = handle(&m, "read_conversation", &json!({"conversation_id": "c1"})).await.unwrap();
+        assert_eq!(read["session_id"], "live-sid");
+        // and the snapshot beats a registry row that still lags behind it
+        let lagging = row("c1", Some("row-sid"), &repo);
+        let live = m.status("c1").await;
+        assert_eq!(session_id_of(&lagging, live.as_ref()).as_deref(), Some("live-sid"));
+        assert_eq!(session_id_of(&lagging, None).as_deref(), Some("row-sid"));
+    }
 }
