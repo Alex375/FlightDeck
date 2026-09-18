@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.4.0
+
+- New: an agent can **link its conversation to a TOSSE task** itself (e.g. after a `/pickup` run by hand), so the task chip and status tracking follow; a link can also be removed from the task panel.
+- New (Tarmac, the phone remote): the phone now sees **background tasks while the agent is still working**, not only once it goes idle — and no longer counts the agent's own foreground sub-agents as background work.
+- New (Tarmac): each background task shows **what the desktop bars show** — a sub-agent's type and model, a workflow's current step, a command without a name as its `$ command`.
+- Fix (Tarmac): a long answer ending on a question now pings the phone under **Questions** instead of "Ready for review".
+
 ## v2.3.1
 
 - Fix: **artifacts published by Claude open again** — inline artifact cards no longer show "Unavailable", and artifact links in Claude's replies are back to clickable cards (Claude Code 2.1.272 changed the artifact link format).
