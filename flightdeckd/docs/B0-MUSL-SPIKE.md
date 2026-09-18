@@ -34,15 +34,28 @@ Il suffit de Docker (n'importe quelle arch d'hôte). Les scripts vivent dans le
 crate (`flightdeckd/scripts/`) pour le suivre dans le futur monorepo.
 
 ```bash
-flightdeckd/scripts/build-musl.sh   # → flightdeckd/target/musl/dist/flightdeckd-<target>
+flightdeckd/scripts/build-musl.sh   # → <racine>/target/musl/dist/flightdeckd-<target>
 flightdeckd/scripts/smoke-musl.sh   # ldd + --version + init + run/TLS + status, par arch
+flightdeckd/scripts/build-musl.sh --print-dist-dir     # où atterrissent les binaires
+TARGETS=aarch64-unknown-linux-musl flightdeckd/scripts/build-musl.sh   # une seule arch
 ```
+
+`<racine>` est détectée (`scripts/lib-layout.sh`, comme cargo : le plus proche
+ancêtre dont le `Cargo.toml` a une table `[workspace]`, ou `WORKSPACE_ROOT=`) :
+le crate lui-même quand il est **autonome** (aujourd'hui, et après un import
+dans tosse-code comme paquet autonome), la racine du **workspace** quand il en
+est membre — c'est elle qui est montée dans le builder (son `Cargo.lock`,
+`--locked`), avec `-p flightdeckd` et le profil `daemon` du workspace s'il en a
+un (sinon `release` ; `PROFILE=` force). Vérifié le 18/09 dans les deux modes :
+crate autonome (les deux arches) et workspace simulé (un second membre, lock à
+la racine, `[profile.daemon]` → `target/musl/aarch64-unknown-linux-musl/daemon/`).
 
 - `scripts/musl-builder.Dockerfile` : `rust:1-alpine` + `apk add cargo-zigbuild`
   (tire `zig`) + `rustup target add` des deux cibles musl.
-- `build-musl.sh` : `cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl`
-  dans ce conteneur, crate monté, sous l'uid de l'appelant (rien écrit en root) ;
-  registre cargo + cache zig sous `target/musl/` ⇒ relances incrémentales.
+- `build-musl.sh` : `cargo zigbuild --locked -p flightdeckd --profile <release|daemon> --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl`
+  dans ce conteneur, `<racine>` montée, sous l'uid de l'appelant (rien écrit en
+  root) ; registre cargo + cache zig sous `<racine>/target/musl/` ⇒ relances
+  incrémentales.
 - Durées observées (VM colima 2 CPU, Mac arm64) : **7 min 48 s** à froid pour
   les deux cibles, **1 min 14 s** après une modif de `main.rs`. Image builder ~1,7 Go.
 

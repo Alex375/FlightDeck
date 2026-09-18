@@ -1,33 +1,46 @@
 #!/usr/bin/env bash
-# Cross-compile static flightdeckd binaries for Linux (musl):
-#   target/musl/dist/flightdeckd-x86_64-unknown-linux-musl
-#   target/musl/dist/flightdeckd-aarch64-unknown-linux-musl
+# Cross-compile static flightdeckd binaries for Linux (musl) into
+#   <root>/target/musl/dist/flightdeckd-x86_64-unknown-linux-musl
+#   <root>/target/musl/dist/flightdeckd-aarch64-unknown-linux-musl
+# where <root> is the crate itself (standalone) or its Cargo workspace root
+# (workspace member) — detected, see lib-layout.sh.
 #
-#   scripts/build-musl.sh              # from the crate root or anywhere
+#   scripts/build-musl.sh                     # both targets, from anywhere
+#   TARGETS=aarch64-unknown-linux-musl scripts/build-musl.sh
+#   scripts/build-musl.sh --print-dist-dir    # where the binaries land
 #
-# Needs only Docker (any host arch). Cargo's registry + zig's cache live under
-# target/musl/, so reruns are incremental and nothing is written as root.
+# Needs only Docker (any host arch). <root> is bind-mounted (the workspace's
+# Cargo.lock is the one used, --locked); cargo's registry + zig's cache live
+# under <root>/target/musl/, so reruns are incremental and nothing is written
+# as root.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib-layout.sh"
+fd_layout
+if [ "${1:-}" = "--print-dist-dir" ]; then
+  echo "$FD_DIST_DIR"
+  exit 0
+fi
 
 IMAGE="${IMAGE:-flightdeckd-musl-builder}"
-TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
-
+echo "· $(fd_describe)"
 echo "· builder image $IMAGE"
-docker build -q -t "$IMAGE" -f scripts/musl-builder.Dockerfile scripts >/dev/null
+docker build -q -t "$IMAGE" -f "$FD_CRATE_DIR/scripts/musl-builder.Dockerfile" "$FD_CRATE_DIR/scripts" >/dev/null
 
-mkdir -p target/musl/dist target/musl/home
-echo "· cargo zigbuild --release ${TARGETS[*]}"
+mkdir -p "$FD_DIST_DIR" "$FD_TARGET_DIR/home"
+echo "· cargo zigbuild -p flightdeckd --profile $FD_PROFILE $FD_TARGETS"
+# shellcheck disable=SC2086  # FD_TARGETS is a word list
 docker run --rm \
   -u "$(id -u):$(id -g)" \
-  -v "$PWD:/src" \
+  -v "$FD_ROOT:/src" \
+  -w /src \
   -e HOME=/src/target/musl/home \
   -e CARGO_HOME=/src/target/musl/cargo-home \
   -e CARGO_TARGET_DIR=/src/target/musl \
   "$IMAGE" \
-  sh -c 'cargo zigbuild --release --locked $(printf -- "--target %s " "$@")' _ "${TARGETS[@]}"
+  sh -c 'profile="$1"; shift; cargo zigbuild --locked -p flightdeckd --profile "$profile" $(printf -- "--target %s " "$@")' \
+  _ "$FD_PROFILE" $FD_TARGETS
 
-for t in "${TARGETS[@]}"; do
-  cp "target/musl/$t/release/flightdeckd" "target/musl/dist/flightdeckd-$t"
+for t in $FD_TARGETS; do
+  cp "$FD_TARGET_DIR/$t/$FD_PROFILE_DIR/flightdeckd" "$FD_DIST_DIR/flightdeckd-$t"
 done
-ls -l target/musl/dist/
+ls -l "$FD_DIST_DIR"

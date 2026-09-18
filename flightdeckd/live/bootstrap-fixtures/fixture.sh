@@ -14,7 +14,7 @@
 #
 # Env: BASE (ubuntu:20.04 — the real test server's distro),
 #      FLIGHTDECKD_BIN (fixture c: a static linux binary for Docker's arch;
-#      default: the flightdeckd/scripts/build-musl.sh output, built if missing).
+#      default: the crate's scripts/build-musl.sh output, built if missing).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BASE="${BASE:-ubuntu:20.04}"
@@ -35,13 +35,28 @@ pssh() { # <user> <password> <port> <cmd...>
 }
 fx() { pssh "$(user_of "$1")" "$(pass_of "$1")" "$(port_of "$1")" "${@:2}"; }
 
+# The flightdeckd crate: a sibling today (flightdeck-server/flightdeckd), this
+# directory's grandparent once moved under it (tosse-code/flightdeckd/live/…).
+flightdeckd_crate() {
+  local c
+  for c in "$HERE/../flightdeckd" "$HERE/../.."; do
+    if grep -qs '^name = "flightdeckd"' "$c/Cargo.toml"; then (cd "$c" && pwd); return; fi
+  done
+  echo "cannot find the flightdeckd crate from $HERE — set FLIGHTDECKD_BIN" >&2
+  return 1
+}
+
 flightdeckd_bin() {
   if [ -n "${FLIGHTDECKD_BIN:-}" ]; then echo "$FLIGHTDECKD_BIN"; return; fi
-  local arch; arch="$(docker info -f '{{.Architecture}}')"
+  local arch crate dist
+  arch="$(docker info -f '{{.Architecture}}')"
   case "$arch" in arm64) arch=aarch64 ;; amd64) arch=x86_64 ;; esac
-  local bin="$HERE/../flightdeckd/target/musl/dist/flightdeckd-$arch-unknown-linux-musl"
-  [ -x "$bin" ] || "$HERE/../flightdeckd/scripts/build-musl.sh" >&2
-  echo "$bin"
+  crate="$(flightdeckd_crate)"
+  dist="$("$crate/scripts/build-musl.sh" --print-dist-dir)"
+  if [ ! -x "$dist/flightdeckd-$arch-unknown-linux-musl" ]; then
+    TARGETS="$arch-unknown-linux-musl" "$crate/scripts/build-musl.sh" >&2
+  fi
+  echo "$dist/flightdeckd-$arch-unknown-linux-musl"
 }
 
 up() {

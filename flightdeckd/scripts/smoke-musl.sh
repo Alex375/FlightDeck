@@ -5,16 +5,19 @@
 # and complete a real TLS handshake (rustls + ring) — pointed at
 # https://example.com, whose 404 on the websocket upgrade proves TLS worked
 # without registering anything on the real relay. The foreign arch runs under
-# Docker's binfmt emulation (qemu / Rosetta).
+# Docker's binfmt emulation (qemu / Rosetta). TARGETS= limits the arches, as in
+# build-musl.sh; the binaries are looked up where build-musl.sh puts them.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib-layout.sh"
+fd_layout
+echo "· $(fd_describe) — binaries from $FD_DIST_DIR"
 
-for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+for t in $FD_TARGETS; do
   case "$t" in x86_64-*) platform=linux/amd64 ;; aarch64-*) platform=linux/arm64 ;; esac
-  bin="target/musl/dist/flightdeckd-$t"
+  bin="$FD_DIST_DIR/flightdeckd-$t"
   [ -x "$bin" ] || { echo "missing $bin — run scripts/build-musl.sh"; exit 1; }
   echo "== $t on $platform debian"
-  docker run --rm --platform "$platform" -v "$PWD/$bin:/usr/local/bin/flightdeckd:ro" \
+  docker run --rm --platform "$platform" -v "$bin:/usr/local/bin/flightdeckd:ro" \
     debian:bookworm-slim sh -euc '
       uname -m
       ldd /usr/local/bin/flightdeckd 2>&1 | sed "s/^/ldd: /" || true

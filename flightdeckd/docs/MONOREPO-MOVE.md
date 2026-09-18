@@ -226,12 +226,16 @@ embarqué dans le bundle de l'app) — hors de ce document.
 **Préalables dans `flightdeckd`, faisables dès maintenant sur `program/wave2`**
 (chacun testé, sans rien déplacer) :
 
-1. `rusqlite` 0.31 → 0.32 (**bloquant**).
-2. `tokio-tungstenite` 0.23 → 0.24, `dirs` 5 → 6 (doublons).
-3. `serde_json` + `preserve_order` et le test d'ordre des clés corrigé.
+1. `rusqlite` 0.31 → 0.32 (**bloquant**). **Fait.**
+2. `tokio-tungstenite` 0.23 → 0.24, `dirs` 5 → 6 (doublons). **Fait.**
+3. `serde_json` + `preserve_order` et le test d'ordre des clés corrigé. **Fait.**
 4. `build-musl.sh` / `smoke-musl.sh` rendus « workspace-aware » (monter la
    racine du workspace, `-p flightdeckd`, profil et dossier de sortie
-   paramétrables) — fonctionne aussi en standalone.
+   paramétrables) — fonctionne aussi en standalone. **Fait** : détection
+   automatique (`scripts/lib-layout.sh`), vérifiée dans les deux modes ; en
+   workspace cargo avertit « profiles for the non root package will be
+   ignored » : au passage en workspace, retirer le `[profile.release]` du crate
+   (ses réglages vivent dans `[profile.daemon]` à la racine).
 5. `live/m1` : l'image M1 consomme le binaire musl (plus de compilation dans
    Docker), étage de base M0 intégré.
 
