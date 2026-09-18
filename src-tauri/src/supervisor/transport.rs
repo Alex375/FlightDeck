@@ -152,12 +152,18 @@ pub struct RemoteTarget {
     /// itself, server-side.
     pub daemon_bin: String,
     /// Every candidate address for this server, `host` always FIRST (see
-    /// `ipc::commands::remote_target_addresses`), for a later task (A6) to rotate
-    /// through on a failed reconnect. CARRIED ONLY today — `host` is still the sole
-    /// address this transport ever dials (see [`build_remote_command`] /
-    /// [`Transport::spawn`]). Never empty, even for a paired-before-A5 machine with no
-    /// recorded candidates: that case falls back to the single known-good `host`.
+    /// `ipc::commands::remote_target_addresses`), that [`super::session::run_actor`]'s
+    /// address-rotation policy (A6) rotates `host` through on a sustained reconnect
+    /// failure. Never empty, even for a paired-before-A5 machine with no recorded
+    /// candidates: that case falls back to the single known-good `host` (and A6's
+    /// rotation never fires, since there is nothing else to try).
     pub addresses: Vec<String>,
+    /// The [`super::super::store::MachineRecord::id`] this target was built from, so a
+    /// SUCCESSFUL address rotation (A6) can report which machine's `host` to persist
+    /// back to. `None` for every test/fixture `RemoteTarget` that names no real
+    /// machine row — rotation still works (it only mutates `host` in memory for this
+    /// session), it just never emits a persist signal with nothing to key it by.
+    pub machine_id: Option<String>,
 }
 
 impl SpawnConfig {
@@ -1312,6 +1318,7 @@ mod tests {
             known_hosts_file: None,
             daemon_bin: "flightdeckd".into(),
             addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.starts_with("exec $(FLIGHTDECKD_NAME='flightdeckd'"), "cmd was: {cmd}");
@@ -2081,6 +2088,7 @@ mod tests {
             known_hosts_file: Some("/dev/null".into()),
             daemon_bin: "flightdeckd".into(),
             addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
         };
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-haiku-4-5-20251001".into());
