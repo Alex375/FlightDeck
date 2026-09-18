@@ -721,7 +721,10 @@ mod tests {
         drop(ours);
         let got = reader.await.unwrap();
         let lines: Vec<&str> = got.lines().collect();
-        assert_eq!(lines, vec![big.as_str(), r#"{"reason":"stalled","type":"fd_detach"}"#]);
+        assert_eq!(lines.len(), 2, "{} lines", lines.len());
+        assert_eq!(lines[0], big, "the torn line must arrive whole");
+        let farewell: Value = serde_json::from_str(lines[1]).unwrap(); // key order is not the contract
+        assert_eq!(farewell, json!({"type": "fd_detach", "reason": "stalled"}));
         drop(tx);
     }
 
