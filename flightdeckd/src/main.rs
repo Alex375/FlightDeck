@@ -154,6 +154,7 @@ async fn main() -> Result<()> {
             let path = config::default_config_path();
             // Held across check-and-write: a live daemon (phone tokens) or a
             // second `init` can't interleave with this one (see ConfigLock).
+            config::harden_state_dir(&config::state_dir())?;
             let lock = config::ConfigLock::acquire(&path)?;
             if path.exists() && !force {
                 anyhow::bail!("{} already exists (use --force to overwrite)", path.display());
@@ -196,6 +197,7 @@ async fn main() -> Result<()> {
                 )
                 .init();
             let path = cfg_path.unwrap_or_else(config::default_config_path);
+            config::harden_state_dir(&config::state_dir())?;
             let cfg = Config::load(&path)
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
             let registry = registry::Registry::open(&config::registry_path())?;

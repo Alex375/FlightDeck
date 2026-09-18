@@ -58,21 +58,52 @@ struct StopParams {
     conversation: String,
 }
 
+/// Bind the attach socket owner-only: whoever can connect controls every
+/// session and the phone access. The umask is narrowed AROUND the bind so the
+/// socket is never born group/world-accessible (a bind-then-chmod leaves a
+/// window); the chmod after is a second belt.
+fn bind_private(socket: &Path) -> Result<UnixListener> {
+    // SAFETY: umask(2) cannot fail; the previous mask is restored right after.
+    let old = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(socket);
+    unsafe { libc::umask(old) };
+    let listener = bound.with_context(|| format!("cannot bind {}", socket.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot chmod 600 {}", socket.display()))?;
+    Ok(listener)
+}
+
+/// Only the daemon's own user may use the socket (defense in depth beside the
+/// socket's mode and the 0700 state dir).
+fn peer_is_owner(conn: &UnixStream) -> std::result::Result<(), String> {
+    // SAFETY: geteuid(2) cannot fail.
+    let own = unsafe { libc::geteuid() };
+    match conn.peer_cred() {
+        Ok(cred) if cred.uid() == own => Ok(()),
+        Ok(cred) => Err(format!("uid {} (the daemon runs as uid {own})", cred.uid())),
+        Err(e) => Err(format!("unknown peer credentials ({e})")),
+    }
+}
+
 pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
     if socket.exists() {
         std::fs::remove_file(socket).ok();
     }
-    if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+        crate::config::create_private_dir(dir)?;
     }
-    let listener = UnixListener::bind(socket)
-        .with_context(|| format!("cannot bind {}", socket.display()))?;
+    let listener = bind_private(socket)?;
     info!("attach socket ready at {}", socket.display());
     loop {
         // One failed accept (EMFILE, a raced peer) must not take the whole
         // daemon — and every live session — down with it.
         match listener.accept().await {
             Ok((conn, _)) => {
+                if let Err(who) = peer_is_owner(&conn) {
+                    warn!("attach connection refused: {who}");
+                    continue; // dropping `conn` closes it
+                }
                 let manager = manager.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(manager, conn).await {
@@ -745,6 +776,17 @@ mod tests {
         stop_tx.send(()).unwrap();
         let err = pump_stdin(&mut ours, &mut rx, stop_rx, Duration::from_millis(50)).await.unwrap_err();
         assert!(err.to_string().contains("3 stdin line(s) could not be delivered"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_attach_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = testutil::short_tempdir();
+        let socket = testutil::serve_attach(testutil::test_manager(testutil::test_cfg()), dir.path()).await;
+        assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+        // and its owner still gets in (peer credentials match)
+        let line = status_client(&socket).await.unwrap();
+        assert!(line.contains("fd_status"));
     }
 
     #[tokio::test]

@@ -26,9 +26,23 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Open (or create) the registry. The database and its `-wal`/`-shm`
+    /// companions are owner-only (0600): they hold every conversation's title
+    /// and repo path. SQLite creates the companions with the database's mode;
+    /// companions left wider by an older daemon are narrowed here.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            crate::config::create_private_dir(parent)?;
+        }
+        std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path)?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            let file = std::path::PathBuf::from(name);
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+            }
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -210,6 +224,33 @@ mod tests {
         // and the ai-title backfill still never overwrites it
         r.set_title("placeholder", "ai title").unwrap();
         assert_eq!(r.get("placeholder").unwrap().unwrap().title, "Renamed");
+    }
+
+    #[test]
+    fn the_registry_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/registry.sqlite");
+        let mode = |suffix: &str| {
+            let p = format!("{}{suffix}", path.display());
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        let r = Registry::open(&path).unwrap();
+        r.upsert(&mk("a", 1)).unwrap(); // makes SQLite create -wal / -shm
+        assert_eq!(mode(""), 0o600);
+        assert_eq!(mode("-wal"), 0o600);
+        assert_eq!(mode("-shm"), 0o600);
+        assert_eq!(std::fs::metadata(dir.path().join("state")).unwrap().permissions().mode() & 0o777, 0o700);
+        drop(r);
+        // files an older daemon left world-readable are narrowed on open
+        for s in ["", "-wal", "-shm"] {
+            let p = format!("{}{s}", path.display());
+            if std::path::Path::new(&p).exists() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let _r = Registry::open(&path).unwrap();
+        assert_eq!(mode(""), 0o600);
     }
 
     #[test]

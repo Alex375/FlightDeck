@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -61,6 +61,26 @@ fn default_claude_bin() -> String {
 }
 fn default_permission_mode() -> String {
     "bypassPermissions".into()
+}
+
+/// Create `dir` (and any missing parent) owner-only (0700). An EXISTING
+/// directory is left as is — see [`harden_state_dir`] for the daemon's own.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+/// The state dir holds the relay secret, the attach socket (full control of
+/// every session) and the registry: owner-only. Created 0700; an existing one
+/// that is wider (an older daemon, a hand-made dir) is narrowed, with a warning.
+pub fn harden_state_dir(dir: &Path) -> Result<()> {
+    create_private_dir(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!("{} was mode {mode:o} — narrowing it to 700", dir.display());
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot chmod 700 {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 pub fn state_dir() -> PathBuf {
@@ -123,7 +143,7 @@ impl ConfigLock {
     pub fn acquire_within(config_path: &Path, wait: Duration) -> Result<Self> {
         let path = lock_path(config_path);
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
         }
         let file = OpenOptions::new()
             .read(true)
@@ -196,7 +216,7 @@ impl Config {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     let name = path.file_name().context("config path has no file name")?.to_string_lossy();
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
     let written = (|| -> std::io::Result<()> {
@@ -296,6 +316,26 @@ mod tests {
         std::fs::write(&path, r#"{"relay_url":"r","mac_id":"m","mac_token":"t"}"#).unwrap();
         let c = Config::load(&path).unwrap();
         assert!(c.phone_tokens.is_empty() && c.revoked_phone_tokens.is_empty());
+    }
+
+    #[test]
+    fn state_dirs_are_created_private_and_widened_ones_are_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fresh = root.path().join("a/b/.flightdeckd");
+        harden_state_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+        assert_eq!(mode(&root.path().join("a")), 0o700, "missing parents are created private too");
+        let wide = root.path().join("wide");
+        std::fs::create_dir(&wide).unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o755)).unwrap();
+        harden_state_dir(&wide).unwrap();
+        assert_eq!(mode(&wide), 0o700);
+        // a config saved into a missing dir creates it private as well
+        let nested = root.path().join("new/config.json");
+        test_cfg().save(&nested).unwrap();
+        assert_eq!(mode(&root.path().join("new")), 0o700);
     }
 
     #[test]
