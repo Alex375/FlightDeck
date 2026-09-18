@@ -25,7 +25,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use super::protocol::CliMessage;
 
@@ -173,6 +173,15 @@ fn default_claude_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
+/// The `ssh` binary a remote spawn execs. `$TOSSE_SSH_BIN` first — a test-only
+/// escape hatch mirroring `$TOSSE_CLAUDE_BIN` (see [`default_claude_bin`]), so a
+/// test can point a remote launch at a fake script (e.g. one that exits 127 to
+/// simulate a missing `flightdeckd`) without mutating `$PATH` — else the bare
+/// `"ssh"` resolved on `PATH`, exactly as before. Never set in production.
+fn resolve_ssh_bin() -> String {
+    std::env::var("TOSSE_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
+}
+
 /// Build the `claude` argv (everything after the binary) from a [`SpawnConfig`].
 /// Shared verbatim by the local and remote launchers: the SAME flags must run
 /// whether `claude` is spawned here or over SSH, so the wire protocol is identical
@@ -304,7 +313,7 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
 /// command ran and exited 0; failures are logged, never surfaced (the session
 /// is already torn down locally).
 pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_ssh_bin());
     cmd.arg("-T")
         .arg("-p")
         .arg(remote.port.to_string())
@@ -559,6 +568,13 @@ pub struct Transport {
     pumps: Vec<tokio::task::JoinHandle<()>>,
     /// Last N stderr lines, for surfacing the cause of an abnormal exit.
     stderr_tail: StderrTail,
+    /// Fired by `stderr_loop` right after it hits EOF (buffers one permit if
+    /// nobody is waiting yet, so this can never be missed). Lets a caller that
+    /// just reaped the child via [`Self::wait_status`] wait for the stderr
+    /// pump to have actually drained the pipe before reading
+    /// [`Self::stderr_tail`] — otherwise the two race (see
+    /// [`Self::wait_stderr_drained`]).
+    stderr_done: Arc<Notify>,
     /// Set if the stdout reader ended on an IO error (vs a clean EOF).
     reader_err: ErrSlot,
     /// Set if the stdin writer died on a write/flush/serialize failure.
@@ -610,7 +626,7 @@ impl Transport {
             // are the ssh channel, so the reader/writer/stderr pumps below are reused
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
-            let mut cmd = Command::new("ssh");
+            let mut cmd = Command::new(resolve_ssh_bin());
             cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
                 .arg("-p")
                 .arg(remote.port.to_string())
@@ -693,6 +709,7 @@ impl Transport {
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Value>();
 
         let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX)));
+        let stderr_done: Arc<Notify> = Arc::new(Notify::new());
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -709,7 +726,7 @@ impl Transport {
                 first_unparseable_offset.clone(),
             )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
-            tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
+            tokio::spawn(stderr_loop(stderr, stderr_tail.clone(), stderr_done.clone())),
         ];
 
         Ok((
@@ -719,6 +736,7 @@ impl Transport {
                 child,
                 pumps,
                 stderr_tail,
+                stderr_done,
                 reader_err,
                 writer_err,
                 lines_seen,
@@ -771,6 +789,20 @@ impl Transport {
             .lock()
             .map(|b| b.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Wait (bounded) for `stderr_loop` to have drained the pipe to EOF, so a
+    /// [`Self::stderr_tail`] read right after this reflects EVERYTHING the
+    /// process wrote before exiting. Without this, a caller that just reaped
+    /// the child via [`Self::wait_status`] and immediately calls
+    /// `stderr_tail()` races the independent pump task — in practice `wait`
+    /// only resolves once the OS has already delivered SIGCHLD, which gives
+    /// the pump (a much cheaper buffered read) ample opportunity to finish
+    /// first, but nothing GUARANTEES it. Bounded so a stuck pump (should
+    /// never happen — the pipe closes with the process) can never hang the
+    /// caller; on the happy path this returns almost instantly.
+    pub async fn wait_stderr_drained(&self) {
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.stderr_done.notified()).await;
     }
 
     /// The stdout reader's terminal IO error, if it ended on one (vs a clean EOF).
@@ -1032,7 +1064,10 @@ async fn writer_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Valu
 /// Forward the child's stderr to our log AND keep a bounded tail of it, so an
 /// abnormal exit (auth failure, panic, MCP error) can surface its cause in the UI
 /// instead of being lost to a Finder-launched bundle's invisible stderr.
-async fn stderr_loop(stderr: ChildStderr, tail: StderrTail) {
+///
+/// Notifies `done` once the pipe hits EOF, so [`Transport::wait_stderr_drained`]
+/// can be sure the tail is complete before a caller reads it.
+async fn stderr_loop(stderr: ChildStderr, tail: StderrTail, done: Arc<Notify>) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if !line.trim().is_empty() {
@@ -1045,6 +1080,7 @@ async fn stderr_loop(stderr: ChildStderr, tail: StderrTail) {
             }
         }
     }
+    done.notify_one();
 }
 
 fn truncate(s: &str, max: usize) -> String {
