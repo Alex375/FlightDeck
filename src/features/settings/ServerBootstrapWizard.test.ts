@@ -80,6 +80,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { useSettingsUi } from "../../store/settingsUi";
+import sharedStyles from "./SettingsPanel.module.css";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -140,6 +141,15 @@ function clickButtonWithText(text: string) {
 
 function passwordInput(): HTMLInputElement | null {
   return container.querySelector('input[type="password"]');
+}
+
+/** The innermost `<div>` containing `text` — every ancestor of the real element also
+ *  matches a plain `textContent.includes` check (it's a substring of theirs too), and
+ *  `querySelectorAll` returns them in document (pre-)order, ancestors before
+ *  descendants, so the LAST match is the actual, most specific element. */
+function mostSpecificDivWithText(text: string): HTMLElement | undefined {
+  const matches = Array.from(container.querySelectorAll("div")).filter((d) => d.textContent?.includes(text));
+  return matches[matches.length - 1];
 }
 
 beforeEach(() => {
@@ -211,6 +221,40 @@ describe("ServerBootstrapWizard — form", () => {
     mount();
     const toggle = container.querySelector('[role="switch"]');
     expect(toggle?.getAttribute("aria-checked")).toBe("true");
+  });
+
+  // Review finding: `isServerBusyError` was defined and unit-tested in
+  // `serverBootstrapModel.ts` but never actually called from either UI component, so
+  // a `ServerLocks` collision (another bootstrap/repair already running against the
+  // same server) only ever rendered as a raw, indistinguishable red error.
+  it("gives a server_busy_error collision a distinct, non-error treatment", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "error",
+      error: 'Another operation ("Repair: restart") is already running on this server. Wait for it to finish, then try again.',
+    });
+    mount();
+    fill("Address", "busy.example.com");
+    fill("User", "root");
+    clickButtonWithText("Install");
+    await settle();
+
+    const busyBox = mostSpecificDivWithText("is already running on this server");
+    expect(busyBox).toBeTruthy();
+    expect(busyBox?.className).toBe(sharedStyles.hintWarn);
+    expect(busyBox?.className).not.toBe(sharedStyles.errorMsg);
+  });
+
+  it("still gives an ordinary bootstrap failure the normal error treatment", async () => {
+    bootstrapServer.mockResolvedValue({ status: "error", error: "Could not connect: connection refused" });
+    mount();
+    fill("Address", "unreachable.example.com");
+    fill("User", "root");
+    clickButtonWithText("Install");
+    await settle();
+
+    const errorBox = mostSpecificDivWithText("connection refused");
+    expect(errorBox).toBeTruthy();
+    expect(errorBox?.className).toBe(sharedStyles.errorMsg);
   });
 });
 

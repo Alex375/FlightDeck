@@ -28,6 +28,7 @@ import { ToggleRow } from "./SettingsKit";
 import {
   claudeSignInStep,
   isHostKeyMismatch,
+  isServerBusyError,
   isSudoPasswordError,
   needsSudoPassword,
   restartPendingCount,
@@ -58,6 +59,15 @@ function initialSteps(): StepState[] {
  *  generated binding's own `catch`, which re-throws a real `Error` verbatim. */
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** `errorMsg`'s discreet sibling for a `server_busy_error` collision (review finding:
+ *  `isServerBusyError` was defined and tested but never actually called anywhere) —
+ *  it isn't a failure of THIS attempt, just another operation already running against
+ *  the same server, so it reads as a transient "wait and retry" notice rather than a
+ *  hard red error. */
+function errorBoxClass(message: string | null): string {
+  return isServerBusyError(message) ? sharedStyles.hintWarn : sharedStyles.errorMsg;
 }
 
 function StepChecklist({ steps }: { steps: StepState[] }) {
@@ -438,7 +448,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
           checked={keepAwake}
           onChange={setKeepAwake}
         />
-        {topError && <div className={sharedStyles.errorMsg}>{topError}</div>}
+        {topError && <div className={errorBoxClass(topError)}>{topError}</div>}
         <div className={sharedStyles.btnRow}>
           <button
             className={`${sharedStyles.btn} ${sharedStyles.primary}`}
@@ -576,7 +586,7 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
       {failedStep && !installKeyMismatch && (
         <div className={sharedStyles.errorMsg}>{failedStep.detail ?? "This step failed."}</div>
       )}
-      {topError && <div className={sharedStyles.errorMsg}>{topError}</div>}
+      {topError && <div className={errorBoxClass(topError)}>{topError}</div>}
 
       <div className={sharedStyles.btnRow}>
         {failedStep && (
@@ -712,7 +722,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
             aria-label="Pairing ticket"
             autoComplete="off"
           />
-          {error && <div className={sharedStyles.errorMsg}>{error}</div>}
+          {error && <div className={errorBoxClass(error)}>{error}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
@@ -810,7 +820,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
               autoComplete="off"
             />
           </div>
-          {error && <div className={sharedStyles.errorMsg}>{error}</div>}
+          {error && <div className={errorBoxClass(error)}>{error}</div>}
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}

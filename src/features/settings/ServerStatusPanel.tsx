@@ -15,6 +15,7 @@ import {
   claudeNeedsSignIn,
   headlineLabel,
   headlineTone,
+  isServerBusyError,
   isSudoPasswordError,
   repairSuggestionsFor,
   tri,
@@ -353,7 +354,11 @@ export function ServerStatusPanel({
               </button>
             </div>
           )}
-          {repairError && <div className={sharedStyles.errorMsg}>{repairError}</div>}
+          {repairError && (
+            <div className={isServerBusyError(repairError) ? sharedStyles.hintWarn : sharedStyles.errorMsg}>
+              {repairError}
+            </div>
+          )}
           {/* `sign_in_claude` never appears in `repairSuggestionsFor` — see its own doc
               — so it gets its own always-available action here instead. */}
           {claudeNeedsSignIn(diagnosis) && !showClaudeSignIn && (

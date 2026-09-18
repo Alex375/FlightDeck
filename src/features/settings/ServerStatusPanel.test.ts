@@ -66,6 +66,7 @@ import { DiagnosisSummary, ServerStatusPanel } from "./ServerStatusPanel";
 import type { Machine } from "../../store/conversationsStore";
 import type { RepairAction, ServerDiagnosis } from "../../ipc/client";
 import type { ProvisionStatusLabel } from "./provisionStatus";
+import sharedStyles from "./SettingsPanel.module.css";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -229,6 +230,15 @@ function clickButtonWithText(text: string) {
   act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 }
 
+/** The innermost `<div>` containing `text` — every ancestor of the real element also
+ *  matches a plain `textContent.includes` check (it's a substring of theirs too), and
+ *  `querySelectorAll` returns them in document (pre-)order, ancestors before
+ *  descendants, so the LAST match is the actual, most specific element. */
+function mostSpecificDivWithText(text: string): HTMLElement | undefined {
+  const matches = Array.from(container.querySelectorAll("div")).filter((d) => d.textContent?.includes(text));
+  return matches[matches.length - 1];
+}
+
 describe("ServerStatusPanel — fetching machine_diagnose", () => {
   it("a failed initial diagnose is surfaced with the error and a working Retry, never a blank card", async () => {
     machineDiagnose.mockResolvedValueOnce({ status: "error", error: "ssh timed out" });
@@ -298,6 +308,32 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
     expect(container.querySelector('input[placeholder="Sudo password"]')).toBeNull();
     // Never submitted with the typed password.
     expect(machineRepair).toHaveBeenCalledTimes(1);
+  });
+
+  // Review finding: `isServerBusyError` was defined and unit-tested in
+  // `serverBootstrapModel.ts` but never actually called from either UI component, so a
+  // `ServerLocks` collision (e.g. the "+ Add a server" wizard already running against
+  // this same host) only ever rendered as a raw, indistinguishable red error here too.
+  it("gives a server_busy_error repair collision a distinct, non-error treatment", async () => {
+    machineDiagnose.mockResolvedValueOnce({
+      status: "ok",
+      data: baseDiagnosis({ sleep_masked: false }),
+    });
+    mountPanel();
+    await settle();
+
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error: 'Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
+    });
+    const maskSleepBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Mask sleep / suspend"))!;
+    act(() => maskSleepBtn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await settle();
+
+    const busyBox = mostSpecificDivWithText("is already running on this server");
+    expect(busyBox).toBeTruthy();
+    expect(busyBox?.className).toBe(sharedStyles.hintWarn);
+    expect(busyBox?.className).not.toBe(sharedStyles.errorMsg);
   });
 });
 
