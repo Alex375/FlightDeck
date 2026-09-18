@@ -154,6 +154,11 @@ recevoir un rejeu sans les deltas des messages déjà complets.
   `stream_event`. Les flux entrelacés (sous-agents) sont suivis par
   `parent_tool_use_id`.
 - Seul le **rejeu** est compacté ; le flux en direct qui suit est inchangé.
+- Coût : chaque ligne `stream_event`/`assistant` est analysée une seconde fois
+  à son entrée dans le ring (pour son étiquette de rejeu), en plus de la sonde
+  de routage. Assumé tant qu'aucun profil ne montre que ça compte ; sinon,
+  extraire les champs (`parent_tool_use_id`, `event.type`, `message.id`) de la
+  même analyse que `frames::probe` (revue du 18/09, constat #1).
 - Mesuré sur un vrai tour (texte + un appel d'outil + résumé) : 41 lignes /
   17,3 Ko en rejeu intégral → 18 lignes dont 5 `fd_skip` / 8,9 Ko.
 
