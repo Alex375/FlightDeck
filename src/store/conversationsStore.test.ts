@@ -44,6 +44,7 @@ import {
   demoteBypassConversations,
   detachClaudeAccount,
   ensureConversationSession,
+  isSpawning,
   loadConversationHistory,
   reactivateDiskConversation,
   conversationForTask,
@@ -482,6 +483,23 @@ describe("conversationsStore — C9 remote title push", () => {
     expect(commands.pushRemoteConversationTitle).toHaveBeenCalledWith("c1", "New name");
   });
 
+  it("logs a warning when the push does not land — its own best-effort failure path, not just an IPC exception", async () => {
+    // `push_remote_conversation_title` is infallible from the caller's point of view:
+    // it resolves `false` (never rejects) for every documented failure — server
+    // unreachable, daemon too old, ssh round trip failed. A `.catch()` alone would
+    // never see this, so the "log it" contract needs its own `.then()` branch.
+    seedRemote({ handle: null });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store().renameConversation("c1", "New name");
+    // pushRemoteConversationTitle is mocked to resolve `false` (see the mock at the
+    // top of this file) and is fired-and-forgotten (never awaited) by the store —
+    // flush the microtask queue so its `.then()` has run.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("did not land"), "c1");
+    warnSpy.mockRestore();
+  });
+
   it("never pushes while THIS Mac holds a live session for the conversation", () => {
     seedRemote({ handle: "session-7" });
     store().renameConversation("c1", "New name");
@@ -503,6 +521,30 @@ describe("conversationsStore — C9 remote title push", () => {
     seed(baseConv({ sessionId: "sid-1", handle: null }));
     store().renameConversation("c1", "New name");
     expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled();
+  });
+
+  it("never pushes while a resume-spawn of the same idle remote conversation is in flight", async () => {
+    // `conv.handle` stays null for the whole duration `ensureConversationSession`'s
+    // spawn is pending (set only once it resolves) — so a rename racing that window
+    // must be caught by `isSpawning`, not `conv.handle` alone, or it would push mid-
+    // attach and evict the just-landed live session.
+    seedRemote({ handle: null, sessionId: "sid-1" });
+    let resolveSpawn: (v: { status: "ok"; data: string }) => void = () => {};
+    vi.mocked(commands.spawnSession).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSpawn = resolve;
+      }),
+    );
+    const spawnDone = ensureConversationSession("c1");
+    // The spawn promise is registered synchronously (before its first await), so by
+    // this point `isSpawning("c1")` is already true.
+    expect(isSpawning("c1")).toBe(true);
+    store().renameConversation("c1", "New name");
+    expect(conv0().name).toBe("New name"); // the local rename still lands…
+    expect(commands.pushRemoteConversationTitle).not.toHaveBeenCalled(); // …but nothing is pushed
+    resolveSpawn({ status: "ok", data: "session-42" });
+    await spawnDone;
+    expect(isSpawning("c1")).toBe(false);
   });
 
   it("conversationTitleForSpawn omits the still-untitled placeholder but threads a real name", () => {

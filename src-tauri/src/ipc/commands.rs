@@ -4505,9 +4505,18 @@ pub async fn push_remote_conversation_title(
         return false;
     }
     let store = app.state::<Store>();
-    let Ok(Some((cwd, session_id, machine))) = store.remote_session_for_conversation(&conversation_id)
-    else {
-        return false;
+    let (cwd, session_id, machine) = match store.remote_session_for_conversation(&conversation_id) {
+        Ok(Some(found)) => found,
+        // Benign no-op: unknown conversation, local repo, or no daemon session yet —
+        // exactly the documented "nothing useful to do" cases above.
+        Ok(None) => return false,
+        // A real DB-layer failure, unlike the benign cases above — worth surfacing
+        // even though the command still degrades to `false` for the caller (mirrors
+        // `push_remote_title`'s own `eprintln!` on a real ssh-spawn failure).
+        Err(e) => {
+            eprintln!("[commands] push_remote_conversation_title: store lookup failed: {e}");
+            return false;
+        }
     };
     let known_hosts_file = app
         .path()

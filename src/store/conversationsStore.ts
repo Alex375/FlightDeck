@@ -909,13 +909,30 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // (a fresh attach would evict the Mac's OWN live link). `sessionId` gates on
     // "the daemon has ever heard of this conversation" (nothing to `--resume`
     // otherwise); `repo.machineId` gates on "remote at all" (a local Claude has no
-    // daemon-side title to push). Never awaited — a failure here must never block
-    // or fail the LOCAL rename, which has already landed above.
-    if (!conv.handle && conv.sessionId) {
+    // daemon-side title to push). `isSpawning` gates on "a resume-spawn for THIS
+    // conversation is under way right now" — `conv.handle` stays null for the whole
+    // duration `ensureConversationSession`'s spawn is in flight (set only once it
+    // resolves), so without this a rename racing that window would pass the
+    // `!conv.handle` check and could evict the just-landed live session. Never
+    // awaited — a failure here must never block or fail the LOCAL rename, which has
+    // already landed above.
+    if (!conv.handle && !isSpawning(id) && conv.sessionId) {
       const repo = get().repos.find((r) => r.id === conv.repoId);
       if (repo?.machineId) {
         void commands
           .pushRemoteConversationTitle(id, trimmed)
+          .then((ok) => {
+            // `push_remote_conversation_title` is infallible from the caller's point
+            // of view — it resolves `false` (never rejects) for every documented
+            // best-effort failure path (server unreachable, daemon too old, ssh
+            // round trip failed). The `.catch()` below only ever fires on a genuine
+            // Tauri IPC-level exception, so the common failure case needs its own
+            // log here or it vanishes silently. Never blocking: the next spawn
+            // carries the title anyway (see the doc above).
+            if (!ok) {
+              console.warn("pushRemoteConversationTitle: push did not land (daemon unreachable or too old)", id);
+            }
+          })
           .catch((e) => console.error("pushRemoteConversationTitle failed:", e));
       }
     }

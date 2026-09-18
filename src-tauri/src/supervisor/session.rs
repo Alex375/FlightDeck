@@ -915,9 +915,13 @@ async fn run_actor(
                 // D6: decided ONCE at the very first spawn (from a cached per-machine
                 // version probe — see `ipc::commands::supports_skip_for_machine`) and
                 // never re-decided here: `attach` (this loop's local reattach state)
-                // is seeded from `cfg.attach` and nothing ever mutates its
-                // `supports_skip` afterward, so every reconnect for this session's
-                // lifetime carries forward the SAME opt-in it started with.
+                // is seeded from `cfg.attach`, so every reconnect for this session's
+                // lifetime carries forward the SAME opt-in it started with — with
+                // exactly ONE exception, a few lines above in this same loop: a
+                // clap-rejection downgrade (`attach.supports_skip = false` in the
+                // `looks_like_clap_flag_rejection` branch) flips it mid-session when
+                // the server's daemon turns out to have been downgraded below 0.2.0,
+                // and it then stays flipped for the rest of the actor's lifetime.
                 supports_skip: attach.supports_skip,
             });
             match Transport::spawn(cfg2) {

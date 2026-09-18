@@ -543,9 +543,36 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
     // earlier version of this function read a clean EOF (and a timeout) as
     // failure — a false negative on a write that had, provably, already landed.
     const ACK_GRACE: Duration = Duration::from_secs(3);
+    // How long to wait, right after observing a clean EOF, for the child's exit
+    // status to become available before falling back to the optimistic "still
+    // alive" reading. This is NOT a general grace window (see `ACK_GRACE` above)
+    // — it exists purely to disambiguate a same-instant EOF from a same-instant
+    // process exit; see the `Ok(0)` arm below.
+    const EOF_REAP_GRACE: Duration = Duration::from_millis(200);
     let ok = tokio::select! {
         res = reader.read_line(&mut first_line) => match res {
-            Ok(0) => true,
+            Ok(0) => {
+                // A clean EOF with zero bytes does NOT by itself mean success: a
+                // real connection failure (bad host/port/key, daemon down) makes
+                // ssh exit non-zero writing nothing to stdout (stderr is
+                // `Stdio::null()`), and closing a process's stdout pipe happens
+                // essentially AT process exit — so this branch and the sibling
+                // `child.wait()` branch below can become ready at the same
+                // instant, and `tokio::select!` would otherwise pick one at
+                // random (verified: ~50% false-positive "success" on a child
+                // that exits 1 with no output). Disambiguate by checking whether
+                // the child has ALREADY exited: if it has, its exit status is
+                // authoritative (mirrors the `child.wait()` branch's verdict,
+                // just reached from the other future); only when the child is
+                // still alive — the genuine "daemon accepted the attach, wrote
+                // the title, but `claude --resume` hasn't replied yet" case this
+                // redesign targets — does EOF read as the documented optimistic
+                // success.
+                match tokio::time::timeout(EOF_REAP_GRACE, child.wait()).await {
+                    Ok(status) => matches!(status, Ok(s) if s.success()),
+                    Err(_) => true,
+                }
+            }
             Ok(_) => !first_line.contains("\"type\":\"fd_detach\""),
             Err(_) => false,
         },
@@ -1686,6 +1713,69 @@ done
         let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
         std::env::remove_var("TOSSE_SSH_BIN");
         assert!(!ok, "a blank title must be rejected before ever spawning ssh");
+    }
+
+    /// The race this whole EOF-disambiguation exists for: an ssh process that fails
+    /// IMMEDIATELY (connection refused, auth rejected, daemon down — nothing written
+    /// to stdout, since stderr is `Stdio::null()`) and exits non-zero at essentially
+    /// the same instant its stdout pipe closes. Before the fix, `tokio::select!`
+    /// raced a bare `Ok(0)` EOF (read as unconditional success) against
+    /// `child.wait()` (correctly `false`) and picked the winner at random —
+    /// reproduced standalone at a ~50% false-positive rate. Run several iterations
+    /// so a reintroduced race shows up as a flake rather than being masked by
+    /// getting lucky once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_when_ssh_exits_immediately_with_no_output() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-failfast-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        // Exits non-zero writing NOTHING to stdout — the exact shape of a real ssh
+        // connection-level failure.
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        for i in 0..50 {
+            let ok = tokio::time::timeout(
+                Duration::from_secs(10),
+                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            )
+            .await
+            .expect("push_remote_title must not hang");
+            assert!(!ok, "iteration {i}: an ssh that exits non-zero with no output must never read as success");
+        }
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A title containing an embedded NUL byte can never survive to the remote shell
+    /// at all: `std::process::Command::spawn()` rejects any argument containing an
+    /// interior NUL byte before the process is even spawned (verified independently:
+    /// `Command::new("echo").arg("hello\0world").spawn()` errors with
+    /// `InvalidInput`/"nul byte found in provided data"). This proves the already-safe
+    /// behavior — graceful `false`, no panic, no hang — rather than a shell-injection
+    /// risk, since `push_remote_title`'s own `cmd.arg(format!(...))` construction hits
+    /// the same guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_for_a_title_containing_a_nul_byte() {
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+        )
+        .await
+        .expect("push_remote_title must not hang on a NUL-containing title");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        assert!(!ok, "a NUL-containing title must fail gracefully (Command::spawn rejects it), never panic or hang");
     }
 
     /// A clean daemon-side `fd_attach` acknowledgement (title already written by the
