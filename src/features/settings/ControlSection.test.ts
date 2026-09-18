@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { buildServerCommand, parseTicket } from "./ControlSection";
 
@@ -34,6 +35,50 @@ describe("buildServerCommand", () => {
   it("statements are joined with '; ' so a serial paste target survives", () => {
     const cmd = buildServerCommand("key");
     expect(cmd).toContain("; ");
+  });
+});
+
+// Regression test for the Tailscale discovery pattern being dead code against a real
+// `tailscale status --json`: Go's `json.MarshalIndent` puts a SPACE after the colon
+// (`"DNSName": "…"`), but the pattern required none. Runs the ACTUAL pipeline
+// `buildServerCommand` emits (not a hand-copied approximation) through a real POSIX
+// shell against captured real and compact JSON shapes, so a future edit to the regex
+// can't silently regress untested again.
+describe("buildServerCommand — Tailscale address discovery pipeline", () => {
+  /** Pulls the `grep | head | cut | sed` pipeline out of the `TS_H=$(…); fi`
+   *  statement `buildServerCommand` emits, so the test runs the SAME text the real
+   *  pairing command does rather than a copy that could drift from it. Matched
+   *  against the whole joined command (not split on `"; "` first) because the
+   *  statement itself contains internal `;` — e.g. `if …; then …; fi` — which a
+   *  naive split on the array-join separator would also cut through. */
+  function extractTailscalePipeline(cmd: string): string {
+    const match = cmd.match(/then TS_H=\$\(([^)]*)\); fi/);
+    if (!match) throw new Error(`could not isolate the tailscale pipeline from: ${cmd}`);
+    return match[1];
+  }
+
+  /** Runs the extracted pipeline in a real `/bin/sh`, with `tailscale` stubbed as a
+   *  shell function that prints fixture JSON — so `grep`/`cut`/`sed` run unmodified
+   *  against it, exactly as they would against the real binary's output. */
+  function runTailscalePipeline(pipeline: string, fakeJson: string): string {
+    const quotedJson = fakeJson.replace(/'/g, `'\\''`);
+    const script = `tailscale() { printf '%s' '${quotedJson}'; }\nTS_H=$(${pipeline})\nprintf '%s' "$TS_H"`;
+    return execSync(script, { shell: "/bin/sh", encoding: "utf8" });
+  }
+
+  const pipeline = extractTailscalePipeline(buildServerCommand("ssh-ed25519 AAAA test"));
+
+  it("extracts DNSName from real `tailscale status --json` output (space after the colon)", () => {
+    // Shape captured from a real `tailscale status --json` (1.102.4): Self prints
+    // before Peer, and MarshalIndent puts a space after every key's colon.
+    const real =
+      '{\n\t"Version": "1.102.4",\n\t"Self": {\n\t\t"DNSName": "macbook-air-de-armand.tail640409.ts.net.",\n\t\t"Online": true\n\t},\n\t"Peer": {}\n}';
+    expect(runTailscalePipeline(pipeline, real)).toBe("macbook-air-de-armand.tail640409.ts.net");
+  });
+
+  it("also tolerates compact JSON with no space after the colon (the old, narrower shape)", () => {
+    const compact = '{"Self":{"DNSName":"compact-host.ts.net."}}';
+    expect(runTailscalePipeline(pipeline, compact)).toBe("compact-host.ts.net");
   });
 });
 

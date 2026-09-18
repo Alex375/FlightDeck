@@ -233,16 +233,47 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
     a
 }
 
+/// Resolve `daemon_bin` into the POSIX-sh fragment [`build_remote_command`] (and
+/// [`run_remote_stop`]) `exec`s, searching the remote host in the SAME order
+/// `commands::probe_remote`'s script checks it in — `PATH` (as a non-interactive ssh
+/// shell sees it), then the two common non-PATH install spots, `~/.local/bin` and
+/// `/usr/local/bin` — so a passing probe is a genuine guarantee the later `attach`
+/// finds the same binary. Before this, the probe searched all three spots but the
+/// actual attach bare-`exec`'d `daemon_bin` with NO fallback, relying purely on PATH:
+/// a server with `flightdeckd` only under `~/.local/bin` (not on a non-interactive
+/// ssh shell's default PATH on Debian/Ubuntu) would pass pairing and then fail on the
+/// very first attach.
+///
+/// Applies ONLY to a bare name (the default `"flightdeckd"`, or any
+/// `TOSSE_REMOTE_FLIGHTDECKD_BIN` override without a `/`): an explicit path is used
+/// exactly as given, unsearched — mirroring [`resolve_bin`]'s local "an explicit path
+/// wins outright" rule. The bare name itself is shell-quoted throughout, so an
+/// unusual (but slash-free) override can't break the surrounding script.
+fn resolve_remote_daemon_bin(daemon_bin: &str) -> String {
+    if daemon_bin.contains('/') {
+        return shell_quote(daemon_bin);
+    }
+    let name = shell_quote(daemon_bin);
+    format!(
+        "$(FLIGHTDECKD_NAME={name}; command -v \"$FLIGHTDECKD_NAME\" 2>/dev/null || \
+         {{ [ -x \"$HOME/.local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"$HOME/.local/bin/$FLIGHTDECKD_NAME\"; }} || \
+         {{ [ -x \"/usr/local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"/usr/local/bin/$FLIGHTDECKD_NAME\"; }} || \
+         printf %s \"$FLIGHTDECKD_NAME\")"
+    )
+}
+
 /// Build the single POSIX-sh command `ssh` runs on the remote host: `exec
 /// flightdeckd attach …`. The DAEMON owns the `claude` process server-side
 /// (spawning it with the argv passed after `--` if it isn't already running,
 /// env included) and bridges this ssh channel to it — replaying everything the
 /// client missed since [`AttachPoint::cursor`]. Every interpolated value is
 /// single-quote-escaped, so remote paths/args with spaces or metacharacters are
-/// safe.
+/// safe. `daemon_bin` itself goes through [`resolve_remote_daemon_bin`] rather than a
+/// bare `exec`, so this genuinely finds `flightdeckd` wherever `commands::probe_remote`
+/// found it — see that function's doc comment.
 fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String]) -> String {
     let attach = cfg.attach.clone().unwrap_or_default();
-    let mut s = format!("exec {} attach", shell_quote(&remote.daemon_bin));
+    let mut s = format!("exec {} attach", resolve_remote_daemon_bin(&remote.daemon_bin));
     s.push_str(&format!(" --cwd {}", shell_quote(&cfg.cwd.to_string_lossy())));
     if let Some(resume) = &cfg.resume {
         s.push_str(&format!(" --resume-session {}", shell_quote(resume)));
@@ -288,7 +319,7 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     }
     cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
         "exec {} stop --conversation {}",
-        shell_quote(&remote.daemon_bin),
+        resolve_remote_daemon_bin(&remote.daemon_bin),
         shell_quote(conversation),
     ));
     cmd.stdin(Stdio::null())
@@ -989,9 +1020,10 @@ mod tests {
     }
 
     /// The remote command hands the session to the server's daemon: `exec
-    /// flightdeckd attach` with the reattach coordinates, then the claude argv
-    /// after `--` (the daemon spawns claude with it when the session is cold).
-    /// Everything shell-quoted.
+    /// $(… flightdeckd lookup …) attach` with the reattach coordinates, then the
+    /// claude argv after `--` (the daemon spawns claude with it when the session is
+    /// cold). Everything shell-quoted; the daemon binary itself is resolved via
+    /// [`resolve_remote_daemon_bin`] (checked separately below), not a bare name.
     #[test]
     fn build_remote_command_execs_flightdeckd_attach() {
         let mut cfg = SpawnConfig::new("/work/demo");
@@ -1006,7 +1038,8 @@ mod tests {
             daemon_bin: "flightdeckd".into(),
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
-        assert!(cmd.starts_with("exec 'flightdeckd' attach"), "cmd was: {cmd}");
+        assert!(cmd.starts_with("exec $(FLIGHTDECKD_NAME='flightdeckd'"), "cmd was: {cmd}");
+        assert!(cmd.contains(") attach"), "the resolved-bin substitution feeds `attach`: {cmd}");
         assert!(cmd.contains("--cwd '/work/demo'"));
         assert!(cmd.contains("--resume-session 'sid-123'"));
         assert!(cmd.contains("--cursor 0"));
@@ -1024,6 +1057,32 @@ mod tests {
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
         assert!(cmd.contains("--epoch 'ep-1'"));
         assert!(cmd.contains("--cursor 42"));
+    }
+
+    /// [`resolve_remote_daemon_bin`] must search the remote host the SAME way
+    /// `commands::probe_remote`'s script does (`PATH`, then `~/.local/bin`, then
+    /// `/usr/local/bin`) for a bare name — this is the fix for the gap where a passing
+    /// probe (which DID search all three) didn't guarantee `attach` (which previously
+    /// bare-`exec`'d the name, PATH-only) would find the same binary. An explicit path
+    /// override is left completely unsearched, exactly as given.
+    #[test]
+    fn resolve_remote_daemon_bin_searches_path_then_local_then_usr_local_for_a_bare_name() {
+        let resolved = resolve_remote_daemon_bin("flightdeckd");
+        assert!(resolved.starts_with("$(FLIGHTDECKD_NAME='flightdeckd';"), "got: {resolved}");
+        assert!(resolved.contains("command -v \"$FLIGHTDECKD_NAME\""), "checks PATH first: {resolved}");
+        assert!(
+            resolved.contains("$HOME/.local/bin/$FLIGHTDECKD_NAME"),
+            "falls back to ~/.local/bin: {resolved}"
+        );
+        assert!(
+            resolved.contains("/usr/local/bin/$FLIGHTDECKD_NAME"),
+            "falls back to /usr/local/bin: {resolved}"
+        );
+
+        // An explicit path (e.g. TOSSE_REMOTE_FLIGHTDECKD_BIN set to a full path) is
+        // used exactly as given, unsearched — mirrors `resolve_bin`'s local rule.
+        let explicit = resolve_remote_daemon_bin("/opt/flightdeckd/bin/flightdeckd");
+        assert_eq!(explicit, "'/opt/flightdeckd/bin/flightdeckd'", "no search for an explicit path");
     }
 
     /// The replay-cursor predicate — MUST mirror flightdeckd frames.rs

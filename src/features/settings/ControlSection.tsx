@@ -266,7 +266,7 @@ export function buildServerCommand(publicKey: string): string {
     `command -v flightdeckd >/dev/null 2>&1 || printf "NOTE: flightdeckd not found on PATH, ~/.local/bin or /usr/local/bin (needed for persistent sessions)\\n" >&2`,
     `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
     `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; LAN_H=$3; else LAN_H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi`,
-    `TS_H=""; if command -v tailscale >/dev/null 2>&1; then TS_H=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\.$//'); fi`,
+    `TS_H=""; if command -v tailscale >/dev/null 2>&1; then TS_H=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\.$//'); fi`,
     `ADDR=""; SEP=""; H=""`,
     `if [ -n "$TS_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"tailscale\\",\\"value\\":\\"$TS_H\\"}"; SEP=","; H="$TS_H"; fi`,
     `if [ -n "$LAN_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"lan\\",\\"value\\":\\"$LAN_H\\"}"; SEP=","; [ -n "$H" ] || H="$LAN_H"; fi`,
@@ -502,6 +502,10 @@ export function RemoteServersGroup() {
                   className={`${styles.btn} ${styles.ghost}`}
                   onClick={() => {
                     setError(null);
+                    // Manual entry has no ticket-discovered addresses of its own — a
+                    // leftover set from a PREVIOUSLY parsed ticket must not ride along
+                    // to whatever host the user types here.
+                    setAddresses([]);
                     setStage("manual");
                   }}
                 >
@@ -590,6 +594,10 @@ export function RemoteServersGroup() {
                     className={`${styles.btn} ${styles.ghost}`}
                     onClick={() => {
                       setError(null);
+                      // Re-pasting a NEW ticket re-populates this from scratch (or a
+                      // manual host synthesizes none) — a stale set from THIS ticket
+                      // must not survive back to a re-edited host/step 2 round-trip.
+                      setAddresses([]);
                       setStage("command");
                     }}
                   >

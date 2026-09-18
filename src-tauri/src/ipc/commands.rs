@@ -3422,10 +3422,13 @@ fn extract_marker(stdout: &str, marker: &str) -> Option<String> {
 /// BOTH, not just whichever came first.
 ///
 /// `flightdeckd` is looked for the same way the daemon-attach command resolves it
-/// (`transport::build_remote_command`'s `daemon_bin`, default `"flightdeckd"`, override
-/// `TOSSE_REMOTE_FLIGHTDECKD_BIN`): first on `PATH` (as a non-interactive ssh shell
-/// sees it), then the two common non-PATH install spots, `~/.local/bin` and
-/// `/usr/local/bin`.
+/// (`transport::resolve_remote_daemon_bin`, fed `daemon_bin` — default `"flightdeckd"`,
+/// override `TOSSE_REMOTE_FLIGHTDECKD_BIN`): first on `PATH` (as a non-interactive ssh
+/// shell sees it), then the two common non-PATH install spots, `~/.local/bin` and
+/// `/usr/local/bin`. Genuinely the SAME search now (both live in this one script /
+/// that one function) — previously this comment described an aspiration the attach
+/// path didn't implement: it bare-`exec`'d `daemon_bin` with no fallback, so a probe
+/// that passed via `~/.local/bin` could still fail on the very first attach.
 async fn probe_remote(
     host: &str,
     port: u16,
@@ -3588,22 +3591,32 @@ pub struct AddressCandidate {
     pub value: String,
 }
 
+/// The specific message shown for an `identity_file` that turned out to belong to a
+/// pairing command someone else already claimed — surfaced by both
+/// [`stale_identity_file_error`] (the up-front, best-effort check before the SSH
+/// probe) and [`claim_pending_key`] (the actual point a concurrent claim of the SAME
+/// pending key can lose the race — see [`claim_pending_key_locked`]). Kept as ONE
+/// constant so the two call sites can never drift apart in wording.
+const PENDING_KEY_ALREADY_USED_MSG: &str =
+    "This pairing command was already used — click + Add a server again for a fresh one.";
+
 /// The "already used" guard `add_machine` runs BEFORE probing: an `identity_file`
 /// that no longer exists on disk means this pairing command was already claimed by a
 /// DIFFERENT server (see [`claim_pending_key`]'s rename) — most likely the same
 /// command pasted onto two boxes before either was paired. Returns the specific error
 /// to show, or `None` when the check passes (including "no identity_file to check" —
 /// the "use my default SSH key/agent" case, which is never stale).
+///
+/// This is a fast, best-effort pre-flight check ONLY — it runs several seconds before
+/// the SSH probe, so a concurrent claim can still land in between. The guarantee
+/// against that race lives at the actual claim, in
+/// [`claim_pending_key_locked`]/[`claim_pending_key`].
 fn stale_identity_file_error(identity_file: &Option<String>) -> Option<String> {
     let id = identity_file.as_deref()?;
     if Path::new(id).exists() {
         return None;
     }
-    Some(
-        "This pairing command was already used — click + Add a server again for a \
-         fresh one."
-            .to_string(),
-    )
+    Some(PENDING_KEY_ALREADY_USED_MSG.to_string())
 }
 
 /// On a successful pairing, claims the PENDING key — if `identity_file` actually IS
@@ -3612,6 +3625,13 @@ fn stale_identity_file_error(identity_file: &Option<String>) -> Option<String> {
 /// pair instead of silently handing out this one's already-claimed key. A
 /// non-pending `identity_file` (a custom key) or `None` (default SSH key/agent) is
 /// returned UNCHANGED. Takes plain paths so it's testable without a `tauri::AppHandle`.
+///
+/// If the rename fails because `pending` is already gone (`NotFound` — a concurrent
+/// caller won the race and claimed it first), this reports the SAME friendly
+/// [`PENDING_KEY_ALREADY_USED_MSG`] [`stale_identity_file_error`] uses, rather than the
+/// raw OS error, so a losing racer gets an actionable message either way. Callers
+/// SHOULD go through [`claim_pending_key_locked`] rather than this directly, so the
+/// rename itself can't interleave with another claim of the same pending path.
 fn claim_pending_key(
     ssh_keys_dir: &Path,
     identity_file: Option<String>,
@@ -3621,13 +3641,45 @@ fn claim_pending_key(
     match &identity_file {
         Some(id) if Path::new(id) == pending => {
             let claimed = ssh_keys_dir.join(machine_id);
-            std::fs::rename(&pending, &claimed).map_err(|e| e.to_string())?;
+            std::fs::rename(&pending, &claimed).map_err(rename_error_message)?;
             std::fs::rename(format!("{}.pub", pending.display()), format!("{}.pub", claimed.display()))
-                .map_err(|e| e.to_string())?;
+                .map_err(rename_error_message)?;
             Ok(Some(claimed.to_string_lossy().into_owned()))
         }
         _ => Ok(identity_file),
     }
+}
+
+/// Maps a failed `claim_pending_key` rename onto the friendly "already used" message
+/// when the cause is the source file having vanished (a concurrent claim won the
+/// race), or the raw OS error string otherwise (a genuine filesystem failure, e.g.
+/// permissions).
+fn rename_error_message(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        PENDING_KEY_ALREADY_USED_MSG.to_string()
+    } else {
+        e.to_string()
+    }
+}
+
+/// [`claim_pending_key`], guarded by [`PENDING_KEY_LOCK`] — the SAME lock
+/// [`generate_or_reuse_pending_key`] uses. Closes the race two concurrent
+/// [`add_machine`] calls sharing the same not-yet-claimed pending key can hit on the
+/// rename inside `claim_pending_key`: without a shared lock, both can pass
+/// [`stale_identity_file_error`]'s up-front check, both run their SSH probes, and
+/// whichever calls `claim_pending_key` first wins the rename while the second's
+/// `rename` lands on a path that's already gone. The lock only ever wraps the
+/// instant rename itself — `add_machine` calls this AFTER its (multi-second) SSH
+/// probe, so unrelated pairings (different pending keys, or none at all) are never
+/// serialized behind it. Takes plain paths, like `claim_pending_key`, so it's
+/// testable without a `tauri::AppHandle`.
+async fn claim_pending_key_locked(
+    ssh_keys_dir: &Path,
+    identity_file: Option<String>,
+    machine_id: &str,
+) -> Result<Option<String>, String> {
+    let _guard = PENDING_KEY_LOCK.lock().await;
+    claim_pending_key(ssh_keys_dir, identity_file, machine_id)
 }
 
 /// Pair a remote server: probe it (SSH reachable + `claude` and `flightdeckd`
@@ -3665,7 +3717,8 @@ pub async fn add_machine(
     }
 
     let machine_id = uuid::Uuid::new_v4().to_string();
-    let identity_file = claim_pending_key(&app_data_dir.join("ssh_keys"), identity_file, &machine_id)?;
+    let identity_file =
+        claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
 
     let machine = crate::store::MachineRecord {
         id: machine_id,
@@ -3690,16 +3743,34 @@ pub async fn add_machine(
 /// server and everything anchored to it, and best-effort deletes its dedicated SSH
 /// keypair (`Store::delete_machine` is SQL-only — without this, every removed server
 /// permanently leaked its key files on disk).
+///
+/// The removal is best-effort by design — the record must still go even if the key
+/// files can't be cleaned up (e.g. already gone, or a permissions issue) — but a
+/// failure OTHER than "already missing" is still logged (never just discarded), so a
+/// stuck key file is diagnosable instead of leaking silently again under a different
+/// cause than the one this function was written to fix.
 fn delete_machine_and_key(store: &Store, id: &str) -> Result<(), String> {
     // Read the record BEFORE deleting it — the row (and its identity_file path) is
     // gone from the store immediately after.
     let identity_file = store.machine_by_id(id).map_err(|e| e.to_string())?.and_then(|m| m.identity_file);
     store.delete_machine(id).map_err(|e| e.to_string())?;
     if let Some(identity) = identity_file {
-        let _ = std::fs::remove_file(&identity);
-        let _ = std::fs::remove_file(format!("{identity}.pub"));
+        log_remove_file_failure(&identity);
+        log_remove_file_failure(&format!("{identity}.pub"));
     }
     Ok(())
+}
+
+/// Best-effort `std::fs::remove_file`, logging any failure that isn't "the file was
+/// already gone" (an ordinary, expected case — e.g. only the `.pub` half was ever
+/// written, or a previous delete already removed it) rather than discarding it via a
+/// bare `let _ =`.
+fn log_remove_file_failure(path: &str) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("[machines] failed to remove key file {path}: {e}");
+        }
+    }
 }
 
 /// Un-pair a remote server. See [`delete_machine_and_key`].
@@ -4644,6 +4715,40 @@ mod tests {
         let fresh = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
         assert_eq!(fresh.identity_file, pending.identity_file, "same fixed pending path");
         assert_ne!(fresh.public_key, pending.public_key, "but a DIFFERENT (fresh) key");
+    }
+
+    /// Two `add_machine` calls that both won a race to reach the claim step with the
+    /// SAME still-pending key (e.g. the same pairing command pasted onto two boxes and
+    /// paired nearly simultaneously) must not surface a raw OS error to the loser —
+    /// `claim_pending_key_locked` serializes the rename via `PENDING_KEY_LOCK` and maps
+    /// a lost race onto the SAME friendly "already used" message
+    /// `stale_identity_file_error` produces for a statically-stale path.
+    #[tokio::test]
+    async fn claim_pending_key_locked_concurrent_claims_the_loser_gets_the_friendly_message() {
+        let dir = TempKeysDir::new("claim-race");
+        let pending = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+
+        let (a, b) = tokio::join!(
+            super::claim_pending_key_locked(
+                dir.path(),
+                Some(pending.identity_file.clone()),
+                "machine-a"
+            ),
+            super::claim_pending_key_locked(
+                dir.path(),
+                Some(pending.identity_file.clone()),
+                "machine-b"
+            ),
+        );
+
+        let oks = [&a, &b].into_iter().filter(|r| r.is_ok()).count();
+        let errs: Vec<&String> = [&a, &b].into_iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(oks, 1, "exactly one of the two racing claims should win the rename");
+        assert_eq!(errs.len(), 1, "the other must fail");
+        assert_eq!(
+            errs[0], super::PENDING_KEY_ALREADY_USED_MSG,
+            "the loser must get the SAME friendly message as a statically-stale path, not a raw OS error"
+        );
     }
 
     #[test]
