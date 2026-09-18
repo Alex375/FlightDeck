@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -300,6 +300,13 @@ pub async fn spawn_session(
             .app_data_dir()
             .ok()
             .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+        // D6: cheap, cached, best-effort gate for the reattach-replay compaction
+        // (`--supports-skip`) — BEFORE `machine`'s fields are moved into
+        // `RemoteTarget` below, since the probe needs the whole record (id + host +
+        // port + user + identity_file). See `supports_skip_for_machine`'s doc for why
+        // this can never block or fail the spawn.
+        let supports_skip =
+            supports_skip_for_machine(&machine, known_hosts_file.as_deref()).await;
         cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
             host: machine.host,
             port: machine.port,
@@ -319,6 +326,7 @@ pub async fn spawn_session(
             conversation: Some(uuid::Uuid::new_v4().to_string()),
             epoch: None,
             cursor: 0,
+            supports_skip,
         });
     }
     let initial = InitialControls {
@@ -3571,6 +3579,73 @@ fn describe_probe_blockers(probe: &RemoteProbeResult) -> String {
     format!("Connected over SSH, but pairing can't proceed: {}", blockers.join(" "))
 }
 
+/// Minimum `flightdeckd` version that understands `--supports-skip` — the D6
+/// reattach-replay compaction (`fd_skip{from,to}` frames replace runs of
+/// already-complete replayable lines during a reattach with one short frame instead
+/// of re-streaming them verbatim; measured −49% bytes on a real turn). An older
+/// daemon's clap REJECTS the unknown flag outright (the whole attach fails), so this
+/// MUST gate whether it is ever passed — never guessed, and never assumed equal to
+/// [`MIN_DAEMON_VERSION`] (a daemon can be new enough to pair but still predate this
+/// feature).
+const MIN_SKIP_DAEMON_VERSION: &str = "0.2.0";
+
+/// Per-app-run cache of whether a paired machine's `flightdeckd` is new enough to
+/// accept `--supports-skip`, keyed by [`crate::store::MachineRecord::id`]. In-memory
+/// only — never persisted (the daemon can be upgraded between app runs, and the probe
+/// is cheap enough to redo once per run) — so a fresh launch always reprobes a
+/// machine's first spawn, and every spawn after that in the SAME run reuses the
+/// answer instead of paying another ssh round trip on what is otherwise a hot path.
+static SKIP_SUPPORT_CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pure gate: does `probed_version` (raw `flightdeckd --version` output, `None` on a
+/// probe failure/timeout) clear [`MIN_SKIP_DAEMON_VERSION`]? Kept separate from the
+/// ssh/caching machinery in [`supports_skip_for_machine`] so the gate itself is
+/// unit-testable without a live probe.
+fn should_request_skip(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_SKIP_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Whether `machine`'s paired `flightdeckd` accepts `--supports-skip` (D6) — a
+/// CACHED (see [`SKIP_SUPPORT_CACHE`]), bounded, best-effort lookup [`spawn_session`]
+/// feeds straight into the new session's
+/// [`crate::supervisor::transport::AttachPoint::supports_skip`].
+///
+/// Reuses A1's pairing probe ([`probe_remote`]) for the version — the SAME `--version`
+/// round trip pairing already trusts — wrapped in an outer timeout as a second belt
+/// (the probe's own `ConnectTimeout` only bounds the CONNECT phase, not a remote shell
+/// that hangs after connecting). A probe failure OR timeout reads as "unsupported" and
+/// is cached as `false`: this must NEVER block or fail the session spawn that asked
+/// for it — the worst case is simply falling back to the old, uncompacted replay,
+/// which is exactly what happens against a daemon that is actually too old.
+async fn supports_skip_for_machine(
+    machine: &crate::store::MachineRecord,
+    known_hosts_file: Option<&str>,
+) -> bool {
+    if let Some(&cached) = SKIP_SUPPORT_CACHE.lock().unwrap().get(&machine.id) {
+        return cached;
+    }
+    let probed_version = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        probe_remote(
+            &machine.host,
+            machine.port,
+            &machine.user,
+            machine.identity_file.as_deref(),
+            known_hosts_file,
+        ),
+    )
+    .await
+    .ok() // outer timeout elapsed -> None
+    .and_then(Result::ok) // the ssh round trip itself failed -> None
+    .and_then(|r| r.flightdeckd_version);
+    let supported = should_request_skip(probed_version.as_deref());
+    SKIP_SUPPORT_CACHE.lock().unwrap().insert(machine.id.clone(), supported);
+    supported
+}
+
 /// One discovered candidate address for a paired server — as printed in the pairing
 /// ticket's `addresses` array (see the "1 · Run this once on your server" command in
 /// `RemoteServersGroup`, `ControlSection.tsx`). Not persisted anywhere yet: the confirm
@@ -4650,6 +4725,32 @@ mod tests {
         let err = super::parse_probe_output("", "Permission denied (publickey).\n", false)
             .expect_err("no marker lines at all means the script never ran");
         assert!(err.contains("Permission denied"), "should surface the real ssh error: {err}");
+    }
+
+    // ---- D6: fd_skip `--supports-skip` version gate --------------------------------
+
+    #[test]
+    fn should_request_skip_is_false_below_the_min_skip_version() {
+        assert!(!super::should_request_skip(Some("flightdeckd 0.1.0")), "0.1.0 predates fd_skip");
+    }
+
+    #[test]
+    fn should_request_skip_is_false_for_an_unparseable_version() {
+        // Reads as 0.0.0 via `version_at_least`'s malformed-component fallback.
+        assert!(!super::should_request_skip(Some("garbage")));
+    }
+
+    #[test]
+    fn should_request_skip_is_false_on_a_probe_error() {
+        // `None` is what `supports_skip_for_machine` passes on ANY probe
+        // failure/timeout — must never speculatively opt in.
+        assert!(!super::should_request_skip(None));
+    }
+
+    #[test]
+    fn should_request_skip_is_true_at_and_above_the_min_skip_version() {
+        assert!(super::should_request_skip(Some("flightdeckd 0.2.0")), "exactly the minimum");
+        assert!(super::should_request_skip(Some("flightdeckd 0.3.1")), "newer than the minimum");
     }
 
     // ---- Remote pairing: one dedicated key per server (A3) ------------------------

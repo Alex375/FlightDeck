@@ -69,6 +69,15 @@ pub enum CliMessage {
     /// `session.rs::reconnect_policy_for_reason`, the single table this is
     /// decided by (keep this comment in sync with it).
     FdDetach(FdDetachMsg),
+    /// flightdeckd reattach-replay compaction (D6, daemon >= 0.2.0, opt-in via
+    /// `flightdeckd attach --supports-skip`): the daemon replaces a run of
+    /// replayable lines that are already COMPLETE in its ring with this one frame
+    /// instead of re-streaming them verbatim — an INCLUSIVE `[from, to]` range of
+    /// replayable seqs. Only ever sent to a client that asked for it. Never
+    /// forwarded past `transport::reader_loop`, which folds it straight into the
+    /// connection's replayable-line bookkeeping (`Transport::lines_seen`) — see
+    /// that module's `apply_fd_skip`.
+    FdSkip(FdSkipMsg),
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
     Unknown,
@@ -94,6 +103,15 @@ pub struct FdAttachMsg {
     /// and get resolved away. `None` = an older daemon without the field.
     #[serde(default)]
     pub pending: Option<Vec<String>>,
+    /// Whether the daemon actually honours `--supports-skip` for this attach
+    /// (D6). `Some(true)` = it may send [`CliMessage::FdSkip`] frames during the
+    /// replay; absent/`Some(false)` = it ignored the flag (an older daemon, or
+    /// one that decided not to compact this replay) — nothing to react to: no
+    /// `fd_skip` frames simply never arrive, and the client behaves exactly as
+    /// it always has. Kept for diagnostics/forward-compat; no client-side branch
+    /// depends on it today.
+    #[serde(default)]
+    pub skip: Option<bool>,
 }
 
 /// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.
@@ -105,6 +123,18 @@ pub struct FdDetachMsg {
     /// Human-readable detail (attach errors).
     #[serde(default)]
     pub message: Option<String>,
+}
+
+/// See [`CliMessage::FdSkip`]. Wire shape: flightdeckd `frames::fd_skip`. `from`/`to`
+/// are an INCLUSIVE range of replayable seqs the daemon skipped — never `0` and never
+/// crossing zero lines (a daemon would just omit the frame instead of sending an empty
+/// range), but nothing here assumes `to >= from`; the transport-side bookkeeping
+/// (`transport::apply_fd_skip`) treats a malformed range as a protocol violation like
+/// any other cursor mismatch rather than trusting it blindly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FdSkipMsg {
+    pub from: u64,
+    pub to: u64,
 }
 
 impl CliMessage {
@@ -124,6 +154,7 @@ impl CliMessage {
             CliMessage::TranscriptMirror(_) => "transcript_mirror",
             CliMessage::FdAttach(_) => "fd_attach",
             CliMessage::FdDetach(_) => "fd_detach",
+            CliMessage::FdSkip(_) => "fd_skip",
             CliMessage::Unknown => "unknown",
         }
     }
@@ -633,6 +664,39 @@ mod tests {
         let msg: CliMessage =
             serde_json::from_str(r#"{"type":"some_future_type","foo":1}"#).unwrap();
         assert!(msg.is_unknown());
+    }
+
+    /// D6: `fd_skip{from,to}` parses into a known variant, never `Unknown`.
+    #[test]
+    fn fd_skip_parses_the_inclusive_range() {
+        let msg: CliMessage =
+            serde_json::from_str(r#"{"type":"fd_skip","from":2,"to":5}"#).unwrap();
+        match msg {
+            CliMessage::FdSkip(s) => {
+                assert_eq!(s.from, 2);
+                assert_eq!(s.to, 5);
+            }
+            other => panic!("expected fd_skip, got {}", other.kind()),
+        }
+    }
+
+    /// `fd_attach.skip` is optional: an older daemon (or one that ignored
+    /// `--supports-skip` for this attach) omits it entirely, and that must NOT
+    /// fail the handshake — see [`FdAttachMsg::skip`]'s doc for why nothing
+    /// client-side branches on this either way.
+    #[test]
+    fn fd_attach_skip_field_is_optional() {
+        let without: CliMessage = serde_json::from_str(
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}"#,
+        )
+        .unwrap();
+        assert!(matches!(without, CliMessage::FdAttach(a) if a.skip.is_none()));
+
+        let with: CliMessage = serde_json::from_str(
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"skip":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(with, CliMessage::FdAttach(a) if a.skip == Some(true)));
     }
 
     #[test]
