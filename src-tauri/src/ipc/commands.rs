@@ -4225,6 +4225,71 @@ pub(crate) async fn run_ssh_on_machine(
     }
 }
 
+/// [`run_ssh_on_machine`]'s sibling for a remote command that reads bytes off its OWN
+/// stdin — a systemd unit file, a daemon binary — rather than one that just runs and
+/// reports (see that function's doc for the shared option base). `stdin_payload` is
+/// written to the spawned ssh process's stdin and the pipe is then closed (EOF), giving
+/// the remote command a clean signal that the payload is complete; mirrors
+/// `bootstrap::askpass::run_with_password`'s own `stdin_payload` parameter for the
+/// SAME reason, just over this crate's normal KEYED path instead of the first-contact
+/// password relay. Returns the raw `(success, stdout, stderr)` triple rather than
+/// collapsing a failure to a single line — callers here (B8's upload self-verification,
+/// B9's unit install) need to parse markers out of stdout/stderr on BOTH outcomes, not
+/// just the last stderr line [`run_ssh_on_machine`] returns on failure.
+///
+/// `ssh_bin_override`, when `Some`, is prepended to the CHILD PROCESS's own `PATH` (via
+/// `Command::env`, which only affects this one spawn — never the app's own process-wide
+/// environment) — the seam that lets `bootstrap::install`'s unit tests point `ssh` at a
+/// throwaway fake script instead of a real connection, without a live server. `None`
+/// (every production call site) leaves the child's `PATH` exactly as inherited, same as
+/// every other ssh invocation in this crate.
+///
+/// `pub(crate)` so `bootstrap::install` (B8/B9) reuses this SAME keyed invoker for its
+/// own stdin-bearing calls (the daemon binary upload, a systemd unit file) instead of
+/// growing a second one — this crate's "ONE ssh invoker" discipline (see
+/// `bootstrap::server_setup`'s own module doc) extends to this sibling, not just
+/// [`run_ssh_on_machine`] itself.
+pub(crate) async fn run_ssh_on_machine_with_stdin(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+    ssh_bin_override: Option<&Path>,
+) -> Result<(bool, String, String), String> {
+    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
+    if let Some(dir) = ssh_bin_override {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{path}", dir.display()));
+    }
+    cmd.arg("-T")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd.arg(format!("{}@{}", m.user, m.host)).arg(remote_cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt as _;
+        // A write failure here (broken pipe — the remote side, or the connection
+        // itself, died before consuming everything) is deliberately NOT an early
+        // return: the caller still wants whatever stdout/stderr/exit-status the
+        // process produced, to classify exactly WHAT went wrong (a truncated
+        // transfer looks different from a clean early exit) rather than a bare
+        // "could not write" that discards that evidence.
+        let _ = stdin.write_all(stdin_payload).await;
+        drop(stdin); // EOF
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("could not read ssh's output: {e}"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 /// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
 /// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
 /// of making the user recall a path. Returns repo folder paths, most-shallow first.

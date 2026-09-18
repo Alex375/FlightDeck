@@ -139,6 +139,13 @@ cpal = "0.15"
 # feature / dependency — one fewer crate + version to keep aligned.
 ort = "=2.0.0-rc.13"
 
+# Local sha256 of the daemon binary about to be uploaded (bootstrap::install, B8),
+# compared against the remote's own `sha256sum` to decide `AlreadyCurrent` without
+# ever shelling out to a platform-specific checksum binary. Already compiled into the
+# tree transitively (tauri-codegen / wry both pull it in at the SAME 0.10 line), so
+# declaring it direct adds no new crate.
+sha2 = "0.10"
+
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is
 # `SIGKILL`-only and single-process.
