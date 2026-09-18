@@ -885,9 +885,12 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *
  *  Keeping `command_output` soft matters: these lines used to arrive as fake USER bubbles,
  *  which split one response into two folded rounds. Turning them into hard notices would
- *  have preserved exactly that split under a new name. */
+ *  have preserved exactly that split under a new name.
+ *
+ *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
+ *  tool step, and like one it sits inside the work instead of cutting the response in two. */
 function isSoftNotice(subtype: string | undefined): boolean {
-  return subtype === "control_change" || subtype === "command_output";
+  return subtype === "control_change" || subtype === "command_output" || subtype === "task_failed";
 }
 
 /**

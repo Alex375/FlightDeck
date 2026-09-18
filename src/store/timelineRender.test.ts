@@ -158,6 +158,14 @@ describe("coalesceCleanRounds", () => {
     ]);
   });
 
+  it("a failed background task (task_failed) is SOFT — absorbed like a failed tool step", () => {
+    const sub = (id: string) => (id === "tf" ? "task_failed" : "process_exited");
+    const out = coalesceCleanRounds([ai("a1"), nt("tf"), ai("a2")], sub, injected);
+    expect(out).toEqual([
+      { kind: "ai", ids: ["a1", "a2"], markers: [{ markerKind: "notice", id: "tf", after: 1 }] },
+    ]);
+  });
+
   it("an error item is a hard boundary too", () => {
     const out = coalesceCleanRounds([ai("a1"), err("e1"), ai("a2")], subtype, injected);
     expect(out).toEqual([

@@ -335,6 +335,31 @@ describe("appControl — conversations", () => {
     expect(JSON.stringify(out)).not.toContain("sub-agent chatter");
   });
 
+  it("read_conversation keeps a failed background task visible (a notice, not an error turn)", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "run the suite" }] });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "task_failed",
+      detail: { message: "Background task failed: e2e suite", label: "e2e suite", detail: null },
+    });
+    // Other quiet notices stay out of the digest.
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "control_change",
+      detail: { control: "Model", from: "a", to: "b" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "user", text: "run the suite" },
+      { role: "system", text: "[Background task failed: e2e suite]" },
+    ]);
+  });
+
   it("send_message refuses a conversation messaging itself", async () => {
     seed(conv({ handle: "session-7" }));
     await expect(

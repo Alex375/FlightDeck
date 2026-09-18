@@ -225,6 +225,19 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
       if (err) out.push({ role: "system", text: `[error: ${err.message}]` });
       continue;
     }
+    if (e.kind === "notice") {
+      // A failed background task is a discreet notice in the thread, but still something a
+      // reader of this conversation must see.
+      const n = entry.notices[e.id];
+      if (n?.subtype === "task_failed") {
+        const msg = (n.detail as { message?: unknown } | null)?.message;
+        out.push({
+          role: "system",
+          text: `[${typeof msg === "string" ? msg : "Background task failed"}]`,
+        });
+      }
+      continue;
+    }
     if (e.kind !== "turn") continue;
     const turn = entry.turns[e.id];
     // Sub-agent (Task) side-thread turns are internal work, not the dialogue.
