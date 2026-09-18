@@ -13,6 +13,11 @@
 # Cargo.lock is the one used, --locked); cargo's registry + zig's cache live
 # under <root>/target/musl/, so reruns are incremental and nothing is written
 # as root.
+#
+# RUST_IMAGE / CARGO_ZIGBUILD_VERSION / ZIG_VERSION, when set, pin the builder image
+# (by digest, e.g. "rust:1-alpine@sha256:...") and the exact cargo-zigbuild/zig apk
+# package versions — see musl-builder.Dockerfile's own doc. Unset (the default): the
+# Dockerfile's own floating defaults, fine for local/dev iteration.
 set -euo pipefail
 . "$(dirname "$0")/lib-layout.sh"
 fd_layout
@@ -24,7 +29,12 @@ fi
 IMAGE="${IMAGE:-flightdeckd-musl-builder}"
 echo "· $(fd_describe)"
 echo "· builder image $IMAGE"
-docker build -q -t "$IMAGE" -f "$FD_CRATE_DIR/scripts/musl-builder.Dockerfile" "$FD_CRATE_DIR/scripts" >/dev/null
+# shellcheck disable=SC2086  # deliberately unquoted: 0 or 2 words each, ":+"-guarded
+docker build -q -t "$IMAGE" \
+  ${RUST_IMAGE:+--build-arg "RUST_IMAGE=$RUST_IMAGE"} \
+  ${CARGO_ZIGBUILD_VERSION:+--build-arg "CARGO_ZIGBUILD_VERSION=$CARGO_ZIGBUILD_VERSION"} \
+  ${ZIG_VERSION:+--build-arg "ZIG_VERSION=$ZIG_VERSION"} \
+  -f "$FD_CRATE_DIR/scripts/musl-builder.Dockerfile" "$FD_CRATE_DIR/scripts" >/dev/null
 
 mkdir -p "$FD_DIST_DIR" "$FD_TARGET_DIR/home"
 echo "· cargo zigbuild -p flightdeckd --profile $FD_PROFILE $FD_TARGETS"

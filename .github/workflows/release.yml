@@ -59,8 +59,64 @@ jobs:
           fi
           echo "✓ @${{ github.actor }} est autorisé à publier."
 
-  build:
+  # Builds the static musl flightdeckd binaries (B2/B3) that `build` below bundles into
+  # the app (src-tauri/resources/flightdeckd/, tauri.conf.json's bundle.resources —
+  # resolved at runtime by bootstrap::install::daemon_binary_path/
+  # bundled_daemon_manifest). ubuntu-latest: only Docker + Node needed (no Xcode/
+  # signing), and the daemon's real deploy target is Linux anyway — see ci.yml's own
+  # `flightdeckd` job for the same reasoning on tests. Pinned tooling (the builder
+  # image by DIGEST + exact cargo-zigbuild/zig apk package versions — see
+  # flightdeckd/scripts/musl-builder.Dockerfile's own doc) for a reproducible release
+  # build; `cargo zigbuild --locked` is already the default in build-musl.sh. This job
+  # NEVER receives signing secrets — it only ever touches Docker + crates.io.
+  daemon:
     needs: authorize
+    runs-on: ubuntu-latest
+    # Least privilege: this job only checks out the repo (read), builds via Docker,
+    # and uploads a workflow artifact (its own permission model, not `contents`) —
+    # it never writes to the repo, so it does not need the workflow-level `contents:
+    # write` the `build`/publish job below actually requires.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build both musl binaries (pinned tooling)
+        env:
+          # rust:1-alpine pinned by digest — resolves (as of this pin) to rustc 1.98.1 /
+          # Alpine 3.24.2 / cargo-zigbuild 0.23.4-r0 / zig 0.16.0-r1, the exact versions
+          # flightdeckd/docs/B0-MUSL-SPIKE.md verified against. Re-pin deliberately (not
+          # on every release) when the crate needs a newer toolchain — `docker manifest
+          # inspect rust:1-alpine` (or `curl` the registry API) gets the current digest.
+          RUST_IMAGE: "rust:1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f"
+          CARGO_ZIGBUILD_VERSION: "0.23.4-r0"
+          ZIG_VERSION: "0.16.0-r1"
+        run: node scripts/build-daemon.mjs
+
+      - name: Smoke-test the native-arch (x86_64) binary
+        # Only the native arch here — the aarch64 half would need docker/setup-qemu-
+        # action to run under emulation on this x86_64 runner; the cross-compile itself
+        # (zig, not emulation) already proved reliable per B0-MUSL-SPIKE.md, and the
+        # aarch64 binary is exercised for real by flightdeckd's own `live/m1` container
+        # + the app's `#[ignore]`d live tests, separately from this workflow.
+        run: TARGETS=x86_64-unknown-linux-musl flightdeckd/scripts/smoke-musl.sh
+
+      - name: Upload the binaries + manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightdeckd-daemon
+          path: src-tauri/resources/flightdeckd/
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: [authorize, daemon]
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -90,6 +146,29 @@ jobs:
 
       - name: Installer les dépendances JS
         run: pnpm install --frozen-lockfile
+
+      # B2/B3: fetches the binaries the `daemon` job above produced BEFORE the Tauri
+      # build (tauri.conf.json's bundle.resources only ever bundles what is already on
+      # disk at that point). Fails IMMEDIATELY and LOUDLY if a binary or the manifest is
+      # missing — never a release published with a silently-broken daemon installer
+      # (bootstrap::install::daemon_binary_path would only discover it much later, at
+      # actual use).
+      - name: Download the flightdeckd binaries (daemon job)
+        uses: actions/download-artifact@v4
+        with:
+          name: flightdeckd-daemon
+          path: src-tauri/resources/flightdeckd/
+
+      - name: Verify the daemon is bundled before the Tauri build
+        run: |
+          set -euo pipefail
+          for f in flightdeckd-x86_64-unknown-linux-musl flightdeckd-aarch64-unknown-linux-musl manifest.json; do
+            if [ ! -s "src-tauri/resources/flightdeckd/$f" ]; then
+              echo "::error::src-tauri/resources/flightdeckd/$f is missing or empty — did the 'daemon' job fail silently?"
+              exit 1
+            fi
+          done
+          echo "✓ flightdeckd binaries + manifest are present before the Tauri build."
 
       - name: Résoudre la version
         id: version

@@ -3556,7 +3556,11 @@ const MIN_DAEMON_VERSION: &str = "0.1.0";
 /// component-wise; any non-numeric component parses as `0` rather than panicking, so
 /// a future `--version` format tweak degrades to "0.0.0 → outdated" instead of
 /// crashing the probe. Pure and side-effect-free — the version text is all it needs.
-fn version_at_least(v: &str, min: &str) -> bool {
+///
+/// `pub(crate)`: also the comparison [`crate::bootstrap::orchestrator::daemon_is_outdated`]
+/// uses to compare a server's running `flightdeckd` against this Mac's BUNDLED one —
+/// one version-comparison rule for the whole crate, never a second copy drifting apart.
+pub(crate) fn version_at_least(v: &str, min: &str) -> bool {
     fn parts(s: &str) -> Vec<u32> {
         let token = s.split_whitespace().last().unwrap_or(s);
         token.split('.').map(|p| p.parse().unwrap_or(0)).collect()

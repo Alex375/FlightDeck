@@ -54,12 +54,14 @@ const SSH_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 // B8 — upload_daemon
 // ============================================================================
 
-/// Dev/test override for [`daemon_binary_path`]'s resolution: a directory holding the
-/// two static musl binaries directly (`flightdeckd-x86_64-unknown-linux-musl` /
-/// `flightdeckd-aarch64-unknown-linux-musl`) — e.g. this repo's own
-/// `flightdeckd/target/deploy/<tag>/`. Always wins over the app's bundled resource dir
-/// (bundling itself is a later task — this is the ONLY way the binaries are found
-/// today).
+/// Dev/test override for [`daemon_binary_path`]/[`bundled_daemon_manifest`]'s
+/// resolution: a directory holding the two static musl binaries directly
+/// (`flightdeckd-x86_64-unknown-linux-musl` / `flightdeckd-aarch64-unknown-linux-musl`)
+/// plus their `manifest.json` — e.g. this repo's own `flightdeckd/target/deploy/<tag>/`,
+/// or (the normal case, see `scripts/build-daemon.mjs`)
+/// `src-tauri/resources/flightdeckd/` itself. Always wins over the app's bundled
+/// resource dir — the escape hatch `tauri dev`/tests use to point at binaries without
+/// going through a real bundle.
 pub const TOSSE_FLIGHTDECKD_BIN_DIR_ENV: &str = "TOSSE_FLIGHTDECKD_BIN_DIR";
 
 /// The static musl binary's filename for a given `uname -m` arch string, or `None` for
@@ -74,10 +76,25 @@ fn daemon_binary_filename(arch: &str) -> Option<&'static str> {
     }
 }
 
+/// The [`daemon_target_triple`] sibling of [`daemon_binary_filename`]: the bare Rust
+/// target triple for `arch`, e.g. `"x86_64"` -> `"x86_64-unknown-linux-musl"` — the key
+/// [`DaemonManifest::targets`] is keyed by. Derived from [`daemon_binary_filename`]
+/// (strips the shared `"flightdeckd-"` prefix) rather than repeating the two arch
+/// literals a second time — the filename and the triple must never drift apart, since
+/// `scripts/build-daemon.mjs` (the manifest's own writer) derives the triple from the
+/// SAME filename convention on the JS side.
+fn daemon_target_triple(arch: &str) -> Option<&'static str> {
+    daemon_binary_filename(arch).map(|f| {
+        f.strip_prefix("flightdeckd-")
+            .expect("daemon_binary_filename always returns a \"flightdeckd-<triple>\" name")
+    })
+}
+
 /// The pure core of [`daemon_binary_path`]: env override always wins, `resource_dir`
-/// (the app's bundled `flightdeckd/` — a later task actually populates it) is the
-/// fallback the caller supplies, so this is unit-testable without a running Tauri app.
-/// Every non-success path — an arch this app doesn't ship a build for, no resource dir
+/// (the app's bundled `flightdeckd/` — populated by `scripts/build-daemon.mjs` +
+/// `tauri.conf.json`'s `bundle.resources`, see the module doc) is the fallback the
+/// caller supplies, so this is unit-testable without a running Tauri app. Every
+/// non-success path — an arch this app doesn't ship a build for, no resource dir
 /// available, or a resolved path that simply isn't a file on disk — comes back as the
 /// SAME [`BootstrapError::DaemonBinaryNotBundled`] naming the arch, never a generic IO
 /// error a caller would have to guess the meaning of.
@@ -87,10 +104,7 @@ pub(crate) fn resolve_daemon_binary_path(
 ) -> Result<PathBuf, BootstrapError> {
     let not_bundled = || BootstrapError::DaemonBinaryNotBundled(arch.to_string());
     let filename = daemon_binary_filename(arch).ok_or_else(not_bundled)?;
-    let dir = match std::env::var(TOSSE_FLIGHTDECKD_BIN_DIR_ENV) {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => resource_dir.map(|d| d.join("flightdeckd")).ok_or_else(not_bundled)?,
-    };
+    let dir = daemon_resource_dir(resource_dir).ok_or_else(not_bundled)?;
     let path = dir.join(filename);
     if !path.is_file() {
         return Err(not_bundled());
@@ -98,15 +112,102 @@ pub(crate) fn resolve_daemon_binary_path(
     Ok(path)
 }
 
+/// Shared by [`resolve_daemon_binary_path`] and [`resolve_daemon_manifest`]: the
+/// directory that holds both the binaries AND `manifest.json` — `$TOSSE_
+/// FLIGHTDECKD_BIN_DIR` when set (dev/test override, always wins), else `resource_dir/
+/// flightdeckd/` (the app's real bundled resources — `None` when the caller has no
+/// resource dir at all, e.g. `resource_dir()` itself failed).
+fn daemon_resource_dir(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    match std::env::var(TOSSE_FLIGHTDECKD_BIN_DIR_ENV) {
+        Ok(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => resource_dir.map(|d| d.join("flightdeckd")),
+    }
+}
+
 /// (B8) Resolve the local path of the static musl `flightdeckd` binary for `arch`
 /// (`"x86_64"` | `"aarch64"`, straight off [`RemoteProbeResult::arch`]): the app's own
 /// resource dir, or `$TOSSE_FLIGHTDECKD_BIN_DIR` in dev/tests — see
 /// [`resolve_daemon_binary_path`], the actual (testable) resolver this just feeds the
-/// app's real bundled resource dir into.
+/// app's real bundled resource dir into. `resource_dir()` resolves correctly in BOTH a
+/// real bundled `.app` (`Contents/Resources`, populated at build time by `tauri.conf.
+/// json`'s `bundle.resources`) and a `tauri dev` run (Tauri's CLI copies `bundle.
+/// resources` next to the dev binary too, under `target/debug/`) — no separate dev-mode
+/// path needed here.
 pub fn daemon_binary_path(app: &tauri::AppHandle, arch: &str) -> Result<PathBuf, BootstrapError> {
     use tauri::Manager;
     let resource_dir = app.path().resource_dir().ok();
     resolve_daemon_binary_path(arch, resource_dir.as_deref())
+}
+
+/// (B2/B3) One target's entry in [`DaemonManifest::targets`] — the sha256 [`upload_daemon`]
+/// verifies the bundled binary against before ever sending it, plus its byte size
+/// (informational, e.g. for a UI showing bundle size — not itself checked today).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonManifestTarget {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// (B2/B3) `manifest.json`, written by `scripts/build-daemon.mjs` alongside the
+/// binaries it copies into `src-tauri/resources/flightdeckd/` (and, after `tauri
+/// build`/`tauri dev`, resolved via [`bundled_daemon_manifest`] exactly like the
+/// binaries themselves — see [`daemon_resource_dir`]). `version` is read from
+/// `flightdeckd/Cargo.toml` at build time — ONE version for the whole manifest (both
+/// target triples are always built from the same commit), which is what makes it
+/// directly comparable to a server's own `flightdeckd --version` output via
+/// [`crate::ipc::commands::version_at_least`], no per-arch lookup needed for that
+/// comparison (see `bootstrap::orchestrator::daemon_is_outdated`). `targets` may hold
+/// only ONE entry when the manifest was produced by a partial (`TARGETS=`-limited)
+/// build — never assumed to have both.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonManifest {
+    pub version: String,
+    pub built_at: String,
+    pub targets: std::collections::HashMap<String, DaemonManifestTarget>,
+}
+
+/// Pure core of [`bundled_daemon_manifest`]: resolves `manifest.json` the SAME way
+/// [`resolve_daemon_binary_path`] resolves a binary (via [`daemon_resource_dir`] — env
+/// override always wins), then parses it. A missing OR unparseable manifest both come
+/// back as [`BootstrapError::DaemonManifestMissing`] — a caller about to upload cares
+/// only "can I verify?", not which of the two ways that failed.
+pub(crate) fn resolve_daemon_manifest(resource_dir: Option<&Path>) -> Result<DaemonManifest, BootstrapError> {
+    let dir = daemon_resource_dir(resource_dir).ok_or(BootstrapError::DaemonManifestMissing)?;
+    let bytes = std::fs::read(dir.join("manifest.json")).map_err(|_| BootstrapError::DaemonManifestMissing)?;
+    serde_json::from_slice(&bytes).map_err(|_| BootstrapError::DaemonManifestMissing)
+}
+
+/// (B2/B3) This Mac's BUNDLED `flightdeckd` manifest — see [`DaemonManifest`]'s own
+/// doc. Read fresh every call (a `manifest.json` a few hundred bytes on local disk;
+/// never worth caching like [`crate::ipc::commands`]'s per-run remote-version cache).
+pub fn bundled_daemon_manifest(app: &tauri::AppHandle) -> Result<DaemonManifest, BootstrapError> {
+    use tauri::Manager;
+    let resource_dir = app.path().resource_dir().ok();
+    resolve_daemon_manifest(resource_dir.as_deref())
+}
+
+/// (B2/B3) Refuses to trust a bundled binary that doesn't match its own manifest —
+/// [`upload_daemon`]'s preflight, called with the ACTUAL bytes about to be uploaded
+/// (never re-reads the file: the caller already has them in hand for the upload
+/// itself). `arch` maps to the manifest's target-triple key via
+/// [`daemon_target_triple`]; an arch with no manifest entry at all (a partial build
+/// that only produced the OTHER architecture) is [`BootstrapError::DaemonManifestMissing`]
+/// — same "can't verify" bucket as a missing manifest file, not a tamper report (nothing
+/// to compare against, no claim about the bytes being wrong).
+pub(crate) fn verify_daemon_binary_sha256(
+    arch: &str,
+    bytes: &[u8],
+    manifest: &DaemonManifest,
+) -> Result<(), BootstrapError> {
+    let triple = daemon_target_triple(arch).ok_or_else(|| BootstrapError::DaemonBinaryNotBundled(arch.to_string()))?;
+    let expected =
+        manifest.targets.get(triple).map(|t| t.sha256.clone()).ok_or(BootstrapError::DaemonManifestMissing)?;
+    let actual = sha256_hex(bytes);
+    if actual.eq_ignore_ascii_case(&expected) {
+        Ok(())
+    } else {
+        Err(BootstrapError::DaemonBinaryTampered { arch: arch.to_string(), expected, actual })
+    }
 }
 
 /// Outcome of [`upload_daemon`]. `restart_required` is `true` whenever bytes were
@@ -264,9 +365,19 @@ async fn cleanup_upload_temp(
     }
 }
 
-/// The testable core of [`upload_daemon`]: everything except resolving `arch` to a
-/// local file path (already proven separately by [`resolve_daemon_binary_path`]'s own
-/// tests) and the app-handle plumbing. See the module doc for `ssh_bin_override`.
+/// A direct, UNVERIFIED path-to-upload primitive — no manifest, no sha256 check
+/// against anything but the remote's own existing binary. Production code no longer
+/// calls this directly (see [`upload_daemon_verified`], which verifies-then-uploads a
+/// single read); it remains `pub(crate)` as the escape hatch this module's own
+/// `$TOSSE_FLIGHTDECKD_BIN_DIR`-pointed dev/live tests use to push a bare pair of
+/// binaries with no manifest at all, plus the fake-ssh unit tests that exercise the
+/// resolve/stream/cleanup sequence in isolation. `#[allow(dead_code)]` outside tests
+/// because of exactly that: nothing in the non-test binary calls it any more.
+///
+/// Reads `local_binary_path` itself (this is the ONLY read of the path in this call —
+/// see [`upload_daemon_bytes`]'s own doc for why that matters) and uploads exactly
+/// those bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn upload_daemon_from_path(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
@@ -276,7 +387,29 @@ pub(crate) async fn upload_daemon_from_path(
     let bytes = tokio::fs::read(local_binary_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    let local_sha = sha256_hex(&bytes);
+    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+}
+
+/// Shared core of [`upload_daemon_from_path`] and [`upload_daemon_verified`]: hashes
+/// `bytes`, resolves the remote target + its existing sha256, and — unless they
+/// already match — streams exactly `bytes` (never re-reading anything off disk).
+///
+/// ⚠️ This is the ONE place that decides what actually goes over the wire.
+/// [`upload_daemon`] used to verify one read of the binary's sha256 and then call
+/// (what was then) `upload_daemon_from_path` with a PATH, which did its own,
+/// completely separate `tokio::fs::read` for the upload itself — so the
+/// manifest-verified buffer was discarded and a file that changed on disk between
+/// the two reads would upload unverified bytes with zero manifest protection. Taking
+/// `bytes: &[u8]` here instead of a path closes that gap structurally: a caller that
+/// has already read-and-verified a buffer (like [`upload_daemon_verified`]) passes
+/// that SAME buffer straight through, with no way to accidentally re-read the path.
+async fn upload_daemon_bytes(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    bytes: &[u8],
+    ssh_bin_override: Option<&Path>,
+) -> Result<UploadOutcome, BootstrapError> {
+    let local_sha = sha256_hex(bytes);
 
     let (target, existing_sha) = resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
 
@@ -285,7 +418,7 @@ pub(crate) async fn upload_daemon_from_path(
     }
     let restart_required = existing_sha.is_some();
 
-    match stream_upload(machine, known_hosts, ssh_bin_override, &target, &bytes, &local_sha).await {
+    match stream_upload(machine, known_hosts, ssh_bin_override, &target, bytes, &local_sha).await {
         Ok(()) => Ok(UploadOutcome::Uploaded { restart_required }),
         Err(e) => {
             cleanup_upload_temp(machine, known_hosts, ssh_bin_override, &target).await;
@@ -301,6 +434,15 @@ pub(crate) async fn upload_daemon_from_path(
 /// render_upload_script`]'s own doc). Never restarts anything: see [`UploadOutcome`]'s
 /// own doc for why replacing a RUNNING daemon's binary is safe (atomic rename, the
 /// process keeps its old inode) but restarting it is deliberately left to the caller.
+///
+/// (B2/B3) Before anything touches the network: the chosen binary's sha256 is verified
+/// against [`bundled_daemon_manifest`] ([`verify_daemon_binary_sha256`]) — a mismatch
+/// (or no manifest to check against at all) returns
+/// [`BootstrapError::DaemonBinaryTampered`]/[`BootstrapError::DaemonManifestMissing`]
+/// and NOTHING is uploaded. Only the app-handle plumbing (resolving `arch` to a
+/// bundled path + manifest) lives here — the actual read-verify-upload sequence is
+/// [`upload_daemon_verified`], so it can be driven directly in tests without a real
+/// `tauri::AppHandle`.
 pub async fn upload_daemon(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
@@ -308,7 +450,28 @@ pub async fn upload_daemon(
     known_hosts: Option<&str>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_path = daemon_binary_path(app, arch)?;
-    upload_daemon_from_path(machine, known_hosts, &local_path, None).await
+    let manifest = bundled_daemon_manifest(app)?;
+    upload_daemon_verified(machine, arch, &local_path, &manifest, known_hosts, None).await
+}
+
+/// The testable core of [`upload_daemon`]: reads `local_path` **exactly once**,
+/// verifies that single buffer's sha256 against `manifest` ([`verify_daemon_binary_sha256`]),
+/// and — only if that passes — uploads that SAME buffer via [`upload_daemon_bytes`],
+/// which never re-reads the path. A mismatch returns before [`upload_daemon_bytes`] is
+/// even called, so a tampered binary never reaches the network.
+pub(crate) async fn upload_daemon_verified(
+    machine: &MachineRecord,
+    arch: &str,
+    local_path: &Path,
+    manifest: &DaemonManifest,
+    known_hosts: Option<&str>,
+    ssh_bin_override: Option<&Path>,
+) -> Result<UploadOutcome, BootstrapError> {
+    let bytes = tokio::fs::read(local_path)
+        .await
+        .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
+    verify_daemon_binary_sha256(arch, &bytes, manifest)?;
+    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
 }
 
 // ============================================================================
@@ -1170,6 +1333,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&resource_dir);
     }
 
+    // ---- daemon_target_triple ----
+
+    #[test]
+    fn daemon_target_triple_strips_the_shared_filename_prefix() {
+        assert_eq!(daemon_target_triple("x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(daemon_target_triple("aarch64"), Some("aarch64-unknown-linux-musl"));
+        assert_eq!(daemon_target_triple("armv7l"), None);
+    }
+
+    // ---- resolve_daemon_manifest (manifest resolution + DaemonManifestMissing) ----
+
+    fn write_test_manifest(dir: &std::path::Path, targets_json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(r#"{{"version":"0.2.0","built_at":"2026-09-18T00:00:00Z","targets":{targets_json}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_daemon_manifest_parses_a_real_manifest_in_the_resource_dir() {
+        let dir = std::env::temp_dir().join(format!("flightdeck-install-test-manifest-{}", uuid::Uuid::new_v4()));
+        write_test_manifest(
+            &dir.join("flightdeckd"),
+            r#"{"x86_64-unknown-linux-musl":{"sha256":"aa","size":10},"aarch64-unknown-linux-musl":{"sha256":"bb","size":11}}"#,
+        );
+
+        let got = resolve_daemon_manifest(Some(&dir)).expect("a well-formed manifest must parse");
+        assert_eq!(got.version, "0.2.0");
+        assert_eq!(got.targets.len(), 2);
+        assert_eq!(got.targets["x86_64-unknown-linux-musl"].sha256, "aa");
+        assert_eq!(got.targets["x86_64-unknown-linux-musl"].size, 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_daemon_manifest_is_missing_when_the_resource_dir_has_no_manifest_json() {
+        let dir = std::env::temp_dir().join(format!("flightdeck-install-test-nomanifest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
+        // A binary with no accompanying manifest — e.g. a hand-copied dist dir.
+        std::fs::write(dir.join("flightdeckd/flightdeckd-x86_64-unknown-linux-musl"), b"bytes").unwrap();
+
+        assert_eq!(resolve_daemon_manifest(Some(&dir)), Err(BootstrapError::DaemonManifestMissing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_daemon_manifest_is_missing_with_no_resource_dir_at_all() {
+        assert_eq!(resolve_daemon_manifest(None), Err(BootstrapError::DaemonManifestMissing));
+    }
+
+    #[test]
+    fn resolve_daemon_manifest_is_missing_on_malformed_json() {
+        let dir = std::env::temp_dir().join(format!("flightdeck-install-test-badjson-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
+        std::fs::write(dir.join("flightdeckd/manifest.json"), b"{ not json").unwrap();
+
+        assert_eq!(resolve_daemon_manifest(Some(&dir)), Err(BootstrapError::DaemonManifestMissing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- verify_daemon_binary_sha256 (integrity gate before any upload) ----
+
+    fn manifest_with(triple: &str, sha256: &str) -> DaemonManifest {
+        let mut targets = std::collections::HashMap::new();
+        targets.insert(triple.to_string(), DaemonManifestTarget { sha256: sha256.to_string(), size: 42 });
+        DaemonManifest { version: "0.2.0".to_string(), built_at: "2026-09-18T00:00:00Z".to_string(), targets }
+    }
+
+    #[test]
+    fn verify_daemon_binary_sha256_accepts_a_matching_hash() {
+        let bytes = b"the-real-daemon-bytes";
+        let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(bytes));
+        assert_eq!(verify_daemon_binary_sha256("x86_64", bytes, &manifest), Ok(()));
+    }
+
+    #[test]
+    fn verify_daemon_binary_sha256_refuses_a_mismatched_hash_as_tampered_never_a_generic_error() {
+        let bytes = b"tampered-or-corrupted-bytes";
+        let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"the-real-daemon-bytes"));
+        let got = verify_daemon_binary_sha256("x86_64", bytes, &manifest);
+        assert_eq!(
+            got,
+            Err(BootstrapError::DaemonBinaryTampered {
+                arch: "x86_64".to_string(),
+                expected: sha256_hex(b"the-real-daemon-bytes"),
+                actual: sha256_hex(bytes),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_daemon_binary_sha256_is_missing_when_the_manifest_has_no_entry_for_this_arch() {
+        // e.g. a partial TARGETS=aarch64-only build's manifest, asked to verify x86_64.
+        let manifest = manifest_with("aarch64-unknown-linux-musl", &sha256_hex(b"bytes"));
+        assert_eq!(
+            verify_daemon_binary_sha256("x86_64", b"bytes", &manifest),
+            Err(BootstrapError::DaemonManifestMissing)
+        );
+    }
+
+    #[test]
+    fn verify_daemon_binary_sha256_is_not_bundled_for_an_unmapped_arch() {
+        let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"bytes"));
+        assert_eq!(
+            verify_daemon_binary_sha256("riscv64", b"bytes", &manifest),
+            Err(BootstrapError::DaemonBinaryNotBundled("riscv64".to_string()))
+        );
+    }
+
     // ---- sha256_hex ----
 
     #[test]
@@ -1612,6 +1889,107 @@ mod tests {
             log_text.contains("CLEANUP_INVOKED"),
             "a failed upload must trigger the best-effort temp-file cleanup reconnect: {log_text:?}"
         );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// Fake `ssh` for [`upload_daemon_verified`]'s composition tests: resolves to a
+    /// fresh target (no existing sha, so the upload always proceeds), then
+    /// unconditionally succeeds the upload call — but first saves whatever bytes
+    /// arrived on stdin to `<log>.bytes`, so a test can assert EXACTLY which buffer
+    /// was streamed over the wire, not just that some upload happened.
+    fn fake_ssh_upload_success(log: &Path, target: &str) -> String {
+        format!(
+            "#!/bin/bash\n\
+             LOG={log}\n\
+             last=\"${{@: -1}}\"\n\
+             case \"$last\" in\n\
+             \x20   *FLIGHTDECK_UPLOAD_OK*)\n\
+             \x20       echo UPLOAD_INVOKED >> \"$LOG\"\n\
+             \x20       cat > \"$LOG.bytes\"\n\
+             \x20       echo FLIGHTDECK_UPLOAD_OK\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             \x20   *)\n\
+             \x20       echo RESOLVE_INVOKED >> \"$LOG\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET:{target}\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET_SHA256:\"\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             esac\n",
+            log = crate::ipc::commands::shq(&log.to_string_lossy()),
+        )
+    }
+
+    /// A manifest whose single entry (for `arch`) expects `sha256` — built directly,
+    /// bypassing [`bundled_daemon_manifest`]/`resolve_daemon_manifest` (which need a
+    /// resource dir / app handle this unit test has neither of).
+    fn manifest_for(arch: &str, sha256: &str, size: u64) -> DaemonManifest {
+        let triple = daemon_target_triple(arch).expect("test arch must map to a known triple").to_string();
+        DaemonManifest {
+            version: "0.2.0-test".to_string(),
+            built_at: "test".to_string(),
+            targets: std::collections::HashMap::from([(
+                triple,
+                DaemonManifestTarget { sha256: sha256.to_string(), size },
+            )]),
+        }
+    }
+
+    /// Regression test for the composition bug the review flagged: [`upload_daemon`]
+    /// (via its testable core, [`upload_daemon_verified`], since it needs no
+    /// `tauri::AppHandle`) must upload the EXACT byte buffer it just verified against
+    /// the manifest — never a second, independent read of the path. Proven here by
+    /// capturing what actually hit the wire (via [`fake_ssh_upload_success`]'s stdin
+    /// capture) and asserting it equals the on-disk bytes the sha256 was computed
+    /// from, closing the "verified one read, uploaded a different one" gap.
+    #[tokio::test]
+    async fn upload_daemon_verified_uploads_exactly_the_bytes_it_verified() {
+        let bin = FakeBinary::new("verified-upload", 4096);
+        let manifest = manifest_for("aarch64", &sha256_hex(&bin.bytes), bin.bytes.len() as u64);
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/home/deploy/.local/bin/flightdeckd"));
+        let machine = test_machine();
+
+        let result =
+            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+        assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: false }));
+
+        let bytes_path = format!("{}.bytes", log.display());
+        let sent = std::fs::read(&bytes_path).expect("the uploaded bytes must have been captured on the wire");
+        assert_eq!(
+            sent, bin.bytes,
+            "must upload exactly the sha256-verified buffer, never a fresh re-read of the path"
+        );
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&bytes_path);
+    }
+
+    /// The other half of the same regression test: a binary whose sha256 does NOT
+    /// match its manifest entry (simulating either real tampering, or the disk
+    /// changing between an earlier read and this one) is refused — and, crucially,
+    /// this happens BEFORE any ssh call at all (the log file stays empty), proving
+    /// [`upload_daemon_verified`] never uploads unverified bytes on a mismatch.
+    #[tokio::test]
+    async fn upload_daemon_verified_refuses_a_tampered_binary_and_never_touches_the_network() {
+        let bin = FakeBinary::new("tampered-upload", 4096);
+        let manifest = manifest_for("aarch64", &"f".repeat(64), bin.bytes.len() as u64);
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/home/deploy/.local/bin/flightdeckd"));
+        let machine = test_machine();
+
+        let result =
+            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+        assert!(
+            matches!(result, Err(BootstrapError::DaemonBinaryTampered { .. })),
+            "expected DaemonBinaryTampered, got {result:?}"
+        );
+
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.is_empty(), "a tampered binary must never invoke ssh at all: {log_text:?}");
+        let bytes_path = format!("{}.bytes", log.display());
+        assert!(!Path::new(&bytes_path).exists(), "nothing must ever have been streamed");
+
         let _ = std::fs::remove_file(&log);
     }
 
