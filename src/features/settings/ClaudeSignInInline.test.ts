@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => {
     serverLoginPromptEvent: mockEmitter(),
     serverLoginResultEvent: mockEmitter(),
     startClaudeLogin: vi.fn(),
+    restartClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
     openUrl: vi.fn(async () => {}),
@@ -27,6 +28,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("../../ipc/client", () => ({
   commands: {
     startClaudeLogin: mocks.startClaudeLogin,
+    restartClaudeLogin: mocks.restartClaudeLogin,
     submitClaudeLoginCode: mocks.submitClaudeLoginCode,
     cancelClaudeLogin: mocks.cancelClaudeLogin,
   },
@@ -40,8 +42,9 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mocks.openUrl }));
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
+import { useClaudeLoginSessions } from "./claudeLoginSessions";
 
-const { serverLoginPromptEvent, startClaudeLogin, submitClaudeLoginCode, openUrl } = mocks;
+const { serverLoginPromptEvent, serverLoginResultEvent, startClaudeLogin, restartClaudeLogin, submitClaudeLoginCode, openUrl } = mocks;
 
 let container: HTMLDivElement;
 let root: Root;
@@ -80,9 +83,11 @@ beforeEach(() => {
   root = createRoot(container);
   localStorage.clear();
   startClaudeLogin.mockReset();
+  restartClaudeLogin.mockReset();
   submitClaudeLoginCode.mockReset();
   openUrl.mockReset();
   openUrl.mockResolvedValue(undefined);
+  useClaudeLoginSessions.setState({ active: {} });
 });
 
 afterEach(() => {
@@ -136,3 +141,72 @@ describe("ClaudeSignInInline — code handling", () => {
     expect(Object.keys(localStorage)).toHaveLength(0);
   });
 });
+
+// B-finding #4: single-flight semantics — a plain Start attaches (never kills a live
+// session), only the explicit "Restart sign-in" replaces one, and the shared `active`
+// flag other surfaces read is kept in sync with all of that.
+describe("ClaudeSignInInline — single-flight (B-finding #4)", () => {
+  it("marks the shared session active the instant Start succeeds", async () => {
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1" } });
+    mount();
+    expect(useClaudeLoginSessions.getState().active.m1).not.toBe(true);
+    click("Start Claude sign-in");
+    await settle();
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(true);
+  });
+
+  it("a same-caller Cancel clears the shared active flag locally, with no backend event needed", async () => {
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1" } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(true);
+
+    click("Cancel");
+    expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "s1", machine_id: "m1" });
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(false);
+  });
+
+  it("offers Restart sign-in once a session is in flight, and it calls restart_claude_login (never start_claude_login again)", async () => {
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1" } });
+    restartClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s2", machine_id: "m1" } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+
+    click("Restart sign-in");
+    await settle();
+
+    expect(restartClaudeLogin).toHaveBeenCalledWith("m1");
+    expect(startClaudeLogin).toHaveBeenCalledTimes(1); // never called again by the restart
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(true); // still active, under the NEW session
+  });
+
+  it("renders a 'superseded' result exactly like any other failure, and clears the shared active flag", async () => {
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1" } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(true);
+
+    // Exactly what `run_login_actor` emits for the REPLACED session on an explicit
+    // "Restart sign-in" started elsewhere (never for a same-caller Cancel).
+    act(() =>
+      serverLoginResultEvent.emit({
+        machine_id: "m1",
+        ok: false,
+        email: null,
+        error: "superseded by another sign-in for this server",
+      }),
+    );
+    await settle();
+
+    expect(container.textContent).toContain("Sign-in failed: superseded by another sign-in for this server.");
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(false);
+  });
+});
+
+function cancelClaudeLoginCalledWith() {
+  const calls = mocks.cancelClaudeLogin.mock.calls;
+  return calls[calls.length - 1]?.[0];
+}

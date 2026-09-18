@@ -8,6 +8,7 @@ import { Ico } from "../../ui/kit";
 import { commands, type RepairAction, type ServerDiagnosis } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
+import { useClaudeLoginSessions } from "./claudeLoginSessions";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
@@ -135,6 +136,12 @@ export function ServerStatusPanel({
   const [repairSudoAction, setRepairSudoAction] = useState<RepairAction | null>(null);
   const [repairSudoPassword, setRepairSudoPassword] = useState("");
   const [showClaudeSignIn, setShowClaudeSignIn] = useState(false);
+  // B-finding #4: true while ANY surface (typically the bootstrap wizard's own inline
+  // step, for a machine that was just paired) already has a sign-in in flight for this
+  // machine — this card offers "Sign-in in progress…" instead of its OWN "Sign in to
+  // Claude" button in that case, so a freshly-bootstrapped machine never shows two
+  // independent entry points for the same thing at once.
+  const claudeLoginActive = useClaudeLoginSessions((s) => s.active[machine.id] ?? false);
 
   // Always diagnoses FRESH on mount — never a cached/last-known stage. This is what
   // makes "close Settings mid-install, reopen" safe without any extra plumbing: the
@@ -320,7 +327,15 @@ export function ServerStatusPanel({
           {repairError && <div className={sharedStyles.errorMsg}>{repairError}</div>}
           {/* `sign_in_claude` never appears in `repairSuggestionsFor` — see its own doc
               — so it gets its own always-available action here instead. */}
-          {claudeNeedsSignIn(diagnosis) && !showClaudeSignIn && (
+          {claudeNeedsSignIn(diagnosis) && !showClaudeSignIn && claudeLoginActive && (
+            // Another surface (typically the bootstrap wizard, for a machine just
+            // paired) already has a sign-in in flight — no second Start button (see
+            // `claudeLoginActive`'s own doc above).
+            <div className={styles.repairs}>
+              <span className={sharedStyles.remoteStatusText}>Sign-in in progress…</span>
+            </div>
+          )}
+          {claudeNeedsSignIn(diagnosis) && !showClaudeSignIn && !claudeLoginActive && (
             <div className={styles.repairs}>
               <button type="button" className={styles.repairBtn} onClick={() => setShowClaudeSignIn(true)}>
                 <span className={styles.repairTitle}>Sign in to Claude</span>

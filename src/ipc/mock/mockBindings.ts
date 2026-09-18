@@ -2252,6 +2252,32 @@ export const mockCommands = {
   },
 
   async startClaudeLogin(machineId: string): Promise<Result<LoginSession, string>> {
+    // Mirrors the real single-flight semantics (B-finding #4): a second start for a
+    // machine that already has a live mock session ATTACHES to it instead of minting
+    // a competing one — only `restartClaudeLogin` below replaces it.
+    for (const [sessionId, mId] of mockLoginSessions) {
+      if (mId === machineId) return ok({ session_id: sessionId, machine_id: machineId });
+    }
+    const sessionId = `mock-login-${++mockLoginCounter}`;
+    mockLoginSessions.set(sessionId, machineId);
+    setTimeout(() => {
+      serverLoginPromptEvent.emit({ machine_id: machineId, url: "https://claude.ai/oauth/authorize?mock=1" });
+    }, 260);
+    return ok({ session_id: sessionId, machine_id: machineId });
+  },
+
+  async restartClaudeLogin(machineId: string): Promise<Result<LoginSession, string>> {
+    for (const [sessionId, mId] of mockLoginSessions) {
+      if (mId === machineId) {
+        mockLoginSessions.delete(sessionId);
+        serverLoginResultEvent.emit({
+          machine_id: machineId,
+          ok: false,
+          email: null,
+          error: "superseded by another sign-in for this server",
+        });
+      }
+    }
     const sessionId = `mock-login-${++mockLoginCounter}`;
     mockLoginSessions.set(sessionId, machineId);
     setTimeout(() => {

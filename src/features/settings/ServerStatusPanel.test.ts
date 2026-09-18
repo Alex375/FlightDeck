@@ -30,17 +30,19 @@ const mocks = vi.hoisted(() => {
     machineDiagnose: vi.fn(),
     machineRepair: vi.fn(),
     startClaudeLogin: vi.fn(),
+    restartClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
   };
 });
-const { machineDiagnose, machineRepair } = mocks;
+const { machineDiagnose, machineRepair, startClaudeLogin } = mocks;
 
 vi.mock("../../ipc/client", () => ({
   commands: {
     machineDiagnose: mocks.machineDiagnose,
     machineRepair: mocks.machineRepair,
     startClaudeLogin: mocks.startClaudeLogin,
+    restartClaudeLogin: mocks.restartClaudeLogin,
     submitClaudeLoginCode: mocks.submitClaudeLoginCode,
     cancelClaudeLogin: mocks.cancelClaudeLogin,
   },
@@ -57,6 +59,7 @@ import { DiagnosisSummary, ServerStatusPanel } from "./ServerStatusPanel";
 import type { Machine } from "../../store/conversationsStore";
 import type { RepairAction, ServerDiagnosis } from "../../ipc/client";
 import type { ProvisionStatusLabel } from "./provisionStatus";
+import { useClaudeLoginSessions } from "./claudeLoginSessions";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -101,6 +104,8 @@ beforeEach(() => {
   root = createRoot(container);
   machineDiagnose.mockReset();
   machineRepair.mockReset();
+  startClaudeLogin.mockReset();
+  useClaudeLoginSessions.setState({ active: {} });
 });
 
 afterEach(() => {
@@ -287,5 +292,55 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
     expect(container.querySelector('input[placeholder="Sudo password"]')).toBeNull();
     // Never submitted with the typed password.
     expect(machineRepair).toHaveBeenCalledTimes(1);
+  });
+});
+
+// B-finding #4: this card must never offer a SECOND "Sign in to Claude" button while
+// another surface (e.g. the bootstrap wizard's own inline step) already has one live
+// for the same machine — `claudeLoginSessions.ts`'s shared `active` flag is what lets
+// it know that before the user ever clicks anything here.
+describe("ServerStatusPanel — Claude sign-in single-flight (B-finding #4)", () => {
+  it("shows the Sign in to Claude button when nothing else has a session for this machine", async () => {
+    machineDiagnose.mockResolvedValueOnce({
+      status: "ok",
+      data: baseDiagnosis({ claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } }),
+    });
+    mountPanel();
+    await settle();
+
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.includes("Sign in to Claude"))).toBe(true);
+    expect(container.textContent).not.toContain("Sign-in in progress");
+  });
+
+  it("shows 'Sign-in in progress…' instead of its own button while another surface's session is live for this machine", async () => {
+    machineDiagnose.mockResolvedValueOnce({
+      status: "ok",
+      data: baseDiagnosis({ claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } }),
+    });
+    // Simulates the wizard's OWN ClaudeSignInInline already having started a session
+    // for this exact machine — never anything this panel itself triggered.
+    useClaudeLoginSessions.getState().setActive("m1", true);
+    mountPanel();
+    await settle();
+
+    expect(container.textContent).toContain("Sign-in in progress…");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.includes("Sign in to Claude"))).toBe(false);
+  });
+
+  it("flips back to offering its own button once the other surface's session resolves", async () => {
+    machineDiagnose.mockResolvedValueOnce({
+      status: "ok",
+      data: baseDiagnosis({ claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } }),
+    });
+    useClaudeLoginSessions.getState().setActive("m1", true);
+    mountPanel();
+    await settle();
+    expect(container.textContent).toContain("Sign-in in progress…");
+
+    act(() => useClaudeLoginSessions.getState().setActive("m1", false));
+    await settle();
+
+    expect(container.textContent).not.toContain("Sign-in in progress");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.includes("Sign in to Claude"))).toBe(true);
   });
 });

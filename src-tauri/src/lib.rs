@@ -84,7 +84,7 @@ use bootstrap::install::{bootstrap_escalate_persistence, bootstrap_install_servi
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
 };
-use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, start_claude_login, submit_claude_login_code};
+use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
@@ -368,6 +368,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             retry_phone_provisioning,
             bootstrap_run_init,
             start_claude_login,
+            restart_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
             bootstrap_install_key,

@@ -2473,18 +2473,45 @@ async bootstrapRunInit(machineId: string, label: string) : Promise<Result<InitOu
 }
 },
 /**
- * Start driving the server-side `claude` sign-in for `machine_id`. Returns
- * immediately with an opaque [`LoginSession`] handle — the actual URL (or an
- * immediate "already signed in" completion) arrives asynchronously as
- * [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
+ * Start driving the server-side `claude` sign-in for `machine_id` — or, if another
+ * surface already has one live for the SAME machine, ATTACH to it instead of starting
+ * a competing one (B-finding #4: a second start used to silently kill the first, with
+ * zero UI feedback). Returns immediately with an opaque [`LoginSession`] handle — the
+ * actual URL (or an immediate "already signed in" completion) arrives asynchronously
+ * as [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
  * async login flow in this crate (`account_claude_login_start` is a synchronous
  * exception only because ITS wait for the URL is bounded to a couple of seconds
  * against a LOCAL process; this one crosses the network twice before it can even
  * begin, so it does not block the caller on that).
+ * 
+ * On attach, the already-recognized URL (if any) is re-emitted as a fresh
+ * [`ServerLoginPromptEvent`] — a late-joining caller's own listener is registered by
+ * the time this returns (both `ClaudeSignInInline` call sites subscribe before
+ * calling this), but the ORIGINAL prompt may have already fired before that listener
+ * existed, so without this re-emit a second surface attaching to an in-progress
+ * session could be stuck showing "waiting for the sign-in link" even though one
+ * already exists. To replace, rather than attach to, an existing session, use
+ * [`restart_claude_login`] instead.
  */
 async startClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_claude_login", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Explicitly REPLACE any live sign-in session for `machine_id` with a fresh one — the
+ * only thing in this module that supersedes rather than attaches (see
+ * [`LoginSessions`]'s own doc). The replaced session, if any, is told via a
+ * [`ServerLoginResultEvent`] (`ok:false`, a "superseded" reason) — unlike
+ * [`cancel_claude_login`] on a session the SAME caller started, which stays silent on
+ * purpose. Used by the "Restart sign-in" action once a sign-in is already in flight.
+ */
+async restartClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_claude_login", { machineId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4049,8 +4076,8 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
- * Opaque handle [`start_claude_login`] returns, threaded back through
- * [`submit_claude_login_code`] / [`cancel_claude_login`].
+ * Opaque handle [`start_claude_login`]/[`restart_claude_login`] return, threaded back
+ * through [`submit_claude_login_code`] / [`cancel_claude_login`].
  */
 export type LoginSession = { session_id: string; machine_id: string }
 /**
