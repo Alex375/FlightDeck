@@ -6,6 +6,7 @@ import {
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
+  isServerBusyError,
   isSudoPasswordError,
   isTrustedSignInUrl,
   needsSudoPassword,
@@ -148,6 +149,28 @@ describe("isSudoPasswordError", () => {
   it("rejects an unrelated error and null", () => {
     expect(isSudoPasswordError("could not reach the server")).toBe(false);
     expect(isSudoPasswordError(null)).toBe(false);
+  });
+});
+
+// B_lifecycle-#7: wording-contract test with the Rust `server_busy_error` in
+// orchestrator.rs — keep the two in sync (see that function's own doc).
+describe("isServerBusyError", () => {
+  it("recognizes the Rust side's server_busy_error wording, naming the running op", () => {
+    expect(
+      isServerBusyError(
+        'Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
+      ),
+    ).toBe(true);
+    expect(
+      isServerBusyError(
+        'Another operation ("Re-upload the flightdeckd binary") is already running on this server. Wait for it to finish, then try again.',
+      ),
+    ).toBe(true);
+  });
+  it("rejects an unrelated error and null", () => {
+    expect(isServerBusyError("could not reach the server")).toBe(false);
+    expect(isServerBusyError("this server needs a sudo password to continue")).toBe(false);
+    expect(isServerBusyError(null)).toBe(false);
   });
 });
 
