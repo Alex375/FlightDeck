@@ -60,6 +60,9 @@ jobs:
       - name: Tests unitaires front (vitest)
         run: pnpm test # = vitest run (jsdom)
 
+      - name: Tests des scripts de build (node --test)
+        run: pnpm test:scripts # pin du contrat de target-triple Rust<->JS (scripts/build-daemon.test.mjs) — pas de Docker requis
+
       - name: Tests unitaires Rust
         working-directory: src-tauri
         run: cargo test --lib

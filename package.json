@@ -12,6 +12,7 @@
     "tauri:build": "tauri build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:scripts": "node --test scripts/build-daemon.test.mjs",
     "bump": "node scripts/bump-version.mjs",
     "gen:file-icons": "node scripts/gen-file-icons.mjs",
     "daemon:build": "node scripts/build-daemon.mjs"
