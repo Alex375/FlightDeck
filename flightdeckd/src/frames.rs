@@ -70,6 +70,24 @@ pub fn fd_attach(
     .to_string()
 }
 
+/// The running daemon's version (Cargo package version). Reported in
+/// `fd_status` so a client detects version skew over the socket protocol
+/// itself — distinct from `flightdeckd --version`, which reports the binary on
+/// disk (the two differ after an upgrade that has not restarted the daemon).
+pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Reply to a `status` request on the attach socket: the node label, the
+/// running daemon's version and one row per registered conversation.
+pub fn fd_status(label: &str, conversations: Vec<Value>) -> String {
+    json!({
+        "type": "fd_status",
+        "version": DAEMON_VERSION,
+        "label": label,
+        "conversations": conversations,
+    })
+    .to_string()
+}
+
 /// Last line before the daemon closes an attach stream. `reason` ∈
 /// "replaced" (a newer client took over — do NOT auto-reconnect),
 /// "stopped" (explicit fd_stop — do not reconnect),
@@ -169,6 +187,17 @@ mod tests {
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v["reason"], "exited");
         assert_eq!(v["exit_code"], 1);
+    }
+
+    #[test]
+    fn fd_status_carries_daemon_version() {
+        let s = fd_status("node", vec![json!({"conversation": "c1"})]);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "fd_status");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["label"], "node");
+        assert_eq!(v["conversations"][0]["conversation"], "c1");
+        assert!(!is_replayable_line(&s));
     }
 
     #[test]

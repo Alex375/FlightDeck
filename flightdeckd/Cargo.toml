@@ -24,3 +24,6 @@ uuid = { version = "1", features = ["v4"] }
 [profile.release]
 strip = true
 lto = "thin"
+
+[dev-dependencies]
+tempfile = "3"

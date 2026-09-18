@@ -978,19 +978,7 @@ impl SessionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_cfg() -> Config {
-        Config {
-            relay_url: "http://localhost:1".into(),
-            mac_id: "m".into(),
-            mac_token: "t".into(),
-            phone_tokens: vec![],
-            label: "test".into(),
-            default_workdir: None,
-            claude_bin: "claude".into(),
-            permission_mode: "bypassPermissions".into(),
-        }
-    }
+    use crate::testutil::test_cfg;
 
     #[test]
     fn ensure_args_injects_resume_and_defaults() {

@@ -18,6 +18,8 @@ mod registry;
 mod relay;
 mod rpc;
 mod session;
+#[cfg(test)]
+mod testutil;
 mod transcript;
 
 use anyhow::{Context, Result};
@@ -197,5 +199,18 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn version_flag_prints_name_and_package_version() {
+        // `ssh host flightdeckd --version` is the Mac's on-disk version probe.
+        let v = Cli::command().render_version().to_string();
+        assert_eq!(v.trim(), format!("flightdeckd {}", env!("CARGO_PKG_VERSION")));
     }
 }

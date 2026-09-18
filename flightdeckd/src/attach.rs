@@ -4,6 +4,7 @@
 //! transparent line pipe: client → claude stdin, claude stdout (replay + live)
 //! → client.
 
+use crate::frames;
 use crate::session::{ClientQueue, SessionManager, SessionMsg, ACTOR_REPLY_TIMEOUT};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -101,7 +102,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 "pending": live.as_ref().map(|s| s.pending.len()).unwrap_or(0),
             }));
         }
-        let line = json!({"type": "fd_status", "label": manager.cfg.label, "conversations": out});
+        let line = frames::fd_status(&manager.cfg.label, out);
         write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
         return Ok(());
     }
@@ -266,6 +267,8 @@ async fn one_shot(socket: &Path, request: serde_json::Value) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// The daemon's `fd_status` line: `{type, version, label, conversations}` —
+/// `version` is the RUNNING daemon's (see [`frames::DAEMON_VERSION`]).
 pub async fn status_client(socket: &Path) -> Result<String> {
     one_shot(socket, json!({"status": {}})).await
 }
@@ -274,4 +277,24 @@ pub async fn status_client(socket: &Path) -> Result<String> {
 /// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
 pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
     one_shot(socket, json!({"stop": {"conversation": conversation}})).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn status_client_round_trips_the_daemon_version() {
+        let dir = testutil::short_tempdir();
+        let manager = testutil::test_manager(testutil::test_cfg());
+        let socket = testutil::serve_attach(manager, dir.path()).await;
+        let line = status_client(&socket).await.unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "fd_status");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["label"], "test");
+        assert!(v["conversations"].as_array().unwrap().is_empty());
+    }
 }
