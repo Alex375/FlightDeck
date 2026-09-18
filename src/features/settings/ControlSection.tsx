@@ -8,7 +8,14 @@
 // Every core-backed card follows the honest-toggle rule: what it shows is the
 // post-apply READ-BACK from the core, so a failure shows instead of a switch that lies.
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { commands, type AddressCandidate, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
+import {
+  commands,
+  type AddressCandidate,
+  type MachineProvisionStatus,
+  type MachineRevokeStatus,
+  type RemoteStatus,
+  type VoiceBridgeStatus,
+} from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
 import { useCaffeinate } from "../../store/caffeinate";
 import {
@@ -17,6 +24,8 @@ import {
   useMachines,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
+import { useNow } from "../../ui/useNow";
+import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -284,6 +293,57 @@ export function buildServerCommand(publicKey: string): string {
 export function RemoteServersGroup() {
   const machines = useMachines();
 
+  // ---- Per-server phone-provisioning status (C10/C11) ----
+  const [provisionStatuses, setProvisionStatuses] = useState<Map<string, MachineProvisionStatus>>(new Map());
+  // ---- Per-server phone-REVOCATION status (C10's critical fix) — whether the
+  // OLD token from the last "regenerate pairing" was actually forgotten here. ----
+  const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
+  const [retrying, setRetrying] = useState<Set<string>>(new Set());
+  const now = useNow(30_000);
+
+  // Poll both registries so a background provisioning/revocation attempt
+  // (triggered elsewhere — pairing a server, enabling remote access,
+  // regenerating pairing) shows up here without the user having to leave and
+  // reopen Settings.
+  useEffect(() => {
+    let disposed = false;
+    const read = () => {
+      void commands.phoneProvisioningStatus().then((rows) => {
+        if (!disposed) setProvisionStatuses(new Map(rows.map((r) => [r.machine_id, r])));
+      });
+      void commands.phoneRevocationStatus().then((rows) => {
+        if (!disposed) setRevokeStatuses(new Map(rows.map((r) => [r.machine_id, r])));
+      });
+    };
+    read();
+    const id = setInterval(read, 4000);
+    return () => {
+      disposed = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const retryProvisioning = useCallback((machineId: string) => {
+    setRetrying((cur) => new Set(cur).add(machineId));
+    void commands
+      .retryPhoneProvisioning(machineId)
+      .then((res) => {
+        if (res.status === "ok") {
+          setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
+        }
+        // A command-level error (not a provisioning outcome — e.g. the machine
+        // was deleted mid-flight) is transient here: the next poll simply keeps
+        // showing whatever the registry already had, never a silent no-op.
+      })
+      .finally(() => {
+        setRetrying((cur) => {
+          const next = new Set(cur);
+          next.delete(machineId);
+          return next;
+        });
+      });
+  }, []);
+
   // ---- Add-a-server (pairing) flow ----
   const [adding, setAdding] = useState(false);
   const [stage, setStage] = useState<PairStage>("command");
@@ -409,7 +469,11 @@ export function RemoteServersGroup() {
         </div>
       )}
 
-      {machines.map((m) => (
+      {machines.map((m) => {
+        const provisionLabel = describeProvisionStatus(provisionStatuses.get(m.id), now);
+        const revokeLabel = describeRevokeStatus(revokeStatuses.get(m.id), now);
+        const isRetrying = retrying.has(m.id);
+        return (
         <Fragment key={m.id}>
           <div className={styles.remoteRow}>
             <div className={styles.remoteMain}>
@@ -417,7 +481,32 @@ export function RemoteServersGroup() {
               <span className={styles.mono}>
                 {m.user}@{m.host}:{m.port}
               </span>
+              {m.daemonLabel ? (
+                <span className={styles.remoteStatusText}>daemon: {m.daemonLabel}</span>
+              ) : null}
+              <span
+                className={provisionLabel.isProblem ? styles.dangerText : styles.remoteStatusText}
+              >
+                phone access: {isRetrying ? "pending…" : provisionLabel.text}
+              </span>
+              {/* Only shown after a "regenerate pairing" actually attempted a
+                  revoke against this server this run — absent otherwise, per
+                  `describeRevokeStatus`'s doc (nothing to report, not a problem). */}
+              {revokeLabel ? (
+                <span className={revokeLabel.isProblem ? styles.dangerText : styles.remoteStatusText}>
+                  {revokeLabel.text}
+                </span>
+              ) : null}
             </div>
+            {provisionLabel.canRetry && !isRetrying && (
+              <button
+                className={`${styles.btn} ${styles.ghost}`}
+                onClick={() => retryProvisioning(m.id)}
+                title="Retry granting this server phone access"
+              >
+                Retry
+              </button>
+            )}
             <button
               className={`${styles.btn} ${styles.ghost}`}
               onClick={() => void toggleConv(m.id)}
@@ -448,7 +537,8 @@ export function RemoteServersGroup() {
             </div>
           )}
         </Fragment>
-      ))}
+        );
+      })}
 
       {!adding ? (
         <div className={styles.remoteFooter}>
@@ -624,6 +714,9 @@ export function RemoteAccessGroup() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
+  // C11: "This Mac's name" — a draft while the user is typing (committed on
+  // blur/Enter), the same pattern as the voice bridge's port field above.
+  const [labelDraft, setLabelDraft] = useState<string | null>(null);
 
   // Read once on open, then poll so the toggle reflects the live connection
   // (connecting → connected) without needing to reopen the panel.
@@ -642,7 +735,7 @@ export function RemoteAccessGroup() {
   }, []);
 
   const apply = useCallback(
-    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean }) => {
+    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean; macLabel?: string }) => {
       setBusy(true);
       setError(null);
       try {
@@ -650,6 +743,7 @@ export function RemoteAccessGroup() {
           patch.enabled ?? null,
           patch.relayUrl ?? null,
           patch.regeneratePairing ?? false,
+          patch.macLabel ?? null,
         );
         if (res.status === "ok") setRemote(res.data);
         else setError(res.error);
@@ -661,6 +755,21 @@ export function RemoteAccessGroup() {
     },
     [],
   );
+
+  // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
+  // place — the core treats an empty string as "leave it unchanged", never as
+  // "clear the label" (see `set_remote`'s doc), so an empty field must not
+  // silently keep showing the OLD label as if nothing happened.
+  const commitLabel = useCallback(() => {
+    if (labelDraft === null || !remote) return;
+    const label = labelDraft.trim();
+    setLabelDraft(null);
+    if (!label) {
+      setError("This Mac's name cannot be empty.");
+      return;
+    }
+    if (label !== remote.mac_label) void apply({ macLabel: label });
+  }, [labelDraft, remote, apply]);
 
   // Remote access needs the Mac awake; enabling forces Caffeinate "Hard" and
   // snapshots the prior policy so turning it off restores what the user had.
@@ -733,6 +842,24 @@ export function RemoteAccessGroup() {
         }
         checked={remoteAnswers}
         onChange={(next) => setPrefs({ remoteAnswers: next })}
+      />
+      <ToggleRow
+        title="This Mac's name"
+        hint={`Shown in a paired phone's node list, alongside any paired servers (e.g. "MacBook Pro").`}
+        control={
+          <input
+            className={styles.field}
+            style={{ width: 200 }}
+            value={labelDraft ?? remote?.mac_label ?? ""}
+            onChange={(e) => setLabelDraft(e.target.value)}
+            onBlur={commitLabel}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitLabel();
+            }}
+            disabled={busy || !remote}
+            aria-label="This Mac's name"
+          />
+        }
       />
       <ToggleRow
         title="Status"

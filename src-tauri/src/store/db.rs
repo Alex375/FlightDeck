@@ -35,7 +35,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -70,6 +70,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v11,
     migrate_v12,
     migrate_v13,
+    migrate_v14,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -461,6 +462,45 @@ fn migrate_v13(conn: &Connection) -> rusqlite::Result<()> {
         "machines",
         "phone_provisioned_at",
         "ALTER TABLE machines ADD COLUMN phone_provisioned_at INTEGER",
+    )
+}
+
+/// v14 — durable queues for a phone token revocation that could not be delivered
+/// immediately (C10: provisioning/revoking the phone token on every paired daemon,
+/// plus the relay connection this Mac itself dials). Both are small, append-mostly
+/// queues, never joined against anything, so a dedicated table each (rather than a
+/// JSON blob on `machines`) keeps `Store::queue_*`/`clear_*` simple UPSERT/DELETEs.
+///
+/// `pending_relay_phone_revocations` — a token [`Store::set_remote`]'s
+/// regenerate-pairing path queued for `{type:"revoke_phone"}` on THIS Mac's own
+/// outbound relay connection (see `appmcp::relay::post_connect_frames`) but that
+/// hadn't gone out yet (remote access was off, or the socket wasn't up at the
+/// moment of regeneration). One row per outstanding token; no `machine_id` — this
+/// Mac's connection is the only "node" it applies to.
+///
+/// `pending_daemon_phone_revocations` — the same idea per PAIRED SERVER: a token
+/// `Store::delete_machine`/regenerate-pairing tried to `flightdeckd remove-phone`
+/// on a machine that was unreachable at that moment. Composite key
+/// `(machine_id, token)` — several tokens can be queued for the same machine (a
+/// user who regenerates twice while a server is down), and the same token can be
+/// queued for several machines independently.
+///
+/// Neither table is a foreign key to `machines` (same discipline as every other
+/// machine-adjacent table in this schema — see [`migrate_v10`]'s doc): a queued
+/// daemon revocation is deleted by [`Store::delete_machine`] in code, not by a
+/// cascade.
+fn migrate_v14(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_relay_phone_revocations (
+             token      TEXT PRIMARY KEY,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS pending_daemon_phone_revocations (
+             machine_id TEXT NOT NULL,
+             token      TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY (machine_id, token)
+         );",
     )
 }
 
@@ -887,7 +927,111 @@ impl Store {
     pub fn delete_machine(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM repos WHERE machine_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM machines WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Every paired remote server, oldest first — the same rows [`Self::load_state`]
+    /// embeds in [`PersistedState`], as a standalone call for a caller (C10's
+    /// `appmcp::provision`) that needs to iterate every machine without pulling in
+    /// repos/conversations/accounts too.
+    pub fn all_machines(&self) -> rusqlite::Result<Vec<MachineRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+             FROM machines ORDER BY added_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MachineRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    user: row.get(4)?,
+                    identity_file: row.get(5)?,
+                    added_at: row.get(6)?,
+                    addresses: decode_addresses(row.get(7)?),
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    /// Queue a phone token for `{type:"revoke_phone"}` on THIS Mac's own relay
+    /// connection (see [`migrate_v14`]'s doc) — idempotent by token (re-queuing the
+    /// same token just refreshes `created_at`), so a user who mashes "Regenerate"
+    /// while offline never accumulates duplicate rows for the same secret.
+    pub fn queue_relay_phone_revocation(&self, token: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pending_relay_phone_revocations (token, created_at) VALUES (?1, ?2)
+             ON CONFLICT(token) DO UPDATE SET created_at = excluded.created_at",
+            params![token, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every phone token still awaiting `revoke_phone` on this Mac's own relay
+    /// connection — drained (best-effort, no delivery ack exists on the wire; see
+    /// `appmcp::relay`'s module doc) on every reconnect via `RemoteConfig`.
+    pub fn pending_relay_phone_revocations(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT token FROM pending_relay_phone_revocations ORDER BY created_at ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+        rows
+    }
+
+    /// Forget a token queued via [`Self::queue_relay_phone_revocation`] — called once
+    /// it has actually been handed to a live relay connection to send.
+    pub fn clear_relay_phone_revocation(&self, token: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM pending_relay_phone_revocations WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
+    /// Queue a phone token for `flightdeckd remove-phone` on one paired server,
+    /// because it was unreachable when the revoke was first attempted (see
+    /// [`migrate_v14`]'s doc and `appmcp::provision::revoke_phone_on_machine`).
+    /// Idempotent by `(machine_id, token)`.
+    pub fn queue_daemon_phone_revocation(&self, machine_id: &str, token: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pending_daemon_phone_revocations (machine_id, token, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(machine_id, token) DO UPDATE SET created_at = excluded.created_at",
+            params![machine_id, token, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every phone token still awaiting `remove-phone` on this one machine —
+    /// retried the next time that machine is successfully contacted (see
+    /// `appmcp::provision::provision_phone_on_machine`).
+    pub fn pending_daemon_phone_revocations(&self, machine_id: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token FROM pending_daemon_phone_revocations WHERE machine_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![machine_id], |row| row.get::<_, String>(0))?.collect();
+        rows
+    }
+
+    /// Forget a token queued via [`Self::queue_daemon_phone_revocation`] — called
+    /// once that machine has confirmed the removal.
+    pub fn clear_daemon_phone_revocation(&self, machine_id: &str, token: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1 AND token = ?2",
+            params![machine_id, token],
+        )?;
         Ok(())
     }
 
@@ -1747,6 +1891,121 @@ mod tests {
             0
         );
         assert_eq!(s.set_machine_phone_provisioned_at("no-such-machine", 1).unwrap(), 0);
+    }
+
+    /// `all_machines` mirrors `load_state().machines` — same columns, same order —
+    /// as a standalone call `appmcp::provision` can iterate without paying for
+    /// repos/conversations/accounts too.
+    #[test]
+    fn all_machines_lists_every_paired_server_oldest_first() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.all_machines().unwrap(), Vec::new(), "no machines paired yet");
+
+        let m1 = MachineRecord {
+            id: "m1".into(),
+            label: "first".into(),
+            host: "h1".into(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            added_at: 10,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        let mut m2 = m1.clone();
+        m2.id = "m2".into();
+        m2.label = "second".into();
+        m2.added_at = 20;
+        // Insert out of order — the query must still come back oldest-first.
+        s.upsert_machine(&m2).unwrap();
+        s.upsert_machine(&m1).unwrap();
+
+        let got = s.all_machines().unwrap();
+        assert_eq!(got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["m1", "m2"]);
+    }
+
+    /// C10: the relay-side pending-revocation queue round-trips (queue → list →
+    /// clear) and re-queuing the SAME token is a no-op on the row count, not a
+    /// duplicate (the regenerate-pairing path may retry this if the app restarts
+    /// before the token is ever actually sent).
+    #[test]
+    fn relay_phone_revocation_queue_round_trips_and_dedupes_by_token() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.pending_relay_phone_revocations().unwrap(), Vec::<String>::new());
+
+        s.queue_relay_phone_revocation("old-token-1", 100).unwrap();
+        s.queue_relay_phone_revocation("old-token-2", 200).unwrap();
+        assert_eq!(
+            s.pending_relay_phone_revocations().unwrap(),
+            vec!["old-token-1".to_string(), "old-token-2".to_string()],
+            "oldest created_at first"
+        );
+
+        // Re-queuing the first token again (e.g. a second regenerate before the
+        // first one was ever delivered) must not duplicate the row — it REFRESHES
+        // created_at instead, which also moves it to the back of the oldest-first
+        // order (it is, after all, now the most recently queued one).
+        s.queue_relay_phone_revocation("old-token-1", 300).unwrap();
+        assert_eq!(
+            s.pending_relay_phone_revocations().unwrap(),
+            vec!["old-token-2".to_string(), "old-token-1".to_string()],
+            "still exactly 2 rows (no duplicate), reordered by the refreshed created_at"
+        );
+
+        s.clear_relay_phone_revocation("old-token-1").unwrap();
+        assert_eq!(s.pending_relay_phone_revocations().unwrap(), vec!["old-token-2".to_string()]);
+
+        // Clearing a token that was never queued (or already cleared) is a silent
+        // no-op, never an error — mirrors every other "forget this row" store method.
+        s.clear_relay_phone_revocation("never-queued").unwrap();
+    }
+
+    /// C10: the per-daemon pending-revocation queue is scoped by `machine_id` — the
+    /// same token queued for two different (unreachable) machines is tracked
+    /// independently, and `delete_machine` sweeps a machine's own queue (there is no
+    /// FK to cascade it, per this table's own doc in `migrate_v14`).
+    #[test]
+    fn daemon_phone_revocation_queue_is_scoped_per_machine_and_swept_on_delete() {
+        let s = Store::open_in_memory().unwrap();
+        let machine = |id: &str| MachineRecord {
+            id: id.into(),
+            label: id.into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&machine("m1")).unwrap();
+        s.upsert_machine(&machine("m2")).unwrap();
+
+        s.queue_daemon_phone_revocation("m1", "tok", 100).unwrap();
+        s.queue_daemon_phone_revocation("m2", "tok", 100).unwrap();
+        assert_eq!(s.pending_daemon_phone_revocations("m1").unwrap(), vec!["tok".to_string()]);
+        assert_eq!(s.pending_daemon_phone_revocations("m2").unwrap(), vec!["tok".to_string()]);
+
+        s.clear_daemon_phone_revocation("m1", "tok").unwrap();
+        assert_eq!(s.pending_daemon_phone_revocations("m1").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            s.pending_daemon_phone_revocations("m2").unwrap(),
+            vec!["tok".to_string()],
+            "clearing m1's queue must not touch m2's"
+        );
+
+        s.delete_machine("m2").unwrap();
+        assert_eq!(
+            s.pending_daemon_phone_revocations("m2").unwrap(),
+            Vec::<String>::new(),
+            "delete_machine must sweep its own pending revocations (no FK cascade exists)"
+        );
     }
 
     fn conv_at(

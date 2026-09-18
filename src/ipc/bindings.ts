@@ -2032,7 +2032,8 @@ async addMachine(label: string, host: string, port: number, user: string, identi
 }
 },
 /**
- * Un-pair a remote server. See [`delete_machine_and_key`].
+ * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
+ * and [`delete_machine_and_key`] (the delete itself).
  */
 async deleteMachine(id: string) : Promise<Result<null, string>> {
     try {
@@ -2351,14 +2352,68 @@ async remoteStatus() : Promise<RemoteStatus> {
     return await TAURI_INVOKE("remote_status");
 },
 /**
- * Change the remote-access config (enable, relay URL, regenerate the pairing
- * token), persist it, and (re)connect or disconnect accordingly. Regenerating
- * the pairing token revokes every previously-paired phone. Returns the honest
- * post-apply status.
+ * Change the remote-access config (enable, relay URL, this Mac's node label,
+ * regenerate the pairing token), persist it, and (re)connect or disconnect
+ * accordingly. Returns the honest post-apply status.
+ * 
+ * Regenerating the pairing token mints a fresh one AND revokes the old one
+ * everywhere it was ever authorized (C10's critical fix — see the inline
+ * comments below): before this fix, `regenerate_pairing` only ever minted +
+ * authorized the new token, so a lost phone's OLD token stayed valid forever
+ * (verified against this file's history: nothing anywhere called
+ * `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
+ * token on every paired daemon when access just turned on or the token just
+ * changed (C10 hook (b)) — both run in the background so Settings never blocks
+ * on N ssh round trips, and every per-machine outcome is recorded into its
+ * registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
+ * 
+ * The relay-side half of the revoke (THIS Mac's own connection) is NOT
+ * resolved synchronously here — see the inline comment right after
+ * `apply_remote` below for why clearing it here was the original bug, and
+ * where it is actually cleared now (`appmcp::relay::connect_once`, only once
+ * the frame has genuinely gone out on a live socket).
  */
-async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean) : Promise<Result<RemoteStatus, string>> {
+async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean, macLabel: string | null) : Promise<Result<RemoteStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing, macLabel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Every paired server's last phone-provisioning outcome this app run knows about
+ * (C10/C11) — Settings' per-server status row reads this back, joined against
+ * its own machine list by `machine_id`. A machine absent from the result has
+ * simply not been attempted yet this run (e.g. app just launched, remote access
+ * is off) — not a failure.
+ */
+async phoneProvisioningStatus() : Promise<MachineProvisionStatus[]> {
+    return await TAURI_INVOKE("phone_provisioning_status");
+},
+/**
+ * Every paired server's last phone-REVOCATION outcome this app run knows about
+ * — the revoke-side counterpart of [`phone_provisioning_status`], populated by
+ * [`set_remote`]'s regenerate-pairing revoke sweep (C10's critical fix). A
+ * machine absent from the result has simply never had a revoke attempted this
+ * run (most machines, most of the time) — not evidence it still holds a stale
+ * token. Settings reads this to flag a server that refused, was too old, or
+ * is still unreachable (queued for automatic retry) rather than silently
+ * assuming the old token is gone everywhere once `set_remote` returns.
+ */
+async phoneRevocationStatus() : Promise<MachineRevokeStatus[]> {
+    return await TAURI_INVOKE("phone_revocation_status");
+},
+/**
+ * Settings' "Retry" button: (re)attempt provisioning the current phone token on
+ * one server, synchronously — unlike the background hooks in [`set_remote`] /
+ * [`add_machine`], a manual retry click should show immediate feedback. Records
+ * `Pending` the moment it starts (so the row updates right away even though the
+ * ssh round trip itself takes a beat), then the real outcome.
+ */
+async retryPhoneProvisioning(machineId: string) : Promise<Result<MachineProvisionStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_phone_provisioning", { machineId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3857,6 +3912,10 @@ visited: number; elapsedMs: number }
  */
 export type LoginSession = { session_id: string; machine_id: string }
 /**
+ * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
+ */
+export type MachineProvisionStatus = { machine_id: string; state: ProvisionState; checked_at_ms: number }
+/**
  * A remote host (a "server") reached over SSH, on which repos can live and their
  * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
  * the connection coordinates so a user adds a server from the UI without editing any
@@ -3939,6 +3998,15 @@ daemon_label?: string | null;
  * convention as the `daemon_*` fields above.
  */
 phone_provisioned_at?: number | null }
+/**
+ * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
+ * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
+ * token actually get forgotten here". A machine absent from
+ * [`RevokeRegistry::all`] has simply never had a revocation attempted this
+ * run (most machines, most of the time — a revoke only runs when
+ * `regenerate_pairing` fires) — not evidence it still holds a stale token.
+ */
+export type MachineRevokeStatus = { machine_id: string; outcome: RevokeOutcome; checked_at_ms: number }
 /**
  * What the instructions file looks like right now.
  */
@@ -4208,6 +4276,32 @@ skill_count: number; agent_count: number; command_count: number; mcp_count: numb
  */
 export type Pong = { ok: boolean; echo: string; at_ms: number }
 /**
+ * One paired daemon's outcome, as Settings reads it back
+ * (`ipc::commands::phone_provisioning_status`).
+ */
+export type ProvisionState = 
+/**
+ * `add-phone` answered `ok:true` — the daemon now authorizes this Mac's
+ * current phone token.
+ */
+{ kind: "provisioned"; at_ms: number } | 
+/**
+ * An attempt is currently in flight (set by
+ * `ipc::commands::retry_phone_provisioning` the moment it starts, so a
+ * Settings click gets immediate feedback rather than a frozen row).
+ */
+{ kind: "pending" } | 
+/**
+ * The round trip completed but did not succeed — an ssh/connectivity error,
+ * or the daemon's own business-logic refusal (`ok:false`), verbatim.
+ */
+{ kind: "failed"; reason: string } | 
+/**
+ * The daemon answered `fd_detach` — too old to understand `add-phone`/
+ * `remove-phone` at all.
+ */
+{ kind: "daemon_too_old" }
+/**
  * Subscription rate-limit status, normalized from `rate_limit_event.rate_limit_info`.
  * Carries only what the stream-json protocol exposes: the coarse `status`, the
  * reset time, the window type, and whether overage is active. The precise usage
@@ -4330,7 +4424,11 @@ kill_user_processes: boolean | null }
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
  */
-export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; 
+/**
+ * This Mac's node display name (C11), as sent to the relay via `set_label`.
+ */
+mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
 /**
  * A working folder a conversation can be opened in.
  */
@@ -4370,6 +4468,41 @@ max: number | null;
  * Short human reason ("Connection error."), when one is available.
  */
 reason: string | null }
+/**
+ * One `revoke_phone_on_machine` outcome, as Settings reads it back
+ * (`ipc::commands::phone_revocation_status`) — the revoke-side counterpart of
+ * [`ProvisionState`].
+ */
+export type RevokeOutcome = 
+/**
+ * The daemon confirmed the token is gone (or was never authorized — `ok:true`
+ * either way).
+ */
+{ kind: "removed" } | 
+/**
+ * The daemon was unreachable right now, refused the removal, or is too old
+ * to understand `remove-phone` (see below) — in every one of these cases
+ * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
+ * retry the next time this machine is successfully contacted (see
+ * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * "genuinely could not reach it at all" case, so Settings can tell that
+ * apart from a business-logic refusal or an old daemon that answered but
+ * declined.
+ */
+{ kind: "queued" } | 
+/**
+ * The daemon answered `fd_detach` — too old to understand `remove-phone` at
+ * all. Still queued for retry (see `Queued`'s doc): a later `flightdeckd`
+ * update on that box makes the retry succeed for free.
+ */
+{ kind: "daemon_too_old" } | 
+/**
+ * The daemon answered `ok:false` — its own refusal, verbatim. Still queued
+ * for retry (see `Queued`'s doc): re-attempting a removal is idempotent, so
+ * queuing it even for a refusal that might be permanent costs nothing but
+ * an occasional extra ssh round trip.
+ */
+{ kind: "failed"; reason: string }
 /**
  * Outcome of a `rewind_files` request — the binary restoring the files it edited
  * since a given user message, from its own checkpoints. Also the shape of a
