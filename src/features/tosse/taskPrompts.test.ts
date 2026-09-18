@@ -35,6 +35,7 @@ const detail = (over: Partial<TosseTaskDetail> = {}): TosseTaskDetail => ({
   task: task(),
   projectId: "p-1",
   projectName: "Tosse Code",
+  parentTaskId: null,
   context: "Only the panel has this.",
   content: null,
   subtasks: [],

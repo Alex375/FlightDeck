@@ -2156,6 +2156,9 @@ pub struct TosseTaskDetail {
     pub task: TosseTask,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
+    /// The parent task when this one is a SUBTASK (the CRM nests one level deep), else
+    /// `None`. What lets an agent that names a subtask be linked to the work it belongs to.
+    pub parent_task_id: Option<String>,
     /// The long-form fields the briefing omits — Markdown, rendered as-is.
     pub context: Option<String>,
     pub content: Option<String>,
@@ -2174,6 +2177,12 @@ pub async fn task_detail(task_id: &str) -> R<TosseTaskDetail> {
             snippet(&v.to_string())
         ))
     })?;
+    parse_task_detail(data)
+}
+
+/// The `data` object of `GET /api/v1/tasks/:id`, parsed. Split out of [`task_detail`] so the
+/// shape is testable without a network.
+fn parse_task_detail(data: &Value) -> R<TosseTaskDetail> {
     let s = |k: &str| data.get(k).and_then(Value::as_str).map(str::to_string);
     Ok(TosseTaskDetail {
         task: parse_task(data)?,
@@ -2185,6 +2194,7 @@ pub async fn task_detail(task_id: &str) -> R<TosseTaskDetail> {
             .pointer("/project/name")
             .and_then(Value::as_str)
             .map(str::to_string),
+        parent_task_id: s("parentTaskId"),
         context: s("context"),
         content: s("content"),
         subtasks: parse_list(data.get("subtasks"), parse_task)?,
@@ -2835,6 +2845,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A subtask names its parent (`parentTaskId`, a scalar column the route returns as-is);
+    /// a top-level task carries `null`. The agent-link tool relies on it to link the work a
+    /// subtask belongs to rather than the subtask itself.
+    #[test]
+    fn task_detail_carries_the_parent_of_a_subtask() {
+        let sub = serde_json::json!({
+            "id": "t-sub", "title": "Write the tool", "status": "En cours",
+            "parentTaskId": "t-parent",
+            "project": { "id": "p1", "name": "Tosse Code" },
+            "subtasks": [], "blockedBy": [], "blocks": [],
+        });
+        let detail = parse_task_detail(&sub).unwrap();
+        assert_eq!(detail.parent_task_id.as_deref(), Some("t-parent"));
+        assert_eq!(detail.project_id.as_deref(), Some("p1"));
+
+        let top = serde_json::json!({
+            "id": "t-parent", "title": "Link conversations", "status": "À faire",
+            "parentTaskId": null, "subtasks": [], "blockedBy": [], "blocks": [],
+        });
+        assert_eq!(parse_task_detail(&top).unwrap().parent_task_id, None);
     }
 
     #[test]
