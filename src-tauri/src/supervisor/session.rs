@@ -565,9 +565,11 @@ async fn run_actor(
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
     let mut stop_remote = false;
     // A6: the machine's persisted preferred host as this actor was SPAWNED with it —
-    // captured before any rotation ever mutates `cfg.remote.host`, so a later
-    // successful attach can tell "still on the address we started with" from "we
-    // rotated and THIS one turned out to work" (see the `FdAttach` handler below).
+    // captured before any rotation ever mutates `cfg.remote.host`. Used ONLY as the
+    // FALLBACK baseline for `host_to_persist` (see the `FdAttach` handler below):
+    // once `persisted_host` holds a value, IT is the baseline instead — a session
+    // that rotates away and later back onto this original host must still persist
+    // it, since the DB was last told about the away candidate, not this one.
     let original_host = cfg.remote.as_ref().map(|r| r.host.clone());
     // A6: which candidate `cfg.remote.addresses` we are currently dialing, and how
     // many CONSECUTIVE attempts against it in a row failed to reach `fd_attach`.
@@ -584,9 +586,12 @@ async fn run_actor(
         .unwrap_or(0);
     let mut candidate_failures: u32 = 0;
     // A6: the host already persisted as this machine's preferred address THIS
-    // session, so a later reattach onto the SAME already-rotated candidate doesn't
-    // re-emit the persist signal on every single reconnect — only the first
-    // successful attach after a rotation needs to write it.
+    // session — `None` until the first successful persist, after which it (not
+    // `original_host`) becomes the baseline `host_to_persist` compares against.
+    // This is what lets a LATER rotation that lands back on `original_host`
+    // still persist correctly: the baseline has moved on from "where we
+    // started" to "what the DB last heard", so that reattach is correctly seen
+    // as a change again — see `host_to_persist`'s doc.
     let mut persisted_host: Option<String> = None;
     // Remote reattach state, learned from the daemon's fd_attach handshake.
     let mut attach = cfg.attach.clone().unwrap_or_default();
@@ -658,13 +663,18 @@ async fn run_actor(
                             // dials it first instead of re-paying the backoff against a
                             // dead `host` every time.
                             if let Some(remote) = cfg.remote.as_ref() {
-                                let rotated = original_host.as_deref().is_some_and(|h| h != remote.host);
-                                let already_persisted =
-                                    persisted_host.as_deref() == Some(remote.host.as_str());
-                                if rotated && !already_persisted {
-                                    if let Some(machine_id) = remote.machine_id.clone() {
-                                        persisted_host = Some(remote.host.clone());
-                                        core.emit_preferred_host(&machine_id, &remote.host);
+                                // Baseline = the last host we KNOW to be true this
+                                // session — what we most recently persisted, or (if we
+                                // haven't persisted anything yet) the host we were
+                                // spawned with. See `host_to_persist`'s doc for why
+                                // this must NOT be the frozen `original_host` alone.
+                                let baseline = persisted_host.as_deref().or(original_host.as_deref());
+                                if let Some(baseline) = baseline {
+                                    if let Some(new_host) = host_to_persist(baseline, &remote.host) {
+                                        if let Some(machine_id) = remote.machine_id.clone() {
+                                            persisted_host = Some(new_host.clone());
+                                            core.emit_preferred_host(&machine_id, &new_host);
+                                        }
                                     }
                                 }
                             }
@@ -1182,6 +1192,27 @@ fn rotate_remote_address(
     }
     remote.host = new_host.clone();
     Some(new_host)
+}
+
+/// A6's pure persist decision: given `last_known_host` — the most recently
+/// known-true host for THIS session (whatever `run_actor` most recently told
+/// the DB, or the host it was SPAWNED with if it hasn't told the DB anything
+/// yet) — and the host a just-confirmed `fd_attach` landed on, decide whether
+/// that attach should be persisted as the machine's new preferred address.
+/// `None` means "already known to be on this host", so the caller must not
+/// re-emit the persist signal.
+///
+/// Comparing only against the frozen SPAWN-TIME host (what an earlier version
+/// of this logic did) misses a LATER rotation that lands back on an address
+/// already superseded by an EARLIER rotation within the same session: spawn
+/// on X, rotate to Y (persist Y), later rotate back to X — the spawn-time
+/// host is still X, so `attached_host != original_host` sees "no change" and
+/// skips persisting X even though the DB still (wrongly) says Y. Passing the
+/// last-PERSISTED host as the baseline instead (falling back to the spawn
+/// host only until the first persist) catches this: on that second rotation
+/// the baseline is Y, `X != Y`, so X gets persisted as it must.
+fn host_to_persist(last_known_host: &str, attached_host: &str) -> Option<String> {
+    (last_known_host != attached_host).then(|| attached_host.to_string())
 }
 
 /// A `can_use_tool` request we have surfaced and are waiting to answer.
@@ -3485,6 +3516,29 @@ mod tests {
         );
     }
 
+    /// A6 — table-driven coverage of the pure persist decision, INCLUDING the
+    /// rotate-away-then-back-within-one-session regression this review closes:
+    /// a naive "differs from the SPAWN-time host" check would wrongly skip
+    /// persisting X on the second rotation, because X == the spawn host even
+    /// though the DB currently (wrongly) says Y. Passing the last-PERSISTED
+    /// host as the baseline (not the frozen spawn host) is what makes this
+    /// third case come out `Some("a")` instead of `None`.
+    #[test]
+    fn host_to_persist_table() {
+        // Same host: an ordinary reattach to the candidate we're already known
+        // to be on — never re-persist.
+        assert_eq!(host_to_persist("a", "a"), None);
+
+        // First rotation: spawned on "a", attach confirms "b" — persist "b".
+        assert_eq!(host_to_persist("a", "b"), Some("b".to_string()));
+
+        // Second rotation, wrapping BACK to the original host: baseline is now
+        // "b" (the LAST PERSISTED host, not the frozen spawn host "a"), attach
+        // confirms "a" again — must still persist "a", even though "a" equals
+        // where this session started.
+        assert_eq!(host_to_persist("b", "a"), Some("a".to_string()));
+    }
+
     /// [`rotate_remote_address`] applies the decision to a real `SpawnConfig`:
     /// mutates `remote.host` + `addr_idx` and reports the new host, without ever
     /// touching a `cfg` that has no `remote` (a local session) or indexing past
@@ -4342,10 +4396,13 @@ esac
             "the preferred-host persist signal must fire with the WINNING address",
         );
 
-        // Phase 2: the replay/dedup invariant — now that a real link exists on the
-        // winning candidate, a normal turn must still go through cleanly (exactly
-        // one result, no error), proving the rotation left the session in a
-        // perfectly ordinary working state, not a half-attached one.
+        // Phase 2: a plain post-rotation sanity turn (NOT a replay/dedup test —
+        // nothing here disconnects or replays) — now that a real link exists on
+        // the winning candidate, a normal turn must still go through cleanly
+        // (exactly one result, no error), proving the rotation left the session
+        // in a perfectly ordinary working state, not a half-attached one. The
+        // actual replay/dedup invariant is exercised by
+        // `actor_survives_stalled_link_and_replays` (D4).
         handle
             .send_user_text("Reply with exactly the word: PING. Nothing else, no tools.")
             .await
@@ -4614,17 +4671,25 @@ esac
         // up, zero window) — unlike a kill, which is a clean cut the daemon sees at
         // once. Guarded so a panic mid-pause can't leave the process stuck stopped
         // for the next run.
-        struct SigcontGuard;
+        struct SigcontGuard(String);
         impl Drop for SigcontGuard {
             fn drop(&mut self) {
                 let _ = std::process::Command::new("pkill")
-                    .args(["-CONT", "-f", "2224.*flightdeckd.*attach"])
+                    .args(["-CONT", "-f", &self.0])
                     .status();
             }
         }
-        let _sigcont_guard = SigcontGuard;
+        // Scoped to THIS test's own ssh attach child by its unique
+        // `conversation_id` (present in the remote command line ssh execs,
+        // `--conversation <uuid>` — see `build_remote_command`), not just
+        // "2224.*flightdeckd.*attach": that looser pattern would also match a
+        // DIFFERENT live test's attach child if run concurrently against the
+        // same m1 container (the default multi-threaded test harness the repo
+        // documents for `--ignored` runs), SIGSTOPping someone else's link too.
+        let ssh_child_pattern = format!("2224.*flightdeckd.*attach.*{conversation_id}");
+        let _sigcont_guard = SigcontGuard(ssh_child_pattern.clone());
         let stopped = std::process::Command::new("pkill")
-            .args(["-STOP", "-f", "2224.*flightdeckd.*attach"])
+            .args(["-STOP", "-f", &ssh_child_pattern])
             .status()
             .expect("pkill should run");
         assert!(stopped.success(), "expected to SIGSTOP the live ssh attach client");
@@ -4673,7 +4738,7 @@ esac
 
         // SIGCONT and let the actor's own reconnect take over from here.
         let resumed = std::process::Command::new("pkill")
-            .args(["-CONT", "-f", "2224.*flightdeckd.*attach"])
+            .args(["-CONT", "-f", &ssh_child_pattern])
             .status()
             .expect("pkill should run");
         assert!(resumed.success(), "expected to SIGCONT the stalled ssh client");
@@ -4754,29 +4819,63 @@ esac
         assert!(reconnected, "expected a 'Reconnected to the server.' notice after SIGCONT");
         assert_eq!(result, Some(true), "the stalled turn's result should arrive via replay");
         assert!(done_seen, "the DONE_D reply should be present in the replayed transcript");
+        // `phase` must actually straddle the pause: some items delivered live
+        // BEFORE it (phase 0), some only via replay AFTER reconnect (phase 1+).
+        // Without this, the assertions below would pass identically whether the
+        // SIGSTOP genuinely interrupted mid-burst or the whole thing streamed
+        // live before the pause ever took effect (or vice versa) — the exact
+        // failure mode this test exists to rule out.
+        assert!(
+            message_ids.iter().any(|(p, _)| *p == 0),
+            "nothing was delivered live before the pause — the SIGSTOP didn't land \
+             mid-burst: {message_ids:?}",
+        );
+        assert!(
+            tool_use_ids.iter().any(|(p, _)| *p >= 1),
+            "nothing was delivered via replay after reconnect — the pause never \
+             actually interrupted the stream: {tool_use_ids:?}",
+        );
 
         // `AssistantMessage` is a RECONCILING update, not an append-only event — its
         // doc comment is explicit: "carries the SAME id as the streamed
         // `message_start` — the UI reconciles". Confirmed live: a message with one
         // `tool_use` block legitimately arrives as `AssistantMessage` twice back to
-        // back (once as its content block completes, once at `message_stop`),
-        // adjacent and identical, even with NO reconnect involved. That is a normal
+        // back, WITHIN THE SAME phase (once as its content block completes, once at
+        // `message_stop`), even with NO reconnect involved. That is a normal
         // "redraw with the same id", not a replay bug — the invariant D4 actually
-        // cares about is that the SAME id never reappears NON-adjacently (e.g. once
-        // before the reconnect boundary and again after it, which IS what a cursor/
-        // replay bug would look like): collapse adjacent repeats first (the
-        // reconciling redraw), THEN the remainder must already be unique.
-        let mut coalesced_ids = message_ids.clone();
-        coalesced_ids.dedup_by(|a, b| a.1 == b.1);
-        let mut sorted_ids: Vec<&String> = coalesced_ids.iter().map(|(_, id)| id).collect();
+        // cares about is that no id repeats beyond that normal double-fire: group
+        // ADJACENT, SAME-PHASE runs of the same id (`dedup_by` alone is not enough —
+        // it ignores `phase`, so a genuine replay duplicate that happens to land
+        // right next to the message's own normal double-fire would be silently
+        // swallowed with it), cap every such run at 2, THEN the collapsed ids must
+        // already be globally unique (a same id split across two DIFFERENT phases,
+        // or a same-phase run longer than 2, is exactly what a cursor/replay bug
+        // would look like).
+        let mut coalesced_groups: Vec<(u32, String, usize)> = Vec::new();
+        for (phase, id) in &message_ids {
+            match coalesced_groups.last_mut() {
+                Some(last) if last.0 == *phase && &last.1 == id => last.2 += 1,
+                _ => coalesced_groups.push((*phase, id.clone(), 1)),
+            }
+        }
+        for (phase, id, run_len) in &coalesced_groups {
+            assert!(
+                *run_len <= 2,
+                "assistant message {id} repeated {run_len} times back-to-back within \
+                 phase {phase} — expected at most the normal content-block/message_stop \
+                 double-fire: {message_ids:?}",
+            );
+        }
+        let mut sorted_ids: Vec<&String> = coalesced_groups.iter().map(|(_, id, _)| id).collect();
         sorted_ids.sort();
         let coalesced_count = sorted_ids.len();
         sorted_ids.dedup();
         assert_eq!(
             sorted_ids.len(),
             coalesced_count,
-            "an assistant message id reappeared NON-adjacently — a genuine replay \
-             duplicate, not just a reconciling redraw (phase, id): {message_ids:?}",
+            "an assistant message id reappeared across a phase boundary (or a distinct \
+             same-phase run) — a genuine replay duplicate, not just a reconciling redraw \
+             (phase, id): {message_ids:?}",
         );
         // `ToolResult` has no such reconciling redraw (one-shot, unlike
         // `AssistantMessage`) — every id must be unique outright.
