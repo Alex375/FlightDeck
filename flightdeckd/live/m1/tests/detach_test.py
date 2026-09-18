@@ -53,11 +53,13 @@ class Attach:
         if epoch: args += ["--epoch", epoch]
         args += ["--cursor", str(cursor)]
         self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True)
+                                  stderr=subprocess.PIPE, text=True)
         self.q = queue.Queue()
         self.cursor = cursor
         self.bytes = 0  # bytes received on this link (stdout of the ssh child)
+        self.err = []  # ssh's own stderr (auth, host key, connect errors…)
         threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._pump_err, daemon=True).start()
 
     def _pump(self):
         for line in self.p.stdout:
@@ -67,6 +69,17 @@ class Attach:
             if eligible(line): self.cursor += 1
             self.q.put(line)
         self.q.put(None)
+
+    def _pump_err(self):
+        for line in self.p.stderr:
+            self.err.append(line.rstrip("\n"))
+
+    def why(self):
+        """Suffix for assertion messages: what ssh itself said, if anything."""
+        tail = [l for l in self.err if l.strip()][-8:]
+        rc = self.p.poll()
+        state = f"ssh exited {rc}" if rc is not None else "ssh still running"
+        return f" [{state}; ssh stderr: " + (" | ".join(tail) if tail else "(empty)") + "]"
 
     # The local ssh child: SIGSTOP = the link stalls but stays alive (TCP up,
     # zero window) — unlike kill(), which is a clean cut the daemon sees at once.
@@ -155,13 +168,13 @@ def scenario_d():
     d = Attach(cwd=CWD)  # a FRESH conversation — independent of A/B/C
     try:
         _, att = d.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
-        assert att, "no fd_attach"
+        assert att, "no fd_attach" + d.why()
         conv, epoch = att["conversation"], att["epoch"]
         d.cursor = att["replay_from"]
         print(f"   attached conv={conv}")
         d.send_user(prompt)
         _, first = d.read_until(lambda v: jtype(v) == "assistant", timeout=90)
-        assert first, "burst never started"
+        assert first, "burst never started" + d.why()
         d.pause()
         cut_cursor, cut_bytes = d.cursor, d.bytes
         print(f"   ssh SIGSTOPped mid-burst (pid {d.pid}) at cursor={cut_cursor}")
@@ -184,7 +197,7 @@ def scenario_d():
         got, ended = d.drain_until_eof(timeout=60)
         after = d.bytes - cut_bytes
         print(f"   SIGCONT: {len(got)} lines / {after / 1e6:.2f} MB delivered after resume, stream ended={ended}")
-        assert ended, "the stalled stream never ended — the daemon kept the stalled client attached (pre-D1 behaviour)"
+        assert ended, "the stalled stream never ended — the daemon kept the stalled client attached (pre-D1 behaviour)" + d.why()
         frames = []
         for line in got:
             try:
@@ -202,12 +215,12 @@ def scenario_d():
         e = Attach(conversation=conv, epoch=epoch, cursor=d.cursor)
         try:
             _, att2 = e.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
-            assert att2 and att2["epoch"] == epoch, "reattach epoch mismatch"
+            assert att2 and att2["epoch"] == epoch, "reattach epoch mismatch" + e.why()
             assert att2["replay_from"] == d.cursor, f"replay_from {att2['replay_from']} != cursor {d.cursor}"
             backlog = att2["seq"] - d.cursor
             assert backlog > 0, "no backlog was withheld — the daemon never blocked (burst too small?)"
             replay, res = e.read_until(lambda v: jtype(v) == "result", timeout=60)
-            assert res, "the withheld backlog was not replayed"
+            assert res, "the withheld backlog was not replayed" + e.why()
             assert "DONE_D" in "\n".join(replay), "assistant reply missing from replay"
             print(f"   withheld backlog {backlog} lines, replayed from cursor {d.cursor} up to the result")
         finally:
@@ -225,24 +238,24 @@ def scenarios_abc():
     print(f"== A: attach over ssh (port {PORT}), one full turn, clean detach")
     a = Attach(cwd=CWD)
     _, att = a.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
-    assert att, "no fd_attach — is the container up and the key injected?"
+    assert att, "no fd_attach — is the container up and the key injected?" + a.why()
     conv, epoch = att["conversation"], att["epoch"]
     a.cursor = att["replay_from"]
     print(f"   attached conv={conv} epoch={epoch[:8]}")
     a.send_user("Reply with exactly the word: PING. Nothing else, no tools.")
     got, res = a.read_until(lambda v: jtype(v) == "result", timeout=120)
-    assert res and not res.get("is_error"), f"turn A failed: {res}"
+    assert res and not res.get("is_error"), f"turn A failed: {res}" + a.why()
     print(f"   turn A ok ({len(got)} lines, cursor={a.cursor})")
     a.p.stdin.close(); time.sleep(0.5); a.kill()
 
     print("== B: slow turn, SIGKILL ssh mid-turn, finish unattended, reattach + replay")
     b = Attach(conversation=conv, epoch=epoch, cursor=a.cursor)
     _, att2 = b.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
-    assert att2 and att2["epoch"] == epoch, "reattach epoch mismatch"
+    assert att2 and att2["epoch"] == epoch, "reattach epoch mismatch" + b.why()
     b.cursor = att2["replay_from"]
     b.send_user("Run: sleep 8 && echo DETACH_SURVIVED. Then reply with exactly the single word DONE_B.")
     _, first = b.read_until(lambda v: jtype(v) in ("assistant", "stream_event"), timeout=60)
-    assert first, "turn B never started streaming"
+    assert first, "turn B never started streaming" + b.why()
     cut = b.cursor
     b.kill()
     print(f"   ssh KILLED mid-turn at cursor={cut}")
@@ -250,10 +263,10 @@ def scenarios_abc():
 
     c = Attach(conversation=conv, epoch=epoch, cursor=cut)
     _, att3 = c.read_until(lambda v: jtype(v) == "fd_attach", timeout=20)
-    assert att3, "no fd_attach on reattach"
+    assert att3, "no fd_attach on reattach" + c.why()
     assert att3["replay_from"] == cut, f"replay_from {att3['replay_from']} != cut cursor {cut}"
     got, res = c.read_until(lambda v: jtype(v) == "result", timeout=60)
-    assert res, "missed-turn result was not replayed"
+    assert res, "missed-turn result was not replayed" + c.why()
     assert "DONE_B" in "\n".join(got), "assistant reply missing from replay"
     print(f"   REPLAY OK ({len(got)} lines, incl. the result reached while detached)")
 
