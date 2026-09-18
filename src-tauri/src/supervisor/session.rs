@@ -574,6 +574,12 @@ async fn run_actor(
     // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
     // exited / error) — auto-reconnect must not fight that.
     let mut no_reconnect: Option<String> = None;
+    // How many CONSECUTIVE reconnects in a row saw at least one replayable line
+    // this build could not parse (see `Transport::unparseable_replayable`). The
+    // daemon replays deterministically, so a persistently malformed line
+    // reappears at the exact same cursor position on every reattach — this
+    // bounds how long we keep asking for it (see `malformed_replay_step`).
+    let mut malformed_replay_streak: u32 = 0;
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
     let process_gone = 'outer: loop {
@@ -603,19 +609,17 @@ async fn run_actor(
                         }
                     }
                     Some(CliMessage::FdDetach(d)) => {
-                        let message = match d.reason.as_str() {
-                            "exited" => Some(match d.exit_code {
-                                Some(c) => format!("The remote session exited (code {c})."),
-                                None => "The remote session exited.".to_string(),
-                            }),
-                            "replaced" => Some("Another client took over this remote session.".to_string()),
-                            "stopped" => None, // we asked; the stop path narrates itself
-                            _ => Some(d.message.clone().unwrap_or_else(|| "Remote attach failed.".to_string())),
-                        };
+                        let (message, terminal) =
+                            reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
                         if let Some(message) = message {
                             core.emit_error_notice("remote_link", json!({ "message": message }));
                         }
-                        no_reconnect = Some(d.reason);
+                        if terminal {
+                            no_reconnect = Some(d.reason);
+                        }
+                        // else: "stalled" — non-terminal, fall through to the normal
+                        // reconnect path below exactly like a spontaneous transport
+                        // close (`None => break`).
                     }
                     Some(msg) => core.on_message(msg),
                     None => break, // transport closed
@@ -640,7 +644,26 @@ async fn run_actor(
         // Advance the cursor ONLY if this transport completed its handshake;
         // otherwise keep the last known-good position.
         if attach_seen {
-            cursor = attach_base + transport.lines_seen();
+            let unparseable = transport.unparseable_replayable();
+            let (force_advance, new_streak, warn) =
+                malformed_replay_step(unparseable, malformed_replay_streak);
+            malformed_replay_streak = new_streak;
+            cursor = attach_base
+                + reattach_cursor_delta(
+                    transport.lines_seen(),
+                    transport.first_unparseable_offset(),
+                    force_advance,
+                );
+            if warn {
+                eprintln!(
+                    "[session] giving up on {force_advance} replayable line(s) this build \
+                     repeatedly failed to parse — skipping them so the daemon stops resending"
+                );
+                core.emit_error_notice(
+                    "protocol_error",
+                    json!({ "message": "Some messages from the server could not be displayed and were skipped." }),
+                );
+            }
             attach_seen = false;
         }
         transport.shutdown(false).await; // reap the dead ssh client quietly
@@ -735,6 +758,116 @@ async fn run_actor(
     // timed out / gave up) is fine — the send just fails silently.
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
+    }
+}
+
+/// Decide what an `FdDetach` notice says and whether `run_actor` may keep
+/// auto-reconnecting, from the daemon's `reason` plus the two fields the
+/// message text draws from (`exit_code` for "exited", `message` for the
+/// wildcard fallback). Pure and unit-testable — the SINGLE table `run_actor`
+/// wires the inline `match d.reason.as_str() { .. }` into, and the ONE place a
+/// future reason (e.g. a daemon-missing detach) gets added, never a second
+/// hand-edit of `run_actor`'s match.
+///
+/// `"stalled"` is the ONLY reconnect-eligible reason; every other or unknown
+/// reason keeps today's terminal behavior (mirrors `FdDetachMsg`'s doc comment
+/// in `protocol.rs` — keep both in sync).
+fn reconnect_policy_for_reason(
+    reason: &str,
+    exit_code: Option<i64>,
+    message: Option<&str>,
+) -> (Option<String>, bool) {
+    match reason {
+        "exited" => (
+            Some(match exit_code {
+                Some(c) => format!("The remote session exited (code {c})."),
+                None => "The remote session exited.".to_string(),
+            }),
+            true,
+        ),
+        "replaced" => (
+            Some("Another client took over this remote session.".to_string()),
+            true,
+        ),
+        "stopped" => (None, true), // we asked; the stop path narrates itself
+        "stalled" => (
+            Some("Connection stalled — reconnecting…".to_string()),
+            false,
+        ),
+        _ => (
+            Some(message.map(str::to_string).unwrap_or_else(|| "Remote attach failed.".to_string())),
+            true,
+        ),
+    }
+}
+
+/// How many consecutive reconnects in a row may see the SAME unparseable
+/// replayable line before `run_actor` gives up on it. Chosen to comfortably
+/// exceed a transient hiccup (one bad transmission, healed on replay) while
+/// still bounding a genuinely corrupt daemon-side record to a handful of
+/// wasted round trips, not forever.
+const MAX_MALFORMED_REPLAY_ATTEMPTS: u32 = 3;
+
+/// One step of the cross-reconnect bookkeeping for replayable lines this build
+/// could not parse (see `Transport::unparseable_replayable`'s doc for why they
+/// are excluded from the reattach cursor by default).
+///
+/// The daemon replays deterministically, so a persistently malformed line
+/// reappears at the exact same cursor position on every single reattach —
+/// without a bound, the actor would ask for it, fail to parse it, and ask
+/// again forever, taking every line after it down with it (their real
+/// positions never get acknowledged either). Past
+/// [`MAX_MALFORMED_REPLAY_ATTEMPTS`] consecutive reconnects that each saw at
+/// least one such failure, we accept the loss: the returned `forced_advance`
+/// tells the caller to move the cursor past those bytes (so the daemon stops
+/// resending something we can never parse) and `warn` tells it to surface a
+/// ONE-TIME `protocol_error` notice — silently dropping messages forever would
+/// violate the zero-silent-error contract.
+///
+/// A healthy reconnect (`unparseable == 0`) resets the streak: this only fires
+/// for a reason that reproduces on EVERY attempt, not an occasional blip.
+fn malformed_replay_step(unparseable: u64, streak: u32) -> (u64, u32, bool) {
+    if unparseable == 0 {
+        return (0, 0, false);
+    }
+    let streak = streak + 1;
+    if streak >= MAX_MALFORMED_REPLAY_ATTEMPTS {
+        (unparseable, 0, true)
+    } else {
+        (0, streak, false)
+    }
+}
+
+/// The CURRENT transport's contribution to the reattach cursor (`run_actor`
+/// adds the daemon's `replay_from` base on top). Pure and unit-testable —
+/// kept separate from `run_actor` so the composition of `lines_seen` /
+/// `first_unparseable_offset` / `force_advance` can be exercised without a
+/// live transport.
+///
+/// `lines_seen` (a raw count of SUCCESSFULLY parsed replayable lines this
+/// connection) is NOT the daemon's wire position: if later replayable lines
+/// go on to parse fine after an EARLIER one this build could not, `lines_seen`
+/// silently overtakes that earlier failure's true position. Reattaching with
+/// it would tell the daemon we already have everything through a point that
+/// includes a line we actually never received — permanently, silently lost,
+/// never replayed again.
+///
+/// - Still retrying (`force_advance == 0`): roll back to
+///   `first_unparseable_offset` when the transport saw a failure this
+///   connection (the count of successes strictly BEFORE it), so the daemon
+///   resends starting right before it — at the cost of re-delivering any
+///   later lines that DID already parse fine (a bounded duplicate, not a
+///   silent loss). No failure at all → `lines_seen` is exact, use it.
+/// - Giving up (`force_advance > 0`, from [`malformed_replay_step`]): skip
+///   past EVERYTHING this connection delivered, failures included —
+///   `lines_seen + force_advance` is the true total and thus the correct
+///   position; `first_unparseable_offset` must NOT be used here; it would
+///   roll back to a bad line we have just decided to stop asking for.
+fn reattach_cursor_delta(lines_seen: u64, first_unparseable_offset: Option<u64>, force_advance: u64) -> u64 {
+    if force_advance > 0 {
+        lines_seen + force_advance
+    } else {
+        first_unparseable_offset.unwrap_or(lines_seen)
     }
 }
 
@@ -2874,6 +3007,159 @@ mod tests {
             .expect("output file should be readable via the absolute path");
         eprintln!("[live] read_task_output_file {output_file}:\n{out}");
         assert!(out.contains("tosse-bg-done"), "output file should hold the echo");
+    }
+
+    /// Table-driven: every named `FdDetach` reason plus one unknown reason,
+    /// asserting the EXACT (message, terminal) pair — the shared table
+    /// `run_actor` wires the inline reason match into. `"stalled"` must be the
+    /// only reconnect-eligible (non-terminal) entry; every other reason,
+    /// including an unrecognized one, must keep today's terminal behavior.
+    #[test]
+    fn reconnect_policy_covers_every_reason() {
+        assert_eq!(
+            reconnect_policy_for_reason("exited", Some(1), None),
+            (Some("The remote session exited (code 1).".to_string()), true),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("exited", None, None),
+            (Some("The remote session exited.".to_string()), true),
+            "a missing exit_code must not be treated as code 0",
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("replaced", None, None),
+            (
+                Some("Another client took over this remote session.".to_string()),
+                true,
+            ),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("stopped", None, None),
+            (None, true),
+            "the stop path narrates itself — no notice here",
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("stalled", None, None),
+            (Some("Connection stalled — reconnecting…".to_string()), false),
+            "stalled is the ONLY reconnect-eligible reason",
+        );
+        // Today's wildcard ("error" and anything else unrecognized): terminal,
+        // preferring the daemon's own message text when it sent one.
+        assert_eq!(
+            reconnect_policy_for_reason("error", Some(99), Some("custom detail")),
+            (Some("custom detail".to_string()), true),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("error", None, None),
+            (Some("Remote attach failed.".to_string()), true),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("daemon_missing", None, None),
+            (Some("Remote attach failed.".to_string()), true),
+            "an unknown reason must fall back to the wildcard, terminal, never panic",
+        );
+    }
+
+    /// A healthy reconnect (no unparseable replayable lines) never accumulates
+    /// a streak and never forces the cursor forward.
+    #[test]
+    fn malformed_replay_step_is_a_no_op_when_nothing_failed_to_parse() {
+        assert_eq!(malformed_replay_step(0, 0), (0, 0, false));
+        assert_eq!(
+            malformed_replay_step(0, 2),
+            (0, 0, false),
+            "a clean reconnect resets a prior streak",
+        );
+    }
+
+    /// The core bug this guards against: an unparseable line that reproduces on
+    /// EVERY reconnect (the daemon replays deterministically) must eventually
+    /// be skipped — not retried forever — and the caller must be told to warn
+    /// exactly once per bound crossed, not on every attempt below it.
+    #[test]
+    fn malformed_replay_step_gives_up_after_the_bound_then_resets() {
+        let mut streak = 0;
+        for attempt in 1..MAX_MALFORMED_REPLAY_ATTEMPTS {
+            let (advance, new_streak, warn) = malformed_replay_step(1, streak);
+            assert_eq!(advance, 0, "attempt {attempt}: still within the bound, no skip yet");
+            assert!(!warn, "attempt {attempt}: no warning below the bound");
+            assert_eq!(new_streak, attempt);
+            streak = new_streak;
+        }
+        // The attempt that crosses the bound: give up on the 1 unparseable line,
+        // warn once, and reset the streak so a DIFFERENT poison-pill later in the
+        // stream gets its own fresh chances rather than warning again immediately.
+        let (advance, new_streak, warn) = malformed_replay_step(1, streak);
+        assert_eq!(advance, 1, "the unparseable line count is what the cursor must skip");
+        assert_eq!(new_streak, 0, "streak resets after giving up");
+        assert!(warn, "must surface a protocol_error notice exactly once here");
+
+        // A subsequent CLEAN reconnect (the poison pill is now behind the
+        // cursor) does not warn again.
+        assert_eq!(malformed_replay_step(0, new_streak), (0, 0, false));
+    }
+
+    /// A burst of several DIFFERENT unparseable lines in the same connection
+    /// (not just one) is still bounded by attempt count, and the forced advance
+    /// equals however many lines were actually unparseable that attempt — never
+    /// under-skipping (which would loop) or over-skipping (which would drop a
+    /// line we never even saw).
+    #[test]
+    fn malformed_replay_step_advances_by_the_real_unparseable_count() {
+        let mut streak = 0;
+        for _ in 1..MAX_MALFORMED_REPLAY_ATTEMPTS {
+            let (_, new_streak, _) = malformed_replay_step(3, streak);
+            streak = new_streak;
+        }
+        let (advance, _, warn) = malformed_replay_step(5, streak);
+        assert_eq!(advance, 5, "must skip exactly the lines this attempt reported, not a stale count");
+        assert!(warn);
+    }
+
+    /// A clean connection (no failures) uses the exact success count, same as
+    /// before this table existed.
+    #[test]
+    fn reattach_cursor_delta_uses_lines_seen_when_nothing_failed() {
+        assert_eq!(reattach_cursor_delta(4, None, 0), 4);
+    }
+
+    /// The blocker this guards against: OK, FAIL, OK, OK within ONE connection
+    /// (a bad line NOT last) — `lines_seen` (3, both successes before AND
+    /// after the failure) would silently overtake the failure's true position
+    /// and the daemon would never re-offer it. The correct delta rolls back to
+    /// `first_unparseable_offset` (1, the success BEFORE the failure), even
+    /// though `lines_seen` disagrees — this is exactly the case where using
+    /// `lines_seen` alone drops a message forever.
+    #[test]
+    fn reattach_cursor_delta_rolls_back_to_the_first_failure_not_lines_seen() {
+        let lines_seen = 3; // 1 success before FAIL, 2 more after it
+        let first_unparseable_offset = Some(1); // success count strictly before FAIL
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            1,
+            "must resume right before the still-unrecovered failure, not past it",
+        );
+        assert_ne!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            lines_seen,
+            "lines_seen is exactly the wrong answer here — it would skip the failure",
+        );
+    }
+
+    /// Once `malformed_replay_step` decides to give up (`force_advance > 0`),
+    /// the delta must skip past EVERYTHING this connection delivered —
+    /// successes before AND after the failure, plus the failure(s) themselves
+    /// — never roll back to `first_unparseable_offset` (that would ask for the
+    /// very line we just gave up on, forever).
+    #[test]
+    fn reattach_cursor_delta_skips_everything_when_giving_up() {
+        let lines_seen = 4; // successes both sides of the 2 failures
+        let force_advance = 2; // malformed_replay_step's give-up count
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, Some(1), force_advance),
+            6,
+            "giving up must use lines_seen + force_advance (the true total), \
+             ignoring first_unparseable_offset entirely",
+        );
     }
 
     /// Live M1 acceptance check, Mac side: "piloting a remote session from the
