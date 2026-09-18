@@ -522,7 +522,11 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
     //  - a reply line arrives: an `fd_detach` is a real failure, anything else
     //    (normally `fd_attach`) a real success;
     //  - a CLEAN EOF (0 bytes, no error) with no line ever arriving: read as
-    //    SUCCESS, not failure — see the load-bearing note below;
+    //    SUCCESS, not failure, PROVIDED the child hasn't already exited non-zero
+    //    — see the load-bearing note below AND the `Ok(0)` arm's own comment
+    //    (a same-instant ssh connection failure closes its stdout pipe at
+    //    essentially the same instant it exits non-zero, so a bare EOF cannot
+    //    be trusted on its own without checking the child's exit status first);
     //  - the ssh CHILD exits on its own before either: its own exit status is
     //    the verdict (a connection-level failure — daemon down, host
     //    unreachable, auth refused — makes `attach_client` return `Err` and the
