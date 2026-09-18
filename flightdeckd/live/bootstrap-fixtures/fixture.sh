@@ -35,13 +35,11 @@ pssh() { # <user> <password> <port> <cmd...>
 }
 fx() { pssh "$(user_of "$1")" "$(pass_of "$1")" "$(port_of "$1")" "${@:2}"; }
 
-# The flightdeckd crate: a sibling today (flightdeck-server/flightdeckd), this
-# directory's grandparent once moved under it (tosse-code/flightdeckd/live/…).
+# The flightdeckd crate: this directory's grandparent (flightdeckd/live/bootstrap-fixtures/../..).
 flightdeckd_crate() {
-  local c
-  for c in "$HERE/../flightdeckd" "$HERE/../.."; do
-    if grep -qs '^name = "flightdeckd"' "$c/Cargo.toml"; then (cd "$c" && pwd); return; fi
-  done
+  if grep -qs '^name = "flightdeckd"' "$HERE/../../Cargo.toml"; then
+    (cd "$HERE/../.." && pwd); return
+  fi
   echo "cannot find the flightdeckd crate from $HERE — set FLIGHTDECKD_BIN" >&2
   return 1
 }

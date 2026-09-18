@@ -13,18 +13,17 @@
 # here from the current source by the crate's scripts/build-musl.sh
 # (incremental); FLIGHTDECKD_BIN=<path> uses a given binary instead.
 set -euo pipefail
-BENCH="$(cd "$(dirname "$0")/.." && pwd)" # m1-daemon/ today, flightdeckd/live/m1/ once moved
+BENCH="$(cd "$(dirname "$0")/.." && pwd)" # flightdeckd/live/m1/
 
 NAME="${NAME:-flightdeck-m1}"
 PORT="${PORT:-2224}"
 KEY="${KEY:-$HOME/.ssh/flightdeck_m0_ed25519}"
 
-# The flightdeckd crate: a sibling of this bench today, its grandparent once
-# the bench lives under it.
+# The flightdeckd crate: this bench's grandparent (flightdeckd/live/m1/../..).
 crate=""
-for c in "$BENCH/../flightdeckd" "$BENCH/../.."; do
-  if grep -qs '^name = "flightdeckd"' "$c/Cargo.toml"; then crate="$(cd "$c" && pwd)"; break; fi
-done
+if grep -qs '^name = "flightdeckd"' "$BENCH/../../Cargo.toml"; then
+  crate="$(cd "$BENCH/../.." && pwd)"
+fi
 if [ -n "${FLIGHTDECKD_BIN:-}" ]; then
   bin="$FLIGHTDECKD_BIN"
 else
