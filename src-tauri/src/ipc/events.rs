@@ -325,35 +325,19 @@ pub struct HostKeyFingerprintEvent {
     pub known: bool,
 }
 
-/// Progress notice for `bootstrap::install`'s three commands (B8/B9:
-/// `bootstrap_upload_daemon` / `bootstrap_install_service` /
-/// `bootstrap_escalate_persistence`) — `step` names which one (`"upload_daemon"` /
-/// `"install_service"` / `"escalate_persistence"`), `status` is `"started"` / `"ok"` /
-/// `"failed"`, and `detail` carries the outcome (debug-formatted) or error text on a
-/// terminal status. Carries BOTH `machine_id` and `host` (never just one or the other):
-/// every caller of these three commands already has a paired [`crate::store::
-/// MachineRecord`] in hand (unlike B7's first-contact probe, which only has a host), so
-/// there is no reason to make a listener choose — it can key off whichever it already
-/// has.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
-pub struct BootstrapStepEvent {
-    pub machine_id: String,
-    pub host: String,
-    pub step: String,
-    pub status: String,
-    pub detail: Option<String>,
-}
-
 /// B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
-/// pipeline (`bootstrap_server` / `bootstrap_resume`) — unlike [`BootstrapStepEvent`]
-/// (one event per command, per B8/B9's three separate commands), this carries the
-/// WHOLE step list on every emit, so a listener never has to reconstruct progress by
-/// accumulating a stream of partial deltas: the latest event alone is the complete
-/// picture. `steps[].status` is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/
-/// `"failed"`/`"needs_input"` (see `orchestrator::StepStatus::wire_str`, the one place
-/// that owns this exact wording). `session_id` is the opaque handle
-/// `bootstrap_server`'s own response carries — the SAME id `bootstrap_resume`/
-/// `bootstrap_cancel` take back.
+/// pipeline (`bootstrap_server` / `bootstrap_resume`) — carries the WHOLE step list on
+/// every emit, so a listener never has to reconstruct progress by accumulating a stream
+/// of partial deltas: the latest event alone is the complete picture. `steps[].status`
+/// is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/`"failed"`/`"needs_input"` (see
+/// `orchestrator::StepStatus::wire_str`, the one place that owns this exact wording).
+/// `session_id` is the opaque handle `bootstrap_server`'s own response carries — the
+/// SAME id `bootstrap_resume`/`bootstrap_cancel` take back.
+///
+/// (B8/B9's earlier, per-command `BootstrapStepEvent` — one event per `bootstrap_
+/// upload_daemon`/`bootstrap_install_service`/`bootstrap_escalate_persistence` call —
+/// was removed once B11's orchestrator superseded those granular commands and nothing
+/// in the front end listened to it any more; see B-finding #5.)
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct BootstrapProgressStep {
     pub id: String,

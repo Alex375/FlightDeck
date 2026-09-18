@@ -951,26 +951,6 @@ fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
 // Tauri commands
 // ============================================================================
 
-/// Run `flightdeckd init --label <label>` on a paired server. See [`run_init`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_run_init(
-    app: tauri::AppHandle,
-    machine_id: String,
-    label: String,
-) -> Result<InitOutcome, String> {
-    use tauri::Manager;
-    let machine = app
-        .state::<Store>()
-        .machine_by_id(&machine_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "unknown server".to_string())?;
-    let known_hosts = known_hosts_path(&app);
-    run_init(&machine, known_hosts.as_deref(), &label)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// Start driving the server-side `claude` sign-in for `machine_id` — or, if another
 /// surface already has one live for the SAME machine, ATTACH to it instead of starting
 /// a competing one (B-finding #4: a second start used to silently kill the first, with

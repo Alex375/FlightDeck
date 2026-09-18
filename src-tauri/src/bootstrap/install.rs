@@ -38,7 +38,7 @@ use specta::Type;
 use crate::bootstrap::askpass::{self, BootstrapError, SecretString};
 use crate::bootstrap::templates;
 use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, RemoteProbeResult};
-use crate::store::{MachineRecord, Store};
+use crate::store::MachineRecord;
 
 /// Default bound for this module's stdin-bearing ssh calls — every one here except the
 /// daemon binary upload itself is a short script with no meaningful payload (a unit
@@ -1096,114 +1096,6 @@ pub(crate) async fn escalate_persistence_with_override(
         return Err(BootstrapError::NeedsSudoPassword);
     };
     run_sudo_with_password(machine, known_hosts, ssh_bin_override, &script, password).await
-}
-
-// ============================================================================
-// Tauri commands
-// ============================================================================
-
-/// Resolve the app's dedicated `known_hosts` path — mirrors
-/// `bootstrap::connect::known_hosts_path` / `bootstrap::server_setup::known_hosts_path`,
-/// each module's own tiny, App-Handle-only copy of this same resolution rather than a
-/// shared helper (established convention in this directory already).
-fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
-    use tauri::Manager;
-    app.path()
-        .app_data_dir()
-        .ok()
-        .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned())
-}
-
-/// Emit a [`crate::ipc::events::BootstrapStepEvent`], logging (never swallowing) a
-/// failed emit — mirrors `ipc::events::emit_logged`'s discipline for every other event
-/// in this crate. Coarse-grained on purpose (one `started` + one `ok`/`failed` per
-/// command, not per internal ssh round trip): the three commands below are each already
-/// a single bounded operation from the UI's point of view, and `detail` on the terminal
-/// event carries the actual outcome/error text.
-fn emit_step(app: &tauri::AppHandle, machine: &MachineRecord, step: &str, status: &str, detail: Option<String>) {
-    use tauri_specta::Event;
-    let ev = crate::ipc::events::BootstrapStepEvent {
-        machine_id: machine.id.clone(),
-        host: machine.host.clone(),
-        step: step.to_string(),
-        status: status.to_string(),
-        detail,
-    };
-    if let Err(e) = ev.emit(app) {
-        eprintln!("[bootstrap::install] failed to emit bootstrap_step event: {e}");
-    }
-}
-
-fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineRecord, String> {
-    use tauri::Manager;
-    app.state::<Store>()
-        .machine_by_id(machine_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "unknown server".to_string())
-}
-
-/// Upload the static musl `flightdeckd` binary for `arch` onto `machine_id`. See
-/// [`upload_daemon`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_upload_daemon(
-    app: tauri::AppHandle,
-    machine_id: String,
-    arch: String,
-) -> Result<UploadOutcome, String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    emit_step(&app, &machine, "upload_daemon", "started", None);
-    let result = upload_daemon(&app, &machine, &arch, known_hosts.as_deref()).await;
-    match &result {
-        Ok(outcome) => emit_step(&app, &machine, "upload_daemon", "ok", Some(format!("{outcome:?}"))),
-        Err(e) => emit_step(&app, &machine, "upload_daemon", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
-}
-
-/// Set up `flightdeckd` to persist on `machine_id`, given B7's `probe`. See
-/// [`install_service`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_install_service(
-    app: tauri::AppHandle,
-    machine_id: String,
-    probe: RemoteProbeResult,
-) -> Result<ServiceOutcome, String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    emit_step(&app, &machine, "install_service", "started", None);
-    let result = install_service(&machine, &probe, known_hosts.as_deref()).await;
-    match &result {
-        Ok(outcome) => emit_step(&app, &machine, "install_service", "ok", Some(format!("{outcome:?}"))),
-        Err(e) => emit_step(&app, &machine, "install_service", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
-}
-
-/// Escalate persistence (linger + optional sleep-target masking) on `machine_id`. See
-/// [`escalate_persistence`]. `password`, when given, is the ALREADY-CAPTURED server
-/// login password from earlier in the wizard (never re-typed here) — held only long
-/// enough to build a [`SecretString`] for this one call.
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_escalate_persistence(
-    app: tauri::AppHandle,
-    machine_id: String,
-    password: Option<String>,
-    mask_sleep: bool,
-) -> Result<(), String> {
-    let machine = machine_by_id(&app, &machine_id)?;
-    let known_hosts = known_hosts_path(&app);
-    let secret = password.map(SecretString::new);
-    emit_step(&app, &machine, "escalate_persistence", "started", None);
-    let result = escalate_persistence(&machine, known_hosts.as_deref(), secret.as_ref(), mask_sleep).await;
-    match &result {
-        Ok(()) => emit_step(&app, &machine, "escalate_persistence", "ok", None),
-        Err(e) => emit_step(&app, &machine, "escalate_persistence", "failed", Some(e.to_string())),
-    }
-    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

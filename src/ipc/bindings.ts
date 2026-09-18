@@ -2462,17 +2462,6 @@ async retryPhoneProvisioning(machineId: string) : Promise<Result<MachineProvisio
 }
 },
 /**
- * Run `flightdeckd init --label <label>` on a paired server. See [`run_init`].
- */
-async bootstrapRunInit(machineId: string, label: string) : Promise<Result<InitOutcome, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_run_init", { machineId, label }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Start driving the server-side `claude` sign-in for `machine_id` — or, if another
  * surface already has one live for the SAME machine, ATTACH to it instead of starting
  * a competing one (B-finding #4: a second start used to silently kill the first, with
@@ -2545,46 +2534,6 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 }
 },
 /**
- * Install the app's dedicated key on `host:port` (first contact, password-only — see
- * [`install_key`]), reusing [`crate::ipc::commands::generate_or_reuse_pending_key`]
- * for the key itself (A3's lookup-or-generate primitive — never mints a key here).
- * 
- * On SUCCESS ONLY — [`install_key`] returns `Ok`, whether the outcome is `Installed`
- * or `AlreadyPresent` — emits [`crate::ipc::events::HostKeyFingerprintEvent`] with the
- * fingerprint TOFU-pinned in the app's dedicated `known_hosts` and whether it was
- * ALREADY pinned before THIS call — display-only, NON-BLOCKING (Armand's decision: no
- * confirmation gate). The emit is gated on the OVERALL `Result`, never on "some
- * fingerprint happens to be readable": TOFU pinning happens at the transport layer,
- * before auth, so a fingerprint can be readable even after a FAILED call (a wrong
- * password still pins a fresh host key; a stale pin is still readable right after a
- * [`BootstrapError::HostKeyMismatch`]) — without this gate a caller could mistake
- * receipt of the event for a successful pairing step. Concretely: a wrong password on
- * a brand-new host pins the key but does NOT emit here; the fingerprint becomes
- * visible on the next, successful call instead (at which point `known` correctly
- * reads `true`). A host key that CHANGED since a previous pin never reaches
- * `Ok` at all — it fails as [`BootstrapError::HostKeyMismatch`] — so no event fires
- * for that call either.
- */
-async bootstrapInstallKey(host: string, port: number, user: string, password: string, label: string) : Promise<Result<KeyInstallOutcome, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_install_key", { host, port, user, password, label }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Probe an already-keyed server for the full install-mode picture. See [`probe`].
- */
-async bootstrapProbe(host: string, port: number, user: string, identityFile: string) : Promise<Result<RemoteProbeResult, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_probe", { host, port, user, identityFile }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
  * the user has confirmed the change is expected) so the next connection re-pins it
  * TOFU. See [`forget_host_key`].
@@ -2592,44 +2541,6 @@ async bootstrapProbe(host: string, port: number, user: string, identityFile: str
 async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Upload the static musl `flightdeckd` binary for `arch` onto `machine_id`. See
- * [`upload_daemon`].
- */
-async bootstrapUploadDaemon(machineId: string, arch: string) : Promise<Result<UploadOutcome, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_upload_daemon", { machineId, arch }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Set up `flightdeckd` to persist on `machine_id`, given B7's `probe`. See
- * [`install_service`].
- */
-async bootstrapInstallService(machineId: string, probe: RemoteProbeResult) : Promise<Result<ServiceOutcome, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_install_service", { machineId, probe }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Escalate persistence (linger + optional sleep-target masking) on `machine_id`. See
- * [`escalate_persistence`]. `password`, when given, is the ALREADY-CAPTURED server
- * login password from earlier in the wizard (never re-typed here) — held only long
- * enough to build a [`SecretString`] for this one call.
- */
-async bootstrapEscalatePersistence(machineId: string, password: string | null, maskSleep: boolean) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_escalate_persistence", { machineId, password, maskSleep }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2711,7 +2622,6 @@ export const events = __makeEvents__<{
 accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
 bootstrapProgressEvent: BootstrapProgressEvent,
-bootstrapStepEvent: BootstrapStepEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
@@ -2739,7 +2649,6 @@ workflowJournalEvent: WorkflowJournalEvent
 accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
 bootstrapProgressEvent: "bootstrap-progress-event",
-bootstrapStepEvent: "bootstrap-step-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
@@ -2800,13 +2709,6 @@ export type AddressCandidate = { kind: AddressKind; value: string }
  * yet, but the wire shape carries it so a later change is additive.
  */
 export type AddressKind = "tailscale" | "lan" | "public" | "manual"
-/**
- * What [`ServiceOutcome::Adopted`] found already running on the server — mirrors
- * `bootstrap::connect::PROBE_SCRIPT`'s own three CONFLICT shapes (see
- * [`classify_conflict`]), so the UI can word "adopt" differently for "there's already
- * a real systemd unit" versus "there's just a binary/config sitting there".
- */
-export type AdoptedKind = "SystemUnit" | "ExistingBinary" | "ExistingConfig"
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
@@ -3025,15 +2927,18 @@ export type BackgroundTaskStatus =
 export type BootstrapProgressEvent = { session_id: string; host: string; steps: BootstrapProgressStep[] }
 /**
  * B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
- * pipeline (`bootstrap_server` / `bootstrap_resume`) — unlike [`BootstrapStepEvent`]
- * (one event per command, per B8/B9's three separate commands), this carries the
- * WHOLE step list on every emit, so a listener never has to reconstruct progress by
- * accumulating a stream of partial deltas: the latest event alone is the complete
- * picture. `steps[].status` is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/
- * `"failed"`/`"needs_input"` (see `orchestrator::StepStatus::wire_str`, the one place
- * that owns this exact wording). `session_id` is the opaque handle
- * `bootstrap_server`'s own response carries — the SAME id `bootstrap_resume`/
- * `bootstrap_cancel` take back.
+ * pipeline (`bootstrap_server` / `bootstrap_resume`) — carries the WHOLE step list on
+ * every emit, so a listener never has to reconstruct progress by accumulating a stream
+ * of partial deltas: the latest event alone is the complete picture. `steps[].status`
+ * is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/`"failed"`/`"needs_input"` (see
+ * `orchestrator::StepStatus::wire_str`, the one place that owns this exact wording).
+ * `session_id` is the opaque handle `bootstrap_server`'s own response carries — the
+ * SAME id `bootstrap_resume`/`bootstrap_cancel` take back.
+ * 
+ * (B8/B9's earlier, per-command `BootstrapStepEvent` — one event per `bootstrap_
+ * upload_daemon`/`bootstrap_install_service`/`bootstrap_escalate_persistence` call —
+ * was removed once B11's orchestrator superseded those granular commands and nothing
+ * in the front end listened to it any more; see B-finding #5.)
  */
 export type BootstrapProgressStep = { id: string; status: string; detail: string | null }
 /**
@@ -3045,19 +2950,6 @@ export type BootstrapReport = { session_id: string; host: string; steps: StepSta
  * module doc's "two different kinds of needs-input".
  */
 needs_input: StepId | null; machine_id: string | null; diagnosis: ServerDiagnosis | null }
-/**
- * Progress notice for `bootstrap::install`'s three commands (B8/B9:
- * `bootstrap_upload_daemon` / `bootstrap_install_service` /
- * `bootstrap_escalate_persistence`) — `step` names which one (`"upload_daemon"` /
- * `"install_service"` / `"escalate_persistence"`), `status` is `"started"` / `"ok"` /
- * `"failed"`, and `detail` carries the outcome (debug-formatted) or error text on a
- * terminal status. Carries BOTH `machine_id` and `host` (never just one or the other):
- * every caller of these three commands already has a paired [`crate::store::
- * MachineRecord`] in hand (unlike B7's first-contact probe, which only has a host), so
- * there is no reason to make a listener choose — it can key off whichever it already
- * has.
- */
-export type BootstrapStepEvent = { machine_id: string; host: string; step: string; status: string; detail: string | null }
 /**
  * One branch ref. `is_remote` distinguishes `refs/remotes/*` from local
  * `refs/heads/*`; `ahead`/`behind` come from the branch's upstream tracking
@@ -3950,35 +3842,10 @@ data_base64: string; too_large: boolean; size: number;
  */
 mtime_ms: number | null }
 /**
- * Outcome of [`run_init`]. Both variants carry `identity` — `flightdeckd init` and
- * `flightdeckd whoami` are two separate round trips (see that function's doc), so
- * either one can independently succeed or come back empty.
- */
-export type InitOutcome = 
-/**
- * `flightdeckd init` ran for the first time on this machine.
- */
-{ Initialized: { identity: ServerIdentity | null } } | 
-/**
- * `~/.flightdeckd/config.json` already existed — `flightdeckd init` refused (as
- * designed: this module NEVER passes `--force`, which would overwrite a working
- * identity/relay pairing). Treated as SUCCESS, not an error: the node is already
- * bootstrapped, which is exactly what a re-run of this flow (a retried wizard
- * step, a re-added machine) should find.
- */
-{ AlreadyInitialized: { identity: ServerIdentity | null } }
-/**
  * See [`StepId::AddMachine`]'s doc — probes BOTH unit locations, never assumes.
  */
 export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
-/**
- * Outcome of [`install_key`]'s idempotent append: whether the app's public key was
- * FRESHLY added to `authorized_keys`, or was already there (a re-run of the same "add
- * a server" step — e.g. the wizard was closed and reopened, or the same pairing
- * command was pasted twice).
- */
-export type KeyInstallOutcome = "Installed" | "AlreadyPresent"
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
  * control request. Authoritative in a way a hard-coded table can never be: the
@@ -4530,65 +4397,6 @@ pairing_code: string | null }
  */
 export type RemoteListing = { path: string; dirs: string[] }
 /**
- * Outcome of probing a remote server for the two binaries pairing needs, PLUS (B7)
- * the install-mode facts [`bootstrap::connect::probe`] needs to decide how (or
- * whether) to install `flightdeckd` on a server that has never been paired before.
- * `Ok` covers EVERY combination of present/missing/outdated — "missing" is data IN
- * the struct, never an ssh-level failure — so [`add_machine`] can name every blocker
- * at once instead of just whichever the remote shell happened to trip over first. An
- * `Err` means the ssh round-trip itself failed (unreachable host, auth refused, …),
- * before the probe script could report anything.
- * 
- * The install-mode fields (`conflict`/`os`/`arch`/`systemd`/`passwordless_sudo`/
- * `linger`/`kill_user_processes`) are ALWAYS `None` for a pairing probe
- * ([`probe_remote`]'s own script never emits their markers — see
- * [`parse_probe_output`]'s doc) — [`add_machine`] ignores them either way, exactly as
- * before this struct grew them. Only [`bootstrap::connect::probe`]'s own, EXTENDED
- * script populates them.
- * 
- * `Serialize`/`Type` (B7): [`bootstrap::connect::bootstrap_probe`] returns this
- * directly across the Tauri IPC boundary — [`add_machine`]'s own use never needed
- * this before, since it only ever consumed a `RemoteProbeResult` internally and
- * returned a [`MachineRecord`] instead.
- */
-export type RemoteProbeResult = { claude_version: string | null; claude_missing: boolean; flightdeckd_version: string | null; flightdeckd_missing: boolean; flightdeckd_outdated: boolean; 
-/**
- * One-line description of a pre-existing `flightdeckd` install this server
- * already carries (a system unit, a binary outside `~/.local/bin`, or an existing
- * `~/.flightdeckd/config.json`) — meaning "adopt it, don't reinstall", not a
- * failure. `None` when the probe script found none of those (or never ran this
- * check at all — a pairing probe, see the struct doc).
- */
-conflict: string | null; 
-/**
- * `uname -s` (e.g. `"Linux"`).
- */
-os: string | null; 
-/**
- * `uname -m` (e.g. `"x86_64"`/`"aarch64"`) — picks the daemon binary to install.
- */
-arch: string | null; 
-/**
- * Whether systemd is PID 1 (`/run/systemd/system` exists).
- */
-systemd: boolean | null; 
-/**
- * Whether `sudo -n true` succeeds (passwordless sudo) — never prompts, so this is
- * safe to run from a batch probe.
- */
-passwordless_sudo: boolean | null; 
-/**
- * `loginctl show-user $USER -p Linger` — whether the user can keep a `systemd
- * --user` unit running after the SSH session that started it closes.
- */
-linger: boolean | null; 
-/**
- * logind's `KillUserProcesses` setting (best-effort, via `busctl` — `None` when
- * `busctl` itself is unavailable, never an error): whether a detached process
- * (the no-linger, no-sudo fallback) survives the session closing.
- */
-kill_user_processes: boolean | null }
-/**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
@@ -4819,13 +4627,6 @@ bundled_daemon_version: string | null;
  */
 daemon_outdated: boolean }
 /**
- * This node's relay identity, straight off `flightdeckd whoami` (`{mac_id, relay_url,
- * label}` — see that subcommand's own doc in `flightdeckd/src/main.rs`). Field names
- * match the daemon's JSON verbatim (snake_case both sides), so no `#[serde(rename)]`
- * is needed.
- */
-export type ServerIdentity = { mac_id: string; relay_url: string; label: string }
-/**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
  * per session; a session that was ALREADY signed in never emits this (it jumps
@@ -4839,32 +4640,6 @@ export type ServerLoginPromptEvent = { machine_id: string; url: string }
  * `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
  */
 export type ServerLoginResultEvent = { machine_id: string; ok: boolean; email: string | null; error: string | null }
-/**
- * Outcome of [`install_service`] — which persistence mechanism actually ended up
- * governing `flightdeckd` on the server.
- */
-export type ServiceOutcome = 
-/**
- * B7 already found something there (a unit, a binary, a config) — NOTHING was
- * written; the pre-existing install is left exactly as found.
- */
-{ Adopted: { kind: AdoptedKind; unit_path: string | null } } | 
-/**
- * A root-owned `/etc/systemd/system/flightdeckd.service`, enabled `--now`.
- */
-"SystemUnit" | 
-/**
- * A per-user `~/.config/systemd/user/flightdeckd.service`, enabled `--now
- * --user`, with `loginctl enable-linger` confirmed so it survives logout.
- */
-"UserUnit" | 
-/**
- * No systemd, or linger/`sudo` both unavailable: a `setsid`+`nohup`-detached
- * process — survives THIS session closing (`KillUserProcesses=no`, verified
- * before this is ever chosen) but never a reboot, and has no `Restart=` on a
- * crash.
- */
-{ DetachedProcess: { survives_reboot: boolean } }
 /**
  * The Codex backend's subscription rate-limit % (5h + weekly windows) changed. Codex
  * pushes this over the live app-server (`account/rateLimits/updated`) — there is no
@@ -5530,22 +5305,6 @@ export type TosseTaskProject = { id: string; name: string; status: string | null
  * with no change here.
  */
 client: TosseClientRef | null }
-/**
- * Outcome of [`upload_daemon`]. `restart_required` is `true` whenever bytes were
- * actually written over a PRE-EXISTING binary (the remote's own sha256 for the target
- * came back non-empty before the upload, whether or not it happened to still match —
- * it didn't, or this would have been `AlreadyCurrent`) — a fresh install (nothing was
- * there before) is `false`: there is nothing running to interrupt. Restarting an
- * already-running daemon is deliberately NOT done here — see this crate's own doc for
- * why (a restart kills live sessions; it is B9/B11's explicit decision, never
- * automatic).
- */
-export type UploadOutcome = 
-/**
- * The target already holds the exact bytes about to be sent — nothing was
- * written, over the wire or to disk on either end.
- */
-"AlreadyCurrent" | { Uploaded: { restart_required: boolean } }
 /**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.

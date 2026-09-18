@@ -79,18 +79,17 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
-use bootstrap::connect::{bootstrap_forget_host_key, bootstrap_install_key, bootstrap_probe};
-use bootstrap::install::{bootstrap_escalate_persistence, bootstrap_install_service, bootstrap_upload_daemon};
+use bootstrap::connect::bootstrap_forget_host_key;
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
 };
-use bootstrap::server_setup::{bootstrap_run_init, cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
+use bootstrap::server_setup::{cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, BootstrapStepEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent, TickEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
@@ -366,17 +365,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             phone_provisioning_status,
             phone_revocation_status,
             retry_phone_provisioning,
-            bootstrap_run_init,
             start_claude_login,
             restart_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
-            bootstrap_install_key,
-            bootstrap_probe,
             bootstrap_forget_host_key,
-            bootstrap_upload_daemon,
-            bootstrap_install_service,
-            bootstrap_escalate_persistence,
             bootstrap_server,
             bootstrap_resume,
             bootstrap_cancel,
@@ -409,7 +402,6 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginPromptEvent,
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
-            BootstrapStepEvent,
             BootstrapProgressEvent,
         ])
 }
