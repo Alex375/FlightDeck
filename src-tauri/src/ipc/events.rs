@@ -286,6 +286,23 @@ pub struct ServerLoginResultEvent {
     pub error: Option<String>,
 }
 
+/// `bootstrap::connect`'s own TOFU host-key pin (B7), read back after ANY successful
+/// connection through that module — the `install_key` password step, and every keyed
+/// reconnect/probe after it. DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is
+/// no confirmation step gating on this event, it never blocks the flow. `known` = the
+/// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
+/// this particular connection attempt — `false` only on a server's genuine first
+/// contact. A host key that CHANGED versus what was pinned never reaches this event at
+/// all: it fails the connection itself as `BootstrapError::HostKeyMismatch` instead
+/// (see `bootstrap::connect::install_key`'s doc).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct HostKeyFingerprintEvent {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub known: bool,
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {

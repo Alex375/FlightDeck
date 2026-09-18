@@ -1574,8 +1574,8 @@ mod tests {
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo {} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
             crate::ipc::commands::shq(&key.public)
         );
-        let cmd = bootstrap_ssh_command(&format!("ssh://{user}@127.0.0.1:{port}"), None, &remote);
-        let out = run_with_password(cmd, password, Duration::from_secs(15))
+        let cmd = bootstrap_ssh_command(&format!("ssh://{user}@127.0.0.1:{port}"), None, None, &remote);
+        let out = run_with_password(cmd, password, None, Duration::from_secs(15))
             .await
             .expect("installing the throwaway key over the fixture's documented password must succeed");
         assert!(

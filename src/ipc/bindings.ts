@@ -2419,6 +2419,52 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Install the app's dedicated key on `host:port` (first contact, password-only — see
+ * [`install_key`]), reusing [`crate::ipc::commands::generate_or_reuse_pending_key`]
+ * for the key itself (A3's lookup-or-generate primitive — never mints a key here).
+ * 
+ * On ANY successful connection this call makes (whether the outcome is
+ * `Installed` or `AlreadyPresent`), emits
+ * [`crate::ipc::events::HostKeyFingerprintEvent`] with the fingerprint TOFU-pinned in
+ * the app's dedicated `known_hosts` and whether it was ALREADY pinned before THIS
+ * call — display-only, NON-BLOCKING (Armand's decision: no confirmation gate). A host
+ * key that CHANGED since a previous pin never reaches this far: it fails the
+ * connection itself as [`BootstrapError::HostKeyMismatch`], and no event fires for
+ * that call.
+ */
+async bootstrapInstallKey(host: string, port: number, user: string, password: string, label: string) : Promise<Result<KeyInstallOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_install_key", { host, port, user, password, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Probe an already-keyed server for the full install-mode picture. See [`probe`].
+ */
+async bootstrapProbe(host: string, port: number, user: string, identityFile: string) : Promise<Result<RemoteProbeResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_probe", { host, port, user, identityFile }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
+ * the user has confirmed the change is expected) so the next connection re-pins it
+ * TOFU. See [`forget_host_key`].
+ */
+async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2430,6 +2476,7 @@ accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
+hostKeyFingerprintEvent: HostKeyFingerprintEvent,
 serverLoginPromptEvent: ServerLoginPromptEvent,
 serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -2455,6 +2502,7 @@ accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
+hostKeyFingerprintEvent: "host-key-fingerprint-event",
 serverLoginPromptEvent: "server-login-prompt-event",
 serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -3567,6 +3615,18 @@ condition: string;
  */
 reason: string | null }
 /**
+ * `bootstrap::connect`'s own TOFU host-key pin (B7), read back after ANY successful
+ * connection through that module — the `install_key` password step, and every keyed
+ * reconnect/probe after it. DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is
+ * no confirmation step gating on this event, it never blocks the flow. `known` = the
+ * fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
+ * this particular connection attempt — `false` only on a server's genuine first
+ * contact. A host key that CHANGED versus what was pinned never reaches this event at
+ * all: it fails the connection itself as `BootstrapError::HostKeyMismatch` instead
+ * (see `bootstrap::connect::install_key`'s doc).
+ */
+export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
+/**
  * An image joined to a user turn: base64 bytes + their MIME type. Sent inside the
  * message `content` array as an `image` block (spec §3.10) — verified accepted by
  * `claude` 2.1.187, which "sees" it and answers about its content. The `data` field
@@ -3618,6 +3678,13 @@ export type InitOutcome =
  */
 { AlreadyInitialized: { identity: ServerIdentity | null } }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * Outcome of [`install_key`]'s idempotent append: whether the app's public key was
+ * FRESHLY added to `authorized_keys`, or was already there (a re-run of the same "add
+ * a server" step — e.g. the wizard was closed and reopened, or the same pairing
+ * command was pasted twice).
+ */
+export type KeyInstallOutcome = "Installed" | "AlreadyPresent"
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
  * control request. Authoritative in a way a hard-coded table can never be: the
@@ -4093,6 +4160,65 @@ pairing_code: string | null }
  * immediate SUB-directories (names only). Powers the remote folder browser.
  */
 export type RemoteListing = { path: string; dirs: string[] }
+/**
+ * Outcome of probing a remote server for the two binaries pairing needs, PLUS (B7)
+ * the install-mode facts [`bootstrap::connect::probe`] needs to decide how (or
+ * whether) to install `flightdeckd` on a server that has never been paired before.
+ * `Ok` covers EVERY combination of present/missing/outdated — "missing" is data IN
+ * the struct, never an ssh-level failure — so [`add_machine`] can name every blocker
+ * at once instead of just whichever the remote shell happened to trip over first. An
+ * `Err` means the ssh round-trip itself failed (unreachable host, auth refused, …),
+ * before the probe script could report anything.
+ * 
+ * The install-mode fields (`conflict`/`os`/`arch`/`systemd`/`passwordless_sudo`/
+ * `linger`/`kill_user_processes`) are ALWAYS `None` for a pairing probe
+ * ([`probe_remote`]'s own script never emits their markers — see
+ * [`parse_probe_output`]'s doc) — [`add_machine`] ignores them either way, exactly as
+ * before this struct grew them. Only [`bootstrap::connect::probe`]'s own, EXTENDED
+ * script populates them.
+ * 
+ * `Serialize`/`Type` (B7): [`bootstrap::connect::bootstrap_probe`] returns this
+ * directly across the Tauri IPC boundary — [`add_machine`]'s own use never needed
+ * this before, since it only ever consumed a `RemoteProbeResult` internally and
+ * returned a [`MachineRecord`] instead.
+ */
+export type RemoteProbeResult = { claude_version: string | null; claude_missing: boolean; flightdeckd_version: string | null; flightdeckd_missing: boolean; flightdeckd_outdated: boolean; 
+/**
+ * One-line description of a pre-existing `flightdeckd` install this server
+ * already carries (a system unit, a binary outside `~/.local/bin`, or an existing
+ * `~/.flightdeckd/config.json`) — meaning "adopt it, don't reinstall", not a
+ * failure. `None` when the probe script found none of those (or never ran this
+ * check at all — a pairing probe, see the struct doc).
+ */
+conflict: string | null; 
+/**
+ * `uname -s` (e.g. `"Linux"`).
+ */
+os: string | null; 
+/**
+ * `uname -m` (e.g. `"x86_64"`/`"aarch64"`) — picks the daemon binary to install.
+ */
+arch: string | null; 
+/**
+ * Whether systemd is PID 1 (`/run/systemd/system` exists).
+ */
+systemd: boolean | null; 
+/**
+ * Whether `sudo -n true` succeeds (passwordless sudo) — never prompts, so this is
+ * safe to run from a batch probe.
+ */
+passwordless_sudo: boolean | null; 
+/**
+ * `loginctl show-user $USER -p Linger` — whether the user can keep a `systemd
+ * --user` unit running after the SSH session that started it closes.
+ */
+linger: boolean | null; 
+/**
+ * logind's `KillUserProcesses` setting (best-effort, via `busctl` — `None` when
+ * `busctl` itself is unavailable, never an error): whether a detached process
+ * (the no-linger, no-sudo fallback) survives the session closing.
+ */
+kill_user_processes: boolean | null }
 /**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last

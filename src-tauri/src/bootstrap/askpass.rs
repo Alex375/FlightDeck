@@ -68,6 +68,14 @@ pub enum BootstrapError {
     HostUnreachable,
     /// The host key changed, or a brand-new host key was refused.
     HostKeyMismatch,
+    /// (B7) `bootstrap::connect::install_key` appended the key to the server's
+    /// `authorized_keys` (or found it already there), but a VERIFICATION reconnect
+    /// using it over the normal keyed/`BatchMode` path then failed — the server
+    /// accepted the PASSWORD but something about the key path specifically is broken
+    /// (`PubkeyAuthentication no`, a non-default `AuthorizedKeysFile`, permissions
+    /// sshd itself refuses). Carries a hint built from the verification failure, so
+    /// this is never reported as a bare, unexplained "it didn't work".
+    KeyInstalledButNotAccepted(String),
     /// Anything else — the ssh/askpass plumbing itself failing, not the login
     /// outcome. Carries a short, already-scrubbed-of-secrets diagnostic.
     Other(String),
@@ -82,6 +90,7 @@ impl std::fmt::Display for BootstrapError {
             Self::HostKeyMismatch => {
                 write!(f, "the server's host key does not match what was expected")
             }
+            Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
             Self::Other(d) => write!(f, "{d}"),
         }
     }
@@ -100,32 +109,37 @@ impl std::error::Error for BootstrapError {}
 /// (`NumberOfPasswordPrompts=1`) — a wrong password should fail fast, not retry
 /// itself into a lockout on the server.
 ///
+/// `known_hosts`: `Some` pins `StrictHostKeyChecking=accept-new`'s TOFU pin into THAT
+/// file (`-o UserKnownHostsFile=...`) instead of the developer's real
+/// `~/.ssh/known_hosts` — `bootstrap::connect` (B7) always passes the app's own
+/// dedicated `remote_known_hosts` here, exactly like [`crate::ipc::commands::
+/// keyed_ssh_options`] does for the already-paired path. `None` (this module's own
+/// unit tests, which never actually complete a handshake) leaves ssh's default alone.
+///
 /// Does NOT itself set `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE`: this builds the ssh
 /// invocation's argv/options, which are the same regardless of which relay ends up
 /// answering the prompt; [`run_with_password`] is what owns an [`AskpassGuard`] and
 /// wires those two env vars to ITS helper right before spawning. A caller that never
 /// goes through `run_with_password` (there is none in this crate yet) would need to
 /// set them itself.
-pub fn bootstrap_ssh_command(target: &str, identity_or_none: Option<&str>, remote_cmd: &str) -> Command {
-    let mut cmd = bootstrap_ssh_options(identity_or_none);
+pub fn bootstrap_ssh_command(
+    target: &str,
+    identity_or_none: Option<&str>,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+) -> Command {
+    let mut cmd = bootstrap_ssh_options(identity_or_none, known_hosts);
     // MUST be the last two args appended: ssh's own argv grammar is
     // `ssh [options] destination [command]` — anything appended after the
     // destination is part of the REMOTE command line, not parsed as an ssh option
-    // any more. A caller (this module's own live test, notably) that needs to add
-    // one more `-o` on top of [`bootstrap_ssh_options`]'s set must do so BEFORE
-    // appending its own destination/command, not onto this function's return value.
+    // any more.
     cmd.arg(target).arg(remote_cmd);
     cmd
 }
 
 /// The option half of [`bootstrap_ssh_command`], without the destination/remote
 /// command it appends last (see that function's doc for why the order matters).
-/// Split out so this module's live test can insert one more `-o` (an isolated
-/// `UserKnownHostsFile`) in the only place ssh will actually parse it as an option —
-/// before the destination — while still exercising every other flag this bootstrap
-/// flow really ships with, rather than a hand-duplicated copy that could drift from
-/// it.
-fn bootstrap_ssh_options(identity_or_none: Option<&str>) -> Command {
+fn bootstrap_ssh_options(identity_or_none: Option<&str>, known_hosts: Option<&str>) -> Command {
     let mut cmd = Command::new("ssh");
     cmd
         // No controlling terminal for ssh to fall back to prompting on either — a
@@ -139,6 +153,9 @@ fn bootstrap_ssh_options(identity_or_none: Option<&str>) -> Command {
         .arg("ConnectTimeout=10")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
+    if let Some(kh) = known_hosts {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
     if let Some(identity) = identity_or_none {
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     } else {
@@ -279,6 +296,23 @@ fn make_fifo(path: &std::path::Path) -> Result<(), BootstrapError> {
 /// The password never touches argv (ssh reads it from the askpass helper's stdout,
 /// which reads it from the FIFO), never touches disk, never touches a regular file —
 /// only pipe bytes inside a 0700 temp dir that is gone before this function returns.
+/// This is a SEPARATE channel from `stdin_payload` below: the askpass relay answers
+/// ssh's OWN login prompt (via `SSH_ASKPASS`, never the process's real stdin); the
+/// remote command's stdin is the process's ordinary stdin pipe, untouched by any of
+/// that.
+///
+/// `stdin_payload`, when `Some`, is written to the spawned ssh process's stdin and
+/// the pipe is then closed (EOF) — for a remote command that reads its own input from
+/// stdin (`bootstrap::connect::install_key`'s key-append script, notably: the public
+/// key line is piped in rather than interpolated into the command string). Written
+/// eagerly, right after spawn, before the password-delivery race below: ssh buffers
+/// stdin in the pipe regardless of whether the remote command has even started
+/// reading yet (no reader needs to be attached for a `write` to a pipe to complete),
+/// so this never blocks on the remote side being ready — as long as the payload
+/// stays comfortably under a pipe's OS buffer size, true for every payload this crate
+/// actually sends here (a public key line, at most a few hundred bytes). `None`
+/// (every OTHER call site) sets `Stdio::null()` exactly as before this parameter
+/// existed.
 ///
 /// Sets `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE` on `cmd` itself, pointed at its OWN
 /// [`AskpassGuard`] — `cmd` (typically built by [`bootstrap_ssh_command`]) does not
@@ -286,19 +320,33 @@ fn make_fifo(path: &std::path::Path) -> Result<(), BootstrapError> {
 pub async fn run_with_password(
     mut cmd: Command,
     password: &str,
+    stdin_payload: Option<&[u8]>,
     deadline: Duration,
 ) -> Result<std::process::Output, BootstrapError> {
     let guard = AskpassGuard::new()?;
     cmd.env("SSH_ASKPASS", &guard.helper)
         .env("SSH_ASKPASS_REQUIRE", "force")
-        .stdin(Stdio::null())
+        .stdin(if stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| BootstrapError::Other(format!("could not start ssh: {e}")))?;
+    if let Some(payload) = stdin_payload {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            if let Err(e) = stdin.write_all(payload).await {
+                return Err(BootstrapError::Other(format!(
+                    "could not write to ssh's stdin: {e}"
+                )));
+            }
+            // Drop to close (EOF) — the remote command's own `cat`/`read` is waiting
+            // on exactly this to know the payload is complete.
+            drop(stdin);
+        }
+    }
     let pid = child.id();
     // A future that reads stdout+stderr to completion (avoiding a pipe-buffer
     // deadlock) AND waits for exit, spawned as its own task so it can be raced
@@ -535,7 +583,7 @@ mod tests {
 
     #[test]
     fn bootstrap_ssh_command_omits_batch_mode() {
-        let cmd = bootstrap_ssh_command("tester@127.0.0.1", None, "true");
+        let cmd = bootstrap_ssh_command("tester@127.0.0.1", None, None, "true");
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
@@ -548,13 +596,27 @@ mod tests {
 
     #[test]
     fn bootstrap_ssh_command_with_identity_skips_password_only_restriction() {
-        let cmd = bootstrap_ssh_command("tester@127.0.0.1", Some("/tmp/some_key"), "true");
+        let cmd = bootstrap_ssh_command("tester@127.0.0.1", Some("/tmp/some_key"), None, "true");
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "IdentitiesOnly=yes"));
         assert!(
             !args.iter().any(|a| a == "PreferredAuthentications=password,keyboard-interactive"),
             "an identity was given, so this restriction must not be applied: {args:?}"
+        );
+    }
+
+    /// (B7) `bootstrap::connect` always passes the app's dedicated `known_hosts` here
+    /// so the first-contact TOFU pin never touches the developer's real
+    /// `~/.ssh/known_hosts` — proves the option actually lands on the built command.
+    #[test]
+    fn bootstrap_ssh_command_with_known_hosts_sets_the_dedicated_file() {
+        let cmd = bootstrap_ssh_command("tester@127.0.0.1", None, Some("/tmp/dedicated_known_hosts"), "true");
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(
+            args.iter().any(|a| a == "UserKnownHostsFile=/tmp/dedicated_known_hosts"),
+            "expected the dedicated known_hosts override in {args:?}"
         );
     }
 
@@ -572,8 +634,8 @@ mod tests {
         // `ssh://` URI destination form is used (rather than `user@host`) because a
         // plain destination doesn't accept a trailing `:port` — OpenSSH's URI form
         // does (manually verified against the local OpenSSH_10.3 client).
-        let cmd = bootstrap_ssh_command("ssh://nobody@127.0.0.1:1", None, "true");
-        let result = run_with_password(cmd, "irrelevant", Duration::from_secs(10)).await;
+        let cmd = bootstrap_ssh_command("ssh://nobody@127.0.0.1:1", None, None, "true");
+        let result = run_with_password(cmd, "irrelevant", None, Duration::from_secs(10)).await;
         assert_eq!(result, Err(BootstrapError::HostUnreachable));
     }
 
@@ -659,23 +721,15 @@ mod tests {
 
         let target = format!("ssh://{USER}@127.0.0.1:{PORT}");
         // Every ssh invocation in this test goes through this helper so all of them
-        // — polling AND the final proof — share the same isolated `known_hosts`.
-        //
-        // Built from `bootstrap_ssh_options` (the option-only half of
-        // `bootstrap_ssh_command`), NOT by appending to `bootstrap_ssh_command`'s own
-        // return value: that function already appends the destination/remote-command
-        // pair last, and ssh treats anything appended AFTER those as part of the
-        // REMOTE command line, not as one of its own options — appending
-        // `-o UserKnownHostsFile=...` there would silently do nothing and leave ssh
-        // consulting the real `~/.ssh/known_hosts` (reproduced while fixing this
-        // test: the override was a no-op and the "isolated" run still failed with a
-        // `HostKeyMismatch` sourced from the developer's real known_hosts file).
-        let ssh_cmd = |remote_cmd: &str| {
-            let mut cmd = bootstrap_ssh_options(None);
-            cmd.arg("-o").arg(format!("UserKnownHostsFile={}", known_hosts_file.display()));
-            cmd.arg(&target).arg(remote_cmd);
-            cmd
-        };
+        // — polling AND the final proof — share the same isolated `known_hosts`, via
+        // `bootstrap_ssh_command`'s own `known_hosts` parameter (B7) rather than a
+        // hand-appended `-o UserKnownHostsFile=...` (that used to be the only way
+        // before this parameter existed — appending it AFTER `bootstrap_ssh_command`
+        // built its own destination/remote-command pair was a no-op, since ssh treats
+        // anything after those as part of the REMOTE command line, not its own
+        // options; reproduced while first building this test).
+        let known_hosts_str = known_hosts_file.to_str().expect("scratch known_hosts path must be UTF-8");
+        let ssh_cmd = |remote_cmd: &str| bootstrap_ssh_command(&target, None, Some(known_hosts_str), remote_cmd);
 
         // Poll with the WRONG password until sshd actually accepts connections (a
         // freshly started container's sshd takes a moment to come up) — this
@@ -685,7 +739,7 @@ mod tests {
         let mut last_result = String::new();
         for _ in 0..30 {
             let cmd = ssh_cmd("true");
-            match run_with_password(cmd, "definitely-wrong-password", Duration::from_secs(5)).await {
+            match run_with_password(cmd, "definitely-wrong-password", None, Duration::from_secs(5)).await {
                 Err(BootstrapError::WrongPassword) => {
                     ready = true;
                     break;
@@ -701,7 +755,7 @@ mod tests {
         // The actual proof: the right password succeeds AND runs the remote
         // command, returning its real output.
         let cmd = ssh_cmd("echo REMOTE_OK_$(id -un)");
-        let out = run_with_password(cmd, PASSWORD, Duration::from_secs(10))
+        let out = run_with_password(cmd, PASSWORD, None, Duration::from_secs(10))
             .await
             .expect("the correct password must succeed");
         assert!(out.status.success(), "remote command should have exited 0: {out:?}");
