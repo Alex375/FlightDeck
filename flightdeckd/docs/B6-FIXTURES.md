@@ -56,7 +56,8 @@ L'unit est la copie exacte de `systemctl cat flightdeckd` sur josty-cc
 (18/09) : `/etc/systemd/system/flightdeckd.service`, `root:root 644`,
 `User=josty`, `Environment=HOME=/home/josty`, `Environment=PATH=…`,
 `ExecStart=/usr/local/bin/flightdeckd run`, `Restart=always`, `RestartSec=3`,
-`WantedBy=multi-user.target` ; binaire `/usr/local/bin/flightdeckd`
+`WantedBy=multi-user.target` — plus `TimeoutStopSec=20` (ajouté au 18/09 après
+la revue : l'arrêt gracieux du démon dure jusqu'à 10 s ; à reporter sur josty-cc) ; binaire `/usr/local/bin/flightdeckd`
 `root:root 777` ; `Linger=no`. Le binaire est le build musl statique de B0
 (`flightdeckd/scripts/build-musl.sh`, arch de Docker détectée, construit si
 absent ; `FLIGHTDECKD_BIN=` pour en fournir un autre). La config

@@ -29,6 +29,10 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use std::path::PathBuf;
 
+/// Bound on a graceful shutdown (every session's stop ladder is ~4 s at
+/// worst). Keep the unit's TimeoutStopSec above it (20 s recommended).
+const SHUTDOWN_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 const DEFAULT_RELAY: &str = "https://relay-production-8fd4.up.railway.app";
 
 #[derive(Parser)]
@@ -215,12 +219,29 @@ async fn main() -> Result<()> {
                 let manager = manager.clone();
                 tokio::spawn(async move { relay::serve(manager).await })
             };
-            tokio::select! {
-                r = attach_srv => r?.context("attach server ended")?,
-                _ = relay_srv => {},
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutting down");
+            // SIGTERM (systemctl stop/restart) exactly like SIGINT: the
+            // sessions die with the daemon either way (their pipes are ours),
+            // but through their stop ladder, with every attached client told
+            // (fd_detach exited) — not by a SIGKILL of the whole cgroup.
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let signal = tokio::select! {
+                r = attach_srv => {
+                    r?.context("attach server ended")?;
+                    None
                 }
+                _ = relay_srv => None,
+                _ = tokio::signal::ctrl_c() => Some("SIGINT"),
+                _ = sigterm.recv() => Some("SIGTERM"),
+            };
+            if let Some(sig) = signal {
+                tracing::info!("{sig}: stopping every session, then exiting");
+                let left = manager.shutdown(SHUTDOWN_WITHIN).await;
+                if left > 0 {
+                    tracing::warn!("{left} session(s) still alive after {SHUTDOWN_WITHIN:?} — exiting anyway");
+                }
+                // Let the attach writers flush the fd_detach frames.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                std::fs::remove_file(&socket).ok();
             }
             Ok(())
         }

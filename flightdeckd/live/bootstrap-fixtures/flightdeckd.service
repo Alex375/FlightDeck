@@ -10,6 +10,7 @@ Environment=PATH=/usr/local/bin:/home/josty/.local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/flightdeckd run
 Restart=always
 RestartSec=3
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

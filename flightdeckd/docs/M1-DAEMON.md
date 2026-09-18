@@ -120,7 +120,13 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
 
 - **Démon redémarré = sessions perdues** (les pipes meurent avec lui). Le
   registre survit : la conversation repart via `--resume` au prochain message.
-  systemd + unit fournie plus tard (conteneur : entrypoint).
+  `systemctl stop/restart` (SIGTERM) est traité comme SIGINT : chaque session
+  passe par son échelle d'arrêt (EOF stdin → SIGTERM du groupe → SIGKILL,
+  ~4 s au pire, borné à 10 s en tout), chaque client attaché reçoit
+  `fd_detach{exited}`, le socket est retiré, sortie 0. Unité systemd :
+  garder le `KillMode` par défaut (**pas** `KillMode=process`, qui laisserait
+  des `claude` orphelins aux pipes morts) et mettre **`TimeoutStopSec=20`**
+  (au-dessus des 10 s de l'arrêt gracieux).
 - Auth Claude du conteneur = copie du token du Mac (rotation ⇒ relancer
   `up.sh`). Un vrai serveur fera son propre `claude` login (M1.2).
 - Provisioning (installer le démon depuis « Ajouter un serveur », pousser

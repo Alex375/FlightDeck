@@ -425,6 +425,33 @@ impl SessionManager {
         Ok(conv_id)
     }
 
+    /// Daemon shutdown: stop every live session through its own ladder (stdin
+    /// EOF → SIGTERM(group) → SIGKILL) and wait, bounded, until every actor
+    /// has finished — so each attached client gets its `fd_detach{exited}`.
+    /// Returns how many sessions were still alive at the deadline.
+    pub async fn shutdown(&self, within: std::time::Duration) -> usize {
+        let live: Vec<mpsc::UnboundedSender<SessionMsg>> = {
+            let sessions = self.sessions.lock().await;
+            sessions.values().filter(|e| !e.msg_tx.is_closed()).map(|e| e.msg_tx.clone()).collect()
+        };
+        for tx in &live {
+            let (ack, _) = oneshot::channel();
+            let _ = tx.send(SessionMsg::Stop { ack });
+        }
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let left = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.retain(|_, e| !e.msg_tx.is_closed());
+                sessions.len()
+            };
+            if left == 0 || tokio::time::Instant::now() >= deadline {
+                return left;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     pub async fn route(&self, conv_id: &str, msg: SessionMsg) -> Result<()> {
         let tx = self
             .entry_tx(conv_id)
