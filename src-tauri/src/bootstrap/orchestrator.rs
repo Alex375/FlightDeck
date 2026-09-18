@@ -97,8 +97,8 @@ use tokio::sync::Mutex;
 use crate::bootstrap::askpass::{BootstrapError, SecretString};
 use crate::bootstrap::{connect, install, server_setup};
 use crate::ipc::commands::{
-    persist_paired_machine, probe_candidates, resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin,
-    shq, RemoteProbeResult,
+    invalidate_daemon_version_cache, persist_paired_machine, probe_candidates, resolve_daemon_bin_expr,
+    run_ssh_on_machine, run_ssh_on_machine_stdin, shq, RemoteProbeResult,
 };
 use crate::store::{MachineRecord, Store};
 
@@ -976,6 +976,18 @@ async fn run_pipeline_and_register(
     })
     .await;
     let final_ctx = ctx.lock().await;
+    // B_lifecycle-#6 review finding: a completed run (`needs_input: None` — paused
+    // sessions haven't finished anything yet) may have uploaded/upgraded this
+    // machine's `flightdeckd` (`step_upload_daemon`'s own RESTART RULE), so drop
+    // whatever `crate::ipc::commands::DAEMON_VERSION_CACHE` still holds for it from an
+    // earlier spawn THIS SAME APP RUN — same reasoning as `repair`'s own invalidation,
+    // for the guided-install path instead of the Repair buttons. Harmless (a plain
+    // cache miss) when nothing was ever cached, or nothing changed.
+    if needs_input.is_none() {
+        if let Some(id) = &final_ctx.machine_id {
+            invalidate_daemon_version_cache(id);
+        }
+    }
     BootstrapReport {
         session_id,
         host: req.host,
@@ -1475,6 +1487,16 @@ pub struct RepairOutcome {
     pub diagnosis: ServerDiagnosis,
 }
 
+/// Whether `action` can have changed the remote `flightdeckd` binary/process the
+/// cached probe behind `crate::ipc::commands::DAEMON_VERSION_CACHE` describes
+/// (B_lifecycle-#6 review finding) — pulled into its own named, directly-testable gate
+/// (rather than an inline `matches!` in [`repair`]'s body) so "the cache is invalidated
+/// after each of the three daemon-changing repair kinds, and NOT after the other five"
+/// is a regression test on its own.
+fn repair_action_invalidates_daemon_version_cache(action: RepairAction) -> bool {
+    matches!(action, RepairAction::ReuploadDaemon | RepairAction::RestartDaemon | RepairAction::InstallService)
+}
+
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
 /// re-diagnose. `sudo_password` beyond the brief's own shorthand signature — see the
 /// module doc.
@@ -1557,6 +1579,19 @@ async fn repair(
             format!("{state:?}")
         }
     };
+
+    // B_lifecycle-#6 review finding: `crate::ipc::commands::DAEMON_VERSION_CACHE` is
+    // per-app-run and, before this, was invalidated ONLY on a clap-rejection downgrade
+    // (`session.rs::run_actor`) — a same-run UPGRADE via one of these three repairs left
+    // the stale OLD version cached, so `--supports-skip`/`--title` stayed silently off
+    // for every later spawn until the app restarted. Drop the entry unconditionally for
+    // any repair that changed (or could have changed) the remote `flightdeckd`
+    // binary/process the cached probe describes (a `?` above already returned early on
+    // failure — reaching here means the action succeeded), and let the very next call
+    // to `daemon_version_for_machine` re-probe for real.
+    if repair_action_invalidates_daemon_version_cache(action) {
+        invalidate_daemon_version_cache(&machine.id);
+    }
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
 }
@@ -1899,6 +1934,33 @@ mod tests {
             RepairAction::ProvisionPhone,
         ] {
             assert!(!repair_action_label(action).is_empty(), "{action:?} has no label");
+        }
+    }
+
+    // ---- repair_action_invalidates_daemon_version_cache (B_lifecycle-#6) ----
+
+    #[test]
+    fn repair_action_invalidates_daemon_version_cache_covers_exactly_the_daemon_changing_kinds() {
+        for action in
+            [RepairAction::ReuploadDaemon, RepairAction::RestartDaemon, RepairAction::InstallService]
+        {
+            assert!(
+                repair_action_invalidates_daemon_version_cache(action),
+                "{action:?} can change the remote flightdeckd — the cache must be invalidated",
+            );
+        }
+        for action in [
+            RepairAction::EnableLinger,
+            RepairAction::MaskSleep,
+            RepairAction::RunInit,
+            RepairAction::SignInClaude,
+            RepairAction::ProvisionPhone,
+        ] {
+            assert!(
+                !repair_action_invalidates_daemon_version_cache(action),
+                "{action:?} never touches flightdeckd itself — invalidating for it would just \
+                 force a needless re-probe on the next spawn",
+            );
         }
     }
 
