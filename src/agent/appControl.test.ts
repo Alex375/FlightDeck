@@ -649,9 +649,32 @@ describe("appControl — open_file view:\"ide\"", () => {
     await executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", helpers());
     expect(useConversationsStore.getState().activeId).toBe("c2");
     expect(editorActions.openFile).toHaveBeenCalled();
-    // The agent's conversation is only OFFERED to the dock (shown when the active one is
-    // not one of this folder's), never forced onto the app.
-    expect(useIdeStore.getState().workspaces[0].lastConvId).toBe("c1");
+    // …and the conversation the DOCK shows is left alone too: repointing it swapped the
+    // thread the user was reading for the calling agent's, mid-read.
+    expect(useIdeStore.getState().workspaces[0].lastConvId).toBeNull();
+  });
+
+  it("never swaps the folder under the user — even when the docked agent has LEFT it", async () => {
+    // The worktree is the workspace on screen and c1 is docked there; its agent then ran
+    // ExitWorktree (what `/land` does), so it now works at the repository root and every
+    // path it names lives OUTSIDE the workspace. Opening the root as a second workspace
+    // would swap explorer, tabs, terminals and dock mid-`/land`, from a background call.
+    const wt = "/tmp/r1/.claude/worktrees/x";
+    seed(conv({ handle: "session-7", cwd: "/tmp/r1", liveCwd: "/tmp/r1" }));
+    useDisplay.getState().set({ ideView: true });
+    const ws = useIdeStore.getState().openWorkspace(wt, "r1");
+    useIdeStore.getState().noteConversation(ws, "c1"); // docked → pinned although outside
+    const h = { ...helpers(), currentView: "ide" as const };
+    await executeAppControlTool("open_file", { path: "CHANGELOG.md" }, "session-7", h);
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+    expect(useIdeStore.getState().activeId).toBe(ws);
+    // The file still opens — in the workspace on screen, as a tab rooted elsewhere.
+    expect(editorActions.openFile).toHaveBeenCalledWith(
+      editorKeyFor(ws),
+      "/tmp/r1/CHANGELOG.md",
+      expect.anything(),
+    );
+    expect(h.views).toEqual(["ide"]);
   });
 
   it("with no 'view', follows the user's eyes: stays in the IDE when the agent is docked there", async () => {

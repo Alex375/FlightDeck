@@ -160,16 +160,24 @@ function within(ancestor: string, child: string): boolean {
  * cwd to the repository root mid-run). Without the pin the tab vanished under the user,
  * was offered by neither the strip nor the "closed tabs" menu, and its attention pips went
  * dark on the very surface being watched. See `isOutsideWorkspace` for how it is marked.
+ *
+ * The same goes for a conversation whose tab was CLOSED here: closing a tab hides it, it
+ * must never delete the conversation from the folder — this list feeds both the attention
+ * pips and the "closed tabs" menu, which is the only way back. Without it, closing the tab
+ * of an agent that had left the folder made it unreopenable and silenced it for good.
  */
 export function workspaceConversations<C extends ConvLike>(
-  ws: Pick<IdeWorkspace, "path" | "repoId" | "lastConvId">,
+  ws: Pick<IdeWorkspace, "path" | "repoId" | "lastConvId"> & { closedConvIds?: readonly string[] },
   conversations: C[],
   repos: RepoLike[],
 ): C[] {
   const repoId = workspaceRepoId(ws, repos);
   if (!repoId) return [];
+  const closedHere = new Set(ws.closedConvIds ?? []);
   return conversations.filter(
-    (c) => c.repoId === repoId && (c.id === ws.lastConvId || !isOutsideWorkspace(ws, c)),
+    (c) =>
+      c.repoId === repoId &&
+      (c.id === ws.lastConvId || closedHere.has(c.id) || !isOutsideWorkspace(ws, c)),
   );
 }
 

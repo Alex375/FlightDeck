@@ -857,7 +857,10 @@ async function openFile(
     typeof args.column === "number" ? Math.max(1, Math.floor(args.column)) : undefined;
 
   if (view === "ide") {
-    openFileInIde(conv.id, cwd, abs, line != null ? { line, column } : undefined);
+    // `null` = the conversation vanished between resolution and here (deleted during the
+    // pathExists await). Nothing was opened — so say so rather than report a hollow success.
+    if (openFileInIde(conv.id, cwd, abs, line != null ? { line, column } : undefined) === null)
+      throw new Error("open_file: the conversation no longer exists");
     helpers.changeView("ide");
     return {
       conversation_id: conv.id,

@@ -112,14 +112,17 @@ export function openFileInIde(
   if (!conv) return null;
 
   const ide = useIdeStore.getState();
-  // Stay in the workspace ON SCREEN when it already holds both the file and this
-  // conversation — typically the repository's folder, with the agent in one of its
-  // worktrees underneath. Opening a second workspace for the worktree there would swap the
-  // folder under the user to show a file their current explorer can already reach.
+  // Stay in the workspace ON SCREEN whenever it holds this conversation — WHETHER OR NOT
+  // the file sits under its root. Opening (or focusing) another workspace swaps the whole
+  // IDE — explorer, tabs, terminals, dock — under the user, which a background agent must
+  // never be able to do. The file being elsewhere is the normal case, not an exotic one:
+  // the repository's folder is open and the agent works in a worktree; or the docked agent
+  // has LEFT the folder (`/land`'s ExitWorktree) and is only listed through the pin — then
+  // every path it names lives outside. A tab rooted elsewhere is fine: `openFile` takes
+  // any absolute path, and the explorer's auto-reveal simply no-ops off-root.
   const current = ide.workspaces.find((w) => w.id === ide.activeId) ?? null;
   const stay =
     current !== null &&
-    (abs === current.path || abs.startsWith(current.path + "/")) &&
     workspaceConversations(current, store.conversations, store.repos).some((c) => c.id === convId);
   const wsId = stay ? current.id : ide.openWorkspace(cwd, conv.repoId);
   const ws = useIdeStore.getState().workspaces.find((w) => w.id === wsId);
@@ -135,14 +138,13 @@ export function openFileInIde(
     reveal: opts?.line != null ? { line: opts.line, column: opts.column } : undefined,
   });
 
-  // The FILE is what was asked for, so the app's active conversation is left alone: an
-  // agent in the background must not be able to repoint the user's selection (persisted,
-  // and inherited by ⌘1, ⌘⌥↑/↓ and the next launch) — least of all with the dock closed
-  // or on Terminals, where nothing on screen would even say so. Its tab is merely made
-  // available again, and offered as this workspace's conversation: the dock shows it when
-  // the active conversation is not one of this folder's (see `dockedConversation`).
+  // The FILE is what was asked for — so NOTHING about conversations moves: not the app's
+  // active one (persisted, inherited by ⌘1, ⌘⌥↑/↓ and the next launch), and not the one
+  // this dock shows either (`lastConvId`). Repointing the latter from here swapped the
+  // thread the user was reading for the calling agent's, mid-read — and, when the one on
+  // screen was only listed through the pin, dropped its tab altogether. The agent's tab is
+  // merely made available again if it had been closed here.
   ide.reopenConversationTab(wsId, convId);
-  ide.noteConversation(wsId, convId);
   // A maximized dock hides the editor entirely — the file just opened would be invisible.
   ide.setDockMaximized(false);
   return wsId;

@@ -112,6 +112,20 @@ describe("the conversations a workspace docks", () => {
     expect(workspaceConversations(at(WORKTREE, "r2", "agent"), landed, [REPO, OTHER])).toEqual([]);
   });
 
+  it("keeps a conversation whose tab was CLOSED here listed, wherever its agent went", () => {
+    // Closing the tab of an agent that had left the folder moved the pin to its neighbour
+    // — and the closed one then fell out of the list entirely: not reopenable (the closed
+    // tabs menu reads this list) and silenced (so do the attention pips). Closing a tab
+    // hides it; it must never delete the conversation from the folder.
+    const landed = [conv("agent", { cwd: "/code/app", liveCwd: "/code/app" }), conv("inside", { cwd: WORKTREE })];
+    const ws = { ...at(WORKTREE, "r1", "inside"), closedConvIds: ["agent"] };
+    const listed = workspaceConversations(ws, landed, [REPO]);
+    expect(listed.map((c) => c.id)).toEqual(["agent", "inside"]);
+    const { open, closed } = splitConversationTabs(listed, ws.closedConvIds);
+    expect(open.map((c) => c.id)).toEqual(["inside"]);
+    expect(closed.map((c) => c.id)).toEqual(["agent"]);
+  });
+
   it("does not match a sibling folder that merely shares a prefix", () => {
     const sibling = [conv("sib", { cwd: "/code/app-v2" })];
     expect(workspaceConversations(at("/code/app", "r1"), sibling, [REPO])).toEqual([]);
