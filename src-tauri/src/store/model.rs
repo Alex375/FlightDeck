@@ -31,6 +31,34 @@ pub struct AddressCandidate {
     pub value: String,
 }
 
+/// Reject an address value that would be unsafe or meaningless to hand to `ssh` as
+/// part of `user@<value>`: empty (nothing to connect to), containing whitespace or a
+/// control character (never a valid hostname/IP — most likely a paste mistake), or
+/// starting with `-` (would be parsed as an `ssh` OPTION rather than the destination —
+/// e.g. a crafted `-oProxyCommand=...` value achieving arbitrary command execution).
+/// Pure and side-effect-free.
+///
+/// Enforced at TWO points so a future write path can't silently reintroduce the
+/// injection class this closes just by skipping one of them: the IPC boundary
+/// (`ipc::commands::add_machine` checks every probe candidate BEFORE any `ssh`
+/// process is even spawned) and the persistence boundary that actually owns the
+/// invariant (`super::db::Store::upsert_machine` checks `host`/`addresses` again
+/// right before writing the row).
+pub fn validate_address_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("A server address cannot be empty.".to_string());
+    }
+    if value.starts_with('-') {
+        return Err(format!("Invalid address \"{value}\": cannot start with \"-\"."));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "Invalid address \"{value}\": cannot contain whitespace or control characters."
+        ));
+    }
+    Ok(())
+}
+
 /// A remote host (a "server") reached over SSH, on which repos can live and their
 /// conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
 /// the connection coordinates so a user adds a server from the UI without editing any

@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    AddressCandidate, ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState,
-    RepoRecord, RepoTosseLink, TosseProjectRepo,
+    validate_address_value, AddressCandidate, ClaudeAccountRecord, ConversationRecord,
+    MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -143,6 +143,17 @@ fn encode_addresses(addresses: &[AddressCandidate]) -> Option<String> {
         // over a theoretical serde bug rather than losing the whole machine record.
         Some(serde_json::to_string(addresses).unwrap_or_default())
     }
+}
+
+/// [`validate_address_value`] over `m.host` and every `m.addresses` value — the
+/// persistence-layer half of the ssh-option-injection guard (see
+/// [`Store::upsert_machine`]).
+fn validate_machine_addresses(m: &MachineRecord) -> Result<(), String> {
+    validate_address_value(&m.host)?;
+    for c in &m.addresses {
+        validate_address_value(&c.value)?;
+    }
+    Ok(())
 }
 
 /// v1 — the initial schema: a key/value `meta` table, `repos`, and the
@@ -708,8 +719,18 @@ impl Store {
     /// Insert or update a remote server (idempotent by id). Connection coordinates
     /// only — never key material (see [`MachineRecord`]). `addresses` round-trips
     /// through [`encode_addresses`]/[`decode_addresses`] as a JSON blob (see
-    /// [`migrate_v12`]).
+    /// [`migrate_v12`]). Re-checks `host` and every `addresses` value through
+    /// [`validate_address_value`] before writing — the SAME ssh-option-injection guard
+    /// `ipc::commands::add_machine` runs before ever probing, enforced again here so
+    /// this invariant belongs to the boundary that actually owns it, not just to
+    /// today's one caller.
     pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {
+        validate_machine_addresses(m).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -1208,6 +1229,41 @@ mod tests {
         cleared.addresses = Vec::new();
         s.upsert_machine(&cleared).unwrap();
         assert!(s.machine_by_id("m1").unwrap().unwrap().addresses.is_empty());
+    }
+
+    /// The ssh-option-injection guard belongs to the persistence boundary, not just
+    /// to `ipc::commands::add_machine` — a future write path (an "edit server" or
+    /// "import machines" command) must not be able to reintroduce it just by skipping
+    /// the IPC-layer check. `upsert_machine` re-validates `host` AND every
+    /// `addresses` value before ever reaching SQLite.
+    #[test]
+    fn upsert_machine_rejects_an_unsafe_address_value() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+        };
+
+        m.host = "-oProxyCommand=evil".into();
+        assert!(s.upsert_machine(&m).is_err(), "an unsafe host must be rejected before writing");
+        assert!(
+            s.machine_by_id("m1").unwrap().is_none(),
+            "the rejected row must not land in the db"
+        );
+
+        m.host = "h.example".into();
+        m.addresses = vec![AddressCandidate { kind: AddressKind::Lan, value: "has space".into() }];
+        assert!(
+            s.upsert_machine(&m).is_err(),
+            "an unsafe value inside `addresses` must be rejected too, not just `host`"
+        );
+        assert!(s.machine_by_id("m1").unwrap().is_none());
     }
 
     /// v12 — a row from BEFORE the `addresses` column existed (`ALTER TABLE ADD

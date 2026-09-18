@@ -9,8 +9,8 @@ use tauri::Manager;
 
 use crate::ipc::events::TauriEmitter;
 use crate::store::{
-    AddressCandidate, AddressKind, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
-    Store,
+    validate_address_value, AddressCandidate, AddressKind, ConversationRecord, MachineRecord,
+    PersistedState, RepoRecord, Store,
 };
 use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
@@ -3746,28 +3746,6 @@ fn address_probe_order(candidates: Vec<AddressCandidate>) -> Vec<AddressCandidat
     deduped
 }
 
-/// Reject an address value that would be unsafe or meaningless to hand to `ssh` as
-/// part of `user@<value>`: empty (nothing to connect to), containing whitespace or a
-/// control character (never a valid hostname/IP — most likely a paste mistake), or
-/// starting with `-` (would be parsed as an `ssh` OPTION rather than the destination —
-/// e.g. a crafted `-oProxyCommand=...` value achieving arbitrary command execution).
-/// Pure and side-effect-free; every address `add_machine` probes goes through this
-/// FIRST, before any `ssh` process is even spawned.
-fn validate_address_value(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("A server address cannot be empty.".to_string());
-    }
-    if value.starts_with('-') {
-        return Err(format!("Invalid address \"{value}\": cannot start with \"-\"."));
-    }
-    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!(
-            "Invalid address \"{value}\": cannot contain whitespace or control characters."
-        ));
-    }
-    Ok(())
-}
-
 /// Build the [`crate::supervisor::transport::RemoteTarget::addresses`] a spawn
 /// carries for a machine: `host` — the address that last actually worked, the one
 /// `RemoteTarget` still dials today — always FIRST, followed by every other recorded
@@ -3879,25 +3857,44 @@ async fn claim_pending_key_locked(
     claim_pending_key(ssh_keys_dir, identity_file, machine_id)
 }
 
-/// Fold `host` into `addresses` as a `Manual` candidate (unless it's already one of
-/// them, by value) and order the result via [`address_probe_order`]. Guarantees the
-/// address the user actually confirmed — typed by hand, or edited away from every
-/// ticket-discovered candidate on the confirm screen — is always among what
-/// [`add_machine`] probes, even when it was never a discovered candidate. Pure.
+/// Order candidates for [`add_machine`] to probe: `host` — the address the confirm
+/// screen actually holds, whether typed by hand or picked from the ticket's
+/// "Discovered addresses — pick one" list — is ALWAYS tried FIRST, exactly as
+/// `add_machine` dialed it before per-kind priority-ordering existed. This is
+/// load-bearing: the confirm screen's "pick one" buttons only ever call `setHost`,
+/// they don't touch the `addresses` list, so a user who explicitly clicks e.g. the
+/// LAN candidate must have LAN probed (and, on success, persisted as `machine.host`)
+/// first — never silently outranked by a Tailscale candidate the user did NOT pick,
+/// which `address_probe_order`'s fixed Tailscale>LAN>Public>Manual order would
+/// otherwise put ahead of it. The REST of the ticket-discovered candidates (if any)
+/// follow in [`address_probe_order`] priority as a fallback for when the user's own
+/// pick turns out unreachable, deduplicated by value against `host` and each other.
+/// `host` keeps its discovered kind (e.g. `Lan`) when it matches one of `addresses`
+/// by value, and is recorded as `Manual` otherwise (typed by hand, or edited away
+/// from every discovered candidate). Pure.
 fn probe_candidates(host: &str, addresses: Option<Vec<AddressCandidate>>) -> Vec<AddressCandidate> {
-    let mut candidates = addresses.unwrap_or_default();
-    if !candidates.iter().any(|c| c.value == host) {
-        candidates.push(AddressCandidate { kind: AddressKind::Manual, value: host.to_string() });
+    let discovered = addresses.unwrap_or_default();
+    let host_kind = discovered
+        .iter()
+        .find(|c| c.value == host)
+        .map(|c| c.kind.clone())
+        .unwrap_or(AddressKind::Manual);
+    let mut candidates = vec![AddressCandidate { kind: host_kind, value: host.to_string() }];
+    for c in address_probe_order(discovered) {
+        if c.value != host {
+            candidates.push(c);
+        }
     }
-    address_probe_order(candidates)
+    candidates
 }
 
-/// Pair a remote server: probe every candidate address in [`address_probe_order`]
-/// (Tailscale, then LAN, then public, then manual — see [`probe_candidates`]),
-/// stopping at the first that's SSH-reachable with `claude` and a current
-/// `flightdeckd` present, and on success persist it as a [`MachineRecord`]. Returns
-/// the saved record so the UI lists it. Probing runs FIRST so a bad host/key/paste or
-/// a missing/outdated tool fails loudly here, not at the first message.
+/// Pair a remote server: probe the confirmed `host` first, then fall back through the
+/// rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
+/// then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
+/// first that's SSH-reachable with `claude` and a current `flightdeckd` present, and
+/// on success persist it as a [`MachineRecord`]. Returns the saved record so the UI
+/// lists it. Probing runs FIRST so a bad host/key/paste or a missing/outdated tool
+/// fails loudly here, not at the first message.
 ///
 /// `addresses` is the full set of candidate hosts the pairing ticket discovered
 /// (Tailscale name, LAN IP, bare hostname). The address that actually worked is
@@ -4976,6 +4973,48 @@ mod tests {
     fn probe_candidates_with_no_discovered_addresses_falls_back_to_the_typed_host() {
         let candidates = super::probe_candidates("my-typed-host", None);
         assert_eq!(candidates, vec![addr(AddressKind::Manual, "my-typed-host")]);
+    }
+
+    /// Regression for the confirm screen's "Discovered addresses — pick one" buttons
+    /// (`ControlSection.tsx`, `onClick={() => setHost(a.value)}`): clicking a LOWER
+    /// priority candidate (e.g. LAN) must not be silently outranked by a HIGHER
+    /// priority one (Tailscale) the user did not pick. `host` must lead regardless of
+    /// its kind's `address_probe_order` priority, and must keep its discovered kind.
+    #[test]
+    fn probe_candidates_confirmed_host_leads_over_a_higher_priority_candidate() {
+        let discovered = vec![
+            addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            addr(AddressKind::Lan, "192.168.1.5"),
+        ];
+        // The user clicked "LAN: 192.168.1.5" on the confirm screen.
+        let candidates = super::probe_candidates("192.168.1.5", Some(discovered));
+        assert_eq!(
+            candidates,
+            vec![
+                addr(AddressKind::Lan, "192.168.1.5"),
+                addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            ],
+            "the user's explicit pick is probed (and, on success, persisted as machine.host) \
+             first — the undiscovered-higher-priority Tailscale candidate only ever runs as \
+             a fallback if the pick itself is unreachable",
+        );
+    }
+
+    #[test]
+    fn probe_candidates_puts_a_hand_typed_host_first_ahead_of_every_discovered_candidate() {
+        let discovered = vec![
+            addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+            addr(AddressKind::Lan, "192.168.1.5"),
+        ];
+        let candidates = super::probe_candidates("my-typed-host", Some(discovered));
+        assert_eq!(
+            candidates,
+            vec![
+                addr(AddressKind::Manual, "my-typed-host"),
+                addr(AddressKind::Tailscale, "box.tailnet.ts.net"),
+                addr(AddressKind::Lan, "192.168.1.5"),
+            ],
+        );
     }
 
     #[test]

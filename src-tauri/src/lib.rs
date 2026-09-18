@@ -711,10 +711,21 @@ pub fn run() {
             // per app launch, here rather than gated per-call, since this is the
             // earliest point the store (and so the referenced-key set) is open.
             // `load_state` failing degrades to "skip the sweep entirely" (fail-safe —
-            // see `sweep_orphan_ssh_keys`), never to blocking startup.
+            // see `sweep_orphan_ssh_keys`), never to blocking startup — but, unlike a
+            // bare `.ok()`, the real error is logged first (mirrors the
+            // `backfill_last_activity` handling right above), so a genuine store-read
+            // failure (corrupt table, locked db, …) leaves a diagnostic trail instead
+            // of silently disabling the sweep.
+            let machines_for_sweep = match store.load_state() {
+                Ok(s) => Some(s.machines),
+                Err(e) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
+                    None
+                }
+            };
             ipc::commands::sweep_orphan_ssh_keys(
                 &data_dir.join("ssh_keys"),
-                store.load_state().ok().as_ref().map(|s| s.machines.as_slice()),
+                machines_for_sweep.as_deref(),
             );
             app.manage(store);
 

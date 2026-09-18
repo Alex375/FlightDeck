@@ -2007,12 +2007,13 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
- * Pair a remote server: probe every candidate address in [`address_probe_order`]
- * (Tailscale, then LAN, then public, then manual — see [`probe_candidates`]),
- * stopping at the first that's SSH-reachable with `claude` and a current
- * `flightdeckd` present, and on success persist it as a [`MachineRecord`]. Returns
- * the saved record so the UI lists it. Probing runs FIRST so a bad host/key/paste or
- * a missing/outdated tool fails loudly here, not at the first message.
+ * Pair a remote server: probe the confirmed `host` first, then fall back through the
+ * rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
+ * then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
+ * first that's SSH-reachable with `claude` and a current `flightdeckd` present, and
+ * on success persist it as a [`MachineRecord`]. Returns the saved record so the UI
+ * lists it. Probing runs FIRST so a bad host/key/paste or a missing/outdated tool
+ * fails loudly here, not at the first message.
  * 
  * `addresses` is the full set of candidate hosts the pairing ticket discovered
  * (Tailscale name, LAN IP, bare hostname). The address that actually worked is
