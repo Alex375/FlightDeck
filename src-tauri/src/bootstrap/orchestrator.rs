@@ -1190,6 +1190,26 @@ async fn run_pipeline_and_register(
         },
     )
     .await;
+    let final_ctx = ctx.lock().await;
+    // B_lifecycle-#6 review finding: a completed run (`needs_input: None` — paused
+    // sessions haven't finished anything yet) may have uploaded/upgraded this
+    // machine's `flightdeckd` (`step_upload_daemon`'s own RESTART RULE), so drop
+    // whatever `crate::ipc::commands::DAEMON_VERSION_CACHE` still holds for it from an
+    // earlier spawn THIS SAME APP RUN — same reasoning as `repair`'s own invalidation,
+    // for the guided-install path instead of the Repair buttons. Harmless (a plain
+    // cache miss) when nothing was ever cached, or nothing changed.
+    //
+    // Review fix (lock-order): this MUST run before the [`ServerLocks`] release just
+    // below, not after — `ctx.lock().await` above is a genuine yield point, so
+    // releasing the per-server lock first and invalidating the cache after it would
+    // let a second run claim the freshly-freed lock and re-probe a FRESH daemon
+    // version in that window, only for this call's now-late invalidation to wipe that
+    // fresh entry right back out.
+    if needs_input.is_none() {
+        if let Some(id) = &final_ctx.machine_id {
+            invalidate_daemon_version_cache(id);
+        }
+    }
     // B_lifecycle-#7 review finding: release the per-server lock now the run has
     // actually FINISHED (`needs_input.is_none()` — the same condition
     // `drive_and_register` itself uses to decide the session is done, Ok or Failed
@@ -1200,19 +1220,6 @@ async fn run_pipeline_and_register(
         drop(lock_guard);
     } else {
         lock_guard.into_forgotten_key();
-    }
-    let final_ctx = ctx.lock().await;
-    // B_lifecycle-#6 review finding: a completed run (`needs_input: None` — paused
-    // sessions haven't finished anything yet) may have uploaded/upgraded this
-    // machine's `flightdeckd` (`step_upload_daemon`'s own RESTART RULE), so drop
-    // whatever `crate::ipc::commands::DAEMON_VERSION_CACHE` still holds for it from an
-    // earlier spawn THIS SAME APP RUN — same reasoning as `repair`'s own invalidation,
-    // for the guided-install path instead of the Repair buttons. Harmless (a plain
-    // cache miss) when nothing was ever cached, or nothing changed.
-    if needs_input.is_none() {
-        if let Some(id) = &final_ctx.machine_id {
-            invalidate_daemon_version_cache(id);
-        }
     }
     BootstrapReport {
         session_id,
