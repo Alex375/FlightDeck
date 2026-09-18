@@ -2363,6 +2363,62 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Run `flightdeckd init --label <label>` on a paired server. See [`run_init`].
+ */
+async bootstrapRunInit(machineId: string, label: string) : Promise<Result<InitOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_run_init", { machineId, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start driving the server-side `claude` sign-in for `machine_id`. Returns
+ * immediately with an opaque [`LoginSession`] handle — the actual URL (or an
+ * immediate "already signed in" completion) arrives asynchronously as
+ * [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
+ * async login flow in this crate (`account_claude_login_start` is a synchronous
+ * exception only because ITS wait for the URL is bounded to a couple of seconds
+ * against a LOCAL process; this one crosses the network twice before it can even
+ * begin, so it does not block the caller on that).
+ */
+async startClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_claude_login", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Submit the code the user pasted for an in-flight [`start_claude_login`] session.
+ * The code is written to the remote CLI's stdin the instant the driver confirms it's
+ * actually at the `AwaitingCode` prompt (never blindly) — see
+ * [`ClaudeLoginDriver::submit_code`].
+ */
+async submitClaudeLoginCode(session: LoginSession, code: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("submit_claude_login_code", { session, code }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel an in-flight [`start_claude_login`] session — kills the remote process. Safe
+ * (a harmless no-op, not an error surfaced to the user) when the session already
+ * finished on its own.
+ */
+async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_claude_login", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2374,6 +2430,8 @@ accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
+serverLoginPromptEvent: ServerLoginPromptEvent,
+serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
 sessionCommandsEvent: SessionCommandsEvent,
 sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
@@ -2397,6 +2455,8 @@ accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
+serverLoginPromptEvent: "server-login-prompt-event",
+serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
 sessionCommandsEvent: "session-commands-event",
 sessionExtensionsChangedEvent: "session-extensions-changed-event",
@@ -3539,6 +3599,24 @@ data_base64: string; too_large: boolean; size: number;
  * stamp (see [`FileStat`]). `None` when the platform doesn't report one.
  */
 mtime_ms: number | null }
+/**
+ * Outcome of [`run_init`]. Both variants carry `identity` — `flightdeckd init` and
+ * `flightdeckd whoami` are two separate round trips (see that function's doc), so
+ * either one can independently succeed or come back empty.
+ */
+export type InitOutcome = 
+/**
+ * `flightdeckd init` ran for the first time on this machine.
+ */
+{ Initialized: { identity: ServerIdentity | null } } | 
+/**
+ * `~/.flightdeckd/config.json` already existed — `flightdeckd init` refused (as
+ * designed: this module NEVER passes `--force`, which would overwrite a working
+ * identity/relay pairing). Treated as SUCCESS, not an error: the node is already
+ * bootstrapped, which is exactly what a re-run of this flow (a retried wizard
+ * step, a re-added machine) should find.
+ */
+{ AlreadyInitialized: { identity: ServerIdentity | null } }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
@@ -3636,6 +3714,11 @@ unreadable: string[];
  * on, which is precisely how a blocked privacy prompt hid itself once.
  */
 visited: number; elapsedMs: number }
+/**
+ * Opaque handle [`start_claude_login`] returns, threaded back through
+ * [`submit_claude_login_code`] / [`cancel_claude_login`].
+ */
+export type LoginSession = { session_id: string; machine_id: string }
 /**
  * A remote host (a "server") reached over SSH, on which repos can live and their
  * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
@@ -4146,6 +4229,27 @@ group: string | null; window: UsageWindow }
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
 export type SearchHit = { session_id: string; score: number; snippet: string }
+/**
+ * This node's relay identity, straight off `flightdeckd whoami` (`{mac_id, relay_url,
+ * label}` — see that subcommand's own doc in `flightdeckd/src/main.rs`). Field names
+ * match the daemon's JSON verbatim (snake_case both sides), so no `#[serde(rename)]`
+ * is needed.
+ */
+export type ServerIdentity = { mac_id: string; relay_url: string; label: string }
+/**
+ * A `bootstrap::server_setup::start_claude_login` session recognized the remote
+ * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
+ * per session; a session that was ALREADY signed in never emits this (it jumps
+ * straight to [`ServerLoginResultEvent`]).
+ */
+export type ServerLoginPromptEvent = { machine_id: string; url: string }
+/**
+ * Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
+ * `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
+ * otherwise. NEVER emitted for a session the front itself cancelled (see
+ * `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+ */
+export type ServerLoginResultEvent = { machine_id: string; ok: boolean; email: string | null; error: string | null }
 /**
  * The Codex backend's subscription rate-limit % (5h + weekly windows) changed. Codex
  * pushes this over the live app-server (`account/rateLimits/updated`) — there is no
