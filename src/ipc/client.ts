@@ -8,6 +8,8 @@ export { commands, events, isTauri } from "./provider";
 export type {
   AccountLoginEvent,
   AccountProfile,
+  AddressCandidate,
+  AddressKind,
   AgentInfo,
   BackgroundTask,
   BackgroundTaskKind,

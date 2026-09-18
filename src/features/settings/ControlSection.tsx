@@ -8,7 +8,7 @@
 // Every core-backed card follows the honest-toggle rule: what it shows is the
 // post-apply READ-BACK from the core, so a failure shows instead of a switch that lies.
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { commands, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
+import { commands, type AddressCandidate, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
 import { useCaffeinate } from "../../store/caffeinate";
 import {
@@ -198,24 +198,82 @@ export function VoiceBridgeGroup() {
 
 type PairStage = "command" | "confirm" | "manual";
 
+/** A ticket's decoded address candidates, plus the pre-fill fields carried
+ *  alongside them. `addresses` is always non-empty: an old-format ticket (no
+ *  `addresses` field) synthesizes a single "manual" candidate from `host`. */
+interface ParsedTicket {
+  label: string;
+  host: string;
+  port: string;
+  user: string;
+  addresses: AddressCandidate[];
+}
+
 /** Decode a `fdpair:<base64-json>` ticket a server printed, tolerating surrounding
- *  quotes/whitespace. Returns the pre-fill fields, or null if it isn't a valid ticket. */
-function parseTicket(raw: string): { label: string; host: string; port: string; user: string } | null {
+ *  quotes/whitespace. Returns the pre-fill fields, or null if it isn't a valid ticket.
+ *  Exported for the regression test on the addresses/back-compat shape. */
+export function parseTicket(raw: string): ParsedTicket | null {
   try {
     let s = raw.trim();
     const i = s.indexOf("fdpair:");
     if (i >= 0) s = s.slice(i + "fdpair:".length).trim();
     s = s.replace(/[`'"]/g, "");
     const t = JSON.parse(atob(s));
+    const host = String(t.host ?? "");
+    // Old tickets (printed before address discovery existed) carry no `addresses`
+    // field at all — tolerate that by synthesizing a single manual candidate from
+    // `host`, so the confirm screen always has at least one to show.
+    const rawAddresses: unknown[] = Array.isArray(t.addresses) ? t.addresses : [];
+    const addresses: AddressCandidate[] = rawAddresses
+      .filter((a: unknown): a is Record<string, unknown> => typeof a === "object" && a !== null)
+      .map((a) => {
+        const kind = a.kind;
+        const value = String(a.value ?? "");
+        const validKind: AddressCandidate["kind"] = kind === "tailscale" || kind === "lan" ? kind : "manual";
+        return { kind: validKind, value };
+      })
+      .filter((a) => a.value !== "");
     return {
       label: String(t.label ?? ""),
-      host: String(t.host ?? ""),
+      host,
       port: String(t.port ?? "22"),
       user: String(t.user ?? ""),
+      addresses: addresses.length > 0 ? addresses : [{ kind: "manual", value: host }],
     };
   } catch {
     return null;
   }
+}
+
+/** Builds the one-line command the user runs ON the server to authorize Flight
+ *  Deck's key, note Claude/flightdeckd presence, discover reachable addresses, and
+ *  print a paste-back ticket. Exported (pure — takes only the public key) for the
+ *  no-real-newlines regression test.
+ *
+ *  Deliberately single-quote-free so it survives any shell wrapper, and joined with
+ *  `"; "` rather than `"\n"`: a serial paste target that submits each line on its own
+ *  Enter can leave an unterminated quote/subshell open across a REAL newline,
+ *  silently swallowing everything after it — one line (every statement already
+ *  self-terminated with `;`/`&&`/`||`) survives that intact. The `\\n` sequences
+ *  inside `printf` format strings are or must stay LITERAL two-character
+ *  backslash-n — printf itself turns those into real newlines in ITS output; they
+ *  must never collapse into a real newline in the script's own source text. */
+export function buildServerCommand(publicKey: string): string {
+  return [
+    `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
+    `printf "%s\\n" "${publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+    `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | sh) then run: claude\\n" >&2`,
+    `command -v flightdeckd >/dev/null 2>&1 || printf "NOTE: flightdeckd not found on PATH, ~/.local/bin or /usr/local/bin (needed for persistent sessions)\\n" >&2`,
+    `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
+    `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; LAN_H=$3; else LAN_H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi`,
+    `TS_H=""; if command -v tailscale >/dev/null 2>&1; then TS_H=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\.$//'); fi`,
+    `ADDR=""; SEP=""; H=""`,
+    `if [ -n "$TS_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"tailscale\\",\\"value\\":\\"$TS_H\\"}"; SEP=","; H="$TS_H"; fi`,
+    `if [ -n "$LAN_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"lan\\",\\"value\\":\\"$LAN_H\\"}"; SEP=","; [ -n "$H" ] || H="$LAN_H"; fi`,
+    `if [ -z "$H" ]; then MH=$(hostname); ADDR="$ADDR$SEP{\\"kind\\":\\"manual\\",\\"value\\":\\"$MH\\"}"; H="$MH"; fi`,
+    `T=$(printf "{\\"label\\":\\"%s\\",\\"host\\":\\"%s\\",\\"port\\":%s,\\"user\\":\\"%s\\",\\"addresses\\":[%s]}" "$(hostname)" "$H" "$P" "$U" "$ADDR" | base64 | tr -d "\\n")`,
+    `printf "\\n=== Flight Deck pairing ticket — copy the next line ===\\nfdpair:%s\\n" "$T"`,
+  ].join("; ");
 }
 
 /** Pair remote SSH servers and open conversations that run on them (the alpha
@@ -235,6 +293,10 @@ export function RemoteServersGroup() {
   const [host, setHost] = useState("");
   const [port, setPort] = useState("22");
   const [user, setUser] = useState("");
+  // Every address candidate the ticket discovered (Tailscale / LAN / hostname) — kept
+  // alongside `host` so the confirm screen can offer them and thread the full set
+  // through to `addMachine`. Reset to empty outside the "confirm" stage.
+  const [addresses, setAddresses] = useState<AddressCandidate[]>([]);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -251,6 +313,7 @@ export function RemoteServersGroup() {
     setHost("");
     setPort("22");
     setUser("");
+    setAddresses([]);
     setCopied(false);
     setBusy(false);
     setError(null);
@@ -264,26 +327,16 @@ export function RemoteServersGroup() {
     setGenKey(null);
     setTicket("");
     // Generate Flight Deck's dedicated key up front so the command (which embeds its
-    // PUBLIC key) is ready immediately — nothing to fill in first.
+    // PUBLIC key) is ready immediately — nothing to fill in first. Re-entering the
+    // wizard (close Settings, reopen, "+ Add a server" again) calls this again too —
+    // the core reuses the SAME not-yet-claimed pending key rather than minting a new
+    // one, so the command stays valid to re-paste until it's actually claimed.
     const res = await useConversationsStore.getState().generateMachineKey("server");
     if (res.ok) setGenKey({ identityFile: res.key.identity_file, publicKey: res.key.public_key });
     else setError(res.error);
   }, []);
 
-  // The command the user runs ON the server: authorize Flight Deck's key, check Claude,
-  // DISCOVER the coords (user / port / a reachable host / label), and print a paste-back
-  // ticket. Deliberately single-quote-free so it survives any shell wrapper.
-  const serverCommand = genKey
-    ? [
-        `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
-        `printf "%s\\n" "${genKey.publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
-        `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | sh) then run: claude\\n" >&2`,
-        `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
-        `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; H=$3; else H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi; [ -n "$H" ] || H=$(hostname)`,
-        `T=$(printf "{\\"label\\":\\"%s\\",\\"host\\":\\"%s\\",\\"port\\":%s,\\"user\\":\\"%s\\"}" "$(hostname)" "$H" "$P" "$U" | base64 | tr -d "\\n")`,
-        `printf "\\n=== Flight Deck pairing ticket — copy the next line ===\\nfdpair:%s\\n" "$T"`,
-      ].join("\n")
-    : "";
+  const serverCommand = genKey ? buildServerCommand(genKey.publicKey) : "";
 
   const copyCmd = useCallback(() => {
     void navigator.clipboard.writeText(serverCommand);
@@ -297,10 +350,15 @@ export function RemoteServersGroup() {
       setError("Couldn't read that ticket — copy the whole fdpair:… line the command printed.");
       return;
     }
+    // Prefer a discovered Tailscale name over a raw IP by default — it survives NAT
+    // and IP changes the way a LAN/SSH-derived IP doesn't. Falls back to whichever
+    // candidate the ticket led with (LAN, then hostname) when none was found.
+    const preferred = t.addresses.find((a) => a.kind === "tailscale") ?? t.addresses[0];
     setLabel(t.label);
-    setHost(t.host);
+    setHost(preferred?.value || t.host);
     setPort(t.port || "22");
     setUser(t.user);
+    setAddresses(t.addresses);
     setError(null);
     setStage("confirm");
   }, [ticket]);
@@ -314,11 +372,20 @@ export function RemoteServersGroup() {
       port: Number(port) || 22,
       user: user.trim(),
       identityFile: genKey?.identityFile ?? null,
+      addresses: addresses.length > 0 ? addresses : null,
     });
     setBusy(false);
-    if (res.ok) resetAdd();
-    else setError(res.error);
-  }, [label, host, port, user, genKey, resetAdd]);
+    if (res.ok) {
+      // Null this out FIRST (not just via resetAdd, below): the core renames this
+      // pending key to the new machine's id on a successful pair, so a stale
+      // genKey.identityFile must never be resubmitted for a SECOND server — e.g. the
+      // same pairing command pasted onto two boxes before either was paired here.
+      setGenKey(null);
+      resetAdd();
+    } else {
+      setError(res.error);
+    }
+  }, [label, host, port, user, genKey, addresses, resetAdd]);
 
   const toggleConv = useCallback((machineId: string) => {
     setAdding(false);
@@ -435,6 +502,10 @@ export function RemoteServersGroup() {
                   className={`${styles.btn} ${styles.ghost}`}
                   onClick={() => {
                     setError(null);
+                    // Manual entry has no ticket-discovered addresses of its own — a
+                    // leftover set from a PREVIOUSLY parsed ticket must not ride along
+                    // to whatever host the user types here.
+                    setAddresses([]);
                     setStage("manual");
                   }}
                 >
@@ -475,6 +546,24 @@ export function RemoteServersGroup() {
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
               />
+              {stage === "confirm" && addresses.length > 1 && (
+                <div className={styles.remoteStep}>
+                  Discovered addresses — pick one:
+                  <div className={styles.btnRow}>
+                    {addresses.map((a) => (
+                      <button
+                        key={`${a.kind}-${a.value}`}
+                        type="button"
+                        className={`${styles.btn} ${host === a.value ? styles.primary : styles.ghost}`}
+                        onClick={() => setHost(a.value)}
+                      >
+                        {a.kind === "tailscale" ? "Tailscale" : a.kind === "lan" ? "LAN" : "Hostname"}:{" "}
+                        {a.value}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className={styles.fieldRow}>
                 <input
                   className={styles.field}
@@ -505,6 +594,10 @@ export function RemoteServersGroup() {
                     className={`${styles.btn} ${styles.ghost}`}
                     onClick={() => {
                       setError(null);
+                      // Re-pasting a NEW ticket re-populates this from scratch (or a
+                      // manual host synthesizes none) — a stale set from THIS ticket
+                      // must not survive back to a re-edited host/step 2 round-trip.
+                      setAddresses([]);
                       setStage("command");
                     }}
                   >
