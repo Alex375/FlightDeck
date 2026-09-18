@@ -1108,7 +1108,7 @@ const CAFFEINATE_MODES: Array<{ id: CaffeinateMode; label: string; desc: string 
   {
     id: "light",
     label: "Light — follow the agents",
-    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. As soon as the whole fleet is idle, the Mac is free to sleep. The everyday mode: it never keeps the Mac awake needlessly.",
+    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the Mac is free to sleep — the minute lets an agent pick its work back up after a background task finishes. The everyday mode: it never keeps the Mac awake needlessly.",
   },
   {
     id: "hard",

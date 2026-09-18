@@ -13,8 +13,8 @@ const STORAGE_KEY = "tosse:caffeinate";
 
 /** How aggressively the Mac is kept awake while Caffeinate is ON.
  *  - `light`: keep awake only while an agent is actively working — a running turn OR a
- *    running background task. When the whole fleet is idle, let the Mac sleep. Auto,
- *    ref-counted on fleet activity.
+ *    running background task. Once the whole fleet has been idle for
+ *    {@link LIGHT_RELEASE_GRACE_MS}, let the Mac sleep. Auto, ref-counted on fleet activity.
  *  - `hard` : keep awake permanently while ON, independent of activity — for Scheduled
  *    Tasks that may fire while nothing is running. Released only when Caffeinate is OFF. */
 export type CaffeinateMode = "light" | "hard";
@@ -63,6 +63,24 @@ export function caffeineDesired(
 ): boolean {
   if (!enabled) return false;
   return mode === "hard" || anyAgentActive;
+}
+
+/** How long Light mode keeps holding the Mac awake after the fleet goes idle.
+ *
+ *  "Idle" is not always idle: when a background task finishes, the CLI starts a follow-up turn
+ *  on its own to handle the `<task-notification>`, but that turn only reads as busy at its
+ *  first `message_start` — seconds later on a large context. The task's completion drops the
+ *  activity count to zero in between, and a Mac idle past its sleep timer goes to sleep
+ *  within ~5 s of the release (seen 2026-09-18: slept 1 s before the re-hold, mid-turn).
+ *  The grace window bridges that gap; the cost is the Mac staying up one extra minute. */
+export const LIGHT_RELEASE_GRACE_MS = 60_000;
+
+/** Pure: how long to keep holding before a release takes effect. Only Light mode lingers —
+ *  that release follows fleet activity, which has the gap above. Turning Caffeinate OFF is
+ *  the user saying "let it sleep" and releases at once (so does Hard, whose only release IS
+ *  being turned off). */
+export function releaseGraceMs(enabled: boolean, mode: CaffeinateMode): number {
+  return enabled && mode === "light" ? LIGHT_RELEASE_GRACE_MS : 0;
 }
 
 interface CaffeinateState extends CaffeinatePrefs {

@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { caffeineDesired } from "./caffeinate";
+import { caffeineDesired, LIGHT_RELEASE_GRACE_MS, releaseGraceMs } from "./caffeinate";
+
+describe("releaseGraceMs", () => {
+  it("lingers only for Light's activity-driven release", () => {
+    expect(releaseGraceMs(true, "light")).toBe(LIGHT_RELEASE_GRACE_MS);
+  });
+
+  it("releases at once when the user turns Caffeinate off", () => {
+    expect(releaseGraceMs(false, "light")).toBe(0);
+    expect(releaseGraceMs(false, "hard")).toBe(0);
+  });
+
+  it("does not linger in Hard (its only release is being turned off)", () => {
+    expect(releaseGraceMs(true, "hard")).toBe(0);
+  });
+});
 
 describe("caffeineDesired", () => {
   it("never holds when disabled, whatever the mode or activity", () => {
