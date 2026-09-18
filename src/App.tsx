@@ -404,9 +404,9 @@ export default function App() {
       {/* Idem (render-null): executes the app-control tool calls bridged from the
           app-hosted MCP servers (agents piloting the app). Mounted HERE so it can
           drive the view, like the keyboard shortcuts. */}
-      <AppControlHost changeView={changeView} tosseAvailable={tosseAvailable} />
+      <AppControlHost changeView={changeView} currentView={view} tosseAvailable={tosseAvailable} />
       {/* Idem (render-null): the voice agent's helpers + announcement drain. */}
-      <VoiceHost changeView={changeView} tosseAvailable={tosseAvailable} />
+      <VoiceHost changeView={changeView} currentView={view} tosseAvailable={tosseAvailable} />
       {/* Idem (render-null): keeps each linked conversation's copy of its TOSSE task in step
           with the CRM, so the delete warning stops asking about tasks that are already done. */}
       <LinkedTaskSync />

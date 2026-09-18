@@ -185,6 +185,13 @@ export interface DisplayPrefs {
    *  never mounted; open workspaces are kept for when it comes back. Read by {@link App}. */
   ideView: boolean;
 
+  /** Fade the HIDDEN entries of the file explorer — every name starting with a dot
+   *  (`.git`, `.claude`, `.DS_Store`, `.editorconfig`…): paler text, a desaturated icon.
+   *  They stay listed and fully usable; they just stop competing with the files you came
+   *  for. ON by default. Applies to every file tree (IDE view and the conversation's side
+   *  editor). Read by `FileTree`. */
+  explorerDimHidden: boolean;
+
   /** Keep the window on the TASKS view after pressing « Start » on a task — the conversation
    *  opens and its first message goes out, but the app does not follow it. ON by default:
    *  starting is a HAND-OFF (the agent picks the task up on its own), so being thrown into a
@@ -310,6 +317,7 @@ const DEFAULTS: DisplayPrefs = {
   tosseRepoBadge: true,
   tosseTasksView: true,
   ideView: true,
+  explorerDimHidden: true,
   tosseStartStaysOnTasks: true,
   tosseTaskDeleteWarning: true,
   // ON, though it is the only preference here that sends CRM data to a third party: the
@@ -384,6 +392,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         ideView: patch.ideView ?? s.ideView,
+        explorerDimHidden: patch.explorerDimHidden ?? s.explorerDimHidden,
         tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,

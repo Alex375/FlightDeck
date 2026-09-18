@@ -16,6 +16,7 @@ import {
   type Repo,
 } from "../../store/conversationsStore";
 import { ideBlockedReason, openRepoInIde } from "../ide/openInIde";
+import { useAppErrors } from "../../store/appErrors";
 import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
@@ -319,16 +320,24 @@ function RepoGroup({
           <Ico name="layers" className="sm" />
         </button>
         {/* Open the folder in the IDE view — explorer, editor, terminals and this
-            repository's conversations docked under them. Disabled WITH the reason for a
-            remote repository: the IDE reads this Mac's disk. */}
+            repository's conversations docked under them. Refused WITH the reason for a
+            remote repository (the IDE reads this Mac's disk). ⚠️ `aria-disabled`, not
+            `disabled`: a disabled button takes no pointer events, so its tooltip — the
+            reason — would never render. It stays hoverable, and the click says why. */}
         {ideEnabled ? (
           <button
             type="button"
             className="cv-repo-act cv-repo-reveal"
             title={ideBlocked ?? "Open this repository in the IDE"}
             aria-label="Open in IDE"
-            disabled={!!ideBlocked}
-            onClick={() => openRepoInIde(repo)}
+            aria-disabled={ideBlocked ? true : undefined}
+            onClick={() => {
+              if (ideBlocked) {
+                useAppErrors.getState().pushError("Can't open this repository in the IDE", ideBlocked);
+                return;
+              }
+              openRepoInIde(repo);
+            }}
           >
             <Ico name="ide" className="sm" />
           </button>

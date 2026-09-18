@@ -3,10 +3,12 @@ import { useShallow } from "zustand/react/shallow";
 import { commands } from "../../ipc/client";
 import type { FsEntry } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
+import { useDisplay } from "../../store/display";
 import { Ico } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { baseName, dirName } from "./language";
 import { useEditorStore, type EditTarget } from "./editorStore";
+import { isHiddenName } from "./hiddenEntries";
 import { FileContextMenu, type CtxMenuEntry } from "./FileContextMenu";
 import { fileIconUrl, folderIconUrl, useFileIcons, type IconMap } from "./fileIcons";
 import styles from "./editor.module.css";
@@ -114,10 +116,14 @@ function EditRow({
  * The file tree for a conversation, rooted at its working directory. Lazily
  * expands one level per click (`toggleDir` reads exactly that directory), so even
  * a huge repo only reads what the user opens. Selects just the tree-relevant
- * slice (dirs / expanded / errors / activeTab / editing) with a shallow
- * comparison, so typing in an open buffer — which mutates a sibling part of the
- * store — never re-renders it. Right-click opens a VS Code-style context menu
+ * slice (dirs / expanded / errors / activeTab / editing / treeReveal) with a
+ * shallow comparison, so typing in an open buffer — which mutates a sibling part of
+ * the store — never re-renders it. Right-click opens a VS Code-style context menu
  * (new / rename / delete / cut / copy / paste / reveal).
+ *
+ * Two display behaviours ride on the rows: a one-shot scroll request from
+ * `revealInTree` (found by `data-path`), and the dimming of hidden dot-names, which
+ * stay listed and clickable but styled as things you did not mean to open.
  */
 export function FileTree({
   convId,
@@ -131,7 +137,7 @@ export function FileTree({
   /** Hide the tree — the panel decides which layout (the global one or a host's own) flips. */
   onCollapse: () => void;
 }) {
-  const { dirs, expanded, loadingDirs, dirErrors, activeTab, editing } = useEditorStore(
+  const { dirs, expanded, loadingDirs, dirErrors, activeTab, editing, treeReveal } = useEditorStore(
     useShallow((s) => {
       const c = s.byConv[convId];
       return {
@@ -141,10 +147,14 @@ export function FileTree({
         dirErrors: c?.dirErrors ?? EMPTY_ERRORS,
         activeTab: c?.activeTab ?? null,
         editing: c?.editing ?? null,
+        treeReveal: c?.treeReveal ?? null,
       };
     }),
   );
   const toggleDir = useEditorStore((s) => s.toggleDir);
+  const clearTreeReveal = useEditorStore((s) => s.clearTreeReveal);
+  // Dot-names (.git, .DS_Store…) are dimmed unless the user turned that off.
+  const dimHidden = useDisplay((s) => s.explorerDimHidden);
   const openFile = useEditorStore((s) => s.openFile);
   const startCreate = useEditorStore((s) => s.startCreate);
   const startRename = useEditorStore((s) => s.startRename);
@@ -165,6 +175,10 @@ export function FileTree({
   const [confirmDelete, setConfirmDelete] = useState<FsEntry | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // The rendered rows, scoping the reveal's `data-path` lookup below (the scroll
+  // itself walks up to `.tree`, which is the scrolling element).
+  const bodyRef = useRef<HTMLDivElement>(null);
+
   // Paths cut to the clipboard — dimmed in the tree until pasted (or replaced).
   const cutSet = useMemo(
     () => (clipboard?.mode === "cut" ? new Set(clipboard.paths) : EMPTY_SET),
@@ -180,6 +194,25 @@ export function FileTree({
       void toggleDir(convId, root);
     }
   }, [convId, root, dirs, loadingDirs, dirErrors, toggleDir]);
+
+  // Consume a one-shot "scroll this row into view" request (`revealInTree` records
+  // it only once every ancestor listing is in, so the row is rendered in the very
+  // commit this effect runs after). `block: "nearest"` scrolls the minimum needed —
+  // a row already on screen doesn't move — and nothing here takes focus: the user
+  // may be typing in the editor while the explorer catches up.
+  useEffect(() => {
+    if (!treeReveal) return;
+    const row = bodyRef.current?.querySelector<HTMLElement>(
+      // A path is a CSS string here, so only `"` and `\` need escaping.
+      `[data-path="${treeReveal.path.replace(/["\\]/g, "\\$&")}"]`,
+    );
+    row?.scrollIntoView({ block: "nearest" });
+    // Consumed either way: a row we could not find (the file is no longer in the
+    // parent's listing) must not leave a request pending for every later render to
+    // retry. The reveal is ambient, so a miss is silent BY DESIGN — a real failure
+    // to read a directory is already surfaced by `dirErrors` on the way down.
+    clearTreeReveal(convId);
+  }, [treeReveal, convId, clearTreeReveal]);
 
   const rootEntries = dirs[root];
   const rootIcon = iconMap ? folderIconUrl(iconMap, root, true) : null;
@@ -276,7 +309,7 @@ export function FileTree({
           <Ico name="x" className="sm" />
         </button>
       </div>
-      <div className={styles.treeBody} onContextMenu={(e) => openMenu(e, null)}>
+      <div ref={bodyRef} className={styles.treeBody} onContextMenu={(e) => openMenu(e, null)}>
         {dirErrors[root] ? (
           <div className={styles.treeError} title={dirErrors[root]}>
             <Ico name="alert" className="sm" />
@@ -313,6 +346,7 @@ export function FileTree({
                   activeTab={activeTab}
                   editing={editing}
                   cutSet={cutSet}
+                  dimHidden={dimHidden}
                   iconMap={iconMap}
                   onToggleDir={(p) => void toggleDir(convId, p)}
                   onOpenFile={(p) => void openFile(convId, p, { preview: true })}
@@ -372,6 +406,8 @@ interface NodeProps {
   activeTab: string | null;
   editing: EditTarget | null;
   cutSet: Set<string>;
+  /** Dim rows whose OWN name is a dot-name (display preference `explorerDimHidden`). */
+  dimHidden: boolean;
   iconMap: IconMap | null;
   onToggleDir: (path: string) => void;
   onOpenFile: (path: string) => void;
@@ -391,6 +427,7 @@ function TreeNode({
   activeTab,
   editing,
   cutSet,
+  dimHidden,
   iconMap,
   onToggleDir,
   onOpenFile,
@@ -402,6 +439,9 @@ function TreeNode({
   const isOpen = entry.is_dir && !!expanded[entry.path];
   const children = isOpen ? dirs[entry.path] : undefined;
   const active = !entry.is_dir && activeTab === entry.path;
+  // Only the row's OWN name dims it: the contents of a `.claude/` are ordinary
+  // files, and once you have opened that folder you are working IN it.
+  const hidden = dimHidden && isHiddenName(entry.name);
   const err = entry.is_dir ? dirErrors[entry.path] : undefined;
   const renaming = editing?.kind === "rename" && editing.targetPath === entry.path;
   const newHere = isOpen && editing && editing.kind !== "rename" && editing.parentPath === entry.path;
@@ -419,7 +459,14 @@ function TreeNode({
       ) : (
         <button
           type="button"
-          className={styles.row + (active ? " " + styles.rowActive : "") + (cutSet.has(entry.path) ? " " + styles.rowCut : "")}
+          // `data-path` is how a reveal finds this row to scroll it into view.
+          data-path={entry.path}
+          className={
+            styles.row +
+            (active ? " " + styles.rowActive : "") +
+            (cutSet.has(entry.path) ? " " + styles.rowCut : "") +
+            (hidden ? " " + styles.rowHidden : "")
+          }
           style={{ paddingLeft: depth * INDENT + 8 }}
           onClick={() => (entry.is_dir ? onToggleDir(entry.path) : onOpenFile(entry.path))}
           onDoubleClick={() => (entry.is_dir ? undefined : onPinFile(entry.path))}
@@ -474,6 +521,7 @@ function TreeNode({
               activeTab={activeTab}
               editing={editing}
               cutSet={cutSet}
+              dimHidden={dimHidden}
               iconMap={iconMap}
               onToggleDir={onToggleDir}
               onOpenFile={onOpenFile}

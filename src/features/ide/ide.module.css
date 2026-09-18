@@ -109,7 +109,11 @@
   min-height: 0;
   display: flex;
 }
+/* Relative so the drop-zone overlay can pin itself to the editor + dock area. Nothing else
+   inside positions itself against an ancestor this far out (the editor's and the composer's
+   own absolutes all sit under a nearer relative parent). */
 .split {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -139,6 +143,40 @@
   align-items: stretch;
   background: var(--wf-bg-2);
   border-bottom: 1px solid var(--wf-line);
+}
+/* While the panel is being dragged the whole header reads as held. (The page-wide
+   `grabbing` cursor is set on <body> by the drag itself, for everywhere the pointer goes.) */
+.dockHead[data-dragging] {
+  cursor: grabbing;
+}
+
+/* ---- Moving the dock: the grip, and the drop zones it drags onto ---- */
+/* The affordance for the whole feature — a panel that can be moved has to LOOK like one,
+   which a lone icon button on the far right never did. */
+.grip {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 18px;
+  height: 24px;
+  margin-left: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--wf-tx-xlo);
+  cursor: grab;
+  /* The gesture is ours from the first pointerdown: no scrolling or panning may take the
+     pointer sequence away mid-drag. */
+  touch-action: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.grip:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx);
+}
+.dockHead[data-dragging] .grip {
+  cursor: grabbing;
+  color: var(--wf-accent);
 }
 .modeSwitch {
   flex: 0 0 auto;
@@ -198,6 +236,9 @@
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
+  /* Its EMPTY end is a second place to take hold of the panel; the tabs and the + button
+     carry their own `pointer` cursor, so only the filler shows this one. */
+  cursor: grab;
 }
 .tabStrip::-webkit-scrollbar {
   display: none;
@@ -228,8 +269,11 @@
   color: var(--wf-tx-hi);
   box-shadow: inset 0 -2px 0 var(--wf-accent);
 }
-.convTab {
-  padding-right: 12px;
+/* (No extra right padding: a conversation tab ends on its close button, like a terminal's.)
+   The focus ring is the keyboard user's only cue on a div-based tab. */
+.convTab:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: -1px;
 }
 /* A conversation that wants the user tints its tab in its status colour — the sidebar
    row's language, so "amber = it is waiting for you" means the same thing here. */
@@ -305,15 +349,37 @@
   opacity: 0;
   transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
 }
+/* …and whenever the keyboard reaches it (the tab itself, or the button): an invisible
+   focused × would close a tab the user cannot see is targeted. */
 .tab:hover .tabClose,
 .tab[data-on] .tabClose,
+.tab:focus-within .tabClose,
 .wsTab:hover .tabClose,
-.wsTabOn .tabClose {
+.wsTabOn .tabClose,
+.wsTab:focus-within .tabClose,
+.tabClose:focus-visible {
   opacity: 1;
 }
 .tabClose:hover {
   background: var(--wf-panel-3);
   color: var(--wf-tx-hi);
+}
+.tabClose:focus-visible,
+.tab:focus-visible,
+.wsTab:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: -1px;
+}
+/* A pinned conversation whose agent has LEFT this folder: the name reads as "not from
+   here" (dimmed, italic) and carries a small "elsewhere" glyph. */
+.convTab[data-outside] .tabName {
+  font-style: italic;
+  color: var(--wf-tx-lo);
+}
+.tabOutside {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--wf-tx-lo);
 }
 .tabAdd {
   flex: 0 0 auto;
@@ -363,6 +429,24 @@
 .headBtn[data-on] {
   color: var(--wf-accent);
 }
+/* "N closed tabs" — wider than a plain header button: it carries a count (and pips). */
+.reopenBtn {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.reopenBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
 /* The kit's chevron points down; "maximize" wants it pointing up. */
 .flip {
   transform: rotate(180deg);
@@ -390,6 +474,100 @@
 }
 .empty p {
   margin: 0;
+}
+.emptyActions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+/* ---- Drop zones (shown over the editor + dock while the panel is dragged) ---- */
+.dropOverlay {
+  position: absolute;
+  inset: 0;
+  /* Above Monaco's own layers and xterm's canvases, below the kit's portalled menus (200).
+     It is a picture of the drag, never a participant: it must never be what a pointer
+     lands on, or the drop would be hit-tested against the overlay instead of the area. */
+  z-index: 40;
+  pointer-events: none;
+}
+.dropZone {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed color-mix(in srgb, var(--wf-accent) 50%, transparent);
+  border-radius: var(--wf-r-l);
+  /* Veils what is underneath instead of hiding it: the editor stays recognisable, so the
+     zone reads as a place on screen rather than as a floating rectangle. */
+  background: color-mix(in srgb, var(--wf-bg) 62%, transparent);
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+/* The inset keeps the outline clear of the window edges; the size on the other axis comes
+   from the component, out of the same constant the hit-test uses. */
+.dropZone[data-zone="bottom"] {
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+}
+.dropZone[data-zone="right"] {
+  top: 6px;
+  right: 6px;
+  bottom: 6px;
+}
+/* The one under the pointer: solid, filled, unmistakable — this is where it lands. */
+.dropZone[data-hot] {
+  border-style: solid;
+  border-color: var(--wf-accent);
+  background: var(--wf-accent-dim);
+}
+.dropChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 10px 26px -14px #000;
+}
+.dropZone[data-hot] .dropChip {
+  border-color: var(--wf-accent);
+  color: var(--wf-tx-hi);
+}
+/* "current" — dropping here leaves the panel exactly where it already is. */
+.dropCurrent {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--wf-tx-xlo);
+}
+.dropZone[data-hot] .dropCurrent {
+  color: var(--wf-accent);
+}
+.dropHint {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  /* Over the zones: the right-hand one reaches the top of the area and would otherwise
+     swallow the middle of the sentence as soon as it goes solid. */
+  z-index: 1;
+  max-width: calc(100% - 20px);
+  padding: 5px 13px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 10px 26px -14px #000;
 }
 
 /* ---- Status bar ---- */

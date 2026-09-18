@@ -5,7 +5,13 @@ import { Ico } from "../../ui/kit";
 import { useGitAutoRefresh, useGitStatus } from "../../ipc/useGit";
 import { useConversations, useRepos } from "../../store/conversationsStore";
 import { AttentionPips } from "./IdeAttention";
-import { useIdeStore, workspaceConversations, type DockMode, type IdeWorkspace } from "./ideStore";
+import {
+  splitConversationTabs,
+  useIdeStore,
+  workspaceConversations,
+  type DockMode,
+  type IdeWorkspace,
+} from "./ideStore";
 import styles from "./ide.module.css";
 
 export function IdeStatusBar({ ws }: { ws: IdeWorkspace }) {
@@ -21,7 +27,11 @@ export function IdeStatusBar({ ws }: { ws: IdeWorkspace }) {
   const setDockOpen = useIdeStore((s) => s.setDockOpen);
   const conversations = useConversations();
   const repos = useRepos();
-  const convIds = workspaceConversations(ws, conversations, repos).map((c) => c.id);
+  const allConvs = workspaceConversations(ws, conversations, repos);
+  // The count is the tabs on show; the pips listen to EVERY conversation of the folder —
+  // closing a tab must not silence an agent that needs you.
+  const convIds = allConvs.map((c) => c.id);
+  const openTabCount = splitConversationTabs(allConvs, ws.closedConvIds).open.length;
 
   // Clicking the mode already on screen closes the panel; anything else shows that mode.
   const toggle = (mode: DockMode) => {
@@ -71,7 +81,7 @@ export function IdeStatusBar({ ws }: { ws: IdeWorkspace }) {
       >
         <Ico name="chat" className="sm" />
         Conversations
-        {convIds.length > 0 ? <span className={styles.statusDim}>{convIds.length}</span> : null}
+        {openTabCount > 0 ? <span className={styles.statusDim}>{openTabCount}</span> : null}
         {/* With the conversations off screen, a waiting agent shows up here. */}
         {dockOpen && dockMode === "conversations" ? null : <AttentionPips convIds={convIds} />}
       </button>

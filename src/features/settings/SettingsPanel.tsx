@@ -13,6 +13,7 @@ import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
+import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, formatZoom, nextZoom, prevZoom } from "../../ui/zoom";
@@ -93,6 +94,7 @@ const DISPLAY_SUBS = [
   { id: "timing", label: "Durations", icon: "clock" },
   { id: "composer", label: "Composer", icon: "wand" },
   { id: "models", label: "Models", icon: "spark" },
+  { id: "ide", label: "IDE", icon: "ide" },
   { id: "order", label: "Order", icon: "reorder" },
 ] as const;
 
@@ -404,6 +406,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 {displaySub === "timing" && <TimingPrefs />}
                 {displaySub === "composer" && <ComposerSection embedded />}
                 {displaySub === "models" && <ModelsSection embedded />}
+                {displaySub === "ide" && <IdePrefs />}
                 {displaySub === "order" && <OrderingPrefs />}
               </div>
             )}
@@ -563,7 +566,6 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
  *  "how does the app itself look", as opposed to the thread ({@link ThreadPrefs}). */
 function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
-  const ideView = useDisplay((s) => s.ideView);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
   const set = useDisplay((s) => s.set);
@@ -581,23 +583,6 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
-        />
-        <ToggleRow
-          title="IDE view"
-          hint={
-            <>
-              A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
-              way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
-              <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
-              — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
-              buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
-              the tab and those buttons disappear; your open folders are kept for when you turn
-              it back on. <strong>On by default.</strong>
-            </>
-          }
-          checked={ideView}
-          onChange={(v) => set({ ideView: v })}
-          label="Show the IDE view"
         />
         <ToggleRow
           title="Live workflow on the Flight Deck card"
@@ -635,6 +620,105 @@ function AppearancePrefs() {
       </SettingsGroup>
 
     </>
+  );
+}
+
+/** Bottom vs right for the IDE dock (Display → IDE → "Panel position"): the same "pick
+ *  one" shape as Caffeinate's mode and the minimap's hover mode, rendered through the
+ *  shared {@link OptionCardRail}. */
+const IDE_DOCK_POSITIONS: Array<{ id: DockPosition; label: string; desc: string }> = [
+  {
+    id: "bottom",
+    label: "Bottom",
+    desc: "Under the editor, like an IDE's terminal panel.",
+  },
+  {
+    id: "right",
+    label: "Right",
+    desc: "Beside the editor, as a right-hand margin — taller, better for reading a conversation.",
+  },
+];
+
+/** The "IDE" card of Display → IDE: the IDE view's own home. Holds the toggle that used
+ *  to sit in Appearance (unrelated to "how the app itself looks" — it is its own
+ *  feature), where its dock sits, and the hidden-file dimming it shares with the
+ *  conversation's side editor. `dockPosition` lives in the IDE store, not `useDisplay`
+ *  — see ideStore's `Layout` — because it is IDE layout, not a global display default. */
+function IdePrefs() {
+  const ideView = useDisplay((s) => s.ideView);
+  const explorerDimHidden = useDisplay((s) => s.explorerDimHidden);
+  const set = useDisplay((s) => s.set);
+  const dockPosition = useIdeStore((s) => s.dockPosition);
+  const setDockPosition = useIdeStore((s) => s.setDockPosition);
+  return (
+    <SettingsGroup title="IDE" icon="ide">
+      <ToggleRow
+        title="IDE view"
+        hint={
+          <>
+            A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
+            way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
+            <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
+            — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
+            buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
+            the tab and those buttons disappear; your open folders are kept for when you turn
+            it back on. <strong>On by default.</strong>
+          </>
+        }
+        checked={ideView}
+        onChange={(v) => set({ ideView: v })}
+        label="Show the IDE view"
+      />
+      {/* Not a ToggleRow: the IDE dock's own layout, not a display default, so it reads
+          from useIdeStore rather than useDisplay. Greyed out (rather than hidden) while
+          the IDE view is off — the reason lives in the always-visible note below, since a
+          disabled control's tooltip never shows. Guarding `onSelect` too: opacity + the
+          wrapper's `pointerEvents` block the mouse, but a Tab-focused card could still be
+          activated by the keyboard. */}
+      <div className={styles.modeBlock}>
+        <div className={styles.ttitle} style={ideView ? undefined : { opacity: 0.5 }}>
+          Panel position
+        </div>
+        <div
+          style={ideView ? undefined : { opacity: 0.5, pointerEvents: "none" }}
+          aria-disabled={ideView ? undefined : true}
+        >
+          <OptionCardRail
+            options={IDE_DOCK_POSITIONS}
+            selected={dockPosition}
+            onSelect={(id) => {
+              if (ideView) setDockPosition(id);
+            }}
+            ariaLabel="IDE dock position"
+          />
+        </div>
+        <div className={styles.note}>
+          {ideView ? (
+            <>
+              Can also be changed by dragging the grip at the left of the panel's header, or
+              with the button in that header.
+            </>
+          ) : (
+            <>Turn on “IDE view” above to change where the panel sits.</>
+          )}
+        </div>
+      </div>
+      <ToggleRow
+        title="Dim hidden files in the explorer"
+        hint={
+          <>
+            Fades every name starting with a dot (<code>.git</code>, <code>.claude</code>,{" "}
+            <code>.DS_Store</code>…) in the file explorer: paler text, a desaturated icon. The
+            entries stay <strong>listed and fully usable</strong> — they just stop competing
+            with the files you came for. Applies to <strong>every file tree</strong>: the IDE
+            view and the conversation's side editor. <strong>On by default.</strong>
+          </>
+        }
+        checked={explorerDimHidden}
+        onChange={(v) => set({ explorerDimHidden: v })}
+        label="Dim hidden files in the explorer"
+      />
+    </SettingsGroup>
   );
 }
 

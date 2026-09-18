@@ -14,8 +14,10 @@ import { EditorPanel, type TreeLayout } from "../editor/EditorPanel";
 import { Splitter } from "../editor/Splitter";
 import { MIN_CONVERSATION_PANE_PX } from "../conversation/composerLayout";
 import { AttentionPips } from "./IdeAttention";
+import { DockDropZones } from "./DockDropZones";
 import { IdeDock } from "./IdeDock";
 import { IdeStatusBar } from "./IdeStatusBar";
+import { useDockDrag } from "./useDockDrag";
 import { ideBlockedReason, openPickedFolderInIde, openRepoInIde } from "./openInIde";
 import {
   editorKeyFor,
@@ -52,9 +54,19 @@ function WorkspaceStrip() {
         <div
           key={w.id}
           role="tab"
+          // Focusable + Enter/Space, like the dock's tabs: a div-based tab is otherwise out
+          // of the keyboard's reach (it cannot be a <button> — it holds its close button).
+          tabIndex={0}
           aria-selected={w.id === activeId}
           className={styles.wsTab + (w.id === activeId ? " " + styles.wsTabOn : "")}
           onClick={() => setActive(w.id)}
+          onKeyDown={(e) => {
+            if (e.target !== e.currentTarget) return;
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setActive(w.id);
+            }
+          }}
           title={w.path}
         >
           <Ico name="folder" className="sm" />
@@ -204,6 +216,7 @@ function Workspace({
           cwd={ws.path}
           stacked={false}
           flush
+          autoReveal
           treeLayout={treeLayout}
           wrapEditor={(editor) => (
             <EditorAndDock editor={editor} ws={ws} onOpenConversation={onOpenConversation} />
@@ -215,7 +228,9 @@ function Workspace({
   );
 }
 
-/** The editor with the dock under it (or beside it), split by a draggable divider. */
+/** The editor with the dock under it (or beside it), split by a draggable divider — and the
+ *  level that owns MOVING the dock from one to the other: it renders both the header that
+ *  starts the drag and the overlay that shows where the panel would land. */
 function EditorAndDock({
   editor,
   ws,
@@ -230,9 +245,16 @@ function EditorAndDock({
   const dockFraction = useIdeStore((s) => s.dockFraction);
   const dockMaximized = useIdeStore((s) => s.dockMaximized);
   const setDockFraction = useIdeStore((s) => s.setDockFraction);
+  const setDockPosition = useIdeStore((s) => s.setDockPosition);
   const ref = useRef<HTMLDivElement>(null);
   const bottom = dockPosition === "bottom";
   const maximized = dockOpen && dockMaximized;
+  // Dragging the panel to the bottom or to the right. This is the level that owns it: the
+  // dock's header starts the drag, and the overlay that shows where it would land is a
+  // sibling of the editor and dock — both are rendered here. Transient by nature (it lives
+  // for the length of one gesture), so it stays in React and out of the persisted store,
+  // which only ever hears the RESULT through `setDockPosition`.
+  const drag = useDockDrag(ref, setDockPosition);
 
   const onDrag = (clientX: number, clientY: number) => {
     const rect = ref.current?.getBoundingClientRect();
@@ -265,15 +287,27 @@ function EditorAndDock({
             style={{
               flex: `${maximized ? 1 : dockFraction} 1 0`,
               // Beside the editor the dock must still fit a composer — the same floor the
-              // conversation view gives its own conversation column.
-              minWidth: bottom ? 0 : MIN_CONVERSATION_PANE_PX,
+              // conversation view gives its own conversation column — but never MORE than
+              // the row has: on a narrow window (or a wide explorer) a fixed 552px floor
+              // overflowed the row and pushed the header's buttons off-screen with no way
+              // to scroll to them. A cramped composer beats unreachable controls.
+              minWidth: bottom ? 0 : `min(${MIN_CONVERSATION_PANE_PX}px, 100%)`,
               minHeight: bottom ? 150 : 0,
             }}
           >
-            <IdeDock ws={ws} onOpenConversation={onOpenConversation} />
+            <IdeDock
+              ws={ws}
+              onOpenConversation={onOpenConversation}
+              onMoveStart={drag.start}
+              moving={drag.active}
+            />
           </div>
         </>
       ) : null}
+      {/* Over both slots, and only while the pointer is down. It measures itself against
+          this very container — which keeps its full box even when the editor slot is
+          hidden behind a maximized dock. */}
+      {drag.active ? <DockDropZones hot={drag.hot} current={dockPosition} /> : null}
     </div>
   );
 }

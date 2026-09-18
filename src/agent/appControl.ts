@@ -44,6 +44,8 @@ import {
 import { useDisplay } from "../store/display";
 import { useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
+import { IDE_SETTING_PATH, ideBlockedReason, openFileInIde } from "../features/ide/openInIde";
+import { useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
@@ -61,6 +63,10 @@ import type { View } from "../ui/shortcuts";
  *  lives in App state, injected the same way `runAppAction` receives it). */
 export interface AppControlHelpers {
   changeView: (view: View) => void;
+  /** The view on screen RIGHT NOW — so a tool can route to where the user is looking
+   *  instead of yanking them somewhere else (see `defaultOpenFileView`). Optional: a host
+   *  that cannot tell (none today) simply gets the historical behaviour. */
+  currentView?: View;
   /** Whether the TOSSE view currently exists (signed in + pref on). `changeView`
    *  silently no-ops on an unavailable view; a TOOL result must not — the caller
    *  needs the refusal, not a success that did nothing. */
@@ -788,6 +794,28 @@ async function addRepo(args: Record<string, unknown>) {
   return { repo_id: repo.id, name: baseName(path), path };
 }
 
+/**
+ * Where `open_file` opens when the agent did not say: WHERE THE USER IS LOOKING.
+ *
+ * An agent has no idea which view is on screen, so it omits `view` — and the historical
+ * default ("conversation") then threw a user who was working in the IDE view out of it,
+ * to show the file in a side editor they were not using. So: when the IDE view is on
+ * screen AND its current workspace holds this agent's conversation, the file belongs in
+ * that workspace's editor (the very route a click on its file mention takes there).
+ * Everywhere else the historical default stands — including when the workspace on screen
+ * is another folder's: opening a file must not swap the folder under the user.
+ */
+function defaultOpenFileView(conv: Conversation, helpers: AppControlHelpers): "conversation" | "ide" {
+  if (helpers.currentView !== "ide") return "conversation";
+  const ide = useIdeStore.getState();
+  const ws = ide.workspaces.find((w) => w.id === ide.activeId);
+  if (!ws) return "conversation";
+  const { conversations, repos } = useConversationsStore.getState();
+  return workspaceConversations(ws, conversations, repos).some((c) => c.id === conv.id)
+    ? "ide"
+    : "conversation";
+}
+
 async function openFile(
   args: Record<string, unknown>,
   session: string | null,
@@ -796,19 +824,49 @@ async function openFile(
   const conv = resolveTarget(args, session);
   const path = typeof args.path === "string" ? args.path.trim() : "";
   if (!path) throw new Error("open_file: 'path' is required");
+  // No explicit `view` → follow the user's eyes (see defaultOpenFileView); anything other
+  // than the two known views is a caller mistake, not a silent fallback.
+  const view = args.view ?? defaultOpenFileView(conv, helpers);
+  if (view !== "conversation" && view !== "ide")
+    throw new Error("open_file: 'view' must be conversation | ide");
+  if (view === "ide") {
+    // Same refusal CLAUSE as open_view's ide branch — checked BEFORE any of the shared
+    // resolution work below, so a switched-off IDE or a remote repository never costs a
+    // wasted pathExists round-trip for a call that was always going to be refused.
+    if (!useDisplay.getState().ideView)
+      throw new Error(`open_file: the IDE view is switched off (${IDE_SETTING_PATH})`);
+    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
+    if (ideBlockedReason(repo))
+      throw new Error("open_file: the IDE cannot open a remote repository (it browses this Mac's files)");
+  }
   // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
   // would "succeed" into a nonsense tab. Refuse with the fix in the message.
   if (path === "~" || path.startsWith("~/"))
     throw new Error("open_file: '~' is not expanded — use an absolute path");
+  // SHARED by both modes, computed ONCE: the same cwd resolves the path AND — in "ide"
+  // mode — becomes the workspace's folder, so the file that opens and the folder it opens
+  // IN can never disagree about where they came from.
   const cwd = conv.liveCwd ?? conv.cwd;
   const abs = resolveMentionAbs(cwd, path);
-  // Check existence BEFORE reporting success: revealInEditor would open a
-  // preview tab whose read then fails, while the tool told the agent all was well.
+  // Check existence BEFORE reporting success: opening would create a preview tab whose
+  // read then fails, while the tool told the agent all was well.
   if (!(await commands.pathExists(abs)))
     throw new Error(`open_file: '${abs}' does not exist`);
   const line = typeof args.line === "number" ? Math.max(1, Math.floor(args.line)) : undefined;
   const column =
     typeof args.column === "number" ? Math.max(1, Math.floor(args.column)) : undefined;
+
+  if (view === "ide") {
+    openFileInIde(conv.id, cwd, abs, line != null ? { line, column } : undefined);
+    helpers.changeView("ide");
+    return {
+      conversation_id: conv.id,
+      path: abs,
+      ...(line != null ? { line } : {}),
+      view: "ide" as const,
+    };
+  }
+
   // Showing a file only means something on screen: focus the conversation, then
   // reveal (which opens the editor panel and jumps to the line).
   useConversationsStore.getState().selectConversation(conv.id);
@@ -828,7 +886,7 @@ function openView(args: Record<string, unknown>, helpers: AppControlHelpers) {
   if (view === "tosse" && !helpers.tosseAvailable)
     throw new Error("open_view: the TOSSE view is unavailable (not signed in to the CRM)");
   if (view === "ide" && !useDisplay.getState().ideView)
-    throw new Error("open_view: the IDE view is switched off (Settings → General → Display)");
+    throw new Error(`open_view: the IDE view is switched off (${IDE_SETTING_PATH})`);
   helpers.changeView(view);
   return { view };
 }

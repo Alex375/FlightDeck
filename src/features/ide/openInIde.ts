@@ -8,7 +8,7 @@ import { useConversationStore } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { effectiveCwd } from "../git/worktree";
-import { editorKeyFor, useIdeStore } from "./ideStore";
+import { editorKeyFor, useIdeStore, workspaceConversations } from "./ideStore";
 
 /** Why a repository cannot be opened in the IDE, or null when it can. PURE, so a button
  *  can grey itself out WITH the reason instead of clicking into an empty explorer: the
@@ -18,17 +18,22 @@ export function ideBlockedReason(repo: Pick<Repo, "machineId"> | null | undefine
   return null;
 }
 
+/** Where the "IDE view" switch lives, spelled ONCE: a refusal that sends the user (or an
+ *  agent) to a Settings page that does not exist is its own dead end. "Display" is a
+ *  top-level Settings tab, "IDE" its sub-page. */
+export const IDE_SETTING_PATH = "Settings → Display → IDE";
+
 /** Why "Open in IDE" is refused for a conversation of `repo`, the preference included — what
  *  a user-made composer button shows when it greys itself out. PURE. */
 export function openInIdeBlockedReason(
   repo: Pick<Repo, "machineId"> | null | undefined,
   ideViewEnabled: boolean,
 ): string | null {
-  if (!ideViewEnabled) return "The IDE view is switched off — Settings → General → Display.";
+  if (!ideViewEnabled) return `The IDE view is switched off — ${IDE_SETTING_PATH}.`;
   return ideBlockedReason(repo);
 }
 
-/** The IDE view is a preference (Settings → General → Display). Every opener checks it, so
+/** The IDE view is a preference (see {@link IDE_SETTING_PATH}). Every opener checks it, so
  *  a chord or a user-made composer button cannot land on a view that is switched off. */
 function ideEnabled(): boolean {
   return useDisplay.getState().ideView;
@@ -63,6 +68,8 @@ export function openConversationInIde(convId: string): boolean {
   const ws = useIdeStore.getState().workspaces.find((w) => w.id === wsId);
   if (ws) carryOpenFiles(convId, editorKeyFor(wsId), ws.path);
 
+  // Asking for THIS conversation in the IDE overrides having closed its tab there earlier.
+  ide.reopenConversationTab(wsId, convId);
   store.selectConversation(convId);
   ide.showDock("conversations");
   ide.show();
@@ -79,6 +86,66 @@ function carryOpenFiles(convId: string, editorKey: string, root: string): void {
   const ordered = source.tabs.filter((p) => p !== source.activeTab);
   if (source.activeTab) ordered.push(source.activeTab);
   for (const path of ordered) void editor.openFile(editorKey, path);
+}
+
+/**
+ * Open ONE file, at an optional line/column, in the IDE workspace for a conversation's
+ * folder — the app-control `open_file` tool's `view: "ide"` path. Unlike
+ * `openConversationInIde` (which carries a conversation's WHOLE editor state along), this
+ * targets a single file an agent just named. Returns the workspace id, or null when the
+ * conversation no longer exists.
+ *
+ * Deliberately narrow: it does NOT check the IDE-enabled / remote-repo gates (the caller
+ * does, so each caller can word its own refusal) and does NOT switch the view (the caller
+ * owns that, same contract as every other opener here). It also never routes through
+ * `revealInEditor` — that helper mutates the CONVERSATION view's global layout flags
+ * (`setOpen`/`setTreeCollapsed`), which have nothing to do with a workspace's own editor.
+ */
+export function openFileInIde(
+  convId: string,
+  cwd: string,
+  abs: string,
+  opts?: { line?: number; column?: number },
+): string | null {
+  const store = useConversationsStore.getState();
+  const conv = store.conversations.find((c) => c.id === convId);
+  if (!conv) return null;
+
+  const ide = useIdeStore.getState();
+  // Stay in the workspace ON SCREEN when it already holds both the file and this
+  // conversation — typically the repository's folder, with the agent in one of its
+  // worktrees underneath. Opening a second workspace for the worktree there would swap the
+  // folder under the user to show a file their current explorer can already reach.
+  const current = ide.workspaces.find((w) => w.id === ide.activeId) ?? null;
+  const stay =
+    current !== null &&
+    (abs === current.path || abs.startsWith(current.path + "/")) &&
+    workspaceConversations(current, store.conversations, store.repos).some((c) => c.id === convId);
+  const wsId = stay ? current.id : ide.openWorkspace(cwd, conv.repoId);
+  const ws = useIdeStore.getState().workspaces.find((w) => w.id === wsId);
+  // openWorkspace always returns an id for a workspace it just created or focused, so `ws`
+  // is present here — but fall back to the raw cwd rather than crash if that ever changes.
+  const root = ws?.path ?? cwd;
+
+  const editor = useEditorStore.getState();
+  const editorKey = editorKeyFor(wsId);
+  editor.ensureConv(editorKey, root);
+  void editor.openFile(editorKey, abs, {
+    preview: true,
+    reveal: opts?.line != null ? { line: opts.line, column: opts.column } : undefined,
+  });
+
+  // The FILE is what was asked for, so the app's active conversation is left alone: an
+  // agent in the background must not be able to repoint the user's selection (persisted,
+  // and inherited by ⌘1, ⌘⌥↑/↓ and the next launch) — least of all with the dock closed
+  // or on Terminals, where nothing on screen would even say so. Its tab is merely made
+  // available again, and offered as this workspace's conversation: the dock shows it when
+  // the active conversation is not one of this folder's (see `dockedConversation`).
+  ide.reopenConversationTab(wsId, convId);
+  ide.noteConversation(wsId, convId);
+  // A maximized dock hides the editor entirely — the file just opened would be invisible.
+  ide.setDockMaximized(false);
+  return wsId;
 }
 
 /** Pick any folder with the native dialog and open it as a workspace. */

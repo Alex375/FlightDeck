@@ -38,7 +38,7 @@
   height: 30px;
   flex: 0 0 30px;
   padding: 0 10px;
-  font-size: 11px;
+  font-size: 11.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--wf-tx-xlo);
@@ -80,18 +80,50 @@
   background: transparent;
   color: var(--wf-tx);
   font: inherit;
-  font-size: 12.5px;
+  /* Comfortably readable at a glance — the explorer is scanned, not read. The
+     16px icons stay as they are, so the row grows by ~1px, not a line. */
+  font-size: 13.5px;
+  line-height: 1.45;
   text-align: left;
   padding: 3px 8px 3px 0;
   cursor: pointer;
   white-space: nowrap;
   border-radius: 5px;
+  /* Keep a revealed row clear of the sticky tree header (30px + its border) when
+     `scrollIntoView` brings it in from above. */
+  scroll-margin-top: 34px;
+  scroll-margin-bottom: 6px;
 }
 .row:hover {
   background: var(--wf-panel-2);
 }
 .rowActive {
   background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+/* A hidden entry (a dot-name: .git, .claude, .DS_Store…). Still listed, still
+   clickable — just styled like something you did not mean to open: weaker text and
+   a near-greyscale, slightly transparent icon. Hovering gives the contrast back, so
+   working in one ON PURPOSE stays comfortable. Only the row's own name triggers
+   this (see `isHiddenName`), so a dot-folder's children look normal. */
+.rowHidden {
+  color: var(--wf-tx-lo);
+}
+.rowHidden .entryIcon,
+.rowHidden .rowIcon {
+  filter: grayscale(1);
+  opacity: 0.5;
+}
+.rowHidden:hover {
+  color: var(--wf-tx);
+}
+.rowHidden:hover .entryIcon,
+.rowHidden:hover .rowIcon {
+  filter: grayscale(0.35);
+  opacity: 0.85;
+}
+/* The open file is what you are looking at — it stays readable whatever its name. */
+.rowHidden.rowActive {
   color: var(--wf-tx-hi);
 }
 .rowName {
@@ -131,11 +163,13 @@
 .dirIcon {
   color: var(--wf-wait);
 }
+/* Secondary rows of the tree — kept a notch under the entry rows so they read as
+   status, not as entries, while staying proportional to the bumped row text. */
 .treeEmpty,
 .treeLoading {
   padding: 14px 12px;
   color: var(--wf-tx-lo);
-  font-size: 12px;
+  font-size: 12.5px;
 }
 .treeError {
   display: flex;
@@ -143,7 +177,7 @@
   gap: 6px;
   padding: 8px 12px;
   color: var(--wf-err);
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.4;
 }
 .treeRetry {
@@ -172,7 +206,9 @@
   flex: 1;
   min-width: 0;
   font: inherit;
-  font-size: 12.5px;
+  /* Matches the row text it replaces, so a rename doesn't resize the line. */
+  font-size: 13.5px;
+  line-height: 1.45;
   color: var(--wf-tx-hi);
   background: var(--wf-bg);
   border: 1px solid var(--wf-accent);

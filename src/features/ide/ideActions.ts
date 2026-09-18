@@ -2,10 +2,9 @@
 // sense rather than their target: ⌘B still shows/hides "the files", ⌘J still opens/closes
 // "the panel at the bottom" — they just drive the IDE's explorer and dock instead of the
 // conversation view's side region, which is not on screen here.
-import { useConversationsStore } from "../../store/conversationsStore";
 import { runAppAction } from "../../ui/appActions";
 import type { ShortcutAction } from "../../ui/shortcuts";
-import { useIdeStore, workspaceConversations } from "./ideStore";
+import { useIdeStore } from "./ideStore";
 
 /** Run a conversation-scoped action in the IDE view. Returns whether it did something, so
  *  the keyboard handler only swallows the key when it acted. */
@@ -22,15 +21,12 @@ export function runIdeAction(action: ShortcutAction): boolean {
       return true;
     case "toggle-clean-output":
     case "open-extensions": {
-      // These act on a conversation — and only the one DOCKED HERE counts. With the dock
-      // closed, on Terminals, or showing nothing of this folder, the app's active
-      // conversation is off screen: acting on it would change something the user cannot see.
-      if (!ide.dockOpen || ide.dockMode !== "conversations") return false;
-      const store = useConversationsStore.getState();
-      const docked = workspaceConversations(ws, store.conversations, store.repos).some(
-        (c) => c.id === store.activeId,
-      );
-      return docked ? runAppAction(action) : false;
+      // These act on a conversation — and only the one DOCKED HERE counts, which is not
+      // necessarily the app's active one (see `dockedConversation`). `watchedConvId` is
+      // exactly "the conversation this dock has on screen": null with the dock closed or
+      // on Terminals, where acting would change something the user cannot see.
+      const docked = ide.watchedConvId;
+      return docked ? runAppAction(action, { convId: docked }) : false;
     }
     default:
       return false;

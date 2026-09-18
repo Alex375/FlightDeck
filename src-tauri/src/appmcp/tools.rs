@@ -404,18 +404,25 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 },
                 ToolSpec {
                     name: "open_file",
-                    description: "Open a file in the app's editor panel, optionally at a line \
-                        and column — use it to show the user the code you are talking about. \
-                        Focuses the target conversation (default: the calling one) and its \
-                        editor. Relative paths resolve against that conversation's working \
-                        directory.",
+                    description: "Open a file in the app's editor, optionally at a line and \
+                        column — use it to show the user the code you are talking about. \
+                        Relative paths resolve against the target conversation's working \
+                        directory. With view: \"ide\" (default \"conversation\"), the file opens \
+                        in the top-level IDE view instead — the conversation's folder becomes (or \
+                        is focused as) an IDE workspace and the file opens in ITS editor; refused \
+                        when the IDE view is switched off or the conversation's repository is \
+                        remote (the IDE only browses this Mac's files). Default \"conversation\" \
+                        focuses the target conversation (default: the calling one) and its editor.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
                             "path": { "type": "string", "description": "File path (absolute, or relative to the conversation's cwd)." },
                             "line": { "type": "integer", "minimum": 1, "description": "1-based line to reveal." },
                             "column": { "type": "integer", "minimum": 1, "description": "1-based column." },
-                            "conversation_id": conversation_id_prop("Conversation whose editor opens the file (default: the calling one)."),
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) opens the file (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Where to open the file: the conversation view's editor \
+                                    (default), or the top-level IDE view." },
                         }),
                         &["path"],
                     ),

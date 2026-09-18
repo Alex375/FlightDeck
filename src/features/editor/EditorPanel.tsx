@@ -34,6 +34,7 @@ export function EditorPanel({
   treeLayout,
   flush = false,
   wrapEditor,
+  autoReveal = false,
 }: {
   /** The editor slice's key — a conversation's stable id, or an IDE workspace's key. */
   convId: string;
@@ -46,6 +47,12 @@ export function EditorPanel({
    *  beside) the EDITOR only, leaving the tree full-height as an IDE's explorer is. A
    *  wrapper rather than a sibling slot, so the tree | editor split stays owned here. */
   wrapEditor?: (editor: ReactNode) => ReactNode;
+  /** Keep the explorer pointed at the file on screen: whenever the active tab changes,
+   *  unfold the folders leading to it and scroll its row into view (an IDE's "auto
+   *  reveal"). The IDE view turns it on, so a file opened by an agent, a clicked mention
+   *  or a tab switch always shows WHERE that file lives. Off in the conversation view's
+   *  side editor, which deliberately hides its tree to focus on the file. */
+  autoReveal?: boolean;
 }) {
   const globalTreeWidth = useEditorStore((s) => s.treeWidth);
   const setGlobalTreeWidth = useEditorStore((s) => s.setTreeWidth);
@@ -58,11 +65,26 @@ export function EditorPanel({
   const ensureConv = useEditorStore((s) => s.ensureConv);
   const loadIcons = useFileIconStore((s) => s.load);
   const panelRef = useRef<HTMLDivElement>(null);
+  // The file on screen, and NOTHING else of the slice: a broad selector here would
+  // re-run the reveal on every keystroke in a buffer. Off (constant null) when the
+  // host didn't ask for auto-reveal, so the conversation view never subscribes to
+  // anything new.
+  const activeTab = useEditorStore((s) => (autoReveal ? s.byConv[convId]?.activeTab ?? null : null));
 
   // Initialise / re-root this conversation's tree at the current cwd.
   useEffect(() => {
     ensureConv(convId, cwd);
   }, [convId, cwd, ensureConv]);
+
+  // Auto-reveal: unfold the explorer down to the active tab and scroll its row into
+  // view. Declared AFTER the `ensureConv` effect on purpose — effects run in
+  // declaration order within a commit, so the slice already exists at the right root
+  // when this fires (a re-root is in the deps via `cwd`, and `treeCollapsed` covers
+  // "the tree was just shown", whose rows could not be scrolled while unmounted).
+  useEffect(() => {
+    if (!autoReveal || treeCollapsed || !activeTab) return;
+    void useEditorStore.getState().revealInTree(convId, activeTab);
+  }, [autoReveal, convId, cwd, treeCollapsed, activeTab]);
 
   // Load the Material icon map here (not in FileTree): the panel is always mounted
   // while the editor is shown, so the tabs get real icons even when the file tree
