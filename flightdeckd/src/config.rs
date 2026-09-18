@@ -243,9 +243,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("cannot write config {}", path.display()));
     }
-    // Make the rename itself durable.
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
+    // Make the rename itself durable. The new file is in place either way, so
+    // a failure here does not fail the save — but it must not go unnoticed.
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            "config {} written, but syncing its directory failed ({e}) — the change may not survive a crash",
+            path.display()
+        );
     }
     Ok(())
 }
