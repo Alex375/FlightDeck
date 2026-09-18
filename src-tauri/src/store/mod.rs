@@ -10,6 +10,6 @@ pub mod model;
 
 pub use db::Store;
 pub use model::{
-    ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
-    TosseProjectRepo,
+    validate_address_value, AddressCandidate, AddressKind, ClaudeAccountRecord, ConversationRecord,
+    MachineRecord, PersistedState, RepoRecord, TosseProjectRepo,
 };

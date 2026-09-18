@@ -10,6 +10,55 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+/// One discovered candidate address for a paired server — as printed in the pairing
+/// ticket's `addresses` array (see the "1 · Run this once on your server" command in
+/// `RemoteServersGroup`, `ControlSection.tsx`) or typed by hand. `Public` is reserved
+/// for a future discovery step (e.g. a public IP behind NAT) — nothing populates it
+/// yet, but the wire shape carries it so a later change is additive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressKind {
+    Tailscale,
+    Lan,
+    Public,
+    Manual,
+}
+
+/// See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AddressCandidate {
+    pub kind: AddressKind,
+    pub value: String,
+}
+
+/// Reject an address value that would be unsafe or meaningless to hand to `ssh` as
+/// part of `user@<value>`: empty (nothing to connect to), containing whitespace or a
+/// control character (never a valid hostname/IP — most likely a paste mistake), or
+/// starting with `-` (would be parsed as an `ssh` OPTION rather than the destination —
+/// e.g. a crafted `-oProxyCommand=...` value achieving arbitrary command execution).
+/// Pure and side-effect-free.
+///
+/// Enforced at TWO points so a future write path can't silently reintroduce the
+/// injection class this closes just by skipping one of them: the IPC boundary
+/// (`ipc::commands::add_machine` checks every probe candidate BEFORE any `ssh`
+/// process is even spawned) and the persistence boundary that actually owns the
+/// invariant (`super::db::Store::upsert_machine` checks `host`/`addresses` again
+/// right before writing the row).
+pub fn validate_address_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("A server address cannot be empty.".to_string());
+    }
+    if value.starts_with('-') {
+        return Err(format!("Invalid address \"{value}\": cannot start with \"-\"."));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "Invalid address \"{value}\": cannot contain whitespace or control characters."
+        ));
+    }
+    Ok(())
+}
+
 /// A remote host (a "server") reached over SSH, on which repos can live and their
 /// conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
 /// the connection coordinates so a user adds a server from the UI without editing any
@@ -20,7 +69,10 @@ pub struct MachineRecord {
     pub id: String,
     /// Human label shown in the UI (e.g. "my-vps").
     pub label: String,
-    /// Hostname or IP reachable from this Mac.
+    /// Hostname or IP reachable from this Mac. The address pairing (or the user)
+    /// confirmed as WORKING — the one [`super::db::Store::upsert_machine`] persists
+    /// after a successful probe, and what `RemoteTarget` connects with today (see
+    /// `supervisor::transport`).
     pub host: String,
     /// SSH port (usually 22).
     pub port: u16,
@@ -32,6 +84,15 @@ pub struct MachineRecord {
     pub identity_file: Option<String>,
     /// Unix ms timestamp the server was added.
     pub added_at: i64,
+    /// Every address candidate pairing discovered (or the user typed) for this server
+    /// — Tailscale name, LAN IP, hostname, … — including `host` itself. Carried for a
+    /// later task (A6) to rotate through on a failed reconnect; today only `host` is
+    /// actually dialed. Defaults to an empty `Vec` for a pre-migration row or one whose
+    /// stored JSON fails to decode — never an error, since a missing/corrupt address
+    /// list must degrade to "just `host`", not break the machine (see
+    /// [`super::db::Store::machine_by_id`]).
+    #[serde(default)]
+    pub addresses: Vec<AddressCandidate>,
 }
 
 /// A working folder a conversation can be opened in.

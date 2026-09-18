@@ -3501,6 +3501,7 @@ mod tests {
             identity_file: None,
             known_hosts_file: None,
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -3584,6 +3585,7 @@ mod tests {
             )),
             known_hosts_file: Some("/dev/null".into()),
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();

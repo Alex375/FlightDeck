@@ -132,6 +132,11 @@ export interface Machine {
   /** Path to the private key on this Mac Flight Deck authenticates with. */
   identityFile?: string | null;
   addedAt: number;
+  /** Every candidate address pairing discovered (or the user typed) for this server,
+   *  `host` included — Tailscale name, LAN IP, hostname, … Carried for a later task
+   *  (A6) to rotate through on a failed reconnect; today only `host` is dialed.
+   *  Empty for a machine paired before this was recorded. */
+  addresses: AddressCandidate[];
 }
 
 /** Which agent backend drives a conversation. Chosen at creation, immutable after
@@ -358,6 +363,11 @@ const recordToMachine = (m: MachineRecord): Machine => ({
   user: m.user,
   identityFile: m.identity_file,
   addedAt: m.added_at,
+  // `?` in the generated type (from the Rust side's `#[serde(default)]`) is a
+  // deserialization nicety only — the core always serializes a concrete `[]`, never
+  // omits the field — but the `?? []` mirrors how `PersistedState.machines` is
+  // already defaulted below, for the same reason.
+  addresses: m.addresses ?? [],
 });
 
 const convToRecord = (c: Conversation): ConversationRecord => ({
@@ -457,9 +467,9 @@ interface ConversationsState {
   /** Pair a remote server: probe it (SSH + `claude` + `flightdeckd`) and, on success,
    *  persist + add it. Returns the saved machine, or an actionable error the form
    *  shows. `addresses` is the full set of candidates the pairing ticket discovered
-   *  (Tailscale name / LAN IP / hostname) — currently informational on the core side
-   *  (ignored there until a later task persists it), kept here so the confirm screen
-   *  can offer them and the wire is already shaped for that task. */
+   *  (Tailscale name / LAN IP / hostname) — the core probes them in priority order
+   *  and persists whichever one actually worked as `Machine.host`, the full set as
+   *  `Machine.addresses`. */
   addMachine: (input: {
     label: string;
     host: string;

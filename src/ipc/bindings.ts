@@ -2007,15 +2007,21 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
- * Pair a remote server: probe it (SSH reachable + `claude` and `flightdeckd`
- * present, `flightdeckd` current), and on success persist it as a [`MachineRecord`].
- * Returns the saved record so the UI lists it. The probe runs FIRST so a bad
- * host/key/paste or a missing/outdated tool fails loudly here, not at the first
- * message.
+ * Pair a remote server: probe the confirmed `host` first, then fall back through the
+ * rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
+ * then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
+ * first that's SSH-reachable with `claude` and a current `flightdeckd` present, and
+ * on success persist it as a [`MachineRecord`]. Returns the saved record so the UI
+ * lists it. Probing runs FIRST so a bad host/key/paste or a missing/outdated tool
+ * fails loudly here, not at the first message.
  * 
  * `addresses` is the full set of candidate hosts the pairing ticket discovered
- * (Tailscale name, LAN IP, bare hostname) — currently informational only (ignored),
- * kept so the front's IPC call is already shaped for the column a later task adds.
+ * (Tailscale name, LAN IP, bare hostname). The address that actually worked is
+ * persisted as `host` — what every other part of the app dials — while the full
+ * ordered, deduplicated candidate list (including `host` itself) is persisted as
+ * `addresses`, carried for a later task (A6) to rotate through on a failed
+ * reconnect; the transport itself still only ever dials `host` today. When every
+ * candidate fails, the returned error names each one tried and why.
  */
 async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<MachineRecord, string>> {
     try {
@@ -2435,17 +2441,17 @@ export type AccountProfile = { email: string | null; orgName: string | null;
  */
 subscriptionType: string | null }
 /**
- * See [`AddressKind`].
+ * See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
  */
 export type AddressCandidate = { kind: AddressKind; value: string }
 /**
  * One discovered candidate address for a paired server — as printed in the pairing
  * ticket's `addresses` array (see the "1 · Run this once on your server" command in
- * `RemoteServersGroup`, `ControlSection.tsx`). Not persisted anywhere yet: the confirm
- * screen resolves it down to a single `host` before `add_machine` is called — the
- * column for keeping the full discovered set lands in a later task.
+ * `RemoteServersGroup`, `ControlSection.tsx`) or typed by hand. `Public` is reserved
+ * for a future discovery step (e.g. a public IP behind NAT) — nothing populates it
+ * yet, but the wire shape carries it so a later change is additive.
  */
-export type AddressKind = "tailscale" | "lan" | "manual"
+export type AddressKind = "tailscale" | "lan" | "public" | "manual"
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
@@ -3643,7 +3649,10 @@ export type MachineRecord = { id: string;
  */
 label: string; 
 /**
- * Hostname or IP reachable from this Mac.
+ * Hostname or IP reachable from this Mac. The address pairing (or the user)
+ * confirmed as WORKING — the one [`super::db::Store::upsert_machine`] persists
+ * after a successful probe, and what `RemoteTarget` connects with today (see
+ * `supervisor::transport`).
  */
 host: string; 
 /**
@@ -3663,7 +3672,17 @@ identity_file: string | null;
 /**
  * Unix ms timestamp the server was added.
  */
-added_at: number }
+added_at: number; 
+/**
+ * Every address candidate pairing discovered (or the user typed) for this server
+ * — Tailscale name, LAN IP, hostname, … — including `host` itself. Carried for a
+ * later task (A6) to rotate through on a failed reconnect; today only `host` is
+ * actually dialed. Defaults to an empty `Vec` for a pre-migration row or one whose
+ * stored JSON fails to decode — never an error, since a missing/corrupt address
+ * list must degrade to "just `host`", not break the machine (see
+ * [`super::db::Store::machine_by_id`]).
+ */
+addresses?: AddressCandidate[] }
 /**
  * What the instructions file looks like right now.
  */
