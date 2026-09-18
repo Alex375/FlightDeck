@@ -85,6 +85,18 @@ confirmés puis corrigés : sérialisation des spawns, écrivain stdin non bloqu
 timeouts de bout en bout, conformité des events au contrat PWA, backoff/deadline
 relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
 
+- **Config `~/.flightdeckd/config.json` : verrou inter-processus.** Plusieurs
+  processus l'écrivent (le démon quand on ajoute/retire un téléphone,
+  `flightdeckd init`, l'installeur du Mac via SSH). Tout écrivain prend un
+  `flock(2)` exclusif sur `~/.flightdeckd/config.json.lock` pendant toute sa
+  lecture-modification-écriture ; le fichier est remplacé atomiquement
+  (tmp + rename, mode 0600), donc les lecteurs n'ont pas besoin du verrou.
+  La CLI `flightdeckd` (dont `init`) le prend elle-même : l'installeur qui
+  l'appelle n'a rien d'autre à faire. Qui écrit le fichier **directement**
+  doit prendre le même verrou : `flock ~/.flightdeckd/config.json.lock -c '…'`.
+  Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`,
+  16 max) re-révoquées à chaque connexion au relais, qui, lui, persiste les
+  autorisations.
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `bypassPermissions` pour les sessions créées

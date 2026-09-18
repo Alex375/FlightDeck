@@ -109,6 +109,9 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Init { relay, label, force } => {
             let path = config::default_config_path();
+            // Held across check-and-write: a live daemon (phone tokens) or a
+            // second `init` can't interleave with this one (see ConfigLock).
+            let lock = config::ConfigLock::acquire(&path)?;
             if path.exists() && !force {
                 anyhow::bail!("{} already exists (use --force to overwrite)", path.display());
             }
@@ -126,13 +129,14 @@ async fn main() -> Result<()> {
                     token: uuid::Uuid::new_v4().to_string(),
                     label: "phone".into(),
                 }],
+                revoked_phone_tokens: vec![],
                 label: label.or(host).unwrap_or_else(|| "flightdeckd".into()),
                 default_workdir: None,
                 claude_bin: "claude".into(),
                 permission_mode: "bypassPermissions".into(),
             };
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+            cfg.save_locked(&path, &lock)?;
+            drop(lock);
             println!("config written to {}", path.display());
             println!("node label: {}", cfg.label);
             println!("macId:      {}", cfg.mac_id);
@@ -152,7 +156,7 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&path)
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
             let registry = registry::Registry::open(&config::registry_path())?;
-            let manager = session::SessionManager::new(cfg, registry);
+            let manager = session::SessionManager::new(cfg, registry, path);
             if let Some(link) = pairing_link(&manager.cfg) {
                 tracing::info!("phone pairing link: {link}");
             }

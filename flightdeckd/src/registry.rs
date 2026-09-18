@@ -109,6 +109,18 @@ impl Registry {
         Ok(())
     }
 
+    /// The CLIENT's title wins: overwrite unconditionally (a placeholder or
+    /// an earlier title alike). Blank/whitespace input is a no-op. Distinct
+    /// from [`Registry::set_title`], the fill-only-if-empty ai-title backfill.
+    pub fn set_title_authoritative(&self, id: &str, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute("UPDATE conversations SET title = ?2 WHERE id = ?1", params![id, title])?;
+        Ok(())
+    }
+
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE conversations SET archived = ?2 WHERE id = ?1",
@@ -182,6 +194,22 @@ mod tests {
         let list = r.list(false).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "b"); // most recent first
+    }
+
+    #[test]
+    fn authoritative_title_overwrites_and_ignores_blank() {
+        let r = Registry::open_in_memory().unwrap();
+        r.upsert(&mk("placeholder", 1)).unwrap(); // title ''
+        r.set_title_authoritative("placeholder", "My Feature").unwrap();
+        assert_eq!(r.get("placeholder").unwrap().unwrap().title, "My Feature");
+        r.set_title_authoritative("placeholder", "Renamed").unwrap();
+        assert_eq!(r.get("placeholder").unwrap().unwrap().title, "Renamed");
+        r.set_title_authoritative("placeholder", "   ").unwrap();
+        r.set_title_authoritative("placeholder", "").unwrap();
+        assert_eq!(r.get("placeholder").unwrap().unwrap().title, "Renamed");
+        // and the ai-title backfill still never overwrites it
+        r.set_title("placeholder", "ai title").unwrap();
+        assert_eq!(r.get("placeholder").unwrap().unwrap().title, "Renamed");
     }
 
     #[test]

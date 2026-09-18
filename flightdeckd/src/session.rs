@@ -20,7 +20,7 @@
 //!    byte-budget kill switch — a wedged claude or a stalled ssh link can slow
 //!    ITS session, never the daemon.
 
-use crate::config::Config;
+use crate::config::{self, Config, PhoneToken};
 use crate::events::Event;
 use crate::frames;
 use crate::registry::{ConversationRow, Registry};
@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, MutexGuard};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 /// Ring budget: how many bytes of replayable stream lines each session keeps.
@@ -152,8 +153,25 @@ struct SessionEntry {
 
 type SessionsMap = HashMap<String, SessionEntry>;
 
+/// The phones this node authorizes on the relay — the LIVE copy of the
+/// config's `phone_tokens` / `revoked_phone_tokens` (the config file on disk
+/// stays the durable one).
+#[derive(Debug, Default, Clone)]
+pub struct PhoneAccess {
+    pub tokens: Vec<PhoneToken>,
+    /// Tombstones, re-revoked on every relay connect (see `Config`).
+    pub revoked: Vec<String>,
+}
+
 pub struct SessionManager {
+    /// The config as loaded at startup. Phone access is live in `phones`.
     pub cfg: Config,
+    /// Where `cfg` came from — phone-token changes are persisted there.
+    config_path: PathBuf,
+    /// Lock order: `phones` before `relay_out`, never the reverse.
+    pub phones: StdMutex<PhoneAccess>,
+    /// The connected relay link's single-writer queue, `None` while offline.
+    pub relay_out: StdMutex<Option<mpsc::UnboundedSender<Message>>>,
     registry: StdMutex<Registry>,
     sessions: Mutex<SessionsMap>,
     pub events_tx: broadcast::Sender<Event>,
@@ -161,15 +179,67 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(cfg: Config, registry: Registry) -> Arc<Self> {
+    pub fn new(cfg: Config, registry: Registry, config_path: PathBuf) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(256);
+        let phones = PhoneAccess { tokens: cfg.phone_tokens.clone(), revoked: cfg.revoked_phone_tokens.clone() };
         Arc::new(Self {
             cfg,
+            config_path,
+            phones: StdMutex::new(phones),
+            relay_out: StdMutex::new(None),
             registry: StdMutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             events_tx,
             ids: AtomicU64::new(1),
         })
+    }
+
+    // -- phone access ------------------------------------------------------
+
+    /// Authorize a phone on this node (or relabel it): persisted to the config
+    /// under its cross-process lock, then pushed to the relay if connected —
+    /// otherwise the next connect's authorize burst carries it. Returns true
+    /// when the phone was not authorized yet. Blocking (file I/O + lock).
+    pub fn add_phone_token(&self, token: &str, label: &str) -> Result<bool> {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("phone token is empty");
+        }
+        let mut phones = self.phones.lock().expect("phones lock");
+        Config::update(&self.config_path, |c| {
+            config::upsert_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, token, label)
+        })?;
+        let PhoneAccess { tokens, revoked } = &mut *phones;
+        let added = config::upsert_phone_token(tokens, revoked, token, label);
+        self.send_relay(json!({"type": "authorize_phone", "phoneToken": token, "label": label}));
+        Ok(added)
+    }
+
+    /// De-authorize a phone: persisted (with a tombstone, re-revoked on every
+    /// connect — the relay keeps authorizations, so an undelivered revoke must
+    /// be retried), then pushed to the relay if connected. Ok(false) = the
+    /// token was not authorized (nothing changes).
+    pub fn remove_phone_token(&self, token: &str) -> Result<bool> {
+        let token = token.trim();
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| {
+            config::remove_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, token)
+        })?;
+        let PhoneAccess { tokens, revoked } = &mut *phones;
+        let live = config::remove_phone_token(tokens, revoked, token);
+        if !(on_disk || live) {
+            return Ok(false);
+        }
+        self.send_relay(json!({"type": "revoke_phone", "phoneToken": token}));
+        Ok(true)
+    }
+
+    /// Queue one frame on the live relay link; false when offline.
+    fn send_relay(&self, frame: Value) -> bool {
+        match self.relay_out.lock().expect("relay_out lock").as_ref() {
+            Some(tx) => tx.send(Message::Text(frame.to_string())).is_ok(),
+            None => false,
+        }
     }
 
     pub fn next_client_id(&self) -> u64 {
@@ -1006,6 +1076,76 @@ mod tests {
         let client = vec!["--output-format".to_string(), "--resume".to_string()];
         let a = ensure_args(client, Some("sid-2"), &cfg);
         assert!(a.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-2"));
+    }
+
+    fn frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Option<Value> {
+        match rx.try_recv().ok()? {
+            Message::Text(t) => serde_json::from_str(&t).ok(),
+            _ => None,
+        }
+    }
+
+    /// A manager whose config lives in a temp dir, with a fake relay link.
+    fn phone_manager(
+        connected: bool,
+    ) -> (tempfile::TempDir, PathBuf, Arc<SessionManager>, mpsc::UnboundedReceiver<Message>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.phone_tokens = vec![PhoneToken { token: "seed".into(), label: "old phone".into() }];
+        cfg.save(&path).unwrap();
+        let m = SessionManager::new(cfg, Registry::open_in_memory().unwrap(), path.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        if connected {
+            *m.relay_out.lock().unwrap() = Some(tx);
+        }
+        (dir, path, m, rx)
+    }
+
+    #[test]
+    fn add_phone_token_persists_and_authorizes_live() {
+        let (_dir, path, m, mut rx) = phone_manager(true);
+        assert!(m.add_phone_token("pt-new", "Pixel").unwrap());
+        let disk = Config::load(&path).unwrap().phone_tokens;
+        assert_eq!(disk.len(), 2);
+        assert_eq!(disk[1], PhoneToken { token: "pt-new".into(), label: "Pixel".into() });
+        assert_eq!(frame(&mut rx).unwrap(), json!({"type": "authorize_phone", "phoneToken": "pt-new", "label": "Pixel"}));
+        assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
+
+        // duplicate: relabels, no second entry anywhere
+        assert!(!m.add_phone_token("pt-new", "Pixel 9").unwrap());
+        let disk = Config::load(&path).unwrap().phone_tokens;
+        assert_eq!(disk.iter().filter(|p| p.token == "pt-new").count(), 1);
+        assert_eq!(disk[1].label, "Pixel 9");
+        assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
+        assert_eq!(frame(&mut rx).unwrap()["label"], "Pixel 9");
+        assert!(m.add_phone_token("  ", "x").is_err());
+    }
+
+    #[test]
+    fn add_phone_token_offline_still_persists() {
+        let (_dir, path, m, mut rx) = phone_manager(false);
+        assert!(m.add_phone_token("pt-offline", "").unwrap());
+        assert!(Config::load(&path).unwrap().phone_tokens.iter().any(|p| p.token == "pt-offline"));
+        assert!(m.phones.lock().unwrap().tokens.iter().any(|p| p.token == "pt-offline"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn remove_phone_token_persists_tombstones_and_revokes_live() {
+        let (_dir, path, m, mut rx) = phone_manager(true);
+        assert!(m.remove_phone_token("seed").unwrap());
+        let disk = Config::load(&path).unwrap();
+        assert!(disk.phone_tokens.is_empty());
+        assert_eq!(disk.revoked_phone_tokens, vec!["seed".to_string()]);
+        assert_eq!(frame(&mut rx).unwrap(), json!({"type": "revoke_phone", "phoneToken": "seed"}));
+        assert_eq!(m.phones.lock().unwrap().revoked, vec!["seed".to_string()]);
+
+        // absent token: Ok(false), no frame, the file is untouched
+        let before = std::fs::read(&path).unwrap();
+        assert!(!m.remove_phone_token("never-added").unwrap());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub fn test_cfg() -> Config {
         mac_id: "m".into(),
         mac_token: "t".into(),
         phone_tokens: vec![],
+        revoked_phone_tokens: vec![],
         label: "test".into(),
         default_workdir: None,
         claude_bin: "claude".into(),
@@ -25,9 +26,14 @@ pub fn short_tempdir() -> tempfile::TempDir {
     tempfile::Builder::new().prefix("fdd").tempdir_in("/tmp").expect("tempdir")
 }
 
-/// A manager over an in-memory registry.
+/// A manager over an in-memory registry. Its config path is unwritable: tests
+/// that persist phone tokens build their own manager over a temp config.
 pub fn test_manager(cfg: Config) -> Arc<SessionManager> {
-    SessionManager::new(cfg, Registry::open_in_memory().expect("registry"))
+    SessionManager::new(
+        cfg,
+        Registry::open_in_memory().expect("registry"),
+        PathBuf::from("/dev/null/flightdeckd-test/config.json"),
+    )
 }
 
 /// Serve the attach plane on `dir/fd.sock` and wait until it accepts.
