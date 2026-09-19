@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ACTION_BINDINGS,
+  CONVERSATION_PANEL_CHORD,
   type ChordSpec,
   isEditableTarget,
   isSettingsChord,
@@ -214,6 +215,16 @@ describe("ACTION_BINDINGS / SHORTCUT_GROUPS", () => {
         expect(takers.map((t) => t.action), `${b.action} on ${e.code || e.key}`).toEqual([b.action]);
       }
     }
+  });
+
+  it("toggles the conversation panel on ⌘I, the chord the UI prints everywhere", () => {
+    const bind = (e: ChordEvent) => ACTION_BINDINGS.find((b) => matchChord(e, b.spec))?.action;
+    expect(bind(chord({ metaKey: true, key: "i", code: "KeyI" }))).toBe("toggle-conversation-panel");
+    // The on-screen reminder must name the chord the app actually answers to.
+    const spec = ACTION_BINDINGS.find((b) => b.action === "toggle-conversation-panel")!.spec;
+    expect(CONVERSATION_PANEL_CHORD.replace(/\s/g, "").toLowerCase()).toBe(`⌘${spec.key}`);
+    const documented = SHORTCUT_GROUPS.flatMap((g) => g.items).map((i) => i.keys);
+    expect(documented).toContain(CONVERSATION_PANEL_CHORD);
   });
 
   it("answers the zoom chords on a US layout", () => {

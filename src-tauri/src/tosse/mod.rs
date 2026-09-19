@@ -2088,6 +2088,22 @@ pub async fn set_task_status(task_id: &str, status: &str) -> R<()> {
     .map(|_| ())
 }
 
+/// Reassign a task (`PATCH /api/v1/tasks/:id`) — the avatar picker of the conversation side
+/// panel's task card, the CRM's own `AssigneeAvatarSelect`.
+///
+/// Passed through untouched, like [`set_task_status`]: the server owns the assignee enum
+/// (« Alexandre » / « Armand » / « Les deux » today) and answers an unknown one with a
+/// readable 400.
+pub async fn set_task_assignee(task_id: &str, assigned_to: &str) -> R<()> {
+    api_write(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/tasks/{task_id}"),
+        &serde_json::json!({ "assignedTo": assigned_to }),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Move a project to another status (`PATCH /api/v1/projects/:id`) — the Start / Pause /
 /// Finish control on a project card.
 pub async fn set_project_status(project_id: &str, status: &str) -> R<()> {

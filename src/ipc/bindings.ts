@@ -736,6 +736,18 @@ async tosseSetTaskStatus(taskId: string, status: string) : Promise<Result<null, 
 }
 },
 /**
+ * Reassign a task (Alexandre / Armand / Les deux) — a human picking a person in the
+ * conversation side panel's task card. Nothing in the agent surface calls it.
+ */
+async tosseSetTaskAssignee(taskId: string, assignedTo: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_task_assignee", { taskId, assignedTo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Move a project to another status — the Start / Pause / Finish control on a project card.
  */
 async tosseSetProjectStatus(projectId: string, status: string) : Promise<Result<null, string>> {

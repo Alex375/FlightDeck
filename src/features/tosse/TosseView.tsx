@@ -1079,7 +1079,109 @@ function ProjectCard({
 }
 
 /**
- * The detail panel's status ladder — one click per step, the CRM's own buttons.
+ * A task's status as a CONTROL, not a label — the same menu as the row's dot, one way to
+ * change a status wherever you are. Shared by the detail panel's head and the conversation
+ * side panel's task card.
+ */
+export function TaskStatusChip({
+  status,
+  onSetStatus,
+}: {
+  status: string;
+  onSetStatus: (status: string) => void;
+}) {
+  return (
+    <Menu
+      portal
+      trigger={
+        // A TASK's status, so it uses the task colour language — `projectStatusTone`
+        // maps PROJECT states, and sends everything it doesn't know to "todo": a task
+        // in « Review » came out grey here while the board painted it violet, in the
+        // one place meant to tell you what the task is.
+        <button
+          className={`${s.state} ${s.stateBtn} ${s[`state_${taskStatusTone(status)}`]}`}
+          title={`${status} — change status`}
+        >
+          {status}
+          <Ico name="chevron" className="sm" />
+        </button>
+      }
+    >
+      {TASK_STATUS_CHOICES.map((choice) => (
+        <div key={choice}>
+          {choice === "Fait" ? <div className={s.menuSep} /> : null}
+          <MenuItem on={status === choice} onClick={() => onSetStatus(choice)}>
+            {choice}
+          </MenuItem>
+        </div>
+      ))}
+    </Menu>
+  );
+}
+
+/**
+ * A task's subtasks as checkbox rows: a click flips one between « Fait » and « À faire ».
+ * Shared by the detail panel and the conversation side panel's task card.
+ */
+export function TaskSubtaskRows({
+  subtasks,
+  onToggle,
+}: {
+  subtasks: { id: string; title: string; status: string }[];
+  onToggle: (subtaskId: string, next: string) => void;
+}) {
+  return (
+    <>
+      {subtasks.map((st) => (
+        <button
+          key={st.id}
+          className={s.subRow}
+          title={`Mark as ${st.status === "Fait" ? "À faire" : "Fait"}`}
+          onClick={() => onToggle(st.id, st.status === "Fait" ? "À faire" : "Fait")}
+        >
+          <span className={`${s.check} ${st.status === "Fait" ? s.checkOn : ""}`} />
+          <span className={st.status === "Fait" ? s.subDone : ""}>{st.title}</span>
+        </button>
+      ))}
+    </>
+  );
+}
+
+/**
+ * A task's head chips: its status (see {@link TaskStatusChip}), priority, kind and assignee —
+ * the detail panel's head.
+ */
+function TaskHeadChips({
+  task,
+  onSetStatus,
+}: {
+  task: TosseTask;
+  onSetStatus: (status: string) => void;
+}) {
+  return (
+    <div className={s.detailChips}>
+      <TaskStatusChip status={task.status} onSetStatus={onSetStatus} />
+      {task.priority ? (
+        <span className={`${s.pri} ${s[`pri_${priorityClass(task.priority)}`]}`}>
+          {task.priority}
+        </span>
+      ) : null}
+      {task.kind ? <span className={s.kind}>{task.kind}</span> : null}
+      {/* The person wears the SAME mark as in the list, with their name spelled out —
+          the panel has room for it, a 20px disc alone would not say who. */}
+      {task.assignedTo ? (
+        <span className={s.whoChip}>
+          <AssigneeAvatar name={task.assignedTo} />
+          {splitMcpActor(task.assignedTo).person}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The detail panel's status ladder — one click per step, the CRM's own buttons. Also the
+ * action row of the conversation side panel's task card (same buttons, same write).
  *
  * Lives in the panel and NOT on the row (asked for explicitly, 2026-09-07): the panel is
  * where a task is read in full before it is moved, and a row already carries Open / Discuss
@@ -1091,7 +1193,7 @@ function ProjectCard({
  * the panel already renders. A second write path would have been a second chance to swallow
  * a refusal.
  */
-function TaskStatusActions({
+export function TaskStatusActions({
   detail,
   onWrite,
 }: {
@@ -1212,53 +1314,10 @@ export function TaskDetail({
         </div>
         <div className={s.detailTitle}>{data?.task.title ?? "…"}</div>
         {data ? (
-          <div className={s.detailChips}>
-            {/* A TASK's status, so it uses the task colour language — `projectStatusTone`
-                maps PROJECT states, and sends everything it doesn't know to "todo": a task
-                in « Review » came out grey here while the board painted it violet, in the
-                one place meant to tell you what the task is. */}
-            {/* The status is a CONTROL here too, not a label: the panel is where you read a
-                task in full, so it is also where you move it on. Same menu as the row's
-                dot — one way to change a status, wherever you are. */}
-            <Menu
-              portal
-              trigger={
-                <button
-                  className={`${s.state} ${s.stateBtn} ${s[`state_${taskStatusTone(data.task.status)}`]}`}
-                  title={`${data.task.status} — change status`}
-                >
-                  {data.task.status}
-                  <Ico name="chevron" className="sm" />
-                </button>
-              }
-            >
-              {TASK_STATUS_CHOICES.map((choice) => (
-                <div key={choice}>
-                  {choice === "Fait" ? <div className={s.menuSep} /> : null}
-                  <MenuItem
-                    on={data.task.status === choice}
-                    onClick={() => setTaskStatus.mutate({ taskId, status: choice })}
-                  >
-                    {choice}
-                  </MenuItem>
-                </div>
-              ))}
-            </Menu>
-            {data.task.priority ? (
-              <span className={`${s.pri} ${s[`pri_${priorityClass(data.task.priority)}`]}`}>
-                {data.task.priority}
-              </span>
-            ) : null}
-            {data.task.kind ? <span className={s.kind}>{data.task.kind}</span> : null}
-            {/* The person wears the SAME mark as in the list, with their name spelled out —
-                the panel has room for it, a 20px disc alone would not say who. */}
-            {data.task.assignedTo ? (
-              <span className={s.whoChip}>
-                <AssigneeAvatar name={data.task.assignedTo} />
-                {splitMcpActor(data.task.assignedTo).person}
-              </span>
-            ) : null}
-          </div>
+          <TaskHeadChips
+            task={data.task}
+            onSetStatus={(status) => setTaskStatus.mutate({ taskId, status })}
+          />
         ) : null}
       </div>
 
@@ -1334,22 +1393,10 @@ export function TaskDetail({
             <div className={s.detailKey}>
               Subtasks {data.task.subtaskDone}/{data.task.subtaskCount}
             </div>
-            {data.subtasks.map((st) => (
-              <button
-                key={st.id}
-                className={s.subRow}
-                title={`Mark as ${st.status === "Fait" ? "À faire" : "Fait"}`}
-                onClick={() =>
-                  setTaskStatus.mutate({
-                    taskId: st.id,
-                    status: st.status === "Fait" ? "À faire" : "Fait",
-                  })
-                }
-              >
-                <span className={`${s.check} ${st.status === "Fait" ? s.checkOn : ""}`} />
-                <span className={st.status === "Fait" ? s.subDone : ""}>{st.title}</span>
-              </button>
-            ))}
+            <TaskSubtaskRows
+              subtasks={data.subtasks}
+              onToggle={(subtaskId, next) => setTaskStatus.mutate({ taskId: subtaskId, status: next })}
+            />
           </section>
         ) : null}
       </div>

@@ -86,6 +86,13 @@ export interface DisplayPrefs {
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
 
+  /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
+   *  worktree) into a side panel at the far right, leaving the header with actions only. ON
+   *  by default. Off → the previous layout: those chips back in the header and the composer,
+   *  the todo list pinned above the composer. Read by {@link ConversationSidePanel} and every
+   *  surface it replaces. */
+  conversationSidePanel: boolean;
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -301,6 +308,7 @@ const DEFAULTS: DisplayPrefs = {
   agentMessageToasts: true,
   agentCreationToasts: true,
   showLastMessagePreview: true,
+  conversationSidePanel: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -380,6 +388,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,

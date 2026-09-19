@@ -674,6 +674,13 @@ export interface TaskStatusAction {
   confirmWhenBlocked?: boolean;
 }
 
+/**
+ * Who a task can be assigned to — the CRM's `ASSIGNED_TO_OPTIONS`, verbatim and in its order.
+ * Only the picker's CHOICES: the server stays the judge of the value (an unknown one comes
+ * back as a readable 400), and a task may still carry a value outside this list (« MCP de X »).
+ */
+export const TASK_ASSIGNEES = ["Alexandre", "Armand", "Les deux"] as const;
+
 export function taskStatusActions(status: string): TaskStatusAction[] {
   switch (status) {
     case "Backlog":

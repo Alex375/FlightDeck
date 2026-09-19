@@ -39,6 +39,7 @@ import { ComposerSection } from "./ComposerSection";
 import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
+import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -762,6 +763,7 @@ function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
@@ -811,6 +813,22 @@ function ThreadPrefs() {
           checked={showLastMessagePreview}
           onChange={(v) => set({ showLastMessagePreview: v })}
           label="Preview of the last sent message"
+        />
+        <ToggleRow
+          title="Conversation side panel"
+          hint={
+            <>
+              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
+              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
+              so the header only holds actions. Open or close it with its header button or{" "}
+              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              above the composer. Off → the previous layout: those chips in the header and the
+              composer, the todo list above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={conversationSidePanel}
+          onChange={(v) => set({ conversationSidePanel: v })}
+          label="Show the conversation side panel"
         />
         <ToggleRow
           title="Message minimap"

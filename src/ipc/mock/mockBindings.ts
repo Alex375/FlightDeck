@@ -1417,6 +1417,14 @@ export const mockCommands = {
       blocks: [],
     });
   },
+  // Written INTO the demo task (the briefing's own object), so the refetch that follows the
+  // write shows the new person — a mock that only answered ok would hide a lost write.
+  async tosseSetTaskAssignee(taskId: string, assignedTo: string): Promise<Result<null, string>> {
+    const found = demoAllTasks().find((row) => row.task.id === taskId);
+    if (!found) return err(`no task with id ${taskId}`);
+    found.task.assignedTo = assignedTo;
+    return ok(null);
+  },
   async tosseSetTaskStatus(taskId: string, status: string): Promise<Result<null, string>> {
     // One id always refuses, so the demo can show what a rejected write looks like.
     if (taskId === "t-blocked") return err("Task is blocked by « Lot 1 » and cannot be started");

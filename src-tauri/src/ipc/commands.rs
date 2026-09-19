@@ -1525,6 +1525,16 @@ pub async fn tosse_set_task_status(task_id: String, status: String) -> Result<()
         .map_err(|e| e.to_string())
 }
 
+/// Reassign a task (Alexandre / Armand / Les deux) — a human picking a person in the
+/// conversation side panel's task card. Nothing in the agent surface calls it.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_set_task_assignee(task_id: String, assigned_to: String) -> Result<(), String> {
+    crate::tosse::set_task_assignee(&task_id, &assigned_to)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Move a project to another status — the Start / Pause / Finish control on a project card.
 #[tauri::command]
 #[specta::specta]
