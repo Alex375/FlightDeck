@@ -5111,7 +5111,7 @@ warnings: string[] }
  * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
  * see the module doc's overview.
  */
-export type StepId = "install_key" | "probe" | "install_claude" | "upload_daemon" | "install_service" | "escalate_persistence" | "run_init" | "claude_auth" | "add_machine" | "diagnose"
+export type StepId = "install_key" | "probe" | "install_claude" | "upload_daemon" | "run_init" | "install_service" | "escalate_persistence" | "claude_auth" | "add_machine" | "diagnose"
 /**
  * One step's current/final state, as carried on [`BootstrapReport`] and (via
  * [`StepState::to_wire`]) on every [`crate::ipc::events::BootstrapProgressEvent`].
