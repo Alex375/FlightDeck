@@ -673,6 +673,38 @@ async fn install_user_unit(machine: &MachineRecord, known_hosts: Option<&str>) -
     }
 }
 
+/// (B14 review fix — blocker) Rewrites an ALREADY-EXISTING per-user systemd unit that
+/// [`crate::bootstrap::orchestrator::ServerDiagnosis::user_unit_missing_path`] has
+/// confirmed predates the `Environment=PATH=` line
+/// [`templates::render_user_unit`]'s current template writes — used by
+/// [`crate::bootstrap::orchestrator::RepairAction::InstallService`] INSTEAD of
+/// [`install_service`]'s generic entry point whenever THAT specific diagnosis is what
+/// triggered the repair (see `orchestrator::repair`'s own `InstallService` arm).
+///
+/// [`install_service`]'s conflict short-circuit exists to protect a FRESH install from
+/// silently overwriting something unrelated it finds already there, but it can only
+/// ever see `probe.conflict` — a free-text description with no idea WHY the thing it
+/// names is there — so it treated a confirmed pre-B14 user unit (missing exactly the
+/// line this repair exists to add) the same as any other unrelated pre-existing setup:
+/// [`ServiceOutcome::Adopted`], writing NOTHING. Every server that has ever completed
+/// `flightdeckd init` has a `~/.flightdeckd/config.json`, which IS one of
+/// [`crate::bootstrap::connect::PROBE_SCRIPT_BODY`]'s three conflict shapes — so routing
+/// THIS repair through that entry point made it a permanent, silent no-op on every real,
+/// already-initialized server it was meant to fix (the population `user_unit_missing_
+/// path` can ever be `true` for). This function skips that check entirely and goes
+/// straight to [`install_user_unit`]'s render+write+reload+enable — the exact same
+/// idempotent operation a fresh, no-conflict user install already performs, just
+/// reached without first asking a conflict-detector that was never designed to
+/// authorize repairing an install it itself half-recognizes.
+pub(crate) async fn repair_user_unit_path(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+) -> Result<ServiceOutcome, BootstrapError> {
+    install_user_unit(machine, known_hosts).await?;
+    verify_daemon_running(machine, known_hosts, Some(UnitScope::User)).await?;
+    Ok(ServiceOutcome::UserUnit)
+}
+
 /// Launches `flightdeckd` as a `setsid`+`nohup`-detached process, run out of the SAME
 /// `~/.local/bin/flightdeckd` [`upload_daemon`] targets for a fresh, non-root install —
 /// the last-resort path, chosen ONLY when [`plan_service_install`] has already confirmed
@@ -2821,6 +2853,141 @@ mod tests {
                 assert!(
                     env_text.contains(".local/bin"),
                     "the user unit's daemon environment must carry ~/.local/bin in PATH: {env_text}"
+                );
+            })
+            .await;
+
+            fixture_down("a");
+        }
+
+        /// (B14 review fix — blocker) PROVES the actual fix for the finding: a
+        /// confirmed pre-B14 user unit (missing `Environment=PATH=`) is REWRITTEN by
+        /// [`repair_user_unit_path`] — not silently adopted-and-left-alone the way
+        /// routing it through [`install_service`]'s generic, conflict-detecting entry
+        /// point would (every already-`init`ed server has a
+        /// `~/.flightdeckd/config.json`, one of `connect::PROBE_SCRIPT_BODY`'s own
+        /// conflict shapes — see [`repair_user_unit_path`]'s own doc). Installs +
+        /// inits fixture A for real (so `config.json` genuinely exists, reproducing
+        /// the exact condition that made the generic path a no-op), simulates a
+        /// pre-B14 unit by overwriting the just-installed one with the OLD shape
+        /// (hand-written here, never through `render_user_unit`, which would defeat
+        /// the point of the simulation), confirms `diagnose` sees the gap, then
+        /// invokes the real dedicated repair and confirms both `diagnose` and (from
+        /// OUTSIDE this test's own ssh connections, via `docker exec`) the unit's
+        /// actual systemd environment agree it is fixed.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start)"]
+        async fn live_repair_user_unit_path_rewrites_a_pre_b14_unit_the_generic_path_would_silently_adopt() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let key = ThrowawayKey::generate("repair-path-a");
+            install_key_via_password(FIXTURE_A_PORT, FIXTURE_A_USER, FIXTURE_A_PASSWORD, &key).await;
+            let machine = fixture_machine(FIXTURE_A_PORT, FIXTURE_A_USER, &key);
+            let kh = ScratchKnownHosts::new("repair-path-a");
+
+            let probe_result = crate::bootstrap::connect::probe(
+                &crate::bootstrap::connect::BootstrapTarget {
+                    host: machine.host.clone(),
+                    port: machine.port,
+                    user: machine.user.clone(),
+                },
+                machine.identity_file.as_deref().unwrap(),
+                kh.path().unwrap(),
+            )
+            .await
+            .expect("B7 probe against fixture A must succeed");
+
+            with_real_dist_dir(|dist| async move {
+                let local_path = dist.join(format!("flightdeckd-{}-unknown-linux-musl", host_arch()));
+                upload_daemon_from_path(&machine, kh.path(), &local_path, None)
+                    .await
+                    .expect("upload to fixture A must succeed");
+                init_via_resolved_path(&machine, kh.path(), "repair-path-a-live-test").await;
+
+                let outcome = install_service(&machine, &probe_result, kh.path())
+                    .await
+                    .expect("install_service against fixture A must succeed");
+                assert_eq!(outcome, ServiceOutcome::UserUnit, "fixture A is a fresh non-root box");
+
+                // Simulate a pre-B14 unit: overwrite the just-installed, PATH-carrying
+                // unit file with the OLD shape (identical otherwise, real resolved
+                // home) that predates the `Environment=PATH=` line.
+                let home = remote_home_dir(&machine, kh.path()).await.expect("must resolve $HOME on fixture A");
+                let stale_unit = format!(
+                    "[Unit]\n\
+                     Description=Flight Deck server daemon (flightdeckd)\n\
+                     \n\
+                     [Service]\n\
+                     ExecStart={}/.local/bin/flightdeckd run\n\
+                     Restart=always\n\
+                     RestartSec=3\n\
+                     \n\
+                     [Install]\n\
+                     WantedBy=default.target\n",
+                    crate::ipc::commands::shq(&home)
+                );
+                let write_script = "export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+                     cat > ~/.config/systemd/user/flightdeckd.service && \
+                     systemctl --user daemon-reload && systemctl --user restart flightdeckd";
+                let out = run_ssh_on_machine_stdin(
+                    &machine,
+                    kh.path(),
+                    write_script,
+                    stale_unit.as_bytes(),
+                    None,
+                    SSH_STDIN_TIMEOUT,
+                )
+                .await
+                .expect("writing the simulated pre-B14 unit must succeed");
+                assert!(
+                    out.success,
+                    "writing the simulated pre-B14 unit failed: stdout={:?} stderr={:?}",
+                    out.stdout, out.stderr
+                );
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let before = crate::bootstrap::orchestrator::diagnose(&machine, kh.path()).await;
+                assert_eq!(
+                    before.user_unit_missing_path,
+                    Some(true),
+                    "diagnose must confirm the simulated unit lacks PATH before the repair: {before:?}"
+                );
+
+                // The actual fix under test: `repair_user_unit_path`, not the generic
+                // `install_service` (which would see fixture A's own
+                // `~/.flightdeckd/config.json` and adopt, writing nothing —
+                // reproducing the finding before this fix landed).
+                let outcome = repair_user_unit_path(&machine, kh.path())
+                    .await
+                    .expect("repair_user_unit_path must succeed");
+                assert_eq!(outcome, ServiceOutcome::UserUnit);
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let after = crate::bootstrap::orchestrator::diagnose(&machine, kh.path()).await;
+                assert_eq!(
+                    after.user_unit_missing_path,
+                    Some(false),
+                    "the repair must have rewritten the unit with the PATH line: {after:?}"
+                );
+
+                // FIX 1's user-unit PATH line, read from OUTSIDE this test's own ssh
+                // connections (a fresh `docker exec`), the exact command the brief
+                // specs: `systemctl --user show flightdeckd -p Environment`.
+                let env = std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        "fd-fixture-a",
+                        "su",
+                        FIXTURE_A_USER,
+                        "-c",
+                        "systemctl --user show flightdeckd -p Environment",
+                    ])
+                    .output()
+                    .expect("docker exec must be available");
+                let env_text = String::from_utf8_lossy(&env.stdout);
+                assert!(
+                    env_text.contains(".local/bin"),
+                    "the repaired unit's daemon environment must carry ~/.local/bin in PATH: {env_text}"
                 );
             })
             .await;

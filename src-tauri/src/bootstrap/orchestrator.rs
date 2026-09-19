@@ -1042,9 +1042,13 @@ async fn step_claude_auth(app: &tauri::AppHandle, req: &StoredBootstrapRequest, 
 /// — never reaching `NeedsClaudeSignIn` — on every server that doesn't have `claude`
 /// yet, which is every one of the brief's own fixtures and the primary "bootstrap a
 /// fresh box" use case. By this point in the pipeline, reachability is ALREADY proven
-/// ([`StepId::Probe`] succeeded) and "claude missing" is ALREADY handled as its own,
-/// separate, non-blocking [`StepId::ClaudeAuth`] step — gating pairing on it again
-/// here would just re-fail what that step deliberately lets through.
+/// ([`StepId::Probe`] succeeded) and "claude missing" is handled by [`StepId::
+/// InstallClaude`] (B14), which runs right after `Probe` and — unlike `ClaudeAuth` —
+/// FAILS the whole pipeline early when it cannot install/find a working `claude` (a
+/// server that cannot run Claude Code cannot usefully run the rest of this pipeline
+/// either). `ClaudeAuth` therefore only ever sees a `claude` `InstallClaude` already
+/// confirmed or installed — gating pairing on presence again here would just
+/// duplicate a check `InstallClaude` already made authoritative.
 async fn step_add_machine(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &Arc<Mutex<PipelineCtx>>) -> StepOutcome {
     let identity_file = match ctx.lock().await.identity_file.clone() {
         Some(i) => i,
@@ -1613,7 +1617,14 @@ impl ServerDiagnosis {
 /// `claude` presence is checked via `$CLAUDE_BIN` (B14's shared
 /// [`crate::ipc::commands::resolve_claude_bin_expr`]), never a bare `command -v claude`
 /// — see that function's doc for why a bare check falsely reported a genuinely
-/// installed, official-installer `claude` as missing.
+/// installed, official-installer `claude` as missing. (Review fix) `FLIGHTDECK_CLAUDE_
+/// INSTALLED` additionally requires `$CLAUDE_BIN --version` to actually SUCCEED, not
+/// just be present/executable — a broken/corrupted install (wrong arch/libc, a
+/// truncated download, a dangling `versions/` dir) must collapse to
+/// [`DiagnosisState::NeedsClaudeInstall`] (so [`RepairAction::InstallClaude`]
+/// re-installs over it) rather than [`DiagnosisState::NeedsClaudeSignIn`], which would
+/// send a novice into a sign-in flow that can never succeed against a binary that
+/// doesn't run.
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
 if [ -f /etc/systemd/system/flightdeckd.service ]; then
     echo FLIGHTDECK_UNIT_SYSTEM:yes
@@ -1648,7 +1659,19 @@ ENABLED_USER=$(export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-en
 echo "FLIGHTDECK_ENABLED_USER:$ENABLED_USER"
 SLEEP_MASKED=$(systemctl is-enabled sleep.target 2>/dev/null)
 echo "FLIGHTDECK_SLEEP_MASKED:$SLEEP_MASKED"
+CLAUDE_WORKS=no
 if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
+    # (review fix) Presence/executable-bit alone is not enough — a broken/corrupted
+    # install (wrong arch/libc, a truncated download, a dangling `versions/` dir)
+    # would otherwise report FLIGHTDECK_CLAUDE_INSTALLED:yes, `collapse_state` would
+    # fall through to the sign-in branch, and a novice with a broken install would be
+    # told to sign in instead of reinstall. Require the SAME "actually runs" bar
+    # `PROBE_SCRIPT_BODY` (`ipc::commands`/`connect`) now holds `claude --version` to.
+    if "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+        CLAUDE_WORKS=yes
+    fi
+fi
+if [ "$CLAUDE_WORKS" = yes ]; then
     echo FLIGHTDECK_CLAUDE_INSTALLED:yes
     echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$("$CLAUDE_BIN" auth status --json 2>/dev/null)"
 else
@@ -1992,6 +2015,18 @@ fn repair_action_invalidates_daemon_version_cache(action: RepairAction) -> bool 
     matches!(action, RepairAction::ReuploadDaemon | RepairAction::RestartDaemon | RepairAction::InstallService)
 }
 
+/// Pure: does the diagnosis that triggered [`RepairAction::InstallService`] mean
+/// `repair`'s own arm for it must go through [`install::repair_user_unit_path`] (a
+/// confirmed pre-B14 user unit missing its `Environment=PATH=` line) rather than the
+/// generic, conflict-detecting [`install::install_service`] entry point? (B14 review
+/// finding.) `true` only when BOTH facts are CONFIRMED — a User-level install AND
+/// `user_unit_missing_path == Some(true)` — never on `None`/`Unknown`, which fall
+/// through to the generic path exactly as every OTHER `InstallService` use (a
+/// not-reboot-safe system/detached install) already did before this fix.
+fn install_service_repair_needs_path_fix(d: &ServerDiagnosis) -> bool {
+    d.installed_as == InstalledAs::User && d.user_unit_missing_path == Some(true)
+}
+
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
 /// re-diagnose. `sudo_password` beyond the brief's own shorthand signature — see the
 /// module doc.
@@ -2010,9 +2045,15 @@ async fn repair(
     // whether it changed anything or the server was already in that state) — captured
     // BEFORE dispatch so `EnableLinger`/`MaskSleep`'s summaries below can say "already
     // enabled/masked" instead of a fixed string that claims a change even on a no-op
-    // re-run (B11 review finding).
+    // re-run (B11 review finding). `InstallService` ALSO needs it, fresh, to decide
+    // WHICH repair path it must take — see `install_service_repair_needs_path_fix`'s
+    // doc and that arm below (B14 review finding: routing every `InstallService` call
+    // through `install::install_service`'s generic conflict-detecting entry point made
+    // the `user_unit_missing_path` repair a permanent no-op on every real server).
     let before = match action {
-        RepairAction::EnableLinger | RepairAction::MaskSleep => Some(diagnose(machine, known_hosts).await),
+        RepairAction::EnableLinger | RepairAction::MaskSleep | RepairAction::InstallService => {
+            Some(diagnose(machine, known_hosts).await)
+        }
         _ => None,
     };
     let summary = match action {
@@ -2031,11 +2072,23 @@ async fn repair(
             "restarted".to_string()
         }
         RepairAction::InstallService => {
-            let target =
-                connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
-            let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
-            let outcome = install::install_service(machine, &probe, known_hosts).await?;
-            format!("{outcome:?}")
+            let fresh = before.as_ref().expect("diagnosed above for InstallService");
+            if install_service_repair_needs_path_fix(fresh) {
+                // Dedicated path — see `install::repair_user_unit_path`'s own doc for
+                // why the generic entry point below would just adopt-and-do-nothing
+                // here (B14 review finding).
+                let outcome = install::repair_user_unit_path(machine, known_hosts).await?;
+                format!("{outcome:?}")
+            } else {
+                let target = connect::BootstrapTarget {
+                    host: machine.host.clone(),
+                    port: machine.port,
+                    user: machine.user.clone(),
+                };
+                let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
+                let outcome = install::install_service(machine, &probe, known_hosts).await?;
+                format!("{outcome:?}")
+            }
         }
         RepairAction::EnableLinger => {
             install::escalate_persistence(machine, known_hosts, sudo_password, false).await?;
@@ -2164,6 +2217,52 @@ mod tests {
     fn claude_already_resolvable_mirrors_the_probe_fact() {
         assert!(claude_already_resolvable(&probe_with_claude(false)), "the probe found a working claude");
         assert!(!claude_already_resolvable(&probe_with_claude(true)), "the probe found none — InstallClaude must run");
+    }
+
+    // ---- install_service_repair_needs_path_fix (B14 review fix — blocker) ----
+
+    #[test]
+    fn install_service_repair_needs_path_fix_only_for_a_confirmed_user_unit_missing_it() {
+        assert!(
+            install_service_repair_needs_path_fix(&ServerDiagnosis {
+                installed_as: InstalledAs::User,
+                user_unit_missing_path: Some(true),
+                ..base_diagnosis()
+            }),
+            "a confirmed pre-B14 user unit must take the dedicated path"
+        );
+        assert!(
+            !install_service_repair_needs_path_fix(&ServerDiagnosis {
+                installed_as: InstalledAs::User,
+                user_unit_missing_path: Some(false),
+                ..base_diagnosis()
+            }),
+            "a user unit that already carries PATH must go through the generic path (a no-op there)"
+        );
+        assert!(
+            !install_service_repair_needs_path_fix(&ServerDiagnosis {
+                installed_as: InstalledAs::User,
+                user_unit_missing_path: None,
+                ..base_diagnosis()
+            }),
+            "an unconfirmed PATH check must never be treated as a repair trigger"
+        );
+        assert!(
+            !install_service_repair_needs_path_fix(&ServerDiagnosis {
+                installed_as: InstalledAs::System,
+                user_unit_missing_path: Some(true),
+                ..base_diagnosis()
+            }),
+            "the field is meaningless outside a User-level install — never routed through the user-unit-only repair"
+        );
+        assert!(
+            !install_service_repair_needs_path_fix(&ServerDiagnosis {
+                installed_as: InstalledAs::Detached,
+                user_unit_missing_path: Some(true),
+                ..base_diagnosis()
+            }),
+            "a not-reboot-safe detached install must keep using the generic InstallService path"
+        );
     }
 
     // ---- crate-wide regression: no remote script bare-checks `claude` (B14) ---------

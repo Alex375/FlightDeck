@@ -3885,6 +3885,15 @@ MISSING=""
 CLAUDE_VERSION=""
 if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
     CLAUDE_VERSION=$("$CLAUDE_BIN" --version 2>/dev/null)
+    # (review fix) A present-but-broken binary (wrong arch/libc, a truncated
+    # download, a dangling `versions/` dir) must NOT be reported as "installed" —
+    # only a ZERO exit AND non-empty output count as "claude actually works", the
+    # same bar `install_claude`'s own post-install verification already holds
+    # itself to (see `bootstrap::server_setup::install_claude`'s doc).
+    if [ $? -ne 0 ] || [ -z "$CLAUDE_VERSION" ]; then
+        CLAUDE_VERSION=""
+        MISSING="$MISSING claude"
+    fi
 else
     MISSING="$MISSING claude"
 fi

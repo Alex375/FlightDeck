@@ -2239,6 +2239,7 @@ export const mockCommands = {
         break;
       case "install_service":
         d.reboot_safe = true;
+        d.user_unit_missing_path = false;
         label = "Install the persistence service";
         summary = "Installed";
         break;

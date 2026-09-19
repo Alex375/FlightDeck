@@ -436,6 +436,18 @@ MISSING=""
 CLAUDE_VERSION=""
 if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
     CLAUDE_VERSION=$("$CLAUDE_BIN" --version 2>/dev/null)
+    # (review fix) Same discipline as `ipc::commands::PROBE_SCRIPT_BODY`'s sibling
+    # copy: a present-but-broken binary (wrong arch/libc, a truncated download, a
+    # dangling `versions/` dir) must not be reported as "installed" just because it
+    # exists and is executable — only a ZERO exit AND non-empty output count as
+    # "claude actually works". Without this, `StepId::InstallClaude`'s own
+    # `claude_already_resolvable` skip-gate (fed by THIS script's `claude_missing`)
+    # would skip re-installing over a broken binary, routing it straight into
+    # `NeedsClaudeSignIn` instead.
+    if [ $? -ne 0 ] || [ -z "$CLAUDE_VERSION" ]; then
+        CLAUDE_VERSION=""
+        MISSING="$MISSING claude"
+    fi
 else
     MISSING="$MISSING claude"
 fi

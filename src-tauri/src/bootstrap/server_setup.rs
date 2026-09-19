@@ -214,9 +214,24 @@ pub const CLAUDE_INSTALL_URL: &str = "https://claude.ai/install.sh";
 ///
 /// The version is read back off a single `FLIGHTDECK_CLAUDE_INSTALLED_VERSION:` marker
 /// line (the same accumulating-script discipline this crate's other probes use) rather
-/// than the script's raw stdout — the installer's OWN progress output (redirected away
-/// here) would otherwise land in front of the version string with nothing to tell the
-/// two apart.
+/// than the script's raw stdout — the installer's OWN progress output would otherwise
+/// land in front of the version string with nothing to tell the two apart, so a
+/// SUCCESSFUL run still discards it (captured into `$OUT`, never echoed).
+///
+/// (Review fix) A FAILED run's captured output is NOT discarded: `run_ssh_on_machine`
+/// only ever surfaces the LAST line of stderr on a non-zero exit (see its own doc), and
+/// the wrapper script this installer is fetched from (`https://claude.ai/install.sh`)
+/// is only disciplined to `echo … >&2` for checks IT performs itself (download
+/// failures, unsupported OS/arch) — the compiled `claude install` subcommand it then
+/// runs internally is a black box that could just as easily explain a failure on its
+/// OWN stdout, which used to be silently thrown at `/dev/null` unconditionally, even
+/// on failure. `$OUT` now captures both streams; on a non-zero exit its last few lines
+/// are joined onto ONE line (so `run_ssh_on_machine`'s own "last stderr line" plumbing
+/// carries more than a single line's worth of context) and written to stderr before
+/// re-raising the SAME exit code the installer itself failed with — `set -e` cannot be
+/// left to do this (a failing command substitution assigned directly to a variable
+/// aborts the script before `$?` can be read; wrapping it as the `if` condition itself
+/// is exempt from `errexit`, which is why that shape is used here).
 pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
     let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
     let script = format!(
@@ -231,7 +246,15 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   echo 'neither curl nor wget is available to download the Claude Code installer' >&2\n\
          \x20   exit 7\n\
          fi\n\
-         bash \"$TMP\" >/dev/null\n\
+         if OUT=$(bash \"$TMP\" 2>&1); then\n\
+         \x20   INSTALL_STATUS=0\n\
+         else\n\
+         \x20   INSTALL_STATUS=$?\n\
+         fi\n\
+         if [ \"$INSTALL_STATUS\" -ne 0 ]; then\n\
+         \x20   printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
+         \x20   exit \"$INSTALL_STATUS\"\n\
+         fi\n\
          echo \"FLIGHTDECK_CLAUDE_INSTALLED_VERSION:$({claude_bin} --version 2>/dev/null)\"\n",
         url = CLAUDE_INSTALL_URL,
     );
