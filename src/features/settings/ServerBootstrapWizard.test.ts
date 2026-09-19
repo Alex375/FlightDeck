@@ -78,7 +78,7 @@ vi.mock("../../ipc/client", () => ({
   },
 }));
 
-import { act, createElement } from "react";
+import { StrictMode, act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { useSettingsUi } from "../../store/settingsUi";
@@ -835,8 +835,8 @@ describe("ServerBootstrapWizard — legacy flow", () => {
   // CRM holistic-review blocker #3 (chantier A bd7ca709): a pairing ticket is
   // SERVER-PRINTED — a hostile or compromised server can hand back one that
   // pre-fills an ssh-option-shaped `user`. "Continue" must refuse it and stay on the
-  // ticket-paste stage, so the confirm screen (and "Test & pair") never even sees it.
-  it("refuses a malicious ticket's user, staying on the ticket-paste stage", async () => {
+  // ticket-paste stage, so the confirm screen (and "Install") never even sees it.
+  it("refuses a malicious ticket's user, staying on the ticket-paste stage, and never calls bootstrap_server", async () => {
     generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
     mount();
     clickButtonWithText("Use a command instead (servers with key-only login)");
@@ -859,12 +859,13 @@ describe("ServerBootstrapWizard — legacy flow", () => {
     await settle();
 
     // Still on the ticket-paste stage — "3 · Confirm the connection" (and, with it,
-    // "Test & pair") never rendered.
+    // "Install") never rendered.
     expect(container.textContent).not.toContain("Confirm the connection");
     expect(container.textContent).toMatch(/isn't safe to use/);
+    expect(bootstrapServer).not.toHaveBeenCalled();
   });
 
-  it("manual entry: refuses an ssh-option-shaped user, disabling Test & pair with an inline reason", async () => {
+  it("manual entry: refuses an ssh-option-shaped user, disabling Install with an inline reason", async () => {
     generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
     mount();
     clickButtonWithText("Use a command instead (servers with key-only login)");
@@ -876,10 +877,101 @@ describe("ServerBootstrapWizard — legacy flow", () => {
     fill("User", "-oProxyCommand=touch /tmp/pwned");
     await settle();
 
-    const pairBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Test & pair",
+    const installBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Install",
     ) as HTMLButtonElement;
-    expect(pairBtn.disabled).toBe(true);
+    expect(installBtn.disabled).toBe(true);
     expect(container.textContent).toMatch(/User name cannot start with/);
+    expect(bootstrapServer).not.toHaveBeenCalled();
+  });
+
+  // B12-legacy: the ticket flow used to dead-end here — its own "pair" action called
+  // the LEGACY `addMachine` IPC, which hard-blocks with "claude is not installed…" on
+  // a fresh server. Now the confirmed connection is handed to `PrimaryBootstrap`
+  // (`onInstall`), which runs the SAME full `bootstrap_server` pipeline that installs
+  // everything — see the module doc's top paragraph.
+  it("pasting a valid ticket then clicking Install switches to the primary view and installs with no password", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "s-legacy",
+        host: "my-vps.tailnet.ts.net",
+        steps: allOk(),
+        needs_input: null,
+        machine_id: "m-legacy",
+        diagnosis: null,
+      },
+    });
+    mount();
+    clickButtonWithText("Use a command instead (servers with key-only login)");
+    await settle();
+
+    // Deliberately give the ticket a `host` DIFFERENT from its tailscale address, so a
+    // pass on this assertion actually proves the tailscale-preferred candidate won —
+    // not just whatever the ticket's raw `host` field happened to hold.
+    const ticket = `fdpair:${btoa(
+      JSON.stringify({
+        label: "my-vps",
+        host: "203.0.113.5",
+        port: 2222,
+        user: "deploy",
+        addresses: [
+          { kind: "lan", value: "192.168.1.50" },
+          { kind: "tailscale", value: "my-vps.tailnet.ts.net" },
+        ],
+      }),
+    )}`;
+    fill("fdpair", ticket);
+    clickButtonWithText("Continue");
+    await settle();
+    expect(container.textContent).toContain("Confirm the connection");
+
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
+    expect(bootstrapServer).toHaveBeenCalledWith("my-vps", "my-vps.tailnet.ts.net", 2222, "deploy", null, true, null);
+    // Switched to the primary view's live checklist — the ticket-paste stage is gone.
+    expect(container.textContent).not.toContain("Confirm the connection");
+    expect(container.textContent).toContain("Using the key your server just authorized");
+  });
+
+  // React StrictMode double-invokes a freshly-mounted component's effects (call →
+  // cleanup → call again) in dev, to surface effects that aren't idempotent.
+  // `PrimaryBootstrap`'s auto-install effect is exactly that kind of effect — without
+  // the `autoInstallStarted` ref guard, this would fire `bootstrap_server` twice and
+  // spawn two overlapping sessions against the same server.
+  it("does not double-start the install under React StrictMode's double-invoked mount effect", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "s-strict",
+        host: "strict.example.com",
+        steps: allOk(),
+        needs_input: null,
+        machine_id: "m-strict",
+        diagnosis: null,
+      },
+    });
+
+    act(() => {
+      root.render(createElement(StrictMode, null, createElement(ServerBootstrapWizard, { onClose: () => {} })));
+    });
+    clickButtonWithText("Use a command instead (servers with key-only login)");
+    await settle();
+
+    const ticket = `fdpair:${btoa(
+      JSON.stringify({ label: "strict-vps", host: "strict.example.com", port: 22, user: "deploy", addresses: [] }),
+    )}`;
+    fill("fdpair", ticket);
+    clickButtonWithText("Continue");
+    await settle();
+
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
   });
 });

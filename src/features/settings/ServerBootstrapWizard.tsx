@@ -6,7 +6,14 @@
 // The OLD ticket/command flow (`buildServerCommand`/`parseTicket`, still defined in
 // ControlSection.tsx — its own regression tests import them from there) stays reachable
 // behind a secondary link, for servers this Mac can only reach with a pre-authorized
-// key (no password prompt at all).
+// key. It no longer pairs the server on its own: once the ticket is confirmed,
+// `LegacyPairing` hands the connection details to `PrimaryBootstrap` via `onInstall`,
+// which auto-starts the SAME full `bootstrap_server` pipeline with no password — the
+// key the pasted command just authorized on the server is the same shared pending key
+// `bootstrap_server`'s own `InstallKey` step tries first, so that step is skipped and
+// no password is ever asked for (unless that key turns out not to work, in which case
+// the pipeline's own error shows and the primary form's password field lets the user
+// retry).
 //
 // ⚠️ `install`/`runInstall` split (review fix): the typed password is cleared from
 // `password` state the instant an attempt submits — win or lose — so a HostKeyMismatch
@@ -89,12 +96,35 @@ function StepChecklist({ steps }: { steps: StepState[] }) {
   );
 }
 
-/** The primary wizard: form → live checklist → inline needs_input handling → done. */
-function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUseLegacy: () => void }) {
-  const [name, setName] = useState("");
-  const [address, setAddress] = useState("");
-  const [port, setPort] = useState("22");
-  const [user, setUser] = useState("");
+/** Connection details `LegacyPairing` hands over once its ticket is confirmed — see
+ *  `PrimaryBootstrap`'s own `prefill` prop doc. */
+interface BootstrapPrefill {
+  name: string;
+  address: string;
+  port: number;
+  user: string;
+}
+
+/** The primary wizard: form → live checklist → inline needs_input handling → done.
+ *
+ *  `prefill`, when present, means this mount came from `LegacyPairing` — the user
+ *  already pasted the pairing command on the server (authorizing this Mac's pending
+ *  key) and confirmed the connection details. The form below seeds from it and the
+ *  effect further down auto-starts the install with no password, since that same key
+ *  almost certainly already works. */
+function PrimaryBootstrap({
+  onClose,
+  onUseLegacy,
+  prefill,
+}: {
+  onClose: () => void;
+  onUseLegacy: () => void;
+  prefill?: BootstrapPrefill | null;
+}) {
+  const [name, setName] = useState(prefill?.name ?? "");
+  const [address, setAddress] = useState(prefill?.address ?? "");
+  const [port, setPort] = useState(prefill ? String(prefill.port) : "22");
+  const [user, setUser] = useState(prefill?.user ?? "");
   const [password, setPassword] = useState("");
   // Opt-out (default ON), applies even to a root login — see the B12 brief.
   const [keepAwake, setKeepAwake] = useState(true);
@@ -227,6 +257,23 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
     pendingKeyPasswordRef.current = pw || null; // …but kept for a same-run "forget and retry" hop
     return runInstall(pw || null);
   }, [password, runInstall]);
+
+  // Arriving with a `prefill` means the legacy ticket flow just authorized this Mac's
+  // pending key on the server — kick off the same pipeline immediately, with no
+  // password, instead of making the user re-type what they just confirmed and click
+  // "Install" again. Guarded with a ref (not just relying on `prefill` staying stable)
+  // because React StrictMode double-invokes effects in dev: without the guard, the
+  // second invocation would fire a second `bootstrap_server` call and spawn two
+  // overlapping sessions against the same server.
+  const autoInstallStarted = useRef(false);
+  useEffect(() => {
+    if (!prefill || autoInstallStarted.current) return;
+    autoInstallStarted.current = true;
+    void runInstall(null);
+    // Deliberately empty deps — this must fire only once, on mount, reading whatever
+    // `runInstall` closed over at that point (the prefill-seeded initial state).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const resume = useCallback(async () => {
     if (!sessionId) return;
@@ -485,6 +532,12 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
 
   return (
     <div className={sharedStyles.remotePanel}>
+      {prefill && (
+        <div className={wStyles.infoLine}>
+          <Ico name="key" />
+          Using the key your server just authorized — no password needed.
+        </div>
+      )}
       <StepChecklist steps={steps} />
 
       {fingerprint && (
@@ -629,13 +682,23 @@ function PrimaryBootstrap({ onClose, onUseLegacy }: { onClose: () => void; onUse
   );
 }
 
-type LegacyStage = "command" | "confirm" | "manual" | "done";
+type LegacyStage = "command" | "confirm" | "manual";
 
 /** The OLD ticket/paste flow, moved here verbatim from ControlSection.tsx (its own
  *  `buildServerCommand`/`parseTicket` stay put — their regression tests import them
  *  from there). Reachable as a secondary path for a server this Mac can already reach
- *  with a pre-authorized key, so a password prompt is never needed. */
-function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePrimary: () => void }) {
+ *  with a pre-authorized key. Once the connection is confirmed, `onInstall` hands the
+ *  details to `PrimaryBootstrap`, which runs the SAME full install this key almost
+ *  certainly needs no password for — see the module doc up top. */
+function LegacyPairing({
+  onClose,
+  onUsePrimary,
+  onInstall,
+}: {
+  onClose: () => void;
+  onUsePrimary: () => void;
+  onInstall: (prefill: BootstrapPrefill) => void;
+}) {
   const [stage, setStage] = useState<LegacyStage>("command");
   const [genKey, setGenKey] = useState<{ identityFile: string; publicKey: string } | null>(null);
   const [ticket, setTicket] = useState("");
@@ -645,12 +708,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
   const [user, setUser] = useState("");
   const [addresses, setAddresses] = useState<AddressCandidate[]>([]);
   const [copied, setCopied] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Set only when a pairing converged on an ALREADY-paired server (see `addMachine`'s
-  // `matchedExisting`) — the label to say "Updated the existing server ..." about,
-  // instead of the panel just closing as if a second server had silently appeared.
-  const [updatedExistingLabel, setUpdatedExistingLabel] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -680,7 +738,7 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
     // A pairing ticket is SERVER-PRINTED, not typed by this Mac's user — a hostile or
     // compromised server can hand back one that pre-fills an ssh-option-shaped
     // user/host (CRM holistic-review blocker #3, chantier A `bd7ca709`). Refused
-    // HERE, before the confirm screen (and "Test & pair") ever shows it, rather than
+    // HERE, before the confirm screen (and "Install") ever shows it, rather than
     // only after a round trip to the core.
     const fieldErr = firstConnectionFieldError(t.user, candidateHost, candidatePort);
     if (fieldErr) {
@@ -696,33 +754,19 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
     setStage("confirm");
   }, [ticket]);
 
-  const pair = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    const res = await useConversationsStore.getState().addMachine({
-      label: label.trim() || host.trim(),
-      host: host.trim(),
+  // Hands the confirmed connection off to `PrimaryBootstrap` rather than pairing the
+  // server itself — see the module doc: `bootstrap_server`'s own `InstallKey` step
+  // will find this Mac's pending key (the one the pasted command just authorized)
+  // already works and skip straight past it, no password needed, running the SAME
+  // full install the primary form's password path runs.
+  const pair = useCallback(() => {
+    onInstall({
+      name: label.trim() || host.trim(),
+      address: host.trim(),
       port: Number(port) || 22,
       user: user.trim(),
-      identityFile: genKey?.identityFile ?? null,
-      addresses: addresses.length > 0 ? addresses : null,
     });
-    setBusy(false);
-    if (res.ok) {
-      setGenKey(null);
-      if (res.matchedExisting) {
-        // This host (or one of its other recorded addresses) was already paired —
-        // the row was UPDATED, not added. Say so rather than closing silently, which
-        // would read as a second server having appeared.
-        setUpdatedExistingLabel(res.machine.label);
-        setStage("done");
-      } else {
-        onClose();
-      }
-    } else {
-      setError(res.error);
-    }
-  }, [label, host, port, user, genKey, addresses, onClose]);
+  }, [label, host, port, user, onInstall]);
 
   // Live validation of whatever `host`/`user`/`port` currently hold — covers every
   // way they can get set: a parsed ticket (already pre-screened by
@@ -743,8 +787,10 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
         <>
           <div className={sharedStyles.remoteStep}>
             <b>1 · Run this once on your server.</b> Open a shell on it (over SSH, or on the
-            machine itself) and paste. It authorizes Flight Deck, checks Claude, and prints a
-            pairing ticket. Nothing to type here — Flight Deck already made a dedicated key.
+            machine itself) and paste. It authorizes Flight Deck&apos;s key and prints a ticket
+            back. Nothing to type here — Flight Deck already made a dedicated key. Paste that
+            ticket below and confirm the connection — Flight Deck installs Claude Code and
+            everything else it needs from there, the same as the guided install.
           </div>
           {serverCommand ? (
             <>
@@ -875,10 +921,10 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
-              disabled={busy || !host.trim() || !user.trim() || !!fieldError}
-              onClick={() => void pair()}
+              disabled={!host.trim() || !user.trim() || !!fieldError}
+              onClick={pair}
             >
-              {busy ? "Testing…" : "Test & pair"}
+              Install
             </button>
             {stage === "confirm" && (
               <button
@@ -899,20 +945,6 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
           </div>
         </>
       )}
-
-      {stage === "done" && (
-        <>
-          <div className={sharedStyles.remoteStep}>
-            Updated the existing server &ldquo;{updatedExistingLabel}&rdquo; — this host was already
-            paired, so nothing new was added.
-          </div>
-          <div className={sharedStyles.btnRow}>
-            <button className={`${sharedStyles.btn} ${sharedStyles.primary}`} onClick={onClose}>
-              Done
-            </button>
-          </div>
-        </>
-      )}
     </div>
   );
 }
@@ -922,8 +954,22 @@ function LegacyPairing({ onClose, onUsePrimary }: { onClose: () => void; onUsePr
  *  an explicit Cancel/Done alike — the caller doesn't need to know which). */
 export function ServerBootstrapWizard({ onClose }: { onClose: () => void }) {
   const [useLegacy, setUseLegacy] = useState(false);
+  // Set once `LegacyPairing`'s ticket is confirmed and "Install" is clicked — carried
+  // across the switch back to `PrimaryBootstrap` so it can seed the form and
+  // auto-start the install. Never cleared back to null (nothing re-reads it once the
+  // primary view has taken over).
+  const [prefill, setPrefill] = useState<BootstrapPrefill | null>(null);
   if (useLegacy) {
-    return <LegacyPairing onClose={onClose} onUsePrimary={() => setUseLegacy(false)} />;
+    return (
+      <LegacyPairing
+        onClose={onClose}
+        onUsePrimary={() => setUseLegacy(false)}
+        onInstall={(p) => {
+          setPrefill(p);
+          setUseLegacy(false);
+        }}
+      />
+    );
   }
-  return <PrimaryBootstrap onClose={onClose} onUseLegacy={() => setUseLegacy(true)} />;
+  return <PrimaryBootstrap onClose={onClose} onUseLegacy={() => setUseLegacy(true)} prefill={prefill} />;
 }
