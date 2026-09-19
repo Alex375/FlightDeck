@@ -354,11 +354,13 @@ pub struct ServerLoginResultEvent {
 }
 
 /// `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
-/// `bootstrap_install_key` returns `Ok` (`Installed` or `AlreadyPresent`) — never on
-/// any `Err`, even one (like a wrong password) that still pinned a fresh host key at
-/// the transport layer; see `bootstrap::connect::bootstrap_install_key`'s own doc for
-/// why the emit is gated on the overall `Result`, not on "some fingerprint happens to
-/// be readable". DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+/// `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
+/// never on any `Err`, even one (like a wrong password) that still pinned a fresh host
+/// key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
+/// pipeline step that is the only caller of
+/// [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
+/// on the overall `Result`, not on "some fingerprint happens to be readable".
+/// DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
 /// confirmation step gating on this event, it never blocks the flow. `known` = the
 /// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
 /// this particular connection attempt — `false` only on a server's genuine first

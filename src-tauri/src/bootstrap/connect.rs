@@ -168,7 +168,7 @@ static INSTALL_KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 /// `identity_file`/`public_key` are expected to be
 /// [`crate::ipc::commands::generate_or_reuse_pending_key`]'s own output — A3's
 /// per-server dedicated key. This function never mints a key itself. `known_hosts` is
-/// the app's dedicated file (`bootstrap_install_key` always passes
+/// the app's dedicated file (this function's own callers always pass
 /// `app_data/remote_known_hosts`): the FIRST connection here is what TOFU-pins the
 /// server's host key (`StrictHostKeyChecking=accept-new`, baked into
 /// `bootstrap_ssh_command`) — see the module doc and
@@ -333,8 +333,9 @@ fn parse_host_key_fingerprint(stdout: &str) -> Option<String> {
 }
 
 /// Whether `(host, port)` already has a pinned entry in `known_hosts` — read BEFORE a
-/// connection attempt. [`bootstrap_install_key`] compares this against a fresh read
-/// AFTER the attempt to decide [`HostKeyFingerprintEvent::known`]. `pub(crate)` so
+/// connection attempt. [`install_key`]'s caller (`bootstrap::orchestrator::
+/// step_install_key`) compares this against a fresh read AFTER the attempt to decide
+/// [`HostKeyFingerprintEvent::known`]. `pub(crate)` so
 /// `bootstrap::orchestrator` (B11) reuses this same before/after dance for its own
 /// install-key pipeline step instead of duplicating it.
 pub(crate) async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) -> bool {
@@ -351,8 +352,9 @@ pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port:
     // hand `ssh-keygen` a pattern built from a `host` that failed the SAME rule every
     // other ssh-argv builder in this crate enforces, even though `-F`'s own argument
     // grammar already isn't vulnerable to the `user@host` injection class this rule
-    // exists for (see `bootstrap_install_key`'s doc). Degrades to "nothing pinned"
-    // rather than an error — this function is display-only/non-blocking by design.
+    // exists for (see `crate::store::validate_address_value`'s own doc). Degrades to
+    // "nothing pinned" rather than an error — this function is display-only/non-
+    // blocking by design.
     crate::store::validate_address_value(host).ok()?;
     if !Path::new(known_hosts).exists() {
         return None;
