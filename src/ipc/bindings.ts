@@ -2516,9 +2516,12 @@ async startClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>
  * Explicitly REPLACE any live sign-in session for `machine_id` with a fresh one — the
  * only thing in this module that supersedes rather than attaches (see
  * [`LoginSessions`]'s own doc). The replaced session, if any, is told via a
- * [`ServerLoginResultEvent`] (`ok:false`, a "superseded" reason) — unlike
- * [`cancel_claude_login`] on a session the SAME caller started, which stays silent on
- * purpose. Used by the "Restart sign-in" action once a sign-in is already in flight.
+ * [`ServerLoginResultEvent`] (`ok:false`, `reason:Superseded`) — [`cancel_claude_login`]
+ * on a session the SAME caller started gets the same terminal-event treatment now
+ * (`reason:Cancelled`, since residual defect A8/R1), but that caller is expected to
+ * recognize and ignore its own echo, whereas a superseded surface never initiated
+ * anything and must always see this as new information. Used by the "Restart sign-in"
+ * action once a sign-in is already in flight.
  */
 async restartClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
     try {
@@ -2545,7 +2548,12 @@ async submitClaudeLoginCode(session: LoginSession, code: string) : Promise<Resul
 /**
  * Cancel an in-flight [`start_claude_login`] session — kills the remote process. Safe
  * (a harmless no-op, not an error surfaced to the user) when the session already
- * finished on its own.
+ * finished on its own. The actor still emits a terminal [`ServerLoginResultEvent`]
+ * (`reason:Cancelled`) for this session (residual defect A8/R1) — this command itself
+ * never surfaces that as an `Err` to ITS caller, who is expected to already know it
+ * asked for this and to ignore that event when it arrives (see `ClaudeSignInInline`'s
+ * own doc); an attached, non-owning surface still watching the same session gets the
+ * signal it never used to.
  */
 async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
     try {
@@ -4004,6 +4012,40 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
+ * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
+ * ever having to match on `error`'s wording (free-text, display-only). `None` on a
+ * successful sign-in (`ok: true`) — there is nothing to discriminate there.
+ * 
+ * Added for residual defect A8/R1 (CRM `1abfc028`, counter-verification of the
+ * single-flight sign-in fix wave): `Cancelled` used to be the one [`LoginOutcome`]
+ * that emitted NO event at all, on the assumption "the caller who cancelled already
+ * knows" — true only while a session had exactly one caller. Once `attach_or_reserve`
+ * let a second, non-owning surface watch the SAME session, that assumption broke: an
+ * attached surface left watching after the OWNER cancels/unmounts needs the same
+ * terminal signal `Superseded` already gets. `Cancelled` is now ALWAYS emitted too —
+ * this discriminant is what lets the surface that INITIATED the cancel recognize and
+ * ignore its own echo (it already knows), while every other attached surface treats it
+ * as the "stop showing a dead session" signal it never got before. See
+ * `ClaudeSignInInline`'s own doc for the front-end split.
+ */
+export type LoginResultReason = 
+/**
+ * A `DriverCommand::Cancel` reached the actor — either the owning caller's own
+ * Cancel/unmount, or (going forward) anything else that ever sends one.
+ */
+"cancelled" | 
+/**
+ * An explicit "Restart sign-in" ([`crate::bootstrap::server_setup::
+ * restart_claude_login`]) replaced this session before it reached a terminal
+ * state.
+ */
+"superseded" | 
+/**
+ * The sign-in itself failed (wrong code, lost connection, timed out, …) — `error`
+ * carries the human-readable detail.
+ */
+"failed"
+/**
  * Opaque handle [`start_claude_login`]/[`restart_claude_login`] return, threaded back
  * through [`submit_claude_login_code`] / [`cancel_claude_login`].
  */
@@ -4721,9 +4763,11 @@ daemon_outdated: boolean }
 export type ServerLoginPromptEvent = { session_id: string; machine_id: string; url: string }
 /**
  * Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
- * `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
- * otherwise. NEVER emitted for a session the front itself cancelled (see
- * `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+ * `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error`/`reason`
+ * set otherwise. Emitted for EVERY terminal [`LoginOutcome`] now, `Cancelled` included
+ * (see [`LoginResultReason`]'s own doc for why that changed) — a listener that
+ * initiated the cancel itself is expected to recognize `reason: "cancelled"` for ITS
+ * OWN session and render nothing for it, not have the backend stay silent.
  * 
  * ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
  * has no way to distinguish this session's OWN terminal event from a stale one
@@ -4731,7 +4775,7 @@ export type ServerLoginPromptEvent = { session_id: string; machine_id: string; u
  * race a follow-up review of B-finding #4 caught: the just-superseded session's
  * belated `superseded` result clobbering the brand-new session's state).
  */
-export type ServerLoginResultEvent = { session_id: string; machine_id: string; ok: boolean; email: string | null; error: string | null }
+export type ServerLoginResultEvent = { session_id: string; machine_id: string; ok: boolean; email: string | null; error: string | null; reason: LoginResultReason | null }
 /**
  * The Codex backend's subscription rate-limit % (5h + weekly windows) changed. Codex
  * pushes this over the live app-server (`account/rateLimits/updated`) — there is no

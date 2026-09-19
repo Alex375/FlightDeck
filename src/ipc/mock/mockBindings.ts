@@ -19,6 +19,7 @@ import type {
   DiskConversation,
   GeneratedKey,
   HostKeyFingerprintEvent,
+  LoginResultReason,
   LoginSession,
   MachineProvisionStatus,
   MachineRecord,
@@ -2299,6 +2300,7 @@ export const mockCommands = {
           ok: false,
           email: null,
           error: "superseded by another sign-in for this server",
+          reason: "superseded" satisfies LoginResultReason,
         });
       }, 50);
     }
@@ -2319,6 +2321,7 @@ export const mockCommands = {
         ok: accepted,
         email: accepted ? "demo@example.com" : null,
         error: accepted ? null : "that code wasn't accepted",
+        reason: accepted ? null : ("failed" satisfies LoginResultReason),
       });
       if (accepted) {
         const d = mockDiagnoses.get(session.machine_id);
@@ -2335,7 +2338,24 @@ export const mockCommands = {
   },
 
   async cancelClaudeLogin(session: LoginSession): Promise<Result<null, string>> {
-    mockLoginSessions.delete(session.session_id);
+    const existed = mockLoginSessions.delete(session.session_id);
+    // Mirrors the real backend (residual defect A8/R1, CRM 1abfc028): a Cancel now
+    // ALWAYS emits a terminal result, even for the caller who initiated it — a still-
+    // ATTACHED surface for the same session needs the same signal `Superseded` already
+    // gets. The initiating surface's own UI is what ignores this event for itself (see
+    // `ClaudeSignInInline`'s doc); this mock doesn't need to know who owns what.
+    if (existed) {
+      setTimeout(() => {
+        serverLoginResultEvent.emit({
+          session_id: session.session_id,
+          machine_id: session.machine_id,
+          ok: false,
+          email: null,
+          error: "cancelled",
+          reason: "cancelled" satisfies LoginResultReason,
+        });
+      }, 10);
+    }
     return ok(null);
   },
 
