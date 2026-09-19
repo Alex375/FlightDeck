@@ -2626,7 +2626,17 @@ async bootstrapServer(label: string, host: string, port: number, user: string, p
  * [`ServerLocks`]: REUSES (never re-claims) the [`ServerLockGuard`] the original
  * `bootstrap_server` call claimed and left held across the pause (B_lifecycle-#7) —
  * see [`BootstrapSessions::resume`]'s own `lock_key`. A fresh `claim` here would
- * simply collide with this very session's own still-held lock.
+ * simply collide with this very session's own still-held lock. That key is the
+ * MACHINE id whenever one was already known at the ORIGINAL `bootstrap_server` call
+ * (see [`server_lock_key`]) — carried forward verbatim from `StoredSession::lock_key`,
+ * never re-derived here, so [`sync_resume_request_to_machine`]'s own coordinate
+ * rewrite below can never disturb which lock this run holds.
+ * 
+ * [`sync_resume_request_to_machine`]: residual defect A8/R2 (CRM `1abfc028`) — once
+ * [`resolve_resume_machine`] re-finds the right, possibly-rotated [`MachineRecord`],
+ * its CURRENT `host`/`port`/`user` are copied onto the resumed `req` BEFORE the
+ * pipeline is built, so every step dials where the machine is reachable TODAY, not
+ * wherever it was when this session originally paused — see that function's own doc.
  */
 async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
