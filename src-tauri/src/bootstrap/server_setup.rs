@@ -446,10 +446,36 @@ pub(crate) fn claude_auth_status_cmd() -> String {
     format!("{} auth status --json", crate::ipc::commands::resolve_claude_bin_expr())
 }
 
-/// The `claude auth login` command — same resolver, same reason. See
-/// [`claude_auth_status_cmd`]'s doc.
+/// Where the remote `claude auth login` records its own PID, so a later cleanup can
+/// kill exactly that process (see [`kill_stale_login_script`]).
+const LOGIN_PIDFILE: &str = "\"$HOME/.cache/flightdeck-claude-login.pid\"";
+
+/// Kills the `claude auth login` recorded in [`LOGIN_PIDFILE`], if that PID is still a
+/// `claude … auth login` (checked via `/proc/<pid>/cmdline`, so a recycled PID is never
+/// touched). SIGKILL, not SIGTERM: VERIFIED on a real server (19/09) that a waiting
+/// `claude auth login` survives SIGTERM (`timeout 15` left it running). Needed because
+/// with no pty, killing our local ssh does NOT stop the remote process: the first real
+/// novice run left one orphaned `claude auth login` per attempt on the server. Never
+/// matches by name (`pkill -f "claude auth login"` would also kill a login the user
+/// runs by hand, and matches the very shell running it).
+pub(crate) fn kill_stale_login_script() -> String {
+    format!(
+        "p=$(cat {LOGIN_PIDFILE} 2>/dev/null); case \"$p\" in ''|*[!0-9]*) ;; *) \
+         if tr '\\0' ' ' < \"/proc/$p/cmdline\" 2>/dev/null | grep -q 'auth login'; then \
+         kill -KILL \"$p\" 2>/dev/null; fi ;; esac; rm -f {LOGIN_PIDFILE}"
+    )
+}
+
+/// The `claude auth login` command — same resolver, same reason as
+/// [`claude_auth_status_cmd`]. It first kills a stale login left by an earlier attempt,
+/// then records its own PID (`exec` keeps the shell's PID, so `$$` IS the `claude`
+/// process) for [`kill_stale_login_script`] to clean up after a cancel/failure.
 pub(crate) fn claude_auth_login_cmd() -> String {
-    format!("{} auth login", crate::ipc::commands::resolve_claude_bin_expr())
+    format!(
+        "{}; mkdir -p \"$HOME/.cache\" && echo $$ > {LOGIN_PIDFILE} && exec {} auth login",
+        kill_stale_login_script(),
+        crate::ipc::commands::resolve_claude_bin_expr()
+    )
 }
 
 /// Runs `claude auth status --json` on `machine` and parses its stdout REGARDLESS of
@@ -518,11 +544,20 @@ pub struct ClaudeLoginDriver {
     /// straddle two separate reads, so re-scanning the whole buffer each time is the
     /// only way a split marker is never missed.
     accumulated: String,
+    /// The sign-in URL, once recognized — kept apart from `state` because one read can
+    /// carry the URL AND the prompt, jumping straight past `UrlReady` (see
+    /// [`Self::feed`]); the caller still has to show that URL to the human.
+    url: Option<String>,
 }
 
 impl ClaudeLoginDriver {
     pub fn new() -> Self {
-        Self { state: LoginState::Start, accumulated: String::new() }
+        Self { state: LoginState::Start, accumulated: String::new(), url: None }
+    }
+
+    /// The sign-in URL recognized so far, whatever the current state.
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
     }
 
     /// Feed a newly-read chunk of the remote `claude auth login`'s stdout. Advances
@@ -530,27 +565,48 @@ impl ClaudeLoginDriver {
     /// recognizes the prompt, `Submitting` recognizes a failure line. `AwaitingCode` /
     /// `Done` / `Failed` ignore further output (a `Done`/`Failed` fixture doesn't un-
     /// terminate; `AwaitingCode` only advances via [`Self::submit_code`]).
+    ///
+    /// Advances to a FIXPOINT, not one transition per call: VERIFIED on a real server
+    /// (19/09, `claude` 2.1.278 over Tailscale) that the URL line AND the "Paste code
+    /// here" prompt can arrive in the SAME read — after which the CLI blocks on stdin
+    /// and no further chunk ever comes. A one-step `feed` stopped at `UrlReady`, the
+    /// pasted code was refused (`submit_code` only fires from `AwaitingCode`), and the
+    /// recognition deadline then failed the sign-in as "the CLI changed its output".
     pub fn feed(&mut self, chunk: &str) {
         self.accumulated.push_str(chunk);
         let stripped = strip_ansi(&self.accumulated);
-        self.state = match &self.state {
-            LoginState::Start => match extract_login_url(&stripped) {
-                Some(url) => LoginState::UrlReady { url },
+        loop {
+            let next = self.step(&stripped);
+            if next == self.state {
+                break;
+            }
+            self.state = next;
+        }
+    }
+
+    /// One transition of [`Self::feed`]'s fixpoint loop against the stripped buffer.
+    fn step(&mut self, stripped: &str) -> LoginState {
+        match &self.state {
+            LoginState::Start => match extract_login_url(stripped) {
+                Some(url) => {
+                    self.url = Some(url.clone());
+                    LoginState::UrlReady { url }
+                }
                 None => LoginState::Start,
             },
             LoginState::UrlReady { url } => {
-                if is_prompt_seen(&stripped) {
+                if is_prompt_seen(stripped) {
                     LoginState::AwaitingCode
                 } else {
                     LoginState::UrlReady { url: url.clone() }
                 }
             }
-            LoginState::Submitting => match extract_login_failure(&stripped) {
+            LoginState::Submitting => match extract_login_failure(stripped) {
                 Some(reason) => LoginState::Failed { reason },
                 None => LoginState::Submitting,
             },
             other => other.clone(),
-        };
+        }
     }
 
     /// The human submitted a pasted code: only a valid transition from `AwaitingCode`.
@@ -889,6 +945,31 @@ enum LoginOutcome {
     Superseded,
 }
 
+/// Writes the pasted code (plus the newline the CLI's prompt waits for) to the remote
+/// `claude auth login`'s stdin.
+async fn write_login_code(stdin: &mut tokio::process::ChildStdin, code: &str) -> std::io::Result<()> {
+    stdin.write_all(format!("{code}\n").as_bytes()).await?;
+    stdin.flush().await
+}
+
+/// Best-effort: kills the remote `claude auth login` this drive started (see
+/// [`kill_stale_login_script`] for why killing our local ssh is not enough). Bounded
+/// by the same round-trip timeout as every other short remote call; a failure is only
+/// logged — the next sign-in's own command kills a stale login first anyway.
+async fn kill_stale_login(machine: &MachineRecord, known_hosts: Option<&str>) {
+    let script = kill_stale_login_script();
+    match tokio::time::timeout(
+        crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT,
+        run_ssh_on_machine(machine, known_hosts, &script),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("[claude-login] could not stop the remote sign-in process: {e}"),
+        Err(_) => eprintln!("[claude-login] timed out stopping the remote sign-in process"),
+    }
+}
+
 /// The actual I/O drive, Tauri-FREE: pre-check `claude auth status`, then (if not
 /// already signed in) spawn `claude auth login`, feed its stdout into a
 /// [`ClaudeLoginDriver`], write the pasted code to its stdin the instant
@@ -969,6 +1050,9 @@ async fn drive_claude_login(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut url_reported = false;
+    // A code pasted BEFORE the prompt was recognized (the human can be faster than the
+    // CLI) is held here and written the instant the prompt shows up — never dropped.
+    let mut pending_code: Option<String> = None;
     let recognize_deadline = tokio::time::Instant::now() + RECOGNITION_TIMEOUT;
     let mut submit_deadline: Option<tokio::time::Instant> = None;
     let mut cancelled = false;
@@ -993,12 +1077,14 @@ async fn drive_claude_login(
                         break 'read;
                     }
                     Some(DriverCommand::SubmitCode(code)) => {
-                        if driver.submit_code() {
-                            if let Err(e) = stdin.write_all(format!("{code}\n").as_bytes()).await {
+                        if matches!(driver.state, LoginState::Start | LoginState::UrlReady { .. }) {
+                            pending_code = Some(code);
+                        } else if driver.submit_code() {
+                            if let Err(e) = write_login_code(&mut stdin, &code).await {
                                 let _ = child.start_kill();
+                                kill_stale_login(machine, known_hosts).await;
                                 return LoginOutcome::Failed { reason: format!("could not send the code: {e}") };
                             }
-                            let _ = stdin.flush().await;
                             submit_deadline = Some(tokio::time::Instant::now() + SUBMIT_TIMEOUT);
                         }
                     }
@@ -1010,14 +1096,25 @@ async fn drive_claude_login(
                     Ok(n) => {
                         let chunk = String::from_utf8_lossy(&stdout_buf[..n]).into_owned();
                         driver.feed(&chunk);
-                        if let LoginState::UrlReady { url } = &driver.state {
-                            if !url_reported {
+                        if !url_reported {
+                            if let Some(url) = driver.url() {
                                 url_reported = true;
                                 on_url(url);
                             }
                         }
                         if matches!(driver.state, LoginState::Failed { .. }) {
                             break 'read;
+                        }
+                        if matches!(driver.state, LoginState::AwaitingCode) {
+                            if let Some(code) = pending_code.take() {
+                                driver.submit_code();
+                                if let Err(e) = write_login_code(&mut stdin, &code).await {
+                                    let _ = child.start_kill();
+                                    kill_stale_login(machine, known_hosts).await;
+                                    return LoginOutcome::Failed { reason: format!("could not send the code: {e}") };
+                                }
+                                submit_deadline = Some(tokio::time::Instant::now() + SUBMIT_TIMEOUT);
+                            }
                         }
                     }
                     Err(e) => {
@@ -1061,13 +1158,16 @@ async fn drive_claude_login(
     let wait_result = child.wait().await;
 
     if cancelled {
+        kill_stale_login(machine, known_hosts).await;
         return LoginOutcome::Cancelled;
     }
     if superseded {
+        kill_stale_login(machine, known_hosts).await;
         return LoginOutcome::Superseded;
     }
 
     if let LoginState::Failed { reason } = &driver.state {
+        kill_stale_login(machine, known_hosts).await;
         return LoginOutcome::Failed { reason: reason.clone() };
     }
 
@@ -1648,6 +1748,51 @@ mod tests {
     #[test]
     fn driver_default_is_start() {
         assert_eq!(ClaudeLoginDriver::default().state, LoginState::Start);
+    }
+
+    // ---- one read carrying the URL AND the prompt (first real novice run, 19/09) ----
+
+    /// The exact shape `claude` 2.1.278 printed over a real Tailscale ssh link, in ONE
+    /// read: the URL line then the prompt, no trailing newline (the CLI then blocks on
+    /// stdin, so nothing else ever arrives to trigger a second `feed`).
+    const URL_AND_PROMPT_IN_ONE_READ: &str = "Opening browser to sign in\u{2026}\n\
+        If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=y\n\
+        Paste code here if prompted > ";
+
+    #[test]
+    fn one_read_with_url_and_prompt_reaches_awaiting_code_and_keeps_the_url() {
+        let mut driver = ClaudeLoginDriver::new();
+        driver.feed(URL_AND_PROMPT_IN_ONE_READ);
+        assert_eq!(driver.state, LoginState::AwaitingCode, "must not stop at UrlReady");
+        assert_eq!(
+            driver.url(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=y")
+        );
+        assert!(driver.submit_code(), "the pasted code must be accepted right away");
+    }
+
+    #[test]
+    fn the_url_is_remembered_when_it_arrives_before_the_prompt() {
+        let mut driver = ClaudeLoginDriver::new();
+        let (first, second) = URL_AND_PROMPT_IN_ONE_READ.split_at(URL_AND_PROMPT_IN_ONE_READ.find("Paste").unwrap());
+        driver.feed(first);
+        assert!(matches!(driver.state, LoginState::UrlReady { .. }));
+        driver.feed(second);
+        assert_eq!(driver.state, LoginState::AwaitingCode);
+        assert!(driver.url().is_some());
+    }
+
+    #[test]
+    fn the_login_command_kills_a_stale_login_then_records_its_own_pid() {
+        let cmd = claude_auth_login_cmd();
+        let kill = cmd.find("kill -KILL").expect("must kill a stale login first");
+        let record = cmd.find("echo $$ >").expect("must record its own pid");
+        let exec = cmd.find("exec ").expect("must exec claude so $$ is claude's pid");
+        assert!(kill < record && record < exec, "order: kill stale, record pid, exec: {cmd}");
+        assert!(cmd.ends_with("auth login"), "{cmd}");
+        let cleanup = kill_stale_login_script();
+        assert!(cleanup.contains("/proc/$p/cmdline"), "must check the pid is still a login: {cleanup}");
+        assert!(!cleanup.contains("pkill"), "never match by name: {cleanup}");
     }
 
     // ---- next_deadline — regression coverage for the AwaitingCode timeout bug ----
@@ -2289,6 +2434,57 @@ mod tests {
         let url = url.expect("must have recognized the sign-in URL before cancelling");
         assert!(url.starts_with("https://"), "got {url:?}");
         assert!(url.to_ascii_lowercase().contains("oauth"), "got {url:?}");
+
+        // No orphan: killing our local ssh does not stop the remote process by itself
+        // (no pty) — the first real novice run left one `claude auth login` per attempt.
+        assert_no_remote_login(&machine, kh.path()).await;
+    }
+
+    async fn assert_no_remote_login(machine: &MachineRecord, known_hosts: Option<&str>) {
+        let left = run_ssh_on_machine(machine, known_hosts, "pgrep -a -f '[c]laude auth login' || echo NONE")
+            .await
+            .expect("pgrep over ssh");
+        assert_eq!(left.trim(), "NONE", "a remote `claude auth login` was left running: {left}");
+    }
+
+    /// The first real novice run's failure, end to end: the human pastes a code the
+    /// instant the URL shows (before or right as the prompt arrives). The code must
+    /// reach the CLI — proven by the CLI's OWN rejection of a fake code ("Login
+    /// failed…") — never the 30 s "the CLI changed its sign-in output" timeout.
+    #[tokio::test]
+    #[ignore = "needs Docker (colima start)"]
+    async fn live_claude_login_accepts_a_code_pasted_as_soon_as_the_url_shows() {
+        let _guard = LIVE_FIXTURE_LOCK.lock().await;
+        fixture_up("a");
+        let key = ThrowawayKey::generate("claude-login-early-code");
+        install_key_via_password(FIXTURE_A_PORT, FIXTURE_A_USER, FIXTURE_A_PASSWORD, &key).await;
+        let machine = fixture_machine(FIXTURE_A_PORT, FIXTURE_A_USER, &key);
+        let kh = ScratchKnownHosts::new("claude-login-early-code");
+        install_claude_on_fixture_a(&machine, kh.path()).await;
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<DriverCommand>();
+        let cmd_tx_cb = cmd_tx.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(90),
+            drive_claude_login(&machine, kh.path(), cmd_rx, move |_url| {
+                let _ = cmd_tx_cb.send(DriverCommand::SubmitCode("not-a-real-code".to_string()));
+            }),
+        )
+        .await
+        .expect("the drive must end on its own within 90 s");
+        drop(cmd_tx);
+
+        match outcome {
+            LoginOutcome::Failed { reason } => {
+                assert_ne!(reason, LOGIN_PROMPT_NOT_RECOGNIZED_MSG, "the pasted code was never delivered");
+                assert!(
+                    reason.contains("Login failed") || reason.contains("did not confirm"),
+                    "expected the CLI's own rejection of the fake code, got: {reason}"
+                );
+            }
+            other => panic!("a fake code must be rejected by the CLI, got {other:?}"),
+        }
+        assert_no_remote_login(&machine, kh.path()).await;
     }
 
     /// B-finding #4's `Supersede` sibling of the test above: an explicit "Restart
