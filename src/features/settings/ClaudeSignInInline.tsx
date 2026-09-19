@@ -43,13 +43,23 @@
 // ATTACHED sibling watching the same session was left showing a dead session forever,
 // reproducing the exact same bug class from the other side. The backend now emits a
 // terminal `ServerLoginResultEvent{reason:"cancelled"}` for EVERY cancel, owner
-// included — `selfCancelledSessionIdRef` below is what lets the OWNER recognize and
-// ignore its own echo of that event (it already knows: it just called
-// `cancelClaudeLogin` or is unmounting), while every OTHER surface attached to that
-// session_id treats the same event as the "stop showing a dead session" signal it
-// never got before: it exits its waiting/code-entry view for a neutral "cancelled
-// elsewhere" message and offers Start again, exactly like a genuine failure would,
-// just without the alarming "Sign-in failed" wording.
+// included — `selfCancelledSessionIdRef` below is what lets the OWNER's Cancel click
+// recognize and ignore its own echo of that event (it already knows: it just called
+// `cancelClaudeLogin`), while every OTHER surface attached to that session_id treats
+// the same event as the "stop showing a dead session" signal it never got before: it
+// exits its waiting/code-entry view for a neutral "cancelled elsewhere" message and
+// offers Start again, exactly like a genuine failure would, just without the alarming
+// "Sign-in failed" wording. The unmount cleanup below does NOT set the ref (it can't
+// matter — see its own comment), so unmounting stays a purely local detach that leaves
+// the backend's belated event for some later instance to receive normally.
+//
+// ⚠️ Re-attach race (test-honesty residual defect, CRM `1abfc028`, counter-
+// verification of the fix above): `start()`/`restart()` clear `selfCancelledSessionIdRef`
+// before their IPC call — a quick owner Cancel-then-Start can reattach to the exact
+// same (still dying) `session_id` `attach_or_reserve` hasn't finished tearing down yet,
+// and without this reset the OLD cancel's stale ref would wrongly swallow the belated
+// `cancelled` event as if it were still an echo of that old intent, leaving THIS
+// (re-)attached view stuck on "Waiting for the sign-in link…" forever.
 //
 // ⚠️ Stale-event filtering (same follow-up review): both listeners below ignore an
 // event whose `session_id` doesn't match the session THIS instance currently tracks
@@ -104,13 +114,17 @@ export function ClaudeSignInInline({
   // session down.
   const ownsSessionRef = useRef(false);
 
-  // The session_id THIS instance itself just cancelled (owner's Cancel click, or
-  // owner's unmount), if any — see the module doc's "residual defect A8/R1" note.
-  // Cleared the instant the matching `cancelled` result event is recognized and
-  // ignored below. Only ever set by the OWNER (an attached instance's own Cancel/
-  // unmount is a local-only detach that never sends `cancelClaudeLogin` at all — see
-  // `cancel()` below — so it never produces a backend event to ignore in the first
-  // place).
+  // The session_id THIS instance's own Cancel click just cancelled, if any — see the
+  // module doc's "residual defect A8/R1" note. Only ever set by the OWNER's `cancel()`
+  // below (an attached instance's own Cancel/unmount is a local-only detach that never
+  // sends `cancelClaudeLogin` at all, so it never produces a backend event to ignore in
+  // the first place; the unmount cleanup below doesn't set it either — see its own
+  // comment for why that would be inert). Cleared the instant the matching `cancelled`
+  // result event is recognized and ignored below, AND at the top of `start()`/
+  // `restart()` (test-honesty residual defect, CRM `1abfc028`): `attach_or_reserve`
+  // can hand a fresh `start()` call the SAME `session_id` a just-cancelled owner is
+  // still tearing down, so without this second clear a belated echo of THAT old cancel
+  // would wrongly swallow live information about the newly (re-)attached session.
   const selfCancelledSessionIdRef = useRef<string | null>(null);
 
   // The shared "is a sign-in live for this machine" flag other surfaces read (see
@@ -163,7 +177,11 @@ export function ClaudeSignInInline({
   // the shared `active` flag locally rather than waiting on the backend's own
   // `ServerLoginResultEvent` for this cancel — this component is about to be gone, so
   // it cannot react to that event even though the backend now does emit one for it
-  // (residual defect A8/R1, see the module doc).
+  // (residual defect A8/R1, see the module doc). Unlike `cancel()` below, this does
+  // NOT set `selfCancelledSessionIdRef`: the listener effect that reads it tears
+  // itself down (sets `disposed = true`) in this SAME unmount commit, with no
+  // async gap in between, so no event could ever reach it after such a write —
+  // setting it here would be dead code implying an echo-suppression that can't run.
   //
   // ⚠️ Gated on `ownsSessionRef` (see the module doc): an instance that merely
   // ATTACHED to another surface's session must NOT cancel it or clear the shared flag
@@ -171,7 +189,6 @@ export function ClaudeSignInInline({
   useEffect(() => {
     return () => {
       if (sessionRef.current && ownsSessionRef.current) {
-        selfCancelledSessionIdRef.current = sessionRef.current.session_id;
         void commands.cancelClaudeLogin(sessionRef.current);
         useClaudeLoginSessions.getState().setActive(machineId, false);
       }
@@ -180,6 +197,16 @@ export function ClaudeSignInInline({
   }, []);
 
   const start = useCallback(async () => {
+    // Clear any earlier "ignore my own cancel echo" intent before establishing a
+    // fresh session view (residual defect, CRM `1abfc028`, counter-verification of
+    // the A8/R1 fix): `attach_or_reserve` can hand back the SAME (still dying)
+    // `session_id` a just-cancelled owner cancelled moments ago, if the backend
+    // actor hasn't finished tearing it down yet. Without this reset, a belated
+    // `Cancelled` event for that reused id would still match the stale ref and get
+    // silently swallowed here — even though it is now live information about THIS
+    // (re-)attached view, not an echo of the prior cancel — leaving the instance
+    // stuck on "Waiting for the sign-in link…" forever.
+    selfCancelledSessionIdRef.current = null;
     setStarting(true);
     setError(null);
     setResult(null);
@@ -200,6 +227,8 @@ export function ClaudeSignInInline({
   // module doc). Offered once a session is already in flight (waiting for the URL or
   // entering a code), for the rare case that flow is stuck.
   const restart = useCallback(async () => {
+    // Same reset as `start()` above, for the same reason — see its comment.
+    selfCancelledSessionIdRef.current = null;
     setRestarting(true);
     setError(null);
     setResult(null);

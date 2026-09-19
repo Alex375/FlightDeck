@@ -457,6 +457,47 @@ describe("ClaudeSignInInline — owner cancel/unmount leaves an attached sibling
   });
 });
 
+// Counter-verification of the residual-defect fix above found a further gap: a quick
+// owner Cancel-then-Start can reattach to the exact same (still dying) `session_id`
+// (`attach_or_reserve` hands back whatever is still registered) before the backend
+// actor finishes tearing it down — the belated `cancelled` event for the OLD cancel
+// must not be swallowed as an echo of that old intent once THIS instance has moved on
+// to a freshly (re-)attached view of the same id.
+describe("ClaudeSignInInline — quick Cancel-then-Start reusing the same session_id (residual defect, CRM 1abfc028)", () => {
+  it("does not swallow the belated cancelled event as its own echo after re-attaching to the same reused session_id", async () => {
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: true } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+
+    // Owner cancels — resets its own view synchronously, before the backend actor has
+    // necessarily finished tearing the session down.
+    click("Cancel");
+    expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "s1", machine_id: "m1", owned: true });
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start Claude sign-in")).toBe(true);
+
+    // Same instance clicks Start again immediately — `attach_or_reserve` hands back the
+    // SAME (still dying) session_id, this time as a non-owning attach.
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: false } });
+    click("Start Claude sign-in");
+    await settle();
+    // Now viewing the (re-)attached session, waiting for its prompt.
+    expect(container.textContent).toContain("Waiting for the sign-in link…");
+
+    // The OLD cancel's belated terminal event finally arrives, for the same session_id.
+    act(() =>
+      serverLoginResultEvent.emit({ session_id: "s1", machine_id: "m1", ok: false, email: null, error: "cancelled", reason: "cancelled" }),
+    );
+    await settle();
+
+    // Must be treated as live, truthful information about the NEW attached view, not
+    // silently dropped as the old cancel's own echo — never stuck on "Waiting…".
+    expect(container.textContent).not.toContain("Waiting for the sign-in link…");
+    expect(container.textContent).toContain("Sign-in was cancelled from another panel.");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start again")).toBe(true);
+  });
+});
+
 function cancelClaudeLoginCalledWith() {
   const calls = mocks.cancelClaudeLogin.mock.calls;
   return calls[calls.length - 1]?.[0];
