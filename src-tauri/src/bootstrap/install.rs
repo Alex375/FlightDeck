@@ -696,11 +696,37 @@ async fn install_user_unit(machine: &MachineRecord, known_hosts: Option<&str>) -
 /// idempotent operation a fresh, no-conflict user install already performs, just
 /// reached without first asking a conflict-detector that was never designed to
 /// authorize repairing an install it itself half-recognizes.
+///
+/// (B14 fix round 2) [`install_user_unit`]'s own `daemon-reload && enable --now` is a
+/// no-op, RESTART-WISE, on an unit that is ALREADY ACTIVE — and this repair only ever
+/// fires for one that is (the diagnosis that routes a call here,
+/// [`crate::bootstrap::orchestrator::install_service_repair_needs_path_fix`], requires a
+/// confirmed pre-B14 user unit, which is by definition already running under the OLD,
+/// PATH-less environment). Verified empirically against Docker fixture A: after
+/// rewriting an active unit's `Environment=` line and running `daemon-reload &&
+/// enable --now`, the PID and its own `/proc/<pid>/environ` were BOTH unchanged, while
+/// `systemctl --user show -p Environment` — the one thing the first review-fix round's
+/// own live test checked — already reported the NEW value (it reflects the reloaded
+/// unit FILE, not the live process's real environment). So this now forces an actual
+/// restart afterward via [`crate::bootstrap::orchestrator::restart_daemon`], reused
+/// verbatim rather than hand-rolled here, which gets its ALREADY-ESTABLISHED
+/// busy-conversation guard for free: never silently kill a live conversation to apply
+/// this fix (the same [`BootstrapError::DaemonBusy`] a caller already knows how to
+/// surface from [`crate::bootstrap::orchestrator::RepairAction::RestartDaemon`], so a
+/// busy server reports itself, in the exact same words, as "won't restart" — never a
+/// silent success — instead of restarting). `sudo_password: None` is always correct
+/// here: the diagnosis that routes a call to this function already confirmed a
+/// User-level install, whose restart branch never needs one. Rewriting the unit FILE
+/// itself stays unconditional (a `cat > … && daemon-reload && enable --now` never
+/// touches the live process either way) — only the restart is gated, so a busy server
+/// still ends up with the CORRECTED unit on disk, ready for the very next retry (or the
+/// daemon's own next natural restart) to pick up.
 pub(crate) async fn repair_user_unit_path(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
 ) -> Result<ServiceOutcome, BootstrapError> {
     install_user_unit(machine, known_hosts).await?;
+    crate::bootstrap::orchestrator::restart_daemon(machine, known_hosts, None).await?;
     verify_daemon_running(machine, known_hosts, Some(UnitScope::User)).await?;
     Ok(ServiceOutcome::UserUnit)
 }
@@ -2338,6 +2364,20 @@ mod tests {
             let _ = std::process::Command::new("bash").arg(&script).args(["down", letter]).output();
         }
 
+        /// Runs `cmd` as [`FIXTURE_A_USER`] inside the `fd-fixture-a` container via a
+        /// FRESH `docker exec` — deliberately OUTSIDE this test's own ssh connections
+        /// (see `live_repair_user_unit_path_rewrites_a_pre_b14_unit_...`'s own doc for
+        /// why an independent verification channel matters here). Returns stdout;
+        /// panics if `docker` itself could not be run (never on the remote command's
+        /// own exit code — callers assert on the returned text).
+        fn docker_exec_fixture_a(cmd: &str) -> String {
+            let out = std::process::Command::new("docker")
+                .args(["exec", "fd-fixture-a", "su", FIXTURE_A_USER, "-c", cmd])
+                .output()
+                .expect("docker exec must be available");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
         /// Runs a plain (password, no key yet) command against a fixture over
         /// `bootstrap::askpass`'s own first-contact relay — used by these tests only
         /// to install the throwaway key, exactly like every other live bootstrap test
@@ -2860,21 +2900,29 @@ mod tests {
             fixture_down("a");
         }
 
-        /// (B14 review fix — blocker) PROVES the actual fix for the finding: a
-        /// confirmed pre-B14 user unit (missing `Environment=PATH=`) is REWRITTEN by
-        /// [`repair_user_unit_path`] — not silently adopted-and-left-alone the way
-        /// routing it through [`install_service`]'s generic, conflict-detecting entry
-        /// point would (every already-`init`ed server has a
+        /// (B14 review fix — blocker, then fix round 2) PROVES the actual fix for the
+        /// finding: a confirmed pre-B14 user unit (missing `Environment=PATH=`) is
+        /// REWRITTEN by [`repair_user_unit_path`] — not silently adopted-and-left-alone
+        /// the way routing it through [`install_service`]'s generic, conflict-detecting
+        /// entry point would (every already-`init`ed server has a
         /// `~/.flightdeckd/config.json`, one of `connect::PROBE_SCRIPT_BODY`'s own
         /// conflict shapes — see [`repair_user_unit_path`]'s own doc). Installs +
         /// inits fixture A for real (so `config.json` genuinely exists, reproducing
         /// the exact condition that made the generic path a no-op), simulates a
         /// pre-B14 unit by overwriting the just-installed one with the OLD shape
         /// (hand-written here, never through `render_user_unit`, which would defeat
-        /// the point of the simulation), confirms `diagnose` sees the gap, then
-        /// invokes the real dedicated repair and confirms both `diagnose` and (from
-        /// OUTSIDE this test's own ssh connections, via `docker exec`) the unit's
-        /// actual systemd environment agree it is fixed.
+        /// the point of the simulation, and RESTARTED so the daemon is genuinely
+        /// running under the old, PATH-less environment — the only real-world
+        /// precondition this repair ever fires under), confirms `diagnose` sees the
+        /// gap, then invokes the real dedicated repair and confirms — from OUTSIDE
+        /// this test's own ssh connections, via `docker exec` — not just that
+        /// `diagnose` and `systemctl --user show -p Environment` agree it is fixed
+        /// (the fix round 1 live test's own checks, which a verification pass proved
+        /// pass EVEN WHEN the live process never actually restarted: `systemctl show`
+        /// reflects the reloaded unit FILE, not the running process), but that the
+        /// **PID actually changed** and the **new process's own `/proc/<pid>/environ`**
+        /// carries the corrected `PATH` — the only two checks that can tell a real
+        /// restart apart from a no-op `enable --now` against an already-active unit.
         #[tokio::test]
         #[ignore = "needs Docker (colima start)"]
         async fn live_repair_user_unit_path_rewrites_a_pre_b14_unit_the_generic_path_would_silently_adopt() {
@@ -2953,6 +3001,14 @@ mod tests {
                     "diagnose must confirm the simulated unit lacks PATH before the repair: {before:?}"
                 );
 
+                // MainPID BEFORE the repair, read from OUTSIDE this test's own ssh
+                // connections (a fresh `docker exec`, same channel the FIX 1 check
+                // below already used) — the daemon is genuinely running (the stale
+                // unit's own write-script above already restarted it), under the OLD,
+                // PATH-less environment.
+                let pid_before = docker_exec_fixture_a("systemctl --user show -p MainPID --value flightdeckd");
+                assert_ne!(pid_before.trim(), "0", "the simulated pre-B14 unit must be running before the repair");
+
                 // The actual fix under test: `repair_user_unit_path`, not the generic
                 // `install_service` (which would see fixture A's own
                 // `~/.flightdeckd/config.json` and adopt, writing nothing —
@@ -2972,22 +3028,50 @@ mod tests {
 
                 // FIX 1's user-unit PATH line, read from OUTSIDE this test's own ssh
                 // connections (a fresh `docker exec`), the exact command the brief
-                // specs: `systemctl --user show flightdeckd -p Environment`.
-                let env = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        "fd-fixture-a",
-                        "su",
-                        FIXTURE_A_USER,
-                        "-c",
-                        "systemctl --user show flightdeckd -p Environment",
-                    ])
-                    .output()
-                    .expect("docker exec must be available");
-                let env_text = String::from_utf8_lossy(&env.stdout);
+                // specs: `systemctl --user show flightdeckd -p Environment`. Kept
+                // ALONGSIDE (not instead of) the PID/`/proc` checks below — this alone
+                // cannot tell a real restart apart from a no-op `enable --now` (it
+                // reflects the reloaded unit FILE, not the live process — see the
+                // fix-round-2 verification this test's own doc comment cites).
+                let env_text = docker_exec_fixture_a("systemctl --user show flightdeckd -p Environment");
                 assert!(
                     env_text.contains(".local/bin"),
                     "the repaired unit's daemon environment must carry ~/.local/bin in PATH: {env_text}"
+                );
+
+                // Fix round 2's own assertions: the daemon must have been ACTUALLY
+                // restarted (a different PID), and that new process's OWN
+                // `/proc/<pid>/environ` — not just the unit file `systemctl show`
+                // reads back — must carry the corrected PATH.
+                let pid_after = docker_exec_fixture_a("systemctl --user show -p MainPID --value flightdeckd");
+                let pid_after = pid_after.trim().to_string();
+                assert_ne!(pid_after, "0", "the repaired unit must be running after the repair");
+                assert_ne!(
+                    pid_before.trim(),
+                    pid_after,
+                    "repair_user_unit_path must actually restart flightdeckd, not just reload+enable an \
+                     already-active unit (a no-op restart-wise) — PID before={pid_before:?} after={pid_after:?}"
+                );
+                // Read as root (the default `docker exec` user, never through `su
+                // deploy`): reading another user's live `/proc/<pid>/environ` needs
+                // ptrace access to that process, which the repaired user's own shell
+                // does not have over itself here — root does.
+                let live_environ = std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        "fd-fixture-a",
+                        "sh",
+                        "-c",
+                        &format!("tr '\\0' '\\n' < /proc/{pid_after}/environ | grep '^PATH='"),
+                    ])
+                    .output()
+                    .expect("docker exec must be available");
+                let live_environ_text = String::from_utf8_lossy(&live_environ.stdout);
+                assert!(
+                    live_environ_text.contains(".local/bin"),
+                    "the RUNNING flightdeckd process's own /proc/<pid>/environ must carry ~/.local/bin in \
+                     PATH — a rewritten unit file that was never actually applied to the live process would \
+                     still pass every OTHER assertion in this test: {live_environ_text:?}"
                 );
             })
             .await;

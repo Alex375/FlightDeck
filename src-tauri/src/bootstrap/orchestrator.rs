@@ -815,7 +815,12 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// the guard unconditional for EVERY caller instead of relying on each one to
 /// remember it, at no extra ssh round trip (the busy count rides the SAME
 /// [`diagnose`] call this function already makes for `installed_as`).
-async fn restart_daemon(
+///
+/// `pub(crate)` (B14 fix round 2): [`crate::bootstrap::install::repair_user_unit_path`]
+/// reuses this verbatim for its own restart, rather than hand-rolling a second
+/// busy-conversation guard — see that function's own doc for why a plain
+/// `enable --now` never actually restarts an already-active unit.
+pub(crate) async fn restart_daemon(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     sudo_password: Option<&SecretString>,
