@@ -44,10 +44,14 @@ export function DiagnosisSummary({
   diagnosis,
   repairBusy,
   onRepair,
+  showHeadline = true,
 }: {
   diagnosis: ServerDiagnosis;
   repairBusy: RepairAction | null;
   onRepair: (action: RepairAction) => void;
+  /** False when the caller already shows the headline chip (the server card shows it
+   *  next to the server's name — two identical chips stacked was confusing). */
+  showHeadline?: boolean;
 }) {
   const tone = headlineTone(diagnosis.state);
   const suggestions = repairSuggestionsFor(diagnosis);
@@ -58,10 +62,12 @@ export function DiagnosisSummary({
 
   return (
     <>
-      <span className={styles.headline} data-tone={tone}>
-        <span className={styles.headlineDot} />
-        {headlineLabel(diagnosis.state)}
-      </span>
+      {showHeadline && (
+        <span className={styles.headline} data-tone={tone}>
+          <span className={styles.headlineDot} />
+          {headlineLabel(diagnosis.state)}
+        </span>
+      )}
       <div className={styles.rows}>
         <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
         <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
@@ -324,7 +330,7 @@ export function ServerStatusPanel({
         <div className={styles.checking}>Checking…</div>
       ) : diagnosis ? (
         <>
-          <DiagnosisSummary diagnosis={diagnosis} repairBusy={repairBusy} onRepair={onRepair} />
+          <DiagnosisSummary diagnosis={diagnosis} repairBusy={repairBusy} onRepair={onRepair} showHeadline={false} />
           {diagError && (
             <div className={sharedStyles.errorMsg}>Couldn&apos;t refresh this server&apos;s status: {diagError}</div>
           )}

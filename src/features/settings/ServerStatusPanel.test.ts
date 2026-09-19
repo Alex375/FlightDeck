@@ -260,6 +260,14 @@ function mostSpecificDivWithText(text: string): HTMLElement | undefined {
 }
 
 describe("ServerStatusPanel — fetching machine_diagnose", () => {
+  it("shows the status chip once — next to the server's name, not a second copy above the facts", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    mountPanel();
+    await settle();
+    expect(container.querySelectorAll("[data-tone]")).toHaveLength(1);
+    expect(container.textContent?.match(/Ready/g) ?? []).toHaveLength(1);
+  });
+
   it("a failed initial diagnose is surfaced with the error and a working Retry, never a blank card", async () => {
     machineDiagnose.mockResolvedValueOnce({ status: "error", error: "ssh timed out" });
     mountPanel();

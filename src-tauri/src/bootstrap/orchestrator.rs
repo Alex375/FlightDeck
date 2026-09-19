@@ -1715,7 +1715,12 @@ if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$C
 fi
 if [ "$CLAUDE_WORKS" = yes ]; then
     echo FLIGHTDECK_CLAUDE_INSTALLED:yes
-    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$("$CLAUDE_BIN" auth status --json 2>/dev/null)"
+    # One line: the CLI PRETTY-PRINTS this JSON (12 lines, VERIFIED on a real server,
+    # 19/09) while every marker is read as a single line — unflattened, only "{" was
+    # parsed, so a signed-in server showed "Claude signed in: Unknown" and stayed on
+    # "Needs Claude sign-in" forever. JSON strings never hold a raw newline, so
+    # dropping them is lossless.
+    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$("$CLAUDE_BIN" auth status --json 2>/dev/null | tr -d '\r\n')"
 else
     echo FLIGHTDECK_CLAUDE_INSTALLED:no
     echo "FLIGHTDECK_CLAUDE_AUTH_JSON:"
@@ -2223,6 +2228,46 @@ pub async fn machine_repair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- diagnose against the CLI's real, pretty-printed `auth status --json` ----
+
+    /// Runs the REAL diagnose script (locally, `/bin/sh`) with a fake `claude` on PATH
+    /// that prints `auth status --json` exactly as claude 2.1.278 does on a real server:
+    /// pretty-printed over several lines. Everything else the script probes (systemd,
+    /// loginctl, the daemon) is simply absent here and degrades to empty markers.
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_reads_a_pretty_printed_auth_status_as_signed_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fd-diagnose-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             '--version') echo '2.1.278 (Claude Code)' ;;\n\
+             'auth status --json') printf '{\\n  \"loggedIn\": true,\\n  \"authMethod\": \"claude.ai\",\\n  \"email\": \"a@b.com\"\\n}\\n' ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(diagnose_script())
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("HOME", &dir)
+            .output()
+            .expect("run the diagnose script");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.claude_installed, Some(true), "stdout: {stdout}");
+        assert_eq!(d.claude_logged_in, Some(true), "a pretty-printed signed-in status must parse: {stdout}");
+        assert_eq!(d.claude_email.as_deref(), Some("a@b.com"));
+    }
 
     // ---- PIPELINE_ORDER (first real novice run, 19/09: the service was started before
     // `flightdeckd init` had written its config → crash loop → pipeline failed) ----
