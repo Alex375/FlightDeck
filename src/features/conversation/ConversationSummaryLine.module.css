@@ -1,0 +1,100 @@
+/* Sits in the same column as the background-task bars above the composer. */
+.line {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px auto 2px;
+  max-width: var(--cv-max, 840px);
+  width: calc(100% - 52px);
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.line:hover {
+  background: color-mix(in srgb, var(--wf-panel-3) 55%, transparent);
+  color: var(--wf-tx-hi);
+}
+
+.part {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+/* The todo part takes the room left, so its current item truncates before the chord moves. */
+.grow {
+  flex: 1 1 auto;
+}
+.part :global(.wf-ico) {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+.goalIco {
+  color: var(--wf-att);
+}
+
+.sep {
+  width: 3px;
+  height: 3px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--wf-tx-xlo);
+}
+
+.count {
+  color: var(--wf-tx-hi);
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  display: block;
+  width: 36px;
+  height: 3px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background: var(--wf-line-2);
+  overflow: hidden;
+}
+.barFill {
+  display: block;
+  height: 100%;
+  background: var(--wf-run);
+}
+
+.current {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--wf-tx-lo);
+}
+
+.kbd {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid var(--wf-line-2);
+  box-shadow: 0 1px 0 var(--wf-line);
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+}

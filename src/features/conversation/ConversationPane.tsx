@@ -13,7 +13,9 @@ import { MonitorBar } from "./MonitorBar";
 import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
-import { useEffectiveCleanOutput } from "../../store/display";
+import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { useConvPanelShown } from "../editor/editorStore";
+import { ConversationSummaryLine } from "./ConversationSummaryLine";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -33,6 +35,7 @@ export function ConversationPane({
   onBackgroundClick,
   inertMentions = false,
   disableMessageControls = false,
+  panelHost = false,
 }: {
   session: string;
   cwd: string;
@@ -46,6 +49,12 @@ export function ConversationPane({
    *  modal: a destructive rewind or a background conversation-switching fork is never
    *  intended from that lightweight surface (and fork's switch is invisible there). */
   disableMessageControls?: boolean;
+  /** The host mounts the conversation side panel next to this pane (the conversation view,
+   *  Git mode included). While the display pref keeps the panel on, the todo list and the
+   *  composer's goal/artifact chips live THERE, and a one-line summary stands in for them
+   *  here while the panel is closed. Hosts without the panel (the Flight Deck reply modal)
+   *  keep them inline. */
+  panelHost?: boolean;
 }) {
   // Toggling "clean output" folds/unfolds every round → big height change. Pass the
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
@@ -57,6 +66,11 @@ export function ConversationPane({
   // The pane is the positioning context (position:relative in CSS) AND the scope for the
   // pin's "scroll to my last message" lookup — see LastMessagePin.
   const paneRef = useRef<HTMLDivElement>(null);
+  const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
+  // "Shown", not "open": a panel that stepped aside for lack of room is off screen, and the
+  // summary line must stand in for it exactly as for a closed one.
+  const panelOpen = useConvPanelShown();
+  const inPanel = panelHost && sidePanelPref;
   return (
     <div
       ref={paneRef}
@@ -85,7 +99,11 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
-      <TodoBar session={session} />
+      {!inPanel ? (
+        <TodoBar session={session} />
+      ) : !panelOpen ? (
+        <ConversationSummaryLine session={session} />
+      ) : null}
       <ReviewBar session={session} />
       <AuthWarningBar session={session} />
       <ConductorComposer
@@ -93,6 +111,7 @@ export function ConversationPane({
           session={session}
           onSent={scrollToBottom}
           hasPanels={!inertMentions}
+          stateInPanel={inPanel}
         />
     </div>
   );

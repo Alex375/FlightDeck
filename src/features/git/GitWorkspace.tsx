@@ -130,6 +130,8 @@ export function GitWorkspace({
       cwd={cwd}
       composerRef={composerRef}
       onBackgroundClick={onBackgroundClick}
+      // Git mode lives inside the conversation view, beside the conversation side panel.
+      panelHost
     />
   );
 

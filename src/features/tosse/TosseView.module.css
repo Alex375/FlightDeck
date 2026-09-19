@@ -521,6 +521,7 @@
 .act {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   flex: 0 0 auto;
   white-space: nowrap;
   height: 22px;
@@ -796,6 +797,33 @@
   gap: 6px;
   font-size: 11px;
   color: var(--wf-tx-lo);
+}
+/* The same chip as a control (the side panel's AssigneePicker): click the avatar, pick a
+   person — the CRM's AssigneeAvatarSelect. */
+.whoPick {
+  height: 24px;
+  padding: 0 6px 0 3px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.whoPick:hover:not(:disabled) {
+  background: var(--wf-panel-2);
+  border-color: var(--wf-line-2);
+  color: var(--wf-tx-hi);
+}
+.whoPick:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.whoPick svg {
+  width: 11px;
+  height: 11px;
+  opacity: 0.7;
 }
 .due {
   font-size: 11px;

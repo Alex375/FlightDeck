@@ -167,8 +167,13 @@ export const ConductorComposer = forwardRef<
      * app-wide persisted layout flags with nothing to show for it.
      */
     hasPanels?: boolean;
+    /**
+     * The conversation side panel shows this conversation's state (goal, artifacts), so the
+     * composer drops its own goal and artifacts chips rather than showing them twice.
+     */
+    stateInPanel?: boolean;
   }
->(function ConductorComposer({ session, onSent, hasPanels = true }, ref) {
+>(function ConductorComposer({ session, onSent, hasPanels = true, stateInPanel = false }, ref) {
   const state = useSessionState(session);
   const send = useSendMessage(session);
   const interrupt = useInterrupt(session);
@@ -1076,7 +1081,7 @@ export const ConductorComposer = forwardRef<
     // Artifacts index — every artifact Claude published in THIS conversation, with its
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
-    artifacts: (
+    artifacts: stateInPanel ? null : (
       // `hasPanels` IS the "does this host have a side region?" signal the pane already
       // threads down (it is `!inertMentions`), so the chip is told rather than made to guess.
       <ArtifactsChip session={session} inert={!hasPanels} />
@@ -1120,7 +1125,7 @@ export const ConductorComposer = forwardRef<
     ),
     // Active `/goal` — a target button; click opens a popover with the condition + a clear
     // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
-    goal: !isCodex ? <GoalChip convId={session} /> : null,
+    goal: !isCodex && !stateInPanel ? <GoalChip convId={session} /> : null,
     // Worktree checkbox — only before the session spawns (first message).
     // Explicit empty/checked box so the on/off state is unambiguous.
     worktree: isFresh ? (

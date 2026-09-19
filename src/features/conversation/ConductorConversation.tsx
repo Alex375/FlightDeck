@@ -2,7 +2,9 @@ import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
+  useState,
   type MouseEvent as ReactMouseEvent,
   type RefObject,
 } from "react";
@@ -13,7 +15,13 @@ import {
 import { useSessionState } from "../../store/conversationStore";
 import { effectiveCwd } from "../git/worktree";
 import { Splitter } from "../editor/Splitter";
-import { clamp, useEditorLayout, useEditorStore } from "../editor/editorStore";
+import {
+  clamp,
+  useConvPanelShown,
+  useEditorLayout,
+  useEditorStore,
+  useSideRegionOpen,
+} from "../editor/editorStore";
 import { MIN_CONVERSATION_PANE_PX } from "./composerLayout";
 import { SidePanel } from "./SidePanel";
 import { ArtifactViewer } from "./ArtifactViewer";
@@ -21,6 +29,9 @@ import { TaskDetail } from "../tosse/TosseView";
 import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
+import { ConversationSidePanel } from "./ConversationSidePanel";
+import { SIDE_PANEL_PX, SIDE_REGION_MIN_PX, sidePanelDocks } from "./sidePanelLayout";
+import { useDisplay } from "../../store/display";
 import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 
 // Lazy: the Git workspace pulls in Monaco's diff editor + ribbon overlay — its
@@ -28,11 +39,6 @@ import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSl
 const GitWorkspace = lazy(() =>
   import("../git/GitWorkspace").then((m) => ({ default: m.GitWorkspace })),
 );
-
-// Narrowest the side region may be dragged to: the 280px the panel itself needs, plus the
-// 6px splitter — which now lives INSIDE the animated slot (so the divider slides in with the
-// panel), and therefore counts against the same minimum.
-const SIDE_REGION_MIN_PX = 286;
 
 // Interactive elements whose clicks must NOT be hijacked to focus the composer
 // (buttons, links, other fields, expandable tool-card headers via role=button…).
@@ -72,7 +78,7 @@ export function ConductorConversation({ active }: { active: Conversation | null 
     <>
       <ConductorSidebar />
       {active ? (
-        <MainArea
+        <ConversationArea
           conv={active}
           composerRef={composerRef}
           onBackgroundClick={focusComposerOnClick}
@@ -97,6 +103,110 @@ export function ConductorConversation({ active }: { active: Conversation | null 
         </div>
       )}
     </>
+  );
+}
+
+/** Live layout width of `ref`'s element, or null before it is first measured. Reads the
+ *  LAYOUT box (`offsetWidth`), like the panel slide does, so a transform on an ancestor never
+ *  skews the number compared against the px floors. */
+function useLayoutWidth(ref: RefObject<HTMLElement>): number | null {
+  const [width, setWidth] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setWidth(el.offsetWidth);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setWidth(el.offsetWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return width;
+}
+
+/**
+ * Everything right of the conversations sidebar: the main area (conversation + its
+ * editor/terminal/Git region) and, at the far right, the conversation side panel.
+ *
+ * The panel DOCKS in its own column when the conversation (and the side region, when open)
+ * keeps its minimum width beside it. When it cannot, it never crushes them: it STEPS ASIDE
+ * (the conversation shows its one-line summary instead) — the conversation and the editor or
+ * terminal the user just opened are the working surfaces. Asking for the panel explicitly
+ * while there is no room (toggle, ⌘I, the summary line) brings it back FLOATING over the
+ * right edge. The docking test measures THIS wrapper, whose width does not depend on whether
+ * the panel docks, so the decision cannot oscillate.
+ */
+function ConversationArea({
+  conv,
+  composerRef,
+  onBackgroundClick,
+}: {
+  conv: Conversation;
+  composerRef: RefObject<ComposerHandle>;
+  onBackgroundClick: (e: ReactMouseEvent<HTMLDivElement>) => void;
+}) {
+  const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
+  const panelShown = useConvPanelShown();
+  const sideRegionOpen = useSideRegionOpen(conv.id);
+  const areaRef = useRef<HTMLDivElement>(null);
+  const areaWidth = useLayoutWidth(areaRef);
+  // Unmeasured (first commit) → assume it docks: the common case, and a wrong guess is
+  // corrected before paint by the layout effect above.
+  const docks = areaWidth === null || sidePanelDocks(areaWidth, sideRegionOpen);
+  const want = sidePanelPref && panelShown;
+
+  // Step aside whenever the room runs out — re-decided each time the room or the side region
+  // changes, so opening the terminal on a narrow window hides the panel rather than covering
+  // the terminal. An explicit open clears the flag in between (→ floating) and sticks until
+  // the next such change. Layout effect: the decision lands before paint, no one-frame float.
+  useLayoutEffect(() => {
+    useEditorStore.getState().setConvPanelYielded(!docks);
+  }, [docks, sideRegionOpen]);
+
+  // Switching between docked and floating is a relayout, not the user opening or closing
+  // the panel: that transition must not play the slide (it would fold the docked copy away
+  // while the floating one is already on screen). Read from the previous render.
+  const docksRef = useRef(docks);
+  const docksChanged = docksRef.current !== docks;
+  docksRef.current = docks;
+  const slide = usePanelSlide({
+    open: want && docks,
+    axis: "x",
+    enabled: !docksChanged,
+    restStyle: { flex: `0 0 ${SIDE_PANEL_PX}px`, minWidth: 0, minHeight: 0, display: "flex" },
+  });
+
+  return (
+    <div
+      ref={areaRef}
+      style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", position: "relative" }}
+    >
+      <div style={{ flex: neighborFlex(slide, 1), minWidth: 0, minHeight: 0, display: "flex" }}>
+        <MainArea conv={conv} composerRef={composerRef} onBackgroundClick={onBackgroundClick} />
+      </div>
+      {slide.mounted ? (
+        <div ref={slide.slotRef} style={slide.slotStyle}>
+          <div style={slide.paneStyle}>
+            <ConversationSidePanel conv={conv} />
+          </div>
+        </div>
+      ) : null}
+      {want && !docks ? (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            bottom: 0,
+            width: SIDE_PANEL_PX,
+            zIndex: 20,
+            display: "flex",
+            boxShadow: "-18px 0 36px -20px #000",
+          }}
+        >
+          <ConversationSidePanel conv={conv} />
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -222,6 +332,7 @@ function MainArea({
           cwd={cwd}
           composerRef={composerRef}
           onBackgroundClick={onBackgroundClick}
+          panelHost
         />
       </div>
       {slide.mounted ? (

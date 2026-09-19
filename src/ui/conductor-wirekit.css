@@ -229,6 +229,9 @@
 .wf-btn.prim { background: var(--wf-accent); border-color: var(--wf-accent); color:#1a0f0a; font-weight: 600; }
 .wf-btn.sm { padding: 4px 9px; font-size: 11px; }
 .wf-btn:disabled { opacity: .4; cursor: default; }
+/* A thin vertical rule between groups of title-bar controls (app-wide toggles | conversation
+   actions | the conversation panel toggle). */
+.wf-tb-sep { flex: none; width: 1px; height: 18px; margin: 0 4px; background: var(--wf-line); }
 .wf-icon-btn {
   width: 28px; height: 28px; display: inline-flex; align-items:center; justify-content:center;
   border-radius: var(--wf-r); border: 1px solid var(--wf-line); background: var(--wf-panel); color: var(--wf-tx);

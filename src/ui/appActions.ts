@@ -62,6 +62,12 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
       if (!conv) return false;
       editor.toggleGit();
       return true;
+    case "toggle-conversation-panel":
+      // Off in Settings → the panel does not exist, so the chord must not flip a hidden,
+      // persisted flag the user would only discover the day they switch the panel back on.
+      if (!conv || !useDisplay.getState().conversationSidePanel) return false;
+      editor.toggleConvPanel();
+      return true;
     case "toggle-clean-output": {
       if (!conv) return false;
       const eff = resolveCleanOutput(conv.cleanOutput ?? null, useDisplay.getState().cleanOutput);

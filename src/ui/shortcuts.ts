@@ -197,6 +197,7 @@ export type ShortcutAction =
   | "toggle-editor"
   | "toggle-terminal"
   | "toggle-git"
+  | "toggle-conversation-panel"
   | "toggle-clean-output"
   | "open-extensions"
   | "new-conversation"
@@ -228,6 +229,10 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "toggle-editor", spec: { key: "b" }, scope: "conversation" },
   { action: "toggle-terminal", spec: { key: "j" }, scope: "conversation" },
   { action: "toggle-git", spec: { key: "g", shift: true }, scope: "conversation" },
+  // ⌘I — the macOS "Get Info / Inspector" chord, two keys because the panel is toggled all
+  // the time. Global like its siblings, so it wins over Monaco's secondary ⌘I (trigger
+  // suggest), which keeps ⌃Space. Shown on screen as CONVERSATION_PANEL_CHORD.
+  { action: "toggle-conversation-panel", spec: { key: "i" }, scope: "conversation" },
   { action: "toggle-clean-output", spec: { key: "l" }, scope: "conversation" },
   { action: "open-extensions", spec: { key: "e" }, scope: "conversation" },
   { action: "new-conversation", spec: { key: "n" }, scope: "global" },
@@ -260,6 +265,11 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "zoom-out", spec: { codes: ["NumpadSubtract"], keys: ["-", "_"], shift: "any" }, scope: "global" },
   { action: "zoom-reset", spec: { codes: ["Digit0", "Numpad0"], keys: ["0"], shift: "any" }, scope: "global" },
 ];
+
+/** The conversation side panel's chord as the UI prints it — the ONE label for every place
+ *  that shows it (the panel's header reminder, the closed-state summary line, the toggle's
+ *  tooltip, Settings), so the reminder can never name a chord the app no longer answers to. */
+export const CONVERSATION_PANEL_CHORD = "⌘ I";
 
 // ---- Display catalogue (Settings → Shortcuts) ------------------------------
 
@@ -302,6 +312,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘ B", label: "Open / close the file editor" },
       { keys: "⌘ J", label: "Open / close the integrated terminal" },
       { keys: "⌘⇧ G", label: "Open / close the Git panel" },
+      { keys: CONVERSATION_PANEL_CHORD, label: "Open / close the conversation side panel" },
       { keys: "⌘ L", label: 'Toggle the conversation\'s "clean output"' },
       { keys: "⌘ E", label: "Open Extensions (MCP, plugins, skills, sub-agents)" },
     ],

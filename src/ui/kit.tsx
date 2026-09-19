@@ -71,6 +71,8 @@ const WF_PATHS: Record<string, string> = {
   splith: "M4 5h14v12H4zM11 5v12",
   splitv: "M4 5h14v12H4zM4 11h14",
   sidebar: "M4 5h14v12H4zM9 5v12",
+  sidebarR: "M4 5h14v12H4zM13 5v12",
+  power: "M11 4v7M7.3 6.8a6 6 0 1 0 7.4 0",
   globe: "M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM3 11h16M11 3c2.4 2.2 2.4 13.8 0 16M11 3c-2.4 2.2-2.4 13.8 0 16",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",

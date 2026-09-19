@@ -30,6 +30,7 @@ import {
   type BoardCaches,
 } from "../features/tosse/tosseModel";
 import { refreshLinkedTaskMeta, useConversationsStore } from "../store/conversationsStore";
+import { useDisplay } from "../store/display";
 
 async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   const res = await p;
@@ -51,6 +52,18 @@ export function useTosseConnection(enabled = true) {
     queryFn: () => unwrap(commands.tosseStatus()),
     staleTime: 30_000,
   });
+}
+
+/**
+ * Whether TOSSE surfaces may show at all: the TOSSE tab preference is on AND the CRM is
+ * signed in. ONE definition for every surface that asks (the view switcher, the header, the
+ * conversation side panel), so they can never disagree about whether TOSSE "exists". Passing
+ * the preference as `enabled` means a user who switched TOSSE off never runs the status query.
+ */
+export function useTosseAvailable(): boolean {
+  const tosseTabEnabled = useDisplay((s) => s.tosseTasksView);
+  const { data } = useTosseConnection(tosseTabEnabled);
+  return tosseTabEnabled && data?.connected === true;
 }
 
 /**
@@ -395,6 +408,25 @@ function writeBoardCaches(qc: ReturnType<typeof useQueryClient>, caches: BoardCa
  * where the user had just sent it, until a refetch landed. The rollback snapshot is taken
  * across all of them for the same reason.
  */
+/**
+ * Reassign a task. No optimistic cache patch: the one surface that writes it (the side
+ * panel's avatar picker) shows the chosen person from the mutation's own variables until the
+ * refetch lands, the CRM's `AssigneeAvatarSelect` pattern. On settle, every view holding the
+ * task re-reads it — the board (its row avatar) and the open task queries.
+ */
+export function useSetTosseTaskAssignee() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { taskId: string; assignedTo: string }): Promise<null> =>
+      unwrap(commands.tosseSetTaskAssignee(v.taskId, v.assignedTo)),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
+      void qc.invalidateQueries({ queryKey: tosseTaskKeyPrefix });
+    },
+  });
+}
+
 export function useSetTosseTaskStatus() {
   const qc = useQueryClient();
   return useMutation({
