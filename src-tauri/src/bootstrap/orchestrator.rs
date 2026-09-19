@@ -13,9 +13,12 @@
 //! `claude.ai` cannot run Claude Code at all, so this fails the whole pipeline EARLY
 //! rather than limping through daemon install first only to fail later at
 //! [`StepId::ClaudeAuth`]; skipped when the shared resolver already finds a working
-//! `claude`), [`StepId::UploadDaemon`], [`StepId::InstallService`],
-//! [`StepId::EscalatePersistence`], [`StepId::RunInit`], [`StepId::ClaudeAuth`],
-//! [`StepId::AddMachine`], [`StepId::Diagnose`]. Every step is IDEMPOTENT — re-running
+//! `claude`), [`StepId::UploadDaemon`], [`StepId::RunInit`] (BEFORE the service:
+//! `flightdeckd run` refuses to start without the `~/.flightdeckd/config.json` that
+//! `init` writes, so a service started first crash-loops until its verification gives
+//! up — found on the first real novice run), [`StepId::InstallService`],
+//! [`StepId::EscalatePersistence`], [`StepId::ClaudeAuth`], [`StepId::AddMachine`],
+//! [`StepId::Diagnose`] — see [`PIPELINE_ORDER`]. Every step is IDEMPOTENT — re-running
 //! the whole pipeline against a half- or fully-installed server converges (every
 //! already-satisfied step reports `Skipped`/`AlreadyCurrent`/`Adopted`, nothing already
 //! correct is rewritten) — this is what makes "resume" as simple as "run the same
@@ -137,9 +140,9 @@ pub enum StepId {
     Probe,
     InstallClaude,
     UploadDaemon,
+    RunInit,
     InstallService,
     EscalatePersistence,
-    RunInit,
     ClaudeAuth,
     AddMachine,
     Diagnose,
@@ -1120,6 +1123,26 @@ async fn step_diagnose(app: &tauri::AppHandle, ctx: &Arc<Mutex<PipelineCtx>>) ->
 // ============================================================================
 
 /// See the module doc's overview. Order is FIXED — the whole point of the pipeline.
+/// The pipeline's step order — the ONE source of truth [`build_pipeline`] is checked
+/// against (debug builds) and the front's `STEP_ORDER` mirrors. Load-bearing
+/// constraints, each pinned by a test: [`StepId::RunInit`] runs AFTER
+/// [`StepId::UploadDaemon`] (it executes the uploaded binary) and BEFORE
+/// [`StepId::InstallService`] (the service's own "did it come up" check needs the
+/// config `init` writes); [`StepId::Probe`] runs BEFORE `RunInit` (probing after it
+/// would see our own fresh `config.json` as a pre-existing conflict and adopt).
+pub(crate) const PIPELINE_ORDER: [StepId; 10] = [
+    StepId::InstallKey,
+    StepId::Probe,
+    StepId::InstallClaude,
+    StepId::UploadDaemon,
+    StepId::RunInit,
+    StepId::InstallService,
+    StepId::EscalatePersistence,
+    StepId::ClaudeAuth,
+    StepId::AddMachine,
+    StepId::Diagnose,
+];
+
 fn build_pipeline(
     app: tauri::AppHandle,
     req: StoredBootstrapRequest,
@@ -1127,7 +1150,7 @@ fn build_pipeline(
     sudo_password: Option<SecretString>,
     ctx: Arc<Mutex<PipelineCtx>>,
 ) -> Vec<PipelineStep> {
-    vec![
+    let steps = vec![
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
             PipelineStep::new(StepId::InstallKey, move || async move {
@@ -1155,6 +1178,10 @@ fn build_pipeline(
         },
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
+            PipelineStep::new(StepId::RunInit, move || async move { step_run_init(&app, &req, &ctx).await })
+        },
+        {
+            let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
             PipelineStep::new(StepId::InstallService, move || async move {
                 step_install_service(&app, &req, &ctx).await
             })
@@ -1164,10 +1191,6 @@ fn build_pipeline(
             PipelineStep::new(StepId::EscalatePersistence, move || async move {
                 step_escalate_persistence(&app, &req, sudo_password.as_ref(), &ctx).await
             })
-        },
-        {
-            let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
-            PipelineStep::new(StepId::RunInit, move || async move { step_run_init(&app, &req, &ctx).await })
         },
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
@@ -1181,7 +1204,13 @@ fn build_pipeline(
             let (app, ctx) = (app, ctx);
             PipelineStep::new(StepId::Diagnose, move || async move { step_diagnose(&app, &ctx).await })
         },
-    ]
+    ];
+    debug_assert_eq!(
+        steps.iter().map(|s| s.id).collect::<Vec<_>>(),
+        PIPELINE_ORDER.to_vec(),
+        "build_pipeline drifted from PIPELINE_ORDER"
+    );
+    steps
 }
 
 /// The full outcome of one `bootstrap_server`/`bootstrap_resume` call.
@@ -2194,6 +2223,36 @@ pub async fn machine_repair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- PIPELINE_ORDER (first real novice run, 19/09: the service was started before
+    // `flightdeckd init` had written its config → crash loop → pipeline failed) ----
+
+    fn pos(id: StepId) -> usize {
+        PIPELINE_ORDER.iter().position(|s| *s == id).expect("every StepId is in PIPELINE_ORDER")
+    }
+
+    #[test]
+    fn run_init_runs_after_the_upload_and_before_the_service_is_started() {
+        assert!(pos(StepId::UploadDaemon) < pos(StepId::RunInit), "init executes the uploaded binary");
+        assert!(
+            pos(StepId::RunInit) < pos(StepId::InstallService),
+            "`flightdeckd run` refuses to start without the config `init` writes — a service \
+             started first crash-loops"
+        );
+    }
+
+    #[test]
+    fn the_probe_runs_before_init_so_our_own_config_is_never_seen_as_a_conflict() {
+        assert!(pos(StepId::Probe) < pos(StepId::RunInit));
+    }
+
+    #[test]
+    fn pipeline_order_lists_every_step_exactly_once() {
+        let mut ids = PIPELINE_ORDER.to_vec();
+        ids.sort_by_key(|id| id.wire_str());
+        ids.dedup();
+        assert_eq!(ids.len(), PIPELINE_ORDER.len());
+    }
 
     // ---- is_enabled_yes ----
 

@@ -2861,9 +2861,9 @@ mod tests {
             // "not installed"/"not running" first (see `collapse_state`'s waterfall).
             //
             // ⚠️ Probed BEFORE `upload_daemon`/`init` run (mirrors the REAL pipeline's
-            // own order — B7 Probe, then B8 UploadDaemon/B9 InstallService, THEN
-            // RunInit — and the sibling `live_install_service_fixture_a_…` test right
-            // above) — probing AFTER `init` would see ITS OWN freshly-written
+            // own order — `orchestrator::PIPELINE_ORDER`: Probe, then UploadDaemon,
+            // RunInit, InstallService — and the sibling `live_install_service_fixture_a_…`
+            // test right above) — probing AFTER `init` would see ITS OWN freshly-written
             // `~/.flightdeckd/config.json` and misreport it as a pre-existing conflict,
             // landing on `Adopted` instead of `UserUnit` (reproduced while building
             // this test: the exact same class of self-conflicting probe the module doc
