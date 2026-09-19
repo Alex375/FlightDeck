@@ -85,6 +85,7 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
     reboot_safe: true,
     linger: null,
     sleep_masked: true,
+    user_unit_missing_path: null,
     claude_installed: true,
     claude_logged_in: true,
     claude_email: "demo@example.com",
@@ -132,7 +133,7 @@ async function settle() {
   });
 }
 
-describe("DiagnosisSummary — the 4 headline states", () => {
+describe("DiagnosisSummary — the 5 headline states", () => {
   it("Ready — green headline, no repair buttons for a fully healthy server", () => {
     mount(baseDiagnosis());
     expect(container.textContent).toContain("Ready");
@@ -140,10 +141,22 @@ describe("DiagnosisSummary — the 4 headline states", () => {
     expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 
+  // (B14) Distinct from "Needs Claude sign-in" below — a missing `claude` gets its
+  // OWN headline + repair suggestion (`install_claude`, via `repairSuggestionsFor`),
+  // never routed through the sign-in flow (see `claudeNeedsSignIn`'s own doc).
+  it("Claude Code is not installed — amber headline, offers Install Claude Code via repairSuggestionsFor", () => {
+    mount(baseDiagnosis({ claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_install" } }));
+    expect(container.textContent).toContain("Claude Code is not installed");
+    expect(container.querySelector('[data-tone="attention"]')).not.toBeNull();
+    expect(repairButtonTitles().some((t) => t.includes("Install Claude Code"))).toBe(true);
+  });
+
   it("Needs Claude sign-in — amber headline (its own repair lives outside repairSuggestionsFor)", () => {
-    mount(baseDiagnosis({ claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_sign_in" } }));
+    mount(baseDiagnosis({ claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } }));
     expect(container.textContent).toContain("Needs Claude sign-in");
     expect(container.querySelector('[data-tone="attention"]')).not.toBeNull();
+    // Installed already — must NOT also offer Install Claude Code.
+    expect(repairButtonTitles().some((t) => t.includes("Install Claude Code"))).toBe(false);
   });
 
   it("Running — not reboot-safe — blue headline, offers the matching repair for a user-level install", () => {
@@ -164,6 +177,7 @@ describe("DiagnosisSummary — the 4 headline states", () => {
       reboot_safe: null,
       linger: null,
       sleep_masked: null,
+      user_unit_missing_path: null,
       claude_installed: null,
       claude_logged_in: null,
       claude_email: null,

@@ -22,6 +22,7 @@ import type {
 export const STEP_LABELS: Record<StepId, string> = {
   install_key: "Authorize this Mac's key",
   probe: "Check the server",
+  install_claude: "Install Claude Code",
   upload_daemon: "Install the Flight Deck daemon",
   install_service: "Set up the background service",
   escalate_persistence: "Enable persistence (survive logout & reboot)",
@@ -34,6 +35,7 @@ export const STEP_LABELS: Record<StepId, string> = {
 export const STEP_ORDER: readonly StepId[] = [
   "install_key",
   "probe",
+  "install_claude",
   "upload_daemon",
   "install_service",
   "escalate_persistence",
@@ -168,6 +170,7 @@ export function headlineTone(state: DiagnosisState): HeadlineTone {
   switch (state.kind) {
     case "ready":
       return "ready";
+    case "needs_claude_install":
     case "needs_claude_sign_in":
       return "attention";
     case "running_not_reboot_safe":
@@ -181,6 +184,8 @@ export function headlineLabel(state: DiagnosisState): string {
   switch (state.kind) {
     case "ready":
       return "Ready";
+    case "needs_claude_install":
+      return "Claude Code is not installed";
     case "needs_claude_sign_in":
       return "Needs Claude sign-in";
     case "running_not_reboot_safe":
@@ -212,9 +217,27 @@ export interface RepairSuggestion {
  * `submit_claude_login_code` needs) — `ServerStatusPanel` drives it directly through
  * `start_claude_login` instead, the same inline flow the wizard itself uses. See
  * `deviations_from_brief` in the B12 report.
+ *
+ * `install_claude` (B14) is the OPPOSITE case: unlike `sign_in_claude` it needs no
+ * interactive handle back — `machine_repair` running the installer and returning a
+ * plain summary string is all this needs — so it DOES appear here.
  */
 export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
   const out: RepairSuggestion[] = [];
+  if (d.claude_installed !== true) {
+    out.push({
+      action: "install_claude",
+      title: "Install Claude Code",
+      reason: "Claude Code isn't installed on this server",
+    });
+  }
+  if (d.installed_as === "user" && d.user_unit_missing_path === true) {
+    out.push({
+      action: "install_service",
+      title: "Fix the background service's PATH",
+      reason: "the background service was set up before this app knew to add claude's install location to its PATH",
+    });
+  }
   if (d.installed_as === "none") {
     out.push({
       action: "reupload_daemon",
@@ -265,11 +288,24 @@ export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
   return out;
 }
 
-/** Whether Claude needs attention (missing, logged out, or unconfirmed either way) —
- *  drives the panel's own inline sign-in action, kept apart from
- *  {@link repairSuggestionsFor} for the reason documented there. */
+/** Whether Claude is INSTALLED but needs signing in (logged out, or unconfirmed
+ *  either way) — drives the panel's own inline sign-in action, kept apart from
+ *  {@link repairSuggestionsFor} for the reason documented there.
+ *
+ * (B14) Deliberately requires `claude_installed === true`: `ClaudeSignInInline` must
+ * never be offered while claude is missing (that case is `install_claude`'s job
+ * instead, in {@link repairSuggestionsFor}) — offering a sign-in flow for a server
+ * with no `claude` to sign in with was never actionable, it just failed on the first
+ * click. See {@link claudeNeedsInstall} for the complementary check. */
 export function claudeNeedsSignIn(d: ServerDiagnosis): boolean {
-  return d.claude_installed !== true || d.claude_logged_in !== true;
+  return d.claude_installed === true && d.claude_logged_in !== true;
+}
+
+/** (B14) Whether Claude Code itself is missing (or unconfirmed either way) — the
+ *  complementary check to {@link claudeNeedsSignIn}, for callers that need to tell
+ *  the two apart explicitly rather than just consulting {@link repairSuggestionsFor}. */
+export function claudeNeedsInstall(d: ServerDiagnosis): boolean {
+  return d.claude_installed !== true;
 }
 
 /** Parses a "restart pending — N conversation(s) running" detail (or the "an unknown

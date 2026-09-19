@@ -2702,6 +2702,132 @@ mod tests {
             fixture_down("a");
         }
 
+        /// (B14) End to end against fixture A: [`crate::bootstrap::server_setup::
+        /// install_claude`] installs Claude Code for real via the official installer,
+        /// the SAME B7 probe [`StepId::Probe`] runs then resolves it via the shared
+        /// resolver alone — no `/usr/local/bin` symlink, unlike this file's own
+        /// pre-B14 fixture helpers — and a SECOND install call is a safe no-op (the
+        /// official installer is itself idempotent, and the pipeline's own
+        /// `claude_already_resolvable` skip-gate would agree). Once flightdeckd is also
+        /// up (a User unit — `deploy` is non-root), `orchestrator::diagnose` reports
+        /// `claude_installed: true` and lands on `NeedsClaudeSignIn` (never
+        /// `NeedsClaudeInstall`) — proving FIX 1 (the resolver) and FIX 2's diagnosis
+        /// split land together correctly. Also proves FIX 1's user-unit `PATH` line
+        /// actually reaches the unit systemd manages, read from OUTSIDE this test's own
+        /// ssh connections (mirrors the sibling test above's own discipline).
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start)"]
+        async fn live_install_claude_then_diagnose_reports_it_and_the_user_unit_carries_path() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let key = ThrowawayKey::generate("install-claude-a");
+            install_key_via_password(FIXTURE_A_PORT, FIXTURE_A_USER, FIXTURE_A_PASSWORD, &key).await;
+            let machine = fixture_machine(FIXTURE_A_PORT, FIXTURE_A_USER, &key);
+            let kh = ScratchKnownHosts::new("install-claude-a");
+
+            async fn probe_it(machine: &MachineRecord, kh: &ScratchKnownHosts) -> crate::ipc::commands::RemoteProbeResult {
+                crate::bootstrap::connect::probe(
+                    &crate::bootstrap::connect::BootstrapTarget {
+                        host: machine.host.clone(),
+                        port: machine.port,
+                        user: machine.user.clone(),
+                    },
+                    machine.identity_file.as_deref().unwrap(),
+                    kh.path().unwrap(),
+                )
+                .await
+                .expect("B7 probe against fixture A must succeed")
+            }
+
+            // Fresh fixture: claude genuinely absent, confirmed the SAME way
+            // `StepId::Probe` would (B14's shared resolver) — never assumed.
+            let probe_before = probe_it(&machine, &kh).await;
+            assert!(probe_before.claude_missing, "a fresh fixture A must not already have claude");
+
+            let version = crate::bootstrap::server_setup::install_claude(&machine, kh.path())
+                .await
+                .expect("installing claude on fixture A must succeed");
+            assert!(!version.trim().is_empty(), "install_claude must return a non-empty version string");
+
+            // The SAME probe, re-run, must now resolve it — via `~/.local/bin` alone,
+            // no symlink onto `/usr/local/bin` (B14's whole point).
+            let probe_after = probe_it(&machine, &kh).await;
+            assert!(!probe_after.claude_missing, "the shared resolver must now find the freshly-installed claude");
+            assert!(
+                crate::bootstrap::orchestrator::claude_already_resolvable(&probe_after),
+                "a second InstallClaude pipeline run must skip — the resolver already finds it"
+            );
+
+            // Re-running the installer itself must also be a safe no-op.
+            let second_install = crate::bootstrap::server_setup::install_claude(&machine, kh.path()).await;
+            assert!(second_install.is_ok(), "the official installer is itself idempotent: {second_install:?}");
+
+            // Bring flightdeckd up too (a User unit — `deploy` is non-root) so
+            // `diagnose` reaches ITS OWN claude checks instead of short-circuiting on
+            // "not installed"/"not running" first (see `collapse_state`'s waterfall).
+            //
+            // ⚠️ Probed BEFORE `upload_daemon`/`init` run (mirrors the REAL pipeline's
+            // own order — B7 Probe, then B8 UploadDaemon/B9 InstallService, THEN
+            // RunInit — and the sibling `live_install_service_fixture_a_…` test right
+            // above) — probing AFTER `init` would see ITS OWN freshly-written
+            // `~/.flightdeckd/config.json` and misreport it as a pre-existing conflict,
+            // landing on `Adopted` instead of `UserUnit` (reproduced while building
+            // this test: the exact same class of self-conflicting probe the module doc
+            // already warns about for `upload_daemon`'s own binary).
+            let probe_result = probe_it(&machine, &kh).await;
+            with_real_dist_dir(|dist| async move {
+                let local_path = dist.join(format!("flightdeckd-{}-unknown-linux-musl", host_arch()));
+                upload_daemon_from_path(&machine, kh.path(), &local_path, None)
+                    .await
+                    .expect("upload to fixture A must succeed");
+                init_via_resolved_path(&machine, kh.path(), "install-claude-a-live-test").await;
+
+                let outcome = install_service(&machine, &probe_result, kh.path())
+                    .await
+                    .expect("install_service against fixture A must succeed");
+                assert_eq!(outcome, ServiceOutcome::UserUnit);
+
+                // Past logind's user-manager startup — flightdeckd must be answering
+                // before `diagnose` reads its `status`.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                let diagnosis = crate::bootstrap::orchestrator::diagnose(&machine, kh.path()).await;
+                assert_eq!(
+                    diagnosis.claude_installed,
+                    Some(true),
+                    "diagnose must see the just-installed claude: {diagnosis:?}"
+                );
+                assert_eq!(
+                    diagnosis.state,
+                    crate::bootstrap::orchestrator::DiagnosisState::NeedsClaudeSignIn,
+                    "installed but never signed in must be NeedsClaudeSignIn, not NeedsClaudeInstall: {diagnosis:?}"
+                );
+
+                // FIX 1's user-unit PATH line, read from OUTSIDE this test's own ssh
+                // connections (a fresh `docker exec`), the exact command the brief
+                // specs: `systemctl --user show flightdeckd -p Environment`.
+                let env = std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        "fd-fixture-a",
+                        "su",
+                        FIXTURE_A_USER,
+                        "-c",
+                        "systemctl --user show flightdeckd -p Environment",
+                    ])
+                    .output()
+                    .expect("docker exec must be available");
+                let env_text = String::from_utf8_lossy(&env.stdout);
+                assert!(
+                    env_text.contains(".local/bin"),
+                    "the user unit's daemon environment must carry ~/.local/bin in PATH: {env_text}"
+                );
+            })
+            .await;
+
+            fixture_down("a");
+        }
+
         /// PROVES B9's `Adopted` branch against fixture C: `install_service` writes
         /// NOTHING and reports `Adopted`, and the pre-installed daemon is left running,
         /// untouched (same `MainPID` before and after).

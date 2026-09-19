@@ -8,8 +8,12 @@
 //!
 //! ## The pipeline (`bootstrap_server` / `bootstrap_resume` / `bootstrap_cancel`)
 //!
-//! Nine steps, always in this order: [`StepId::InstallKey`], [`StepId::Probe`],
-//! [`StepId::UploadDaemon`], [`StepId::InstallService`],
+//! Ten steps, always in this order: [`StepId::InstallKey`], [`StepId::Probe`],
+//! [`StepId::InstallClaude`] (B14 — right after the probe: a server that cannot reach
+//! `claude.ai` cannot run Claude Code at all, so this fails the whole pipeline EARLY
+//! rather than limping through daemon install first only to fail later at
+//! [`StepId::ClaudeAuth`]; skipped when the shared resolver already finds a working
+//! `claude`), [`StepId::UploadDaemon`], [`StepId::InstallService`],
 //! [`StepId::EscalatePersistence`], [`StepId::RunInit`], [`StepId::ClaudeAuth`],
 //! [`StepId::AddMachine`], [`StepId::Diagnose`]. Every step is IDEMPOTENT — re-running
 //! the whole pipeline against a half- or fully-installed server converges (every
@@ -48,7 +52,7 @@
 //!
 //! ## `diagnose` / `repair`
 //! [`diagnose`] is ONE ssh round trip running an accumulating marker script (same
-//! discipline as [`super::connect::PROBE_SCRIPT`] / B8's `RESOLVE_DAEMON_TARGET_SCRIPT`
+//! discipline as [`super::connect::probe_script`] / B8's `RESOLVE_DAEMON_TARGET_SCRIPT`
 //! — every check runs regardless of any earlier one's outcome, so a broken server
 //! reports every fact it CAN at once) whose pure parser ([`parse_diagnosis_fields`])
 //! makes every sub-probe tri-state (`Option<bool>`/`Option<String>` — "unknown" on a
@@ -123,6 +127,7 @@ const SSH_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum StepId {
     InstallKey,
     Probe,
+    InstallClaude,
     UploadDaemon,
     InstallService,
     EscalatePersistence,
@@ -139,6 +144,7 @@ impl StepId {
         match self {
             Self::InstallKey => "install_key",
             Self::Probe => "probe",
+            Self::InstallClaude => "install_claude",
             Self::UploadDaemon => "upload_daemon",
             Self::InstallService => "install_service",
             Self::EscalatePersistence => "escalate_persistence",
@@ -735,6 +741,44 @@ async fn step_probe(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &
     }
 }
 
+/// Pure: does [`StepId::Probe`]'s own fact about `claude` already mean
+/// [`StepId::InstallClaude`] has nothing to do? `probe.claude_missing` is itself
+/// produced by the SAME shared resolver ([`crate::ipc::commands::resolve_claude_bin_expr`])
+/// every remote `claude` lookup in this crate now uses, so this is never fooled by a
+/// user-level install a bare `command -v claude` would have missed.
+pub(crate) fn claude_already_resolvable(probe: &RemoteProbeResult) -> bool {
+    !probe.claude_missing
+}
+
+/// [`StepId::InstallClaude`] (B14) — runs the official native installer as the ssh
+/// LOGIN user (never sudo/root — see [`server_setup::install_claude`]'s own doc for the
+/// citation and the exact command), skipped when [`StepId::Probe`] already found a
+/// working `claude`. Placed right after [`StepId::Probe`] and, on failure, stops the
+/// WHOLE pipeline ([`StepOutcome::Failed`], never [`StepOutcome::NeedsInputContinue`]):
+/// a server that cannot install/run Claude Code cannot usefully run the rest of this
+/// pipeline either (see the module doc).
+async fn step_install_claude(
+    app: &tauri::AppHandle,
+    req: &StoredBootstrapRequest,
+    ctx: &Arc<Mutex<PipelineCtx>>,
+) -> StepOutcome {
+    let probe = match ctx.lock().await.probe.clone() {
+        Some(p) => p,
+        None => return StepOutcome::Failed("no probe result available yet".to_string()),
+    };
+    if claude_already_resolvable(&probe) {
+        return StepOutcome::Skipped(Some("claude is already installed".to_string()));
+    }
+    let (machine, known_hosts) = match step_context(app, req, ctx).await {
+        Ok(v) => v,
+        Err(e) => return StepOutcome::Failed(e),
+    };
+    match server_setup::install_claude(&machine, Some(&known_hosts)).await {
+        Ok(version) => StepOutcome::Ok(Some(version)),
+        Err(e) => StepOutcome::Failed(e.to_string()),
+    }
+}
+
 /// Count of currently-busy conversations from a FRESH `flightdeckd status` — `None`
 /// when the round trip itself failed or the answer didn't parse as `fd_status`
 /// (unknown, never assumed zero). Feeds the RESTART RULE ([`step_upload_daemon`]) and
@@ -1076,6 +1120,12 @@ fn build_pipeline(
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
             PipelineStep::new(StepId::Probe, move || async move { step_probe(&app, &req, &ctx).await })
+        },
+        {
+            let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
+            PipelineStep::new(StepId::InstallClaude, move || async move {
+                step_install_claude(&app, &req, &ctx).await
+            })
         },
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
@@ -1457,6 +1507,10 @@ pub enum InstalledAs {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiagnosisState {
     Ready,
+    /// (B14) `claude` itself is missing — distinct from [`Self::NeedsClaudeSignIn`]
+    /// (installed but signed out): [`RepairAction::InstallClaude`] is the fix here,
+    /// [`RepairAction::SignInClaude`] there. See [`collapse_state`]'s doc.
+    NeedsClaudeInstall,
     NeedsClaudeSignIn,
     RunningNotRebootSafe,
     Failed { reason: String },
@@ -1488,6 +1542,19 @@ pub struct ServerDiagnosis {
     /// manufactured for an install kind it doesn't apply to).
     pub linger: Option<bool>,
     pub sleep_masked: Option<bool>,
+    /// (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
+    /// lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
+    /// daemon started this way cannot resolve `claude` at all if it only lives in
+    /// `~/.local/bin` (never on the unit's own minimal PATH). `None` when no user unit
+    /// exists at all ([`InstalledAs`] isn't [`InstalledAs::User`]) — meaningless there,
+    /// never a manufactured `Some(false)`, same discipline as
+    /// [`sleep_masked`](Self::sleep_masked)/[`linger`](Self::linger). Read unconditionally
+    /// by [`diagnose_script`] regardless of [`installed_as`](Self::installed_as).
+    /// [`RepairAction::InstallService`] fixes it — re-running [`install::install_service`]
+    /// against an already-User install re-renders (and overwrites) the unit file with
+    /// [`crate::bootstrap::templates::render_user_unit`]'s current (PATH-including)
+    /// template.
+    pub user_unit_missing_path: Option<bool>,
     pub claude_installed: Option<bool>,
     pub claude_logged_in: Option<bool>,
     pub claude_email: Option<String>,
@@ -1523,6 +1590,7 @@ impl ServerDiagnosis {
             reboot_safe: None,
             linger: None,
             sleep_masked: None,
+            user_unit_missing_path: None,
             claude_installed: None,
             claude_logged_in: None,
             claude_email: None,
@@ -1535,12 +1603,17 @@ impl ServerDiagnosis {
     }
 }
 
-/// The static (non-interpolated) body of [`diagnose_script`] — everything after the
-/// one line that resolves `$FLIGHTDECKD_BIN` (kept as a separate `format!` argument
-/// rather than inlined, so this constant's own literal `{`/`}` — e.g. `awk
+/// The static (non-interpolated) body of [`diagnose_script`] — everything after the two
+/// lines that resolve `$FLIGHTDECKD_BIN`/`$CLAUDE_BIN` (kept as separate `format!`
+/// arguments rather than inlined, so this constant's own literal `{`/`}` — e.g. `awk
 /// '{print $2}'` — never has to be escaped for `format!`). Never `exit`s early — same
-/// accumulating discipline as [`super::connect::PROBE_SCRIPT`]: every check below runs
-/// regardless of any earlier one's outcome.
+/// accumulating discipline as [`super::connect::PROBE_SCRIPT_BODY`]: every check below
+/// runs regardless of any earlier one's outcome.
+///
+/// `claude` presence is checked via `$CLAUDE_BIN` (B14's shared
+/// [`crate::ipc::commands::resolve_claude_bin_expr`]), never a bare `command -v claude`
+/// — see that function's doc for why a bare check falsely reported a genuinely
+/// installed, official-installer `claude` as missing.
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
 if [ -f /etc/systemd/system/flightdeckd.service ]; then
     echo FLIGHTDECK_UNIT_SYSTEM:yes
@@ -1549,8 +1622,14 @@ else
 fi
 if [ -f "$HOME/.config/systemd/user/flightdeckd.service" ]; then
     echo FLIGHTDECK_UNIT_USER:yes
+    if grep -q '^Environment=PATH=' "$HOME/.config/systemd/user/flightdeckd.service" 2>/dev/null; then
+        echo FLIGHTDECK_UNIT_USER_HAS_PATH:yes
+    else
+        echo FLIGHTDECK_UNIT_USER_HAS_PATH:no
+    fi
 else
     echo FLIGHTDECK_UNIT_USER:no
+    echo "FLIGHTDECK_UNIT_USER_HAS_PATH:"
 fi
 if [ -n "$FLIGHTDECKD_BIN" ] && (command -v "$FLIGHTDECKD_BIN" >/dev/null 2>&1 || [ -x "$FLIGHTDECKD_BIN" ]); then
     echo FLIGHTDECK_BIN_PRESENT:yes
@@ -1569,9 +1648,9 @@ ENABLED_USER=$(export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-en
 echo "FLIGHTDECK_ENABLED_USER:$ENABLED_USER"
 SLEEP_MASKED=$(systemctl is-enabled sleep.target 2>/dev/null)
 echo "FLIGHTDECK_SLEEP_MASKED:$SLEEP_MASKED"
-if command -v claude >/dev/null 2>&1; then
+if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
     echo FLIGHTDECK_CLAUDE_INSTALLED:yes
-    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$(claude auth status --json 2>/dev/null)"
+    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$("$CLAUDE_BIN" auth status --json 2>/dev/null)"
 else
     echo FLIGHTDECK_CLAUDE_INSTALLED:no
     echo "FLIGHTDECK_CLAUDE_AUTH_JSON:"
@@ -1585,7 +1664,12 @@ echo "FLIGHTDECK_LAST_BOOT:$(uptime -s 2>/dev/null)"
 "#;
 
 fn diagnose_script() -> String {
-    format!("FLIGHTDECKD_BIN={}\n{}", resolve_daemon_bin_expr("flightdeckd"), DIAGNOSE_SCRIPT_BODY)
+    format!(
+        "FLIGHTDECKD_BIN={}\nCLAUDE_BIN={}\n{}",
+        resolve_daemon_bin_expr("flightdeckd"),
+        crate::ipc::commands::resolve_claude_bin_expr(),
+        DIAGNOSE_SCRIPT_BODY
+    )
 }
 
 /// `systemctl is-enabled`-style output → tri-state: `Some(true)` only for the literal
@@ -1669,6 +1753,15 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
 
     let sleep_masked = extract_marker(stdout, "FLIGHTDECK_SLEEP_MASKED:").map(|v| v == "masked");
 
+    // (B14) Only meaningful when a user unit is CONFIRMED to exist AND the PATH check
+    // itself resolved either way — an unconfirmed unit (`unit_user` unknown) or a
+    // garbled/missing PATH marker both degrade to `None`, never a guessed `Some(false)`.
+    let unit_user_has_path = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER_HAS_PATH:"));
+    let user_unit_missing_path = match (unit_user, unit_user_has_path) {
+        (Some(true), Some(has_path)) => Some(!has_path),
+        _ => None,
+    };
+
     let claude_installed = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_CLAUDE_INSTALLED:"));
     let claude_auth_json = extract_marker(stdout, "FLIGHTDECK_CLAUDE_AUTH_JSON:");
     let (claude_logged_in, claude_email) = match claude_auth_json.as_deref() {
@@ -1696,6 +1789,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         reboot_safe,
         linger,
         sleep_masked,
+        user_unit_missing_path,
         claude_installed,
         claude_logged_in,
         claude_email,
@@ -1734,16 +1828,22 @@ fn collapse_state(d: &ServerDiagnosis) -> DiagnosisState {
         }
         Some(true) => {}
     }
-    // `claude` missing entirely, confirmed logged out, OR "could not confirm either
-    // way" all land in the SAME bucket — never `Failed`: the live fixtures (which
-    // never have `claude` installed AT ALL, only a fresh flightdeckd) must reach
-    // `NeedsClaudeSignIn`, not fail the whole diagnosis over it (per the brief's own
-    // explicit "the pipeline must END in NeedsClaudeSignIn there, not fail"). A
-    // missing `claude` binary is, in practice, exactly as actionable as a present-but-
-    // signed-out one: [`RepairAction::SignInClaude`] is the SAME next step either way
-    // (and surfaces its own clear error if `claude` genuinely isn't installed) — the
-    // brief's own `RepairAction` list has no separate "install claude" action.
-    if d.claude_installed != Some(true) || d.claude_logged_in != Some(true) {
+    // (B14) `claude` missing, confirmed absent, OR "could not confirm either way" all
+    // land in `NeedsClaudeInstall` — never `Failed`: a server that only needs Claude
+    // Code installed is not a broken server, it's the pipeline's normal
+    // `RepairAction::InstallClaude` next step (which itself safely no-ops if `claude`
+    // turns out to already be there — see that action's own doc). This used to be
+    // folded together with "installed but signed out" into one `NeedsClaudeSignIn`
+    // bucket (the brief's own `RepairAction` list had no separate install action back
+    // then) — B14 adds [`RepairAction::InstallClaude`], so the two are now told apart:
+    // offering a sign-in flow for a server that has no `claude` to sign in with was
+    // never actionable, it just failed as soon as the human tried it.
+    if d.claude_installed != Some(true) {
+        return DiagnosisState::NeedsClaudeInstall;
+    }
+    // `claude` is installed but confirmed logged out, or we could not confirm the
+    // sign-in status either way — same "never `Failed`" tolerance as above.
+    if d.claude_logged_in != Some(true) {
         return DiagnosisState::NeedsClaudeSignIn;
     }
     match d.reboot_safe {
@@ -1762,8 +1862,11 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 }
 
 /// ONE ssh round trip, accumulating every fact [`ServerDiagnosis`] carries. See the
-/// module doc.
-async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
+/// module doc. `pub(crate)` so live tests elsewhere in `bootstrap::` (e.g.
+/// `bootstrap::install`'s own Docker-fixture suite) can diagnose a fixture directly,
+/// without needing a full [`tauri::AppHandle`]/[`Store`]-backed [`machine_diagnose`]
+/// call for a machine that was never actually persisted.
+pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
     let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
     cmd.arg("-T");
     // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
@@ -1839,6 +1942,11 @@ pub enum RepairAction {
     EnableLinger,
     MaskSleep,
     RunInit,
+    /// (B14) Runs the official native installer — see
+    /// [`server_setup::install_claude`]'s own doc. Distinct from [`Self::SignInClaude`]:
+    /// this fixes [`DiagnosisState::NeedsClaudeInstall`], that one fixes
+    /// [`DiagnosisState::NeedsClaudeSignIn`].
+    InstallClaude,
     SignInClaude,
     ProvisionPhone,
 }
@@ -1856,6 +1964,7 @@ pub(crate) fn repair_action_label(action: RepairAction) -> &'static str {
         RepairAction::EnableLinger => "Enable linger for this user",
         RepairAction::MaskSleep => "Mask sleep/suspend targets",
         RepairAction::RunInit => "Run flightdeckd init",
+        RepairAction::InstallClaude => "Install Claude Code",
         RepairAction::SignInClaude => "Start the Claude sign-in flow",
         RepairAction::ProvisionPhone => "Provision this Mac's phone token",
     }
@@ -1948,6 +2057,10 @@ async fn repair(
             let outcome = server_setup::run_init(machine, known_hosts, &machine.label).await?;
             format!("{outcome:?}")
         }
+        RepairAction::InstallClaude => {
+            let version = server_setup::install_claude(machine, known_hosts).await?;
+            format!("installed: {version}")
+        }
         RepairAction::SignInClaude => {
             let sessions = app.state::<Arc<server_setup::LoginSessions>>();
             let session = server_setup::start_claude_login(app.clone(), sessions, machine.id.clone())
@@ -2026,6 +2139,60 @@ mod tests {
         assert_eq!(is_enabled_yes(Some("static")), Some(false));
         assert_eq!(is_enabled_yes(Some("")), None);
         assert_eq!(is_enabled_yes(None), None);
+    }
+
+    // ---- claude_already_resolvable (B14) ----
+
+    fn probe_with_claude(claude_missing: bool) -> RemoteProbeResult {
+        RemoteProbeResult {
+            claude_version: None,
+            claude_missing,
+            flightdeckd_version: None,
+            flightdeckd_missing: false,
+            flightdeckd_outdated: false,
+            conflict: None,
+            os: None,
+            arch: None,
+            systemd: None,
+            passwordless_sudo: None,
+            linger: None,
+            kill_user_processes: None,
+        }
+    }
+
+    #[test]
+    fn claude_already_resolvable_mirrors_the_probe_fact() {
+        assert!(claude_already_resolvable(&probe_with_claude(false)), "the probe found a working claude");
+        assert!(!claude_already_resolvable(&probe_with_claude(true)), "the probe found none — InstallClaude must run");
+    }
+
+    // ---- crate-wide regression: no remote script bare-checks `claude` (B14) ---------
+    //
+    // Every remote script/command that touches `claude` must resolve it through the ONE
+    // shared resolver (`crate::ipc::commands::resolve_claude_bin_expr`) — never a bare
+    // `command -v claude`, which silently mis-reports a genuinely-installed,
+    // official-installer `claude` (landing in `~/.local/bin`, never on a
+    // non-interactive ssh shell's `PATH`) as missing. This test is the ONE place that
+    // scans every such script/command in the crate at once, so a future remote `claude`
+    // call site that forgets the resolver fails HERE, not in a live server report.
+
+    #[test]
+    fn no_remote_script_bare_checks_command_dash_v_claude() {
+        let scripts: Vec<(&str, String)> = vec![
+            ("ipc::commands::probe_script", crate::ipc::commands::probe_script()),
+            ("bootstrap::connect::probe_script", connect::probe_script()),
+            ("bootstrap::orchestrator::diagnose_script", diagnose_script()),
+            ("bootstrap::server_setup::claude_auth_status_cmd", server_setup::claude_auth_status_cmd()),
+            ("bootstrap::server_setup::claude_auth_login_cmd", server_setup::claude_auth_login_cmd()),
+        ];
+        for (name, script) in &scripts {
+            assert!(
+                !script.contains("command -v claude"),
+                "{name} still bare-checks `command -v claude` — every remote claude lookup \
+                 must go through resolve_claude_bin_expr instead:\n{script}"
+            );
+            assert!(script.to_lowercase().contains("claude"), "{name} should still reference claude somehow: {script}");
+        }
     }
 
     // ---- count_busy_conversations ----
@@ -2179,6 +2346,40 @@ mod tests {
         assert_eq!(parse_diagnosis_fields(&linger_refused).reboot_safe, Some(false));
     }
 
+    /// (B14) A user unit that exists but was rendered before the PATH fix must be
+    /// flagged — this is what makes `InstallService`'s repair suggestion actually
+    /// appear for it (see `serverBootstrapModel.ts::repairSuggestionsFor`).
+    #[test]
+    fn parse_diagnosis_flags_a_user_unit_missing_its_path_line() {
+        let with_path = healthy_stdout()
+            .replace("FLIGHTDECK_UNIT_SYSTEM:yes", "FLIGHTDECK_UNIT_SYSTEM:no")
+            .replace("FLIGHTDECK_UNIT_USER:no", "FLIGHTDECK_UNIT_USER:yes\nFLIGHTDECK_UNIT_USER_HAS_PATH:yes");
+        assert_eq!(parse_diagnosis_fields(&with_path).user_unit_missing_path, Some(false));
+
+        let missing_path = healthy_stdout()
+            .replace("FLIGHTDECK_UNIT_SYSTEM:yes", "FLIGHTDECK_UNIT_SYSTEM:no")
+            .replace("FLIGHTDECK_UNIT_USER:no", "FLIGHTDECK_UNIT_USER:yes\nFLIGHTDECK_UNIT_USER_HAS_PATH:no");
+        assert_eq!(parse_diagnosis_fields(&missing_path).user_unit_missing_path, Some(true));
+    }
+
+    /// No user unit at all (or its own PATH marker missing/garbled) must never
+    /// manufacture a `Some(false)` — this fact is meaningless outside a User install.
+    #[test]
+    fn parse_diagnosis_user_unit_missing_path_is_unknown_without_a_confirmed_user_unit() {
+        // `healthy_stdout()` is a SYSTEM install (`FLIGHTDECK_UNIT_USER:no`) and carries
+        // no `FLIGHTDECK_UNIT_USER_HAS_PATH` marker at all.
+        assert_eq!(parse_diagnosis_fields(&healthy_stdout()).user_unit_missing_path, None);
+
+        let unit_confirmed_but_path_unknown = healthy_stdout()
+            .replace("FLIGHTDECK_UNIT_SYSTEM:yes", "FLIGHTDECK_UNIT_SYSTEM:no")
+            .replace("FLIGHTDECK_UNIT_USER:no", "FLIGHTDECK_UNIT_USER:yes\nFLIGHTDECK_UNIT_USER_HAS_PATH:");
+        assert_eq!(
+            parse_diagnosis_fields(&unit_confirmed_but_path_unknown).user_unit_missing_path,
+            None,
+            "a garbled/empty PATH marker must degrade to unknown, never a guessed Some(false)"
+        );
+    }
+
     #[test]
     fn parse_diagnosis_detached_is_never_reboot_safe() {
         let stdout = healthy_stdout()
@@ -2216,6 +2417,7 @@ mod tests {
             reboot_safe: Some(true),
             linger: Some(false),
             sleep_masked: Some(true),
+            user_unit_missing_path: None,
             claude_installed: Some(true),
             claude_logged_in: Some(true),
             claude_email: Some("a@b.com".into()),
@@ -2254,12 +2456,12 @@ mod tests {
             (
                 "claude not installed at all (the live fixtures' own case) — never Failed",
                 ServerDiagnosis { claude_installed: Some(false), ..base_diagnosis() },
-                DiagnosisState::NeedsClaudeSignIn,
+                DiagnosisState::NeedsClaudeInstall,
             ),
             (
                 "claude install unknown — treated the same as not installed",
                 ServerDiagnosis { claude_installed: None, ..base_diagnosis() },
-                DiagnosisState::NeedsClaudeSignIn,
+                DiagnosisState::NeedsClaudeInstall,
             ),
             (
                 "claude not logged in — never Failed",
@@ -2328,6 +2530,7 @@ mod tests {
             RepairAction::EnableLinger,
             RepairAction::MaskSleep,
             RepairAction::RunInit,
+            RepairAction::InstallClaude,
             RepairAction::SignInClaude,
             RepairAction::ProvisionPhone,
         ] {
@@ -2351,6 +2554,7 @@ mod tests {
             RepairAction::EnableLinger,
             RepairAction::MaskSleep,
             RepairAction::RunInit,
+            RepairAction::InstallClaude,
             RepairAction::SignInClaude,
             RepairAction::ProvisionPhone,
         ] {
@@ -2948,11 +3152,13 @@ mod tests {
             let d = diagnose(&machine, kh.path()).await;
             assert_eq!(d.installed_as, InstalledAs::System, "fixture C ships a root-owned system unit: {d:?}");
             assert_eq!(d.daemon_running, Some(true), "fixture C's unit is enabled --now: {d:?}");
-            assert_eq!(d.claude_installed, Some(false), "no fixture ever has claude installed: {d:?}");
+            assert_eq!(d.claude_installed, Some(false), "no fixture ever has claude installed unless a test installs it: {d:?}");
+            // (B14) Split from NeedsClaudeSignIn — missing claude is its OWN state now,
+            // still never `Failed` (per the original brief this test cites).
             assert_eq!(
                 d.state,
-                DiagnosisState::NeedsClaudeSignIn,
-                "missing claude must read as needs-sign-in, never Failed, per the brief: {d:?}"
+                DiagnosisState::NeedsClaudeInstall,
+                "missing claude must read as needs-install, never Failed, per the brief: {d:?}"
             );
             assert_eq!(d.reboot_safe, Some(true), "a `systemctl enable`d system unit survives a reboot: {d:?}");
         }

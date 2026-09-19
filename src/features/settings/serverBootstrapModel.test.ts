@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BootstrapProgressStep, ServerDiagnosis, StepState } from "../../ipc/client";
 import {
+  claudeNeedsInstall,
   claudeNeedsSignIn,
   claudeSignInStep,
   headlineLabel,
@@ -34,6 +35,7 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
     reboot_safe: true,
     linger: null,
     sleep_masked: true,
+    user_unit_missing_path: null,
     claude_installed: true,
     claude_logged_in: true,
     claude_email: "demo@example.com",
@@ -62,7 +64,7 @@ describe("repairSuggestionsFor — outdated daemon", () => {
 });
 
 describe("toStepRows", () => {
-  it("returns all 9 steps in the fixed pipeline order, even from a partial/empty report", () => {
+  it("returns all 10 steps in the fixed pipeline order, even from a partial/empty report", () => {
     const rows = toStepRows([]);
     expect(rows.map((r) => r.id)).toEqual(STEP_ORDER);
     expect(rows.every((r) => r.status === "pending" && r.detail === null)).toBe(true);
@@ -207,12 +209,25 @@ describe("headlineTone / headlineLabel", () => {
   it("maps every DiagnosisState kind to its own tone and a readable label", () => {
     expect(headlineTone({ kind: "ready" })).toBe("ready");
     expect(headlineLabel({ kind: "ready" })).toBe("Ready");
+    // (B14) Distinct from needs_claude_sign_in — see collapse_state's own doc.
+    expect(headlineTone({ kind: "needs_claude_install" })).toBe("attention");
+    expect(headlineLabel({ kind: "needs_claude_install" })).toBe("Claude Code is not installed");
     expect(headlineTone({ kind: "needs_claude_sign_in" })).toBe("attention");
     expect(headlineLabel({ kind: "needs_claude_sign_in" })).toBe("Needs Claude sign-in");
     expect(headlineTone({ kind: "running_not_reboot_safe" })).toBe("caution");
     expect(headlineLabel({ kind: "running_not_reboot_safe" })).toBe("Running — not reboot-safe");
     expect(headlineTone({ kind: "failed", reason: "could not reach the server" })).toBe("error");
     expect(headlineLabel({ kind: "failed", reason: "could not reach the server" })).toBe("Failed — could not reach the server");
+  });
+});
+
+describe("STEP_ORDER (B14)", () => {
+  it("inserts install_claude right after probe, before upload_daemon", () => {
+    const probeIdx = STEP_ORDER.indexOf("probe");
+    const installClaudeIdx = STEP_ORDER.indexOf("install_claude");
+    const uploadIdx = STEP_ORDER.indexOf("upload_daemon");
+    expect(installClaudeIdx).toBe(probeIdx + 1);
+    expect(uploadIdx).toBe(installClaudeIdx + 1);
   });
 });
 
@@ -261,7 +276,7 @@ describe("repairSuggestionsFor", () => {
   });
 
   it("never suggests sign_in_claude — that flow is driven directly, not through machine_repair (see the doc)", () => {
-    const d = baseDiagnosis({ claude_installed: false, claude_logged_in: null, state: { kind: "needs_claude_sign_in" } });
+    const d = baseDiagnosis({ claude_installed: false, claude_logged_in: null, state: { kind: "needs_claude_install" } });
     expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("sign_in_claude");
   });
 
@@ -270,16 +285,49 @@ describe("repairSuggestionsFor", () => {
     const actions = repairSuggestionsFor(d).map((s) => s.action);
     expect(actions).toEqual(expect.arrayContaining(["restart_daemon", "enable_linger", "mask_sleep"]));
   });
+
+  // ---- install_claude (B14) ----
+
+  it("suggests install_claude whenever claude isn't confirmed installed, ahead of every other repair", () => {
+    expect(repairSuggestionsFor(baseDiagnosis({ claude_installed: false })).map((s) => s.action)).toEqual(["install_claude"]);
+    expect(repairSuggestionsFor(baseDiagnosis({ claude_installed: null })).map((s) => s.action)).toEqual(["install_claude"]);
+  });
+
+  it("never suggests install_claude once it's confirmed installed", () => {
+    expect(repairSuggestionsFor(baseDiagnosis({ claude_installed: true })).map((s) => s.action)).not.toContain("install_claude");
+  });
+
+  it("suggests fixing the background service's PATH for a user install whose unit predates the PATH fix", () => {
+    const d = baseDiagnosis({ installed_as: "user", user_unit_missing_path: true });
+    const suggestion = repairSuggestionsFor(d).find((s) => s.action === "install_service");
+    expect(suggestion?.title).toBe("Fix the background service's PATH");
+  });
+
+  it("never suggests the PATH fix for a system/detached install, or a user install whose unit already has it", () => {
+    expect(
+      repairSuggestionsFor(baseDiagnosis({ installed_as: "system", user_unit_missing_path: true })).map((s) => s.action),
+    ).not.toContain("install_service");
+    expect(
+      repairSuggestionsFor(baseDiagnosis({ installed_as: "user", user_unit_missing_path: false })).map((s) => s.action),
+    ).not.toContain("install_service");
+  });
 });
 
-describe("claudeNeedsSignIn", () => {
-  it("is false only when both installed and logged in are confirmed true", () => {
+describe("claudeNeedsSignIn / claudeNeedsInstall", () => {
+  it("claudeNeedsSignIn is false unless claude is CONFIRMED installed", () => {
     expect(claudeNeedsSignIn(baseDiagnosis())).toBe(false);
+    // (B14) A missing claude is `claudeNeedsInstall`'s job, never the sign-in flow's.
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_installed: false, claude_logged_in: null }))).toBe(false);
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_installed: null }))).toBe(false);
   });
-  it("is true when not installed, not logged in, or either is unknown", () => {
-    expect(claudeNeedsSignIn(baseDiagnosis({ claude_installed: false }))).toBe(true);
-    expect(claudeNeedsSignIn(baseDiagnosis({ claude_logged_in: false }))).toBe(true);
-    expect(claudeNeedsSignIn(baseDiagnosis({ claude_logged_in: null }))).toBe(true);
+  it("claudeNeedsSignIn is true once installed but not (confirmed) logged in", () => {
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_installed: true, claude_logged_in: false }))).toBe(true);
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_installed: true, claude_logged_in: null }))).toBe(true);
+  });
+  it("claudeNeedsInstall is true unless claude is CONFIRMED installed", () => {
+    expect(claudeNeedsInstall(baseDiagnosis())).toBe(false);
+    expect(claudeNeedsInstall(baseDiagnosis({ claude_installed: false }))).toBe(true);
+    expect(claudeNeedsInstall(baseDiagnosis({ claude_installed: null }))).toBe(true);
   });
 });
 

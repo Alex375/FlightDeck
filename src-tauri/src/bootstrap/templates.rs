@@ -86,12 +86,22 @@ fn reject_unit_line_break(field: &'static str, value: &str) -> Result<(), Unsafe
 /// manage a user unit — this is the no-escalation install path; the [`String`]
 /// returned here is the unit's byte-for-byte contents.
 ///
-/// `home` lands inside `ExecStart=`, whose tokenizer honours `shq()`'s single-quote
-/// escaping (see the module doc), so a home directory with a space or a shell
-/// metacharacter in it still resolves to the right, single path — it does not need to
-/// be a "normal" path for this to stay correct. It still must not carry an embedded
-/// newline (see the module doc); this returns [`UnsafeUnitValue`] rather than emit an
-/// injectable unit file.
+/// `home` lands inside `Environment=`/`ExecStart=`, whose tokenizer honours `shq()`'s
+/// single-quote escaping (see the module doc), so a home directory with a space or a
+/// shell metacharacter in it still resolves to the right, single path — it does not
+/// need to be a "normal" path for this to stay correct. It still must not carry an
+/// embedded newline (see the module doc); this returns [`UnsafeUnitValue`] rather than
+/// emit an injectable unit file.
+///
+/// ⚠️ (B14) Carries the SAME `Environment=PATH=` line [`render_system_unit`] already
+/// had — its absence here meant a daemon started as a USER unit had no `PATH` at all
+/// beyond whatever minimal default systemd supplies for a `--user` manager, so it could
+/// never spawn `claude` when that binary only lived in `~/.local/bin` (which is exactly
+/// where the official native installer puts it — every non-root, non-detached install
+/// this app makes IS a user unit). `flightdeckd`'s own `ExecStart=` line already worked
+/// around this by hardcoding `{home}/.local/bin/flightdeckd`, but that trick doesn't
+/// extend to a CHILD process `flightdeckd` itself spawns (`claude`) — only its own
+/// environment does.
 pub fn render_user_unit(home: &str) -> Result<String, UnsafeUnitValue> {
     reject_unit_line_break("home", home)?;
     let home = shq(home);
@@ -100,6 +110,7 @@ pub fn render_user_unit(home: &str) -> Result<String, UnsafeUnitValue> {
          Description=Flight Deck server daemon (flightdeckd)\n\
          \n\
          [Service]\n\
+         Environment=PATH=/usr/local/bin:{home}/.local/bin:/usr/bin:/bin\n\
          ExecStart={home}/.local/bin/flightdeckd run\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -275,6 +286,7 @@ mod tests {
                      Description=Flight Deck server daemon (flightdeckd)\n\
                      \n\
                      [Service]\n\
+                     Environment=PATH=/usr/local/bin:'/home/alex'/.local/bin:/usr/bin:/bin\n\
                      ExecStart='/home/alex'/.local/bin/flightdeckd run\n\
                      Restart=always\n\
                      RestartSec=3\n\
@@ -282,6 +294,18 @@ mod tests {
                      [Install]\n\
                      WantedBy=default.target\n";
         assert_eq!(got, want);
+    }
+
+    /// (B14) The user unit's `PATH` must include `~/.local/bin` — where a non-root,
+    /// non-detached install's `flightdeckd` spawns `claude` from, and exactly where the
+    /// official native installer puts it. Regression test for FIX 1.
+    #[test]
+    fn user_unit_path_includes_local_bin() {
+        let got = render_user_unit("/home/alex").expect("plain home must render");
+        assert!(
+            got.contains("Environment=PATH=/usr/local/bin:'/home/alex'/.local/bin:/usr/bin:/bin\n"),
+            "got: {got}"
+        );
     }
 
     /// Byte-for-byte against the file fetched from `josty-cc`'s

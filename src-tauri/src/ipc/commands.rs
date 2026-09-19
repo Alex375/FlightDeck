@@ -3820,18 +3820,41 @@ pub(crate) fn push_ssh_destination(cmd: &mut tokio::process::Command, user: &str
 ///
 /// `bin_name` is expected to be a bare command name (`"flightdeckd"` at every
 /// production call site) — an explicit path (containing `/`) is returned unsearched,
-/// shell-quoted, for any future override that already names a full path.
-pub(crate) fn resolve_daemon_bin_expr(bin_name: &str) -> String {
+/// shell-quoted, for any future override that already names a full path. `var_name` is
+/// a disposable, cosmetic name for this expression's own inline subshell variable —
+/// kept distinct per caller (see [`resolve_daemon_bin_expr`]/[`resolve_claude_bin_expr`])
+/// only so a script built from more than one such expression can never have two of them
+/// stomp the SAME shell variable.
+fn resolve_bin_expr(bin_name: &str, var_name: &str) -> String {
     if bin_name.contains('/') {
         return shq(bin_name);
     }
     let name = shq(bin_name);
     format!(
-        "$(FLIGHTDECKD_NAME={name}; command -v \"$FLIGHTDECKD_NAME\" 2>/dev/null || \
-         {{ [ -x \"$HOME/.local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"$HOME/.local/bin/$FLIGHTDECKD_NAME\"; }} || \
-         {{ [ -x \"/usr/local/bin/$FLIGHTDECKD_NAME\" ] && printf %s \"/usr/local/bin/$FLIGHTDECKD_NAME\"; }} || \
-         printf %s \"$FLIGHTDECKD_NAME\")"
+        "$({var_name}={name}; command -v \"${var_name}\" 2>/dev/null || \
+         {{ [ -x \"$HOME/.local/bin/${var_name}\" ] && printf %s \"$HOME/.local/bin/${var_name}\"; }} || \
+         {{ [ -x \"/usr/local/bin/${var_name}\" ] && printf %s \"/usr/local/bin/${var_name}\"; }} || \
+         printf %s \"${var_name}\")"
     )
+}
+
+pub(crate) fn resolve_daemon_bin_expr(bin_name: &str) -> String {
+    resolve_bin_expr(bin_name, "FLIGHTDECKD_NAME")
+}
+
+/// The `claude` sibling of [`resolve_daemon_bin_expr`] — SAME search order, for the
+/// SAME reason: the official native installer (`curl -fsSL https://claude.ai/install.sh
+/// | bash`, see `bootstrap::server_setup::install_claude`'s own doc for the citation)
+/// places `claude` at `~/.local/bin/claude` (a symlink into
+/// `~/.local/share/claude/versions/`), which a non-interactive ssh shell's `PATH` never
+/// includes (only a LOGIN shell sources `~/.profile`) — VERIFIED live: a server with
+/// nothing but a hand-made `/usr/local/bin/claude` symlink "worked" only by accident,
+/// while every genuinely fresh install (the official installer's own, default location)
+/// made a bare `command -v claude`/`claude ...` report "not installed" even though it
+/// plainly was. Every remote invocation of `claude` in this crate MUST go through this
+/// — never a bare `claude`/`command -v claude`.
+pub(crate) fn resolve_claude_bin_expr() -> String {
+    resolve_bin_expr("claude", "FLIGHTDECK_CLAUDE_BIN")
 }
 
 /// Verify we can SSH into a server AND check the two binaries pairing needs —
@@ -3852,23 +3875,16 @@ pub(crate) fn resolve_daemon_bin_expr(bin_name: &str) -> String {
 /// that one function) — previously this comment described an aspiration the attach
 /// path didn't implement: it bare-`exec`'d `daemon_bin` with no fallback, so a probe
 /// that passed via `~/.local/bin` could still fail on the very first attach.
-async fn probe_remote(
-    host: &str,
-    port: u16,
-    user: &str,
-    identity: Option<&str>,
-    known_hosts: Option<&str>,
-) -> Result<RemoteProbeResult, String> {
-    let mut cmd = keyed_ssh_options(port, identity, known_hosts);
-    cmd.arg("-T");
-    // Findings ride on stdout as `MARKER:value` lines (parsed below via
-    // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
-    // with the old single-tool probe and for anyone reading raw ssh output by hand.
-    let script = r#"
+///
+/// `claude` is resolved through the SAME [`resolve_claude_bin_expr`] every other remote
+/// `claude` invocation in this crate now uses — a bare `command -v claude` here used to
+/// report a perfectly real, official-installer `claude` (which lands in
+/// `~/.local/bin`, never on a non-interactive ssh shell's `PATH`) as "not installed".
+const PROBE_SCRIPT_BODY: &str = r#"
 MISSING=""
 CLAUDE_VERSION=""
-if command -v claude >/dev/null 2>&1; then
-    CLAUDE_VERSION=$(claude --version 2>/dev/null)
+if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
+    CLAUDE_VERSION=$("$CLAUDE_BIN" --version 2>/dev/null)
 else
     MISSING="$MISSING claude"
 fi
@@ -3902,8 +3918,30 @@ if [ -n "$MISSING" ]; then
 fi
 exit 0
 "#;
+
+/// [`PROBE_SCRIPT_BODY`] prefixed with the `CLAUDE_BIN` resolution line — same split as
+/// `bootstrap::orchestrator::diagnose_script`'s own `FLIGHTDECKD_BIN` injection, kept as
+/// a separate `format!` argument rather than inlined so the constant's own literal
+/// `{`/`}` never needs escaping. `pub(crate)` so it can be exercised directly by the
+/// crate-wide "no bare `command -v claude`" regression test in `bootstrap::orchestrator`.
+pub(crate) fn probe_script() -> String {
+    format!("CLAUDE_BIN={}\n{}", resolve_claude_bin_expr(), PROBE_SCRIPT_BODY)
+}
+
+async fn probe_remote(
+    host: &str,
+    port: u16,
+    user: &str,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<RemoteProbeResult, String> {
+    let mut cmd = keyed_ssh_options(port, identity, known_hosts);
+    cmd.arg("-T");
     push_ssh_destination(&mut cmd, user, host)?;
-    cmd.arg(script);
+    // Findings ride on stdout as `MARKER:value` lines (parsed below via
+    // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
+    // with the old single-tool probe and for anyone reading raw ssh output by hand.
+    cmd.arg(probe_script());
     let out = cmd
         .output()
         .await
@@ -3979,13 +4017,22 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
 /// Turns a probe result that failed pairing's minimum bar into ONE human-readable
 /// error, naming every blocker at once — so a server missing both `claude` and
 /// `flightdeckd` doesn't make the user fix one, retry, then learn about the other.
+///
+/// A1's own hard block on this legacy/manual "Add a server" path is a deliberate
+/// decision (kept as-is by B14) — it stays a dead end for a server missing `claude`,
+/// rather than growing its own install step — but the wording it dead-ends into was
+/// wrong on two counts: the official installer's command pipes to `bash`, not `sh`
+/// (see `bootstrap::server_setup::install_claude`'s own citation), and it never
+/// mentioned that the OTHER "Add a server" flow (`bootstrap_server`, B14's own
+/// [`crate::bootstrap::orchestrator::StepId::InstallClaude`] step) installs Claude Code
+/// for the user instead of requiring a manual ssh session at all.
 fn describe_probe_blockers(probe: &RemoteProbeResult) -> String {
     let mut blockers = Vec::new();
     if probe.claude_missing {
         blockers.push(
             "`claude` is not installed on the server. On the server run: \
-             curl -fsSL https://claude.ai/install.sh | sh — then log Claude in there \
-             (`claude`), and retry."
+             curl -fsSL https://claude.ai/install.sh | bash — then log Claude in there \
+             (`claude`), and retry. Or use \"Add a server\", which installs it for you."
                 .to_string(),
         );
     }
@@ -5820,6 +5867,126 @@ mod tests {
         // actually print) — only the LAST whitespace token is the version.
         assert!(super::version_at_least("flightdeckd 0.1.0", "0.1.0"));
         assert!(!super::version_at_least("flightdeckd 0.0.9", "0.1.0"));
+    }
+
+    // ---- resolve_claude_bin_expr (B14) --------------------------------------------
+    //
+    // The generated `$(...)` expression is real shell — every case below actually runs
+    // it through `sh -c`, with `PATH`/`HOME` overridden per-process (never the test
+    // runner's own environment), rather than just asserting on the string's shape. The
+    // one exception is the `/usr/local/bin` fallback, which cannot safely stage a fake
+    // executable at a real, shared system path from a unit test — that case stays a
+    // structural assertion, mirroring `supervisor::transport`'s own
+    // `resolve_remote_daemon_bin_searches_path_then_local_then_usr_local_for_a_bare_name`
+    // test for the identical dilemma on the `flightdeckd` resolver.
+    mod resolve_claude_bin_expr_tests {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// A scratch directory removed on drop — same discipline as
+        /// `bootstrap::server_setup::tests::ScratchKnownHosts`.
+        struct ScratchDir(std::path::PathBuf);
+        impl ScratchDir {
+            fn new(tag: &str) -> Self {
+                let path = std::env::temp_dir().join(format!("flightdeck-claude-bin-{tag}-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&path).expect("scratch dir");
+                Self(path)
+            }
+        }
+        impl Drop for ScratchDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Writes an executable (mode 755) no-op script at `path`.
+        fn write_executable(path: &std::path::Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write fake claude");
+            let mut perms = std::fs::metadata(path).expect("stat fake claude").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod fake claude");
+        }
+
+        /// Runs the resolver expression through a real `sh -c`, with `PATH`/`HOME`
+        /// overridden for that ONE child process only, and returns its resolved stdout.
+        fn resolve_with(path: &str, home: &str) -> String {
+            let expr = super::super::resolve_claude_bin_expr();
+            // `/bin/sh` (absolute, never searched via `PATH`) — `path` below overrides
+            // the CHILD's own `PATH` env var (what the resolver's internal `command -v`
+            // reads), which would otherwise ALSO break resolving `sh` itself if it were
+            // spawned by bare name.
+            // `expr` (a `$(...)` command substitution) is itself double-quoted here —
+            // NOT how a production call site uses it (those need it UNQUOTED, in
+            // COMMAND-NAME position — see `resolve_daemon_bin_expr`'s own doc) — purely
+            // so THIS test's own `printf` sees the resolved path as ONE field even when
+            // it contains a space, instead of the outer shell field-splitting it first.
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s \"{expr}\""))
+                .env("PATH", path)
+                .env("HOME", home)
+                .output()
+                .expect("/bin/sh must be available to exercise the resolver");
+            assert!(out.status.success(), "resolver script failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        #[test]
+        fn finds_it_on_path() {
+            let dir = ScratchDir::new("path");
+            let claude = dir.0.join("claude");
+            write_executable(&claude);
+            let home = ScratchDir::new("path-home"); // has no ~/.local/bin at all
+            let resolved = resolve_with(&dir.0.to_string_lossy(), &home.0.to_string_lossy());
+            assert_eq!(resolved, claude.to_string_lossy());
+        }
+
+        #[test]
+        fn falls_back_to_local_bin_when_not_on_path() {
+            // A PATH pointing at an empty, real directory — `command -v` must fail to
+            // find anything there, never silently succeed on a stale absolute lookup.
+            let empty_path = ScratchDir::new("local-bin-emptypath");
+            let home = ScratchDir::new("local-bin-home");
+            let local_bin = home.0.join(".local/bin");
+            std::fs::create_dir_all(&local_bin).expect("mkdir ~/.local/bin");
+            let claude = local_bin.join("claude");
+            write_executable(&claude);
+            let resolved = resolve_with(&empty_path.0.to_string_lossy(), &home.0.to_string_lossy());
+            assert_eq!(resolved, claude.to_string_lossy());
+        }
+
+        /// (B14) A `HOME` containing a space must still resolve correctly — the
+        /// resolver's own double-quoting (`"$HOME/.local/bin/$VAR"`) must survive it.
+        #[test]
+        fn falls_back_to_local_bin_with_a_space_in_home() {
+            let empty_path = ScratchDir::new("space-emptypath");
+            let home_parent = ScratchDir::new("space-home");
+            let home = home_parent.0.join("has space");
+            let local_bin = home.join(".local/bin");
+            std::fs::create_dir_all(&local_bin).expect("mkdir ~/.local/bin");
+            let claude = local_bin.join("claude");
+            write_executable(&claude);
+            let resolved = resolve_with(&empty_path.0.to_string_lossy(), &home.to_string_lossy());
+            assert_eq!(resolved, claude.to_string_lossy());
+        }
+
+        #[test]
+        fn falls_back_to_the_bare_name_when_absent_everywhere() {
+            let empty_path = ScratchDir::new("absent-emptypath");
+            let home = ScratchDir::new("absent-home"); // no ~/.local/bin either
+            let resolved = resolve_with(&empty_path.0.to_string_lossy(), &home.0.to_string_lossy());
+            assert_eq!(resolved, "claude", "with nothing found anywhere, ssh's own \"command not found\" must fire");
+        }
+
+        /// `/usr/local/bin` cannot be safely staged from a unit test (it's a real,
+        /// shared system path) — structural assertion instead, same technique as
+        /// `supervisor::transport`'s identical `flightdeckd` test.
+        #[test]
+        fn searches_usr_local_bin_as_the_last_fallback() {
+            let expr = super::super::resolve_claude_bin_expr();
+            assert!(expr.contains("command -v \"$FLIGHTDECK_CLAUDE_BIN\""), "checks PATH first: {expr}");
+            assert!(expr.contains("$HOME/.local/bin/$FLIGHTDECK_CLAUDE_BIN"), "falls back to ~/.local/bin: {expr}");
+            assert!(expr.contains("/usr/local/bin/$FLIGHTDECK_CLAUDE_BIN"), "falls back to /usr/local/bin: {expr}");
+        }
     }
 
     // ---- Remote pairing: combined probe parsing (A1) ------------------------------

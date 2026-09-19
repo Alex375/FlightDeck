@@ -83,6 +83,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { useSettingsUi } from "../../store/settingsUi";
 import sharedStyles from "./SettingsPanel.module.css";
+import wStyles from "./ServerBootstrapWizard.module.css";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
 
 let container: HTMLDivElement;
@@ -91,6 +92,7 @@ let root: Root;
 const STEP_IDS = [
   "install_key",
   "probe",
+  "install_claude",
   "upload_daemon",
   "install_service",
   "escalate_persistence",
@@ -190,6 +192,29 @@ afterEach(() => {
 });
 
 describe("ServerBootstrapWizard — form", () => {
+  // (B14) The step checklist is entirely data-driven off `STEP_ORDER`/`STEP_LABELS`
+  // (serverBootstrapModel.ts) — this is what makes the newly-added InstallClaude step
+  // show up here with zero JSX changes, mentioning the install up front so it's not a
+  // surprise (see the B14 brief's own "no new setting" requirement).
+  it("the step checklist mentions Install Claude Code, right after Check the server", async () => {
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "s1", host: "1.2.3.4", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: null },
+    });
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    clickButtonWithText("Install");
+    await settle();
+
+    const labels = Array.from(container.getElementsByClassName(wStyles.stepLabel)).map((el) => el.textContent);
+    expect(labels).toContain("Install Claude Code");
+    const checkIdx = labels.indexOf("Check the server");
+    const installClaudeIdx = labels.indexOf("Install Claude Code");
+    expect(checkIdx).toBeGreaterThanOrEqual(0);
+    expect(installClaudeIdx).toBe(checkIdx + 1);
+  });
+
   it("submits the typed password to bootstrap_server, then clears it from state", async () => {
     bootstrapServer.mockResolvedValue({
       status: "ok",

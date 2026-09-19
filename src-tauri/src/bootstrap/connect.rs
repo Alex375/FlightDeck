@@ -426,11 +426,16 @@ pub async fn forget_host_key(known_hosts: &str, host: &str, port: u16) -> Result
 /// (`loginctl`, `busctl`, `sudo`) degrades its own marker to an empty/negative value,
 /// never aborts the rest of the script (see [`crate::ipc::commands::parse_yes_no_marker`]
 /// — an empty or garbled value parses as `None`, never an error).
-const PROBE_SCRIPT: &str = r#"
+///
+/// `claude` is resolved through [`crate::ipc::commands::resolve_claude_bin_expr`] (B14)
+/// — a bare `command -v claude` reported a genuinely-installed, official-installer
+/// `claude` (which lands in `~/.local/bin`, never on a non-interactive ssh shell's
+/// `PATH`) as missing.
+const PROBE_SCRIPT_BODY: &str = r#"
 MISSING=""
 CLAUDE_VERSION=""
-if command -v claude >/dev/null 2>&1; then
-    CLAUDE_VERSION=$(claude --version 2>/dev/null)
+if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
+    CLAUDE_VERSION=$("$CLAUDE_BIN" --version 2>/dev/null)
 else
     MISSING="$MISSING claude"
 fi
@@ -512,6 +517,14 @@ fi
 exit 0
 "#;
 
+/// [`PROBE_SCRIPT_BODY`] prefixed with the `CLAUDE_BIN` resolution line — same split as
+/// `bootstrap::orchestrator::diagnose_script`'s own `FLIGHTDECKD_BIN` injection.
+/// `pub(crate)` so it can be exercised directly by the crate-wide "no bare
+/// `command -v claude`" regression test in `bootstrap::orchestrator`.
+pub(crate) fn probe_script() -> String {
+    format!("CLAUDE_BIN={}\n{}", crate::ipc::commands::resolve_claude_bin_expr(), PROBE_SCRIPT_BODY)
+}
+
 /// Probe a server that ALREADY holds the app's key (post [`install_key`]) for the
 /// full picture [`RemoteProbeResult`] carries — both A1's original pairability facts
 /// (`claude`/`flightdeckd` presence) and B7's install-mode facts (os/arch/systemd/
@@ -520,7 +533,7 @@ exit 0
 /// already works, see the module doc). Parsing goes through the SAME
 /// [`crate::ipc::commands::parse_probe_output`] A1's own pairing probe uses — one
 /// parser, one struct (see that function's doc) — fed THIS module's own, extended
-/// [`PROBE_SCRIPT`]. A connection-level failure that is itself a host-key mismatch
+/// [`probe_script`]. A connection-level failure that is itself a host-key mismatch
 /// (the server was reimaged, or something is impersonating it, since [`install_key`]
 /// last pinned it) is classified as [`BootstrapError::HostKeyMismatch`] via
 /// [`askpass::is_host_key_mismatch`] BEFORE falling through to `parse_probe_output`'s
@@ -538,7 +551,7 @@ pub async fn probe(
     cmd.arg("-T");
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
-    cmd.arg(PROBE_SCRIPT);
+    cmd.arg(probe_script());
     let out = cmd
         .output()
         .await
