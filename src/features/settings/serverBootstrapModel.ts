@@ -185,7 +185,12 @@ export function headlineLabel(state: DiagnosisState): string {
     case "ready":
       return "Ready";
     case "needs_claude_install":
-      return "Claude Code is not installed";
+      // (B14 fix round 3 — minor) `needs_claude_install` also covers a PRESENT but
+      // broken `claude` binary (wrong arch/libc, a truncated download — see
+      // `collapse_state`'s own doc in orchestrator.rs, which folds both into this one
+      // state on purpose). "not installed" would be literally false for that case —
+      // this wording is accurate either way.
+      return "Claude Code isn't working on this server";
     case "needs_claude_sign_in":
       return "Needs Claude sign-in";
     case "running_not_reboot_safe":
@@ -228,7 +233,10 @@ export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
     out.push({
       action: "install_claude",
       title: "Install Claude Code",
-      reason: "Claude Code isn't installed on this server",
+      // (B14 fix round 3 — minor) `claude_installed !== true` also covers a PRESENT
+      // but broken binary (see `headlineLabel`'s own note above) — worded to be
+      // accurate for both, since `install_claude` (reinstalling) fixes either.
+      reason: "Claude Code isn't installed or isn't working on this server",
     });
   }
   if (d.installed_as === "user" && d.user_unit_missing_path === true) {

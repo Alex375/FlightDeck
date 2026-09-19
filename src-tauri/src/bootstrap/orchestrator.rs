@@ -114,7 +114,15 @@ use crate::store::{MachineRecord, Store};
 /// a remote shell that hangs after connecting (a stuck lock, a wedged `flightdeckd`) —
 /// without this, `machine_diagnose`/the pipeline's own `Diagnose` step/the RESTART
 /// RULE's busy check could hang the caller forever (B11 review finding).
-const SSH_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// `pub(crate)` (B14 fix round 3): [`crate::bootstrap::connect::probe`] and
+/// [`crate::ipc::commands::probe_remote`] reuse this SAME bound for their own
+/// `cmd.output()` round trips — a plain `claude --version`/`flightdeckd --version`
+/// probe script is the same shape of remote command this already guards, and a wedged
+/// shell there (e.g. the B14 broken-install check's own `claude --version`) must not
+/// hang `step_probe`/`repair`/the "Add a server" pairing flow any more than a wedged
+/// `diagnose` shell may hang this module's own callers.
+pub(crate) const SSH_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ============================================================================
 // Steps — ids, status, the generic (fake-step-testable) pipeline runner

@@ -554,6 +554,14 @@ pub(crate) fn probe_script() -> String {
 /// indistinguishable from an ordinary connection failure once the error is flattened
 /// to a `String` at the `#[tauri::command]` boundary, and a caller could never offer
 /// [`forget_host_key`] in response to it.
+///
+/// (B14 fix round 3 — major) Bounded by
+/// [`crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT`], the same guard
+/// `orchestrator::diagnose` already applies to its own `cmd.output()`: this function
+/// backs `step_probe` (the very first pipeline step after key install) and `repair`'s
+/// `ReuploadDaemon`/generic `InstallService` arms, so a wedged remote shell — including
+/// one stuck in the B14 broken-install check's own `"$CLAUDE_BIN" --version` — must not
+/// stall them forever either.
 pub async fn probe(
     target: &BootstrapTarget,
     identity_file: &str,
@@ -564,9 +572,9 @@ pub async fn probe(
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg(probe_script());
-    let out = cmd
-        .output()
+    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| BootstrapError::Timeout)?
         .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() && askpass::is_host_key_mismatch(&stderr) {

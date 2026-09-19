@@ -211,7 +211,9 @@ describe("headlineTone / headlineLabel", () => {
     expect(headlineLabel({ kind: "ready" })).toBe("Ready");
     // (B14) Distinct from needs_claude_sign_in — see collapse_state's own doc.
     expect(headlineTone({ kind: "needs_claude_install" })).toBe("attention");
-    expect(headlineLabel({ kind: "needs_claude_install" })).toBe("Claude Code is not installed");
+    // (B14 fix round 3) Worded to also be accurate for a PRESENT but broken binary —
+    // see `headlineLabel`'s own doc.
+    expect(headlineLabel({ kind: "needs_claude_install" })).toBe("Claude Code isn't working on this server");
     expect(headlineTone({ kind: "needs_claude_sign_in" })).toBe("attention");
     expect(headlineLabel({ kind: "needs_claude_sign_in" })).toBe("Needs Claude sign-in");
     expect(headlineTone({ kind: "running_not_reboot_safe" })).toBe("caution");

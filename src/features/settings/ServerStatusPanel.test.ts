@@ -146,7 +146,8 @@ describe("DiagnosisSummary — the 5 headline states", () => {
   // never routed through the sign-in flow (see `claudeNeedsSignIn`'s own doc).
   it("Claude Code is not installed — amber headline, offers Install Claude Code via repairSuggestionsFor", () => {
     mount(baseDiagnosis({ claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_install" } }));
-    expect(container.textContent).toContain("Claude Code is not installed");
+    // (B14 fix round 3) Worded to also be accurate for a PRESENT but broken binary.
+    expect(container.textContent).toContain("Claude Code isn't working on this server");
     expect(container.querySelector('[data-tone="attention"]')).not.toBeNull();
     expect(repairButtonTitles().some((t) => t.includes("Install Claude Code"))).toBe(true);
   });

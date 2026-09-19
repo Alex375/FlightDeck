@@ -3937,6 +3937,14 @@ pub(crate) fn probe_script() -> String {
     format!("CLAUDE_BIN={}\n{}", resolve_claude_bin_expr(), PROBE_SCRIPT_BODY)
 }
 
+/// (B14 fix round 3 — major) Bounded by
+/// [`crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT`] — the same guard
+/// `bootstrap::orchestrator::diagnose`/`bootstrap::connect::probe` already apply to
+/// their own `cmd.output()`, previously missing here. This backs the "Add a server"
+/// pairing flow's per-candidate probe loop (no outer timeout of its own) and
+/// [`daemon_version_for_machine`]'s cached lookup (which layers its own, shorter 12s
+/// timeout on top — both now stack harmlessly rather than the outer one being the
+/// ONLY thing standing between a wedged remote shell and a caller that hangs forever).
 async fn probe_remote(
     host: &str,
     port: u16,
@@ -3951,9 +3959,9 @@ async fn probe_remote(
     // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
     // with the old single-tool probe and for anyone reading raw ssh output by hand.
     cmd.arg(probe_script());
-    let out = cmd
-        .output()
+    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| "ssh command timed out".to_string())?
         .map_err(|e| format!("could not run ssh: {e}"))?;
     parse_probe_output(
         &String::from_utf8_lossy(&out.stdout),

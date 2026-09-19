@@ -716,15 +716,37 @@ async fn install_user_unit(machine: &MachineRecord, known_hosts: Option<&str>) -
 /// busy server reports itself, in the exact same words, as "won't restart" — never a
 /// silent success — instead of restarting). `sudo_password: None` is always correct
 /// here: the diagnosis that routes a call to this function already confirmed a
-/// User-level install, whose restart branch never needs one. Rewriting the unit FILE
-/// itself stays unconditional (a `cat > … && daemon-reload && enable --now` never
-/// touches the live process either way) — only the restart is gated, so a busy server
-/// still ends up with the CORRECTED unit on disk, ready for the very next retry (or the
-/// daemon's own next natural restart) to pick up.
+/// User-level install, whose restart branch never needs one.
+///
+/// (B14 fix round 3 — blocker) The unit-file rewrite must NOT run before the busy
+/// check: [`crate::bootstrap::orchestrator::ServerDiagnosis::user_unit_missing_path`] is
+/// computed by grepping the ON-DISK unit file (same disk-vs-live-process gap this
+/// function's own fix-round-2 doc above calls out for `systemctl show`), and it is the
+/// ONLY signal that (a) routes a repair call here at all
+/// ([`crate::bootstrap::orchestrator::install_service_repair_needs_path_fix`]) and (b)
+/// makes the front offer this repair action in the first place
+/// (`serverBootstrapModel.ts`'s `user_unit_missing_path === true` check). If
+/// [`install_user_unit`] ran first and the daemon turned out to be busy, it would
+/// permanently erase that signal — the on-disk unit is now correct, so the NEXT
+/// diagnose (the one the user's retry triggers) reports `user_unit_missing_path:
+/// false`, the repair suggestion disappears, and the live process is left stuck forever
+/// on its stale PATH-less environment with no way to retry through the app. So this now
+/// diagnoses FIRST and bails out — writing nothing — when busy, exactly like
+/// [`crate::bootstrap::orchestrator::restart_daemon`]'s own guard (duplicated here
+/// rather than reused, since that function's diagnose has to run again anyway right
+/// after the write to actually restart — see below). Only once confirmed idle does the
+/// unit file get rewritten; [`crate::bootstrap::orchestrator::restart_daemon`] is then
+/// still called normally afterward (its own fresh diagnose is the authoritative,
+/// race-free check right before the restart itself — this upfront one is only to avoid
+/// writing at all when a busy daemon makes the write pointless and destructive).
 pub(crate) async fn repair_user_unit_path(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
 ) -> Result<ServiceOutcome, BootstrapError> {
+    let pre_check = crate::bootstrap::orchestrator::diagnose(machine, known_hosts).await;
+    if pre_check.busy_conversations != Some(0) {
+        return Err(BootstrapError::DaemonBusy(pre_check.busy_conversations));
+    }
     install_user_unit(machine, known_hosts).await?;
     crate::bootstrap::orchestrator::restart_daemon(machine, known_hosts, None).await?;
     verify_daemon_running(machine, known_hosts, Some(UnitScope::User)).await?;
