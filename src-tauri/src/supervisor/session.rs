@@ -1317,6 +1317,12 @@ struct SessionCore {
     id: String,
     emitter: Arc<dyn SessionEmitter>,
     assembler: Assembler,
+    /// Whether a user message was written to the CURRENT outbound link (reset when a
+    /// reconnect swaps the link in — see [`Self::set_outbound`]). Read by
+    /// [`Self::sync_remote_busy`]: a message written on this same link is ordered
+    /// AFTER the daemon's `fd_attach` on the pipe, so the attach's `busy: false`
+    /// predates it and says nothing about it being lost.
+    sent_on_current_link: bool,
     /// Inbound permission prompts keyed by their `request_id`.
     pending: HashMap<String, PendingPermission>,
     /// Our OUTBOUND control requests awaiting their ack, keyed by `request_id`, so
@@ -1387,6 +1393,7 @@ impl SessionCore {
             next_req: 0,
             outbound,
             appmcp,
+            sent_on_current_link: false,
         }
     }
 
@@ -1395,6 +1402,7 @@ impl SessionCore {
     /// the pipe changes.
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
+        self.sent_on_current_link = false;
     }
 
     /// The claude session id the assembler learned from `system/init`, if any.
@@ -1406,7 +1414,16 @@ impl SessionCore {
     /// with ours. Our busy flag is optimistic (set on send) — a message that
     /// died in a dead link leaves it stuck `true` forever, since the turn it
     /// announced never runs. The daemon KNOWS whether a turn is running.
+    ///
+    /// Not when the busy flag comes from a message written on THIS link: the daemon
+    /// sends `fd_attach` first and only then reads what we wrote, so its `busy:
+    /// false` is simply older than our message (found on the first real remote
+    /// conversation, 19/09: the very first message of a fresh conversation always
+    /// flashed "The server has no turn running…" half a second before its turn ran).
     fn sync_remote_busy(&mut self, daemon_busy: bool) {
+        if !daemon_busy && self.sent_on_current_link {
+            return;
+        }
         if self.assembler.state().busy != daemon_busy {
             if !daemon_busy {
                 self.emit_error_notice(
@@ -1938,6 +1955,7 @@ impl SessionCore {
                     &uuid,
                 )) {
                     self.assembler.note_sent_user_message(&uuid);
+                    self.sent_on_current_link = true;
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
                 } else {
@@ -2238,6 +2256,40 @@ mod tests {
             None,
         );
         (core, event_rx, out_rx)
+    }
+
+    fn lost_message_notices(events: &mut mpsc::UnboundedReceiver<SessionEvent>) -> usize {
+        drain(events)
+            .into_iter()
+            .filter(|e| format!("{e:?}").contains("has no turn running"))
+            .count()
+    }
+
+    /// First real remote conversation (19/09): the first message of a fresh
+    /// conversation is written on the same link, right behind the daemon's
+    /// `fd_attach{busy:false}` — not a lost message.
+    #[test]
+    fn a_message_sent_on_the_current_link_is_not_reported_lost_by_the_attach() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        drain(&mut events);
+        core.sync_remote_busy(false);
+        assert_eq!(lost_message_notices(&mut events), 0);
+        assert!(core.assembler.state().busy, "the turn is still expected");
+    }
+
+    /// The case the notice exists for: a message written on a link that then died,
+    /// reattached (new link) to a daemon with no turn running.
+    #[test]
+    fn a_message_sent_before_a_reconnect_is_reported_lost_when_the_daemon_is_idle() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+        core.set_outbound(new_tx);
+        drain(&mut events);
+        core.sync_remote_busy(false);
+        assert_eq!(lost_message_notices(&mut events), 1);
+        assert!(!core.assembler.state().busy);
     }
 
     /// Find the first outbound control_request with the given subtype.
