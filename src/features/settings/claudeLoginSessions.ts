@@ -54,12 +54,12 @@ export const useClaudeLoginSessions = create<ClaudeLoginSessionsState>((set) => 
 
 // Wired ONCE regardless of how many `ClaudeSignInInline` instances mount/unmount over
 // the app's lifetime — mirrors `termManager`'s "the session lives outside React, only
-// its STATE is rendered by components" discipline. A `ServerLoginResultEvent` is the
-// ONLY thing that can clear `active` from OUTSIDE the surface that set it (a same-
-// caller Cancel clears it locally instead — see `ClaudeSignInInline`'s own cleanup): it
-// fires for every terminal outcome that isn't a same-caller cancel (done, failed, AND
-// superseded — see `run_login_actor`'s doc), so this never gets stuck true after a
-// session it didn't start itself ends.
+// its STATE is rendered by components" discipline. A `ServerLoginResultEvent` clears
+// `active` from OUTSIDE the surface that set it (a same-caller Cancel also clears it
+// locally, redundantly but harmlessly — see `ClaudeSignInInline`'s own cleanup): it
+// now fires for EVERY terminal outcome, cancelled included (residual defect A8/R1 —
+// see `run_login_actor`'s doc), so this never gets stuck true after a session it
+// didn't start itself ends, however that session ended.
 let wired = false;
 export function ensureClaudeLoginSessionsWired(): void {
   if (wired) return;

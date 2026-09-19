@@ -17,12 +17,12 @@
 // the same server used to silently kill the first, with zero UI feedback. Only the
 // explicit "Restart sign-in" button (`restart()`, shown once a session is in flight)
 // replaces one, via `restart_claude_login` — the session it replaces is told via a
-// `ServerLoginResultEvent{ok:false, error:"superseded…"}`, rendered here exactly like
-// any other failed result. `claudeLoginSessions.ts`'s shared `active` flag (set the
-// instant `start`/`restart` succeeds here, cleared on a same-caller Cancel/unmount OR
-// on ANY `ServerLoginResultEvent` for this machine) is what lets a SECOND surface
-// (`ServerStatusPanel`) show "Sign-in in progress…" instead of its own Start button
-// before ever needing to call `start()` itself.
+// `ServerLoginResultEvent{ok:false, reason:"superseded", error:"superseded…"}`,
+// rendered here exactly like any other failed result. `claudeLoginSessions.ts`'s
+// shared `active` flag (set the instant `start`/`restart` succeeds here, cleared on a
+// same-caller Cancel/unmount OR on ANY `ServerLoginResultEvent` for this machine) is
+// what lets a SECOND surface (`ServerStatusPanel`) show "Sign-in in progress…" instead
+// of its own Start button before ever needing to call `start()` itself.
 //
 // ⚠️ Ownership (follow-up review of B-finding #4): ATTACHING to a session you did not
 // start is not the same as OWNING it. `LoginSession.owned` (`false` on attach, `true`
@@ -35,6 +35,31 @@
 // other surface watching it, reproducing the exact "silently killed, zero UI feedback"
 // bug class the single-flight fix was meant to close, just via teardown instead of a
 // competing Start.
+//
+// ⚠️ Residual defect A8/R1 (counter-verification of the fix above, CRM `1abfc028`):
+// gating on `ownsSessionRef` alone closed the ATTACHED→owner direction, but not the
+// reverse — when the OWNER itself cancels/unmounts, the backend used to stay
+// completely silent about it (`LoginOutcome::Cancelled` emitted nothing), so a still-
+// ATTACHED sibling watching the same session was left showing a dead session forever,
+// reproducing the exact same bug class from the other side. The backend now emits a
+// terminal `ServerLoginResultEvent{reason:"cancelled"}` for EVERY cancel, owner
+// included — `selfCancelledSessionIdRef` below is what lets the OWNER's Cancel click
+// recognize and ignore its own echo of that event (it already knows: it just called
+// `cancelClaudeLogin`), while every OTHER surface attached to that session_id treats
+// the same event as the "stop showing a dead session" signal it never got before: it
+// exits its waiting/code-entry view for a neutral "cancelled elsewhere" message and
+// offers Start again, exactly like a genuine failure would, just without the alarming
+// "Sign-in failed" wording. The unmount cleanup below does NOT set the ref (it can't
+// matter — see its own comment), so unmounting stays a purely local detach that leaves
+// the backend's belated event for some later instance to receive normally.
+//
+// ⚠️ Re-attach race (test-honesty residual defect, CRM `1abfc028`, counter-
+// verification of the fix above): `start()`/`restart()` clear `selfCancelledSessionIdRef`
+// before their IPC call — a quick owner Cancel-then-Start can reattach to the exact
+// same (still dying) `session_id` `attach_or_reserve` hasn't finished tearing down yet,
+// and without this reset the OLD cancel's stale ref would wrongly swallow the belated
+// `cancelled` event as if it were still an echo of that old intent, leaving THIS
+// (re-)attached view stuck on "Waiting for the sign-in link…" forever.
 //
 // ⚠️ Stale-event filtering (same follow-up review): both listeners below ignore an
 // event whose `session_id` doesn't match the session THIS instance currently tracks
@@ -49,7 +74,7 @@
 // superseded…".
 import { useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { commands, events, type LoginSession } from "../../ipc/client";
+import { commands, events, type LoginResultReason, type LoginSession } from "../../ipc/client";
 import { ensureClaudeLoginSessionsWired, useClaudeLoginSessions } from "./claudeLoginSessions";
 import { isTrustedSignInUrl } from "./serverBootstrapModel";
 import styles from "./SettingsPanel.module.css";
@@ -71,7 +96,9 @@ export function ClaudeSignInInline({
   const [restarting, setRestarting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{ ok: boolean; email: string | null; error: string | null } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; email: string | null; error: string | null; reason: LoginResultReason | null } | null>(
+    null,
+  );
 
   // Tracks the live session for the unmount-only cleanup effect below (which can't
   // close over `session` directly without re-subscribing on every change) AND for the
@@ -86,6 +113,19 @@ export function ClaudeSignInInline({
   // doc and the module doc above. Only an owner's Cancel/unmount may actually tear the
   // session down.
   const ownsSessionRef = useRef(false);
+
+  // The session_id THIS instance's own Cancel click just cancelled, if any — see the
+  // module doc's "residual defect A8/R1" note. Only ever set by the OWNER's `cancel()`
+  // below (an attached instance's own Cancel/unmount is a local-only detach that never
+  // sends `cancelClaudeLogin` at all, so it never produces a backend event to ignore in
+  // the first place; the unmount cleanup below doesn't set it either — see its own
+  // comment for why that would be inert). Cleared the instant the matching `cancelled`
+  // result event is recognized and ignored below, AND at the top of `start()`/
+  // `restart()` (test-honesty residual defect, CRM `1abfc028`): `attach_or_reserve`
+  // can hand a fresh `start()` call the SAME `session_id` a just-cancelled owner is
+  // still tearing down, so without this second clear a belated echo of THAT old cancel
+  // would wrongly swallow live information about the newly (re-)attached session.
+  const selfCancelledSessionIdRef = useRef<string | null>(null);
 
   // The shared "is a sign-in live for this machine" flag other surfaces read (see
   // `claudeLoginSessions.ts`'s own doc) — wiring is idempotent, so every mounted
@@ -108,9 +148,18 @@ export function ClaudeSignInInline({
     const unResult = events.serverLoginResultEvent.listen((e) => {
       if (disposed || e.payload.machine_id !== machineId) return;
       if (sessionRef.current && sessionRef.current.session_id !== e.payload.session_id) return;
+      // This instance is the one that INITIATED this exact cancel (Cancel click or
+      // unmount, gated on `ownsSessionRef` there — see the module doc's "residual
+      // defect A8/R1" note): it already knows, and already reset its own view
+      // synchronously when it acted — rendering this echo as a failure would put the
+      // very bug class this fix closes right back, just from the opposite direction.
+      if (e.payload.reason === "cancelled" && selfCancelledSessionIdRef.current === e.payload.session_id) {
+        selfCancelledSessionIdRef.current = null;
+        return;
+      }
       setSession(null);
       setUrl(null);
-      setResult({ ok: e.payload.ok, email: e.payload.email, error: e.payload.error });
+      setResult({ ok: e.payload.ok, email: e.payload.email, error: e.payload.error, reason: e.payload.reason });
       ownsSessionRef.current = false;
       if (e.payload.ok) onSignedIn?.(e.payload.email);
     });
@@ -125,15 +174,18 @@ export function ClaudeSignInInline({
   // Unmount: cancel any session still in flight rather than leaving it dangling —
   // mirrors the wizard's own cancel discipline. Intentionally the ONLY place this
   // fires (empty deps), reading the live values through the refs above. Also clears
-  // the shared `active` flag: a same-caller Cancel (this IS one — the actor's own
-  // `Cancel` handling stays silent, see `run_login_actor`'s doc) is the one case
-  // nothing else will ever clear it for us, since no `ServerLoginResultEvent` follows.
+  // the shared `active` flag locally rather than waiting on the backend's own
+  // `ServerLoginResultEvent` for this cancel — this component is about to be gone, so
+  // it cannot react to that event even though the backend now does emit one for it
+  // (residual defect A8/R1, see the module doc). Unlike `cancel()` below, this does
+  // NOT set `selfCancelledSessionIdRef`: the listener effect that reads it tears
+  // itself down (sets `disposed = true`) in this SAME unmount commit, with no
+  // async gap in between, so no event could ever reach it after such a write —
+  // setting it here would be dead code implying an echo-suppression that can't run.
   //
   // ⚠️ Gated on `ownsSessionRef` (see the module doc): an instance that merely
   // ATTACHED to another surface's session must NOT cancel it or clear the shared flag
-  // on unmount — that would silently kill the session for whoever still owns it, with
-  // no `ServerLoginResultEvent` to tell them (the actor's `Cancel` handling is silent
-  // by design, on the assumption only the true owner ever sends it).
+  // on unmount — that would silently kill the session for whoever still owns it.
   useEffect(() => {
     return () => {
       if (sessionRef.current && ownsSessionRef.current) {
@@ -145,6 +197,16 @@ export function ClaudeSignInInline({
   }, []);
 
   const start = useCallback(async () => {
+    // Clear any earlier "ignore my own cancel echo" intent before establishing a
+    // fresh session view (residual defect, CRM `1abfc028`, counter-verification of
+    // the A8/R1 fix): `attach_or_reserve` can hand back the SAME (still dying)
+    // `session_id` a just-cancelled owner cancelled moments ago, if the backend
+    // actor hasn't finished tearing it down yet. Without this reset, a belated
+    // `Cancelled` event for that reused id would still match the stale ref and get
+    // silently swallowed here — even though it is now live information about THIS
+    // (re-)attached view, not an echo of the prior cancel — leaving the instance
+    // stuck on "Waiting for the sign-in link…" forever.
+    selfCancelledSessionIdRef.current = null;
     setStarting(true);
     setError(null);
     setResult(null);
@@ -165,6 +227,8 @@ export function ClaudeSignInInline({
   // module doc). Offered once a session is already in flight (waiting for the URL or
   // entering a code), for the rare case that flow is stuck.
   const restart = useCallback(async () => {
+    // Same reset as `start()` above, for the same reason — see its comment.
+    selfCancelledSessionIdRef.current = null;
     setRestarting(true);
     setError(null);
     setResult(null);
@@ -217,9 +281,15 @@ export function ClaudeSignInInline({
     // own view without touching the backend session or the shared `active` flag,
     // leaving both alone for whoever still owns it.
     if (session && ownsSessionRef.current) {
+      // Recorded BEFORE the IPC call resolves, since the backend's own terminal event
+      // for it can arrive while this instance is still mounted (see the module doc's
+      // "residual defect A8/R1" note) — the result listener needs it to recognize and
+      // ignore that echo.
+      selfCancelledSessionIdRef.current = session.session_id;
       void commands.cancelClaudeLogin(session);
-      // A same-caller Cancel — the backend stays silent on it (see the module doc), so
-      // this is the only place that will ever clear the shared flag for it.
+      // A same-caller Cancel also clears the shared flag locally — the backend's own
+      // terminal event for it would clear it too (redundantly, harmlessly) once it
+      // arrives, but this instance need not wait for that round trip.
       useClaudeLoginSessions.getState().setActive(machineId, false);
     }
     setSession(null);
@@ -230,15 +300,23 @@ export function ClaudeSignInInline({
   }, [session, machineId]);
 
   if (result) {
+    // A `cancelled` result reaching this render is, by construction, never the surface
+    // that initiated it (that surface recognizes and ignores its own echo before ever
+    // calling `setResult` — see the listener above) — always some OTHER, still-
+    // attached surface finding out its session just ended elsewhere. Neutral wording,
+    // not "Sign-in failed": nothing actually failed.
+    const cancelledElsewhere = result.reason === "cancelled";
     return (
       <div className={styles.remoteStep}>
         {result.ok ? (
           <>Signed in{result.email ? ` as ${result.email}` : ""}.</>
+        ) : cancelledElsewhere ? (
+          <>Sign-in was cancelled from another panel.</>
         ) : (
           <span className={styles.dangerText}>Sign-in failed{result.error ? `: ${result.error}` : ""}.</span>
         )}{" "}
         <button type="button" className={`${styles.btn} ${styles.ghost}`} onClick={() => void start()}>
-          {result.ok ? "Sign in again" : "Try again"}
+          {result.ok ? "Sign in again" : cancelledElsewhere ? "Start again" : "Try again"}
         </button>
       </div>
     );

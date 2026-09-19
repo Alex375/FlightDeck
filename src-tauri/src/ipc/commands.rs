@@ -3611,11 +3611,19 @@ pub(crate) fn version_at_least(v: &str, min: &str) -> bool {
 /// before this struct grew them. Only [`bootstrap::connect::probe`]'s own, EXTENDED
 /// script populates them.
 ///
-/// `Serialize`/`Type` (B7): [`bootstrap::connect::bootstrap_probe`] returns this
-/// directly across the Tauri IPC boundary — [`add_machine`]'s own use never needed
-/// this before, since it only ever consumed a `RemoteProbeResult` internally and
-/// returned a [`MachineRecord`] instead.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+/// Never crosses the Tauri IPC boundary today (stale doc fix, residual defect A8/R3,
+/// CRM `1abfc028`): [`bootstrap::connect::probe`] and [`probe_remote`] are both plain
+/// internal `async fn`s, not `#[tauri::command]`s — called only from within
+/// `bootstrap::orchestrator` (its pipeline's `step_probe` AND its `repair()` flow's
+/// `ReuploadDaemon`/`InstallService` actions) and from [`add_machine`] respectively,
+/// neither exposed to the frontend, and [`add_machine`] itself returns an
+/// [`AddMachineOutcome`], never this struct directly. `Serialize`/`Deserialize`/`Type`
+/// were dropped for exactly that reason (previously justified by a `bootstrap_probe`
+/// Tauri command that was removed by the signin-and-hygiene merge, leaving this doc
+/// pointing at a symbol that no longer exists) — nothing serializes or exports this
+/// type today; re-add them (with a fresh justification) if a future command starts
+/// returning it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteProbeResult {
     pub claude_version: Option<String>,
     pub claude_missing: bool,

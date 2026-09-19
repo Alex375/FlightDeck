@@ -59,7 +59,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::bootstrap::askpass::BootstrapError;
 use crate::ipc::commands::{keyed_ssh_options, run_ssh_on_machine};
-use crate::ipc::events::{ServerLoginPromptEvent, ServerLoginResultEvent};
+use crate::ipc::events::{LoginResultReason, ServerLoginPromptEvent, ServerLoginResultEvent};
 use crate::store::{MachineRecord, Store};
 
 // ============================================================================
@@ -518,13 +518,14 @@ enum DriverCommand {
     SubmitCode(String),
     Cancel,
     /// An explicit "Restart sign-in" ([`restart_claude_login`]) superseded this
-    /// session — distinct from `Cancel` so [`run_login_actor`] can tell the two apart:
-    /// a same-caller `Cancel` stays silent (see its own doc), but a supersession must
-    /// tell the REPLACED surface (`ServerLoginResultEvent{ok:false, error:"superseded
-    /// …"}`), since that surface did not itself initiate the cancellation and would
-    /// otherwise be left waiting forever with no signal anything happened (B-finding
-    /// #4: this is exactly what "starting a second sign-in silently kills the first"
-    /// used to do for EVERY new start, not just an explicit restart).
+    /// session — distinct from `Cancel` so [`run_login_actor`] can tell the two apart
+    /// and emit the right [`crate::ipc::events::LoginResultReason`]
+    /// (`Superseded` vs `Cancelled`) — both are terminal events now (residual defect
+    /// A8/R1), but the two must stay distinguishable: a `Cancelled` for a session's own
+    /// initiating surface is one it should recognize and ignore, while `Superseded`
+    /// never has an "initiating surface" to begin with (B-finding #4: this is exactly
+    /// what "starting a second sign-in silently kills the first" used to do for EVERY
+    /// new start, not just an explicit restart).
     Supersede,
 }
 
@@ -591,9 +592,12 @@ enum AttachOutcome {
 /// and the status panel's own action) must never silently orphan whichever one got
 /// there first. Only an explicit "Restart sign-in" ([`restart_claude_login`])
 /// supersedes — via [`Self::supersede_and_insert`] — and the replaced session is told
-/// (`ServerLoginResultEvent{ok:false, error:"superseded…"}`, via `DriverCommand::
-/// Supersede` rather than `Cancel`), unlike a same-caller `Cancel`, which stays silent
-/// (the caller who cancelled already knows).
+/// (`ServerLoginResultEvent{ok:false, reason:Superseded, error:"superseded…"}`, via
+/// `DriverCommand::Supersede` rather than `Cancel`). A same-caller `Cancel` gets the
+/// SAME terminal-event treatment (`reason:Cancelled`) since residual defect A8/R1 (CRM
+/// `1abfc028`) — see [`run_login_actor`]'s own doc: an attached, non-owning surface can
+/// be watching the very session a `Cancel` just ended, and it needs the exact signal
+/// `Superseded` already provided.
 #[derive(Default)]
 pub struct LoginSessions {
     inner: Mutex<HashMap<String, ActiveLoginSession>>,
@@ -694,9 +698,18 @@ impl LoginSessions {
 
 /// Emit [`ServerLoginResultEvent`], logging (never swallowing) a failed emit — mirrors
 /// `ipc::events::emit_logged`'s discipline for every OTHER terminal event in the crate.
-fn emit_result(app: &tauri::AppHandle, session_id: &str, machine_id: &str, ok: bool, email: Option<String>, error: Option<String>) {
+fn emit_result(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    machine_id: &str,
+    ok: bool,
+    email: Option<String>,
+    error: Option<String>,
+    reason: Option<LoginResultReason>,
+) {
     use tauri_specta::Event;
-    let ev = ServerLoginResultEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), ok, email, error };
+    let ev =
+        ServerLoginResultEvent { session_id: session_id.to_string(), machine_id: machine_id.to_string(), ok, email, error, reason };
     if let Err(e) = ev.emit(app) {
         eprintln!("[bootstrap] failed to emit server_login_result event: {e}");
     }
@@ -921,19 +934,44 @@ async fn drive_claude_login(
     }
 }
 
+/// Pure mapping from a terminal [`LoginOutcome`] to the `(ok, email, error, reason)`
+/// fields [`run_login_actor`] emits as a [`ServerLoginResultEvent`] — factored out so
+/// "does every outcome variant produce a well-formed, correctly-typed event" is
+/// unit-testable without a `tauri::AppHandle` (the actor's own Tauri plumbing is
+/// otherwise untestable, same split as [`drive_claude_login`] itself).
+///
+/// ⚠️ Residual defect A8/R1 (CRM `1abfc028`, counter-verification of the single-flight
+/// sign-in fix wave): `Cancelled` used to map to nothing at all — [`run_login_actor`]'s
+/// old doc called a same-caller `Cancel` "SILENT by design", true only while a session
+/// had exactly one possible watcher. Once [`LoginSessions::attach_or_reserve`] let a
+/// second, non-owning surface watch the SAME session, that stopped holding: an attached
+/// surface left watching after the owner cancels/unmounts got zero signal, stuck
+/// showing a dead session forever — reproducing the exact bug class the single-flight
+/// fix was written to close, just via teardown instead of a competing Start. Every
+/// variant now maps to a `Some` reason and IS emitted — the front end (not this
+/// mapping) is what decides whether the surface that itself initiated a `Cancelled`
+/// should render it (see `ClaudeSignInInline`'s own doc for that split).
+fn login_result_fields(outcome: LoginOutcome) -> (bool, Option<String>, Option<String>, Option<LoginResultReason>) {
+    match outcome {
+        LoginOutcome::Done { email } => (true, email, None, None),
+        LoginOutcome::Failed { reason } => (false, None, Some(reason), Some(LoginResultReason::Failed)),
+        LoginOutcome::Cancelled => (false, None, Some("cancelled".to_string()), Some(LoginResultReason::Cancelled)),
+        LoginOutcome::Superseded => (
+            false,
+            None,
+            Some("superseded by another sign-in for this server".to_string()),
+            Some(LoginResultReason::Superseded),
+        ),
+    }
+}
+
 /// The Tauri-aware shell around [`drive_claude_login`]: wires its `on_url` callback to
 /// an emitted [`ServerLoginPromptEvent`] (and records it into `last_url`, so a
 /// late-joining second surface can be told immediately — see [`LoginSessions::
-/// attach_or_reserve`]), turns its [`LoginOutcome`] into at most one
-/// [`ServerLoginResultEvent`], and removes this session from `sessions` on every exit
-/// path.
-///
-/// A same-caller `Cancel` is SILENT by design: the caller who cancelled already knows,
-/// and this is not a failure the user needs surfaced as one (mirrors `accounts::
-/// login_cancel`, which likewise reports nothing back beyond the command's own
-/// `Ok(())`). A `Supersede` (an explicit "Restart sign-in" elsewhere) is NOT silent —
-/// the replaced surface did not initiate it and would otherwise be left waiting forever
-/// with no signal anything happened (B-finding #4).
+/// attach_or_reserve`]), turns its [`LoginOutcome`] into EXACTLY one
+/// [`ServerLoginResultEvent`] via [`login_result_fields`] (every variant, `Cancelled`
+/// included — see that function's own doc for why that changed), and removes this
+/// session from `sessions` on every exit path.
 async fn run_login_actor(
     app: tauri::AppHandle,
     sessions: std::sync::Arc<LoginSessions>,
@@ -950,19 +988,8 @@ async fn run_login_actor(
     .await;
 
     sessions.finish(&session_id).await;
-    match outcome {
-        LoginOutcome::Done { email } => emit_result(&app, &session_id, &machine.id, true, email, None),
-        LoginOutcome::Failed { reason } => emit_result(&app, &session_id, &machine.id, false, None, Some(reason)),
-        LoginOutcome::Cancelled => {}
-        LoginOutcome::Superseded => emit_result(
-            &app,
-            &session_id,
-            &machine.id,
-            false,
-            None,
-            Some("superseded by another sign-in for this server".to_string()),
-        ),
-    }
+    let (ok, email, error, reason) = login_result_fields(outcome);
+    emit_result(&app, &session_id, &machine.id, ok, email, error, reason);
 }
 
 /// Resolve a machine's dedicated `known_hosts` path, mirroring `add_machine`'s own
@@ -1035,9 +1062,12 @@ pub async fn start_claude_login(
 /// Explicitly REPLACE any live sign-in session for `machine_id` with a fresh one — the
 /// only thing in this module that supersedes rather than attaches (see
 /// [`LoginSessions`]'s own doc). The replaced session, if any, is told via a
-/// [`ServerLoginResultEvent`] (`ok:false`, a "superseded" reason) — unlike
-/// [`cancel_claude_login`] on a session the SAME caller started, which stays silent on
-/// purpose. Used by the "Restart sign-in" action once a sign-in is already in flight.
+/// [`ServerLoginResultEvent`] (`ok:false`, `reason:Superseded`) — [`cancel_claude_login`]
+/// on a session the SAME caller started gets the same terminal-event treatment now
+/// (`reason:Cancelled`, since residual defect A8/R1), but that caller is expected to
+/// recognize and ignore its own echo, whereas a superseded surface never initiated
+/// anything and must always see this as new information. Used by the "Restart sign-in"
+/// action once a sign-in is already in flight.
 #[tauri::command]
 #[specta::specta]
 pub async fn restart_claude_login(
@@ -1097,7 +1127,12 @@ pub async fn submit_claude_login_code(
 
 /// Cancel an in-flight [`start_claude_login`] session — kills the remote process. Safe
 /// (a harmless no-op, not an error surfaced to the user) when the session already
-/// finished on its own.
+/// finished on its own. The actor still emits a terminal [`ServerLoginResultEvent`]
+/// (`reason:Cancelled`) for this session (residual defect A8/R1) — this command itself
+/// never surfaces that as an `Err` to ITS caller, who is expected to already know it
+/// asked for this and to ignore that event when it arrives (see `ClaudeSignInInline`'s
+/// own doc); an attached, non-owning surface still watching the same session gets the
+/// signal it never used to.
 #[tauri::command]
 #[specta::specta]
 pub async fn cancel_claude_login(
@@ -2118,8 +2153,9 @@ mod tests {
     /// B-finding #4's `Supersede` sibling of the test above: an explicit "Restart
     /// sign-in" arriving mid-drive must resolve as `LoginOutcome::Superseded`, NOT
     /// `Cancelled` — the two must stay distinguishable end to end (`run_login_actor`
-    /// only emits a `ServerLoginResultEvent` for the former), never just at the
-    /// `DriverCommand` enum level.
+    /// now emits a `ServerLoginResultEvent` for BOTH, via `login_result_fields`, but
+    /// with a different `reason` — see that function's own test coverage), never just
+    /// at the `DriverCommand` enum level.
     #[tokio::test]
     #[ignore = "needs Docker (colima start)"]
     async fn live_claude_login_supersede_resolves_as_superseded_not_cancelled() {
@@ -2157,5 +2193,48 @@ mod tests {
             Ok(other) => panic!("expected Superseded once the URL was seen, got {other:?}"),
             Err(_) => panic!("drive_claude_login did not reach UrlReady within the test's own 20s bound"),
         }
+    }
+
+    // ---- login_result_fields — residual defect A8/R1 (CRM 1abfc028): Cancelled must
+    // now emit a typed event too, and stay distinguishable from Superseded ----
+
+    #[test]
+    fn login_result_fields_cancelled_now_emits_a_typed_event_exactly_once() {
+        let (ok, email, error, reason) = login_result_fields(LoginOutcome::Cancelled);
+        assert!(!ok);
+        assert_eq!(email, None);
+        assert_eq!(reason, Some(LoginResultReason::Cancelled), "Cancelled must no longer map to a silent, no-op result");
+        assert!(error.is_some(), "a human-readable error string must still ride along for display");
+    }
+
+    #[test]
+    fn login_result_fields_superseded_stays_distinct_from_cancelled() {
+        let (cancelled_ok, _, cancelled_error, cancelled_reason) = login_result_fields(LoginOutcome::Cancelled);
+        let (superseded_ok, _, superseded_error, superseded_reason) = login_result_fields(LoginOutcome::Superseded);
+        assert!(!cancelled_ok && !superseded_ok);
+        assert_ne!(
+            cancelled_reason, superseded_reason,
+            "the two terminal-but-not-a-failure outcomes must carry different typed reasons"
+        );
+        assert_eq!(superseded_reason, Some(LoginResultReason::Superseded));
+        assert_ne!(cancelled_error, superseded_error, "their display text must also stay distinguishable");
+    }
+
+    #[test]
+    fn login_result_fields_done_carries_no_reason() {
+        let (ok, email, error, reason) = login_result_fields(LoginOutcome::Done { email: Some("a@b.com".to_string()) });
+        assert!(ok);
+        assert_eq!(email, Some("a@b.com".to_string()));
+        assert_eq!(error, None);
+        assert_eq!(reason, None, "a successful sign-in has nothing to discriminate");
+    }
+
+    #[test]
+    fn login_result_fields_failed_carries_the_failure_reason_and_message() {
+        let (ok, email, error, reason) = login_result_fields(LoginOutcome::Failed { reason: "boom".to_string() });
+        assert!(!ok);
+        assert_eq!(email, None);
+        assert_eq!(error, Some("boom".to_string()));
+        assert_eq!(reason, Some(LoginResultReason::Failed));
     }
 }

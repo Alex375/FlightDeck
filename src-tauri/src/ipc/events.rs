@@ -301,10 +301,42 @@ pub struct ServerLoginPromptEvent {
     pub url: String,
 }
 
+/// Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
+/// ever having to match on `error`'s wording (free-text, display-only). `None` on a
+/// successful sign-in (`ok: true`) — there is nothing to discriminate there.
+///
+/// Added for residual defect A8/R1 (CRM `1abfc028`, counter-verification of the
+/// single-flight sign-in fix wave): `Cancelled` used to be the one [`LoginOutcome`]
+/// that emitted NO event at all, on the assumption "the caller who cancelled already
+/// knows" — true only while a session had exactly one caller. Once `attach_or_reserve`
+/// let a second, non-owning surface watch the SAME session, that assumption broke: an
+/// attached surface left watching after the OWNER cancels/unmounts needs the same
+/// terminal signal `Superseded` already gets. `Cancelled` is now ALWAYS emitted too —
+/// this discriminant is what lets the surface that INITIATED the cancel recognize and
+/// ignore its own echo (it already knows), while every other attached surface treats it
+/// as the "stop showing a dead session" signal it never got before. See
+/// `ClaudeSignInInline`'s own doc for the front-end split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginResultReason {
+    /// A `DriverCommand::Cancel` reached the actor — either the owning caller's own
+    /// Cancel/unmount, or (going forward) anything else that ever sends one.
+    Cancelled,
+    /// An explicit "Restart sign-in" ([`crate::bootstrap::server_setup::
+    /// restart_claude_login`]) replaced this session before it reached a terminal
+    /// state.
+    Superseded,
+    /// The sign-in itself failed (wrong code, lost connection, timed out, …) — `error`
+    /// carries the human-readable detail.
+    Failed,
+}
+
 /// Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
-/// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error` set
-/// otherwise. NEVER emitted for a session the front itself cancelled (see
-/// `run_login_actor`'s doc) — a cancel is not a failure the user needs surfaced as one.
+/// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error`/`reason`
+/// set otherwise. Emitted for EVERY terminal [`LoginOutcome`] now, `Cancelled` included
+/// (see [`LoginResultReason`]'s own doc for why that changed) — a listener that
+/// initiated the cancel itself is expected to recognize `reason: "cancelled"` for ITS
+/// OWN session and render nothing for it, not have the backend stay silent.
 ///
 /// ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
 /// has no way to distinguish this session's OWN terminal event from a stale one
@@ -318,14 +350,17 @@ pub struct ServerLoginResultEvent {
     pub ok: bool,
     pub email: Option<String>,
     pub error: Option<String>,
+    pub reason: Option<LoginResultReason>,
 }
 
 /// `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
-/// `bootstrap_install_key` returns `Ok` (`Installed` or `AlreadyPresent`) — never on
-/// any `Err`, even one (like a wrong password) that still pinned a fresh host key at
-/// the transport layer; see `bootstrap::connect::bootstrap_install_key`'s own doc for
-/// why the emit is gated on the overall `Result`, not on "some fingerprint happens to
-/// be readable". DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+/// `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
+/// never on any `Err`, even one (like a wrong password) that still pinned a fresh host
+/// key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
+/// pipeline step that is the only caller of
+/// [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
+/// on the overall `Result`, not on "some fingerprint happens to be readable".
+/// DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
 /// confirmation step gating on this event, it never blocks the flow. `known` = the
 /// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
 /// this particular connection attempt — `false` only on a server's genuine first

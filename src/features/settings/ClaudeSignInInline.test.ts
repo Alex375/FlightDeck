@@ -158,7 +158,7 @@ describe("ClaudeSignInInline — single-flight (B-finding #4)", () => {
     expect(useClaudeLoginSessions.getState().active.m1).toBe(true);
   });
 
-  it("a same-caller Cancel clears the shared active flag locally, with no backend event needed", async () => {
+  it("a same-caller Cancel clears the shared active flag locally, without waiting for the backend's own event", async () => {
     startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: true } });
     mount();
     click("Start Claude sign-in");
@@ -168,6 +168,17 @@ describe("ClaudeSignInInline — single-flight (B-finding #4)", () => {
     click("Cancel");
     expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "s1", machine_id: "m1", owned: true });
     expect(useClaudeLoginSessions.getState().active.m1).toBe(false);
+
+    // The backend now DOES emit a terminal event for this cancel too (residual defect
+    // A8/R1) — the owner's own belated echo of its own cancel must render NOTHING when
+    // it arrives (see the dedicated describe block below for the full spec).
+    act(() =>
+      serverLoginResultEvent.emit({ session_id: "s1", machine_id: "m1", ok: false, email: null, error: "cancelled", reason: "cancelled" }),
+    );
+    await settle();
+    expect(container.textContent).not.toContain("Sign-in failed");
+    expect(container.textContent).not.toContain("cancelled from another panel");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start Claude sign-in")).toBe(true);
   });
 
   it("offers Restart sign-in once a session is in flight, and it calls restart_claude_login (never start_claude_login again)", async () => {
@@ -201,6 +212,7 @@ describe("ClaudeSignInInline — single-flight (B-finding #4)", () => {
         ok: false,
         email: null,
         error: "superseded by another sign-in for this server",
+        reason: "superseded",
       }),
     );
     await settle();
@@ -313,6 +325,176 @@ describe("ClaudeSignInInline — ownership & stale-event filtering (follow-up re
     await settle();
     expect(container.textContent).toContain("Signed in as demo@example.com");
     expect(useClaudeLoginSessions.getState().active.m1).toBe(false);
+  });
+});
+
+// Counter-verification of the fix wave (residual defect A8/R1, CRM `1abfc028`): the
+// follow-up review above only closed the ATTACHED→owner teardown direction. This
+// closes the reverse — the OWNER cancelling/unmounting while another surface is still
+// ATTACHED to the same session must not leave that surface stuck forever.
+describe("ClaudeSignInInline — owner cancel/unmount leaves an attached sibling informed, not stuck (residual defect A8/R1)", () => {
+  it("owner cancels: the OWNER shows no error, the ATTACHED sibling gets a neutral 'cancelled elsewhere' message and Start again", async () => {
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-3", machine_id: "m1", owned: true } });
+    mount(); // instance A — the owner
+    click("Start Claude sign-in");
+    await settle();
+
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-3", machine_id: "m1", owned: false } });
+    const containerB = document.createElement("div");
+    document.body.appendChild(containerB);
+    const rootB = createRoot(containerB);
+    act(() => rootB.render(createElement(ClaudeSignInInline, { machineId: "m1" })));
+    click("Start Claude sign-in", containerB);
+    await settle();
+
+    // The owner (A) cancels — this DOES call the backend now (unlike an attached
+    // instance's own Cancel).
+    click("Cancel", container);
+    expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "shared-3", machine_id: "m1", owned: true });
+
+    // The backend's own terminal event for that cancel arrives at BOTH mounted
+    // instances (they share the same mock emitter) — exactly what `run_login_actor`
+    // now emits for every `Cancelled` outcome, owner-initiated or not.
+    act(() =>
+      serverLoginResultEvent.emit({
+        session_id: "shared-3",
+        machine_id: "m1",
+        ok: false,
+        email: null,
+        error: "cancelled",
+        reason: "cancelled",
+      }),
+    );
+    await settle();
+
+    // Owner (A): already reset itself locally on Cancel and recognizes this as its OWN
+    // echo — shows no error at all, just its ordinary Start button.
+    expect(container.textContent).not.toContain("Sign-in failed");
+    expect(container.textContent).not.toContain("cancelled from another panel");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start Claude sign-in")).toBe(true);
+
+    // Attached sibling (B): did NOT initiate this cancel — must exit its stuck
+    // "waiting for the sign-in link" view for the neutral message, never the alarming
+    // "Sign-in failed" wording, and be offered a way to start over.
+    expect(containerB.querySelector('input[placeholder="Authorization code"]')).toBeNull();
+    expect(containerB.textContent).toContain("Sign-in was cancelled from another panel.");
+    expect(containerB.textContent).not.toContain("Sign-in failed");
+    expect(Array.from(containerB.querySelectorAll("button")).some((b) => b.textContent === "Start again")).toBe(true);
+
+    act(() => rootB.unmount());
+    containerB.remove();
+  });
+
+  it("owner unmounts: the ATTACHED sibling gets the same neutral 'cancelled elsewhere' message and Start again", async () => {
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-4", machine_id: "m1", owned: true } });
+    const containerA = document.createElement("div");
+    document.body.appendChild(containerA);
+    const rootA = createRoot(containerA);
+    act(() => rootA.render(createElement(ClaudeSignInInline, { machineId: "m1" })));
+    click("Start Claude sign-in", containerA);
+    await settle();
+
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-4", machine_id: "m1", owned: false } });
+    const containerB = document.createElement("div");
+    document.body.appendChild(containerB);
+    const rootB = createRoot(containerB);
+    act(() => rootB.render(createElement(ClaudeSignInInline, { machineId: "m1" })));
+    click("Start Claude sign-in", containerB);
+    await settle();
+
+    // The owner (A) unmounts instead of clicking Cancel — its cleanup effect cancels
+    // the backend session exactly like a Cancel click would.
+    act(() => rootA.unmount());
+    containerA.remove();
+    expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "shared-4", machine_id: "m1", owned: true });
+
+    act(() =>
+      serverLoginResultEvent.emit({
+        session_id: "shared-4",
+        machine_id: "m1",
+        ok: false,
+        email: null,
+        error: "cancelled",
+        reason: "cancelled",
+      }),
+    );
+    await settle();
+
+    // The now-unmounted owner has no listener left to react (nothing to assert there);
+    // the still-attached sibling must be informed instead of left stuck.
+    expect(containerB.querySelector('input[placeholder="Authorization code"]')).toBeNull();
+    expect(containerB.textContent).toContain("Sign-in was cancelled from another panel.");
+    expect(containerB.textContent).not.toContain("Sign-in failed");
+    expect(Array.from(containerB.querySelectorAll("button")).some((b) => b.textContent === "Start again")).toBe(true);
+
+    act(() => rootB.unmount());
+    containerB.remove();
+  });
+
+  it("regression guard (899ccf7): an ATTACHED instance's own cancel/unmount still never touches the owner's session", async () => {
+    // This exact behavior is already covered by the "ownership & stale-event
+    // filtering" describe block above — asserted again here, explicitly, as the
+    // regression guard this residual-fix task calls for.
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-5", machine_id: "m1", owned: true } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "shared-5", machine_id: "m1", owned: false } });
+    const containerB = document.createElement("div");
+    document.body.appendChild(containerB);
+    const rootB = createRoot(containerB);
+    act(() => rootB.render(createElement(ClaudeSignInInline, { machineId: "m1" })));
+    click("Start Claude sign-in", containerB);
+    await settle();
+
+    act(() => rootB.unmount());
+    containerB.remove();
+    await settle();
+
+    expect(cancelClaudeLogin).not.toHaveBeenCalled();
+    expect(useClaudeLoginSessions.getState().active.m1).toBe(true);
+  });
+});
+
+// Counter-verification of the residual-defect fix above found a further gap: a quick
+// owner Cancel-then-Start can reattach to the exact same (still dying) `session_id`
+// (`attach_or_reserve` hands back whatever is still registered) before the backend
+// actor finishes tearing it down — the belated `cancelled` event for the OLD cancel
+// must not be swallowed as an echo of that old intent once THIS instance has moved on
+// to a freshly (re-)attached view of the same id.
+describe("ClaudeSignInInline — quick Cancel-then-Start reusing the same session_id (residual defect, CRM 1abfc028)", () => {
+  it("does not swallow the belated cancelled event as its own echo after re-attaching to the same reused session_id", async () => {
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: true } });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+
+    // Owner cancels — resets its own view synchronously, before the backend actor has
+    // necessarily finished tearing the session down.
+    click("Cancel");
+    expect(cancelClaudeLoginCalledWith()).toEqual({ session_id: "s1", machine_id: "m1", owned: true });
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start Claude sign-in")).toBe(true);
+
+    // Same instance clicks Start again immediately — `attach_or_reserve` hands back the
+    // SAME (still dying) session_id, this time as a non-owning attach.
+    startClaudeLogin.mockResolvedValueOnce({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: false } });
+    click("Start Claude sign-in");
+    await settle();
+    // Now viewing the (re-)attached session, waiting for its prompt.
+    expect(container.textContent).toContain("Waiting for the sign-in link…");
+
+    // The OLD cancel's belated terminal event finally arrives, for the same session_id.
+    act(() =>
+      serverLoginResultEvent.emit({ session_id: "s1", machine_id: "m1", ok: false, email: null, error: "cancelled", reason: "cancelled" }),
+    );
+    await settle();
+
+    // Must be treated as live, truthful information about the NEW attached view, not
+    // silently dropped as the old cancel's own echo — never stuck on "Waiting…".
+    expect(container.textContent).not.toContain("Waiting for the sign-in link…");
+    expect(container.textContent).toContain("Sign-in was cancelled from another panel.");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Start again")).toBe(true);
   });
 });
 

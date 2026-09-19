@@ -40,6 +40,7 @@ export type {
   GeneratedKey,
   HostKeyFingerprintEvent,
   InstalledAs,
+  LoginResultReason,
   LoginSession,
   MachineRecord,
   MachineProvisionStatus,

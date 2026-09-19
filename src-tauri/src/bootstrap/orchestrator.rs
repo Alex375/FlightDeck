@@ -1316,6 +1316,63 @@ fn resolve_resume_machine(
     }
 }
 
+/// Rebuild `req`'s connection coordinates from `machine`'s CURRENT row before the
+/// resumed pipeline dials anything — residual defect A8/R2 (CRM `1abfc028`,
+/// counter-verification of the B_lifecycle-#8 fix). [`resolve_resume_machine`] above
+/// correctly re-finds the right [`MachineRecord`] BY ID, surviving a live address
+/// rotation (`Store::set_machine_preferred_host`) that happened while this run sat
+/// paused — but until this existed, the resumed pipeline still dialed whatever
+/// `(host, port, user)` the FROZEN `req` carried from `bootstrap_server`'s ORIGINAL
+/// call, since [`run_pipeline_and_register`] only ever read `identity_file`/`machine_id`
+/// off `existing_machine`, never its connection coordinates (every step closes over
+/// `req`, not `existing_machine` — see [`build_pipeline`]). A resume after a genuine
+/// rotation (the old address stopped answering, which is exactly why it rotated) would
+/// then still fail `verify_key_works` against the stale host and — `bootstrap_resume`
+/// always passing `password: None` — surface the same misleading "needs its login
+/// password" [`step_install_key`] error this fix's own doc claims to eliminate.
+///
+/// A `None` machine (a genuinely first-contact host, or one removed while this session
+/// sat paused) leaves `req` untouched — there is no fresher row to prefer over what the
+/// paused session already carries forward, exactly as before this fix. The row's
+/// `host`/`port`/`user` were already validated when they were written (`add_machine`/
+/// `set_machine_preferred_host`), so no re-validation happens here — this only ever
+/// copies values already known-safe. Private (not `pub(crate)`): `StoredBootstrapRequest`
+/// itself is private to this module, so this is unit-tested directly from the same
+/// module's own `tests` submodule, mirroring [`resolve_resume_machine`]'s own split
+/// from the Tauri-aware command.
+fn sync_resume_request_to_machine(req: &mut StoredBootstrapRequest, machine: Option<&MachineRecord>) {
+    if let Some(machine) = machine {
+        req.host = machine.host.clone();
+        req.port = machine.port;
+        req.user = machine.user.clone();
+    }
+}
+
+/// [`resolve_resume_machine`] + [`sync_resume_request_to_machine`], collapsed into the
+/// ONE call [`bootstrap_resume`] makes (test-honesty residual defect, CRM `1abfc028`,
+/// counter-verification of the A8/R2 fix above): with those as two independent call
+/// sites, a future refactor could drop the sync half alone and the existing tests —
+/// which only exercised the two pure helpers in isolation, never anything resembling
+/// what `bootstrap_resume` itself does — would stay green right through the exact
+/// stale-host regression reappearing (verified: deleting just the sync call left the
+/// full `cargo test --lib bootstrap::orchestrator::` suite passing). There is now
+/// exactly one call site left for `bootstrap_resume` to make, and this function's own
+/// unit test below exercises the pair together the same way it actually invokes them —
+/// a `#[tauri::command]`-level test remains out of reach (this crate's `tauri`
+/// dependency has no `test` feature/dev-dependency override to build a `mock_builder`
+/// app from, and faking every ssh round trip the full pipeline's steps make would be a
+/// separate, much larger undertaking), so this is the closest unit test can get to the
+/// real wiring without that harness.
+fn resolve_and_sync_resume_machine(
+    store: &Store,
+    machine_id: Option<&str>,
+    req: &mut StoredBootstrapRequest,
+) -> Result<Option<MachineRecord>, String> {
+    let machine = resolve_resume_machine(store, machine_id, &req.host, req.port, &req.user)?;
+    sync_resume_request_to_machine(req, machine.as_ref());
+    Ok(machine)
+}
+
 /// Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
 /// needing a sudo password) — re-runs the same, idempotent pipeline with
 /// `sudo_password` now available.
@@ -1337,7 +1394,17 @@ fn resolve_resume_machine(
 /// [`ServerLocks`]: REUSES (never re-claims) the [`ServerLockGuard`] the original
 /// `bootstrap_server` call claimed and left held across the pause (B_lifecycle-#7) —
 /// see [`BootstrapSessions::resume`]'s own `lock_key`. A fresh `claim` here would
-/// simply collide with this very session's own still-held lock.
+/// simply collide with this very session's own still-held lock. That key is the
+/// MACHINE id whenever one was already known at the ORIGINAL `bootstrap_server` call
+/// (see [`server_lock_key`]) — carried forward verbatim from `StoredSession::lock_key`,
+/// never re-derived here, so [`resolve_and_sync_resume_machine`]'s own coordinate
+/// rewrite below can never disturb which lock this run holds.
+///
+/// [`resolve_and_sync_resume_machine`]: residual defect A8/R2 (CRM `1abfc028`) — once
+/// [`resolve_resume_machine`] re-finds the right, possibly-rotated [`MachineRecord`],
+/// its CURRENT `host`/`port`/`user` are copied onto the resumed `req` BEFORE the
+/// pipeline is built, so every step dials where the machine is reachable TODAY, not
+/// wherever it was when this session originally paused — see that function's own doc.
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_resume(
@@ -1348,9 +1415,8 @@ pub async fn bootstrap_resume(
     sudo_password: Option<String>,
 ) -> Result<BootstrapReport, String> {
     let sudo_password = sudo_password.map(SecretString::new);
-    let (req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
-    let existing_machine =
-        resolve_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &req.host, req.port, &req.user)?;
+    let (mut req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
+    let existing_machine = resolve_and_sync_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &mut req)?;
     let guard = ServerLockGuard::adopt(&locks, lock_key);
     Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password, existing_machine, guard).await)
 }
@@ -2478,6 +2544,60 @@ mod tests {
         let resolved =
             resolve_resume_machine(&store, Some("m1"), "old-host.example.com", 22, "u").unwrap();
         assert_eq!(resolved.map(|m| m.host), Some("new-host.example.com".to_string()));
+    }
+
+    // ---- sync_resume_request_to_machine (residual defect A8/R2) ----
+
+    #[test]
+    fn sync_resume_request_to_machine_adopts_the_rotated_hosts_host_port_and_user() {
+        let mut req = stored_request(); // host "h", port 22, user "u"
+        let rotated = MachineRecord {
+            host: "new-host.example.com".into(),
+            port: 2222,
+            user: "rotated-user".into(),
+            ..machine_record("m1", "unused")
+        };
+        sync_resume_request_to_machine(&mut req, Some(&rotated));
+        assert_eq!(req.host, "new-host.example.com");
+        assert_eq!(req.port, 2222);
+        assert_eq!(req.user, "rotated-user");
+    }
+
+    #[test]
+    fn sync_resume_request_to_machine_leaves_the_frozen_request_alone_when_no_machine_is_found() {
+        let mut req = stored_request();
+        let before = (req.host.clone(), req.port, req.user.clone());
+        sync_resume_request_to_machine(&mut req, None);
+        assert_eq!((req.host, req.port, req.user), before, "a genuinely first-contact host has nothing fresher to adopt");
+    }
+
+    /// End-to-end (minus the actual ssh calls, which need a `tauri::AppHandle` this
+    /// crate has no unit-test harness for) through [`resolve_and_sync_resume_machine`]
+    /// itself — the EXACT single call `bootstrap_resume` makes, not the two helpers it
+    /// wraps exercised separately (test-honesty residual defect, CRM `1abfc028`: a
+    /// counter-verification found the previous version of this test called
+    /// `resolve_resume_machine` then `sync_resume_request_to_machine` by hand, so
+    /// deleting `bootstrap_resume`'s own wiring call to the latter left this test, and
+    /// the rest of the suite, green). Asserts the resumed `req` targets the ROTATED
+    /// host, and that the row itself is still the rotated one afterward (nothing here
+    /// writes it back).
+    #[test]
+    fn resume_after_a_host_rotation_targets_the_rotated_host_not_the_frozen_one() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine_record("m1", "old-host.example.com")).unwrap();
+        store.set_machine_preferred_host("m1", "new-host.example.com").unwrap();
+
+        let mut req = stored_request(); // frozen at pause time: host "h", not the real one
+        req.host = "old-host.example.com".to_string();
+        let existing_machine = resolve_and_sync_resume_machine(&store, Some("m1"), &mut req).unwrap();
+
+        assert_eq!(req.host, "new-host.example.com", "the resumed pipeline must dial the rotated host, not the frozen one");
+        assert_eq!(existing_machine.map(|m| m.host), Some("new-host.example.com".to_string()));
+        assert_eq!(
+            store.machine_by_id("m1").unwrap().unwrap().host,
+            "new-host.example.com",
+            "the row itself must still be the rotated host"
+        );
     }
 
     #[test]
