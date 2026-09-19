@@ -3613,8 +3613,9 @@ pub(crate) fn version_at_least(v: &str, min: &str) -> bool {
 ///
 /// Never crosses the Tauri IPC boundary today (stale doc fix, residual defect A8/R3,
 /// CRM `1abfc028`): [`bootstrap::connect::probe`] and [`probe_remote`] are both plain
-/// internal `async fn`s, not `#[tauri::command]`s — called only from `bootstrap::
-/// orchestrator`'s pipeline (`step_probe`) and from [`add_machine`] respectively,
+/// internal `async fn`s, not `#[tauri::command]`s — called only from within
+/// `bootstrap::orchestrator` (its pipeline's `step_probe` AND its `repair()` flow's
+/// `ReuploadDaemon`/`InstallService` actions) and from [`add_machine`] respectively,
 /// neither exposed to the frontend, and [`add_machine`] itself returns an
 /// [`AddMachineOutcome`], never this struct directly. `Serialize`/`Deserialize`/`Type`
 /// were dropped for exactly that reason (previously justified by a `bootstrap_probe`
