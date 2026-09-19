@@ -14,6 +14,7 @@ import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
 import { useEffectiveCleanOutput } from "../../store/display";
+import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -67,12 +68,17 @@ export function ConversationPane({
   // The pane is the positioning context (position:relative in CSS) AND the scope for the
   // pin's "scroll to my last message" lookup — see LastMessagePin.
   const paneRef = useRef<HTMLDivElement>(null);
+  // The whole column is a drop zone for files dragged from the Finder (see fileDrop.ts):
+  // they attach to THIS conversation exactly as the composer's "+" would.
+  const dropOver = useIsDropOver(session, "pane");
   return (
     <div
       ref={paneRef}
       className="wf-col cv-pane"
       style={{ flex: 1, minWidth: 0 }}
       onClick={onBackgroundClick}
+      {...dropZoneAttrs(session, "pane")}
+      data-drop-over={dropOver || undefined}
     >
       {/* Floating "last message you sent" pin, pinned over the top of the thread. */}
       <LastMessagePin session={session} paneRef={paneRef} />

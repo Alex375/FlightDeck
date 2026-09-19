@@ -17,6 +17,7 @@ import { AutoAccountSwitchHost } from "./features/settings/AutoAccountSwitchHost
 import { ClaudeAccountApplyHost } from "./features/settings/ClaudeAccountApplyHost";
 import { ZoomHost } from "./ui/ZoomHost";
 import { WorkflowWatchHost } from "./features/conversation/WorkflowWatchHost";
+import { FileDropHost } from "./features/conversation/FileDropHost";
 import { ExtensionsManager } from "./features/extensions/ExtensionsManager";
 import { TosseRepoCard } from "./features/tosse/TosseRepoCard";
 import { TosseView } from "./features/tosse/TosseView";
@@ -421,6 +422,10 @@ export default function App() {
           App-global on purpose — a per-view subscription would open and close the socket
           with the tab. Off unless connected AND the preference is on. */}
       <TosseLiveHost />
+      {/* Idem (render-null): receives files dropped from the Finder (native webview events,
+          never HTML5 drops) and attaches them to the conversation column or Flight Deck card
+          under the cursor, exactly as the composer's "+" would. */}
+      <FileDropHost />
       {/* Mounted once, globally: in-app toasts (e.g. one conversation messaging another). */}
       <ToastHost />
     </Win>

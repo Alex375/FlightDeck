@@ -168,6 +168,24 @@
    centre on this same max-width so they share one visual column, like Claude. */
 /* position:relative → the pane is the containing block for the floating .cv-lastpin. */
 .cv-pane { --cv-max:840px; position:relative; }
+/* Files dragged from the Finder over the conversation column (FileDropHost): a framed
+   veil over the whole pane + a centred hint — the drop attaches them as the composer's
+   "+" would. Pseudo-elements don't match the global `*` box-sizing rule, hence the
+   explicit one. */
+.cv-pane[data-drop-over]::before {
+  content:""; position:absolute; inset:8px; z-index:40; pointer-events:none; box-sizing:border-box;
+  border:2px dashed var(--wf-accent); border-radius:var(--wf-r-l);
+  background:color-mix(in srgb, var(--wf-bg) 78%, var(--wf-accent) 6%);
+  backdrop-filter:blur(2px);
+}
+.cv-pane[data-drop-over]::after {
+  content:"Drop to attach to this conversation";
+  position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); z-index:41; pointer-events:none;
+  box-sizing:border-box; padding:9px 16px; white-space:nowrap;
+  background:var(--wf-panel-2); border:1px solid var(--wf-accent); border-radius:999px;
+  font:500 13px var(--wf-sans); color:var(--wf-tx-hi);
+  box-shadow:0 14px 36px -12px #000;
+}
 
 /* ---- floating "last sent message" pin: pinned at the top, above the thread ----
    Reuses the Flight Deck preview (short message in clear / Haiku summary). Click → scroll

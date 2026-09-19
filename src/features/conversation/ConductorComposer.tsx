@@ -72,14 +72,16 @@ import {
   type RecallResult,
 } from "./messageHistory";
 import {
+  attachPaths,
   attachmentFromBlob,
-  attachmentFromPath,
   attachmentsFor,
   imageDataUrl,
+  useAttachError,
+  useAttachReading,
   useComposerAttachments,
   useConvAttachments,
-  wireImageMimeForPath,
 } from "./composerAttachments";
+import { useFileDrop } from "./fileDrop";
 import {
   appliesToBackend,
   chipById,
@@ -266,16 +268,19 @@ export const ConductorComposer = forwardRef<
   };
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  // ---- Attachments (the "+" button + paste-an-image) ----------------------
+  // ---- Attachments (the "+" button, paste-an-image, a Finder drop) --------
   // Joined images for THIS conversation (in-memory, per-conv; see composerAttachments).
   const attachments = useConvAttachments(session);
   // Last attach failure (unreadable / too large / unsupported), shown inline in the
-  // attachment row until the next successful attach or send.
-  const [attachErr, setAttachErr] = useState<string | null>(null);
-  // In-flight pasted-image reads (FileReader is async). While > 0 the send is blocked
-  // so a fast paste-then-Enter can't fire BEFORE the image lands (which would send
+  // attachment row until the next attach attempt or send. Per-conversation store state,
+  // not local: a file dropped on a Flight Deck card is read before this composer mounts.
+  const attachErr = useAttachError(session);
+  const setAttachErr = (message: string | null) =>
+    useComposerAttachments.getState().setError(session, message);
+  // Image reads in flight (disk / FileReader are async). While true the send is blocked
+  // so a fast attach-then-Enter can't fire BEFORE the image lands (which would send
   // without it, then attach it to the NEXT message).
-  const [attaching, setAttaching] = useState(0);
+  const attaching = useAttachReading(session);
 
   // ---- Shell-style ↑/↓ history recall -------------------------------------
   // The user's own previously-sent messages, oldest→newest (see selector). The
@@ -494,23 +499,11 @@ export const ConductorComposer = forwardRef<
     ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
   };
 
-  // Make an absolute path relative to the conversation cwd when it lives under it, so
-  // an inserted file mention stays short + resolves to a clickable chip; else keep it
-  // absolute (still readable by Claude and by the mention resolver).
-  const relForCwd = (abs: string): string => {
-    const base = cwd ? cwd.replace(/\/+$/, "") : "";
-    return base && abs.startsWith(base + "/") ? abs.slice(base.length + 1) : abs;
-  };
-
-  // Append file-path mentions to the draft (space-separated), caret at the end.
-  const insertMentions = (paths: string[]) => {
-    if (!paths.length) return;
-    const joined = paths.map(relForCwd).join(" ");
-    const next = text.trim() ? `${text.replace(/\s*$/, "")} ${joined} ` : `${joined} `;
-    setText(next);
+  // Focus the input with the caret at the very end (after appended file mentions).
+  const focusAtEnd = () => {
     requestAnimationFrame(() => {
       const ta = taRef.current;
-      if (!ta) return;
+      if (!ta || ta.disabled) return;
       ta.focus();
       const end = ta.value.length;
       ta.setSelectionRange(end, end);
@@ -518,35 +511,23 @@ export const ConductorComposer = forwardRef<
     });
   };
 
-  // Route picked paths: model-attachable images → base64 attachment; anything else →
-  // a path mention Claude reads with its own tools.
-  const addPaths = async (paths: string[]) => {
-    const mentions: string[] = [];
-    const errs: string[] = [];
-    // Same send-lock as onPaste: these picked-image reads are async (disk + base64 over
-    // IPC, up to 16 MiB), so block send while they're in flight — else a fast
-    // pick-then-Enter sends BEFORE the image lands (it would ride the NEXT message).
-    setAttaching((n) => n + 1);
-    try {
-      for (const p of paths) {
-        if (wireImageMimeForPath(p)) {
-          const res = await attachmentFromPath(p);
-          if (res && "error" in res) errs.push(res.error);
-          else if (res) useComposerAttachments.getState().add(session, res);
-        } else {
-          mentions.push(p);
-        }
-      }
-    } finally {
-      setAttaching((n) => Math.max(0, n - 1));
-    }
-    // Surface every failure at once — a later failure must not silently erase earlier ones.
-    if (errs.length) setAttachErr([...new Set(errs)].join(" · "));
-    insertMentions(mentions);
-  };
+  // A file dropped from the Finder onto this conversation (FileDropHost) already went
+  // through `attachPaths`; it only asks the composer to take the focus — once: the
+  // request is consumed here, including when it was made just before we mounted.
+  const focusRequest = useFileDrop((s) =>
+    s.focusRequest?.convId === session ? s.focusRequest.seq : null,
+  );
+  useEffect(() => {
+    if (focusRequest === null) return;
+    useFileDrop.getState().consumeFocus(session);
+    focusAtEnd();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest, session]);
 
   // The "+" button: native multi-file picker (any file / image). In the dev/browser
   // mock there's no native dialog, so fall back to a path prompt (mention only).
+  // Routing (image → attachment, anything else → path mention) is `attachPaths`, shared
+  // with a Finder drop so both give the same result.
   const pickAndAttach = async () => {
     setAttachErr(null);
     let paths: string[] = [];
@@ -558,7 +539,8 @@ export const ConductorComposer = forwardRef<
       const p = window.prompt("Path of the file to attach:", "");
       paths = p && p.trim() ? [p.trim()] : [];
     }
-    await addPaths(paths);
+    const { mentions } = await attachPaths(session, paths, cwd);
+    if (mentions > 0) focusAtEnd();
   };
 
   // Paste an image (screenshot / copied file) → attachment. Only preventDefault when
@@ -576,18 +558,19 @@ export const ConductorComposer = forwardRef<
     if (!blobs.length) return;
     e.preventDefault();
     setAttachErr(null);
-    setAttaching((n) => n + 1);
+    const store = useComposerAttachments.getState;
+    store().beginRead(session);
     void (async () => {
       try {
         for (const b of blobs) {
           const name = b.name && b.name.trim() ? b.name : "Pasted image";
           const res = await attachmentFromBlob(b, name);
           if (res && "error" in res) setAttachErr(res.error);
-          else if (res) useComposerAttachments.getState().add(session, res);
+          else if (res) store().add(session, res);
           else setAttachErr("Unsupported image format (png, jpeg, gif, webp).");
         }
       } finally {
-        setAttaching((n) => Math.max(0, n - 1));
+        store().endRead(session);
       }
     })();
   };
@@ -732,7 +715,7 @@ export const ConductorComposer = forwardRef<
   const doSend = () => {
     // A pasted image is still being read — don't send yet, or it would go out on the
     // NEXT message instead (the async add lands after this send's clear).
-    if (attaching > 0) return;
+    if (attaching) return;
     sendMessageNow(
       text.trim(),
       attachmentsFor(session).map((a) => ({
@@ -1213,7 +1196,7 @@ export const ConductorComposer = forwardRef<
             "interrupt". As soon as there is something to send — text or a joined image,
             busy or not — it's a send button: a message sent mid-turn is natively queued
             by the CLI and injected at the next loop boundary. */}
-        {busy && !text.trim() && attachments.length === 0 && attaching === 0 ? (
+        {busy && !text.trim() && attachments.length === 0 && !attaching ? (
           <button className="cv-send" onClick={() => interrupt.mutate()} title="Interrupt">
             <Ico name="stop" className="sm" />
           </button>
@@ -1221,7 +1204,7 @@ export const ConductorComposer = forwardRef<
           <button
             className="cv-send"
             onClick={doSend}
-            disabled={(!text.trim() && attachments.length === 0) || attaching > 0}
+            disabled={(!text.trim() && attachments.length === 0) || attaching}
             title={busy ? "Send — the agent will handle it along the way" : "Send"}
           >
             <Ico name="send" className="sm" />
