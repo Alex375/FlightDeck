@@ -380,9 +380,10 @@ export function ServerStatusPanel({
             <div className={styles.repairs}>
               <button type="button" className={styles.repairBtn} onClick={() => setShowClaudeSignIn(true)}>
                 <span className={styles.repairTitle}>Sign in to Claude</span>
-                <span className={styles.repairReason}>
-                  {diagnosis.claude_installed === false ? "Claude Code isn't installed" : "Claude Code isn't signed in"}
-                </span>
+                {/* Reachable only once `claudeNeedsSignIn` confirms claude IS
+                    installed (B14) — a missing claude offers "Install Claude Code"
+                    instead, via the generic `repairSuggestionsFor` button above. */}
+                <span className={styles.repairReason}>Claude Code isn&apos;t signed in</span>
               </button>
             </div>
           )}

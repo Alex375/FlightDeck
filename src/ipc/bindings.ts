@@ -3572,7 +3572,13 @@ claude_account_id: string | null }
 /**
  * The single headline verdict [`collapse_state`] reduces every independent fact to.
  */
-export type DiagnosisState = { kind: "ready" } | { kind: "needs_claude_sign_in" } | { kind: "running_not_reboot_safe" } | { kind: "failed"; reason: string }
+export type DiagnosisState = { kind: "ready" } | 
+/**
+ * (B14) `claude` itself is missing — distinct from [`Self::NeedsClaudeSignIn`]
+ * (installed but signed out): [`RepairAction::InstallClaude`] is the fix here,
+ * [`RepairAction::SignInClaude`] there. See [`collapse_state`]'s doc.
+ */
+{ kind: "needs_claude_install" } | { kind: "needs_claude_sign_in" } | { kind: "running_not_reboot_safe" } | { kind: "failed"; reason: string }
 /**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
@@ -4542,7 +4548,14 @@ mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; er
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
-export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_service" | "enable_linger" | "mask_sleep" | "run_init" | "sign_in_claude" | "provision_phone"
+export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_service" | "enable_linger" | "mask_sleep" | "run_init" | 
+/**
+ * (B14) Runs the official native installer — see
+ * [`server_setup::install_claude`]'s own doc. Distinct from [`Self::SignInClaude`]:
+ * this fixes [`DiagnosisState::NeedsClaudeInstall`], that one fixes
+ * [`DiagnosisState::NeedsClaudeSignIn`].
+ */
+"install_claude" | "sign_in_claude" | "provision_phone"
 /**
  * One `machine_repair` outcome: what changed, plus a FRESH [`diagnose`] (never a stale
  * one from before the fix).
@@ -4741,7 +4754,22 @@ restart_pending: boolean; reboot_safe: boolean | null;
  * install, but is never itself gated on that (never a false `Some(false)`
  * manufactured for an install kind it doesn't apply to).
  */
-linger: boolean | null; sleep_masked: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+linger: boolean | null; sleep_masked: boolean | null; 
+/**
+ * (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
+ * lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
+ * daemon started this way cannot resolve `claude` at all if it only lives in
+ * `~/.local/bin` (never on the unit's own minimal PATH). `None` when no user unit
+ * exists at all ([`InstalledAs`] isn't [`InstalledAs::User`]) — meaningless there,
+ * never a manufactured `Some(false)`, same discipline as
+ * [`sleep_masked`](Self::sleep_masked)/[`linger`](Self::linger). Read unconditionally
+ * by [`diagnose_script`] regardless of [`installed_as`](Self::installed_as).
+ * [`RepairAction::InstallService`] fixes it — re-running [`install::install_service`]
+ * against an already-User install re-renders (and overwrites) the unit file with
+ * [`crate::bootstrap::templates::render_user_unit`]'s current (PATH-including)
+ * template.
+ */
+user_unit_missing_path: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
@@ -5083,7 +5111,7 @@ warnings: string[] }
  * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
  * see the module doc's overview.
  */
-export type StepId = "install_key" | "probe" | "upload_daemon" | "install_service" | "escalate_persistence" | "run_init" | "claude_auth" | "add_machine" | "diagnose"
+export type StepId = "install_key" | "probe" | "install_claude" | "upload_daemon" | "install_service" | "escalate_persistence" | "run_init" | "claude_auth" | "add_machine" | "diagnose"
 /**
  * One step's current/final state, as carried on [`BootstrapReport`] and (via
  * [`StepState::to_wire`]) on every [`crate::ipc::events::BootstrapProgressEvent`].

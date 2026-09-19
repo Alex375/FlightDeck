@@ -370,7 +370,10 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
   if (d.daemon_running === false) return { kind: "failed", reason: "flightdeckd is not running" };
   if (d.daemon_running === null)
     return { kind: "failed", reason: "could not determine whether flightdeckd is running" };
-  if (d.claude_installed !== true || d.claude_logged_in !== true) return { kind: "needs_claude_sign_in" };
+  // (B14) Split, same as the real `collapse_state`: missing claude gets its OWN state,
+  // distinct from installed-but-signed-out.
+  if (d.claude_installed !== true) return { kind: "needs_claude_install" };
+  if (d.claude_logged_in !== true) return { kind: "needs_claude_sign_in" };
   return d.reboot_safe === true ? { kind: "ready" } : { kind: "running_not_reboot_safe" };
 }
 
@@ -385,6 +388,7 @@ function readyDiagnosis(): ServerDiagnosis {
     reboot_safe: true,
     linger: null,
     sleep_masked: true,
+    user_unit_missing_path: null,
     claude_installed: true,
     claude_logged_in: true,
     claude_email: "demo@example.com",
@@ -399,6 +403,7 @@ function readyDiagnosis(): ServerDiagnosis {
 const STEP_SEQUENCE: StepId[] = [
   "install_key",
   "probe",
+  "install_claude",
   "upload_daemon",
   "install_service",
   "escalate_persistence",
@@ -458,6 +463,7 @@ function outcomeFor(scenario: MockScenario, id: StepId, resuming: boolean): Mock
   const details: Partial<Record<StepId, string>> = {
     install_key: "Installed",
     probe: "arch=x86_64",
+    install_claude: "2.1.211 (Claude Code)",
     upload_daemon: "Uploaded { restart_required: false }",
     install_service: "Installed { mechanism: System }",
     run_init: "Initialized",
@@ -469,7 +475,7 @@ function outcomeFor(scenario: MockScenario, id: StepId, resuming: boolean): Mock
 }
 
 /** Advances the scripted pipeline from `fromIndex`, mutating and emitting `states`
- *  (already sized to the full 9-row checklist) after every transition — mirrors
+ *  (already sized to the full 10-row checklist) after every transition — mirrors
  *  `orchestrator::run_steps`'s own "emit after every transition, stop on Failed or a
  *  blocking pause" shape closely enough for the UI's live checklist to exercise the
  *  same states a real run would. */
@@ -552,7 +558,10 @@ function findOrCreateMockMachine(label: string, host: string, port: number, user
 function finalDiagnosisFor(scenario: MockScenario): ServerDiagnosis {
   const base = readyDiagnosis();
   if (scenario === "claude") {
-    return { ...base, claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_sign_in" } };
+    // (B14) The pipeline only ever PAUSES at `claude_auth`'s needs_input once
+    // `install_claude` has already succeeded/skipped — so this scenario is "installed,
+    // never signed in", never "not installed" (that's a DIFFERENT, earlier failure).
+    return { ...base, claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } };
   }
   if (scenario === "restart") {
     return { ...base, restart_pending: true, daemon_version_disk: "0.4.3", daemon_version_running: "0.4.2" };
@@ -1906,15 +1915,21 @@ export const mockCommands = {
     // real reload showing the DB's truth rather than a stale snapshot.
     const demoParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("demo") : null;
     // `?demo=servers` — B12 visual check fixture: one paired server per headline
-    // state (Ready / Needs Claude sign-in / Running-not-reboot-safe / Failed), seeded
-    // once (idempotent — a second load must not duplicate them).
+    // state (Ready / Needs Claude install / Needs Claude sign-in /
+    // Running-not-reboot-safe / Failed — B14 added the "install" one, distinct from
+    // "sign-in"), seeded once (idempotent — a second load must not duplicate them).
     if (demoParam === "servers" && mockMachines.length === 0) {
       const seed: Array<[string, string, ServerDiagnosis]> = [
         ["ready-vps", "ready.example.com", readyDiagnosis()],
         [
+          "needs-install-vps",
+          "needs-install.example.com",
+          { ...readyDiagnosis(), claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_install" } },
+        ],
+        [
           "needs-signin-vps",
           "needs-signin.example.com",
-          { ...readyDiagnosis(), claude_installed: false, claude_logged_in: null, claude_email: null, state: { kind: "needs_claude_sign_in" } },
+          { ...readyDiagnosis(), claude_installed: true, claude_logged_in: false, claude_email: null, state: { kind: "needs_claude_sign_in" } },
         ],
         [
           "reboot-unsafe-vps",
@@ -1934,6 +1949,7 @@ export const mockCommands = {
             reboot_safe: null,
             linger: null,
             sleep_masked: null,
+            user_unit_missing_path: null,
             claude_installed: null,
             claude_logged_in: null,
             claude_email: null,
@@ -2223,6 +2239,7 @@ export const mockCommands = {
         break;
       case "install_service":
         d.reboot_safe = true;
+        d.user_unit_missing_path = false;
         label = "Install the persistence service";
         summary = "Installed";
         break;
@@ -2240,6 +2257,11 @@ export const mockCommands = {
       case "run_init":
         label = "Run flightdeckd init";
         summary = "Initialized";
+        break;
+      case "install_claude":
+        d.claude_installed = true;
+        label = "Install Claude Code";
+        summary = "installed: 2.1.211 (Claude Code)";
         break;
       case "sign_in_claude":
         label = "Start the Claude sign-in flow";

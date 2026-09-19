@@ -170,6 +170,143 @@ pub async fn run_init(
 }
 
 // ============================================================================
+// install_claude — B14
+// ============================================================================
+
+/// The official native installer's URL — confirmed 2026-09-19 against the Claude Code
+/// docs (`https://code.claude.com/docs/en/setup`, "Install Claude Code" →
+/// "Native Install (Recommended)" tab, macOS/Linux/WSL command):
+///
+/// ```text
+/// curl -fsSL https://claude.ai/install.sh | bash
+/// ```
+///
+/// That same page documents the install location this crate's shared
+/// [`crate::ipc::commands::resolve_claude_bin_expr`] relies on ("Auto-updates" section):
+/// on macOS/Linux the native installer manages a launcher SYMLINK at
+/// `~/.local/bin/claude`, pointing into `~/.local/share/claude/versions/<version>` —
+/// exactly the non-`PATH` fallback location every remote `claude` lookup in this crate
+/// now searches.
+pub const CLAUDE_INSTALL_URL: &str = "https://claude.ai/install.sh";
+
+/// (B14 fix round 3 — blocker) Bounds [`install_claude`]'s entire ssh round trip — the
+/// download, the installer script, AND the final `claude --version` check all run
+/// inside ONE remote command, with no timeout anywhere on this crate's side before this
+/// fix (unlike every other remote script in `bootstrap/`, e.g.
+/// [`crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT`] guarding `diagnose`'s own
+/// `cmd.output()` for exactly this class of bug — a wedged remote shell must not hang
+/// the caller forever). That 20s bound is right for a status probe, but wrong here: a
+/// real download + the official installer's own work can legitimately take well past
+/// 20s on a slow link, so this gets its own, longer deadline instead of reusing that
+/// one. 5 minutes is generous for a ~100MB-class download over a slow remote link while
+/// still bounded — a hang in `curl`/`wget`, the installer, or the final version check
+/// cannot freeze [`StepId::InstallClaude`]/[`RepairAction::InstallClaude`] (and this
+/// machine's [`crate::bootstrap::orchestrator::ServerLocks`] slot along with it) forever
+/// with no way for the user to cancel.
+const INSTALL_CLAUDE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// (B14 fix round 3 — major) Caps [`install_claude`]'s captured installer-failure log
+/// AFTER [`strip_ansi`], in addition to the remote script's own `tail -n 5` line cap —
+/// that cap bounds line COUNT only, so a single pathologically long line from the
+/// black-box `claude install` subcommand (see [`install_claude`]'s own doc) would still
+/// reach [`BootstrapError::Other`]/the settings UI unbounded. ~2000 chars is generous
+/// for a human-readable diagnostic while still bounded.
+const INSTALL_LOG_MAX_CHARS: usize = 2000;
+
+/// Installs Claude Code on `machine` via the official native installer (see
+/// [`CLAUDE_INSTALL_URL`]'s doc for the citation), run as the ssh LOGIN user —
+/// **never** `sudo`/root: the native installer is entirely user-scoped (installs under
+/// `$HOME`, no system-wide state), and running it as a different user would install it
+/// somewhere the login user's own shell — and this crate's own resolver, which only
+/// ever checks the LOGIN user's `$HOME` — would never find.
+///
+/// Downloads the script to a private temp file first (`curl -fsSL`, falling back to
+/// `wget -qO` when `curl` isn't on the target — some minimal Debian/Ubuntu images ship
+/// neither by default, but `wget` is more commonly preinstalled than `curl` there), and
+/// only runs it with `bash` once that download completed IN FULL (`set -e` fails the
+/// whole script the instant either download command reports an error — `curl -f`
+/// itself fails on a 4xx/5xx HTTP status) — never piping a possibly-truncated network
+/// stream straight into a shell, which could otherwise execute a syntactically-valid
+/// PREFIX of the installer as if it were the complete thing.
+///
+/// Verifies with `<resolved claude> --version` (the crate's shared resolver, so this
+/// proves the very same lookup every OTHER remote `claude` invocation in this crate
+/// will use, not just that the installer's own exit code was zero) and returns that
+/// version string. `Err` when the download/install itself failed, OR when it reported
+/// success but the resolver still can't find a working `claude` afterward (an
+/// unexpected installer layout change) — never a silent, unverified "done".
+///
+/// The version is read back off a single `FLIGHTDECK_CLAUDE_INSTALLED_VERSION:` marker
+/// line (the same accumulating-script discipline this crate's other probes use) rather
+/// than the script's raw stdout — the installer's OWN progress output would otherwise
+/// land in front of the version string with nothing to tell the two apart, so a
+/// SUCCESSFUL run still discards it (captured into `$OUT`, never echoed).
+///
+/// (Review fix) A FAILED run's captured output is NOT discarded: `run_ssh_on_machine`
+/// only ever surfaces the LAST line of stderr on a non-zero exit (see its own doc), and
+/// the wrapper script this installer is fetched from (`https://claude.ai/install.sh`)
+/// is only disciplined to `echo … >&2` for checks IT performs itself (download
+/// failures, unsupported OS/arch) — the compiled `claude install` subcommand it then
+/// runs internally is a black box that could just as easily explain a failure on its
+/// OWN stdout, which used to be silently thrown at `/dev/null` unconditionally, even
+/// on failure. `$OUT` now captures both streams; on a non-zero exit its last few lines
+/// are joined onto ONE line (so `run_ssh_on_machine`'s own "last stderr line" plumbing
+/// carries more than a single line's worth of context) and written to stderr before
+/// re-raising the SAME exit code the installer itself failed with — `set -e` cannot be
+/// left to do this (a failing command substitution assigned directly to a variable
+/// aborts the script before `$?` can be read; wrapping it as the `if` condition itself
+/// is exempt from `errexit`, which is why that shape is used here).
+///
+/// (B14 fix round 3 — major) The remote `tail -n 5` above bounds LINE COUNT only — the
+/// black-box `claude install` subcommand this doc already warns is "not guaranteed to
+/// be well-behaved, plain text" could just as easily emit five arbitrarily long lines,
+/// or wrap its output in the exact same OSC-8/CSI escape sequences this module's own
+/// [`strip_ansi`] already exists to defend the sign-in prompt against (see the module
+/// doc's "claude auth login needs NO pty" section) — but that stripping was never
+/// applied to THIS capture path. The captured tail is now run through [`strip_ansi`]
+/// and clamped to [`INSTALL_LOG_MAX_CHARS`] before it reaches [`BootstrapError::Other`]
+/// / the settings UI.
+pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
+    let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
+    let script = format!(
+        "set -e\n\
+         TMP=$(mktemp)\n\
+         trap 'rm -f \"$TMP\"' EXIT\n\
+         if command -v curl >/dev/null 2>&1; then\n\
+         \x20   curl --max-time 120 -fsSL {url} -o \"$TMP\"\n\
+         elif command -v wget >/dev/null 2>&1; then\n\
+         \x20   wget --timeout=120 -qO \"$TMP\" {url}\n\
+         else\n\
+         \x20   echo 'neither curl nor wget is available to download the Claude Code installer' >&2\n\
+         \x20   exit 7\n\
+         fi\n\
+         if OUT=$(bash \"$TMP\" 2>&1); then\n\
+         \x20   INSTALL_STATUS=0\n\
+         else\n\
+         \x20   INSTALL_STATUS=$?\n\
+         fi\n\
+         if [ \"$INSTALL_STATUS\" -ne 0 ]; then\n\
+         \x20   printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
+         \x20   exit \"$INSTALL_STATUS\"\n\
+         fi\n\
+         echo \"FLIGHTDECK_CLAUDE_INSTALLED_VERSION:$({claude_bin} --version 2>/dev/null)\"\n",
+        url = CLAUDE_INSTALL_URL,
+    );
+    // (B14 fix round 3 — blocker) Bounded so a hang anywhere in the remote script —
+    // the download despite its own `--max-time`, the installer, or the final version
+    // check — cannot freeze this step forever; see `INSTALL_CLAUDE_TIMEOUT`'s own doc.
+    let out = tokio::time::timeout(INSTALL_CLAUDE_TIMEOUT, run_ssh_on_machine(machine, known_hosts, &script))
+        .await
+        .map_err(|_| BootstrapError::Timeout)?
+        .map_err(|e| BootstrapError::Other(strip_ansi(&e).chars().take(INSTALL_LOG_MAX_CHARS).collect()))?;
+    let version = crate::ipc::commands::extract_marker(&out, "FLIGHTDECK_CLAUDE_INSTALLED_VERSION:")
+        .filter(|s| !s.is_empty());
+    version.ok_or_else(|| {
+        BootstrapError::Other("Claude Code's installer finished but `claude --version` produced no output".to_string())
+    })
+}
+
+// ============================================================================
 // claude_login — pure text recognition
 // ============================================================================
 
@@ -300,6 +437,21 @@ fn parse_auth_status(stdout: &str) -> Option<AuthStatus> {
     Some(AuthStatus { logged_in: raw.logged_in, email: raw.email })
 }
 
+/// The `claude auth status --json` command, resolved through the crate's shared
+/// [`crate::ipc::commands::resolve_claude_bin_expr`] (B14) rather than a bare `claude`
+/// — a non-interactive ssh shell never has the official installer's `~/.local/bin` on
+/// `PATH`. `pub(crate)` so the crate-wide "no bare `command -v claude`" regression test
+/// in `bootstrap::orchestrator` can exercise it directly.
+pub(crate) fn claude_auth_status_cmd() -> String {
+    format!("{} auth status --json", crate::ipc::commands::resolve_claude_bin_expr())
+}
+
+/// The `claude auth login` command — same resolver, same reason. See
+/// [`claude_auth_status_cmd`]'s doc.
+pub(crate) fn claude_auth_login_cmd() -> String {
+    format!("{} auth login", crate::ipc::commands::resolve_claude_bin_expr())
+}
+
 /// Runs `claude auth status --json` on `machine` and parses its stdout REGARDLESS of
 /// the ssh command's exit status — deliberately NOT `run_ssh_on_machine`, which treats
 /// any non-zero exit as failure and discards stdout entirely. VERIFIED live: the real
@@ -317,7 +469,7 @@ pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Opti
     // edit) degrades to "could not confirm" here, exactly like every other ssh-level
     // failure this function already treats that way — never a spawn built from it.
     crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
-    cmd.arg("claude auth status --json");
+    cmd.arg(claude_auth_status_cmd());
     let output = cmd.output().await.ok()?;
     parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
@@ -781,7 +933,7 @@ async fn drive_claude_login(
             reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
         };
     }
-    cmd.arg("claude auth login");
+    cmd.arg(claude_auth_login_cmd());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1926,31 +2078,20 @@ mod tests {
     /// dependency), then `install`s it with root ownership via `sudo -S`, fed the
     /// fixture's own documented (non-secret, throwaway) password. Fixture C ships with
     /// `flightdeckd` already baked into its image, so only fixture A needs this.
-    /// Installs the `claude` CLI onto fixture A via its own official installer, then
-    /// symlinks it onto `/usr/local/bin` (root-owned, needs the fixture's `sudo`) —
-    /// `~/.local/bin` alone is NOT enough: a non-interactive ssh command doesn't source
-    /// `.profile`/`.bashrc` (VERIFIED live while building this test), so `claude`
-    /// would be invisible to the very `command -v claude` this crate's own
-    /// `probe_remote` uses to decide a server is pairable in the first place — a real
-    /// paired machine's `claude` is ALREADY resolvable this way by construction; this
-    /// mirrors that for the fixture, which (unlike fixture C's baked-in `flightdeckd`)
-    /// starts every `fixture.sh up a` with nothing installed at all.
+    ///
+    /// Installs the `claude` CLI onto fixture A via THIS module's own production
+    /// [`install_claude`] — proves the exact same code path
+    /// [`crate::bootstrap::orchestrator::StepId::InstallClaude`] runs live, against a
+    /// real container that starts every `fixture.sh up a` with nothing installed at
+    /// all. (B14) No `/usr/local/bin` symlink hack needed any more: before B14 every
+    /// remote `claude` lookup was a bare `command -v claude`, invisible to a
+    /// non-interactive ssh shell's `PATH`-less `~/.local/bin` (VERIFIED live while
+    /// building the ORIGINAL version of this helper) — B14's shared
+    /// [`crate::ipc::commands::resolve_claude_bin_expr`] finds it there directly, so
+    /// this now just IS the real install path, unmodified.
     async fn install_claude_on_fixture_a(machine: &MachineRecord, known_hosts: Option<&str>) {
-        let install = run_ssh_on_machine(
-            machine,
-            known_hosts,
-            "curl -fsSL https://claude.ai/install.sh | bash",
-        )
-        .await;
-        assert!(install.is_ok(), "claude install failed: {install:?}");
-
-        let link_cmd = format!(
-            "printf '%s\\n' {} | sudo -S ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude",
-            crate::ipc::commands::shq(FIXTURE_A_PASSWORD)
-        );
-        run_ssh_on_machine(machine, known_hosts, &link_cmd)
-            .await
-            .expect("linking claude onto /usr/local/bin must succeed");
+        let version = install_claude(machine, known_hosts).await;
+        assert!(version.is_ok(), "claude install failed: {version:?}");
     }
 
     async fn install_flightdeckd_on_fixture_a(machine: &MachineRecord, known_hosts: Option<&str>) {

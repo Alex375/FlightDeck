@@ -271,7 +271,12 @@ export function buildServerCommand(publicKey: string): string {
   return [
     `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
     `printf "%s\\n" "${publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
-    `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | sh) then run: claude\\n" >&2`,
+    // (B14) The official command pipes to `bash`, not `sh` — see
+    // `bootstrap::server_setup::install_claude`'s own doc for the citation. This is a
+    // best-effort, non-blocking NOTE only (unlike our own ssh probes' hard pairing
+    // gate) — it runs in the user's OWN interactive terminal, not a non-interactive
+    // ssh batch call, so `command -v claude` is left as-is here.
+    `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | bash) then run: claude\\n" >&2`,
     `command -v flightdeckd >/dev/null 2>&1 || printf "NOTE: flightdeckd not found on PATH, ~/.local/bin or /usr/local/bin (needed for persistent sessions)\\n" >&2`,
     `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
     `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; LAN_H=$3; else LAN_H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi`,
