@@ -74,6 +74,7 @@
 // superseded…".
 import { useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { Ico } from "../../ui/kit";
 import { commands, events, type LoginResultReason, type LoginSession } from "../../ipc/client";
 import { ensureClaudeLoginSessionsWired, useClaudeLoginSessions } from "./claudeLoginSessions";
 import { isTrustedSignInUrl } from "./serverBootstrapModel";
@@ -95,6 +96,10 @@ export function ClaudeSignInInline({
   const [starting, setStarting] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // True once a code has been handed to the server-side CLI, until its verdict event
+  // arrives: the CLI can take up to a minute to exchange it, and the first real
+  // novice run showed an empty form with no sign of life in the meantime.
+  const [codeSent, setCodeSent] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ ok: boolean; email: string | null; error: string | null; reason: LoginResultReason | null } | null>(
     null,
@@ -211,6 +216,7 @@ export function ClaudeSignInInline({
     setError(null);
     setResult(null);
     setUrl(null);
+    setCodeSent(false);
     const res = await commands.startClaudeLogin(machineId);
     setStarting(false);
     if (res.status === "ok") {
@@ -234,6 +240,7 @@ export function ClaudeSignInInline({
     setResult(null);
     setUrl(null);
     setCode("");
+    setCodeSent(false);
     const res = await commands.restartClaudeLogin(machineId);
     setRestarting(false);
     if (res.status === "ok") {
@@ -271,7 +278,8 @@ export function ClaudeSignInInline({
     setError(null);
     void commands.submitClaudeLoginCode(target, submitted).then((res) => {
       setSubmitting(false);
-      if (res.status !== "ok") setError(res.error);
+      if (res.status === "ok") setCodeSent(true);
+      else setError(res.error);
     });
   }, [session, code]);
 
@@ -295,6 +303,7 @@ export function ClaudeSignInInline({
     setSession(null);
     setUrl(null);
     setCode("");
+    setCodeSent(false);
     setError(null);
     ownsSessionRef.current = false;
   }, [session, machineId]);
@@ -336,21 +345,29 @@ export function ClaudeSignInInline({
   return (
     <div className={styles.remotePanel}>
       <div className={styles.remoteStep}>
-        {url ? (
+        {codeSent ? (
+          <>
+            <Ico name="refresh" className="wf-spin-fast" /> Checking the code with Claude on the server… this can
+            take up to a minute.
+          </>
+        ) : url ? (
           <>
             <b>Open the sign-in page</b>, sign in, then paste the code it shows below.
           </>
         ) : (
-          "Waiting for the sign-in link…"
+          <>
+            <Ico name="refresh" className="wf-spin-fast" /> Waiting for the sign-in link…
+          </>
         )}
       </div>
-      {url && (
+      {url && !codeSent && (
         <div className={styles.btnRow}>
           <button type="button" className={`${styles.btn} ${styles.ghost}`} onClick={openSignIn}>
             Open sign-in page
           </button>
         </div>
       )}
+      {!codeSent && (
       <div className={styles.fieldRow}>
         <input
           className={styles.field}
@@ -372,6 +389,7 @@ export function ClaudeSignInInline({
           {submitting ? "Connecting…" : "Submit"}
         </button>
       </div>
+      )}
       {error && <div className={styles.errorMsg}>{error}</div>}
       <div className={styles.btnRow}>
         <button type="button" className={`${styles.btn} ${styles.ghost}`} onClick={cancel}>

@@ -143,6 +143,35 @@ describe("ClaudeSignInInline — code handling", () => {
     await settle();
     expect(Object.keys(localStorage)).toHaveLength(0);
   });
+
+  // First real novice run (19/09): after pasting the code, nothing on screen moved for
+  // up to a minute while the server-side CLI exchanged it.
+  it("shows a spinner while waiting for the link, then a 'checking the code' state until the verdict", async () => {
+    startClaudeLogin.mockResolvedValue({ status: "ok", data: { session_id: "s1", machine_id: "m1", owned: true } });
+    submitClaudeLoginCode.mockResolvedValue({ status: "ok", data: null });
+    mount();
+    click("Start Claude sign-in");
+    await settle();
+    expect(container.textContent).toContain("Waiting for the sign-in link");
+    expect(container.querySelector(".wf-spin-fast")).not.toBeNull();
+
+    act(() => serverLoginPromptEvent.emit({ session_id: "s1", machine_id: "m1", url: "https://claude.ai/oauth" }));
+    await settle();
+    expect(container.querySelector(".wf-spin-fast")).toBeNull();
+    setValue(codeInput()!, "123456");
+    click("Submit");
+    await settle();
+
+    expect(container.textContent).toContain("Checking the code with Claude");
+    expect(container.querySelector(".wf-spin-fast")).not.toBeNull();
+    expect(codeInput()).toBeNull();
+
+    act(() =>
+      serverLoginResultEvent.emit({ session_id: "s1", machine_id: "m1", ok: true, email: "a@b.c", error: null, reason: null }),
+    );
+    await settle();
+    expect(container.textContent).toContain("Signed in as a@b.c");
+  });
 });
 
 // B-finding #4: single-flight semantics — a plain Start attaches (never kills a live
