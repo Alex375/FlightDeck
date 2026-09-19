@@ -2629,10 +2629,10 @@ async bootstrapServer(label: string, host: string, port: number, user: string, p
  * simply collide with this very session's own still-held lock. That key is the
  * MACHINE id whenever one was already known at the ORIGINAL `bootstrap_server` call
  * (see [`server_lock_key`]) — carried forward verbatim from `StoredSession::lock_key`,
- * never re-derived here, so [`sync_resume_request_to_machine`]'s own coordinate
+ * never re-derived here, so [`resolve_and_sync_resume_machine`]'s own coordinate
  * rewrite below can never disturb which lock this run holds.
  * 
- * [`sync_resume_request_to_machine`]: residual defect A8/R2 (CRM `1abfc028`) — once
+ * [`resolve_and_sync_resume_machine`]: residual defect A8/R2 (CRM `1abfc028`) — once
  * [`resolve_resume_machine`] re-finds the right, possibly-rotated [`MachineRecord`],
  * its CURRENT `host`/`port`/`user` are copied onto the resumed `req` BEFORE the
  * pipeline is built, so every step dials where the machine is reachable TODAY, not
