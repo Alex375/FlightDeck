@@ -1,19 +1,19 @@
 import { Ico } from "../../ui/kit";
-import { useEditorLayout, useEditorStore } from "./editorStore";
+import { useEditorLayout, useEditorStore, useSideRegionOpen } from "./editorStore";
 
 /**
- * Title-bar controls for the editor panel: a toggle to open/close it, and — when
- * a region is shown (editor, terminal, OR the Git workspace) — a toggle to switch
- * its placement between side-by-side and stacked. In Git mode the orientation
- * button drives the Git workspace's own orientation (`gitOrientation`); otherwise
- * the editor/terminal region's (`orientation`).
+ * Title-bar controls for the editor panel: a toggle to open/close it, and — when the side
+ * region shows anything (editor, terminal, the Git workspace, an artifact or a TOSSE task)
+ * — a toggle to switch its placement between side-by-side and stacked. In Git mode the
+ * orientation button drives the Git workspace's own orientation (`gitOrientation`);
+ * otherwise the side region's (`orientation`), which an open artifact or task follows too.
  */
-export function EditorToggle() {
-  const { open, terminalOpen, gitOpen, orientation, gitOrientation } = useEditorLayout();
+export function EditorToggle({ convId }: { convId: string }) {
+  const { open, gitOpen, orientation, gitOrientation } = useEditorLayout();
   const toggleOpen = useEditorStore((s) => s.toggleOpen);
   const setOrientation = useEditorStore((s) => s.setOrientation);
   const setGitOrientation = useEditorStore((s) => s.setGitOrientation);
-  const sideOpen = open || terminalOpen || gitOpen;
+  const sideOpen = useSideRegionOpen(convId);
   const curOrientation = gitOpen ? gitOrientation : orientation;
   const flipOrientation = () => {
     const next = curOrientation === "row" ? "column" : "row";

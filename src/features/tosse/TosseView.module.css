@@ -521,6 +521,7 @@
 .act {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   flex: 0 0 auto;
   white-space: nowrap;
   height: 22px;
@@ -797,6 +798,33 @@
   font-size: 11px;
   color: var(--wf-tx-lo);
 }
+/* The same chip as a control (the side panel's AssigneePicker): click the avatar, pick a
+   person — the CRM's AssigneeAvatarSelect. */
+.whoPick {
+  height: 24px;
+  padding: 0 6px 0 3px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.whoPick:hover:not(:disabled) {
+  background: var(--wf-panel-2);
+  border-color: var(--wf-line-2);
+  color: var(--wf-tx-hi);
+}
+.whoPick:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.whoPick svg {
+  width: 11px;
+  height: 11px;
+  opacity: 0.7;
+}
 .due {
   font-size: 11px;
   color: var(--wf-tx-xlo);
@@ -809,8 +837,14 @@
 /* Revealed on row hover, like the sidebar's own row tools. `display: none` → `inline-flex`
    rather than an opacity fade with reserved space: the title flexes, so the buttons take
    their room from IT when they appear, and the row never reflows the parts that matter
-   (dot, priority, title start). Keyboard focus reveals them too — a control that only
-   exists under a pointer is unreachable otherwise. */
+   (dot, priority, title start).
+   The keyboard reveals them too, from the ROW's `:focus-within` — never this box's own.
+   `display: none` takes everything inside it out of the tab order, so `.rowActs:focus-within`
+   could never match: nothing in here can be focused while it is hidden, and it stays hidden
+   until something in it is focused. The row itself is focusable (`role="button"`,
+   `tabindex="0"`) and carries the status dot's button, so `.row:focus-within` holds from the
+   moment the keyboard reaches the row — and keeps holding once focus moves on into these
+   buttons, which are the row's descendants. */
 .rowActs {
   display: none;
   align-items: center;
@@ -818,7 +852,7 @@
   flex: 0 0 auto;
 }
 .row:hover .rowActs,
-.rowActs:focus-within {
+.row:focus-within .rowActs {
   display: inline-flex;
   animation: actsIn 0.12s ease-out;
 }
@@ -1008,6 +1042,14 @@
   overflow-y: auto;
   flex: 1;
   min-height: 0;
+}
+/* The body takes the keyboard PROGRAMMATICALLY, and only that (`tabindex="-1"`, never in the
+   tab order): unlinking the last conversation on a task unmounts the list it lived in, and
+   focus would otherwise drop to <body> and make the user tab in from the top of the document
+   again. No ring — this box is the whole panel, a 2px outline around it would read as an
+   error state, and nobody can land here by tabbing. */
+.detailBody:focus {
+  outline: none;
 }
 /* Sections are separated by a rule, as in the CRM's continuous card — never by empty space
    alone, which reads as a gap rather than as a boundary. */
@@ -1283,13 +1325,35 @@
   opacity: 0.6;
   transition: opacity 0.12s ease, color 0.12s ease;
 }
+/* Revealed on hover — and on `:focus-within` of the ROW, which is what makes the × exist
+   for the keyboard at all. `display:none` takes an element out of the tab order entirely,
+   so a rule hanging off the button's OWN focus could never match: it can't be focused while
+   it is hidden, and it is hidden until it is focused. `.convItem:focus-within` is the whole
+   answer on its own — the × is INSIDE the item, so the condition still holds once the ×
+   itself takes the focus. Tabbing onto the row's open button brings the × into the layout,
+   and the next Tab lands on it. */
 .convItem:hover .convUnlink,
-.convUnlink:focus-visible {
+.convItem:focus-within .convUnlink {
   display: inline-flex;
 }
 .convUnlink:hover {
   opacity: 1;
   color: var(--wf-tx-hi);
+}
+/* Focused for real — a different rule from the reveal above, which only decides whether the
+   × is in the layout at all. On this near-black panel a 0.6-opacity glyph doesn't read as the
+   thing about to be activated, and a brightness/opacity nudge would be invisible — so the base
+   colours change (filled background, strong ink) and the app's focus ring is drawn around it:
+   2px of accent, 1px clear of the box, as everywhere else (`conductor-flightdeck.css`,
+   `conductor-conversation.css`). Nothing clips the outer ring: `.convItem` sets no `overflow`,
+   and in the panel's scroll box the × sits 18px clear of the clipping edge (22px of
+   `.detailBody` padding, minus the item's 8px of negative margin, plus the ×'s own 4px). */
+.convUnlink:focus-visible {
+  opacity: 1;
+  color: var(--wf-tx-hi);
+  background: var(--wf-panel-3);
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 1px;
 }
 
 /* ---- "Start" as a split button ---------------------------------------- */
@@ -1370,7 +1434,7 @@
    already is (you have just clicked "Start"), so hiding it on hover would delete the only
    confirmation there is, precisely when it is meant to be read. */
 .row:hover .linked:not(.linkedStarted),
-.row:has(.rowActs:focus-within) .linked:not(.linkedStarted) {
+.row:focus-within .linked:not(.linkedStarted) {
   display: none;
 }
 

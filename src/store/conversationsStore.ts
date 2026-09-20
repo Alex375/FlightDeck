@@ -21,7 +21,7 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import type { AddressCandidate, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
@@ -90,6 +90,20 @@ import { useMemo } from "react";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
+/**
+ * C9: the title to thread into a REMOTE spawn's `attach --title` (Rust
+ * `SpawnFlags.conversationTitle`) — `null` while the conversation is still on its
+ * own untitled placeholder ({@link DEFAULT_CONV_NAME}). The daemon writes whatever
+ * non-blank title it's given AUTHORITATIVELY (overwrites), including its own
+ * ai-title backfill for a still-untitled conversation — stamping the placeholder
+ * there at every spawn would permanently poison that backfill with a string no more
+ * useful than what it already shows for an empty title. Exported for its own unit
+ * test.
+ */
+export function conversationTitleForSpawn(name: string): string | null {
+  return name === DEFAULT_CONV_NAME ? null : name;
+}
+
 // Product defaults for a conversation's controls — also the spawn defaults the
 // Rust core falls back to. A conversation seeds these at creation; the composer
 // uses the same values as its display fallback, so UI and stream never disagree.
@@ -132,6 +146,24 @@ export interface Machine {
   /** Path to the private key on this Mac Flight Deck authenticates with. */
   identityFile?: string | null;
   addedAt: number;
+  /** Every candidate address pairing discovered (or the user typed) for this server,
+   *  `host` included — Tailscale name, LAN IP, hostname, … Carried for a later task
+   *  (A6) to rotate through on a failed reconnect; today only `host` is dialed.
+   *  Empty for a machine paired before this was recorded. */
+  addresses: AddressCandidate[];
+  /** This node's relay identity, straight off `flightdeckd whoami`. `null` until a
+   *  daemon init/whoami round trip has succeeded for this machine. */
+  daemonMacId?: string | null;
+  /** This node's relay URL, straight off `flightdeckd whoami`. Same `null` discipline
+   *  as {@link daemonMacId}. */
+  daemonRelayUrl?: string | null;
+  /** The label the daemon itself was initialized with — separate from {@link label}
+   *  (the human-facing name Flight Deck shows), the two can drift. Same `null`
+   *  discipline as {@link daemonMacId}. */
+  daemonLabel?: string | null;
+  /** Unix ms timestamp the phone (mobile relay) was last provisioned for this server,
+   *  or `null`/`undefined` if it never has been. */
+  phoneProvisionedAt?: number | null;
 }
 
 /** Which agent backend drives a conversation. Chosen at creation, immutable after
@@ -361,6 +393,15 @@ const recordToMachine = (m: MachineRecord): Machine => ({
   user: m.user,
   identityFile: m.identity_file,
   addedAt: m.added_at,
+  // `?` in the generated type (from the Rust side's `#[serde(default)]`) is a
+  // deserialization nicety only — the core always serializes a concrete `[]`, never
+  // omits the field — but the `?? []` mirrors how `PersistedState.machines` is
+  // already defaulted below, for the same reason.
+  addresses: m.addresses ?? [],
+  daemonMacId: m.daemon_mac_id,
+  daemonRelayUrl: m.daemon_relay_url,
+  daemonLabel: m.daemon_label,
+  phoneProvisionedAt: m.phone_provisioned_at,
 });
 
 const convToRecord = (c: Conversation): ConversationRecord => ({
@@ -457,15 +498,29 @@ interface ConversationsState {
   generateMachineKey: (
     label: string,
   ) => Promise<{ ok: true; key: GeneratedKey } | { ok: false; error: string }>;
-  /** Pair a remote server: probe it (SSH + `claude`) and, on success, persist +
-   *  add it. Returns the saved machine, or an actionable error the form shows. */
+  /** Pair a remote server: probe it (SSH + `claude` + `flightdeckd`) and, on success,
+   *  persist + add it. Returns the saved machine, or an actionable error the form
+   *  shows. `addresses` is the full set of candidates the pairing ticket discovered
+   *  (Tailscale name / LAN IP / hostname) — the core probes them in priority order
+   *  and persists whichever one actually worked as `Machine.host`, the full set as
+   *  `Machine.addresses`.
+   *
+   *  `matchedExisting: true` means this converged on an ALREADY-paired server (same
+   *  host/port/user, or the working address matched one of that machine's other
+   *  recorded addresses — see `Store::machine_by_any_address`) and UPDATED that row
+   *  rather than adding a new one; the caller shows "Updated the existing server …"
+   *  instead of implying a second server was added. */
   addMachine: (input: {
     label: string;
     host: string;
     port: number;
     user: string;
     identityFile: string | null;
-  }) => Promise<{ ok: true; machine: Machine } | { ok: false; error: string }>;
+    addresses?: AddressCandidate[] | null;
+  }) => Promise<
+    | { ok: true; machine: Machine; matchedExisting: boolean }
+    | { ok: false; error: string }
+  >;
   /** Un-pair a server: removes it and every repo/conversation anchored to it. */
   removeMachine: (id: string) => void;
   /** Register a repo that lives on a remote server (idempotent by path+machine). */
@@ -606,6 +661,45 @@ interface ConversationsState {
   linkConversationToTask: (id: string, task: LinkedTosseTask | null) => void;
 }
 
+/**
+ * Full per-conversation teardown, shared by every cascade-delete path (one
+ * conversation, a whole repo, or a whole server): stop the live `claude` process (if
+ * any — the no-orphan policy) and drop every per-conversation store + persisted cache,
+ * so nothing from a removed conversation lingers. `stopSession` failures are surfaced
+ * (never silent) via `syncToCore`'s app-error banner, same as every other write here.
+ *
+ * Deliberately does NOT touch the conversations/repos arrays themselves, undo-stack
+ * bookkeeping, or repo-scoped state (sidebar fold, manual repo order) — each caller
+ * owns those at its own level (see `removeConversation`/`removeRepo`/`removeMachine`).
+ */
+function teardownConversationSession(id: string, handle: string | null): void {
+  if (handle) {
+    syncToCore("stopSession", () => commands.stopSession(handle));
+  }
+  useConversationStore.getState().dropSession(id);
+  useBackgroundTasksStore.getState().dropSession(id);
+  useWorkflowLiveStore.getState().drop(id);
+  useWorkflowJournalStore.getState().drop(id);
+  clearCachedWindow(id);
+  disposeTerminal(id);
+  clearTodoBarOpen(id);
+  clearComposerDraft(id);
+  clearComposerAttachments(id);
+  clearCodexControls(id);
+  clearWorkFold(id);
+  clearPlanAnnotations(id);
+  useGitViewStore.getState().clear(id);
+  useRemoteControlStore.getState().clear(id);
+  useGoalStore.getState().clear(id);
+  // Drop the derived artifacts memo: it pins this conversation's timeline + tool results.
+  clearArtifactsCache(id);
+  useLastMessageSummaryStore.getState().clear(id);
+  autoTitlePending.delete(id);
+  titleContext.delete(id);
+  titleGenCount.delete(id);
+  lastAppliedSeq.delete(id);
+}
+
 export const useConversationsStore = create<ConversationsState>()((set, get) => ({
   repos: [],
   conversations: [],
@@ -620,35 +714,58 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   addMachine: async (input) => {
-    // The core probes the server (SSH reachable + `claude` present) BEFORE saving,
-    // so a bad host / key / paste / missing claude surfaces as an error here.
+    // The core probes the server (SSH reachable + `claude` + `flightdeckd` present,
+    // `flightdeckd` current) BEFORE saving, so a bad host / key / paste / missing or
+    // outdated tool surfaces as an error here.
     const res = await commands.addMachine(
       input.label,
       input.host,
       input.port,
       input.user,
       input.identityFile,
+      input.addresses ?? null,
     );
     if (res.status !== "ok") return { ok: false, error: res.error };
-    const machine = recordToMachine(res.data);
+    const machine = recordToMachine(res.data.machine);
     set((s) => ({
       machines: [...s.machines.filter((m) => m.id !== machine.id), machine],
     }));
-    return { ok: true, machine };
+    return { ok: true, machine, matchedExisting: res.data.matched_existing };
   },
 
   removeMachine: (id) => {
     // Remove the server and everything anchored to it (its repos + their conversations),
-    // mirroring the core's cascade so the UI matches without a reload.
-    const repoIds = new Set(
-      get().repos.filter((r) => r.machineId === id).map((r) => r.id),
-    );
-    set((s) => ({
-      machines: s.machines.filter((m) => m.id !== id),
-      repos: s.repos.filter((r) => r.machineId !== id),
-      conversations: s.conversations.filter((c) => !repoIds.has(c.repoId)),
-    }));
+    // mirroring the core's cascade so the UI matches without a reload. The Rust
+    // delete_machine only cascades DB rows (repos, conversations) — it never touches a
+    // live process — so, same as removeRepo/removeConversation, we must stop every live
+    // `claude` on this server ourselves (no orphan) before dropping it from state.
+    const repos = get().repos.filter((r) => r.machineId === id);
+    const repoIds = new Set(repos.map((r) => r.id));
+    for (const c of get().conversations) {
+      if (!repoIds.has(c.repoId)) continue;
+      teardownConversationSession(c.id, c.handle);
+    }
+    for (const r of repos) {
+      // Forget this repo's sidebar collapse state + manual drag order — same repo-scoped
+      // cleanup removeRepo performs, so a removed server leaves nothing behind either.
+      clearSidebarFold(r.id);
+      clearManualOrderRepo(r.id);
+    }
+    set((s) => {
+      const conversations = s.conversations.filter((c) => !repoIds.has(c.repoId));
+      return {
+        machines: s.machines.filter((m) => m.id !== id),
+        repos: s.repos.filter((r) => r.machineId !== id),
+        conversations,
+        // Same reselect-on-cascade as removeRepo: fall back to the last remaining
+        // conversation (or none) when the active one was on this server.
+        activeId: conversations.some((c) => c.id === s.activeId)
+          ? s.activeId
+          : (conversations[conversations.length - 1]?.id ?? null),
+      };
+    });
     syncToCore("deleteMachine", () => commands.deleteMachine(id));
+    syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
   },
 
   addRemoteRepo: (machineId, path) => {
@@ -694,38 +811,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // Forget any manual drag order for this repo (and its conversations, in every slot).
     clearManualOrderRepo(repo.id);
     // Cascade-delete every conversation under this repo. Mirror removeConversation's
-    // full per-row teardown: the Rust delete_repo only cascades DB rows, so we must
-    // stop each live `claude` process here (no orphan) and drop every per-conversation
-    // store + persisted cache so nothing is leaked.
+    // full per-row teardown (shared helper below): the Rust delete_repo only cascades
+    // DB rows, so we must stop each live `claude` process here (no orphan) and drop
+    // every per-conversation store + persisted cache so nothing is leaked.
     for (const c of get().conversations) {
       if (c.repoId !== repo.id) continue;
-      // Kill the live `claude` process (if any) so deleting a repo never leaves an
-      // orphan — same no-orphan policy as removeConversation.
-      if (c.handle) {
-        syncToCore("stopSession", () => commands.stopSession(c.handle!));
-      }
-      useConversationStore.getState().dropSession(c.id);
-      useBackgroundTasksStore.getState().dropSession(c.id);
-      useWorkflowLiveStore.getState().drop(c.id);
-      useWorkflowJournalStore.getState().drop(c.id);
-      clearCachedWindow(c.id);
-      disposeTerminal(c.id);
-      clearTodoBarOpen(c.id);
-      clearComposerDraft(c.id);
-      clearComposerAttachments(c.id);
-      clearCodexControls(c.id);
-      clearWorkFold(c.id);
-      clearPlanAnnotations(c.id);
-      useGitViewStore.getState().clear(c.id);
-      useRemoteControlStore.getState().clear(c.id);
-      useGoalStore.getState().clear(c.id);
-      // Drop the derived artifacts memo: it pins this conversation's timeline + tool results.
-      clearArtifactsCache(c.id);
-      useLastMessageSummaryStore.getState().clear(c.id);
-      autoTitlePending.delete(c.id);
-      titleContext.delete(c.id);
-      titleGenCount.delete(c.id);
-      lastAppliedSeq.delete(c.id);
+      teardownConversationSession(c.id, c.handle);
     }
     set((s) => {
       const conversations = s.conversations.filter((c) => c.repoId !== repo.id);
@@ -772,43 +863,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
         activeId: s.activeId === id ? (rest[rest.length - 1]?.id ?? null) : s.activeId,
       };
     });
-    // Kill the live `claude` process (if any) so deleting a conversation never
-    // leaves an orphan. Distinct from interrupt: this terminates the session.
-    if (conv?.handle) {
-      syncToCore("stopSession", () => commands.stopSession(conv.handle!));
-    }
-    // Drop its (now unreachable) message timeline from the message store, and its
-    // persisted context-window so the localStorage cache doesn't keep orphans.
-    useConversationStore.getState().dropSession(id);
-    useBackgroundTasksStore.getState().dropSession(id);
-    useWorkflowLiveStore.getState().drop(id);
-    useWorkflowJournalStore.getState().drop(id);
-    clearCachedWindow(id);
-    clearTodoBarOpen(id);
-    clearComposerDraft(id);
-    clearComposerAttachments(id);
-    clearCodexControls(id);
-    clearWorkFold(id);
+    // Full shared teardown (stop the live `claude` process — no orphan — plus every
+    // per-conversation store/cache) — same helper removeRepo/removeMachine use.
+    teardownConversationSession(id, conv?.handle ?? null);
+    // Forget any manual drag order for this one conversation — repo-level removal
+    // clears its whole per-repo slot instead (see removeRepo/removeMachine).
     clearManualOrderConversation(id);
-    clearPlanAnnotations(id);
-    autoTitlePending.delete(id);
-    titleContext.delete(id);
-    titleGenCount.delete(id);
-    lastAppliedSeq.delete(id);
-    // Kill its integrated terminal (PTY shell + xterm instance) too — same no-orphan
-    // policy as the claude session above. No-op if it never opened a terminal.
-    disposeTerminal(id);
-    useGitViewStore.getState().clear(id);
-    // Drop the bridge state too — the session was just stopped, so a lingering
-    // "connected" chip would be a stale, misleading indicator.
-    useRemoteControlStore.getState().clear(id);
-    // Drop its active-goal too — the conversation is gone.
-    useGoalStore.getState().clear(id);
-    // Drop the derived artifacts memo, which pins the (now dropped) timeline + tool results —
-    // otherwise the heaviest part of a deleted conversation outlives it for the whole run.
-    clearArtifactsCache(id);
-    // Drop its Flight Deck last-message summary — the card is gone.
-    useLastMessageSummaryStore.getState().clear(id);
     syncToCore("deleteConversation", () => commands.deleteConversation(id));
     syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
   },
@@ -857,6 +917,41 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     syncToCore("upsertConversation(rename)", () =>
       commands.upsertConversation(convToRecord(updated)),
     );
+    // C9 — idle-rename push: best-effort, only when this Mac ISN'T the one driving
+    // the conversation right now. A LIVE session's own next reattach already
+    // carries the current title forward (see `conversationTitleForSpawn`'s callers
+    // in `ensureConversationSession`), so pushing here too would be redundant —
+    // and, per `push_remote_conversation_title`'s safety contract, actively unsafe
+    // (a fresh attach would evict the Mac's OWN live link). `sessionId` gates on
+    // "the daemon has ever heard of this conversation" (nothing to `--resume`
+    // otherwise); `repo.machineId` gates on "remote at all" (a local Claude has no
+    // daemon-side title to push). `isSpawning` gates on "a resume-spawn for THIS
+    // conversation is under way right now" — `conv.handle` stays null for the whole
+    // duration `ensureConversationSession`'s spawn is in flight (set only once it
+    // resolves), so without this a rename racing that window would pass the
+    // `!conv.handle` check and could evict the just-landed live session. Never
+    // awaited — a failure here must never block or fail the LOCAL rename, which has
+    // already landed above.
+    if (!conv.handle && !isSpawning(id) && conv.sessionId) {
+      const repo = get().repos.find((r) => r.id === conv.repoId);
+      if (repo?.machineId) {
+        void commands
+          .pushRemoteConversationTitle(id, trimmed)
+          .then((ok) => {
+            // `push_remote_conversation_title` is infallible from the caller's point
+            // of view — it resolves `false` (never rejects) for every documented
+            // best-effort failure path (server unreachable, daemon too old, ssh
+            // round trip failed). The `.catch()` below only ever fires on a genuine
+            // Tauri IPC-level exception, so the common failure case needs its own
+            // log here or it vanishes silently. Never blocking: the next spawn
+            // carries the title anyway (see the doc above).
+            if (!ok) {
+              console.warn("pushRemoteConversationTitle: push did not land (daemon unreachable or too old)", id);
+            }
+          })
+          .catch((e) => console.error("pushRemoteConversationTitle failed:", e));
+      }
+    }
   },
 
   noteFirstMessage: (id, text) => {
@@ -1628,6 +1723,12 @@ export async function ensureConversationSession(
     // Which Claude account this process authenticates as. Read at spawn — the ONLY moment
     // it can be applied, since the CLI reads its credentials once at startup.
     const claudeAccountId = atSpawn.kind === "claude" ? (atSpawn.claudeAccountId ?? null) : null;
+    // C9: the conversation's CURRENT title, so a REMOTE spawn's `attach --title`
+    // carries it from the very first attach (gated + applied Rust-side — see
+    // `spawn_session`). Omitted while the conversation is still on its own
+    // placeholder name, so an untitled conversation never stamps that placeholder
+    // as the daemon's authoritative title (see `conversationTitleForSpawn`'s doc).
+    const conversationTitle = conversationTitleForSpawn(atSpawn.name);
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1636,7 +1737,13 @@ export async function ensureConversationSession(
       atSpawn.permissionMode,
       // The backend is fixed at creation; the spawn routes to the Claude or Codex actor.
       atSpawn.kind,
-      { ultracode: atSpawn.ultracode, allowBypassPermissions: allowBypass, appControl, claudeAccountId },
+      {
+        ultracode: atSpawn.ultracode,
+        allowBypassPermissions: allowBypass,
+        appControl,
+        claudeAccountId,
+        conversationTitle,
+      },
     );
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
@@ -1676,6 +1783,7 @@ export async function ensureConversationSession(
             appControl,
             // Same account too: a lost worktree must not silently change identity.
             claudeAccountId,
+            conversationTitle,
           },
         );
       }

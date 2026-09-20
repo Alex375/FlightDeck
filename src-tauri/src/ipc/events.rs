@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::Manager;
 use tauri_specta::Event;
 
 use crate::supervisor::model::{
@@ -205,6 +206,24 @@ impl crate::appmcp::ToolSink for AppControlEmitter {
     }
 }
 
+/// C10's critical fix, closed for real: `appmcp::relay::connect_once` calls
+/// this the moment a `revoke_phone` frame for `token` is actually written to a
+/// live, connected relay socket — never merely because a reconnect task was
+/// spawned (see `crate::appmcp::RevocationSink`'s doc for the bug this
+/// closes). Reuses `AppControlEmitter` rather than a dedicated struct — it
+/// already holds the `AppHandle` this needs, the same "least-invasive Store
+/// bridge" `TauriEmitter::emit_preferred_host` (below) uses for the
+/// supervisor's own analogous case. Best-effort persist, logged: a failure
+/// here just means the token stays queued and is sent — and this called —
+/// again on the next reconnect (harmless, idempotent).
+impl crate::appmcp::RevocationSink for AppControlEmitter {
+    fn relay_revocation_sent(&self, token: &str) {
+        if let Err(e) = self.app.state::<crate::store::Store>().clear_relay_phone_revocation(token) {
+            eprintln!("[appmcp] failed to clear relay phone revocation after sending it: {e}");
+        }
+    }
+}
+
 /// The wake word was heard by the on-device detector (`crate::wake`). The front
 /// reacts like a spoken push-to-talk — arm the voice session and open the mic (see
 /// `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`
@@ -262,6 +281,125 @@ pub struct TerminalOutputEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct TerminalExitEvent {
     pub id: String,
+}
+
+/// A `bootstrap::server_setup::start_claude_login` session recognized the remote
+/// `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
+/// per session; a session that was ALREADY signed in never emits this (it jumps
+/// straight to [`ServerLoginResultEvent`]).
+///
+/// ⚠️ `session_id` (added for the B-finding #4 single-flight fix's own follow-up
+/// review) is what lets a listener tell THIS session apart from one it has already
+/// moved past for the same `machine_id` — at most one session is ever live per
+/// machine, but a just-superseded session's belated event can still arrive after a
+/// `restart_claude_login` replacement is already known. See `ClaudeSignInInline`'s and
+/// `claudeLoginSessions.ts`'s own filtering docs.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct ServerLoginPromptEvent {
+    pub session_id: String,
+    pub machine_id: String,
+    pub url: String,
+}
+
+/// Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
+/// ever having to match on `error`'s wording (free-text, display-only). `None` on a
+/// successful sign-in (`ok: true`) — there is nothing to discriminate there.
+///
+/// Added for residual defect A8/R1 (CRM `1abfc028`, counter-verification of the
+/// single-flight sign-in fix wave): `Cancelled` used to be the one [`LoginOutcome`]
+/// that emitted NO event at all, on the assumption "the caller who cancelled already
+/// knows" — true only while a session had exactly one caller. Once `attach_or_reserve`
+/// let a second, non-owning surface watch the SAME session, that assumption broke: an
+/// attached surface left watching after the OWNER cancels/unmounts needs the same
+/// terminal signal `Superseded` already gets. `Cancelled` is now ALWAYS emitted too —
+/// this discriminant is what lets the surface that INITIATED the cancel recognize and
+/// ignore its own echo (it already knows), while every other attached surface treats it
+/// as the "stop showing a dead session" signal it never got before. See
+/// `ClaudeSignInInline`'s own doc for the front-end split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginResultReason {
+    /// A `DriverCommand::Cancel` reached the actor — either the owning caller's own
+    /// Cancel/unmount, or (going forward) anything else that ever sends one.
+    Cancelled,
+    /// An explicit "Restart sign-in" ([`crate::bootstrap::server_setup::
+    /// restart_claude_login`]) replaced this session before it reached a terminal
+    /// state.
+    Superseded,
+    /// The sign-in itself failed (wrong code, lost connection, timed out, …) — `error`
+    /// carries the human-readable detail.
+    Failed,
+}
+
+/// Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
+/// `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error`/`reason`
+/// set otherwise. Emitted for EVERY terminal [`LoginOutcome`] now, `Cancelled` included
+/// (see [`LoginResultReason`]'s own doc for why that changed) — a listener that
+/// initiated the cancel itself is expected to recognize `reason: "cancelled"` for ITS
+/// OWN session and render nothing for it, not have the backend stay silent.
+///
+/// ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
+/// has no way to distinguish this session's OWN terminal event from a stale one
+/// belonging to a session it has already moved past (the exact "Restart sign-in"
+/// race a follow-up review of B-finding #4 caught: the just-superseded session's
+/// belated `superseded` result clobbering the brand-new session's state).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct ServerLoginResultEvent {
+    pub session_id: String,
+    pub machine_id: String,
+    pub ok: bool,
+    pub email: Option<String>,
+    pub error: Option<String>,
+    pub reason: Option<LoginResultReason>,
+}
+
+/// `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+/// `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
+/// never on any `Err`, even one (like a wrong password) that still pinned a fresh host
+/// key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
+/// pipeline step that is the only caller of
+/// [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
+/// on the overall `Result`, not on "some fingerprint happens to be readable".
+/// DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+/// confirmation step gating on this event, it never blocks the flow. `known` = the
+/// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
+/// this particular connection attempt — `false` only on a server's genuine first
+/// contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
+/// it fails as `BootstrapError::HostKeyMismatch` instead (see
+/// `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct HostKeyFingerprintEvent {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub known: bool,
+}
+
+/// B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
+/// pipeline (`bootstrap_server` / `bootstrap_resume`) — carries the WHOLE step list on
+/// every emit, so a listener never has to reconstruct progress by accumulating a stream
+/// of partial deltas: the latest event alone is the complete picture. `steps[].status`
+/// is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/`"failed"`/`"needs_input"` (see
+/// `orchestrator::StepStatus::wire_str`, the one place that owns this exact wording).
+/// `session_id` is the opaque handle `bootstrap_server`'s own response carries — the
+/// SAME id `bootstrap_resume`/`bootstrap_cancel` take back.
+///
+/// (B8/B9's earlier, per-command `BootstrapStepEvent` — one event per `bootstrap_
+/// upload_daemon`/`bootstrap_install_service`/`bootstrap_escalate_persistence` call —
+/// was removed once B11's orchestrator superseded those granular commands and nothing
+/// in the front end listened to it any more; see B-finding #5.)
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct BootstrapProgressStep {
+    pub id: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct BootstrapProgressEvent {
+    pub session_id: String,
+    pub host: String,
+    pub steps: Vec<BootstrapProgressStep>,
 }
 
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
@@ -358,6 +496,30 @@ impl SessionEmitter for TauriEmitter {
             session: session.to_string(),
             area: area.to_string(),
         });
+    }
+
+    /// A6: NOT a front-facing event (no `Event` type, no bindings) — the supervisor
+    /// has no `Store` dependency (see the repo's encapsulation rule: `store/db.rs` is
+    /// the ONLY SQL service), so this is the least-invasive place to close the loop:
+    /// `TauriEmitter` already holds the `AppHandle` every other method here uses, and
+    /// through it the same Tauri-managed `Store` the IPC commands read/write. A
+    /// best-effort persist — logged, never surfaced to the conversation (the session
+    /// itself already reconnected fine; a failure here only means the NEXT spawn
+    /// re-tries the stale address, not that this one is broken).
+    fn emit_preferred_host(&self, _session: &str, machine_id: &str, host: &str) {
+        match self.app.state::<crate::store::Store>().set_machine_preferred_host(machine_id, host) {
+            Ok(0) => {
+                eprintln!(
+                    "[ipc] preferred-host persist: no machine row for id {machine_id} (deleted concurrently?)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "[ipc] failed to persist preferred host {host:?} for machine {machine_id}: {e}"
+                );
+            }
+        }
     }
 }
 

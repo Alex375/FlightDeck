@@ -16,7 +16,11 @@ import type { UserTurnImage } from "../../store/types";
 import { isTauri } from "../../ipc/provider";
 import { useShallow } from "zustand/react/shallow";
 import { useInterrupt, useSendMessage } from "../../ipc/useCommands";
-import { useSessionState, useUserMessageHistory } from "../../store/conversationStore";
+import {
+  useConversationStore,
+  useSessionState,
+  useUserMessageHistory,
+} from "../../store/conversationStore";
 import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
 import { defaultEffortFor, defaultModelFor, useModelPrefs } from "../../store/modelPrefs";
 import {
@@ -25,7 +29,9 @@ import {
   useSlashCommands,
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
-import { useEffectiveCleanOutput } from "../../store/display";
+import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { effectiveCwd } from "../git/worktree";
+import { openInIdeBlockedReason } from "../ide/openInIde";
 import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
 import { ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
@@ -71,14 +77,16 @@ import {
   type RecallResult,
 } from "./messageHistory";
 import {
-  attachmentFromBlob,
-  attachmentFromPath,
+  attachBlobs,
+  attachPaths,
   attachmentsFor,
   imageDataUrl,
+  useAttachError,
+  useAttachReading,
   useComposerAttachments,
   useConvAttachments,
-  wireImageMimeForPath,
 } from "./composerAttachments";
+import { useFileDrop } from "./fileDrop";
 import {
   appliesToBackend,
   chipById,
@@ -104,6 +112,7 @@ import {
   PermissionFace,
   WorktreeFace,
 } from "./composerChipFaces";
+import { ComposerStatusBand } from "./ComposerStatusBand";
 import styles from "./ConductorComposer.module.css";
 
 // Exact Claude Code permission modes (Shift+Tab selector), in the same order/labels.
@@ -167,8 +176,13 @@ export const ConductorComposer = forwardRef<
      * app-wide persisted layout flags with nothing to show for it.
      */
     hasPanels?: boolean;
+    /**
+     * The conversation side panel shows this conversation's state (goal, artifacts), so the
+     * composer drops its own goal and artifacts chips rather than showing them twice.
+     */
+    stateInPanel?: boolean;
   }
->(function ConductorComposer({ session, onSent, hasPanels = true }, ref) {
+>(function ConductorComposer({ session, onSent, hasPanels = true, stateInPanel = false }, ref) {
   const state = useSessionState(session);
   const send = useSendMessage(session);
   const interrupt = useInterrupt(session);
@@ -265,16 +279,38 @@ export const ConductorComposer = forwardRef<
   };
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  // ---- Attachments (the "+" button + paste-an-image) ----------------------
+  // ---- Attachments (the "+" button, paste-an-image, a Finder drop) --------
   // Joined images for THIS conversation (in-memory, per-conv; see composerAttachments).
   const attachments = useConvAttachments(session);
   // Last attach failure (unreadable / too large / unsupported), shown inline in the
-  // attachment row until the next successful attach or send.
-  const [attachErr, setAttachErr] = useState<string | null>(null);
-  // In-flight pasted-image reads (FileReader is async). While > 0 the send is blocked
-  // so a fast paste-then-Enter can't fire BEFORE the image lands (which would send
-  // without it, then attach it to the NEXT message).
-  const [attaching, setAttaching] = useState(0);
+  // attachment row until the next attach attempt or send. Per-conversation store state,
+  // not local: a file dropped on a Flight Deck card is read before this composer mounts.
+  const attachErr = useAttachError(session);
+  const setAttachErr = (message: string | null) =>
+    useComposerAttachments.getState().setError(session, message);
+  // Image reads in flight (disk / FileReader are async). While true the send is blocked
+  // so a fast attach-then-Enter can't fire BEFORE the image lands (which would send
+  // without it, then attach it to the NEXT message). Shown in the attachment row too:
+  // a greyed-out send button with no visible reason reads as a broken composer.
+  const attaching = useAttachReading(session);
+  // Where the agent IS right now, which is what a path mention is made relative to:
+  // after an EnterWorktree that's the worktree, NOT the spawn anchor `cwd` below (which
+  // stays the --resume anchor). A mention rooted on the wrong directory resolves to a
+  // DIFFERENT file, with no error anywhere. Same answer a Finder drop computes.
+  //
+  // ⚠️ Read from the stores at CALL time, not at render time: the native file panel can
+  // stay open for minutes, and the agent may EnterWorktree while it is. A value captured
+  // in the click's closure would root the mention on the directory the agent has since
+  // left — the very bug the drop path was fixed for.
+  const resolveMentionCwd = (): string | null => {
+    const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
+    if (!conv) return null;
+    return effectiveCwd(conv, useConversationStore.getState().sessions[session]?.state) || null;
+  };
+  // The conversation may be deleted while a picked image is being read (the reply modal
+  // closes, the card goes); attachments and drafts must not be written back for it.
+  const convIsAlive = () =>
+    useConversationsStore.getState().conversations.some((c) => c.id === session);
 
   // ---- Shell-style ↑/↓ history recall -------------------------------------
   // The user's own previously-sent messages, oldest→newest (see selector). The
@@ -303,6 +339,17 @@ export const ConductorComposer = forwardRef<
     (s) => s.conversations.find((c) => c.id === session)?.name ?? "Conversation",
   );
   const openExtensions = useExtensionsUi((s) => s.openManager);
+  // Why a user-made "IDE view" button must grey itself out here, if it must: the
+  // conversation's repository is remote, or the view is switched off in Settings.
+  const repoIsRemote = useConversationsStore((s) => {
+    const conv = s.conversations.find((c) => c.id === session);
+    return !!s.repos.find((r) => r.id === conv?.repoId)?.machineId;
+  });
+  const ideViewEnabled = useDisplay((s) => s.ideView);
+  const ideBlocked = openInIdeBlockedReason(
+    repoIsRemote ? { machineId: "remote" } : null,
+    ideViewEnabled,
+  );
   // The `/` catalogue is backend-specific: Claude's comes from its `initialize`
   // response (per cwd); Codex's from `skills/list` (fetched only for a Codex conv).
   // Both share the same `SlashCommand` shape + insert/run behaviour (a `/name` in the
@@ -482,23 +529,11 @@ export const ConductorComposer = forwardRef<
     ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
   };
 
-  // Make an absolute path relative to the conversation cwd when it lives under it, so
-  // an inserted file mention stays short + resolves to a clickable chip; else keep it
-  // absolute (still readable by Claude and by the mention resolver).
-  const relForCwd = (abs: string): string => {
-    const base = cwd ? cwd.replace(/\/+$/, "") : "";
-    return base && abs.startsWith(base + "/") ? abs.slice(base.length + 1) : abs;
-  };
-
-  // Append file-path mentions to the draft (space-separated), caret at the end.
-  const insertMentions = (paths: string[]) => {
-    if (!paths.length) return;
-    const joined = paths.map(relForCwd).join(" ");
-    const next = text.trim() ? `${text.replace(/\s*$/, "")} ${joined} ` : `${joined} `;
-    setText(next);
+  // Focus the input with the caret at the very end (after appended file mentions).
+  const focusAtEnd = () => {
     requestAnimationFrame(() => {
       const ta = taRef.current;
-      if (!ta) return;
+      if (!ta || ta.disabled) return;
       ta.focus();
       const end = ta.value.length;
       ta.setSelectionRange(end, end);
@@ -506,37 +541,31 @@ export const ConductorComposer = forwardRef<
     });
   };
 
-  // Route picked paths: model-attachable images → base64 attachment; anything else →
-  // a path mention Claude reads with its own tools.
-  const addPaths = async (paths: string[]) => {
-    const mentions: string[] = [];
-    const errs: string[] = [];
-    // Same send-lock as onPaste: these picked-image reads are async (disk + base64 over
-    // IPC, up to 16 MiB), so block send while they're in flight — else a fast
-    // pick-then-Enter sends BEFORE the image lands (it would ride the NEXT message).
-    setAttaching((n) => n + 1);
-    try {
-      for (const p of paths) {
-        if (wireImageMimeForPath(p)) {
-          const res = await attachmentFromPath(p);
-          if (res && "error" in res) errs.push(res.error);
-          else if (res) useComposerAttachments.getState().add(session, res);
-        } else {
-          mentions.push(p);
-        }
-      }
-    } finally {
-      setAttaching((n) => Math.max(0, n - 1));
-    }
-    // Surface every failure at once — a later failure must not silently erase earlier ones.
-    if (errs.length) setAttachErr([...new Set(errs)].join(" · "));
-    insertMentions(mentions);
-  };
+  // A file dropped from the Finder onto this conversation (FileDropHost) already went
+  // through `attachPaths`; it only asks the composer to take the focus — once: the
+  // request is consumed here, including when it was made just before we mounted.
+  const focusRequest = useFileDrop((s) =>
+    s.focusRequest?.convId === session ? s.focusRequest.seq : null,
+  );
+  useEffect(() => {
+    if (focusRequest === null) return;
+    useFileDrop.getState().consumeFocus(session);
+    focusAtEnd();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest, session]);
 
   // The "+" button: native multi-file picker (any file / image). In the dev/browser
   // mock there's no native dialog, so fall back to a path prompt (mention only).
+  // Routing (image → attachment, anything else → path mention) is `attachPaths`, shared
+  // with a Finder drop — and with a paste, via its blob twin — so all three give the
+  // same result.
   const pickAndAttach = async () => {
-    setAttachErr(null);
+    // Clear the last failure on the CLICK, not when the dialog closes: the OS file panel
+    // can be up for a long time, and a stale message sitting there the whole while reads
+    // as a live one. Skipped while another batch is still reading — that message is
+    // already on screen and is not this click's to erase (attachPaths applies the same
+    // rule when it starts).
+    if (!useComposerAttachments.getState().reading[session]) setAttachErr(null);
     let paths: string[] = [];
     if (isTauri) {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -546,38 +575,30 @@ export const ConductorComposer = forwardRef<
       const p = window.prompt("Path of the file to attach:", "");
       paths = p && p.trim() ? [p.trim()] : [];
     }
-    await addPaths(paths);
+    // Resolved HERE, after the dialog settled — see resolveMentionCwd.
+    const { mentions } = await attachPaths(session, paths, resolveMentionCwd(), {
+      isAlive: convIsAlive,
+    });
+    if (mentions > 0) focusAtEnd();
   };
 
-  // Paste an image (screenshot / copied file) → attachment. Only preventDefault when
-  // we actually consumed image data, so plain text paste is untouched.
+  // Paste an image (screenshot / copied file) → attachment, through the SAME pipeline as
+  // the "+" button and a Finder drop (send lock, deadline, size ceiling, merged errors):
+  // a paste that read its own way would drift from the other two. Only preventDefault
+  // when we actually consumed image data, so plain text paste is untouched.
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData?.items;
     if (!items) return;
-    const blobs: File[] = [];
+    const blobs: { blob: Blob; name: string }[] = [];
     for (const it of Array.from(items)) {
       if (it.kind === "file" && it.type.startsWith("image/")) {
         const f = it.getAsFile();
-        if (f) blobs.push(f);
+        if (f) blobs.push({ blob: f, name: f.name && f.name.trim() ? f.name : "Pasted image" });
       }
     }
     if (!blobs.length) return;
     e.preventDefault();
-    setAttachErr(null);
-    setAttaching((n) => n + 1);
-    void (async () => {
-      try {
-        for (const b of blobs) {
-          const name = b.name && b.name.trim() ? b.name : "Pasted image";
-          const res = await attachmentFromBlob(b, name);
-          if (res && "error" in res) setAttachErr(res.error);
-          else if (res) useComposerAttachments.getState().add(session, res);
-          else setAttachErr("Unsupported image format (png, jpeg, gif, webp).");
-        }
-      } finally {
-        setAttaching((n) => Math.max(0, n - 1));
-      }
-    })();
+    void attachBlobs(session, blobs, { isAlive: convIsAlive });
   };
 
   // A restored/re-seeded draft can be multi-line; the textarea defaults to one row, so size
@@ -712,6 +733,7 @@ export const ConductorComposer = forwardRef<
     // makes file mentions inert), so panel actions must refuse there rather than flip
     // the persisted layout flags invisibly.
     hostHasPanels: hasPanels,
+    ideBlocked,
   };
 
   // The composer's primary send (button / Enter): text + this conversation's
@@ -719,7 +741,7 @@ export const ConductorComposer = forwardRef<
   const doSend = () => {
     // A pasted image is still being read — don't send yet, or it would go out on the
     // NEXT message instead (the async add lands after this send's clear).
-    if (attaching > 0) return;
+    if (attaching) return;
     sendMessageNow(
       text.trim(),
       attachmentsFor(session).map((a) => ({
@@ -1076,7 +1098,7 @@ export const ConductorComposer = forwardRef<
     // Artifacts index — every artifact Claude published in THIS conversation, with its
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
-    artifacts: (
+    artifacts: stateInPanel ? null : (
       // `hasPanels` IS the "does this host have a side region?" signal the pane already
       // threads down (it is `!inertMentions`), so the chip is told rather than made to guess.
       <ArtifactsChip session={session} inert={!hasPanels} />
@@ -1120,7 +1142,7 @@ export const ConductorComposer = forwardRef<
     ),
     // Active `/goal` — a target button; click opens a popover with the condition + a clear
     // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
-    goal: !isCodex ? <GoalChip convId={session} /> : null,
+    goal: !isCodex && !stateInPanel ? <GoalChip convId={session} /> : null,
     // Worktree checkbox — only before the session spawns (first message).
     // Explicit empty/checked box so the on/off state is unambiguous.
     worktree: isFresh ? (
@@ -1134,6 +1156,10 @@ export const ConductorComposer = forwardRef<
 
   return (
     <div className="cv-composer">
+      {/* The conversation's settled status (review / question / error / background), as a
+          header band of this card — it also tints the card's border via CSS `:has()`.
+          Its own leaf: the composer never re-renders on a status change. */}
+      <ComposerStatusBand session={session} />
       {slashOpen ? (
         <SlashCommandMenu
           items={slashMatches}
@@ -1142,7 +1168,10 @@ export const ConductorComposer = forwardRef<
           onPick={(cmd) => pickCommand(cmd, false)}
         />
       ) : null}
-      {attachments.length > 0 || attachErr ? (
+      {/* `attaching` earns its own row even with nothing attached yet: while a read is in
+          flight the send button is disabled, and a disabled control's tooltip never shows —
+          without this line a stalled read would be a silently dead composer. */}
+      {attachments.length > 0 || attachErr || attaching ? (
         <div className="cv-attach-row">
           {attachments.map((a) => (
             <div key={a.id} className="cv-attach" title={a.name}>
@@ -1159,6 +1188,11 @@ export const ConductorComposer = forwardRef<
               </button>
             </div>
           ))}
+          {attaching ? (
+            <span className="cv-attach" aria-live="polite">
+              <span className="cv-attach-name">Reading attachments…</span>
+            </span>
+          ) : null}
           {attachErr ? <span className="cv-attach-err">{attachErr}</span> : null}
         </div>
       ) : null}
@@ -1200,7 +1234,7 @@ export const ConductorComposer = forwardRef<
             "interrupt". As soon as there is something to send — text or a joined image,
             busy or not — it's a send button: a message sent mid-turn is natively queued
             by the CLI and injected at the next loop boundary. */}
-        {busy && !text.trim() && attachments.length === 0 && attaching === 0 ? (
+        {busy && !text.trim() && attachments.length === 0 && !attaching ? (
           <button className="cv-send" onClick={() => interrupt.mutate()} title="Interrupt">
             <Ico name="stop" className="sm" />
           </button>
@@ -1208,7 +1242,7 @@ export const ConductorComposer = forwardRef<
           <button
             className="cv-send"
             onClick={doSend}
-            disabled={(!text.trim() && attachments.length === 0) || attaching > 0}
+            disabled={(!text.trim() && attachments.length === 0) || attaching}
             title={busy ? "Send — the agent will handle it along the way" : "Send"}
           >
             <Ico name="send" className="sm" />

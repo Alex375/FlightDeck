@@ -11,7 +11,7 @@
 // briefing structurally omits — Backlog and « En attente » (see `useTosseOffBoard`). The
 // detail panel fetches a task in full only when a row is opened. Writes are optimistic with
 // a whole-board rollback, and a refused write says why — see `useTosse`.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Dot, Ico, Menu, MenuItem, TosseCrmMark } from "../../ui/kit";
 import { agentStatusToDot } from "../../agent/status";
 import { useAgentStatus } from "../../agent/useAgentStatus";
@@ -513,51 +513,157 @@ function StartWithNote({ onStart }: { onStart: (note: string) => void }) {
 
 /** Every conversation opened on a task, with its agent's live state. Rendered in the
  *  detail panel; nothing at all when the task has none. */
-function TaskConversations({ taskId }: { taskId: string }) {
+function TaskConversations({
+  taskId,
+  panelRef,
+}: {
+  taskId: string;
+  /** The detail panel's scroll box. Where the keyboard goes when a confirmed unlink takes
+   *  the LAST conversation with it and this whole section unmounts — see `confirm` below. */
+  panelRef: React.RefObject<HTMLElement>;
+}) {
   const api = useTaskLaunch();
   const convs = useConversationsForTask(taskId);
   // The conversation whose link is about to go — confirmed first, because nothing in the
   // UI puts a link BACK (only "Start" on a new conversation, or the agent's own tool).
   const [unlinking, setUnlinking] = useState<Conversation | null>(null);
+  // Every row's open button, by conversation id. The LIST owns them rather than each row
+  // owning its own: on a confirmed unlink the row that opened the confirmation is the one
+  // that goes, so the keyboard has to be handed to one of the OTHERS.
+  const rows = useRef(new Map<string, HTMLButtonElement>());
+  const registerRow = useCallback((id: string, row: HTMLButtonElement | null) => {
+    if (row) rows.current.set(id, row);
+    else rows.current.delete(id);
+  }, []);
+
+  // How the confirmation is being dismissed. `ConfirmDialog` calls `onCancel` the same way
+  // for Escape, for its Cancel button and for a click on the scrim, so the modality is read
+  // here instead: the last press before it closes decides. It has to be read, because giving
+  // the keyboard back to a row also REVEALS that row's × (the reveal hangs off
+  // `:focus-within`) — after a MOUSE dismissal that lights up a row the pointer left long
+  // ago, on a list nobody is navigating. A pointer user keeps the browser's own outcome.
+  const byKeyboard = useRef(false);
+  useEffect(() => {
+    if (unlinking == null) return;
+    byKeyboard.current = false;
+    const key = () => {
+      byKeyboard.current = true;
+    };
+    const point = () => {
+      byKeyboard.current = false;
+    };
+    // Capture phase, and the PRESS rather than the click: the dialog stops Escape from
+    // propagating on its way up, and the scrim's dismissal is a click we would see too late.
+    document.addEventListener("keydown", key, true);
+    document.addEventListener("pointerdown", point, true);
+    document.addEventListener("mousedown", point, true);
+    return () => {
+      document.removeEventListener("keydown", key, true);
+      document.removeEventListener("pointerdown", point, true);
+      document.removeEventListener("mousedown", point, true);
+    };
+  }, [unlinking]);
+
+  /** Hand the keyboard to `el` — but only when the keyboard is what dismissed the
+   *  confirmation. See `byKeyboard`. */
+  const handBack = (el: HTMLElement | null | undefined) => {
+    if (byKeyboard.current) el?.focus();
+  };
+
+  /** Backed out: the row that opened the confirmation is still in the list, so it takes the
+   *  keyboard back — never the × itself, which is `display:none` again the moment focus
+   *  leaves the row, and `focus()` on a hidden element does nothing. */
+  const cancel = () => {
+    const row = unlinking ? rows.current.get(unlinking.id) : null;
+    setUnlinking(null);
+    handBack(row);
+  };
+
+  /** Confirmed: the row is about to leave the list, so aiming the keyboard at it would drop
+   *  it on <body> and make the user walk in from the top of the document after EVERY unlink.
+   *  It goes to what survives — the neighbouring conversation (the next one, else the
+   *  previous), or the panel's scroll box when that was the last one and this whole section
+   *  unmounts. Focused synchronously, before React re-renders: both targets are nodes React
+   *  KEEPS, so the focus rides through the removal of the row. */
+  const confirm = () => {
+    if (!unlinking) return;
+    const i = convs.findIndex((c) => c.id === unlinking.id);
+    // `-1` means the row already left the list by another route (the conversation was
+    // deleted, or another surface unlinked it) — `convs[-1 + 1]` would then be the FIRST
+    // row, which is not a neighbour of anything. Fall back to the scroll box.
+    const survivor = i < 0 ? null : (convs[i + 1] ?? convs[i - 1] ?? null);
+    const target = survivor ? rows.current.get(survivor.id) : panelRef.current;
+    useConversationsStore.getState().linkConversationToTask(unlinking.id, null);
+    setUnlinking(null);
+    handBack(target);
+  };
+
   if (convs.length === 0) return null;
   return (
     <section>
       <div className={s.detailKey}>Conversations {convs.length}</div>
       {convs.map((c) => (
-        <div key={c.id} className={s.convItem}>
-          <button
-            className={s.convRow}
-            title={`Open « ${c.name} »`}
-            onClick={() => api?.open(c.id)}
-          >
-            <ConvStateDot convId={c.id} />
-            <span className={s.convName}>{c.name}</span>
-            <Ico name="arrow" className={`sm ${s.convGo}`} />
-          </button>
-          <button
-            className={s.convUnlink}
-            title={`Unlink « ${c.name} » from this task`}
-            aria-label={`Unlink « ${c.name} » from this task`}
-            onClick={() => setUnlinking(c)}
-          >
-            <Ico name="x" className="sm" />
-          </button>
-        </div>
+        <ConvItem
+          key={c.id}
+          conv={c}
+          onOpen={() => api?.open(c.id)}
+          onUnlink={() => setUnlinking(c)}
+          registerRow={registerRow}
+        />
       ))}
       <ConfirmDialog
         open={unlinking != null}
         title={`Unlink « ${unlinking?.name ?? ""} » from this task?`}
         confirmLabel="Unlink"
-        onCancel={() => setUnlinking(null)}
-        onConfirm={() => {
-          if (unlinking) useConversationsStore.getState().linkConversationToTask(unlinking.id, null);
-          setUnlinking(null);
-        }}
+        onCancel={cancel}
+        onConfirm={confirm}
       >
         The conversation and the task both stay as they are — only the link between them goes:
         the task leaves the conversation's header, and the conversation leaves this list.
       </ConfirmDialog>
     </section>
+  );
+}
+
+/** One conversation on the task: open it, or unlink it. */
+function ConvItem({
+  conv,
+  onOpen,
+  onUnlink,
+  registerRow,
+}: {
+  conv: Conversation;
+  onOpen: () => void;
+  onUnlink: () => void;
+  /** Hands this row's open button up to the list, which keeps the keyboard's landing spots
+   *  for every row — including the ones a confirmed unlink has to fall back on. */
+  registerRow: (id: string, row: HTMLButtonElement | null) => void;
+}) {
+  return (
+    <div className={s.convItem}>
+      <button
+        ref={(el) => {
+          registerRow(conv.id, el);
+        }}
+        className={s.convRow}
+        title={`Open « ${conv.name} »`}
+        onClick={onOpen}
+      >
+        <ConvStateDot convId={conv.id} />
+        <span className={s.convName}>{conv.name}</span>
+        <Ico name="arrow" className={`sm ${s.convGo}`} />
+      </button>
+      {/* Hidden at rest, but reachable: the CSS reveals it while the row has focus, so a
+          Tab off the row lands here rather than skipping the only way to unlink. */}
+      <button
+        className={s.convUnlink}
+        title={`Unlink « ${conv.name} » from this task`}
+        aria-label={`Unlink « ${conv.name} » from this task`}
+        onClick={onUnlink}
+      >
+        <Ico name="x" className="sm" />
+      </button>
+    </div>
   );
 }
 
@@ -1079,7 +1185,109 @@ function ProjectCard({
 }
 
 /**
- * The detail panel's status ladder — one click per step, the CRM's own buttons.
+ * A task's status as a CONTROL, not a label — the same menu as the row's dot, one way to
+ * change a status wherever you are. Shared by the detail panel's head and the conversation
+ * side panel's task card.
+ */
+export function TaskStatusChip({
+  status,
+  onSetStatus,
+}: {
+  status: string;
+  onSetStatus: (status: string) => void;
+}) {
+  return (
+    <Menu
+      portal
+      trigger={
+        // A TASK's status, so it uses the task colour language — `projectStatusTone`
+        // maps PROJECT states, and sends everything it doesn't know to "todo": a task
+        // in « Review » came out grey here while the board painted it violet, in the
+        // one place meant to tell you what the task is.
+        <button
+          className={`${s.state} ${s.stateBtn} ${s[`state_${taskStatusTone(status)}`]}`}
+          title={`${status} — change status`}
+        >
+          {status}
+          <Ico name="chevron" className="sm" />
+        </button>
+      }
+    >
+      {TASK_STATUS_CHOICES.map((choice) => (
+        <div key={choice}>
+          {choice === "Fait" ? <div className={s.menuSep} /> : null}
+          <MenuItem on={status === choice} onClick={() => onSetStatus(choice)}>
+            {choice}
+          </MenuItem>
+        </div>
+      ))}
+    </Menu>
+  );
+}
+
+/**
+ * A task's subtasks as checkbox rows: a click flips one between « Fait » and « À faire ».
+ * Shared by the detail panel and the conversation side panel's task card.
+ */
+export function TaskSubtaskRows({
+  subtasks,
+  onToggle,
+}: {
+  subtasks: { id: string; title: string; status: string }[];
+  onToggle: (subtaskId: string, next: string) => void;
+}) {
+  return (
+    <>
+      {subtasks.map((st) => (
+        <button
+          key={st.id}
+          className={s.subRow}
+          title={`Mark as ${st.status === "Fait" ? "À faire" : "Fait"}`}
+          onClick={() => onToggle(st.id, st.status === "Fait" ? "À faire" : "Fait")}
+        >
+          <span className={`${s.check} ${st.status === "Fait" ? s.checkOn : ""}`} />
+          <span className={st.status === "Fait" ? s.subDone : ""}>{st.title}</span>
+        </button>
+      ))}
+    </>
+  );
+}
+
+/**
+ * A task's head chips: its status (see {@link TaskStatusChip}), priority, kind and assignee —
+ * the detail panel's head.
+ */
+function TaskHeadChips({
+  task,
+  onSetStatus,
+}: {
+  task: TosseTask;
+  onSetStatus: (status: string) => void;
+}) {
+  return (
+    <div className={s.detailChips}>
+      <TaskStatusChip status={task.status} onSetStatus={onSetStatus} />
+      {task.priority ? (
+        <span className={`${s.pri} ${s[`pri_${priorityClass(task.priority)}`]}`}>
+          {task.priority}
+        </span>
+      ) : null}
+      {task.kind ? <span className={s.kind}>{task.kind}</span> : null}
+      {/* The person wears the SAME mark as in the list, with their name spelled out —
+          the panel has room for it, a 20px disc alone would not say who. */}
+      {task.assignedTo ? (
+        <span className={s.whoChip}>
+          <AssigneeAvatar name={task.assignedTo} />
+          {splitMcpActor(task.assignedTo).person}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The detail panel's status ladder — one click per step, the CRM's own buttons. Also the
+ * action row of the conversation side panel's task card (same buttons, same write).
  *
  * Lives in the panel and NOT on the row (asked for explicitly, 2026-09-07): the panel is
  * where a task is read in full before it is moved, and a row already carries Open / Discuss
@@ -1091,7 +1299,7 @@ function ProjectCard({
  * the panel already renders. A second write path would have been a second chance to swallow
  * a refusal.
  */
-function TaskStatusActions({
+export function TaskStatusActions({
   detail,
   onWrite,
 }: {
@@ -1182,6 +1390,10 @@ export function TaskDetail({
   const settingsOpen = useSettingsUi((u) => u.open);
   const historyOpen = useHistoryUi((u) => u.open);
   const modalOver = settingsOpen || historyOpen;
+  // The panel's scroll box. Programmatically focusable (`tabIndex={-1}`, never in the tab
+  // order) so the conversations list has somewhere to put the keyboard when unlinking the
+  // last conversation takes that list off the screen — see `TaskConversations`.
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   // Escape closes the panel — the button says so, so it has to be true.
   //
@@ -1212,57 +1424,14 @@ export function TaskDetail({
         </div>
         <div className={s.detailTitle}>{data?.task.title ?? "…"}</div>
         {data ? (
-          <div className={s.detailChips}>
-            {/* A TASK's status, so it uses the task colour language — `projectStatusTone`
-                maps PROJECT states, and sends everything it doesn't know to "todo": a task
-                in « Review » came out grey here while the board painted it violet, in the
-                one place meant to tell you what the task is. */}
-            {/* The status is a CONTROL here too, not a label: the panel is where you read a
-                task in full, so it is also where you move it on. Same menu as the row's
-                dot — one way to change a status, wherever you are. */}
-            <Menu
-              portal
-              trigger={
-                <button
-                  className={`${s.state} ${s.stateBtn} ${s[`state_${taskStatusTone(data.task.status)}`]}`}
-                  title={`${data.task.status} — change status`}
-                >
-                  {data.task.status}
-                  <Ico name="chevron" className="sm" />
-                </button>
-              }
-            >
-              {TASK_STATUS_CHOICES.map((choice) => (
-                <div key={choice}>
-                  {choice === "Fait" ? <div className={s.menuSep} /> : null}
-                  <MenuItem
-                    on={data.task.status === choice}
-                    onClick={() => setTaskStatus.mutate({ taskId, status: choice })}
-                  >
-                    {choice}
-                  </MenuItem>
-                </div>
-              ))}
-            </Menu>
-            {data.task.priority ? (
-              <span className={`${s.pri} ${s[`pri_${priorityClass(data.task.priority)}`]}`}>
-                {data.task.priority}
-              </span>
-            ) : null}
-            {data.task.kind ? <span className={s.kind}>{data.task.kind}</span> : null}
-            {/* The person wears the SAME mark as in the list, with their name spelled out —
-                the panel has room for it, a 20px disc alone would not say who. */}
-            {data.task.assignedTo ? (
-              <span className={s.whoChip}>
-                <AssigneeAvatar name={data.task.assignedTo} />
-                {splitMcpActor(data.task.assignedTo).person}
-              </span>
-            ) : null}
-          </div>
+          <TaskHeadChips
+            task={data.task}
+            onSetStatus={(status) => setTaskStatus.mutate({ taskId, status })}
+          />
         ) : null}
       </div>
 
-      <div className={s.detailBody}>
+      <div className={s.detailBody} ref={bodyRef} tabIndex={-1}>
         {isLoading ? <div className={s.muted}>Loading…</div> : null}
         {error ? <div className={s.rowError}>{String(error.message)}</div> : null}
         {/* The MUTATION's error, not the query's. Ticking a subtask writes to the CRM, and
@@ -1290,7 +1459,7 @@ export function TaskDetail({
             to answer first. Their dot is the AGENT's live state (the app's own language),
             which is why it sits inside a chat row rather than next to the task's own CRM
             status above. */}
-        <TaskConversations taskId={taskId} />
+        <TaskConversations taskId={taskId} panelRef={bodyRef} />
 
         {/* The task's BODY. It was fetched, crossed the IPC and was then dropped on the
             floor — so a task whose description lives in `content` (the CRM's long-form
@@ -1334,22 +1503,10 @@ export function TaskDetail({
             <div className={s.detailKey}>
               Subtasks {data.task.subtaskDone}/{data.task.subtaskCount}
             </div>
-            {data.subtasks.map((st) => (
-              <button
-                key={st.id}
-                className={s.subRow}
-                title={`Mark as ${st.status === "Fait" ? "À faire" : "Fait"}`}
-                onClick={() =>
-                  setTaskStatus.mutate({
-                    taskId: st.id,
-                    status: st.status === "Fait" ? "À faire" : "Fait",
-                  })
-                }
-              >
-                <span className={`${s.check} ${st.status === "Fait" ? s.checkOn : ""}`} />
-                <span className={st.status === "Fait" ? s.subDone : ""}>{st.title}</span>
-              </button>
-            ))}
+            <TaskSubtaskRows
+              subtasks={data.subtasks}
+              onToggle={(subtaskId, next) => setTaskStatus.mutate({ taskId: subtaskId, status: next })}
+            />
           </section>
         ) : null}
       </div>

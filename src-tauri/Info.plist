@@ -20,5 +20,16 @@
   <string>Flight Deck needs access to your Downloads to open and edit the files of projects you place there.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Flight Deck uses the microphone only while you talk to the voice agent (push-to-talk).</string>
+  <!--
+    Signing in to claude.ai inside the artifact panel. macOS only offers passkeys on THIS Mac
+    (Touch ID / iCloud Keychain) to apps carrying Apple's browser entitlement
+    (`com.apple.developer.web-browser.public-key-credential`), which is granted to browsers and
+    needs an Apple-issued provisioning profile — this app is self-signed, so it will never have
+    it. What WebKit falls back to is the cross-device passkey flow, where the passkey lives on
+    your phone and answers over Bluetooth; without this string the system refuses that too, and
+    the sign-in dies on "Make sure Bluetooth is on".
+  -->
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Flight Deck uses Bluetooth only to let you approve a claude.ai sign-in with a passkey from your phone.</string>
 </dict>
 </plist>

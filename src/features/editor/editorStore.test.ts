@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAppErrors } from "../../store/appErrors";
 import { resetMockDisk, touchMockFile } from "../../ipc/mock/mockBindings";
-import { useEditorStore, type FileBuffer } from "./editorStore";
+import { ancestorDirs, useEditorStore, type FileBuffer } from "./editorStore";
 
 const CONV = "conv-1";
 const ROOT = "/repo";
@@ -477,6 +477,177 @@ describe("tabs", () => {
   });
 });
 
+// The explorer's "auto reveal": unfolding the tree down to the file on screen so you
+// can SEE where it lives. The walk must load what it needs, expand what is merely
+// folded — never COLLAPSE what is already open — and stop quietly on anything it
+// cannot reach.
+describe("ancestorDirs (which folders a reveal has to unfold)", () => {
+  it("lists the root, then every directory down to the file's parent", () => {
+    expect(ancestorDirs("/repo", "/repo/src/features/a.ts")).toEqual([
+      "/repo",
+      "/repo/src",
+      "/repo/src/features",
+    ]);
+  });
+
+  it("is just the root for a file sitting at the root", () => {
+    expect(ancestorDirs("/repo", "/repo/a.ts")).toEqual(["/repo"]);
+  });
+
+  it("is empty for the root itself and for a path outside it", () => {
+    expect(ancestorDirs("/repo", "/repo")).toEqual([]);
+    expect(ancestorDirs("/repo", "/elsewhere/a.ts")).toEqual([]);
+    // A sibling whose name merely STARTS with the root's — not inside it.
+    expect(ancestorDirs("/repo", "/repo2/a.ts")).toEqual([]);
+  });
+
+  it("ignores doubled separators instead of inventing an empty directory", () => {
+    expect(ancestorDirs("/repo", "/repo//src/a.ts")).toEqual(["/repo", "/repo/src"]);
+  });
+});
+
+describe("revealInTree (the explorer unfolds the path to the open file)", () => {
+  const conv = () => useEditorStore.getState().byConv[CONV];
+
+  // A reveal is ambient: it must never put anything on the app-level banner, so the
+  // tests below assert on an empty one.
+  beforeEach(() => {
+    useAppErrors.setState({ errors: [] });
+  });
+
+  it("loads AND expands every unloaded ancestor down to the file's parent", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+
+    const c = conv();
+    expect(c.dirs[ROOT]).toBeDefined();
+    expect(c.dirs["/repo/src"]).toBeDefined();
+    expect(c.expanded[ROOT]).toBe(true);
+    expect(c.expanded["/repo/src"]).toBe(true);
+    expect(c.treeReveal).toMatchObject({ path: "/repo/src/App.tsx" });
+  });
+
+  it("leaves an already-expanded directory expanded (never toggles it shut)", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.toggleDir(CONV, ROOT); // loaded + expanded
+    await s.toggleDir(CONV, "/repo/src"); // loaded + expanded
+
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+
+    // A blind `toggleDir` per ancestor would have folded both of these.
+    expect(conv().expanded[ROOT]).toBe(true);
+    expect(conv().expanded["/repo/src"]).toBe(true);
+  });
+
+  it("re-expands a directory that is loaded but folded", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.toggleDir(CONV, ROOT);
+    await s.toggleDir(CONV, "/repo/src");
+    await s.toggleDir(CONV, "/repo/src"); // the user folded it again
+    expect(conv().expanded["/repo/src"]).toBe(false);
+
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+
+    expect(conv().expanded["/repo/src"]).toBe(true);
+  });
+
+  it("waits for a directory another reader is already loading", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    // The tree's own mount effect got to the root first. `toggleDir` refuses to
+    // start a second read, so a walk that didn't wait would stop on a folder that
+    // is about to be there — a reveal that silently does nothing.
+    const rootLoad = s.toggleDir(CONV, ROOT);
+    const walking = s.revealInTree(CONV, "/repo/src/App.tsx");
+
+    await rootLoad;
+    await walking;
+
+    expect(conv().expanded["/repo/src"]).toBe(true);
+    expect(conv().treeReveal).toMatchObject({ path: "/repo/src/App.tsx" });
+  });
+
+  it("is a clean no-op for a path outside the root", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+
+    await s.revealInTree(CONV, "/elsewhere/deep/a.txt");
+
+    expect(conv().dirs["/elsewhere"]).toBeUndefined();
+    expect(conv().treeReveal).toBeNull();
+    expect(useAppErrors.getState().errors.length).toBe(0);
+  });
+
+  it("stops at a directory it cannot read, without throwing (dirErrors surfaces it)", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+
+    await expect(s.revealInTree(CONV, "/repo/__fail__/deep/a.txt")).resolves.toBeUndefined();
+
+    const c = conv();
+    expect(c.dirErrors["/repo/__fail__"]).toBeTruthy(); // the tree shows the failure
+    expect(c.dirs["/repo/__fail__/deep"]).toBeUndefined(); // descent stopped there
+    expect(c.treeReveal).toBeNull(); // nothing to scroll to
+  });
+
+  it("bumps the seq so revealing the SAME file again re-fires the scroll", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+    const first = conv().treeReveal!.seq;
+
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+
+    expect(conv().treeReveal!.seq).toBeGreaterThan(first);
+  });
+
+  it("clearTreeReveal consumes the request", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.revealInTree(CONV, "/repo/src/App.tsx");
+    expect(conv().treeReveal).not.toBeNull();
+
+    s.clearTreeReveal(CONV);
+
+    expect(conv().treeReveal).toBeNull();
+  });
+
+  it("stops quietly when the tree is re-rooted while a directory read is in flight", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    // The agent enters a worktree mid-walk: the reveal is about a tree that no
+    // longer exists, so it must neither unfold the NEW root nor arm a scroll.
+    const walking = s.revealInTree(CONV, "/repo/src/App.tsx");
+    s.ensureConv(CONV, "/moved");
+
+    await expect(walking).resolves.toBeUndefined();
+
+    expect(conv().root).toBe("/moved");
+    expect(conv().treeReveal).toBeNull();
+  });
+
+  it("stops quietly when the whole slice is dropped mid-walk", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    const walking = s.revealInTree(CONV, "/repo/src/App.tsx");
+    useEditorStore.setState({ byConv: {} }); // e.g. the IDE workspace was closed
+
+    await expect(walking).resolves.toBeUndefined();
+
+    expect(useEditorStore.getState().byConv[CONV]).toBeUndefined();
+  });
+
+  it("does nothing for a conversation with no slice at all", async () => {
+    await expect(
+      useEditorStore.getState().revealInTree("no-such-conv", "/repo/a.txt"),
+    ).resolves.toBeUndefined();
+  });
+});
+
 // The "jump to a line" plumbing behind clickable file mentions: openFile's `reveal`
 // option, the markdown→source forcing, the seq nonce (so a re-click replays), and the
 // revealInEditor orchestration (open panel + collapse tree + arm the reveal).
@@ -665,5 +836,48 @@ describe("explorer mutations — folder rename rebases open buffers", () => {
     expect(c.buffers["/repo/dir/child.txt"]).toBeUndefined(); // old path gone
     expect(c.buffers["/repo/renamed/child.txt"]).toBeTruthy(); // rebased, not closed
     expect(c.tabs).toContain("/repo/renamed/child.txt");
+  });
+});
+
+describe("conversation side panel toggle", () => {
+  const shown = () => {
+    const s = useEditorStore.getState();
+    return s.convPanelOpen && !s.convPanelYielded;
+  };
+
+  beforeEach(() => {
+    useEditorStore.setState({ convPanelOpen: true, convPanelYielded: false });
+  });
+
+  it("closes a visible panel and reopens a closed one", () => {
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(false);
+    expect(useEditorStore.getState().convPanelOpen).toBe(false);
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(true);
+  });
+
+  it("brings back a panel that stepped aside instead of persisting it closed", () => {
+    // Not enough room: the layout made the open panel step aside — it is off screen.
+    useEditorStore.getState().setConvPanelYielded(true);
+    expect(shown()).toBe(false);
+    // One press = one visible effect: the panel comes back (floating), still open.
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(true);
+    expect(useEditorStore.getState().convPanelOpen).toBe(true);
+  });
+
+  it("an explicit open also clears a step-aside", () => {
+    useEditorStore.setState({ convPanelOpen: false, convPanelYielded: true });
+    useEditorStore.getState().setConvPanelOpen(true);
+    expect(shown()).toBe(true);
+  });
+
+  it("leaves the side region alone (it is its own column)", () => {
+    useEditorStore.setState({ open: true, terminalOpen: true });
+    useEditorStore.getState().toggleConvPanel();
+    const s = useEditorStore.getState();
+    expect(s.open).toBe(true);
+    expect(s.terminalOpen).toBe(true);
   });
 });

@@ -71,13 +71,31 @@ describe("parseFileMention", () => {
     expect(parseFileMention("file:///tmp/x.ts")).toBeNull();
   });
 
-  it("rejects tokens with whitespace", () => {
+  it("rejects BARE tokens with whitespace (prose, not a path)", () => {
     expect(parseFileMention("a b.ts")).toBeNull();
     expect(parseFileMention("  ")).toBeNull();
   });
 
   it("rejects a bare time like 12:30", () => {
     expect(parseFileMention("12:30")).toBeNull();
+  });
+});
+
+// Real files DO contain spaces — a macOS screenshot is the everyday one. The composer
+// writes such a mention as an inline-code span so it reaches the agent as ONE literal
+// token (see quoteMention), which is what the drop had to fix. The RESOLVER deliberately
+// does NOT follow: a whitespace-bearing token stays prose or a shell line to it, because
+// widening it bought no chip anywhere (a user turn renders as plain text, no Markdown
+// pass) while flagging `/usr/bin/ls -la` and `./gradlew build` as files — each false
+// positive also costing a `pathExists` probe.
+describe("parseFileMention — whitespace is never a path", () => {
+  it("refuses a space-bearing token, anchored or not", () => {
+    expect(parseFileMention("a b.ts")).toBeNull();
+    expect(parseFileMention("./Capture d ecran 2026-09-19 a 14.03.21.png")).toBeNull();
+    expect(parseFileMention("/Volumes/nas/My Pictures/holiday 01.png")).toBeNull();
+    expect(parseFileMention("/usr/bin/ls -la")).toBeNull();
+    expect(parseFileMention("./gradlew build")).toBeNull();
+    expect(parseFileMention("git add src/foo.ts")).toBeNull();
   });
 });
 

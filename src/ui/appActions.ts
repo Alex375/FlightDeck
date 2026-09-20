@@ -17,6 +17,8 @@ import { slotFor, useManualOrder } from "../store/manualOrder";
 import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
+import { openConversationInIde, openInIdeBlockedReason } from "../features/ide/openInIde";
+import { useAppErrors } from "../store/appErrors";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
 import type { ShortcutAction, View } from "./shortcuts";
 
@@ -62,6 +64,12 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
       if (!conv) return false;
       editor.toggleGit();
       return true;
+    case "toggle-conversation-panel":
+      // Off in Settings → the panel does not exist, so the chord must not flip a hidden,
+      // persisted flag the user would only discover the day they switch the panel back on.
+      if (!conv || !useDisplay.getState().conversationSidePanel) return false;
+      editor.toggleConvPanel();
+      return true;
     case "toggle-clean-output": {
       if (!conv) return false;
       const eff = resolveCleanOutput(conv.cleanOutput ?? null, useDisplay.getState().cleanOutput);
@@ -78,6 +86,22 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
         session: conv.id,
       });
       return true;
+    case "open-in-ide": {
+      // Switches the view through the IDE store's request (App listens), not `changeView`:
+      // the composer calls this without one.
+      if (!conv) return false;
+      // A refusal SAYS WHY (remote repository, or the view switched off): ⌘⇧I used to be
+      // a completely silent dead key there. `true` = handled — the user was told, so the
+      // chord must not fall through. (A composer button never reaches this branch refused:
+      // its own `availability()` greys it out with the same reason first.)
+      const repo = store.repos.find((r) => r.id === conv.repoId) ?? null;
+      const why = openInIdeBlockedReason(repo, useDisplay.getState().ideView);
+      if (why) {
+        useAppErrors.getState().pushError("Can't open this conversation in the IDE", why);
+        return true;
+      }
+      return openConversationInIde(conv.id);
+    }
     case "new-conversation": {
       const repoPath =
         (conv && store.repos.find((r) => r.id === conv.repoId)?.path) ?? store.repos[0]?.path ?? null;

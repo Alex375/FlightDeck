@@ -373,7 +373,14 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
-                            "task_id": { "type": "string", "description": "The TOSSE task id (UUID)." },
+                            // ⚠️ The pattern is the same fence the Rust side enforces
+                            // (`tosse::is_canonical_uuid`): the id ends up in the CRM
+                            // request path, so anything but a UUID is refused. Declared
+                            // here so the model is framed at call time rather than
+                            // discovering it through an error.
+                            "task_id": { "type": "string",
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "description": "The TOSSE task id (canonical UUID)." },
                             "title": { "type": "string",
                                 "description": "The task's title — used only when the app cannot read the CRM itself." },
                             "status": { "type": "string",
@@ -404,18 +411,28 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 },
                 ToolSpec {
                     name: "open_file",
-                    description: "Open a file in the app's editor panel, optionally at a line \
-                        and column — use it to show the user the code you are talking about. \
-                        Focuses the target conversation (default: the calling one) and its \
-                        editor. Relative paths resolve against that conversation's working \
-                        directory.",
+                    description: "Open a file in the app's editor, optionally at a line and \
+                        column — use it to show the user the code you are talking about. \
+                        Relative paths resolve against the target conversation's working \
+                        directory. Leave `view` OUT unless the user asked for a specific place: \
+                        the file then opens where the user is looking — in the IDE view when it \
+                        is on screen and showing this conversation's folder, otherwise in the \
+                        conversation's own side editor (which focuses that conversation). \
+                        view: \"ide\" forces the top-level IDE view (the conversation's folder is \
+                        opened or focused as a workspace and the file opens in ITS editor); it is \
+                        refused when the IDE view is switched off or the conversation's \
+                        repository is remote (the IDE only browses this Mac's files). \
+                        view: \"conversation\" forces the conversation's side editor.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
                             "path": { "type": "string", "description": "File path (absolute, or relative to the conversation's cwd)." },
                             "line": { "type": "integer", "minimum": 1, "description": "1-based line to reveal." },
                             "column": { "type": "integer", "minimum": 1, "description": "1-based column." },
-                            "conversation_id": conversation_id_prop("Conversation whose editor opens the file (default: the calling one)."),
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) opens the file (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Force where the file opens. Omit it (recommended) to \
+                                    open it where the user is currently looking." },
                         }),
                         &["path"],
                     ),
@@ -423,11 +440,12 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 ToolSpec {
                     name: "open_view",
                     description: "Switch the app's main view: 'conversation' (the active \
-                        thread), 'flightdeck' (the fleet overview) or 'tosse' (the CRM tasks \
-                        board, only when signed in).",
+                        thread), 'flightdeck' (the fleet overview), 'tosse' (the CRM tasks \
+                        board, only when signed in) or 'ide' (folders opened as workspaces: \
+                        file explorer, editor, terminals and docked conversations).",
                     kind: ToolKind::Front,
                     schema: obj(
-                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse"] } }),
+                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse", "ide"] } }),
                         &["view"],
                     ),
                 },
@@ -535,6 +553,22 @@ mod tests {
         assert!(!app.contains(&"wait_for_events"));
     }
 
+    /// `link_tosse_task`'s id reaches the CRM inside a request PATH, so the schema states
+    /// the shape it must have. The pattern is the one the Rust side enforces
+    /// (`tosse::is_canonical_uuid`) and the front mirrors — three copies of one rule, so
+    /// this guards the copy a model reads.
+    #[test]
+    fn the_task_id_schema_asks_for_a_uuid() {
+        let link = for_surface(Surface::App)
+            .into_iter()
+            .find(|t| t.name == "link_tosse_task")
+            .expect("link_tosse_task is an app tool");
+        assert_eq!(
+            link.schema["properties"]["task_id"]["pattern"],
+            json!("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+        );
+    }
+
     /// Every schema is a well-formed object schema whose required keys exist in
     /// properties — the CLI rejects malformed tool schemas silently otherwise.
     #[test]
@@ -552,12 +586,18 @@ mod tests {
     }
 
     /// The blacklist stays a blacklist: no destructive / privilege-raising tool
-    /// name may ever appear on either surface.
+    /// name may ever appear on either surface. `"bootstrap"`/`"diagnose"`/`"repair"`
+    /// (B11) cover `bootstrap_server`/`bootstrap_resume`/`bootstrap_cancel`/
+    /// `machine_diagnose`/`machine_repair` — none of the orchestrator's commands are
+    /// agent tools: installing a service, escalating `sudo`, or driving a server's
+    /// `claude` sign-in stays human-only, same as everything else on this list.
     #[test]
     fn forbidden_tools_are_absent() {
         for surface in [Surface::App, Surface::Voice] {
             for t in for_surface(surface) {
-                for banned in ["permission", "remote_control", "delete", "wipe", "rewind", "fork"] {
+                for banned in
+                    ["permission", "remote_control", "delete", "wipe", "rewind", "fork", "bootstrap", "diagnose", "repair"]
+                {
                     assert!(!t.name.contains(banned), "{} exposes banned capability", t.name);
                 }
             }

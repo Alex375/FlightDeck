@@ -7,8 +7,15 @@
 //    interleaved between these by SettingsPanel.
 // Every core-backed card follows the honest-toggle rule: what it shows is the
 // post-apply READ-BACK from the core, so a failure shows instead of a switch that lies.
-import { Fragment, useCallback, useEffect, useState } from "react";
-import { commands, type RemoteStatus, type VoiceBridgeStatus } from "../../ipc/client";
+import { useCallback, useEffect, useState } from "react";
+import {
+  commands,
+  type AddressCandidate,
+  type MachineProvisionStatus,
+  type MachineRevokeStatus,
+  type RemoteStatus,
+  type VoiceBridgeStatus,
+} from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
 import { useCaffeinate } from "../../store/caffeinate";
 import {
@@ -17,7 +24,11 @@ import {
   useMachines,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
+import { useNow } from "../../ui/useNow";
+import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
+import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
+import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 
@@ -196,132 +207,157 @@ export function VoiceBridgeGroup() {
   );
 }
 
-type PairStage = "command" | "confirm" | "manual";
+/** A ticket's decoded address candidates, plus the pre-fill fields carried
+ *  alongside them. `addresses` is always non-empty: an old-format ticket (no
+ *  `addresses` field) synthesizes a single "manual" candidate from `host`. */
+interface ParsedTicket {
+  label: string;
+  host: string;
+  port: string;
+  user: string;
+  addresses: AddressCandidate[];
+}
 
 /** Decode a `fdpair:<base64-json>` ticket a server printed, tolerating surrounding
- *  quotes/whitespace. Returns the pre-fill fields, or null if it isn't a valid ticket. */
-function parseTicket(raw: string): { label: string; host: string; port: string; user: string } | null {
+ *  quotes/whitespace. Returns the pre-fill fields, or null if it isn't a valid ticket.
+ *  Exported for the regression test on the addresses/back-compat shape. */
+export function parseTicket(raw: string): ParsedTicket | null {
   try {
     let s = raw.trim();
     const i = s.indexOf("fdpair:");
     if (i >= 0) s = s.slice(i + "fdpair:".length).trim();
     s = s.replace(/[`'"]/g, "");
     const t = JSON.parse(atob(s));
+    const host = String(t.host ?? "");
+    // Old tickets (printed before address discovery existed) carry no `addresses`
+    // field at all — tolerate that by synthesizing a single manual candidate from
+    // `host`, so the confirm screen always has at least one to show.
+    const rawAddresses: unknown[] = Array.isArray(t.addresses) ? t.addresses : [];
+    const addresses: AddressCandidate[] = rawAddresses
+      .filter((a: unknown): a is Record<string, unknown> => typeof a === "object" && a !== null)
+      .map((a) => {
+        const kind = a.kind;
+        const value = String(a.value ?? "");
+        const validKind: AddressCandidate["kind"] = kind === "tailscale" || kind === "lan" ? kind : "manual";
+        return { kind: validKind, value };
+      })
+      .filter((a) => a.value !== "");
     return {
       label: String(t.label ?? ""),
-      host: String(t.host ?? ""),
+      host,
       port: String(t.port ?? "22"),
       user: String(t.user ?? ""),
+      addresses: addresses.length > 0 ? addresses : [{ kind: "manual", value: host }],
     };
   } catch {
     return null;
   }
 }
 
+/** Builds the one-line command the user runs ON the server to authorize Flight
+ *  Deck's key, note Claude/flightdeckd presence, discover reachable addresses, and
+ *  print a paste-back ticket. Exported (pure — takes only the public key) for the
+ *  no-real-newlines regression test.
+ *
+ *  Deliberately single-quote-free so it survives any shell wrapper, and joined with
+ *  `"; "` rather than `"\n"`: a serial paste target that submits each line on its own
+ *  Enter can leave an unterminated quote/subshell open across a REAL newline,
+ *  silently swallowing everything after it — one line (every statement already
+ *  self-terminated with `;`/`&&`/`||`) survives that intact. The `\\n` sequences
+ *  inside `printf` format strings are or must stay LITERAL two-character
+ *  backslash-n — printf itself turns those into real newlines in ITS output; they
+ *  must never collapse into a real newline in the script's own source text. */
+export function buildServerCommand(publicKey: string): string {
+  return [
+    `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
+    `printf "%s\\n" "${publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+    // (B14) The official command pipes to `bash`, not `sh` — see
+    // `bootstrap::server_setup::install_claude`'s own doc for the citation. This is a
+    // best-effort, non-blocking NOTE only (unlike our own ssh probes' hard pairing
+    // gate) — it runs in the user's OWN interactive terminal, not a non-interactive
+    // ssh batch call, so `command -v claude` is left as-is here.
+    `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | bash) then run: claude\\n" >&2`,
+    `command -v flightdeckd >/dev/null 2>&1 || printf "NOTE: flightdeckd not found on PATH, ~/.local/bin or /usr/local/bin (needed for persistent sessions)\\n" >&2`,
+    `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
+    `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; LAN_H=$3; else LAN_H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi`,
+    `TS_H=""; if command -v tailscale >/dev/null 2>&1; then TS_H=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\\.$//'); fi`,
+    `ADDR=""; SEP=""; H=""`,
+    `if [ -n "$TS_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"tailscale\\",\\"value\\":\\"$TS_H\\"}"; SEP=","; H="$TS_H"; fi`,
+    `if [ -n "$LAN_H" ]; then ADDR="$ADDR$SEP{\\"kind\\":\\"lan\\",\\"value\\":\\"$LAN_H\\"}"; SEP=","; [ -n "$H" ] || H="$LAN_H"; fi`,
+    `if [ -z "$H" ]; then MH=$(hostname); ADDR="$ADDR$SEP{\\"kind\\":\\"manual\\",\\"value\\":\\"$MH\\"}"; H="$MH"; fi`,
+    `T=$(printf "{\\"label\\":\\"%s\\",\\"host\\":\\"%s\\",\\"port\\":%s,\\"user\\":\\"%s\\",\\"addresses\\":[%s]}" "$(hostname)" "$H" "$P" "$U" "$ADDR" | base64 | tr -d "\\n")`,
+    `printf "\\n=== Flight Deck pairing ticket — copy the next line ===\\nfdpair:%s\\n" "$T"`,
+  ].join("; ");
+}
+
 /** Pair remote SSH servers and open conversations that run on them (the alpha
- *  "machine boundary"). Primary flow: run one command on the server — it authorizes a
- *  Flight-Deck-generated key, checks Claude, and prints a ticket that carries the
- *  connection details back, so the user never has to recall a hostname/user/port.
- *  Typing the details by hand is the last-resort fallback. */
+ *  "machine boundary"). Primary flow (B12): `ServerBootstrapWizard` — type the
+ *  connection details once, Flight Deck installs and configures everything else, no
+ *  terminal required. Its own secondary link keeps the OLD ticket/command flow
+ *  reachable for a server this Mac can only reach with a pre-authorized key.
+ *  Each paired server renders as a `ServerStatusPanel` (live diagnosis + repairs). */
 export function RemoteServersGroup() {
   const machines = useMachines();
 
-  // ---- Add-a-server (pairing) flow ----
-  const [adding, setAdding] = useState(false);
-  const [stage, setStage] = useState<PairStage>("command");
-  const [genKey, setGenKey] = useState<{ identityFile: string; publicKey: string } | null>(null);
-  const [ticket, setTicket] = useState("");
-  const [label, setLabel] = useState("");
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("22");
-  const [user, setUser] = useState("");
-  const [copied, setCopied] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // ---- Per-server phone-provisioning status (C10/C11) ----
+  const [provisionStatuses, setProvisionStatuses] = useState<Map<string, MachineProvisionStatus>>(new Map());
+  // ---- Per-server phone-REVOCATION status (C10's critical fix) — whether the
+  // OLD token from the last "regenerate pairing" was actually forgotten here. ----
+  const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
+  const [retrying, setRetrying] = useState<Set<string>>(new Set());
+  const now = useNow(30_000);
+
+  // Poll both registries so a background provisioning/revocation attempt
+  // (triggered elsewhere — pairing a server, enabling remote access,
+  // regenerating pairing) shows up here without the user having to leave and
+  // reopen Settings.
+  useEffect(() => {
+    let disposed = false;
+    const read = () => {
+      void commands.phoneProvisioningStatus().then((rows) => {
+        if (!disposed) setProvisionStatuses(new Map(rows.map((r) => [r.machine_id, r])));
+      });
+      void commands.phoneRevocationStatus().then((rows) => {
+        if (!disposed) setRevokeStatuses(new Map(rows.map((r) => [r.machine_id, r])));
+      });
+    };
+    read();
+    const id = setInterval(read, 4000);
+    return () => {
+      disposed = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const retryProvisioning = useCallback((machineId: string) => {
+    setRetrying((cur) => new Set(cur).add(machineId));
+    void commands
+      .retryPhoneProvisioning(machineId)
+      .then((res) => {
+        if (res.status === "ok") {
+          setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
+        }
+        // A command-level error (not a provisioning outcome — e.g. the machine
+        // was deleted mid-flight) is transient here: the next poll simply keeps
+        // showing whatever the registry already had, never a silent no-op.
+      })
+      .finally(() => {
+        setRetrying((cur) => {
+          const next = new Set(cur);
+          next.delete(machineId);
+          return next;
+        });
+      });
+  }, []);
+
+  // ---- Add-a-server (B12 wizard) ----
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
-  const resetAdd = useCallback(() => {
-    setAdding(false);
-    setStage("command");
-    setGenKey(null);
-    setTicket("");
-    setLabel("");
-    setHost("");
-    setPort("22");
-    setUser("");
-    setCopied(false);
-    setBusy(false);
-    setError(null);
-  }, []);
-
-  const startAdd = useCallback(async () => {
-    setConvFor(null);
-    setAdding(true);
-    setStage("command");
-    setError(null);
-    setGenKey(null);
-    setTicket("");
-    // Generate Flight Deck's dedicated key up front so the command (which embeds its
-    // PUBLIC key) is ready immediately — nothing to fill in first.
-    const res = await useConversationsStore.getState().generateMachineKey("server");
-    if (res.ok) setGenKey({ identityFile: res.key.identity_file, publicKey: res.key.public_key });
-    else setError(res.error);
-  }, []);
-
-  // The command the user runs ON the server: authorize Flight Deck's key, check Claude,
-  // DISCOVER the coords (user / port / a reachable host / label), and print a paste-back
-  // ticket. Deliberately single-quote-free so it survives any shell wrapper.
-  const serverCommand = genKey
-    ? [
-        `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
-        `printf "%s\\n" "${genKey.publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
-        `command -v claude >/dev/null 2>&1 || printf "NOTE: install Claude Code (curl -fsSL https://claude.ai/install.sh | sh) then run: claude\\n" >&2`,
-        `U=$(id -un); P=$(sshd -T 2>/dev/null | sed -n "s/^port //p" | head -1); [ -n "$P" ] || P=22`,
-        `if [ -n "$SSH_CONNECTION" ]; then set -- $SSH_CONNECTION; H=$3; else H=$(hostname -I 2>/dev/null | cut -d" " -f1); fi; [ -n "$H" ] || H=$(hostname)`,
-        `T=$(printf "{\\"label\\":\\"%s\\",\\"host\\":\\"%s\\",\\"port\\":%s,\\"user\\":\\"%s\\"}" "$(hostname)" "$H" "$P" "$U" | base64 | tr -d "\\n")`,
-        `printf "\\n=== Flight Deck pairing ticket — copy the next line ===\\nfdpair:%s\\n" "$T"`,
-      ].join("\n")
-    : "";
-
-  const copyCmd = useCallback(() => {
-    void navigator.clipboard.writeText(serverCommand);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }, [serverCommand]);
-
-  const continueFromTicket = useCallback(() => {
-    const t = parseTicket(ticket);
-    if (!t) {
-      setError("Couldn't read that ticket — copy the whole fdpair:… line the command printed.");
-      return;
-    }
-    setLabel(t.label);
-    setHost(t.host);
-    setPort(t.port || "22");
-    setUser(t.user);
-    setError(null);
-    setStage("confirm");
-  }, [ticket]);
-
-  const pair = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    const res = await useConversationsStore.getState().addMachine({
-      label: label.trim() || host.trim(),
-      host: host.trim(),
-      port: Number(port) || 22,
-      user: user.trim(),
-      identityFile: genKey?.identityFile ?? null,
-    });
-    setBusy(false);
-    if (res.ok) resetAdd();
-    else setError(res.error);
-  }, [label, host, port, user, genKey, resetAdd]);
-
   const toggleConv = useCallback((machineId: string) => {
-    setAdding(false);
+    setWizardOpen(false);
     setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
 
@@ -336,35 +372,23 @@ export function RemoteServersGroup() {
 
   return (
     <SettingsGroup title="Remote servers (SSH)" icon="globe">
-      {machines.length === 0 && !adding && (
+      {machines.length === 0 && !wizardOpen && (
         <div className={styles.remoteEmpty}>
           No remote server yet. Pair a Linux box and run conversations on it, over SSH.
         </div>
       )}
 
       {machines.map((m) => (
-        <Fragment key={m.id}>
-          <div className={styles.remoteRow}>
-            <div className={styles.remoteMain}>
-              <span className={styles.remoteName}>{m.label}</span>
-              <span className={styles.mono}>
-                {m.user}@{m.host}:{m.port}
-              </span>
-            </div>
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => void toggleConv(m.id)}
-            >
-              New conversation…
-            </button>
-            <button
-              className={`${styles.btn} ${styles.ghost}`}
-              onClick={() => useConversationsStore.getState().removeMachine(m.id)}
-            >
-              Remove
-            </button>
-          </div>
-
+        <ServerStatusPanel
+          key={m.id}
+          machine={m}
+          provisionLabel={describeProvisionStatus(provisionStatuses.get(m.id), now)}
+          revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
+          isRetrying={retrying.has(m.id)}
+          onRetryProvisioning={() => retryProvisioning(m.id)}
+          onNewConversation={() => toggleConv(m.id)}
+          onRemove={() => useConversationsStore.getState().removeMachine(m.id)}
+        >
           {convFor === m.id && (
             <div className={styles.remotePanel}>
               <RemoteFolderPicker
@@ -380,145 +404,23 @@ export function RemoteServersGroup() {
               </div>
             </div>
           )}
-        </Fragment>
+        </ServerStatusPanel>
       ))}
 
-      {!adding ? (
+      {!wizardOpen ? (
         <div className={styles.remoteFooter}>
-          <button className={`${styles.btn} ${styles.primary}`} onClick={() => void startAdd()}>
+          <button
+            className={`${styles.btn} ${styles.primary}`}
+            onClick={() => {
+              setConvFor(null);
+              setWizardOpen(true);
+            }}
+          >
             + Add a server
           </button>
         </div>
       ) : (
-        <div className={styles.remotePanel}>
-          {stage === "command" && (
-            <>
-              <div className={styles.remoteStep}>
-                <b>1 · Run this once on your server.</b> Open a shell on it (over SSH, or on the
-                machine itself) and paste. It authorizes Flight Deck, checks Claude, and prints a
-                pairing ticket. Nothing to type here — Flight Deck already made a dedicated key.
-              </div>
-              {serverCommand ? (
-                <>
-                  <pre className={styles.codeBlock}>{serverCommand}</pre>
-                  <div className={styles.btnRow}>
-                    <button className={`${styles.btn} ${styles.ghost}`} onClick={copyCmd}>
-                      {copied ? "Copied" : "Copy command"}
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className={styles.remoteStep}>{error ? "" : "Preparing the command…"}</div>
-              )}
-              <div className={styles.remoteStep}>
-                <b>2 · Paste the ticket</b> it printed (the <b>fdpair:…</b> line):
-              </div>
-              <input
-                className={styles.field}
-                placeholder="fdpair:…"
-                value={ticket}
-                onChange={(e) => setTicket(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") continueFromTicket();
-                }}
-              />
-              {error && <div className={styles.errorMsg}>{error}</div>}
-              <div className={styles.btnRow}>
-                <button
-                  className={`${styles.btn} ${styles.primary}`}
-                  disabled={!ticket.trim()}
-                  onClick={continueFromTicket}
-                >
-                  Continue
-                </button>
-                <button
-                  className={`${styles.btn} ${styles.ghost}`}
-                  onClick={() => {
-                    setError(null);
-                    setStage("manual");
-                  }}
-                >
-                  Enter details manually
-                </button>
-                <span className={styles.spacer} />
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={resetAdd}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-
-          {(stage === "confirm" || stage === "manual") && (
-            <>
-              <div className={styles.remoteStep}>
-                {stage === "confirm" ? (
-                  <>
-                    <b>3 · Confirm the connection</b> — the server filled these in. Fix anything that
-                    looks off (e.g. the host/port if it's behind a NAT or a port mapping).
-                  </>
-                ) : (
-                  <>
-                    <b>Enter the server's details.</b> A last resort — prefer the pairing command
-                    above when you can.
-                  </>
-                )}
-              </div>
-              <input
-                className={styles.field}
-                placeholder="Name (e.g. my-vps)"
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
-              />
-              <input
-                className={styles.field}
-                placeholder="Host or IP (reachable from this Mac)"
-                value={host}
-                onChange={(e) => setHost(e.target.value)}
-              />
-              <div className={styles.fieldRow}>
-                <input
-                  className={styles.field}
-                  style={{ flex: "0 0 96px" }}
-                  inputMode="numeric"
-                  placeholder="Port"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
-                />
-                <input
-                  className={styles.field}
-                  placeholder="User (e.g. root)"
-                  value={user}
-                  onChange={(e) => setUser(e.target.value)}
-                />
-              </div>
-              {error && <div className={styles.errorMsg}>{error}</div>}
-              <div className={styles.btnRow}>
-                <button
-                  className={`${styles.btn} ${styles.primary}`}
-                  disabled={busy || !host.trim() || !user.trim()}
-                  onClick={() => void pair()}
-                >
-                  {busy ? "Testing…" : "Test & pair"}
-                </button>
-                {stage === "confirm" && (
-                  <button
-                    className={`${styles.btn} ${styles.ghost}`}
-                    onClick={() => {
-                      setError(null);
-                      setStage("command");
-                    }}
-                  >
-                    Back
-                  </button>
-                )}
-                <span className={styles.spacer} />
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={resetAdd}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-        </div>
+        <ServerBootstrapWizard onClose={() => setWizardOpen(false)} />
       )}
     </SettingsGroup>
   );
@@ -531,6 +433,9 @@ export function RemoteAccessGroup() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
+  // C11: "This Mac's name" — a draft while the user is typing (committed on
+  // blur/Enter), the same pattern as the voice bridge's port field above.
+  const [labelDraft, setLabelDraft] = useState<string | null>(null);
 
   // Read once on open, then poll so the toggle reflects the live connection
   // (connecting → connected) without needing to reopen the panel.
@@ -549,7 +454,7 @@ export function RemoteAccessGroup() {
   }, []);
 
   const apply = useCallback(
-    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean }) => {
+    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean; macLabel?: string }) => {
       setBusy(true);
       setError(null);
       try {
@@ -557,6 +462,7 @@ export function RemoteAccessGroup() {
           patch.enabled ?? null,
           patch.relayUrl ?? null,
           patch.regeneratePairing ?? false,
+          patch.macLabel ?? null,
         );
         if (res.status === "ok") setRemote(res.data);
         else setError(res.error);
@@ -568,6 +474,21 @@ export function RemoteAccessGroup() {
     },
     [],
   );
+
+  // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
+  // place — the core treats an empty string as "leave it unchanged", never as
+  // "clear the label" (see `set_remote`'s doc), so an empty field must not
+  // silently keep showing the OLD label as if nothing happened.
+  const commitLabel = useCallback(() => {
+    if (labelDraft === null || !remote) return;
+    const label = labelDraft.trim();
+    setLabelDraft(null);
+    if (!label) {
+      setError("This Mac's name cannot be empty.");
+      return;
+    }
+    if (label !== remote.mac_label) void apply({ macLabel: label });
+  }, [labelDraft, remote, apply]);
 
   // Remote access needs the Mac awake; enabling forces Caffeinate "Hard" and
   // snapshots the prior policy so turning it off restores what the user had.
@@ -640,6 +561,24 @@ export function RemoteAccessGroup() {
         }
         checked={remoteAnswers}
         onChange={(next) => setPrefs({ remoteAnswers: next })}
+      />
+      <ToggleRow
+        title="This Mac's name"
+        hint={`Shown in a paired phone's node list, alongside any paired servers (e.g. "MacBook Pro").`}
+        control={
+          <input
+            className={styles.field}
+            style={{ width: 200 }}
+            value={labelDraft ?? remote?.mac_label ?? ""}
+            onChange={(e) => setLabelDraft(e.target.value)}
+            onBlur={commitLabel}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitLabel();
+            }}
+            disabled={busy || !remote}
+            aria-label="This Mac's name"
+          />
+        }
       />
       <ToggleRow
         title="Status"

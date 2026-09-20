@@ -35,18 +35,21 @@ export interface SettingEntry {
  *  and the panel agree on the ids — the test cross-checks the index against it). */
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
   general: ["accounts", "system"],
-  display: ["appearance", "thread", "timing", "composer", "models", "order"],
+  display: ["appearance", "thread", "timing", "composer", "models", "ide", "order"],
   claudeCode: ["instructions", "behavior", "helpers"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
-  // ---- Display (Appearance / Thread / Durations / Composer / Models / Order) ----
+  // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "Tinted conversation rows", section: "display", sub: "appearance", group: "Appearance", keywords: "sidebar state colour color pill running timer chrono dot status couleur etat pastille ligne conversation display affichage" },
+  { title: "Status inside the composer", section: "display", sub: "appearance", group: "Appearance", keywords: "review bar mark as seen question error banner encadre statut composeur vu display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
+  { title: "Conversation side panel", section: "display", sub: "thread", group: "Thread", keywords: "sidebar panneau lateral droite todo goal artifacts artefacts tosse task tache worktree stream header display affichage" },
   { title: "Message minimap", section: "display", sub: "thread", group: "Thread", keywords: "scrollbar map jump navigation display affichage" },
   { title: "Live workflow on the Flight Deck card", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow card phases display affichage" },
   { title: "Per-agent detail in the workflow view", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow agents phase live detail agents display affichage" },
@@ -55,6 +58,8 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Animate the conversation", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
   { title: "Message controls", section: "display", sub: "thread", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
   { title: "Clickable filename on Read/Write rows", section: "display", sub: "thread", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
+  { title: "Show hosted artifacts in Flight Deck", section: "display", sub: "thread", group: "Thread", keywords: "artifact artefact claude design canvas claude.ai webview browser navigateur panel panneau" },
+  { title: "Time on sidebar rows", section: "display", sub: "timing", group: "Durations & timing", keywords: "sidebar row timer counter chrono temps ligne conversation barre laterale" },
   { title: "Turn duration", section: "display", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
   { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
   { title: "Thinking time", section: "display", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
@@ -95,6 +100,15 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
   { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 
+  // ---- Display, continued: IDE ---------------------------------------------
+  // The IDE card's own title is indexed too (like "Switching" below): on its own it's a
+  // second way to land on the card, and it's the flash target for "Panel position",
+  // which has no titled row of its own to flash instead.
+  { title: "IDE", section: "display", sub: "ide", group: "IDE", keywords: "ide view editor explorer files folder workspace terminals dock panel conversations vue ide" },
+  { title: "IDE view", section: "display", sub: "ide", group: "IDE", keywords: "ide editor explorer files folder workspace terminals dock tab onglet dossier fichiers vs code" },
+  { title: "Panel position", flash: "IDE", section: "display", sub: "ide", group: "IDE", keywords: "panneau position droite bas marge pied de page dock terminal conversations" },
+  { title: "Dim hidden files in the explorer", section: "display", sub: "ide", group: "IDE", keywords: "fichiers cachés dotfiles estomper explorateur git" },
+
   // ---- Shortcuts + Display → Order ----------------------------------------
   { title: "Keyboard shortcuts", section: "shortcuts", group: "Keyboard shortcuts", keywords: "keys chords raccourcis clavier" },
   { title: "Conversations", section: "display", sub: "order", group: "Conversation order", keywords: "drag drop manual order tri ordre" },
@@ -121,6 +135,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Remote servers (SSH)", section: "control", sub: "remote", group: "Remote servers (SSH)", keywords: "ssh host machine distant serveur" },
   { title: "Reach your agents from your phone", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "relay pairing mobile telephone" },
   { title: "Answer permission requests remotely", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "permission phone relay" },
+  { title: "This Mac's name", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "label node name mac relay nom" },
   { title: "Local MCP server for an external agent", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge token port externe" },
   { title: "Port", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge listen" },
   { title: "Access token", section: "control", sub: "bridge", group: "Voice bridge", keywords: "bearer secret bridge jeton" },

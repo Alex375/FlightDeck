@@ -20,6 +20,7 @@ vi.mock("../ipc/client", () => {
       answerPermission: vi.fn(() => ok()),
       publishControlEvent: vi.fn(() => Promise.resolve()),
       tosseTaskDetail: vi.fn(() => ok(null)),
+      pushRemoteConversationTitle: vi.fn(() => Promise.resolve(false)),
     },
   };
 });
@@ -35,6 +36,7 @@ vi.mock("../notifications/notify", () => ({
 const editorActions = {
   revealInEditor: vi.fn(),
   ensureConv: vi.fn(),
+  openFile: vi.fn(() => Promise.resolve()),
   setOpen: vi.fn(),
   setTerminalOpen: vi.fn(),
   setGitOpen: vi.fn(),
@@ -56,6 +58,9 @@ import { useToasts } from "../store/toasts";
 import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
 import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
+// The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
+// view:"ide" tests below is that a real workspace gets opened, not a stub of one.
+import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -182,6 +187,9 @@ beforeEach(() => {
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.setState({ sessions: {} });
   useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
+  // A real store (not mocked): reset it so a workspace opened by one test never leaks
+  // into the next.
+  useIdeStore.setState({ workspaces: [], activeId: null, dockMaximized: false });
   seed(conv());
 });
 
@@ -232,6 +240,45 @@ describe("appControl — conversations", () => {
     expect((out[0].status as { kind: string }).kind).toBe("idle");
     expect((out[1].status as { kind: string }).kind).toBe("off");
     expect((out[0].repository as { name: string }).name).toBe("r1");
+    // C9: additive, local conversations report no host.
+    expect(out[0].hosted_on).toBeNull();
+    expect(out[0].session_id).toBeNull();
+  });
+
+  it("list_conversations and read_conversation report session_id + hosted_on for a REMOTE conversation (C9)", async () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r-remote", path: "/work/demo", addedAt: 1, machineId: "m1" }],
+      machines: [
+        {
+          id: "m1",
+          label: "build-server",
+          host: "h.example",
+          port: 22,
+          user: "agent",
+          addedAt: 1,
+          addresses: [],
+        },
+      ],
+      conversations: [conv({ id: "c1", repoId: "r-remote", sessionId: "claude-sess-1" })],
+      activeId: "c1",
+    });
+    const list = (await executeAppControlTool(
+      "list_conversations",
+      {},
+      null,
+      helpers(),
+    )) as Array<Record<string, unknown>>;
+    expect(list[0].hosted_on).toBe("build-server");
+    expect(list[0].session_id).toBe("claude-sess-1");
+
+    const read = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(read.hosted_on).toBe("build-server");
+    expect(read.session_id).toBe("claude-sess-1");
   });
 
   it("list_conversations counts RUNNING background tasks whatever the status", async () => {
@@ -333,6 +380,144 @@ describe("appControl — conversations", () => {
     expect(out.turns[1].text).toContain("[tool: Bash]");
     expect(out.turns[1].text).toContain("bug is fixed");
     expect(JSON.stringify(out)).not.toContain("sub-agent chatter");
+  });
+
+  it("read_conversation keeps a failed background task visible (a notice, not an error turn)", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "run the suite" }] });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "task_failed",
+      detail: { message: "Background task failed: e2e suite", label: "e2e suite", detail: null },
+    });
+    // Other quiet notices stay out of the digest.
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "control_change",
+      detail: { control: "Model", from: "a", to: "b" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "user", text: "run the suite" },
+      { role: "system", text: "[Background task failed: e2e suite]" },
+    ]);
+  });
+
+  // Zero silent error, on the MCP surface too: a conversation that DIED must not read to
+  // another agent as one still thinking. Every error-bearing notice subtype the core can
+  // emit (the thread's own NOTICE_ERROR_HEADINGS) becomes a visible system line.
+  it.each([
+    ["process_exited", "The Claude Code session stopped unexpectedly"],
+    ["send_failed", "Message not delivered to Claude Code"],
+    ["protocol_error", "Protocol error"],
+    ["permission_error", "Unreadable permission request"],
+    ["history_error", "Problem restoring history"],
+    ["error", "Error"],
+  ])("read_conversation surfaces a %s notice as a system line", async (subtype, heading) => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "ship it" }] });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype,
+      detail: { message: "exit code 1" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "user", text: "ship it" },
+      { role: "system", text: `[${heading}: exit code 1]` },
+    ]);
+  });
+
+  it("read_conversation names the rejected setting of a control_error", async () => {
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "control_error",
+      detail: { control: "Permission mode", message: "unsupported" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "system", text: '[Setting "Permission mode" rejected by Claude Code: unsupported]' },
+    ]);
+  });
+
+  it("read_conversation leaves the QUIET notice subtypes out of the digest", async () => {
+    for (const subtype of ["control_change", "interrupted", "command_output", "remote_link"]) {
+      useConversationStore
+        .getState()
+        .applyItem("c1", { kind: "notice", subtype, detail: { message: "noise" } });
+    }
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "hello" }] });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([{ role: "user", text: "hello" }]);
+  });
+
+  // `max_turns` is a budget of DIALOGUE. A conversation that crashed in a burst emits several
+  // error notices in a row, and when those were counted in, the caller asking for N turns got
+  // N system lines and none of the dialogue it asked for — the very thing it needs to know
+  // WHAT died mid-way through.
+  it("read_conversation does not let system lines eat the requested turns", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "ship it" }] });
+    pushTurn("c1", { role: "assistant", blocks: [{ type: "text", text: "on it" }] });
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "status?" }] });
+    for (const subtype of ["process_exited", "protocol_error", "send_failed", "error"]) {
+      useConversationStore
+        .getState()
+        .applyItem("c1", { kind: "notice", subtype, detail: { message: "boom" } });
+    }
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1", max_turns: 3 },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns.filter((t) => t.role !== "system").map((t) => t.text)).toEqual([
+      "ship it",
+      "on it",
+      "status?",
+    ]);
+    expect(out.turns.filter((t) => t.role === "system")).toHaveLength(4); // still all visible
+  });
+
+  // Alongside is not unbounded: a session flapping in a loop must not answer with megabytes.
+  // The NEWEST system lines are kept (they say what killed it), and what was dropped is
+  // COUNTED and said — never silently swallowed.
+  it("read_conversation caps system lines and says how many it dropped", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "ship it" }] });
+    for (let i = 0; i < 25; i++) {
+      useConversationStore
+        .getState()
+        .applyItem("c1", { kind: "notice", subtype: "process_exited", detail: { message: `#${i}` } });
+    }
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    const system = out.turns.filter((t) => t.role === "system");
+    expect(system).toHaveLength(21); // 20 kept + the line saying 5 were dropped
+    expect(system[0].text).toBe("[5 older system line(s) omitted]");
+    expect(system[1].text).toContain("#5"); // the oldest KEPT one
+    expect(system[20].text).toContain("#24"); // …and the newest
+    expect(out.turns.filter((t) => t.role !== "system")).toHaveLength(1); // the dialogue survived
   });
 
   it("send_message refuses a conversation messaging itself", async () => {
@@ -552,6 +737,21 @@ describe("appControl — UI actions", () => {
     expect(h.views).toEqual([]);
   });
 
+  it("open_view opens the IDE view, and refuses it when the preference is off", async () => {
+    const h = helpers();
+    useDisplay.getState().set({ ideView: true });
+    await executeAppControlTool("open_view", { view: "ide" }, null, h);
+    expect(h.views).toEqual(["ide"]);
+    // `changeView` no-ops on a switched-off view; the TOOL must say so rather than report
+    // a success that changed nothing.
+    useDisplay.getState().set({ ideView: false });
+    await expect(executeAppControlTool("open_view", { view: "ide" }, null, h)).rejects.toThrow(
+      /switched off/,
+    );
+    expect(h.views).toEqual(["ide"]);
+    useDisplay.getState().set({ ideView: true });
+  });
+
   it("open_file refuses '~' paths and nonexistent files", async () => {
     seed(conv({ handle: "session-7" }));
     await expect(
@@ -582,6 +782,182 @@ describe("appControl — UI actions", () => {
   it("notify_user forwards to the agent-notification path", async () => {
     await executeAppControlTool("notify_user", { message: "look here", critical: true }, null, helpers());
     expect(notifyFromAgent).toHaveBeenCalledWith("look here", true);
+  });
+});
+
+describe("appControl — open_file view:\"ide\"", () => {
+  it("opens the file in the workspace's OWN editor slice and switches to the IDE view", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_file",
+      { path: "src/main.rs", line: 42, view: "ide" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+
+    expect(h.views).toEqual(["ide"]);
+    expect(out).toMatchObject({ conversation_id: "c1", path: "/tmp/r1/src/main.rs", line: 42, view: "ide" });
+
+    // One workspace, opened on the conversation's cwd (== the repo folder here).
+    const workspaces = useIdeStore.getState().workspaces;
+    expect(workspaces).toHaveLength(1);
+    const ws = workspaces[0];
+    expect(ws.path).toBe("/tmp/r1");
+
+    const key = editorKeyFor(ws.id);
+    expect(editorActions.ensureConv).toHaveBeenCalledWith(key, "/tmp/r1");
+    expect(editorActions.openFile).toHaveBeenCalledWith(key, "/tmp/r1/src/main.rs", {
+      preview: true,
+      reveal: { line: 42, column: undefined },
+    });
+    // The conversation-view path (revealInEditor mutates the CONVERSATION's global layout
+    // flags) must never fire for an IDE-view open.
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("leaves the app's ACTIVE conversation alone: a background agent asked for a FILE", async () => {
+    // Two conversations in one folder; the user is on c2, and c1 (in the background) opens
+    // a file. It used to repoint the app's selection to c1 — persisted, inherited by ⌘1 and
+    // ⌘⌥↑/↓ — with nothing on screen to say so when the dock was closed or on Terminals.
+    seed(conv({ handle: "session-7" }), conv({ id: "c2", name: "Beta", handle: "session-8" }));
+    useConversationsStore.setState({ activeId: "c2" });
+    useDisplay.getState().set({ ideView: true });
+    await executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", helpers());
+    expect(useConversationsStore.getState().activeId).toBe("c2");
+    expect(editorActions.openFile).toHaveBeenCalled();
+    // …and the conversation the DOCK shows is left alone too: repointing it swapped the
+    // thread the user was reading for the calling agent's, mid-read.
+    expect(useIdeStore.getState().workspaces[0].lastConvId).toBeNull();
+  });
+
+  it("never swaps the folder under the user — even when the docked agent has LEFT it", async () => {
+    // The worktree is the workspace on screen and c1 is docked there; its agent then ran
+    // ExitWorktree (what `/land` does), so it now works at the repository root and every
+    // path it names lives OUTSIDE the workspace. Opening the root as a second workspace
+    // would swap explorer, tabs, terminals and dock mid-`/land`, from a background call.
+    const wt = "/tmp/r1/.claude/worktrees/x";
+    seed(conv({ handle: "session-7", cwd: "/tmp/r1", liveCwd: "/tmp/r1" }));
+    useDisplay.getState().set({ ideView: true });
+    const ws = useIdeStore.getState().openWorkspace(wt, "r1");
+    useIdeStore.getState().noteConversation(ws, "c1"); // docked → pinned although outside
+    const h = { ...helpers(), currentView: "ide" as const };
+    await executeAppControlTool("open_file", { path: "CHANGELOG.md" }, "session-7", h);
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+    expect(useIdeStore.getState().activeId).toBe(ws);
+    // The file still opens — in the workspace on screen, as a tab rooted elsewhere.
+    expect(editorActions.openFile).toHaveBeenCalledWith(
+      editorKeyFor(ws),
+      "/tmp/r1/CHANGELOG.md",
+      expect.anything(),
+    );
+    expect(h.views).toEqual(["ide"]);
+  });
+
+  it("with no 'view', follows the user's eyes: stays in the IDE when the agent is docked there", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    useIdeStore.getState().openWorkspace("/tmp/r1", "r1");
+    const h = { ...helpers(), currentView: "ide" as const };
+    const out = (await executeAppControlTool("open_file", { path: "src/main.rs" }, "session-7", h)) as Record<
+      string,
+      unknown
+    >;
+    // The historical default threw the user out of the IDE view to show the file in a side
+    // editor they were not using.
+    expect(h.views).toEqual(["ide"]);
+    expect(out.view).toBe("ide");
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("with no 'view', keeps the conversation default when the IDE shows ANOTHER folder", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    const other = useIdeStore.getState().openWorkspace("/tmp/elsewhere", null);
+    const h = { ...helpers(), currentView: "ide" as const };
+    await executeAppControlTool("open_file", { path: "src/main.rs" }, "session-7", h);
+    // Opening a file must not swap the folder under the user.
+    expect(h.views).toEqual(["conversation"]);
+    expect(useIdeStore.getState().activeId).toBe(other);
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+  });
+
+  it("stays in the workspace on screen when it already holds the file and the agent", async () => {
+    // The repository's folder is open; the agent works in a worktree UNDER it. A second
+    // workspace for the worktree would swap the explorer to show a file it already reaches.
+    const wt = "/tmp/r1/.claude/worktrees/x";
+    seed(conv({ handle: "session-7", liveCwd: wt }));
+    useDisplay.getState().set({ ideView: true });
+    const root = useIdeStore.getState().openWorkspace("/tmp/r1", "r1");
+    await executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", helpers());
+    expect(useIdeStore.getState().workspaces).toHaveLength(1);
+    expect(useIdeStore.getState().activeId).toBe(root);
+    expect(editorActions.openFile).toHaveBeenCalledWith(
+      editorKeyFor(root),
+      `${wt}/src/main.rs`,
+      expect.anything(),
+    );
+  });
+
+  it("refuses when the IDE view is switched off — nothing opened, no view change", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: false });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", h),
+    ).rejects.toThrow(/switched off/);
+    expect(h.views).toEqual([]);
+    expect(editorActions.ensureConv).not.toHaveBeenCalled();
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
+    useDisplay.getState().set({ ideView: true }); // restore for the tests that follow
+  });
+
+  it("refuses a conversation whose repository is remote", async () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1, machineId: "mac-2" }],
+      conversations: [conv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    useDisplay.getState().set({ ideView: true });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "ide" }, "session-7", h),
+    ).rejects.toThrow(/remote repository/);
+    expect(h.views).toEqual([]);
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
+  });
+
+  it("refuses an unknown 'view' value", async () => {
+    seed(conv({ handle: "session-7" }));
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "flightdeck" }, "session-7", helpers()),
+    ).rejects.toThrow(/'view' must be conversation \| ide/);
+    expect(editorActions.openFile).not.toHaveBeenCalled();
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  it("view:\"conversation\" (explicit) behaves exactly like the default", async () => {
+    seed(conv({ handle: "session-7" }));
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_file",
+      { path: "src/main.rs", line: 42, view: "conversation" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+    expect(h.views).toEqual(["conversation"]);
+    expect(editorActions.revealInEditor).toHaveBeenCalledWith(
+      "c1",
+      "/tmp/r1",
+      "/tmp/r1/src/main.rs",
+      { line: 42, column: undefined },
+    );
+    // No 'view' key — the same shape open_file has always returned.
+    expect(out).toEqual({ conversation_id: "c1", path: "/tmp/r1/src/main.rs", line: 42 });
+    expect(useIdeStore.getState().workspaces).toHaveLength(0);
   });
 });
 
@@ -673,7 +1049,17 @@ describe("answer_request — questions vs permissions", () => {
   });
 });
 
+
 describe("appControl — link_tosse_task / unlink_tosse_task", () => {
+  // Canonical task UUIDs: the ONLY shape `task_id` accepts (see the path-traversal test
+  // below), so every fixture here has to look like one. ⚠️ Every one of them CONTAINS hex
+  // LETTERS on purpose: with digits only, `id.toUpperCase()` is the very same string and the
+  // case-insensitivity tests below would assert nothing at all.
+  const T1 = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+  const SUB = "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e";
+  const PARENT = "c3d4e5f6-a7b8-4c9d-ae1f-2a3b4c5d6e7f";
+  const OLD = "d4e5f6a7-b8c9-4d0e-bf2a-3b4c5d6e7f80";
+
   /** A CRM task detail as `tosse_task_detail` returns it. */
   const detail = (id: string, title: string, status: string, parentTaskId: string | null = null) => ({
     task: {
@@ -709,17 +1095,17 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
   });
 
   it("links the CALLING conversation with the task as the CRM has it", async () => {
-    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail("t1", "Real title", "En cours")));
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail(T1, "Real title", "En cours")));
     const out = (await executeAppControlTool(
       "link_tosse_task",
       // The agent's title is ignored when the CRM can be read — the CRM is the truth.
-      { task_id: "t1", title: "agent's guess" },
+      { task_id: T1, title: "agent's guess" },
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
     expect(out.source).toBe("tosse");
     expect(linked()).toMatchObject({
-      tosseTaskId: "t1",
+      tosseTaskId: T1,
       tosseTaskTitle: "Real title",
       tosseTaskStatus: "En cours",
     });
@@ -728,28 +1114,206 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
 
   it("links a subtask's PARENT", async () => {
     vi.mocked(commands.tosseTaskDetail)
-      .mockReturnValueOnce(crmOk(detail("sub", "A step", "À faire", "parent")))
-      .mockReturnValueOnce(crmOk(detail("parent", "The work", "En cours")));
+      .mockReturnValueOnce(crmOk(detail(SUB, "A step", "À faire", PARENT)))
+      .mockReturnValueOnce(crmOk(detail(PARENT, "The work", "En cours")));
     const out = (await executeAppControlTool(
       "link_tosse_task",
-      { task_id: "sub" },
+      { task_id: SUB },
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
-    expect(linked().tosseTaskId).toBe("parent");
+    expect(linked().tosseTaskId).toBe(PARENT);
     expect(linked().tosseTaskTitle).toBe("The work");
     expect(String(out.note)).toMatch(/subtask/);
+  });
+
+  // ⚠️ NON-REGRESSION GUARD, not the proof of a fix: this passes before and after the change
+  // it ships with. What it pins is the deliberate resolve-THEN-refuse order (see the comment
+  // in `linkTosseTask`). Deciding "already linked to another task" before asking the CRM what
+  // the id resolves to — the tidy-up a reviewer is tempted by, since it would save a read —
+  // breaks exactly here: the id passed is a SUBTASK of the task already linked, so it is the
+  // very same work, and only the CRM can say so.
+  it("answers already_linked when handed a SUBTASK of the task already linked", async () => {
+    seed(
+      conv({
+        handle: "session-7",
+        tosseTaskId: PARENT,
+        tosseTaskTitle: "The work",
+        tosseTaskStatus: "En cours",
+      }),
+    );
+    vi.mocked(commands.tosseTaskDetail)
+      .mockReturnValueOnce(crmOk(detail(SUB, "A step", "À faire", PARENT)))
+      .mockReturnValueOnce(crmOk(detail(PARENT, "The work", "En cours")));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: SUB }, // no replace: true — and none must be needed
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.already_linked).toBe(true);
+    expect(out.replaced).toBeUndefined();
+    expect(linked().tosseTaskId).toBe(PARENT);
   });
 
   // The CRM answered and does not know the id: an error to the agent, never a link to a
   // guess — even when the agent supplied a title.
   it("refuses a task the CRM does not know", async () => {
     vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(
-      crmErr("TOSSE answered HTTP 404: Task not found"),
+      crmErr('TOSSE answered HTTP 404: {"error":{"message":"Task not found"}}'),
     );
     await expect(
-      executeAppControlTool("link_tosse_task", { task_id: "nope", title: "x" }, "session-7", helpers()),
-    ).rejects.toThrow(/HTTP 404/);
+      executeAppControlTool("link_tosse_task", { task_id: T1, title: "x" }, "session-7", helpers()),
+    ).rejects.toThrow(/couldn't read TOSSE task .* the CRM answered HTTP 404/);
+    expect(linked().tosseTaskId).toBeNull();
+  });
+
+  // The CRM's answer is NOT the agent's to read: `tosse_task_detail` folds the first 300
+  // characters of the response body into its error string, so echoing it back turns every
+  // failed read into a 300-byte page of whatever the URL reached.
+  it("reports the NATURE of a CRM failure, never the response body", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(
+      crmErr('TOSSE answered HTTP 403: {"clients":[{"name":"ACME","siret":"123"}]}'),
+    );
+    const err = await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1 },
+      "session-7",
+      helpers(),
+    ).catch((e: Error) => e);
+    expect(String(err)).toContain("HTTP 403");
+    expect(String(err)).not.toContain("ACME");
+    expect(String(err)).not.toContain("siret");
+  });
+
+  it("keeps an unreachable CRM distinct from a refusal, still without the body", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(
+      crmErr("TOSSE is unreachable: dns error: nodename nor servname provided"),
+    );
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: T1 }, "session-7", helpers()),
+    ).rejects.toThrow(/the CRM is unreachable/);
+    expect(String(vi.mocked(commands.tosseTaskDetail).mock.results)).not.toContain("nodename");
+  });
+
+  // ⚠️ The security case. `tosse_task_detail` builds its URL by concatenation, so an id of
+  // '../clients' walks the human's Bearer token onto another CRM endpoint — and the answer
+  // comes back to the agent. The refusal must happen BEFORE any IPC call, and nothing may
+  // be stored either (the tab could be off today and the id spent tomorrow).
+  it.each([
+    "../clients",
+    "..%2Fclients",
+    `${T1}/../clients`,
+    `${T1}?include=secrets`,
+    "not-a-uuid",
+    T1.slice(0, -1), // one hex digit short
+    `${T1.slice(0, -1)}g`, // right length, one character that is not hex
+  ])("refuses a task_id that is not a UUID (%s) without touching the CRM", async (bad) => {
+    await expect(
+      executeAppControlTool(
+        "link_tosse_task",
+        { task_id: bad, title: "Whatever" },
+        "session-7",
+        helpers(),
+      ),
+    ).rejects.toThrow(/must be a TOSSE task UUID/);
+    expect(vi.mocked(commands.tosseTaskDetail)).not.toHaveBeenCalled();
+    expect(linked().tosseTaskId).toBeNull();
+  });
+
+  // Even with the CRM switched off — the branch that makes no request at all — a bad id
+  // must not be persisted.
+  it("refuses a non-UUID task_id with the TOSSE tab off too", async () => {
+    useDisplay.getState().set({ tosseTasksView: false });
+    await expect(
+      executeAppControlTool(
+        "link_tosse_task",
+        { task_id: "../clients", title: "T" },
+        "session-7",
+        helpers(),
+      ),
+    ).rejects.toThrow(/must be a TOSSE task UUID/);
+    expect(linked().tosseTaskId).toBeNull();
+  });
+
+  // A UUID is case-insensitive, so an upper-case one names the SAME task — and it has to be
+  // normalized ONCE, on the way in, or every id comparison downstream reads it as another
+  // task. `T1` contains hex letters, so `toUpperCase()` really is a different string here.
+  it("accepts an upper-case UUID and reads the CRM with the canonical one", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail(T1, "Real title", "En cours")));
+    await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1.toUpperCase() },
+      "session-7",
+      helpers(),
+    );
+    expect(vi.mocked(commands.tosseTaskDetail)).toHaveBeenCalledWith(T1);
+    // What is STORED is the id the CRM handed back, byte for byte: it is what the tasks view
+    // matches conversations on (`refreshLinkedTaskMeta` keys its map on the CRM's own ids).
+    expect(linked().tosseTaskId).toBe(T1);
+  });
+
+  // The consequence of NOT normalizing, and the reason it matters: the same task named in
+  // another case used to read as a DIFFERENT one — the call was refused as "already linked to
+  // another task", and with `replace: true` the agent's guess would have overwritten the
+  // CRM-verified title and blanked the known status.
+  it("treats the same id in another case as the SAME task, not another one", async () => {
+    seed(
+      conv({
+        handle: "session-7",
+        tosseTaskId: T1,
+        tosseTaskTitle: "Refactor the assembler",
+        tosseTaskStatus: "En cours",
+      }),
+    );
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmErr("not connected to TOSSE"));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1.toUpperCase(), title: "some refactor" },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.already_linked).toBe(true);
+    expect(out.replaced).toBeUndefined();
+    expect(linked()).toMatchObject({
+      tosseTaskId: T1, // still the CRM's spelling, not the agent's
+      tosseTaskTitle: "Refactor the assembler",
+      tosseTaskStatus: "En cours",
+    });
+  });
+
+  // …and symmetrically: an existing link written in another case is still recognized, so
+  // re-linking it is idempotent instead of "already linked to another task".
+  it("does not ask for replace when only the CASE of the stored id differs", async () => {
+    seed(
+      conv({
+        handle: "session-7",
+        tosseTaskId: T1.toUpperCase(),
+        tosseTaskTitle: "Stale",
+        tosseTaskStatus: "À faire",
+      }),
+    );
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail(T1, "Fresh", "En cours")));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1 },
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.already_linked).toBe(true);
+    expect(linked()).toMatchObject({ tosseTaskId: T1, tosseTaskTitle: "Fresh" });
+  });
+
+  // A parentTaskId the CRM hands back goes through the same gate: no id reaches the URL
+  // builder unchecked, wherever it came from.
+  it("refuses a parent id the CRM reports in a shape that is not a UUID", async () => {
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(
+      crmOk(detail(SUB, "A step", "À faire", "../clients")),
+    );
+    await expect(
+      executeAppControlTool("link_tosse_task", { task_id: SUB }, "session-7", helpers()),
+    ).rejects.toThrow(/is not a task id/);
+    expect(vi.mocked(commands.tosseTaskDetail)).toHaveBeenCalledTimes(1); // the parent read never fired
     expect(linked().tosseTaskId).toBeNull();
   });
 
@@ -758,11 +1322,11 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
   it("falls back to the agent's title when the app is not signed in", async () => {
     vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmErr("not connected to TOSSE"));
     await expect(
-      executeAppControlTool("link_tosse_task", { task_id: "t1" }, "session-7", helpers()),
+      executeAppControlTool("link_tosse_task", { task_id: T1 }, "session-7", helpers()),
     ).rejects.toThrow(/pass the task's 'title'/);
     const out = (await executeAppControlTool(
       "link_tosse_task",
-      { task_id: "t1", title: "From the agent", status: "En cours" },
+      { task_id: T1, title: "From the agent", status: "En cours" },
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
@@ -773,36 +1337,36 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
   // The TOSSE tab turned off means the app makes NO CRM request at all.
   it("makes no CRM request when the TOSSE tab is off", async () => {
     useDisplay.getState().set({ tosseTasksView: false });
-    await executeAppControlTool("link_tosse_task", { task_id: "t1", title: "T" }, "session-7", helpers());
+    await executeAppControlTool("link_tosse_task", { task_id: T1, title: "T" }, "session-7", helpers());
     expect(vi.mocked(commands.tosseTaskDetail)).not.toHaveBeenCalled();
-    expect(linked().tosseTaskId).toBe("t1");
+    expect(linked().tosseTaskId).toBe(T1);
     expect(linked().tosseTaskStatus).toBeNull(); // unknown, not invented
   });
 
   it("never moves an existing link to another task without replace", async () => {
-    seed(conv({ handle: "session-7", tosseTaskId: "old", tosseTaskTitle: "Old task", tosseTaskStatus: "Review" }));
-    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmOk(detail("t1", "New task", "En cours")));
+    seed(conv({ handle: "session-7", tosseTaskId: OLD, tosseTaskTitle: "Old task", tosseTaskStatus: "Review" }));
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmOk(detail(T1, "New task", "En cours")));
     await expect(
-      executeAppControlTool("link_tosse_task", { task_id: "t1" }, "session-7", helpers()),
+      executeAppControlTool("link_tosse_task", { task_id: T1 }, "session-7", helpers()),
     ).rejects.toThrow(/already linked to another task — 'Old task'.*replace: true/);
-    expect(linked().tosseTaskId).toBe("old");
+    expect(linked().tosseTaskId).toBe(OLD);
 
     const out = (await executeAppControlTool(
       "link_tosse_task",
-      { task_id: "t1", replace: true },
+      { task_id: T1, replace: true },
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
-    expect(linked().tosseTaskId).toBe("t1");
-    expect(out.replaced).toEqual({ task_id: "old", title: "Old task" });
+    expect(linked().tosseTaskId).toBe(T1);
+    expect(out.replaced).toEqual({ task_id: OLD, title: "Old task" });
   });
 
   it("is idempotent on the task already linked", async () => {
-    seed(conv({ handle: "session-7", tosseTaskId: "t1", tosseTaskTitle: "Stale", tosseTaskStatus: "À faire" }));
-    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail("t1", "Fresh", "En cours")));
+    seed(conv({ handle: "session-7", tosseTaskId: T1, tosseTaskTitle: "Stale", tosseTaskStatus: "À faire" }));
+    vi.mocked(commands.tosseTaskDetail).mockReturnValueOnce(crmOk(detail(T1, "Fresh", "En cours")));
     const out = (await executeAppControlTool(
       "link_tosse_task",
-      { task_id: "t1" },
+      { task_id: T1 },
       "session-7",
       helpers(),
     )) as Record<string, unknown>;
@@ -811,11 +1375,73 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
     expect(linked()).toMatchObject({ tosseTaskTitle: "Fresh", tosseTaskStatus: "En cours" }); // re-stamped
   });
 
+  // Re-linking the SAME task while the CRM is unreadable must not downgrade what a real CRM
+  // read already stamped: the agent's guess fills blanks, it never overwrites.
+  it("never lets the agent's guess overwrite CRM-verified title/status", async () => {
+    seed(
+      conv({
+        handle: "session-7",
+        tosseTaskId: T1,
+        tosseTaskTitle: "Refactor the assembler",
+        tosseTaskStatus: "En cours",
+      }),
+    );
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmErr("not connected to TOSSE"));
+    const out = (await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1, title: "some refactor" }, // no status at all
+      "session-7",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.source).toBe("agent");
+    expect(linked()).toMatchObject({
+      tosseTaskTitle: "Refactor the assembler",
+      tosseTaskStatus: "En cours",
+    });
+    expect(out.task).toMatchObject({ title: "Refactor the assembler", status: "En cours" });
+  });
+
+  // …but it still FILLS what the app does not have (a link first written with no status).
+  it("lets the agent fill a status the app does not have yet", async () => {
+    seed(
+      conv({ handle: "session-7", tosseTaskId: T1, tosseTaskTitle: "Known title", tosseTaskStatus: null }),
+    );
+    vi.mocked(commands.tosseTaskDetail).mockReturnValue(crmErr("not connected to TOSSE"));
+    await executeAppControlTool(
+      "link_tosse_task",
+      { task_id: T1, title: "guess", status: "Review" },
+      "session-7",
+      helpers(),
+    );
+    expect(linked()).toMatchObject({ tosseTaskTitle: "Known title", tosseTaskStatus: "Review" });
+  });
+
+  // A stalled CRM must not outlive the hub's 30 s front timeout: the front gives up first,
+  // says so, and writes NOTHING — a link the agent was told never happened is worse than none.
+  it("gives up on a CRM read that stalls, before writing anything", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(commands.tosseTaskDetail).mockReturnValue(new Promise(() => {}) as never);
+      const call = executeAppControlTool(
+        "link_tosse_task",
+        { task_id: T1, title: "T" },
+        "session-7",
+        helpers(),
+      );
+      const settled = expect(call).rejects.toThrow(/took too long — nothing was linked/);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await settled;
+      expect(linked().tosseTaskId).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // Scoped to the caller: a caller with no conversation (voice bridge, phone relay) has
   // nothing to link.
   it("refuses a caller with no conversation", async () => {
     await expect(
-      executeAppControlTool("link_tosse_task", { task_id: "t1", title: "T" }, null, helpers()),
+      executeAppControlTool("link_tosse_task", { task_id: T1, title: "T" }, null, helpers()),
     ).rejects.toThrow(/only a conversation can call this/);
     await expect(executeAppControlTool("unlink_tosse_task", {}, null, helpers())).rejects.toThrow(
       /only a conversation can call this/,
@@ -823,12 +1449,12 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
   });
 
   it("unlinks the calling conversation", async () => {
-    seed(conv({ handle: "session-7", tosseTaskId: "t1", tosseTaskTitle: "T", tosseTaskStatus: "En cours" }));
+    seed(conv({ handle: "session-7", tosseTaskId: T1, tosseTaskTitle: "T", tosseTaskStatus: "En cours" }));
     const out = (await executeAppControlTool("unlink_tosse_task", {}, "session-7", helpers())) as Record<
       string,
       unknown
     >;
-    expect(out).toMatchObject({ unlinked: true, previous: { task_id: "t1", title: "T" } });
+    expect(out).toMatchObject({ unlinked: true, previous: { task_id: T1, title: "T" } });
     expect(linked()).toMatchObject({ tosseTaskId: null, tosseTaskTitle: null, tosseTaskStatus: null });
 
     const again = (await executeAppControlTool("unlink_tosse_task", {}, "session-7", helpers())) as Record<

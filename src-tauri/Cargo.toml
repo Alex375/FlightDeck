@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.4.0"
+version = "2.5.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -14,7 +14,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `unstable` = multi-webview: the in-app claude.ai artifact host is a CHILD webview of the main
+# window (see `artifact_host/`), which only `Window::add_child` can create.
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # Secure auto-update: verifies a cryptographic signature on each artifact before
@@ -138,6 +140,13 @@ cpal = "0.15"
 # `try_extract_tensor` (a `(&Shape, &[f32])` slice), so we need NO `ndarray`
 # feature / dependency — one fewer crate + version to keep aligned.
 ort = "=2.0.0-rc.13"
+
+# Local sha256 of the daemon binary about to be uploaded (bootstrap::install, B8),
+# compared against the remote's own `sha256sum` to decide `AlreadyCurrent` without
+# ever shelling out to a platform-specific checksum binary. Already compiled into the
+# tree transitively (tauri-codegen / wry both pull it in at the SAME 0.10 line), so
+# declaring it direct adds no new crate.
+sha2 = "0.10"
 
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is

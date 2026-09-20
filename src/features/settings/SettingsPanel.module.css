@@ -860,6 +860,12 @@
   font-weight: 600;
   color: var(--text-primary);
 }
+/* The per-server phone-provisioning status line (C10/C11) — muted, matches
+ * `.dangerText`'s size for the problem case (failed / daemon too old). */
+.remoteStatusText {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
 .remoteFooter {
   padding: 12px 15px;
 }

@@ -34,6 +34,9 @@ import {
 import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
+// The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
+// core error subtype surfaces here the same day it surfaces on screen.
+import { NOTICE_ERROR_HEADINGS } from "../features/conversation/noticeView";
 import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
 import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
@@ -44,6 +47,8 @@ import {
 import { useDisplay } from "../store/display";
 import { useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
+import { IDE_SETTING_PATH, ideBlockedReason, openFileInIde } from "../features/ide/openInIde";
+import { useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
@@ -54,13 +59,17 @@ import {
 import { pushAgentMessageToast, pushConversationCreatedToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
-import type { SessionEntry, Turn } from "../store/types";
+import type { NoticeItem, SessionEntry, Turn } from "../store/types";
 import type { View } from "../ui/shortcuts";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
 export interface AppControlHelpers {
   changeView: (view: View) => void;
+  /** The view on screen RIGHT NOW — so a tool can route to where the user is looking
+   *  instead of yanking them somewhere else (see `defaultOpenFileView`). Optional: a host
+   *  that cannot tell (none today) simply gets the historical behaviour. */
+  currentView?: View;
   /** Whether the TOSSE view currently exists (signed in + pref on). `changeView`
    *  silently no-ops on an unavailable view; a TOOL result must not — the caller
    *  needs the refusal, not a success that did nothing. */
@@ -115,6 +124,26 @@ function senderOf(conv: Conversation): AgentMessageSender {
     repo: repo ? baseName(repo.path) : null,
     backend: conv.kind,
   };
+}
+
+/**
+ * The label of the REMOTE machine actually hosting `conv`, when this Mac only relays
+ * it (its repo carries a `machineId`) — `null` for a local conversation. Additive
+ * field for `list_conversations`/`read_conversation` (C9): lets the phone relay
+ * (flightdeck-remote) fold a conversation the Mac lists with one its host
+ * `flightdeckd` daemon ALSO lists into a single row (see PROTOCOL.md §5/§5.3) —
+ * `flightdeckd` never emits this itself (its own conversations are always local to
+ * it), so its presence here is what tells the phone "this row is a relay, prefer the
+ * daemon's own row instead". Falls back to the machine's id if it somehow has no
+ * label (never happens in practice — `add_machine` always sets one) rather than
+ * silently reporting local.
+ */
+function hostedOnFor(conv: Conversation): string | null {
+  const s = useConversationsStore.getState();
+  const repo = s.repos.find((r) => r.id === conv.repoId);
+  if (!repo?.machineId) return null;
+  const machine = s.machines.find((m) => m.id === repo.machineId);
+  return machine ? machine.label || machine.id : repo.machineId;
 }
 
 /** Only the app attributes a message to a conversation. A caller with no conversation (voice,
@@ -209,20 +238,86 @@ function turnText(turn: Turn): string {
   return parts.join("\n");
 }
 
-/** Serialize the tail of a conversation's timeline as plain-text turns. */
+/** An error-bearing notice as ONE plain-text line, or `null` for the quiet ones
+ *  (`control_change`, `interrupted`, `remote_link`…). Routes on exactly what `NoticeBlock`
+ *  routes on — `NOTICE_ERROR_HEADINGS` plus the two subtypes it headings itself — so the
+ *  "zero silent error" contract holds on the MCP surface too: a conversation that died
+ *  (`process_exited`) must not read to another agent as one still thinking. */
+function noticeErrorText(n: NoticeItem): string | null {
+  const d = (n.detail ?? null) as Record<string, unknown> | null;
+  const str = (k: string): string | null => {
+    const v = d?.[k];
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  };
+  const message = str("message");
+  if (n.subtype === "control_error")
+    return `Setting "${str("control") ?? "control"}" rejected by Claude Code${
+      message ? `: ${message}` : ""
+    }`;
+  const heading = NOTICE_ERROR_HEADINGS[n.subtype] ?? (n.subtype === "error" ? "Error" : null);
+  if (!heading) return null;
+  return message ? `${heading}: ${message}` : heading;
+}
+
+/**
+ * How many system lines one digest may carry, on top of the dialogue turns asked for.
+ *
+ * They are collected newest-first, so the cap drops the OLDEST ones — and the count of what
+ * was dropped is reported rather than swallowed. Generous on purpose: the point of the cap is
+ * only to keep a flapping session from returning megabytes, not to ration errors.
+ */
+const MAX_SYSTEM_LINES = 20;
+
+/**
+ * Serialize the tail of a conversation's timeline as plain-text turns.
+ *
+ * `maxTurns` is a budget of DIALOGUE turns: system lines (a dead process, a rejected control
+ * request, a failed background task, a turn that ended in error) ride alongside it and are
+ * capped separately. They used to be counted in, which meant a conversation that crashed in a
+ * burst — `process_exited` then `protocol_error` then… — spent the caller's whole `max_turns`
+ * on its own death rattle and answered with barely any of the dialogue it was asked for.
+ */
 function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
-  for (let i = entry.timeline.length - 1; i >= 0 && out.length < maxTurns; i--) {
+  let dialogue = 0;
+  let systemLines = 0;
+  let omittedSystem = 0;
+  const pushSystem = (text: string) => {
+    if (systemLines >= MAX_SYSTEM_LINES) {
+      omittedSystem++;
+      return;
+    }
+    systemLines++;
+    out.push({ role: "system", text });
+  };
+  for (let i = entry.timeline.length - 1; i >= 0 && dialogue < maxTurns; i--) {
     const e = entry.timeline[i];
     if (e.kind === "turn_result") {
       const meta = entry.turnResults[e.id];
-      if (meta?.isError)
-        out.push({ role: "system", text: `[turn ended in error: ${meta.subtype}]` });
+      if (meta?.isError) pushSystem(`[turn ended in error: ${meta.subtype}]`);
       continue;
     }
     if (e.kind === "error") {
       const err = entry.errors[e.id];
-      if (err) out.push({ role: "system", text: `[error: ${err.message}]` });
+      if (err) pushSystem(`[error: ${err.message}]`);
+      continue;
+    }
+    if (e.kind === "notice") {
+      const n = entry.notices[e.id];
+      if (!n) continue;
+      // A failed background task is a discreet notice in the thread, but still something a
+      // reader of this conversation must see.
+      if (n.subtype === "task_failed") {
+        const msg = (n.detail as { message?: unknown } | null)?.message;
+        pushSystem(`[${typeof msg === "string" ? msg : "Background task failed"}]`);
+        continue;
+      }
+      // …and so is every OTHER error-bearing notice: a dead process, a rejected control
+      // request, a transcript that would not restore. Dropping them let a conversation
+      // polling `read_conversation` on a crashed one see the prompt with no answer and no
+      // system line, and conclude it was still thinking.
+      const err = noticeErrorText(n);
+      if (err) pushSystem(`[${clip(err, 400)}]`);
       continue;
     }
     if (e.kind !== "turn") continue;
@@ -234,6 +329,7 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     // A message another conversation sent: attributed, rather than passing the envelope's
     // tags off as the user's own words.
     const agent = turn.role === "user" ? parseAgentMessage(text) : null;
+    dialogue++;
     if (agent) {
       out.push({
         role: "user",
@@ -244,6 +340,10 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     }
     out.push({ role: turn.role, text: clip(text, 4000) });
   }
+  // Said, not swallowed. `out` is reversed below, so this lands at the top — ahead of every
+  // system line that survived, which are all newer than the dropped ones.
+  if (omittedSystem > 0)
+    out.push({ role: "system", text: `[${omittedSystem} older system line(s) omitted]` });
   return out.reverse();
 }
 
@@ -267,6 +367,10 @@ function listConversations(session: string | null): unknown {
       // exists in `backgrounding`, so a remote client could not otherwise tell that a
       // `running` / `needs_*` conversation also has background work going on.
       background_tasks: runningBackgroundCount(c),
+      // Additive (C9): the join key across hosts (§5) + the relay-vs-local marker
+      // (§5.3) the phone relay uses to fold a Mac-relayed row into its daemon's own.
+      session_id: c.sessionId,
+      hosted_on: hostedOnFor(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
     };
   });
@@ -303,6 +407,9 @@ async function readConversation(args: Record<string, unknown>, session: string |
     model: conv.model,
     effort: conv.ultracode ? "ultracode" : conv.effort,
     turns,
+    // Additive (C9) — same meaning as in list_conversations, see `hostedOnFor`.
+    session_id: conv.sessionId,
+    hosted_on: hostedOnFor(conv),
   };
 }
 
@@ -788,6 +895,28 @@ async function addRepo(args: Record<string, unknown>) {
   return { repo_id: repo.id, name: baseName(path), path };
 }
 
+/**
+ * Where `open_file` opens when the agent did not say: WHERE THE USER IS LOOKING.
+ *
+ * An agent has no idea which view is on screen, so it omits `view` — and the historical
+ * default ("conversation") then threw a user who was working in the IDE view out of it,
+ * to show the file in a side editor they were not using. So: when the IDE view is on
+ * screen AND its current workspace holds this agent's conversation, the file belongs in
+ * that workspace's editor (the very route a click on its file mention takes there).
+ * Everywhere else the historical default stands — including when the workspace on screen
+ * is another folder's: opening a file must not swap the folder under the user.
+ */
+function defaultOpenFileView(conv: Conversation, helpers: AppControlHelpers): "conversation" | "ide" {
+  if (helpers.currentView !== "ide") return "conversation";
+  const ide = useIdeStore.getState();
+  const ws = ide.workspaces.find((w) => w.id === ide.activeId);
+  if (!ws) return "conversation";
+  const { conversations, repos } = useConversationsStore.getState();
+  return workspaceConversations(ws, conversations, repos).some((c) => c.id === conv.id)
+    ? "ide"
+    : "conversation";
+}
+
 async function openFile(
   args: Record<string, unknown>,
   session: string | null,
@@ -796,19 +925,52 @@ async function openFile(
   const conv = resolveTarget(args, session);
   const path = typeof args.path === "string" ? args.path.trim() : "";
   if (!path) throw new Error("open_file: 'path' is required");
+  // No explicit `view` → follow the user's eyes (see defaultOpenFileView); anything other
+  // than the two known views is a caller mistake, not a silent fallback.
+  const view = args.view ?? defaultOpenFileView(conv, helpers);
+  if (view !== "conversation" && view !== "ide")
+    throw new Error("open_file: 'view' must be conversation | ide");
+  if (view === "ide") {
+    // Same refusal CLAUSE as open_view's ide branch — checked BEFORE any of the shared
+    // resolution work below, so a switched-off IDE or a remote repository never costs a
+    // wasted pathExists round-trip for a call that was always going to be refused.
+    if (!useDisplay.getState().ideView)
+      throw new Error(`open_file: the IDE view is switched off (${IDE_SETTING_PATH})`);
+    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
+    if (ideBlockedReason(repo))
+      throw new Error("open_file: the IDE cannot open a remote repository (it browses this Mac's files)");
+  }
   // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
   // would "succeed" into a nonsense tab. Refuse with the fix in the message.
   if (path === "~" || path.startsWith("~/"))
     throw new Error("open_file: '~' is not expanded — use an absolute path");
+  // SHARED by both modes, computed ONCE: the same cwd resolves the path AND — in "ide"
+  // mode — becomes the workspace's folder, so the file that opens and the folder it opens
+  // IN can never disagree about where they came from.
   const cwd = conv.liveCwd ?? conv.cwd;
   const abs = resolveMentionAbs(cwd, path);
-  // Check existence BEFORE reporting success: revealInEditor would open a
-  // preview tab whose read then fails, while the tool told the agent all was well.
+  // Check existence BEFORE reporting success: opening would create a preview tab whose
+  // read then fails, while the tool told the agent all was well.
   if (!(await commands.pathExists(abs)))
     throw new Error(`open_file: '${abs}' does not exist`);
   const line = typeof args.line === "number" ? Math.max(1, Math.floor(args.line)) : undefined;
   const column =
     typeof args.column === "number" ? Math.max(1, Math.floor(args.column)) : undefined;
+
+  if (view === "ide") {
+    // `null` = the conversation vanished between resolution and here (deleted during the
+    // pathExists await). Nothing was opened — so say so rather than report a hollow success.
+    if (openFileInIde(conv.id, cwd, abs, line != null ? { line, column } : undefined) === null)
+      throw new Error("open_file: the conversation no longer exists");
+    helpers.changeView("ide");
+    return {
+      conversation_id: conv.id,
+      path: abs,
+      ...(line != null ? { line } : {}),
+      view: "ide" as const,
+    };
+  }
+
   // Showing a file only means something on screen: focus the conversation, then
   // reveal (which opens the editor panel and jumps to the line).
   useConversationsStore.getState().selectConversation(conv.id);
@@ -821,12 +983,14 @@ async function openFile(
 
 function openView(args: Record<string, unknown>, helpers: AppControlHelpers) {
   const view = args.view;
-  if (view !== "conversation" && view !== "flightdeck" && view !== "tosse")
-    throw new Error("open_view: 'view' must be conversation | flightdeck | tosse");
+  if (view !== "conversation" && view !== "flightdeck" && view !== "tosse" && view !== "ide")
+    throw new Error("open_view: 'view' must be conversation | flightdeck | tosse | ide");
   // `changeView` silently no-ops on an unavailable view; a TOOL must report the
   // refusal instead of returning a success that did nothing.
   if (view === "tosse" && !helpers.tosseAvailable)
     throw new Error("open_view: the TOSSE view is unavailable (not signed in to the CRM)");
+  if (view === "ide" && !useDisplay.getState().ideView)
+    throw new Error(`open_view: the IDE view is switched off (${IDE_SETTING_PATH})`);
   helpers.changeView(view);
   return { view };
 }
@@ -899,36 +1063,129 @@ function callerOnly(tool: string, session: string | null): Conversation {
   return conv;
 }
 
+/**
+ * A TOSSE task id is a canonical UUID, and nothing else.
+ *
+ * `tosse_task_detail` builds its CRM URL by concatenating this id onto the tasks path, so an
+ * id of `../clients` reaches ANY endpoint of the CRM carrying the human's Bearer token — and
+ * the answer comes back to the agent, because a failed read's error text embeds the first 300
+ * characters of the response body (`snippet()`, `tosse/mod.rs`). The SAME pattern is enforced
+ * in Rust: two independent checks on purpose, neither one load-bearing alone.
+ */
+const TOSSE_TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The canonical (lower-case) form of a task id, or `null` when it is not one.
+ *
+ * The regex is case-INSENSITIVE, so the same task can be named `A1B2…` or `a1b2…`; normalizing
+ * here, once, at the single gate every id passes through, is what makes the comparisons
+ * downstream mean anything. Compared raw, one spelling of a task reads as a DIFFERENT task
+ * from the other: re-linking the task already linked would be refused as "already linked to
+ * another task", and the guard that stops an unverified guess from erasing a CRM-verified
+ * title/status would miss.
+ */
+function canonicalTosseTaskId(raw: string): string | null {
+  return TOSSE_TASK_ID_RE.test(raw) ? raw.toLowerCase() : null;
+}
+
+/** Do these two ids name the same task? A stored id came either from the CRM (whatever case
+ *  it serializes in) or from an agent (normalized above), so identity is decided on the
+ *  canonical form, never on the bytes. */
+function sameTaskId(a: string | null | undefined, b: string | null | undefined): boolean {
+  return !!a && !!b && a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * The whole CRM budget of ONE `link_tosse_task` call.
+ *
+ * The MCP hub answers the agent "the app did not answer in time" after 30 s (`FRONT_TIMEOUT`,
+ * `appmcp/mod.rs`), while resolving a SUBTASK costs two CRM reads plus, possibly, a token
+ * refresh. Past the hub's deadline the agent has already been told the call failed, so a link
+ * written afterwards is state it does not know it has. Kept well under 30 s so the front
+ * reports the timeout ITSELF — before anything is written.
+ */
+const CRM_BUDGET_MS = 12_000;
+
+/** Race one CRM read against the remaining budget. The read itself cannot be cancelled (the
+ *  IPC call is already in flight); what matters is that we stop WAITING for it and fail
+ *  before the write, rather than landing a link the agent was told never happened. */
+async function withinBudget<T>(tool: string, deadline: number, work: Promise<T>): Promise<T> {
+  const expired = () =>
+    new Error(`${tool}: reading TOSSE took too long — nothing was linked, try again`);
+  const left = deadline - Date.now();
+  if (left <= 0) throw expired();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(expired()), left);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** WHAT went wrong on a CRM read, with none of WHAT THE SERVER SAID. `tosse_task_detail`'s
+ *  error text carries up to 300 characters of the response body (`snippet()`), so relaying it
+ *  verbatim would hand the agent a 300-byte window onto the CRM it could page through, one
+ *  failed read at a time. Only the nature of the failure travels. */
+function crmFailure(error: string): string {
+  const http = /^TOSSE answered HTTP (\d{3})\b/.exec(error);
+  if (http) return `the CRM answered HTTP ${http[1]}`;
+  if (error.startsWith("TOSSE is unreachable")) return "the CRM is unreachable";
+  return "the read failed";
+}
+
 /** One task read from the CRM, or `null` when the app has no usable TOSSE session.
  *
  *  Only a GONE session (never signed in, revoked) is `null` — the same reading the tasks view
  *  gives it (`isSessionGone`), and the case where the agent's own title is the best we have.
  *  Any other failure — an unknown id (HTTP 404), a malformed one (HTTP 400), an outage — is
  *  thrown: the agent named a task we could not confirm, and saying so beats linking a
- *  conversation to a guess. */
-async function readTosseTask(tool: string, taskId: string): Promise<TosseTaskDetail | null> {
-  const res = await commands.tosseTaskDetail(taskId);
+ *  conversation to a guess. The message names the id and the NATURE of the failure only
+ *  (see `crmFailure`). */
+async function readTosseTask(
+  tool: string,
+  taskId: string,
+  deadline: number,
+): Promise<TosseTaskDetail | null> {
+  // The choke point EVERY CRM read passes through: an id that is not a UUID never reaches
+  // the URL builder, whoever handed it over (the agent, or the CRM's own `parentTaskId`).
+  const id = canonicalTosseTaskId(taskId);
+  if (!id) throw new Error(`${tool}: '${clip(taskId, 60)}' is not a task id`);
+  const res = await withinBudget(tool, deadline, commands.tosseTaskDetail(id));
   if (res.status === "ok") return res.data;
   if (isSessionGone(res.error)) return null;
-  throw new Error(`${tool}: couldn't read TOSSE task '${taskId}' — ${res.error}`);
+  throw new Error(`${tool}: couldn't read TOSSE task '${taskId}' — ${crmFailure(res.error)}`);
 }
 
 /** Resolve the task to link: from the CRM when the app can read it (a subtask resolving to
- *  its parent), else from what the agent passed. */
+ *  its parent), else from what the agent passed. Both reads share ONE deadline, so the whole
+ *  resolution stays inside `CRM_BUDGET_MS` however slow the CRM is.
+ *
+ *  `taskId` is already canonical (`canonicalTosseTaskId`). A task the CRM answered for carries
+ *  the CRM's OWN id, byte for byte — the id the rest of the app matches conversations on; only
+ *  the fallback, where nothing could be read, stores the canonical form of what the agent
+ *  passed. */
 async function resolveLinkTarget(
   args: Record<string, unknown>,
   taskId: string,
 ): Promise<{ task: LinkedTosseTask; source: "tosse" | "agent"; subtask?: LinkedTosseTask }> {
   const tool = "link_tosse_task";
+  const deadline = Date.now() + CRM_BUDGET_MS;
   // The TOSSE tab's own gate: with it off, the app makes NO CRM requests at all
   // (LinkedTaskSync reads the same preference).
-  const detail = useDisplay.getState().tosseTasksView ? await readTosseTask(tool, taskId) : null;
+  const detail = useDisplay.getState().tosseTasksView
+    ? await readTosseTask(tool, taskId, deadline)
+    : null;
   if (detail) {
     const own = { id: detail.task.id, title: detail.task.title, status: detail.task.status };
     if (!detail.parentTaskId) return { task: own, source: "tosse" };
     // A subtask is a step of its parent's work: the conversation carries the PARENT, the
     // unit the tasks view opens, reviews and counts conversations for.
-    const parent = await readTosseTask(tool, detail.parentTaskId);
+    const parent = await readTosseTask(tool, detail.parentTaskId, deadline);
     if (!parent) throw new Error(`${tool}: couldn't read the parent of subtask '${taskId}'`);
     return {
       task: { id: parent.task.id, title: parent.task.title, status: parent.task.status },
@@ -952,15 +1209,31 @@ async function resolveLinkTarget(
  *  explicit `replace`, and the result names what was replaced. */
 async function linkTosseTask(args: Record<string, unknown>, session: string | null) {
   const caller = callerOnly("link_tosse_task", session);
-  const taskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
-  if (!taskId) throw new Error("link_tosse_task: 'task_id' is required");
+  const raw = typeof args.task_id === "string" ? args.task_id.trim() : "";
+  if (!raw) throw new Error("link_tosse_task: 'task_id' is required");
+  // Validated AND normalized BEFORE the resolution, so a forged id never leaves the app
+  // (`resolveLinkTarget` reads the CRM ahead of every refusal below, and with the TOSSE tab
+  // off nothing is read at all — the id is simply STORED, to be spent on the CRM later), and
+  // so every comparison from here on is made on one single spelling of the id.
+  const taskId = canonicalTosseTaskId(raw);
+  if (!taskId)
+    throw new Error(`link_tosse_task: 'task_id' must be a TOSSE task UUID — got '${clip(raw, 60)}'`);
+  // ⚠️ The CRM read happens BEFORE the "already linked / pass replace" refusals below, and
+  // that order is DELIBERATE — not an oversight to be tidied up. The id the agent passes is
+  // not necessarily the id that gets linked: a SUBTASK resolves to its parent. A conversation
+  // linked to the parent, handed the id of one of its subtasks, is `already_linked` — and
+  // there is no way to know that before asking the CRM what the id resolves to. Refusing
+  // first would answer "already linked to ANOTHER task" for what is the very same work. The
+  // id is validated above, and a failed read no longer relays the CRM's answer (`crmFailure`),
+  // so reading first costs nothing but the read.
   const { task, source, subtask } = await resolveLinkTarget(args, taskId);
 
   // Re-read AFTER the awaits: the link may have moved while the CRM was being read.
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === caller.id);
   if (!conv) throw new Error("link_tosse_task: the calling conversation no longer exists");
+  const alreadyLinked = sameTaskId(conv.tosseTaskId, task.id);
   const previous =
-    conv.tosseTaskId && conv.tosseTaskId !== task.id
+    conv.tosseTaskId && !alreadyLinked
       ? { id: conv.tosseTaskId, title: conv.tosseTaskTitle }
       : null;
   if (previous && args.replace !== true)
@@ -968,12 +1241,29 @@ async function linkTosseTask(args: Record<string, unknown>, session: string | nu
       `link_tosse_task: this conversation is already linked to another task — ` +
         `'${previous.title ?? previous.id}' (${previous.id}). Pass replace: true to move the link.`,
     );
-  useConversationsStore.getState().linkConversationToTask(conv.id, task);
+  // An UNVERIFIED entry must never erase a VERIFIED one. On the SAME task id, what the app
+  // already holds came from a CRM read (`refreshLinkedTaskMeta`, the tasks view, an earlier
+  // link); the agent's own title/status — `source: "agent"`, the fallback used when the CRM
+  // cannot be read at all — is a guess, so it only FILLS what is missing. Otherwise a second
+  // link_tosse_task during a CRM outage would replace the real title by the guess and blank
+  // the known status to null.
+  const linked: LinkedTosseTask =
+    source === "agent" && alreadyLinked
+      ? {
+          // The id ALREADY stored, not our normalization of the agent's: it is the exact
+          // string the CRM handed back, and what the tasks view matches conversations on
+          // (`refreshLinkedTaskMeta` keys its map on the CRM's own ids).
+          id: conv.tosseTaskId as string,
+          title: conv.tosseTaskTitle ?? task.title,
+          status: conv.tosseTaskStatus ?? task.status,
+        }
+      : task;
+  useConversationsStore.getState().linkConversationToTask(conv.id, linked);
   return {
     conversation_id: conv.id,
-    task: { task_id: task.id, title: task.title, status: task.status },
+    task: { task_id: linked.id, title: linked.title, status: linked.status },
     source,
-    ...(conv.tosseTaskId === task.id ? { already_linked: true } : {}),
+    ...(alreadyLinked ? { already_linked: true } : {}),
     ...(subtask
       ? { note: `'${subtask.title}' is a subtask — linked its parent task instead` }
       : {}),

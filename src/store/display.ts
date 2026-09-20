@@ -86,6 +86,13 @@ export interface DisplayPrefs {
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
 
+  /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
+   *  worktree) into a side panel at the far right, leaving the header with actions only. ON
+   *  by default. Off → the previous layout: those chips back in the header and the composer,
+   *  the todo list pinned above the composer. Read by {@link ConversationSidePanel} and every
+   *  surface it replaces. */
+  conversationSidePanel: boolean;
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -155,6 +162,14 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
+   *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
+   *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
+   *  any artifact without a local file. Off → those open in the browser, as they did before;
+   *  page artifacts with their local file still preview in-app either way. Read by
+   *  {@link openArtifactView} and the {@link ArtifactViewer}'s missing-file fallback. */
+  artifactsInApp: boolean;
+
   /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
    *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
    *  associate it by hand). Clicking it opens that repository's TOSSE card. ON by default.
@@ -178,6 +193,19 @@ export interface DisplayPrefs {
    *  signed in to TOSSE: signed out, the tab is absent regardless (an empty shell would be
    *  worse than no tab, per the feature's spec). Read by {@link App}. */
   tosseTasksView: boolean;
+
+  /** Offer the IDE view — the top-level view (⌘4) that opens a folder as a workspace, and
+   *  every "Open in IDE" entry point leading to it (sidebar, title bar, composer action,
+   *  ⌘⇧I). ON by default. Off → the tab and those entry points disappear and the view is
+   *  never mounted; open workspaces are kept for when it comes back. Read by {@link App}. */
+  ideView: boolean;
+
+  /** Fade the HIDDEN entries of the file explorer — every name starting with a dot
+   *  (`.git`, `.claude`, `.DS_Store`, `.editorconfig`…): paler text, a desaturated icon.
+   *  They stay listed and fully usable; they just stop competing with the files you came
+   *  for. ON by default. Applies to every file tree (IDE view and the conversation's side
+   *  editor). Read by `FileTree`. */
+  explorerDimHidden: boolean;
 
   /** Keep the window on the TASKS view after pressing « Start » on a task — the conversation
    *  opens and its first message goes out, but the app does not follow it. ON by default:
@@ -268,6 +296,23 @@ export interface DisplayPrefs {
    *  default. OFF → the swimlanes keep a MANUAL, drag-and-drop order. Read by {@link useFleetLanes}. */
   autoOrderFleetRepos: boolean;
 
+  /** Sidebar conversation rows show their state as a TINTED PILL (green running with a live
+   *  "time since your last message" counter under the name, green→violet background work,
+   *  amber needs you, blue to review, red error; idle/off stay plain) instead of the classic
+   *  leading status dot + attention tint. ON by default. Read by {@link ConductorSidebar}. */
+  sidebarStatePills: boolean;
+
+  /** Show the TIME on a sidebar conversation row's second line — ticking while the agent
+   *  works, frozen on how long the turn took once it stopped on a state. ON by default.
+   *  Off → the working dots alone. Only applies to {@link sidebarStatePills} rows. */
+  sidebarRowTimer: boolean;
+
+  /** The review / question / error / background status lives INSIDE the composer — a header
+   *  band on the composer card, whose border takes the state colour — instead of the classic
+   *  full-width bar above it. ON by default. Read by {@link ComposerStatusBand} and
+   *  {@link ReviewBar} (exactly one of the two renders). */
+  composerStatusBand: boolean;
+
   /** Whether the sidebar and the Flight Deck SHARE one manual order (drag in one reorders both)
    *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
    *  that are in manual mode. Read via {@link slotFor}. */
@@ -288,6 +333,7 @@ const DEFAULTS: DisplayPrefs = {
   agentMessageToasts: true,
   agentCreationToasts: true,
   showLastMessagePreview: true,
+  conversationSidePanel: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -301,8 +347,11 @@ const DEFAULTS: DisplayPrefs = {
   conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
+  artifactsInApp: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
+  ideView: true,
+  explorerDimHidden: true,
   tosseStartStaysOnTasks: true,
   tosseTaskDeleteWarning: true,
   // ON, though it is the only preference here that sends CRM data to a third party: the
@@ -321,6 +370,9 @@ const DEFAULTS: DisplayPrefs = {
   autoOrderFleetConvs: true,
   autoOrderFleetRepos: true,
   sharedManualOrder: true,
+  sidebarStatePills: true,
+  sidebarRowTimer: true,
+  composerStatusBand: true,
 };
 
 function load(): DisplayPrefs {
@@ -365,6 +417,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
@@ -374,8 +427,11 @@ export const useDisplay = create<DisplayState>((set) => ({
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
+        ideView: patch.ideView ?? s.ideView,
+        explorerDimHidden: patch.explorerDimHidden ?? s.explorerDimHidden,
         tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
         tosseTaskDeleteWarning: patch.tosseTaskDeleteWarning ?? s.tosseTaskDeleteWarning,
         tosseClientFavicons: patch.tosseClientFavicons ?? s.tosseClientFavicons,
@@ -389,6 +445,9 @@ export const useDisplay = create<DisplayState>((set) => ({
         autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
         autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
         sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
+        sidebarStatePills: patch.sidebarStatePills ?? s.sidebarStatePills,
+        sidebarRowTimer: patch.sidebarRowTimer ?? s.sidebarRowTimer,
+        composerStatusBand: patch.composerStatusBand ?? s.composerStatusBand,
       };
       save(next);
       return next;

@@ -1,0 +1,576 @@
+/* The conversation side panel — design "A": a quiet column of sections separated by hairlines,
+   labels in the small-caps voice the rest of the app uses for section headers, content at
+   thread size, and a darker Session footer pinned at the bottom. */
+
+.panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--wf-bg-2);
+  border-left: 1px solid var(--wf-line);
+}
+
+/* ---- Header: a single tab-like title + close ------------------------------------------- */
+
+.head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 40px;
+  padding: 0 8px;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--wf-line);
+}
+.headTab {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--wf-r);
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* The panel's chord, always on show next to the close button. */
+.kbd {
+  margin-left: auto;
+  margin-right: 2px;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid var(--wf-line-2);
+  box-shadow: 0 1px 0 var(--wf-line);
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--wf-r);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.iconBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Scrolling sections ---------------------------------------------------------------- */
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 14px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--wf-line) 75%, var(--wf-bg-2));
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+}
+.label :global(.wf-ico) {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+.meta {
+  margin-left: auto;
+  font-size: 11px;
+  letter-spacing: 0;
+  color: var(--wf-tx);
+  font-variant-numeric: tabular-nums;
+}
+
+.textBtn {
+  margin-left: auto;
+  padding: 2px 6px;
+  margin-right: -6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.textBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+/* A small status pill (TOSSE status, goal state). */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+}
+.label .pill {
+  padding: 1px 6px;
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.pillAtt {
+  background: var(--wf-att-bg);
+  color: var(--wf-att);
+}
+
+/* ---- TOSSE task ------------------------------------------------------------------------ */
+
+.tosseMark {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  color: var(--wf-tosse-accent);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 12px;
+  border-radius: var(--wf-r-l);
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-line);
+}
+/* The task card is clickable as a whole (opens the task); its controls keep their own job. */
+.taskCard {
+  gap: 7px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.taskCard:hover {
+  border-color: var(--wf-line-2);
+}
+.taskKicker {
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.taskTitle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--wf-tx-hi);
+  text-align: left;
+  overflow-wrap: break-word;
+  cursor: pointer;
+}
+.taskTitle:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--wf-tx-xlo);
+  text-underline-offset: 3px;
+}
+/* Status (left) and assignee (right) on one line. */
+.taskRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.taskRowGap {
+  flex: 1;
+}
+.taskNotes {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--wf-tx);
+  overflow-wrap: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.taskBlocked {
+  font-size: 11.5px;
+  color: var(--wf-att);
+}
+
+/* Subtasks: a disclosure line (« Show subtasks 1/4 ») over the TOSSE view's own tickable
+   rows, set a size down for the card. */
+.subtasks {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: default;
+}
+.subtasksHead {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px 2px 2px;
+  margin-left: -2px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.subtasksHead:hover {
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+}
+.subtasksChev {
+  width: 11px;
+  height: 11px;
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+.subtasksHead[aria-expanded="true"] .subtasksChev {
+  transform: rotate(0deg);
+}
+.subtasksCount {
+  color: var(--wf-tx);
+  font-variant-numeric: tabular-nums;
+}
+.subtasksList {
+  display: flex;
+  flex-direction: column;
+}
+.subtasksList button {
+  padding-top: 5px;
+  padding-bottom: 5px;
+  font-size: 12.5px;
+}
+.taskError {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--wf-err);
+  overflow-wrap: break-word;
+}
+.taskActs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 3px;
+  cursor: default;
+}
+.taskActs:empty {
+  display: none;
+}
+
+/* ---- Goal ------------------------------------------------------------------------------ */
+
+.goalIco {
+  color: var(--wf-att);
+}
+.goalCond {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--wf-tx-hi);
+  overflow-wrap: break-word;
+}
+.goalReason {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--wf-tx-lo);
+  overflow-wrap: break-word;
+}
+
+/* ---- Todo ------------------------------------------------------------------------------ */
+
+.progress {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--wf-line);
+  overflow: hidden;
+}
+.progressFill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--wf-run);
+  transition: width 0.3s ease;
+}
+
+/* The shared <TodoList>, restyled for the panel: square markers (a tinted tick when done, an
+   outline when pending) and a steady accent ring for the item in progress. */
+.todos {
+  padding-top: 2px;
+}
+.todos :global(.cv-todolist) {
+  gap: 6px;
+}
+.todos :global(.cv-todo-i) {
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.todos :global(.cv-todo-i .cv-check) {
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border-radius: 4px;
+  border-width: 1.5px;
+}
+.todos :global(.cv-todo-i .cv-check.done) {
+  background: var(--wf-run-bg);
+  border-color: transparent;
+  color: var(--wf-run);
+}
+.todos :global(.cv-todo-i .cv-check.done .wf-ico) {
+  width: 10px;
+  height: 10px;
+}
+.todos :global(.cv-todo-i .cv-check.doing) {
+  border-radius: 50%;
+  border-style: solid;
+  border-color: var(--wf-accent);
+  animation: none;
+}
+.todos :global(.cv-todo-i .cv-check.doing::after) {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--wf-accent);
+}
+.todos :global(.cv-todo-i .cv-check.todo) {
+  border-color: var(--wf-line-2);
+}
+.todos :global(.cv-todo-i.completed .cv-todo-t) {
+  color: var(--wf-tx-lo);
+  opacity: 1;
+}
+.todos :global(.cv-todo-i.in_progress .cv-todo-t) {
+  font-weight: 500;
+}
+
+/* ---- Artifacts ------------------------------------------------------------------------- */
+
+.artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.artCard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-line);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.artCard:hover {
+  background: var(--wf-panel-2);
+  border-color: var(--wf-line-2);
+}
+.artTile {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
+  font-size: 15px;
+  line-height: 1;
+}
+.artMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.artTitle {
+  font-size: 12.5px;
+  color: var(--wf-tx-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artSub {
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+}
+.artGo {
+  flex: 0 0 auto;
+  color: var(--wf-tx-lo);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.artCard:hover .artGo {
+  opacity: 1;
+}
+
+.empty {
+  margin: 0;
+  padding: 18px 16px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--wf-tx-lo);
+}
+
+/* ---- Session footer -------------------------------------------------------------------- */
+
+.foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--wf-line);
+  background: color-mix(in srgb, var(--wf-bg) 70%, var(--wf-bg-2));
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 6px;
+}
+.rowIco {
+  flex: 0 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--wf-tx);
+}
+.rowIco :global(.wf-ico) {
+  width: 13px;
+  height: 13px;
+}
+.rowMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.rowTitle {
+  font-size: 12.5px;
+  color: var(--wf-tx-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rowSub {
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rowSubErr {
+  color: var(--wf-err);
+}
+.mono {
+  font-family: var(--wf-mono);
+  font-size: 12px;
+}
+.linked {
+  color: var(--wf-accent);
+}
+.rowActs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.rowBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--wf-r);
+  background: transparent;
+  color: var(--wf-tx);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.rowBtn:hover:not(:disabled) {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.rowBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.smallBtn {
+  height: 24px;
+  padding: 0 9px;
+  border-radius: var(--wf-r);
+  border: 1px solid var(--wf-line);
+  background: var(--wf-panel);
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.smallBtn:hover {
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-hi);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progressFill {
+    transition: none;
+  }
+}

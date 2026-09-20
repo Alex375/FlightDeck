@@ -28,8 +28,9 @@ import {
   manualComparator,
   type OrderBlob,
 } from "../store/manualOrder";
-import { readoutBucket, statusRank, type AgentStatus } from "./status";
+import { isActivelyRunning, readoutBucket, statusRank, type AgentStatus } from "./status";
 import { agentStatusForEntry } from "./useAgentStatus";
+import type { SessionEntry } from "../store/types";
 
 // ---- Fleet readout (the "N Running · N Review · …" banner) ----------------------
 
@@ -135,6 +136,58 @@ export function useFleetCounts(): FleetCounts {
             ),
           ),
     ),
+  );
+}
+
+/**
+ * The ids of `convs` that are actively doing work right now — a turn in flight, or
+ * background tools still running even when a higher-priority alert masks that in the
+ * derived status (same "busy for delete" rule ConvRow/StreamCard gate their own
+ * confirm on; see {@link isActivelyRunning}). Pure core of
+ * {@link useMachineActiveConversationIds}, split out so the "which of these
+ * conversations are busy" rule is directly testable without mounting a hook.
+ */
+export function activeConversationIds(
+  convs: Conversation[],
+  sessions: Record<string, SessionEntry | undefined>,
+  bg: Record<string, number>,
+  bgBash: Record<string, number>,
+  reAlertBash: boolean,
+): string[] {
+  return convs
+    .filter((c) => {
+      const status = agentStatusForEntry(
+        c.handle,
+        sessions[c.id],
+        c.pendingReminder,
+        bg[c.id] ?? 0,
+        bgBash[c.id] ?? 0,
+        reAlertBash,
+      );
+      return isActivelyRunning(status) || (bg[c.id] ?? 0) > 0;
+    })
+    .map((c) => c.id);
+}
+
+/**
+ * The ids of conversations anchored to a given server (any repo whose `machineId`
+ * matches) that are actively running right now. Removing the SERVER stops every one
+ * of these live sessions (the machine's `claude` processes have nowhere left to run),
+ * so Settings uses this to decide whether "Remove" needs a confirm and how many it is
+ * about to stop.
+ */
+export function useMachineActiveConversationIds(machineId: string): string[] {
+  const repos = useRepos();
+  const convs = useConversations();
+  const bg = useRunningCountsByConv();
+  const bgBash = useRunningBashCountsByConv();
+  const reAlertBash = useDisplay((s) => s.alertOnBackgroundBash);
+  const machineConvs = useMemo(() => {
+    const repoIds = new Set(repos.filter((r) => r.machineId === machineId).map((r) => r.id));
+    return convs.filter((c) => repoIds.has(c.repoId));
+  }, [repos, convs, machineId]);
+  return useConversationStore(
+    useShallow((s) => activeConversationIds(machineConvs, s.sessions, bg, bgBash, reAlertBash)),
   );
 }
 

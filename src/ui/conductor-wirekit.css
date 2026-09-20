@@ -34,6 +34,7 @@
   --wf-wait-bg:   #1c2740;
   --wf-done:      #7f8593;   /* completed */
   --wf-done-bg:   #23252c;
+  --wf-warn:      #d7a24a;   /* warning — something to look at, but not a failure */
   --wf-err:       #e0727c;   /* error */
   --wf-err-bg:    #3a1f23;
   --wf-msg:       #6fbfcf;   /* a message between two agent conversations */
@@ -229,21 +230,27 @@
 .wf-btn.prim { background: var(--wf-accent); border-color: var(--wf-accent); color:#1a0f0a; font-weight: 600; }
 .wf-btn.sm { padding: 4px 9px; font-size: 11px; }
 .wf-btn:disabled { opacity: .4; cursor: default; }
+/* A thin vertical rule between groups of title-bar controls (app-wide toggles | conversation
+   actions | the conversation panel toggle). */
+.wf-tb-sep { flex: none; width: 1px; height: 18px; margin: 0 4px; background: var(--wf-line); }
 .wf-icon-btn {
   width: 28px; height: 28px; display: inline-flex; align-items:center; justify-content:center;
   border-radius: var(--wf-r); border: 1px solid var(--wf-line); background: var(--wf-panel); color: var(--wf-tx);
   cursor: pointer;
   transition: background .15s ease, border-color .15s ease, color .15s ease, transform .12s ease;
 }
-.wf-icon-btn:hover:not(:disabled) {
+.wf-icon-btn:hover:not(:disabled):not([aria-disabled]) {
   background: var(--wf-panel-3); border-color: var(--wf-line-2); color: var(--wf-tx-hi);
   transform: translateY(-1px);
 }
-.wf-icon-btn:active:not(:disabled) {
+.wf-icon-btn:active:not(:disabled):not([aria-disabled]) {
   transform: translateY(0) scale(.94);
   background: var(--wf-panel-2);
 }
-.wf-icon-btn:disabled {
+/* `[aria-disabled]` = refused but still HOVERABLE, so the tooltip carrying the reason can
+   render (a truly `disabled` button takes no pointer events). Looks the same as disabled. */
+.wf-icon-btn:disabled,
+.wf-icon-btn[aria-disabled] {
   opacity: .38; cursor: default; color: var(--wf-tx-lo);
 }
 /* Active/toggled state (e.g. the editor panel is open). */

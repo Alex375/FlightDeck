@@ -7,8 +7,11 @@
 /** `"tosse"` is the CRM task view. Unlike the other two it is CONDITIONAL: it exists only
  *  while signed in to TOSSE (and while the display preference keeps it on), so every place
  *  that switches views has to cope with a target that may not be available — see
- *  `App.changeView`, which falls back rather than showing an empty shell. */
-export type View = "conversation" | "flightdeck" | "tosse";
+ *  `App.changeView`, which falls back rather than showing an empty shell.
+ *
+ *  `"ide"` opens FOLDERS as workspaces (explorer + editor + a dock of terminals and
+ *  conversations). It is conditional too, on the `ideView` display preference only. */
+export type View = "conversation" | "flightdeck" | "tosse" | "ide";
 
 /** The minimal shape of the keyboard event we decide on (a DOM `KeyboardEvent`
  *  satisfies it structurally, so the App handler passes its event straight in). */
@@ -28,6 +31,9 @@ export function viewForShortcut(e: ViewShortcutEvent): View | null {
   // ⌘3 resolves to a view that may not exist right now; the caller decides what to do
   // with it (App ignores it when the TOSSE tab isn't showing), so this stays pure.
   if (e.code === "Digit3") return "tosse";
+  // The IDE takes ⌘4 rather than renumbering TOSSE: ⌘3 is already muscle memory, and a
+  // conditional tab must not shift a neighbour's chord as it comes and goes.
+  if (e.code === "Digit4") return "ide";
   return null;
 }
 
@@ -197,8 +203,10 @@ export type ShortcutAction =
   | "toggle-editor"
   | "toggle-terminal"
   | "toggle-git"
+  | "toggle-conversation-panel"
   | "toggle-clean-output"
   | "open-extensions"
+  | "open-in-ide"
   | "new-conversation"
   | "prev-conversation"
   | "next-conversation"
@@ -228,8 +236,13 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "toggle-editor", spec: { key: "b" }, scope: "conversation" },
   { action: "toggle-terminal", spec: { key: "j" }, scope: "conversation" },
   { action: "toggle-git", spec: { key: "g", shift: true }, scope: "conversation" },
+  // ⌘I — the macOS "Get Info / Inspector" chord, two keys because the panel is toggled all
+  // the time. Global like its siblings, so it wins over Monaco's secondary ⌘I (trigger
+  // suggest), which keeps ⌃Space. Shown on screen as CONVERSATION_PANEL_CHORD.
+  { action: "toggle-conversation-panel", spec: { key: "i" }, scope: "conversation" },
   { action: "toggle-clean-output", spec: { key: "l" }, scope: "conversation" },
   { action: "open-extensions", spec: { key: "e" }, scope: "conversation" },
+  { action: "open-in-ide", spec: { key: "i", shift: true }, scope: "conversation" },
   { action: "new-conversation", spec: { key: "n" }, scope: "global" },
   { action: "prev-conversation", spec: { code: "ArrowUp", alt: true }, scope: "global" },
   { action: "next-conversation", spec: { code: "ArrowDown", alt: true }, scope: "global" },
@@ -261,6 +274,11 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "zoom-reset", spec: { codes: ["Digit0", "Numpad0"], keys: ["0"], shift: "any" }, scope: "global" },
 ];
 
+/** The conversation side panel's chord as the UI prints it — the ONE label for every place
+ *  that shows it (the panel's header reminder, the closed-state summary line, the toggle's
+ *  tooltip, Settings), so the reminder can never name a chord the app no longer answers to. */
+export const CONVERSATION_PANEL_CHORD = "⌘ I";
+
 // ---- Display catalogue (Settings → Shortcuts) ------------------------------
 
 export interface ShortcutDoc {
@@ -285,6 +303,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘ 1", label: "Conversation view" },
       { keys: "⌘ 2", label: "Flight Deck view" },
       { keys: "⌘ 3", label: "TOSSE tasks view (when signed in to TOSSE)" },
+      { keys: "⌘ 4", label: "IDE view" },
       { keys: "⌘ N", label: "New conversation" },
       { keys: "⌘⌥ ↑ / ⌘⌥ ↓", label: "Previous / next conversation" },
       { keys: "⌘⇧ O", label: "Open conversation history" },
@@ -302,8 +321,19 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘ B", label: "Open / close the file editor" },
       { keys: "⌘ J", label: "Open / close the integrated terminal" },
       { keys: "⌘⇧ G", label: "Open / close the Git panel" },
+      { keys: CONVERSATION_PANEL_CHORD, label: "Open / close the conversation side panel" },
       { keys: "⌘ L", label: 'Toggle the conversation\'s "clean output"' },
       { keys: "⌘ E", label: "Open Extensions (MCP, plugins, skills, sub-agents)" },
+      { keys: "⌘⇧ I", label: "Open the conversation in the IDE view" },
+    ],
+  },
+  {
+    title: "IDE view",
+    items: [
+      { keys: "⌘ B", label: "Show / hide the file explorer" },
+      { keys: "⌘ J", label: "Open / close the bottom panel (terminals and conversations)" },
+      { keys: "⌘ L", label: 'Toggle the docked conversation\'s "clean output"' },
+      { keys: "⌘ E", label: "Open Extensions for the docked conversation" },
     ],
   },
   {

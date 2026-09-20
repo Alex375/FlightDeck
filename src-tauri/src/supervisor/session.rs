@@ -541,20 +541,58 @@ pub fn spawn_session(
 /// base + replayable lines seen on this connection) and the daemon replays what
 /// was missed. The same core/assembler keeps running: a network cut mid-turn
 /// heals without losing stream. Backoff 1s → ×2 → 30s, forever, interruptible
-/// by Shutdown.
+/// by Shutdown. A6: after [`ADDRESS_ROTATION_THRESHOLD`] consecutive failures to
+/// even reach `fd_attach` against the SAME candidate, rotates `cfg.remote.host`
+/// to the next recorded [`transport::RemoteTarget::addresses`] (wrapping forever,
+/// never giving up) — see [`next_candidate_after_failure`]/[`rotate_remote_address`]
+/// for the decision and [`SessionEvent::PreferredHostChanged`] for how a WINNING
+/// rotation gets persisted. Never fires for a TERMINAL `reconnect_policy_for_reason`
+/// (that path ends the session before reaching the rotation check at all).
 async fn run_actor(
     mut core: SessionCore,
     mut transport: Transport,
     mut msg_rx: mpsc::UnboundedReceiver<CliMessage>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     on_exit: Box<dyn FnOnce() + Send + 'static>,
-    cfg: SpawnConfig,
+    // `mut`: A6's address rotation mutates `cfg.remote.host` in place, so every
+    // `cfg2 = cfg.clone()` built for the NEXT spawn attempt (below) already dials
+    // whichever candidate the rotation policy last picked.
+    mut cfg: SpawnConfig,
 ) {
     core.initialize();
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
     let mut stop_remote = false;
+    // A6: the machine's persisted preferred host as this actor was SPAWNED with it —
+    // captured before any rotation ever mutates `cfg.remote.host`. Used ONLY as the
+    // FALLBACK baseline for `host_to_persist` (see the `FdAttach` handler below):
+    // once `persisted_host` holds a value, IT is the baseline instead — a session
+    // that rotates away and later back onto this original host must still persist
+    // it, since the DB was last told about the away candidate, not this one.
+    let original_host = cfg.remote.as_ref().map(|r| r.host.clone());
+    // A6: which candidate `cfg.remote.addresses` we are currently dialing, and how
+    // many CONSECUTIVE attempts against it in a row failed to reach `fd_attach`.
+    // Seeded from wherever `host` already sits in `addresses` (`host` is always
+    // first for a freshly-built `RemoteTarget` — see `ipc::commands::
+    // remote_target_addresses` — but resuming after an EARLIER session in this same
+    // process already rotated would seed from that instead, if it ever mattered).
+    // `unwrap_or(0)` also covers a pre-A5 machine whose `addresses` is just `[host]`:
+    // index 0, and `next_candidate_after_failure` never rotates a single-entry list.
+    let mut addr_idx: usize = cfg
+        .remote
+        .as_ref()
+        .and_then(|r| r.addresses.iter().position(|a| a == &r.host))
+        .unwrap_or(0);
+    let mut candidate_failures: u32 = 0;
+    // A6: the host already persisted as this machine's preferred address THIS
+    // session — `None` until the first successful persist, after which it (not
+    // `original_host`) becomes the baseline `host_to_persist` compares against.
+    // This is what lets a LATER rotation that lands back on `original_host`
+    // still persist correctly: the baseline has moved on from "where we
+    // started" to "what the DB last heard", so that reattach is correctly seen
+    // as a change again — see `host_to_persist`'s doc.
+    let mut persisted_host: Option<String> = None;
     // Remote reattach state, learned from the daemon's fd_attach handshake.
     let mut attach = cfg.attach.clone().unwrap_or_default();
     // The replay position: `attach_base` (the daemon's replay_from) plus the
@@ -574,51 +612,98 @@ async fn run_actor(
     // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
     // exited / error) — auto-reconnect must not fight that.
     let mut no_reconnect: Option<String> = None;
+    // Whether `no_reconnect`'s reason already got its OWN notice (or, for
+    // "stopped", narrates itself elsewhere) — read straight from
+    // `reconnect_policy_for_reason`'s table wherever `no_reconnect` is set, so
+    // the final exit-explain block below never re-lists reason strings itself
+    // (that would be the second hand-edit the table's doc comment promises
+    // callers they'll never need).
+    let mut deliberate_exit = false;
+    // How many CONSECUTIVE reconnects in a row saw at least one replayable line
+    // this build could not parse (see `Transport::unparseable_replayable`). The
+    // daemon replays deterministically, so a persistently malformed line
+    // reappears at the exact same cursor position on every reattach — this
+    // bounds how long we keep asking for it (see `malformed_replay_step`).
+    let mut malformed_replay_streak: u32 = 0;
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
     let process_gone = 'outer: loop {
         // Drive the CURRENT transport until it closes or a Shutdown lands.
         loop {
             tokio::select! {
-                maybe_msg = msg_rx.recv() => match maybe_msg {
-                    Some(CliMessage::FdAttach(a)) => {
-                        attach.conversation = Some(a.conversation);
-                        attach.epoch = Some(a.epoch);
-                        attach_base = a.replay_from;
-                        attach_seen = true;
-                        delay = std::time::Duration::from_secs(1);
-                        if reconnect_pending {
-                            reconnect_pending = false;
-                            core.emit_error_notice("remote_link", json!({
-                                "message": "Reconnected to the server.",
-                            }));
-                        }
-                        // Resync with the daemon's truth: turn state + pending
-                        // permission prompts (see the core methods' docs).
-                        if let Some(daemon_busy) = a.busy {
-                            core.sync_remote_busy(daemon_busy);
-                        }
-                        if let Some(pending) = &a.pending {
-                            core.sync_pending_permissions(pending);
-                        }
+                maybe_msg = msg_rx.recv() => {
+                    // D6: `reader_loop` folds a valid `fd_skip` straight into
+                    // `Transport::lines_seen` and never forwards it here — this is
+                    // just the wake-up point where we poll for the one-time note a
+                    // MISMATCHED frame would have left (see
+                    // `transport::apply_fd_skip`'s doc). Checked on every wake-up
+                    // (message OR transport-closed), not only on a specific
+                    // message type, so it surfaces promptly without adding any
+                    // wire traffic of its own.
+                    if let Some(detail) = transport.take_skip_violation() {
+                        core.emit_error_notice("protocol_error", json!({ "message": detail }));
                     }
-                    Some(CliMessage::FdDetach(d)) => {
-                        let message = match d.reason.as_str() {
-                            "exited" => Some(match d.exit_code {
-                                Some(c) => format!("The remote session exited (code {c})."),
-                                None => "The remote session exited.".to_string(),
-                            }),
-                            "replaced" => Some("Another client took over this remote session.".to_string()),
-                            "stopped" => None, // we asked; the stop path narrates itself
-                            _ => Some(d.message.clone().unwrap_or_else(|| "Remote attach failed.".to_string())),
-                        };
-                        if let Some(message) = message {
-                            core.emit_error_notice("remote_link", json!({ "message": message }));
+                    match maybe_msg {
+                        Some(CliMessage::FdAttach(a)) => {
+                            attach.conversation = Some(a.conversation);
+                            attach.epoch = Some(a.epoch);
+                            attach_base = a.replay_from;
+                            attach_seen = true;
+                            delay = std::time::Duration::from_secs(1);
+                            if reconnect_pending {
+                                reconnect_pending = false;
+                                core.emit_error_notice("remote_link", json!({
+                                    "message": "Reconnected to the server.",
+                                }));
+                            }
+                            // A6: this attach just confirmed a candidate DIFFERENT from
+                            // the machine's persisted preferred host actually works —
+                            // persist the win (once per distinct winning host this
+                            // session; see `persisted_host`'s doc) so the next spawn
+                            // dials it first instead of re-paying the backoff against a
+                            // dead `host` every time.
+                            if let Some(remote) = cfg.remote.as_ref() {
+                                // Baseline = the last host we KNOW to be true this
+                                // session — what we most recently persisted, or (if we
+                                // haven't persisted anything yet) the host we were
+                                // spawned with. See `host_to_persist`'s doc for why
+                                // this must NOT be the frozen `original_host` alone.
+                                let baseline = persisted_host.as_deref().or(original_host.as_deref());
+                                if let Some(baseline) = baseline {
+                                    if let Some(new_host) = host_to_persist(baseline, &remote.host) {
+                                        if let Some(machine_id) = remote.machine_id.clone() {
+                                            persisted_host = Some(new_host.clone());
+                                            core.emit_preferred_host(&machine_id, &new_host);
+                                        }
+                                    }
+                                }
+                            }
+                            // Resync with the daemon's truth: turn state + pending
+                            // permission prompts (see the core methods' docs).
+                            if let Some(daemon_busy) = a.busy {
+                                core.sync_remote_busy(daemon_busy);
+                            }
+                            if let Some(pending) = &a.pending {
+                                core.sync_pending_permissions(pending);
+                            }
                         }
-                        no_reconnect = Some(d.reason);
+                        Some(CliMessage::FdDetach(d)) => {
+                            let (message, terminal, narrated) =
+                                reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
+                            if let Some(message) = message {
+                                core.emit_error_notice("remote_link", json!({ "message": message }));
+                            }
+                            if terminal {
+                                no_reconnect = Some(d.reason);
+                                deliberate_exit = narrated;
+                            }
+                            // else: "stalled" — non-terminal, fall through to the normal
+                            // reconnect path below exactly like a spontaneous transport
+                            // close (`None => break`).
+                        }
+                        Some(msg) => core.on_message(msg),
+                        None => break, // transport closed
                     }
-                    Some(msg) => core.on_message(msg),
-                    None => break, // transport closed
                 },
                 maybe_cmd = cmd_rx.recv() => match maybe_cmd {
                     Some(SessionCommand::Shutdown { ack, stop_remote: sr }) => {
@@ -636,12 +721,151 @@ async fn run_actor(
         if cfg.remote.is_none() || no_reconnect.is_some() {
             break 'outer true;
         }
+        // Whether THIS transport ever completed the fd_attach handshake —
+        // captured now, before the shutdown below reaps the process. A spawn
+        // that never attached (the remote command itself failed, e.g. `ssh`
+        // exec'd `flightdeckd` and it isn't on PATH) never produces an
+        // `FdDetach`, so the existing reason-based exit check above can never
+        // fire for it — this is the only case `looks_like_missing_daemon`
+        // needs to look at.
+        let had_attach = attach_seen;
+        if !had_attach {
+            // Safe to call before `shutdown` (see their doc comments in
+            // transport.rs) — the process already exited on its own; this
+            // just reaps it and reads back what it left behind.
+            let exit_code = transport.wait_status().await.and_then(|s| s.code());
+            // Make sure the stderr pump actually finished draining the pipe
+            // before reading it back — otherwise a still-in-flight pump could
+            // make the classification below miss the "command not found" line
+            // and silently fall back to the old reconnect-forever bug.
+            transport.wait_stderr_drained().await;
+            let stderr = transport.stderr_tail();
+            // The binary THIS session actually invoked — not a hardcoded
+            // "flightdeckd" — so a non-default `daemon_bin` (e.g.
+            // `TOSSE_REMOTE_FLIGHTDECKD_BIN`, see `ipc/commands.rs`) still gets
+            // classified against the name the remote shell actually complained
+            // about. `cfg.remote` is guaranteed `Some` here (checked above).
+            let daemon_bin = cfg
+                .remote
+                .as_ref()
+                .map(|r| r.daemon_bin.as_str())
+                .unwrap_or("flightdeckd");
+            if looks_like_missing_daemon(exit_code, &stderr, daemon_bin) {
+                let (message, terminal, narrated) = reconnect_policy_for_reason(
+                    "daemon_missing",
+                    exit_code.map(i64::from),
+                    Some(daemon_bin),
+                );
+                if let Some(message) = &message {
+                    core.emit_error_notice(
+                        "process_exited",
+                        json!({
+                            "message": message,
+                            // Structured, stable field alongside the free-text
+                            // message — a future UI can match on this instead
+                            // of parsing English prose (see the pairing-side
+                            // daemon-missing wording this doesn't yet share).
+                            "reason": "daemon_missing",
+                            "detail": if stderr.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(stderr.join("\n"))
+                            },
+                        }),
+                    );
+                }
+                if terminal {
+                    // Unlike the `FdDetach` handler, this breaks out of the
+                    // outer loop directly instead of falling through to the
+                    // top-of-loop `no_reconnect.is_some()` check — so, unlike
+                    // there, nothing downstream re-reads `no_reconnect`'s
+                    // value on this path; `deliberate_exit` (below) already
+                    // carries what the exit-explain block needs.
+                    deliberate_exit = narrated;
+                    break 'outer true;
+                }
+                // else: fall through to the normal reconnect path below,
+                // exactly like the FdDetach "stalled" case above — the table
+                // decides, `run_actor` never hardcodes the outcome.
+            } else if looks_like_clap_flag_rejection(exit_code, &stderr) {
+                // D6/C9 follow-up (review finding): the CACHED per-machine daemon
+                // version (`ipc::commands::daemon_version_for_machine`) said this
+                // server's `flightdeckd` understood `--supports-skip`/`--title`, but
+                // it just rejected one of them outright — the server was DOWNGRADED
+                // below 0.2.0 since that cache entry was learned. Without this,
+                // EVERY reconnect would keep passing the same now-unsupported
+                // flag(s), clap would reject them identically forever, and the
+                // conversation could never reconnect until the app restarts.
+                //
+                // Invalidate the cache (so the next fresh top-level spawn re-probes
+                // for real) and drop BOTH optional flags here, for the REST of this
+                // actor's own reconnect loop (both share the same 0.2.0 floor, so a
+                // daemon that rejects one can't understand the other either) —
+                // never re-offering them again this session, which is what "never
+                // loop" requires: a single flip, not a re-arm-and-fail cycle.
+                if let Some(machine_id) = cfg.remote.as_ref().and_then(|r| r.machine_id.as_deref()) {
+                    crate::ipc::commands::invalidate_daemon_version_cache(machine_id);
+                }
+                attach.supports_skip = false;
+                cfg.conversation_title = None;
+                let (message, terminal, narrated) =
+                    reconnect_policy_for_reason("flag_rejected", exit_code.map(i64::from), None);
+                if let Some(message) = &message {
+                    core.emit_error_notice(
+                        "process_exited",
+                        json!({
+                            "message": message,
+                            "reason": "flag_rejected",
+                            "detail": if stderr.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(stderr.join("\n"))
+                            },
+                        }),
+                    );
+                }
+                if terminal {
+                    deliberate_exit = narrated;
+                    break 'outer true;
+                }
+                // else: fall through to the normal reconnect path below, now
+                // downgraded — exactly one retry without the flags, per the table.
+            }
+        }
         // Remote link lost while the server-side session lives on: reconnect.
         // Advance the cursor ONLY if this transport completed its handshake;
         // otherwise keep the last known-good position.
         if attach_seen {
-            cursor = attach_base + transport.lines_seen();
+            let unparseable = transport.unparseable_replayable();
+            let (force_advance, new_streak, warn) =
+                malformed_replay_step(unparseable, malformed_replay_streak);
+            malformed_replay_streak = new_streak;
+            cursor = attach_base
+                + reattach_cursor_delta(
+                    transport.lines_seen(),
+                    transport.first_unparseable_offset(),
+                    force_advance,
+                );
+            if warn {
+                eprintln!(
+                    "[session] giving up on {force_advance} replayable line(s) this build \
+                     repeatedly failed to parse — skipping them so the daemon stops resending"
+                );
+                core.emit_error_notice(
+                    "protocol_error",
+                    json!({ "message": "Some messages from the server could not be displayed and were skipped." }),
+                );
+            }
             attach_seen = false;
+            // A6: this attempt DID reach fd_attach (even if it then later dropped,
+            // e.g. a "stalled" detach) — the candidate `cfg.remote.host` currently
+            // names is proven alive, so its failure streak resets.
+            candidate_failures = 0;
+        } else {
+            // A6: this attempt (the transport just driven, whichever candidate
+            // `cfg.remote.host` named for it) never reached fd_attach at all —
+            // count it toward that candidate's consecutive-failure streak.
+            candidate_failures += 1;
         }
         transport.shutdown(false).await; // reap the dead ssh client quietly
         if !reconnect_pending {
@@ -653,6 +877,16 @@ async fn run_actor(
             // Still in the same outage (the previous attempt spawned ssh but
             // never got an fd_attach): escalate the backoff.
             delay = (delay * 2).min(std::time::Duration::from_secs(30));
+        }
+        // A6: past the threshold against the SAME candidate, try the next
+        // recorded address (see `next_candidate_after_failure`'s doc for the
+        // single-candidate / wrap-around rules). Applies BEFORE the backoff wait
+        // below, so the very next spawn attempt already dials the new candidate.
+        if let Some(new_host) = rotate_remote_address(&mut cfg, &mut addr_idx, candidate_failures) {
+            candidate_failures = 0;
+            core.emit_error_notice("remote_link", json!({
+                "message": format!("Trying another address for this server: {new_host}"),
+            }));
         }
         loop {
             // Wait out the backoff, staying responsive to commands (a send while
@@ -678,6 +912,17 @@ async fn run_actor(
                 conversation: attach.conversation.clone(),
                 epoch: attach.epoch.clone(),
                 cursor,
+                // D6: decided ONCE at the very first spawn (from a cached per-machine
+                // version probe — see `ipc::commands::supports_skip_for_machine`) and
+                // never re-decided here: `attach` (this loop's local reattach state)
+                // is seeded from `cfg.attach`, so every reconnect for this session's
+                // lifetime carries forward the SAME opt-in it started with — with
+                // exactly ONE exception, a few lines above in this same loop: a
+                // clap-rejection downgrade (`attach.supports_skip = false` in the
+                // `looks_like_clap_flag_rejection` branch) flips it mid-session when
+                // the server's daemon turns out to have been downgraded below 0.2.0,
+                // and it then stays flipped for the rest of the actor's lifetime.
+                supports_skip: attach.supports_skip,
             });
             match Transport::spawn(cfg2) {
                 Ok((t, rx)) => {
@@ -692,19 +937,32 @@ async fn run_actor(
                 Err(e) => {
                     eprintln!("[session] remote reconnect failed (retrying in {delay:?}): {e}");
                     delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                    // A6: the spawn itself (forking the local ssh client) never even
+                    // got off the ground — mirrors the `!attach_seen` failure signal
+                    // above, against whichever candidate `cfg2.remote.host` (== the
+                    // CURRENT `cfg.remote.host`, `cfg2` is just its clone) just named.
+                    candidate_failures += 1;
+                    if let Some(new_host) = rotate_remote_address(&mut cfg, &mut addr_idx, candidate_failures) {
+                        candidate_failures = 0;
+                        core.emit_error_notice("remote_link", json!({
+                            "message": format!("Trying another address for this server: {new_host}"),
+                        }));
+                    }
                 }
             }
         }
     };
     // The process vanished without us asking: surface why (exit code + last stderr)
     // so a crash / OOM / auth failure mid-turn is never a silent stop — EXCEPT a
-    // deliberate remote goodbye (exited / replaced / stopped), which was already
-    // narrated with its real reason; the local ssh exit status would only add
-    // noise ("exited (code 0)").
+    // deliberate remote goodbye (exited / replaced / stopped) or a classified
+    // daemon_missing, both already narrated with their real reason above (see
+    // `deliberate_exit`, set straight from `reconnect_policy_for_reason`'s
+    // table wherever `no_reconnect` was set — never re-listed here); the local
+    // ssh exit status would only add noise ("exited (code 0)") or a second,
+    // generic notice on top of the specific one.
     if process_gone {
-        let deliberate = matches!(no_reconnect.as_deref(), Some("exited" | "replaced" | "stopped"));
         let status = transport.wait_status().await;
-        if !deliberate {
+        if !deliberate_exit {
             core.emit_process_exit(
                 status,
                 transport.reader_error(),
@@ -738,6 +996,316 @@ async fn run_actor(
     }
 }
 
+/// Decide what an `FdDetach` notice says, whether `run_actor` may keep
+/// auto-reconnecting, and whether this reason already explains itself (skip
+/// the generic exit-explain notice for it), from a `reason` plus the two
+/// fields the message text draws from (`exit_code` for `"exited"`; `message`
+/// for the wildcard fallback AND for `"daemon_missing"`'s invoked-binary
+/// name). Pure and unit-testable — the SINGLE table `run_actor` wires BOTH the
+/// inline `match d.reason.as_str() { .. }` on a real `FdDetach` AND the
+/// synthesized `"daemon_missing"` reason (from `looks_like_missing_daemon`
+/// classifying a transport that closed before ever attaching) into — the ONE
+/// place a new reason gets added, never a second hand-edit of `run_actor`'s
+/// match OR of its final exit-explain check (`deliberate_exit` is read
+/// straight off this table's 3rd return value, never re-listed by reason
+/// string at the call site).
+///
+/// `"stalled"` is the ONLY reconnect-eligible reason; every other or unknown
+/// reason keeps today's terminal behavior (mirrors `FdDetachMsg`'s doc comment
+/// in `protocol.rs` — keep both in sync).
+fn reconnect_policy_for_reason(
+    reason: &str,
+    exit_code: Option<i64>,
+    message: Option<&str>,
+) -> (Option<String>, bool, bool) {
+    match reason {
+        "exited" => (
+            Some(match exit_code {
+                Some(c) => format!("The remote session exited (code {c})."),
+                None => "The remote session exited.".to_string(),
+            }),
+            true,
+            true,
+        ),
+        "replaced" => (
+            Some("Another client took over this remote session.".to_string()),
+            true,
+            true,
+        ),
+        // we asked; the stop path narrates itself (no notice here, but still
+        // "already explained" — the exit-explain block must not add its own)
+        "stopped" => (None, true, true),
+        "stalled" => (
+            Some("Connection stalled — reconnecting…".to_string()),
+            false,
+            false, // not terminal, so never reaches the exit-explain check
+        ),
+        // Synthesized locally by `looks_like_missing_daemon`, never sent by the
+        // daemon (a missing daemon can't send anything) — a hard precondition
+        // failure, not a retryable blip, so this must stop the auto-reconnect
+        // loop instead of retrying forever on a binary that will never appear.
+        // `message` carries the ACTUAL invoked binary name (the session's
+        // configured `daemon_bin`, not a hardcoded "flightdeckd") so the
+        // notice names what was really looked for.
+        "daemon_missing" => {
+            let bin = message.unwrap_or("flightdeckd");
+            (
+                Some(format!(
+                    "{bin} isn't installed or isn't on PATH on the server — install it, \
+                     then reopen this conversation."
+                )),
+                true,
+                true,
+            )
+        }
+        // Synthesized locally by `looks_like_clap_flag_rejection`, never sent by the
+        // daemon. Non-terminal: `run_actor` has ALREADY invalidated the machine's
+        // cached daemon version and dropped the optional flags for the rest of this
+        // actor's reconnect loop by the time this is reached — this just decides the
+        // one-time notice, same as `"stalled"`.
+        "flag_rejected" => (
+            Some(
+                "The server's flightdeckd no longer understands an optional flag this \
+                 Mac was sending — retrying without it."
+                    .to_string(),
+            ),
+            false,
+            false, // not applicable — never reaches the exit-explain check (non-terminal)
+        ),
+        _ => (
+            Some(message.map(str::to_string).unwrap_or_else(|| "Remote attach failed.".to_string())),
+            true,
+            // Pre-existing (not this task's scope to change): an unrecognized
+            // reason is NOT treated as already-narrated, so the exit-explain
+            // block still adds its generic notice on top of this one.
+            false,
+        ),
+    }
+}
+
+/// Hard-precondition classifier: does a just-closed remote transport's exit
+/// look like the remote command itself was never found — `daemon_bin` isn't
+/// installed or isn't on `PATH` on the server — rather than a retryable
+/// network blip? Requires BOTH an exit code of 127 (the shell convention for
+/// "command not found") AND the LAST non-empty stderr line naming `daemon_bin`
+/// specifically (case-insensitive substring, matched on its basename so a
+/// full-path `daemon_bin` still matches the shell's bare-name wording).
+///
+/// `daemon_bin` is the binary THIS session actually invoked — normally
+/// `"flightdeckd"`, but configurable via `RemoteTarget::daemon_bin` (see
+/// `ipc/commands.rs`'s `TOSSE_REMOTE_FLIGHTDECKD_BIN`) — never hardcode
+/// `"flightdeckd"` here, or a session using a non-default binary name would
+/// never get classified when THAT binary is the one missing.
+///
+/// Anchoring on the command name — not a generic "command not found" / "no
+/// such file" phrase alone — is load-bearing: a looser match would
+/// false-positive on unrelated remote-shell noise that happens to share exit
+/// code 127 (a stale MOTD script, a broken dotfile, some other command
+/// failing in the same ssh session on a real Ubuntu box) and PERMANENTLY kill
+/// a retryable blip instead of reconnecting. Covers the common shell
+/// wordings: `bash: flightdeckd: command not found`, `zsh: command not
+/// found: flightdeckd`, `sh: 1: flightdeckd: not found`, `exec: flightdeckd:
+/// not found`.
+fn looks_like_missing_daemon(exit_code: Option<i32>, stderr_tail: &[String], daemon_bin: &str) -> bool {
+    if exit_code != Some(127) {
+        return false;
+    }
+    let needle = daemon_bin.rsplit('/').next().unwrap_or(daemon_bin).trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    stderr_tail
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.to_lowercase().contains(&needle))
+}
+
+/// D6/C9 follow-up (review finding): does a just-closed remote transport's exit look
+/// like clap rejecting one of our two version-gated OPTIONAL attach flags
+/// (`--supports-skip` — D6 — or `--title` — C9) outright, rather than a network blip?
+/// Requires BOTH clap's own exit code for an unrecognized argument (2) AND the LAST
+/// non-empty stderr line naming one of the two flags specifically alongside clap's
+/// "unexpected argument" wording (case-insensitive, so a clap wording tweak across a
+/// future major still matches on the flag name, mirroring `looks_like_missing_daemon`'s
+/// own anchoring discipline — a looser match on exit code 2 ALONE would false-positive
+/// on an unrelated usage error and could misclassify a real problem as "just retry
+/// without the flags").
+///
+/// This can only fire when the CACHED per-machine version gate
+/// (`ipc::commands::daemon_version_for_machine`) was WRONG for the server's ACTUAL,
+/// now-downgraded `flightdeckd` — the version is learned once per app run and never
+/// re-checked mid-run otherwise (see that cache's doc).
+fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]) -> bool {
+    if exit_code != Some(2) {
+        return false;
+    }
+    stderr_tail
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("unexpected argument")
+                && (lower.contains("--supports-skip") || lower.contains("--title"))
+        })
+}
+
+/// How many consecutive reconnects in a row may see the SAME unparseable
+/// replayable line before `run_actor` gives up on it. Chosen to comfortably
+/// exceed a transient hiccup (one bad transmission, healed on replay) while
+/// still bounding a genuinely corrupt daemon-side record to a handful of
+/// wasted round trips, not forever.
+const MAX_MALFORMED_REPLAY_ATTEMPTS: u32 = 3;
+
+/// One step of the cross-reconnect bookkeeping for replayable lines this build
+/// could not parse (see `Transport::unparseable_replayable`'s doc for why they
+/// are excluded from the reattach cursor by default).
+///
+/// The daemon replays deterministically, so a persistently malformed line
+/// reappears at the exact same cursor position on every single reattach —
+/// without a bound, the actor would ask for it, fail to parse it, and ask
+/// again forever, taking every line after it down with it (their real
+/// positions never get acknowledged either). Past
+/// [`MAX_MALFORMED_REPLAY_ATTEMPTS`] consecutive reconnects that each saw at
+/// least one such failure, we accept the loss: the returned `forced_advance`
+/// tells the caller to move the cursor past those bytes (so the daemon stops
+/// resending something we can never parse) and `warn` tells it to surface a
+/// ONE-TIME `protocol_error` notice — silently dropping messages forever would
+/// violate the zero-silent-error contract.
+///
+/// A healthy reconnect (`unparseable == 0`) resets the streak: this only fires
+/// for a reason that reproduces on EVERY attempt, not an occasional blip.
+fn malformed_replay_step(unparseable: u64, streak: u32) -> (u64, u32, bool) {
+    if unparseable == 0 {
+        return (0, 0, false);
+    }
+    let streak = streak + 1;
+    if streak >= MAX_MALFORMED_REPLAY_ATTEMPTS {
+        (unparseable, 0, true)
+    } else {
+        (0, streak, false)
+    }
+}
+
+/// The CURRENT transport's contribution to the reattach cursor (`run_actor`
+/// adds the daemon's `replay_from` base on top). Pure and unit-testable —
+/// kept separate from `run_actor` so the composition of `lines_seen` /
+/// `first_unparseable_offset` / `force_advance` can be exercised without a
+/// live transport.
+///
+/// `lines_seen` (a raw count of SUCCESSFULLY parsed replayable lines this
+/// connection) is NOT the daemon's wire position: if later replayable lines
+/// go on to parse fine after an EARLIER one this build could not, `lines_seen`
+/// silently overtakes that earlier failure's true position. Reattaching with
+/// it would tell the daemon we already have everything through a point that
+/// includes a line we actually never received — permanently, silently lost,
+/// never replayed again.
+///
+/// - Still retrying (`force_advance == 0`): roll back to
+///   `first_unparseable_offset` when the transport saw a failure this
+///   connection (the count of successes strictly BEFORE it), so the daemon
+///   resends starting right before it — at the cost of re-delivering any
+///   later lines that DID already parse fine (a bounded duplicate, not a
+///   silent loss). No failure at all → `lines_seen` is exact, use it.
+/// - Giving up (`force_advance > 0`, from [`malformed_replay_step`]): skip
+///   past EVERYTHING this connection delivered, failures included —
+///   `lines_seen + force_advance` is the true total and thus the correct
+///   position; `first_unparseable_offset` must NOT be used here; it would
+///   roll back to a bad line we have just decided to stop asking for.
+fn reattach_cursor_delta(lines_seen: u64, first_unparseable_offset: Option<u64>, force_advance: u64) -> u64 {
+    if force_advance > 0 {
+        lines_seen + force_advance
+    } else {
+        first_unparseable_offset.unwrap_or(lines_seen)
+    }
+}
+
+/// A6 — sustained reconnect failure address rotation: how many CONSECUTIVE
+/// attempts against the SAME candidate must fail before `run_actor` tries the
+/// next recorded address. Small on purpose: a dead preferred address should not
+/// be re-tried for long before falling back to a known-good one, but more than
+/// one blip stays enough margin that a single transient failure never rotates.
+const ADDRESS_ROTATION_THRESHOLD: u32 = 2;
+
+/// A6's pure rotation decision: given how many consecutive attempts against the
+/// candidate at `addr_idx` have failed to reach `fd_attach`, and how many
+/// candidates exist in total, decide whether — and to which index — `run_actor`
+/// should rotate. Pure and unit-testable, deliberately knowing nothing about
+/// *why* the last attempt failed: `run_actor` only ever calls this from paths
+/// that are ALREADY retry-eligible (a terminal `reconnect_policy_for_reason`
+/// breaks the outer loop before reaching either call site — see its doc), so
+/// this function has no "reason" to weigh.
+///
+/// - A single candidate (`addr_count <= 1`, true for every machine paired
+///   before A5, whose `addresses` is just `[host]`) never rotates: there is
+///   nothing else to try, so the existing generic backoff-forever behavior is
+///   preserved byte-for-byte.
+/// - Below [`ADDRESS_ROTATION_THRESHOLD`] consecutive failures, stays put — one
+///   blip against an otherwise-fine candidate must not go address-hunting.
+/// - At or past the threshold, advances to `(addr_idx + 1) % addr_count`:
+///   WRAPPING, so a machine whose every candidate is currently dead just keeps
+///   cycling through them forever (with the existing generic "reconnecting…"
+///   notice) rather than ever giving up — `run_actor` has no "give up" state
+///   for a remote session the daemon still owns server-side.
+fn next_candidate_after_failure(
+    addr_idx: usize,
+    consecutive_failures: u32,
+    addr_count: usize,
+) -> Option<usize> {
+    if addr_count <= 1 || consecutive_failures < ADDRESS_ROTATION_THRESHOLD {
+        return None;
+    }
+    Some((addr_idx + 1) % addr_count)
+}
+
+/// Apply [`next_candidate_after_failure`]'s decision to a live [`SpawnConfig`]:
+/// bump `*addr_idx` and mutate `cfg.remote.host` to the new candidate, returning
+/// the new host when a rotation actually happened (so the caller can reset its
+/// failure counter and emit the one-time notice) — `None` when the threshold
+/// wasn't crossed, there's only one candidate, or (defense-in-depth)
+/// `addresses` is empty despite [`transport::RemoteTarget::addresses`]'s
+/// documented invariant that it never is.
+fn rotate_remote_address(
+    cfg: &mut SpawnConfig,
+    addr_idx: &mut usize,
+    consecutive_failures: u32,
+) -> Option<String> {
+    let remote = cfg.remote.as_mut()?;
+    let next_idx = next_candidate_after_failure(*addr_idx, consecutive_failures, remote.addresses.len())?;
+    let new_host = remote.addresses.get(next_idx)?.clone();
+    *addr_idx = next_idx;
+    if new_host == remote.host {
+        // Defensive: `remote_target_addresses` dedupes, so two distinct indices
+        // naming the same value shouldn't happen — but if it ever did, this is
+        // not a rotation worth narrating (nothing actually changes to dial).
+        return None;
+    }
+    remote.host = new_host.clone();
+    Some(new_host)
+}
+
+/// A6's pure persist decision: given `last_known_host` — the most recently
+/// known-true host for THIS session (whatever `run_actor` most recently told
+/// the DB, or the host it was SPAWNED with if it hasn't told the DB anything
+/// yet) — and the host a just-confirmed `fd_attach` landed on, decide whether
+/// that attach should be persisted as the machine's new preferred address.
+/// `None` means "already known to be on this host", so the caller must not
+/// re-emit the persist signal.
+///
+/// Comparing only against the frozen SPAWN-TIME host (what an earlier version
+/// of this logic did) misses a LATER rotation that lands back on an address
+/// already superseded by an EARLIER rotation within the same session: spawn
+/// on X, rotate to Y (persist Y), later rotate back to X — the spawn-time
+/// host is still X, so `attached_host != original_host` sees "no change" and
+/// skips persisting X even though the DB still (wrongly) says Y. Passing the
+/// last-PERSISTED host as the baseline instead (falling back to the spawn
+/// host only until the first persist) catches this: on that second rotation
+/// the baseline is Y, `X != Y`, so X gets persisted as it must.
+fn host_to_persist(last_known_host: &str, attached_host: &str) -> Option<String> {
+    (last_known_host != attached_host).then(|| attached_host.to_string())
+}
+
 /// A `can_use_tool` request we have surfaced and are waiting to answer.
 struct PendingPermission {
     tool_use_id: String,
@@ -749,6 +1317,12 @@ struct SessionCore {
     id: String,
     emitter: Arc<dyn SessionEmitter>,
     assembler: Assembler,
+    /// Whether a user message was written to the CURRENT outbound link (reset when a
+    /// reconnect swaps the link in — see [`Self::set_outbound`]). Read by
+    /// [`Self::sync_remote_busy`]: a message written on this same link is ordered
+    /// AFTER the daemon's `fd_attach` on the pipe, so the attach's `busy: false`
+    /// predates it and says nothing about it being lost.
+    sent_on_current_link: bool,
     /// Inbound permission prompts keyed by their `request_id`.
     pending: HashMap<String, PendingPermission>,
     /// Our OUTBOUND control requests awaiting their ack, keyed by `request_id`, so
@@ -819,6 +1393,7 @@ impl SessionCore {
             next_req: 0,
             outbound,
             appmcp,
+            sent_on_current_link: false,
         }
     }
 
@@ -827,6 +1402,7 @@ impl SessionCore {
     /// the pipe changes.
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
+        self.sent_on_current_link = false;
     }
 
     /// The claude session id the assembler learned from `system/init`, if any.
@@ -838,7 +1414,16 @@ impl SessionCore {
     /// with ours. Our busy flag is optimistic (set on send) — a message that
     /// died in a dead link leaves it stuck `true` forever, since the turn it
     /// announced never runs. The daemon KNOWS whether a turn is running.
+    ///
+    /// Not when the busy flag comes from a message written on THIS link: the daemon
+    /// sends `fd_attach` first and only then reads what we wrote, so its `busy:
+    /// false` is simply older than our message (found on the first real remote
+    /// conversation, 19/09: the very first message of a fresh conversation always
+    /// flashed "The server has no turn running…" half a second before its turn ran).
     fn sync_remote_busy(&mut self, daemon_busy: bool) {
+        if !daemon_busy && self.sent_on_current_link {
+            return;
+        }
         if self.assembler.state().busy != daemon_busy {
             if !daemon_busy {
                 self.emit_error_notice(
@@ -1003,7 +1588,19 @@ impl SessionCore {
                 self.emitter.emit_summary(&self.id, &summary, seq)
             }
             SessionEvent::RemoteControl(s) => self.emitter.emit_remote_control(&self.id, &s),
+            SessionEvent::PreferredHostChanged { machine_id, host } => {
+                self.emitter.emit_preferred_host(&self.id, &machine_id, &host)
+            }
         }
+    }
+
+    /// A6: see [`SessionEvent::PreferredHostChanged`]. Thin wrapper so `run_actor`'s
+    /// reconnect loop (the only caller) reads like its sibling `emit_error_notice`.
+    fn emit_preferred_host(&self, machine_id: &str, host: &str) {
+        self.emit(SessionEvent::PreferredHostChanged {
+            machine_id: machine_id.to_string(),
+            host: host.to_string(),
+        });
     }
 
     /// Initialize handshake at startup (spec §4.4). We do NOT block on it, but we
@@ -1358,6 +1955,7 @@ impl SessionCore {
                     &uuid,
                 )) {
                     self.assembler.note_sent_user_message(&uuid);
+                    self.sent_on_current_link = true;
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
                 } else {
@@ -1585,6 +2183,15 @@ mod tests {
     use crate::supervisor::model::{ConversationItem, PermissionRequestPayload, SessionStatePayload};
     use serde_json::json;
 
+    /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var —
+    /// the SAME crate-wide lock `transport::tests` uses for its own direct
+    /// `push_remote_title`/`run_remote_stop` tests (see
+    /// [`transport::SSH_ENV_LOCK`]'s doc for why this must be ONE shared lock
+    /// rather than a second independent one: two different modules' tests
+    /// mutating the SAME real env var need to serialise against EACH OTHER,
+    /// not just against their own module).
+    use transport::SSH_ENV_LOCK as ENV_LOCK;
+
     /// Test sink: forwards every event onto a channel for assertions.
     struct ChannelEmitter {
         tx: mpsc::UnboundedSender<SessionEvent>,
@@ -1625,6 +2232,12 @@ mod tests {
         fn emit_codex_plan_usage(&self, _session: &str, _usage: &crate::usage::PlanUsage) {
             // Codex-only push; the Claude core never emits it.
         }
+        fn emit_preferred_host(&self, _session: &str, machine_id: &str, host: &str) {
+            let _ = self.tx.send(SessionEvent::PreferredHostChanged {
+                machine_id: machine_id.to_string(),
+                host: host.to_string(),
+            });
+        }
     }
 
     /// Build a `SessionCore` wired to two inspectable channels (events, outbound).
@@ -1643,6 +2256,40 @@ mod tests {
             None,
         );
         (core, event_rx, out_rx)
+    }
+
+    fn lost_message_notices(events: &mut mpsc::UnboundedReceiver<SessionEvent>) -> usize {
+        drain(events)
+            .into_iter()
+            .filter(|e| format!("{e:?}").contains("has no turn running"))
+            .count()
+    }
+
+    /// First real remote conversation (19/09): the first message of a fresh
+    /// conversation is written on the same link, right behind the daemon's
+    /// `fd_attach{busy:false}` — not a lost message.
+    #[test]
+    fn a_message_sent_on_the_current_link_is_not_reported_lost_by_the_attach() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        drain(&mut events);
+        core.sync_remote_busy(false);
+        assert_eq!(lost_message_notices(&mut events), 0);
+        assert!(core.assembler.state().busy, "the turn is still expected");
+    }
+
+    /// The case the notice exists for: a message written on a link that then died,
+    /// reattached (new link) to a daemon with no turn running.
+    #[test]
+    fn a_message_sent_before_a_reconnect_is_reported_lost_when_the_daemon_is_idle() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+        core.set_outbound(new_tx);
+        drain(&mut events);
+        core.sync_remote_busy(false);
+        assert_eq!(lost_message_notices(&mut events), 1);
+        assert!(!core.assembler.state().busy);
     }
 
     /// Find the first outbound control_request with the given subtype.
@@ -2876,6 +3523,1120 @@ mod tests {
         assert!(out.contains("tosse-bg-done"), "output file should hold the echo");
     }
 
+    /// Table-driven: every named reason (the daemon-sent `FdDetach` ones plus
+    /// the locally-synthesized `"daemon_missing"`) plus one truly unknown
+    /// reason, asserting the EXACT (message, terminal, narrated) triple — the
+    /// shared table `run_actor` wires the inline reason match (AND its final
+    /// exit-explain `deliberate_exit` check) into. `"stalled"` must be the
+    /// only reconnect-eligible (non-terminal) entry; every other NAMED reason
+    /// (including `"stopped"`, whose own message is `None`) is already
+    /// narrated; only the truly unknown wildcard is not.
+    #[test]
+    fn reconnect_policy_covers_every_reason() {
+        assert_eq!(
+            reconnect_policy_for_reason("exited", Some(1), None),
+            (Some("The remote session exited (code 1).".to_string()), true, true),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("exited", None, None),
+            (Some("The remote session exited.".to_string()), true, true),
+            "a missing exit_code must not be treated as code 0",
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("replaced", None, None),
+            (
+                Some("Another client took over this remote session.".to_string()),
+                true,
+                true,
+            ),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("stopped", None, None),
+            (None, true, true),
+            "the stop path narrates itself — no notice here, but still already-explained",
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("stalled", None, None),
+            (Some("Connection stalled — reconnecting…".to_string()), false, false),
+            "stalled is the ONLY reconnect-eligible reason",
+        );
+        // Today's wildcard ("error" and anything else unrecognized): terminal,
+        // preferring the daemon's own message text when it sent one, and NOT
+        // already-narrated (pre-existing behavior, unchanged by A2) — the
+        // exit-explain block still adds its own generic notice on top.
+        assert_eq!(
+            reconnect_policy_for_reason("error", Some(99), Some("custom detail")),
+            (Some("custom detail".to_string()), true, false),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("error", None, None),
+            (Some("Remote attach failed.".to_string()), true, false),
+        );
+        // The dedicated entry `looks_like_missing_daemon` routes into (A2):
+        // terminal, already-narrated, with its own explanatory message
+        // regardless of exit_code — never the wildcard's "Remote attach
+        // failed.". No `message` (bin name) given: falls back to the default
+        // "flightdeckd", matching the common case.
+        assert_eq!(
+            reconnect_policy_for_reason("daemon_missing", Some(127), None),
+            (
+                Some(
+                    "flightdeckd isn't installed or isn't on PATH on the server — install it, \
+                     then reopen this conversation."
+                        .to_string()
+                ),
+                true,
+                true,
+            ),
+        );
+        // A NON-default configured `daemon_bin` (e.g. via
+        // `TOSSE_REMOTE_FLIGHTDECKD_BIN`) must be named in the message too —
+        // the regression test for A2's review finding that this arm used to
+        // hardcode "flightdeckd" regardless of `message`.
+        assert_eq!(
+            reconnect_policy_for_reason("daemon_missing", Some(127), Some("flightdeckd-canary")),
+            (
+                Some(
+                    "flightdeckd-canary isn't installed or isn't on PATH on the server — \
+                     install it, then reopen this conversation."
+                        .to_string()
+                ),
+                true,
+                true,
+            ),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("banana_unrecognized_reason", None, None),
+            (Some("Remote attach failed.".to_string()), true, false),
+            "a truly unknown reason must fall back to the wildcard, terminal, never panic",
+        );
+        // The dedicated entry `looks_like_clap_flag_rejection` routes into (D6/C9
+        // follow-up): non-terminal — like "stalled", this is the SECOND
+        // reconnect-eligible reason, and by design (`run_actor` has already
+        // downgraded the flags and invalidated the cache by the time this table is
+        // consulted, purely for the notice).
+        assert_eq!(
+            reconnect_policy_for_reason("flag_rejected", Some(2), None),
+            (
+                Some(
+                    "The server's flightdeckd no longer understands an optional flag this \
+                     Mac was sending — retrying without it."
+                        .to_string()
+                ),
+                false,
+                false,
+            ),
+        );
+    }
+
+    /// [`looks_like_clap_flag_rejection`] unit coverage: exit code 2 alone is not
+    /// enough (any other usage error also exits 2) — the stderr must ALSO name one
+    /// of the two version-gated flags specifically.
+    #[test]
+    fn looks_like_clap_flag_rejection_requires_both_exit_code_and_flag_name() {
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &["error: unexpected argument '--supports-skip' found".to_string()],
+        ));
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &["error: unexpected argument '--title' found".to_string()],
+        ));
+        // Case-insensitive, and matched against the LAST non-empty line (clap
+        // prints usage/help lines after the actual error).
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &[
+                "noise".to_string(),
+                "".to_string(),
+                "ERROR: UNEXPECTED ARGUMENT '--title' FOUND".to_string(),
+            ],
+        ));
+        assert!(
+            !looks_like_clap_flag_rejection(Some(2), &["error: unexpected argument '--socket' found".to_string()]),
+            "a rejection of an UNRELATED flag must not trigger the downgrade",
+        );
+        assert!(
+            !looks_like_clap_flag_rejection(Some(1), &["error: unexpected argument '--title' found".to_string()]),
+            "the wrong exit code must never match, even with the right wording",
+        );
+        assert!(!looks_like_clap_flag_rejection(None, &["unexpected argument '--title'".to_string()]));
+        assert!(!looks_like_clap_flag_rejection(Some(2), &[]));
+    }
+
+    /// A6 — table-driven coverage of the pure rotation decision.
+    #[test]
+    fn next_candidate_after_failure_table() {
+        // A single address (every machine paired before A5) never rotates, no
+        // matter how many consecutive failures pile up.
+        assert_eq!(next_candidate_after_failure(0, 0, 1), None);
+        assert_eq!(next_candidate_after_failure(0, 1, 1), None);
+        assert_eq!(next_candidate_after_failure(0, 100, 1), None);
+        // Defense-in-depth: an empty list (should never happen — see
+        // `RemoteTarget::addresses`'s doc) must not panic or index out of bounds.
+        assert_eq!(next_candidate_after_failure(0, 100, 0), None);
+
+        // Below threshold: stays put.
+        assert_eq!(next_candidate_after_failure(0, 0, 2), None);
+        assert_eq!(
+            next_candidate_after_failure(0, ADDRESS_ROTATION_THRESHOLD - 1, 2),
+            None,
+            "one below the threshold must not rotate yet",
+        );
+
+        // At the threshold: advances to the next index.
+        assert_eq!(
+            next_candidate_after_failure(0, ADDRESS_ROTATION_THRESHOLD, 2),
+            Some(1),
+        );
+        // Past the threshold: still rotates (doesn't require an exact match).
+        assert_eq!(
+            next_candidate_after_failure(0, ADDRESS_ROTATION_THRESHOLD + 5, 2),
+            Some(1),
+        );
+
+        // Wrap-around: the LAST candidate rotates back to the first, forever —
+        // never "gives up" even with every candidate exhausted.
+        assert_eq!(
+            next_candidate_after_failure(2, ADDRESS_ROTATION_THRESHOLD, 3),
+            Some(0),
+            "the last index (2, of 3) must wrap back to 0",
+        );
+        // A middle index just advances by one.
+        assert_eq!(
+            next_candidate_after_failure(0, ADDRESS_ROTATION_THRESHOLD, 3),
+            Some(1),
+        );
+        assert_eq!(
+            next_candidate_after_failure(1, ADDRESS_ROTATION_THRESHOLD, 3),
+            Some(2),
+        );
+    }
+
+    /// A6 — table-driven coverage of the pure persist decision, INCLUDING the
+    /// rotate-away-then-back-within-one-session regression this review closes:
+    /// a naive "differs from the SPAWN-time host" check would wrongly skip
+    /// persisting X on the second rotation, because X == the spawn host even
+    /// though the DB currently (wrongly) says Y. Passing the last-PERSISTED
+    /// host as the baseline (not the frozen spawn host) is what makes this
+    /// third case come out `Some("a")` instead of `None`.
+    #[test]
+    fn host_to_persist_table() {
+        // Same host: an ordinary reattach to the candidate we're already known
+        // to be on — never re-persist.
+        assert_eq!(host_to_persist("a", "a"), None);
+
+        // First rotation: spawned on "a", attach confirms "b" — persist "b".
+        assert_eq!(host_to_persist("a", "b"), Some("b".to_string()));
+
+        // Second rotation, wrapping BACK to the original host: baseline is now
+        // "b" (the LAST PERSISTED host, not the frozen spawn host "a"), attach
+        // confirms "a" again — must still persist "a", even though "a" equals
+        // where this session started.
+        assert_eq!(host_to_persist("b", "a"), Some("a".to_string()));
+    }
+
+    /// [`rotate_remote_address`] applies the decision to a real `SpawnConfig`:
+    /// mutates `remote.host` + `addr_idx` and reports the new host, without ever
+    /// touching a `cfg` that has no `remote` (a local session) or indexing past
+    /// a single-element `addresses` list.
+    #[test]
+    fn rotate_remote_address_mutates_host_and_reports_it() {
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "dead.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["dead.invalid".into(), "good.invalid".into()],
+            machine_id: Some("m1".into()),
+        });
+        let mut addr_idx = 0usize;
+
+        // Below threshold: no mutation.
+        assert_eq!(rotate_remote_address(&mut cfg, &mut addr_idx, ADDRESS_ROTATION_THRESHOLD - 1), None);
+        assert_eq!(cfg.remote.as_ref().unwrap().host, "dead.invalid");
+        assert_eq!(addr_idx, 0);
+
+        // At threshold: rotates to the second candidate.
+        let rotated = rotate_remote_address(&mut cfg, &mut addr_idx, ADDRESS_ROTATION_THRESHOLD);
+        assert_eq!(rotated.as_deref(), Some("good.invalid"));
+        assert_eq!(cfg.remote.as_ref().unwrap().host, "good.invalid");
+        assert_eq!(addr_idx, 1);
+
+        // A local (non-remote) config is a documented no-op, never a panic.
+        let mut local_cfg = SpawnConfig::new("/work/demo");
+        let mut local_idx = 0usize;
+        assert_eq!(rotate_remote_address(&mut local_cfg, &mut local_idx, 999), None);
+
+        // A single-address remote never indexes past it, however high the
+        // failure count climbs.
+        let mut single = SpawnConfig::new("/work/demo");
+        single.remote = Some(transport::RemoteTarget {
+            host: "only.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["only.invalid".into()],
+            machine_id: Some("m1".into()),
+        });
+        let mut single_idx = 0usize;
+        assert_eq!(rotate_remote_address(&mut single, &mut single_idx, 1000), None);
+        assert_eq!(single.remote.as_ref().unwrap().host, "only.invalid");
+    }
+
+    /// The common shell wordings for "the remote command wasn't found" — all
+    /// must be recognized when the exit code is 127.
+    #[test]
+    fn looks_like_missing_daemon_recognizes_the_common_shell_wordings() {
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["bash: flightdeckd: command not found".to_string()],
+            "flightdeckd",
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["zsh: command not found: flightdeckd".to_string()],
+            "flightdeckd",
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["sh: 1: flightdeckd: not found".to_string()],
+            "flightdeckd",
+        ));
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["exec: flightdeckd: not found".to_string()],
+            "flightdeckd",
+        ));
+    }
+
+    /// The direct regression test for the false-positive risk the doc comment
+    /// warns about: an UNRELATED command failing with the same exit code (e.g.
+    /// a stale MOTD script or a broken dotfile) must never be mistaken for a
+    /// missing `flightdeckd` — the anchor is the command NAME, not the exit
+    /// code or the generic "command not found" phrasing.
+    #[test]
+    fn looks_like_missing_daemon_rejects_unrelated_command_not_found() {
+        assert!(!looks_like_missing_daemon(
+            Some(127),
+            &["sl: command not found".to_string()],
+            "flightdeckd",
+        ));
+    }
+
+    /// Exit-code precondition is required: even the exact daemon-missing
+    /// stderr wording must not classify without a 127 (e.g. the process is
+    /// still alive / hasn't been reaped yet, `wait_status` returned `None`).
+    #[test]
+    fn looks_like_missing_daemon_requires_exit_code_127() {
+        assert!(!looks_like_missing_daemon(
+            None,
+            &["bash: flightdeckd: command not found".to_string()],
+            "flightdeckd",
+        ));
+    }
+
+    /// A NON-default configured `daemon_bin` (e.g. a server running a
+    /// differently-named/versioned daemon via `TOSSE_REMOTE_FLIGHTDECKD_BIN`,
+    /// see `ipc/commands.rs`) must be classified against ITS OWN name, not a
+    /// hardcoded "flightdeckd" — the direct regression test for the review
+    /// finding that this classifier ignored the session's actual configured
+    /// binary name entirely.
+    #[test]
+    fn looks_like_missing_daemon_uses_the_configured_binary_name() {
+        assert!(
+            looks_like_missing_daemon(
+                Some(127),
+                &["bash: flightdeckd-canary: command not found".to_string()],
+                "flightdeckd-canary",
+            ),
+            "a non-default daemon_bin must still be recognized when IT is the one missing",
+        );
+        assert!(
+            !looks_like_missing_daemon(
+                Some(127),
+                &["bash: flightdeckd: command not found".to_string()],
+                "flightdeckd-canary",
+            ),
+            "the DEFAULT binary being missing must not falsely classify a session configured \
+             for a DIFFERENT (also missing, but unrelated) binary name",
+        );
+        // A full remote path still matches on its basename, the way a shell's
+        // "command not found" wording would name it.
+        assert!(looks_like_missing_daemon(
+            Some(127),
+            &["bash: flightdeckd: command not found".to_string()],
+            "/usr/local/bin/flightdeckd",
+        ));
+    }
+
+    /// An unrelated failure (e.g. SSH auth) sharing neither the exit code nor
+    /// the stderr wording must not classify.
+    #[test]
+    fn looks_like_missing_daemon_rejects_unrelated_failure() {
+        assert!(!looks_like_missing_daemon(
+            Some(255),
+            &["Permission denied (publickey)".to_string()],
+            "flightdeckd",
+        ));
+    }
+
+    /// A healthy reconnect (no unparseable replayable lines) never accumulates
+    /// a streak and never forces the cursor forward.
+    #[test]
+    fn malformed_replay_step_is_a_no_op_when_nothing_failed_to_parse() {
+        assert_eq!(malformed_replay_step(0, 0), (0, 0, false));
+        assert_eq!(
+            malformed_replay_step(0, 2),
+            (0, 0, false),
+            "a clean reconnect resets a prior streak",
+        );
+    }
+
+    /// The core bug this guards against: an unparseable line that reproduces on
+    /// EVERY reconnect (the daemon replays deterministically) must eventually
+    /// be skipped — not retried forever — and the caller must be told to warn
+    /// exactly once per bound crossed, not on every attempt below it.
+    #[test]
+    fn malformed_replay_step_gives_up_after_the_bound_then_resets() {
+        let mut streak = 0;
+        for attempt in 1..MAX_MALFORMED_REPLAY_ATTEMPTS {
+            let (advance, new_streak, warn) = malformed_replay_step(1, streak);
+            assert_eq!(advance, 0, "attempt {attempt}: still within the bound, no skip yet");
+            assert!(!warn, "attempt {attempt}: no warning below the bound");
+            assert_eq!(new_streak, attempt);
+            streak = new_streak;
+        }
+        // The attempt that crosses the bound: give up on the 1 unparseable line,
+        // warn once, and reset the streak so a DIFFERENT poison-pill later in the
+        // stream gets its own fresh chances rather than warning again immediately.
+        let (advance, new_streak, warn) = malformed_replay_step(1, streak);
+        assert_eq!(advance, 1, "the unparseable line count is what the cursor must skip");
+        assert_eq!(new_streak, 0, "streak resets after giving up");
+        assert!(warn, "must surface a protocol_error notice exactly once here");
+
+        // A subsequent CLEAN reconnect (the poison pill is now behind the
+        // cursor) does not warn again.
+        assert_eq!(malformed_replay_step(0, new_streak), (0, 0, false));
+    }
+
+    /// A burst of several DIFFERENT unparseable lines in the same connection
+    /// (not just one) is still bounded by attempt count, and the forced advance
+    /// equals however many lines were actually unparseable that attempt — never
+    /// under-skipping (which would loop) or over-skipping (which would drop a
+    /// line we never even saw).
+    #[test]
+    fn malformed_replay_step_advances_by_the_real_unparseable_count() {
+        let mut streak = 0;
+        for _ in 1..MAX_MALFORMED_REPLAY_ATTEMPTS {
+            let (_, new_streak, _) = malformed_replay_step(3, streak);
+            streak = new_streak;
+        }
+        let (advance, _, warn) = malformed_replay_step(5, streak);
+        assert_eq!(advance, 5, "must skip exactly the lines this attempt reported, not a stale count");
+        assert!(warn);
+    }
+
+    /// A clean connection (no failures) uses the exact success count, same as
+    /// before this table existed.
+    #[test]
+    fn reattach_cursor_delta_uses_lines_seen_when_nothing_failed() {
+        assert_eq!(reattach_cursor_delta(4, None, 0), 4);
+    }
+
+    /// The blocker this guards against: OK, FAIL, OK, OK within ONE connection
+    /// (a bad line NOT last) — `lines_seen` (3, both successes before AND
+    /// after the failure) would silently overtake the failure's true position
+    /// and the daemon would never re-offer it. The correct delta rolls back to
+    /// `first_unparseable_offset` (1, the success BEFORE the failure), even
+    /// though `lines_seen` disagrees — this is exactly the case where using
+    /// `lines_seen` alone drops a message forever.
+    #[test]
+    fn reattach_cursor_delta_rolls_back_to_the_first_failure_not_lines_seen() {
+        let lines_seen = 3; // 1 success before FAIL, 2 more after it
+        let first_unparseable_offset = Some(1); // success count strictly before FAIL
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            1,
+            "must resume right before the still-unrecovered failure, not past it",
+        );
+        assert_ne!(
+            reattach_cursor_delta(lines_seen, first_unparseable_offset, 0),
+            lines_seen,
+            "lines_seen is exactly the wrong answer here — it would skip the failure",
+        );
+    }
+
+    /// Once `malformed_replay_step` decides to give up (`force_advance > 0`),
+    /// the delta must skip past EVERYTHING this connection delivered —
+    /// successes before AND after the failure, plus the failure(s) themselves
+    /// — never roll back to `first_unparseable_offset` (that would ask for the
+    /// very line we just gave up on, forever).
+    #[test]
+    fn reattach_cursor_delta_skips_everything_when_giving_up() {
+        let lines_seen = 4; // successes both sides of the 2 failures
+        let force_advance = 2; // malformed_replay_step's give-up count
+        assert_eq!(
+            reattach_cursor_delta(lines_seen, Some(1), force_advance),
+            6,
+            "giving up must use lines_seen + force_advance (the true total), \
+             ignoring first_unparseable_offset entirely",
+        );
+    }
+
+    /// Actor-level regression for A2: a remote spawn whose command fails
+    /// immediately because `flightdeckd` isn't on the remote `PATH` must stop
+    /// with EXACTLY ONE terminal notice and never loop retrying forever — the
+    /// bug this task fixes (today, before this fix, this would hang until the
+    /// timeout below fires, since no `FdDetach` is ever produced by a spawn
+    /// failure).
+    ///
+    /// Fakes the remote command by pointing `$TOSSE_SSH_BIN` (a test-only
+    /// escape hatch, see `transport::resolve_ssh_bin`) at a tiny script that
+    /// ignores every `ssh` flag/arg and just prints the exact wording a real
+    /// remote shell prints for a command that isn't on `PATH`, then exits 127
+    /// — precisely what a real Ubuntu box without `flightdeckd` installed
+    /// would produce over the wire.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_stops_cleanly_when_the_remote_daemon_is_missing() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-daemon-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"bash: flightdeckd: command not found\" 1>&2\nexit 127\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `TOSSE_SSH_BIN` is a test-only escape hatch read once at spawn time;
+        // `ENV_LOCK` serialises the mutation against any other test in this
+        // module that might one day also touch it, under the parallel test
+        // runner (mirrors `transport::tests::ENV_LOCK`'s pattern for the
+        // sibling `TOSSE_CLAUDE_BIN`). Held across the spawn, which is where
+        // the var is actually read.
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "daemon-missing-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        // Drain every notice until the actor tears itself down and the event
+        // channel closes on its own (nothing left holding `event_tx` once
+        // `run_actor` drops `core`) — the actor reconnecting forever instead
+        // would never close it, so the timeout is the "it looped" assertion.
+        let mut process_exited_notices: Vec<Value> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    if subtype == "process_exited" {
+                        process_exited_notices.push(detail);
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the actor must stop on its own instead of reconnecting forever \
+             on a daemon binary that will never appear",
+        );
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            process_exited_notices.len(),
+            1,
+            "expected exactly one terminal notice, not a reconnect loop nor a double notice: {process_exited_notices:?}",
+        );
+        let message = process_exited_notices[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("flightdeckd isn't installed"),
+            "expected the daemon-missing message, got: {message:?}",
+        );
+        assert_eq!(
+            process_exited_notices[0]["reason"].as_str(),
+            Some("daemon_missing"),
+            "the notice must carry a stable, structured reason alongside the free-text \
+             message, so a future UI can match on it instead of parsing English prose",
+        );
+    }
+
+    /// D6/C9 follow-up (review finding) end-to-end: a daemon DOWNGRADED below 0.2.0
+    /// mid-run rejects `--supports-skip`/`--title` with clap's unknown-argument exit
+    /// (2). The actor must invalidate the machine's cached version, retry EXACTLY
+    /// ONCE without either flag, and then behave completely normally (reconnect
+    /// succeeds, no loop) — never keep re-offering the flags the daemon just proved
+    /// it doesn't understand.
+    ///
+    /// Fakes the remote command like `run_actor_stops_cleanly_when_the_remote_daemon_
+    /// is_missing`, except this script behaves DIFFERENTLY on its first vs later
+    /// invocation (a call counter sidecar file): first call → clap's rejection
+    /// message + exit 2; every later call → a normal successful attach. It also logs
+    /// the exact command line each invocation received, so the test can assert the
+    /// SECOND attempt genuinely dropped both flags.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_retries_once_without_the_flags_after_a_clap_rejection() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-flag-rejected-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+for last; do :; done
+printf '%s\n' "$last" >> "$DIR/args.log"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+if [ "$N" -eq 1 ]; then
+    echo "error: unexpected argument '--supports-skip' found" 1>&2
+    exit 2
+fi
+printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Arrange "this machine's daemon version is already cached" (as a real
+        // spawn's D6/C9 gate would have left it) so the assertion below can prove
+        // the clap-rejection path actually invalidates it, not just that the retry
+        // behaves correctly.
+        let machine_id = "m-flag-test-clap-rejection";
+        crate::ipc::commands::seed_daemon_version_cache_for_test(
+            machine_id,
+            Some("flightdeckd 0.2.0".to_string()),
+        );
+        assert!(crate::ipc::commands::daemon_version_cache_contains(machine_id));
+
+        // Unlike a single-attempt test, this actor spawns TWO transports over its
+        // lifetime (the reconnect re-reads `TOSSE_SSH_BIN` — see
+        // `transport::resolve_ssh_bin`), so the guard is held for the WHOLE test
+        // body, exactly like `run_actor_rotates_to_the_next_address_after_repeated_
+        // failures_and_persists_it` — released only once no more spawns are coming.
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: Some(machine_id.to_string()),
+        });
+        cfg.conversation_title = Some("My Feature".into());
+        cfg.attach = Some(transport::AttachPoint {
+            conversation: None,
+            epoch: None,
+            cursor: 0,
+            supports_skip: true,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "flag-rejected-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        let handle = handle.expect("fake ssh should spawn");
+
+        // Wait for the "Reconnected" notice — proof the SECOND (downgraded) attempt
+        // actually succeeded, rather than the actor giving up or looping the first
+        // failure forever.
+        let mut reconnected_msg: Option<String> = None;
+        let mut flag_rejected_msg: Option<String> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    let text = detail["message"].as_str().unwrap_or_default().to_string();
+                    if subtype == "process_exited" && detail["reason"].as_str() == Some("flag_rejected") {
+                        flag_rejected_msg = Some(text);
+                    } else if subtype == "remote_link" && text.contains("Reconnected") {
+                        reconnected_msg = Some(text);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the actor must recover from the clap rejection within the deadline, not hang or loop");
+
+        // Safe to release now: the winning (downgraded) transport is already
+        // attached above — no more spawns are coming.
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        assert!(flag_rejected_msg.is_some(), "expected the one-time flag_rejected notice");
+        assert!(reconnected_msg.is_some(), "expected the downgraded retry to succeed");
+
+        let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
+        assert_eq!(calls, 2, "expected EXACTLY one retry (two total attempts), never a loop");
+
+        let log = fs::read_to_string(dir.join("args.log")).unwrap();
+        let attempts: Vec<&str> = log.lines().collect();
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts[0].contains("--supports-skip") && attempts[0].contains("--title="),
+            "the FIRST attempt should still ask for both flags: {}",
+            attempts[0],
+        );
+        assert!(
+            !attempts[1].contains("--supports-skip") && !attempts[1].contains("--title="),
+            "the SECOND (retry) attempt must drop BOTH optional flags: {}",
+            attempts[1],
+        );
+        assert!(
+            !crate::ipc::commands::daemon_version_cache_contains(machine_id),
+            "the clap rejection must invalidate the machine's cached daemon version, \
+             so the NEXT top-level spawn re-probes for real instead of repeating the \
+             now-stale answer",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D6 wiring end-to-end: a daemon that sends a MISMATCHED `fd_skip` (a protocol
+    /// violation it should never produce) must surface exactly one `protocol_error`
+    /// notice through `run_actor` — proving `Transport::take_skip_violation`
+    /// actually reaches the session's event stream, not just the transport-level
+    /// unit tests. Fakes the remote command the same way
+    /// `run_actor_stops_cleanly_when_the_remote_daemon_is_missing` does
+    /// (`$TOSSE_SSH_BIN` pointed at a script), except this one behaves like a live
+    /// `flightdeckd attach`: prints a handshake, a normal replayable line, the
+    /// violating `fd_skip`, then one more replayable line (the actor's natural
+    /// wake-up point to check the flag — see `run_actor`'s `maybe_msg` arm) before
+    /// going quiet.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_surfaces_a_skip_violation_as_one_protocol_error_notice() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-skip-violation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+printf '%s\n' '{"type":"result","subtype":"success"}'
+printf '%s\n' '{"type":"fd_skip","from":5,"to":8}'
+printf '%s\n' '{"type":"result","subtype":"success"}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "skip-violation-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        // The fake daemon goes quiet (just `sleep`s) right after the 4 scripted
+        // lines, so drain only until the ONE notice we're looking for shows up.
+        let mut protocol_error_notices: Vec<Value> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    if subtype == "protocol_error" {
+                        protocol_error_notices.push(detail);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected a protocol_error notice for the mismatched fd_skip");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(protocol_error_notices.len(), 1, "exactly one notice for the one violation");
+        let message = protocol_error_notices[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("fd_skip"),
+            "expected the fd_skip violation wording, got: {message:?}"
+        );
+    }
+
+    /// A6 end-to-end (non-live): a preferred `host` that is simply DEAD must, after
+    /// [`ADDRESS_ROTATION_THRESHOLD`] consecutive failed attempts against it, rotate
+    /// to the next recorded candidate — and once THAT one attaches, emit the
+    /// preferred-host persist signal with the winning address. Fakes the remote
+    /// command the same way the daemon-missing / skip-violation tests above do
+    /// (`$TOSSE_SSH_BIN` pointed at a script), except this one behaves DIFFERENTLY
+    /// depending on which host it was dialed for — inspecting its own argv (ssh
+    /// always includes `user@host`) — exactly like a real ssh client whose outcome
+    /// depends on whether THAT address is reachable: `dead.invalid` fails instantly
+    /// with no output (a connection refused/timeout, exit code far from 127 so this
+    /// is never misclassified as `daemon_missing`), `good.invalid` behaves like a
+    /// live `flightdeckd attach`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_rotates_to_the_next_address_after_repeated_failures_and_persists_it() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-addr-rotation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$*" in
+  *dead.invalid*)
+    exit 7
+    ;;
+  *)
+    printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+    sleep 30
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Unlike the daemon-missing / skip-violation tests above, this actor spawns
+        // MULTIPLE transports over its lifetime (each reconnect re-reads
+        // `TOSSE_SSH_BIN` — see `transport::resolve_ssh_bin`), so the guard is held
+        // for the WHOLE test body, not just the first spawn.
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "dead.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["dead.invalid".into(), "good.invalid".into()],
+            machine_id: Some("m1".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "addr-rotation-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        let mut remote_link_messages: Vec<String> = Vec::new();
+        let mut persisted: Option<(String, String)> = None;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { subtype, detail })
+                        if subtype == "remote_link" =>
+                    {
+                        remote_link_messages
+                            .push(detail["message"].as_str().unwrap_or_default().to_string());
+                    }
+                    SessionEvent::PreferredHostChanged { machine_id, host } => {
+                        persisted = Some((machine_id, host));
+                        break; // the one signal this test is after
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("expected a rotation to good.invalid followed by a preferred-host persist signal");
+
+        // Safe to release now: the actor holds no live handle to `TOSSE_SSH_BIN`
+        // past a spawn (it reads the env var fresh each time), and the winning
+        // transport is already attached above — no more spawns are coming.
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            persisted,
+            Some(("m1".to_string(), "good.invalid".to_string())),
+            "the persist signal must name the machine and the WINNING address",
+        );
+        assert_eq!(
+            remote_link_messages.iter().filter(|m| m.contains("Trying another address")).count(),
+            1,
+            "exactly one rotation notice, not one per failed attempt: {remote_link_messages:?}",
+        );
+        assert!(
+            remote_link_messages.iter().any(|m| m.contains("good.invalid")),
+            "the rotation notice must name the new address: {remote_link_messages:?}",
+        );
+        assert!(
+            remote_link_messages.iter().any(|m| m.contains("Connection to the server lost")),
+            "the existing generic outage notice must still fire: {remote_link_messages:?}",
+        );
+        assert!(
+            remote_link_messages.iter().any(|m| m.contains("Reconnected")),
+            "the winning candidate must still produce the normal 'Reconnected' notice: {remote_link_messages:?}",
+        );
+    }
+
+    /// A6: a TERMINAL reconnect reason (here, `daemon_missing`, exit 127) must end the
+    /// session exactly as it did before A6 — even with a SECOND candidate address
+    /// recorded, rotation must never fire and `good.invalid` must never be dialed.
+    /// Reuses `run_actor_stops_cleanly_when_the_remote_daemon_is_missing`'s fake
+    /// script (every host gets the same "command not found" response).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_never_rotates_on_a_terminal_reconnect_reason() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-no-rotate-terminal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"bash: flightdeckd: command not found\" 1>&2\nexit 127\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            // A second candidate that WOULD be dialed if (incorrectly) rotated onto.
+            addresses: vec!["example.invalid".into(), "good.invalid".into()],
+            machine_id: Some("m1".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "no-rotate-terminal-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        let mut remote_link_messages: Vec<String> = Vec::new();
+        let mut process_exited_notices = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    if subtype == "remote_link" {
+                        remote_link_messages
+                            .push(detail["message"].as_str().unwrap_or_default().to_string());
+                    } else if subtype == "process_exited" {
+                        process_exited_notices += 1;
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the actor must stop on its own (terminal reason) instead of ever considering rotation",
+        );
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(process_exited_notices, 1, "exactly one terminal notice, no reconnect loop");
+        assert!(
+            remote_link_messages.iter().all(|m| !m.contains("Trying another address")),
+            "a terminal reason must never rotate, even with a second candidate available: {remote_link_messages:?}",
+        );
+    }
+
+    /// Live M1 acceptance check (C9): spawning a REMOTE conversation with a title
+    /// set must have the daemon record it as the conversation's AUTHORITATIVE title
+    /// — verified the same way an operator would: `ssh … flightdeckd status` and
+    /// look for it in the JSON. Full path: `SpawnConfig::conversation_title` →
+    /// `build_remote_command`'s `--title=` → the daemon's `attach.rs::handle_conn`
+    /// (`set_title_authoritative`, run BEFORE the `fd_attach` ack — see
+    /// `transport::push_remote_title`'s doc) → `flightdeckd status`'s `title` field.
+    /// A distinctive, uuid-suffixed title makes a raw substring match in the status
+    /// JSON an unambiguous signal without needing to correlate rows by conversation
+    /// id (the daemon mints its own on a cold start).
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored spawn_with_a_title_sets_it_on_the_m1_daemon --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    async fn spawn_with_a_title_sets_it_on_the_m1_daemon() {
+        use std::time::Duration;
+        let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+            format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
+        });
+        let title = format!("tosse-c9-live-test-{}", uuid::Uuid::new_v4());
+
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.conversation_title = Some(title.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(identity.clone()),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "live-title-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("remote spawn should start");
+
+        handle
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .await
+            .expect("send should queue");
+
+        let mut result_ok: Option<bool> = None;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) = ev {
+                    result_ok = Some(!is_error);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn should complete within the deadline");
+        assert_eq!(result_ok, Some(true), "expected a successful remote turn");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        // `ssh <dest> 'exec flightdeckd status'` — the same one-shot pattern
+        // `transport::run_remote_stop` uses — read back the daemon's own view.
+        let out = tokio::process::Command::new("ssh")
+            .arg("-T")
+            .arg("-p")
+            .arg("2224")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-i")
+            .arg(&identity)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("agent@127.0.0.1")
+            .arg("exec flightdeckd status")
+            .output()
+            .await
+            .expect("ssh status should run");
+        let status_json = String::from_utf8_lossy(&out.stdout);
+        eprintln!("[live] flightdeckd status: {status_json}");
+        assert!(
+            status_json.contains(&title),
+            "expected the daemon's status to carry the title '{title}' — got: {status_json}",
+        );
+    }
+
     /// Live M1 acceptance check, Mac side: "piloting a remote session from the
     /// Mac must survive a network cut". Full actor path: spawn a real remote
     /// session (ssh → flightdeckd → daemon-owned claude), start a slow tool
@@ -2884,7 +4645,7 @@ mod tests {
     /// daemon kept the session alive and replayed what we missed).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored actor_survives_ssh_cut --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
@@ -2903,6 +4664,8 @@ mod tests {
             )),
             known_hosts_file: Some("/dev/null".into()),
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -2972,5 +4735,611 @@ mod tests {
 
         assert!(reconnected, "expected a 'Reconnected to the server.' notice");
         assert_eq!(result, Some(true), "the interrupted turn's result should arrive via replay");
+    }
+
+    /// A6 live acceptance check: a machine whose PREFERRED address is genuinely dead
+    /// must still reach the m1 container, by rotating onto a second recorded
+    /// candidate — `203.0.113.1` (TEST-NET-3, RFC 5737: guaranteed unroutable, never
+    /// answers) FIRST, `127.0.0.1` (the real container) second. Full actor path, no
+    /// faked ssh: the actor's own reconnect loop must fail against the dead address
+    /// (`ConnectTimeout=10` per attempt — see `build_remote_command`'s ssh options),
+    /// cross [`ADDRESS_ROTATION_THRESHOLD`], rotate, attach for real, persist the win,
+    /// and still carry a normal turn to completion on the winning candidate.
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored actor_rotates_to_a_live_address_on_the_m1_container --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
+    async fn actor_rotates_to_a_live_address_on_the_m1_container() {
+        use std::time::Duration;
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(transport::RemoteTarget {
+            // The PREFERRED (first) address is the dead one on purpose — this is
+            // what a stale `machines.host` looks like the morning after a server's
+            // address changed.
+            host: "203.0.113.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(
+                std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+                    format!(
+                        "{}/.ssh/flightdeck_m0_ed25519",
+                        std::env::var("HOME").unwrap_or_default()
+                    )
+                }),
+            ),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["203.0.113.1".into(), "127.0.0.1".into()],
+            machine_id: Some("live-m1".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "live-addr-rotation".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("remote spawn should start (it dials the dead address first, which forks fine)");
+
+        // Phase 1: drain events until the actor has rotated onto the live candidate
+        // AND attached for real — sending a turn any earlier (while the dead address
+        // is still being dialed) would just be lost (no live channel yet to carry
+        // it), which is not what this test is measuring. This phase alone already
+        // proves the rotation notice, the persist signal, and the reconnect.
+        let mut remote_link_messages: Vec<String> = Vec::new();
+        let mut persisted: Option<(String, String)> = None;
+        let mut reconnected = false;
+        // Generous: `ConnectTimeout=10` per dead-address attempt, times up to
+        // `ADDRESS_ROTATION_THRESHOLD` consecutive failures, plus backoff sleeps —
+        // easily 30-40s before the FIRST good-address attempt even starts.
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { ref subtype, ref detail })
+                        if subtype == "remote_link" =>
+                    {
+                        eprintln!("[live] remote_link: {detail}");
+                        let msg = detail["message"].as_str().unwrap_or_default().to_string();
+                        if msg.contains("Reconnected") {
+                            reconnected = true;
+                        }
+                        remote_link_messages.push(msg);
+                    }
+                    SessionEvent::PreferredHostChanged { machine_id, host } => {
+                        eprintln!("[live] preferred host persist signal: {machine_id} -> {host}");
+                        persisted = Some((machine_id, host));
+                    }
+                    _ => {}
+                }
+                if reconnected && persisted.is_some() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the actor should rotate onto 127.0.0.1, attach, and persist the winning address");
+
+        let rotation_notices: Vec<&String> =
+            remote_link_messages.iter().filter(|m| m.contains("Trying another address")).collect();
+        assert_eq!(
+            rotation_notices.len(),
+            1,
+            "exactly one rotation notice, not one per failed attempt: {remote_link_messages:?}",
+        );
+        assert!(
+            rotation_notices[0].contains("127.0.0.1"),
+            "the rotation notice must name the winning address: {rotation_notices:?}",
+        );
+        assert_eq!(
+            persisted,
+            Some(("live-m1".to_string(), "127.0.0.1".to_string())),
+            "the preferred-host persist signal must fire with the WINNING address",
+        );
+
+        // Phase 2: a plain post-rotation sanity turn (NOT a replay/dedup test —
+        // nothing here disconnects or replays) — now that a real link exists on
+        // the winning candidate, a normal turn must still go through cleanly
+        // (exactly one result, no error), proving the rotation left the session
+        // in a perfectly ordinary working state, not a half-attached one. The
+        // actual replay/dedup invariant is exercised by
+        // `actor_survives_stalled_link_and_replays` (D4).
+        handle
+            .send_user_text("Reply with exactly the word: PING. Nothing else, no tools.")
+            .await
+            .expect("send should queue now that a live channel exists");
+        let mut result: Option<bool> = None;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) = ev {
+                    result = Some(!is_error);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn on the winning candidate should complete normally");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        assert_eq!(result, Some(true), "the turn must complete normally on the live candidate");
+    }
+
+    /// PNG CRC-32 (ISO 3309 / ITU-T V.42) — the checksum every PNG chunk footer
+    /// carries. Hand-rolled (no compression/image crate — this repo deliberately
+    /// avoids pulling one in just for a lazily-decoded SVG icon; see `qrcode`'s own
+    /// `default-features = false` comment in `Cargo.toml`) for
+    /// [`noise_png`] alone.
+    #[cfg(unix)]
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// The zlib stream footer's Adler-32 checksum of the UNCOMPRESSED payload
+    /// (RFC 1950 §2.2), for [`noise_png`].
+    #[cfg(unix)]
+    fn adler32(data: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    /// A structurally VALID but incompressible PNG (`w`×`h`, 8-bit truecolor, random
+    /// noise) — the same technique and purpose as `flightdeckd/live/m1/tests/
+    /// detach_test.py`'s `noise_png` (ported to Rust so the D4 live test below runs
+    /// through OUR actor, not the raw protocol), just with the zlib/DEFLATE stream
+    /// built as STORED (uncompressed) blocks (RFC 1951 §3.2.4) instead of calling a
+    /// compression library: this repo has none in the tree, and stored blocks are
+    /// exactly as valid to any PNG decoder — irrelevant here anyway, since random
+    /// noise barely compresses. `seed` is a tiny xorshift64* PRNG state (no `rand`
+    /// dependency needed either) so each of the 4 images in the burst differs.
+    #[cfg(unix)]
+    fn noise_png(w: u32, h: u32, seed: u64) -> Vec<u8> {
+        let mut state = seed.max(1);
+        let mut next_byte = move || -> u8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        };
+        let mut raw = Vec::with_capacity((1 + w as usize * 3) * h as usize);
+        for _ in 0..h {
+            raw.push(0u8); // scanline filter type 0 ("None")
+            for _ in 0..(w as usize * 3) {
+                raw.push(next_byte());
+            }
+        }
+
+        let mut zlib = vec![0x78u8, 0x01u8]; // zlib header: default window, no preset dict
+        let mut offset = 0usize;
+        loop {
+            let remaining = raw.len() - offset;
+            let block_len = remaining.min(65535);
+            let is_final = offset + block_len >= raw.len();
+            // BFINAL (bit 0) + BTYPE=00 stored (bits 1-2) + zero padding — a stored
+            // block is always byte-aligned already, so this single byte IS the whole
+            // (padded) block header.
+            zlib.push(if is_final { 1 } else { 0 });
+            let len = block_len as u16;
+            zlib.extend_from_slice(&len.to_le_bytes());
+            zlib.extend_from_slice(&(!len).to_le_bytes()); // NLEN: one's complement of LEN
+            zlib.extend_from_slice(&raw[offset..offset + block_len]);
+            offset += block_len;
+            if is_final {
+                break;
+            }
+        }
+        zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+        let chunk = |typ: &[u8; 4], data: &[u8]| -> Vec<u8> {
+            let mut c = Vec::with_capacity(8 + data.len() + 4);
+            c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            c.extend_from_slice(typ);
+            c.extend_from_slice(data);
+            let mut crc_input = Vec::with_capacity(4 + data.len());
+            crc_input.extend_from_slice(typ);
+            crc_input.extend_from_slice(data);
+            c.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+            c
+        };
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit depth, color type 2 (truecolor)
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IDAT", &zlib));
+        png.extend(chunk(b"IEND", b""));
+        png
+    }
+
+    /// D4 live regression: the actor survives a link that goes STALLED-BUT-ALIVE
+    /// (not a clean cut) — the end-to-end proof of D1 (daemon write timeout) + D2
+    /// (this Mac's reconnect policy already treats `fd_detach{stalled}`/bare-EOF as
+    /// reconnect-eligible) + the cursor math, driven through the REAL actor and a
+    /// REAL `claude` turn instead of the raw protocol
+    /// (`flightdeckd/live/m1/tests/detach_test.py`'s `scenario_d`, which this
+    /// ports: same technique, same daemon, now proving OUR client survives it too).
+    ///
+    /// Flow: attach, start a turn that interleaves small `Bash echo`s with `Read`s of
+    /// 4 incompressible ~3 MB PNGs (a small burst is not enough — the measured ssh
+    /// path buffers ~2.2 MB before the daemon's write blocks at all), SIGSTOP the
+    /// LOCAL ssh attach child (the link stalls but stays alive — unlike a kill, which
+    /// the daemon sees as an immediate clean cut), wait for the turn to finish
+    /// DAEMON-side (polled via a SEPARATE, unaffected `flightdeckd status` ssh call)
+    /// plus the daemon's `ATTACH_WRITE_TIMEOUT` (20s, `flightdeckd/src/session.rs`),
+    /// SIGCONT, then assert: the actor sees the stream END, reconnects and replays on
+    /// its own, the turn completes with the correct final result, and NOTHING in the
+    /// assembled transcript is duplicated, garbled, or missing (message ids / tool_use
+    /// ids / the DONE marker).
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Slow (uploads ~12 MB, pauses
+    /// ~25s+). Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored actor_survives_stalled_link_and_replays --nocapture
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude, SIGSTOPs the local ssh child for ~25-90s (needs the flightdeck-m1 container, not for CI)"]
+    async fn actor_survives_stalled_link_and_replays() {
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        // The daemon's ATTACH_WRITE_TIMEOUT (flightdeckd/src/session.rs) — how long
+        // it keeps trying to write to a stalled client before
+        // dropping it. `+5` matches detach_test.py's own margin.
+        const ATTACH_WRITE_TIMEOUT_SECS: u64 = 20;
+
+        let key = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+            format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
+        });
+        let ssh_flags: Vec<String> = [
+            "-T", "-p", "2224", "-i", &key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o",
+            "StrictHostKeyChecking=accept-new", "agent@127.0.0.1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // INSIDE the cwd (`/work/demo`), not `/tmp` (unlike detach_test.py, which
+        // drives the raw protocol with no extra `claude` args and so never hits
+        // this): our actor's `build_claude_args` always appends `--permission-mode
+        // auto`, and a Read OUTSIDE the working directory still prompts for
+        // approval under that mode (`SpawnConfig::add_dirs`/`--add-dir` would
+        // widen it, but nothing populates that today — see the repo's own doc on
+        // it) — confirmed live: the exact same scenario with a `/tmp` burst dir
+        // left the daemon-side turn stuck on an unanswered `can_use_tool` this
+        // test never answers, indefinitely `busy`.
+        let burst_dir = format!("/work/demo/.tosse-scenario-d-{}", std::process::id());
+        let mkdir = std::process::Command::new("ssh")
+            .args(&ssh_flags)
+            .arg(format!("mkdir -p {burst_dir}"))
+            .status()
+            .expect("ssh mkdir should run");
+        assert!(mkdir.success(), "failed to create the burst dir on the container");
+
+        // Upload 4 incompressible ~3 MB PNGs — comfortably over the ~2.2 MB measured
+        // buffering threshold, interleaved below with small Bash echos.
+        for i in 0..4u64 {
+            let png = noise_png(1000, 1000, i + 1);
+            let mut child = std::process::Command::new("ssh")
+                .args(&ssh_flags)
+                .arg(format!("cat > {burst_dir}/noise{i}.png"))
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("ssh upload should spawn");
+            child.stdin.take().unwrap().write_all(&png).expect("upload write should succeed");
+            let status = child.wait().expect("ssh upload should exit");
+            assert!(status.success(), "uploading noise{i}.png failed");
+        }
+
+        // Pre-mint the daemon-side conversation id (mirrors `ipc::commands::
+        // spawn_session`'s idempotent-retry pattern) so this test can poll
+        // `flightdeckd status` for THIS conversation specifically over a SEPARATE,
+        // short-lived ssh call — unaffected by the one we're about to SIGSTOP.
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.attach = Some(transport::AttachPoint {
+            conversation: Some(conversation_id.clone()),
+            epoch: None,
+            cursor: 0,
+            supports_skip: false,
+        });
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(key.clone()),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "live-stalled".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("remote spawn should start");
+
+        let steps: Vec<String> = (0..4u64)
+            .flat_map(|i| {
+                vec![format!("Bash: echo step-{}", 2 * i), format!("Read: {burst_dir}/noise{i}.png")]
+            })
+            .collect();
+        let prompt = format!(
+            "Do these steps strictly in order, ONE tool call per step, no commentary between \
+             them:\n{}\nThen reply with exactly the single word DONE_D.",
+            steps.iter().enumerate().map(|(n, s)| format!("{}. {s}", n + 1)).collect::<Vec<_>>().join("\n"),
+        );
+        handle.send_user_text(prompt).await.expect("send should queue");
+
+        // Wait for evidence the burst is really streaming before pausing mid-flight.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::MessageStarted { .. })
+                    | SessionEvent::Item(ConversationItem::TextDelta { .. }) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the burst turn should start streaming");
+
+        // SIGSTOP the LOCAL ssh attach child: the link stalls but stays alive (TCP
+        // up, zero window) — unlike a kill, which is a clean cut the daemon sees at
+        // once. Guarded so a panic mid-pause can't leave the process stuck stopped
+        // for the next run.
+        struct SigcontGuard(String);
+        impl Drop for SigcontGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-CONT", "-f", &self.0])
+                    .status();
+            }
+        }
+        // Scoped to THIS test's own ssh attach child by its unique
+        // `conversation_id` (present in the remote command line ssh execs,
+        // `--conversation <uuid>` — see `build_remote_command`), not just
+        // "2224.*flightdeckd.*attach": that looser pattern would also match a
+        // DIFFERENT live test's attach child if run concurrently against the
+        // same m1 container (the default multi-threaded test harness the repo
+        // documents for `--ignored` runs), SIGSTOPping someone else's link too.
+        let ssh_child_pattern = format!("2224.*flightdeckd.*attach.*{conversation_id}");
+        let _sigcont_guard = SigcontGuard(ssh_child_pattern.clone());
+        let stopped = std::process::Command::new("pkill")
+            .args(["-STOP", "-f", &ssh_child_pattern])
+            .status()
+            .expect("pkill should run");
+        assert!(stopped.success(), "expected to SIGSTOP the live ssh attach client");
+        eprintln!("[live] ssh attach child SIGSTOPped mid-burst");
+
+        // Let the whole burst land daemon-side (the daemon's write blocks once the
+        // in-flight buffers are full and our client stops reading), polled over a
+        // FRESH ssh call each time — unaffected by the paused one.
+        let status_flags = ssh_flags.clone();
+        let poll_deadline = std::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "burst turn did not finish daemon-side within 300s"
+            );
+            let out = std::process::Command::new("ssh")
+                .args(&status_flags)
+                .args(["flightdeckd", "status"])
+                .output()
+                .expect("status ssh call should run");
+            if out.status.success() {
+                if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
+                    let busy = v
+                        .get("conversations")
+                        .and_then(|c| c.as_array())
+                        .and_then(|rows| {
+                            rows.iter().find(|c| {
+                                c.get("conversation").and_then(|x| x.as_str())
+                                    == Some(conversation_id.as_str())
+                            })
+                        })
+                        .and_then(|row| row.get("busy"))
+                        .and_then(|b| b.as_bool());
+                    if busy == Some(false) {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        eprintln!(
+            "[live] burst turn finished daemon-side; waiting {}s more (ATTACH_WRITE_TIMEOUT + margin)",
+            ATTACH_WRITE_TIMEOUT_SECS + 5
+        );
+        tokio::time::sleep(Duration::from_secs(ATTACH_WRITE_TIMEOUT_SECS + 5)).await;
+
+        // SIGCONT and let the actor's own reconnect take over from here.
+        let resumed = std::process::Command::new("pkill")
+            .args(["-CONT", "-f", &ssh_child_pattern])
+            .status()
+            .expect("pkill should run");
+        assert!(resumed.success(), "expected to SIGCONT the stalled ssh client");
+        eprintln!("[live] ssh attach child SIGCONTed");
+
+        // The actor must reconnect on its own, replay, and the turn must complete —
+        // with NO duplicated, garbled, or missing message. `phase` tags every item
+        // with which transport delivered it (diagnostic only): 0 = the ORIGINAL
+        // (pre-pause) transport, still draining whatever the daemon buffered while
+        // paused, right up to EOF; 1+ = after the actor's own reconnect(s).
+        let mut phase: u32 = 0;
+        let mut reconnected = false;
+        let mut message_ids: Vec<(u32, String)> = Vec::new();
+        let mut tool_use_ids: Vec<(u32, String)> = Vec::new();
+        let mut done_seen = false;
+        let mut result: Option<bool> = None;
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { ref subtype, ref detail })
+                        if subtype == "remote_link" =>
+                    {
+                        eprintln!("[live +{:>5.1}s] remote_link: {detail}", t0.elapsed().as_secs_f32());
+                        let msg = detail["message"].as_str().unwrap_or_default();
+                        if msg.contains("Reconnected") {
+                            reconnected = true;
+                        }
+                        if msg.contains("lost") {
+                            phase += 1;
+                        }
+                    }
+                    SessionEvent::Item(ConversationItem::AssistantMessage { ref id, ref blocks, .. }) => {
+                        eprintln!("[live +{:>5.1}s] phase {phase} AssistantMessage {id}", t0.elapsed().as_secs_f32());
+                        message_ids.push((phase, id.clone()));
+                        for b in blocks {
+                            if let crate::supervisor::model::NormalizedBlock::Text { text } = b {
+                                if text.contains("DONE_D") {
+                                    done_seen = true;
+                                }
+                            }
+                        }
+                    }
+                    SessionEvent::Item(ConversationItem::TextDelta { ref text, .. }) if text.contains("DONE_D") => {
+                        done_seen = true;
+                    }
+                    SessionEvent::Item(ConversationItem::ToolResult { ref tool_use_id, .. }) => {
+                        eprintln!(
+                            "[live +{:>5.1}s] phase {phase} ToolResult {tool_use_id}",
+                            t0.elapsed().as_secs_f32()
+                        );
+                        tool_use_ids.push((phase, tool_use_id.clone()));
+                    }
+                    SessionEvent::Item(ConversationItem::TurnResult { is_error, .. }) => {
+                        eprintln!("[live +{:>5.1}s] TurnResult is_error={is_error}", t0.elapsed().as_secs_f32());
+                        result = Some(!is_error);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the stalled turn should still complete after auto-reconnect + replay");
+
+        drop(_sigcont_guard); // already resumed above; this is now a harmless no-op CONT
+
+        let _ = std::process::Command::new("ssh")
+            .args(&ssh_flags)
+            .arg(format!("rm -rf {burst_dir}"))
+            .status();
+        let _ = std::process::Command::new("ssh")
+            .args(&ssh_flags)
+            .args(["flightdeckd", "stop", "--conversation", &conversation_id])
+            .status();
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        assert!(reconnected, "expected a 'Reconnected to the server.' notice after SIGCONT");
+        assert_eq!(result, Some(true), "the stalled turn's result should arrive via replay");
+        assert!(done_seen, "the DONE_D reply should be present in the replayed transcript");
+        // `phase` must actually straddle the pause: some items delivered live
+        // BEFORE it (phase 0), some only via replay AFTER reconnect (phase 1+).
+        // Without this, the assertions below would pass identically whether the
+        // SIGSTOP genuinely interrupted mid-burst or the whole thing streamed
+        // live before the pause ever took effect (or vice versa) — the exact
+        // failure mode this test exists to rule out.
+        assert!(
+            message_ids.iter().any(|(p, _)| *p == 0),
+            "nothing was delivered live before the pause — the SIGSTOP didn't land \
+             mid-burst: {message_ids:?}",
+        );
+        assert!(
+            tool_use_ids.iter().any(|(p, _)| *p >= 1),
+            "nothing was delivered via replay after reconnect — the pause never \
+             actually interrupted the stream: {tool_use_ids:?}",
+        );
+
+        // `AssistantMessage` is a RECONCILING update, not an append-only event — its
+        // doc comment is explicit: "carries the SAME id as the streamed
+        // `message_start` — the UI reconciles". Confirmed live: a message with one
+        // `tool_use` block legitimately arrives as `AssistantMessage` twice back to
+        // back, WITHIN THE SAME phase (once as its content block completes, once at
+        // `message_stop`), even with NO reconnect involved. That is a normal
+        // "redraw with the same id", not a replay bug — the invariant D4 actually
+        // cares about is that no id repeats beyond that normal double-fire: group
+        // ADJACENT, SAME-PHASE runs of the same id (`dedup_by` alone is not enough —
+        // it ignores `phase`, so a genuine replay duplicate that happens to land
+        // right next to the message's own normal double-fire would be silently
+        // swallowed with it), cap every such run at 2, THEN the collapsed ids must
+        // already be globally unique (a same id split across two DIFFERENT phases,
+        // or a same-phase run longer than 2, is exactly what a cursor/replay bug
+        // would look like).
+        let mut coalesced_groups: Vec<(u32, String, usize)> = Vec::new();
+        for (phase, id) in &message_ids {
+            match coalesced_groups.last_mut() {
+                Some(last) if last.0 == *phase && &last.1 == id => last.2 += 1,
+                _ => coalesced_groups.push((*phase, id.clone(), 1)),
+            }
+        }
+        for (phase, id, run_len) in &coalesced_groups {
+            assert!(
+                *run_len <= 2,
+                "assistant message {id} repeated {run_len} times back-to-back within \
+                 phase {phase} — expected at most the normal content-block/message_stop \
+                 double-fire: {message_ids:?}",
+            );
+        }
+        let mut sorted_ids: Vec<&String> = coalesced_groups.iter().map(|(_, id, _)| id).collect();
+        sorted_ids.sort();
+        let coalesced_count = sorted_ids.len();
+        sorted_ids.dedup();
+        assert_eq!(
+            sorted_ids.len(),
+            coalesced_count,
+            "an assistant message id reappeared across a phase boundary (or a distinct \
+             same-phase run) — a genuine replay duplicate, not just a reconciling redraw \
+             (phase, id): {message_ids:?}",
+        );
+        // `ToolResult` has no such reconciling redraw (one-shot, unlike
+        // `AssistantMessage`) — every id must be unique outright.
+        let mut dedup_tools: Vec<&String> = tool_use_ids.iter().map(|(_, id)| id).collect();
+        dedup_tools.sort();
+        dedup_tools.dedup();
+        assert_eq!(
+            dedup_tools.len(),
+            tool_use_ids.len(),
+            "no tool_use_id should be delivered twice (phase, id): {tool_use_ids:?}",
+        );
+        // 4 Bash echos + 4 Reads = 8 tool results expected in a clean, non-garbled run.
+        assert_eq!(
+            tool_use_ids.len(),
+            8,
+            "expected exactly 8 tool results (4 Bash + 4 Read), none missing/duplicated: \
+             {tool_use_ids:?}",
+        );
     }
 }

@@ -601,6 +601,14 @@ pub enum SessionEvent {
     /// downgrade (the remote surface dropped / the bridge errored). Drives the
     /// composer's Remote Control chip.
     RemoteControl(RemoteControlState),
+    /// A6: a remote session's reconnect loop rotated onto a DIFFERENT candidate
+    /// address and confirmed it works (`fd_attach` received) — the IPC layer (which
+    /// owns the [`crate::store::Store`], never the supervisor — see the encapsulation
+    /// rule) should persist `host` as this machine's new preferred address, so the
+    /// NEXT spawn dials it first instead of re-paying the backoff against a dead one
+    /// every session. Fire-and-forget: `run_actor` does not wait for (or learn the
+    /// outcome of) the write.
+    PreferredHostChanged { machine_id: String, host: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -629,4 +637,9 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// cached queries on it — no payload beyond the area, so a default no-op is safe
     /// (only the Tauri emitter forwards it; test sinks don't observe it).
     fn emit_extensions_changed(&self, _session: &str, _area: &str) {}
+    /// A6: see [`SessionEvent::PreferredHostChanged`]. Default no-op so the Codex
+    /// sink (which never carries a `RemoteTarget` — remote is Claude-only) and test
+    /// sinks that don't care stay unchanged; only [`crate::ipc::events::TauriEmitter`]
+    /// (which can reach the `Store` through its `AppHandle`) overrides it.
+    fn emit_preferred_host(&self, _session: &str, _machine_id: &str, _host: &str) {}
 }

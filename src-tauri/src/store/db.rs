@@ -21,15 +21,21 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
-    ClaudeAccountRecord, ConversationRecord, MachineRecord, PersistedState, RepoRecord,
-    RepoTosseLink, TosseProjectRepo,
+    validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
+    ConversationRecord, MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
 };
+// `AddressKind` itself is only named directly in this module's tests (production code
+// here only ever moves `AddressCandidate` values around, never matches on their
+// `kind`), so it's imported test-only to avoid an unused-import warning on a normal
+// build.
+#[cfg(test)]
+use super::model::AddressKind;
 
 /// The current schema version. Drives the versioned migration runner: on open, a
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 14;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -62,6 +68,9 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v9,
     migrate_v10,
     migrate_v11,
+    migrate_v12,
+    migrate_v13,
+    migrate_v14,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -101,6 +110,58 @@ fn add_column_if_absent(
     if !column_exists(conn, table, column)? {
         conn.execute(ddl, [])?;
     }
+    Ok(())
+}
+
+/// Decode a `machines.addresses` column value into its `Vec<AddressCandidate>` (see
+/// [`migrate_v12`]). `NULL` (every pre-migration row) decodes to an empty `Vec` —
+/// exactly like a corrupt/unparseable value, since a row this app never wrote is
+/// indistinguishable from one it wrote badly, and both must degrade the SAME way
+/// (never an error: a machine must still load with just its `host`). A decode
+/// failure is logged rather than silently dropped, so a real corruption is
+/// diagnosable instead of just quietly vanishing.
+fn decode_addresses(raw: Option<String>) -> Vec<AddressCandidate> {
+    match raw {
+        None => Vec::new(),
+        Some(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            eprintln!("[store] failed to decode machines.addresses ({json:?}): {e}");
+            Vec::new()
+        }),
+    }
+}
+
+/// Encode a machine's addresses for the `machines.addresses` column — the inverse of
+/// [`decode_addresses`]. An empty `Vec` is stored as `NULL` rather than `"[]"`, so a
+/// machine with no recorded candidates round-trips through the SAME `NULL` a
+/// pre-migration row already has, instead of gaining a distinct-but-equivalent
+/// on-disk representation.
+fn encode_addresses(addresses: &[AddressCandidate]) -> Option<String> {
+    if addresses.is_empty() {
+        None
+    } else {
+        // A `Vec<AddressCandidate>` of plain strings/enums always serializes — no
+        // fallible content (no maps with non-string keys, no NaN floats) — so this
+        // can't realistically fail; `unwrap_or_default` keeps a write from panicking
+        // over a theoretical serde bug rather than losing the whole machine record.
+        Some(serde_json::to_string(addresses).unwrap_or_default())
+    }
+}
+
+/// [`validate_address_value`] over `m.host` and every `m.addresses` value, plus
+/// [`validate_ssh_user`] over `m.user` and [`validate_ssh_port`] over `m.port` — the
+/// persistence-layer half of the ssh-option-injection guard (see
+/// [`Store::upsert_machine`]). This is the LAST line of defense: even if every
+/// upstream caller somehow forgot to check `user`/`port` (the CRM holistic-review
+/// blocker this closes — `user` was validated NOWHERE before this), a write that
+/// would let a future `ssh` invocation parse it as an option, or persist an
+/// unconnectable port, never reaches the row.
+fn validate_machine_addresses(m: &MachineRecord) -> Result<(), String> {
+    validate_address_value(&m.host)?;
+    for c in &m.addresses {
+        validate_address_value(&c.value)?;
+    }
+    validate_ssh_user(&m.user)?;
+    validate_ssh_port(m.port)?;
     Ok(())
 }
 
@@ -372,6 +433,84 @@ fn migrate_v11(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v12 — the full set of candidate addresses discovered (or typed) for a paired
+/// server, alongside its single `host`. `addresses` holds a JSON-encoded
+/// `Vec<AddressCandidate>` (see [`super::model::AddressCandidate`]) — a JSON blob
+/// rather than its own table because it is small, always read/written as a whole
+/// alongside its machine, and never queried by value. NULL (every pre-existing row)
+/// decodes to an empty `Vec` everywhere it's read (never an error — see
+/// [`decode_addresses`]), so a machine paired before this column existed keeps
+/// working exactly as it did: `RemoteTarget.addresses` falls back to `[host]` at the
+/// one construction site that needs a non-empty list (`spawn_session`).
+fn migrate_v12(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "machines", "addresses", "ALTER TABLE machines ADD COLUMN addresses TEXT")
+}
+
+/// v13 — daemon-relay metadata for a paired server: its `flightdeckd whoami` identity
+/// (`daemon_mac_id` / `daemon_relay_url` / `daemon_label`, mirroring
+/// [`crate::bootstrap::server_setup::ServerIdentity`]) and when the mobile relay was
+/// last provisioned for it (`phone_provisioned_at`, Unix ms). All four NULLABLE with no
+/// default: NULL (every pre-existing row, and every machine whose daemon round trip
+/// hasn't run yet) means "not known yet", not "empty" — the same degrade-gracefully
+/// discipline as `machines.addresses` in v12. Written only by the dedicated
+/// [`Store::set_machine_daemon_identity`] / [`Store::set_machine_phone_provisioned_at`]
+/// setters, never by the wholesale [`Store::upsert_machine`] (see that function's doc).
+fn migrate_v13(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "machines", "daemon_mac_id", "ALTER TABLE machines ADD COLUMN daemon_mac_id TEXT")?;
+    add_column_if_absent(
+        conn,
+        "machines",
+        "daemon_relay_url",
+        "ALTER TABLE machines ADD COLUMN daemon_relay_url TEXT",
+    )?;
+    add_column_if_absent(conn, "machines", "daemon_label", "ALTER TABLE machines ADD COLUMN daemon_label TEXT")?;
+    add_column_if_absent(
+        conn,
+        "machines",
+        "phone_provisioned_at",
+        "ALTER TABLE machines ADD COLUMN phone_provisioned_at INTEGER",
+    )
+}
+
+/// v14 — durable queues for a phone token revocation that could not be delivered
+/// immediately (C10: provisioning/revoking the phone token on every paired daemon,
+/// plus the relay connection this Mac itself dials). Both are small, append-mostly
+/// queues, never joined against anything, so a dedicated table each (rather than a
+/// JSON blob on `machines`) keeps `Store::queue_*`/`clear_*` simple UPSERT/DELETEs.
+///
+/// `pending_relay_phone_revocations` — a token [`Store::set_remote`]'s
+/// regenerate-pairing path queued for `{type:"revoke_phone"}` on THIS Mac's own
+/// outbound relay connection (see `appmcp::relay::post_connect_frames`) but that
+/// hadn't gone out yet (remote access was off, or the socket wasn't up at the
+/// moment of regeneration). One row per outstanding token; no `machine_id` — this
+/// Mac's connection is the only "node" it applies to.
+///
+/// `pending_daemon_phone_revocations` — the same idea per PAIRED SERVER: a token
+/// `Store::delete_machine`/regenerate-pairing tried to `flightdeckd remove-phone`
+/// on a machine that was unreachable at that moment. Composite key
+/// `(machine_id, token)` — several tokens can be queued for the same machine (a
+/// user who regenerates twice while a server is down), and the same token can be
+/// queued for several machines independently.
+///
+/// Neither table is a foreign key to `machines` (same discipline as every other
+/// machine-adjacent table in this schema — see [`migrate_v10`]'s doc): a queued
+/// daemon revocation is deleted by [`Store::delete_machine`] in code, not by a
+/// cascade.
+fn migrate_v14(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_relay_phone_revocations (
+             token      TEXT PRIMARY KEY,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS pending_daemon_phone_revocations (
+             machine_id TEXT NOT NULL,
+             token      TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY (machine_id, token)
+         );",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -469,7 +608,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let mut machines_stmt = conn.prepare(
-            "SELECT id, label, host, port, user, identity_file, added_at
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
              FROM machines ORDER BY added_at ASC",
         )?;
         let machines = machines_stmt
@@ -482,6 +622,15 @@ impl Store {
                     user: row.get(4)?,
                     identity_file: row.get(5)?,
                     added_at: row.get(6)?,
+                    // NULL (pre-v12 rows) / a corrupt value both decode to `[]` — see
+                    // `decode_addresses`.
+                    addresses: decode_addresses(row.get(7)?),
+                    // NULL (pre-v13 rows, or a machine whose daemon round trip hasn't
+                    // run yet) → None everywhere below.
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -603,7 +752,8 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at
+                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
+                        m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
                  FROM repos r JOIN machines m ON m.id = r.machine_id
                  WHERE r.path = ?1 AND r.machine_id IS NOT NULL LIMIT 1",
                 params![path],
@@ -616,10 +766,88 @@ impl Store {
                         user: row.get(4)?,
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
                     })
                 },
             )
             .optional()
+    }
+
+    /// For a conversation whose repo is REMOTE and which has already run there at
+    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), and
+    /// the machine it runs on — everything [`crate::ipc::commands::
+    /// push_remote_conversation_title`] (C9) needs to reach that daemon over SSH.
+    /// `None` when the conversation is unknown, its repo isn't remote, or it has no
+    /// `session_id` yet (never spawned there — nothing for the daemon to `--resume`).
+    /// Mirrors [`Self::machine_for_repo_path`]'s shape, joined one hop further.
+    pub fn remote_session_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> rusqlite::Result<Option<(String, String, MachineRecord)>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT c.cwd, c.session_id,
+                        m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
+                        m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 JOIN machines m ON m.id = r.machine_id
+                 WHERE c.id = ?1 AND r.machine_id IS NOT NULL AND c.session_id IS NOT NULL
+                 LIMIT 1",
+                params![conversation_id],
+                |row| {
+                    let cwd: String = row.get(0)?;
+                    let session_id: String = row.get(1)?;
+                    let machine = MachineRecord {
+                        id: row.get(2)?,
+                        label: row.get(3)?,
+                        host: row.get(4)?,
+                        port: row.get(5)?,
+                        user: row.get(6)?,
+                        identity_file: row.get(7)?,
+                        added_at: row.get(8)?,
+                        addresses: decode_addresses(row.get(9)?),
+                        daemon_mac_id: row.get(10)?,
+                        daemon_relay_url: row.get(11)?,
+                        daemon_label: row.get(12)?,
+                        phone_provisioned_at: row.get(13)?,
+                    };
+                    Ok((cwd, session_id, machine))
+                },
+            )
+            .optional()
+    }
+
+    /// Whether `conversation_id`'s repo is REMOTE (`machine_id` set) — cheaper and
+    /// looser than [`Self::remote_session_for_conversation`] (no `session_id`
+    /// requirement): used by [`crate::ipc::commands::publish_control_event`] (C9) to
+    /// gate the app-control journal, which must never double-publish a phone-facing
+    /// event for a conversation this Mac only RELAYS (its host `flightdeckd` daemon
+    /// emits the same event on its own). `false` for an unknown conversation id —
+    /// never silently drop an event for a conversation this call can't even place;
+    /// only a CONFIRMED-remote one is gated.
+    pub fn conversation_repo_is_remote(&self, conversation_id: &str) -> rusqlite::Result<bool> {
+        let hit: Option<i64> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 WHERE c.id = ?1 AND r.machine_id IS NOT NULL
+                 LIMIT 1",
+                params![conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     /// One remote server by id, or `None`.
@@ -628,7 +856,8 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, label, host, port, user, identity_file, added_at
+                "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                        daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
                  FROM machines WHERE id = ?1",
                 params![id],
                 |row| {
@@ -640,24 +869,233 @@ impl Store {
                         user: row.get(4)?,
                         identity_file: row.get(5)?,
                         added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
                     })
                 },
             )
             .optional()
     }
 
+    /// One remote server whose (`host`, `port`, `user`) triple matches exactly, or
+    /// `None` — the idempotency lookup [`crate::bootstrap::orchestrator::bootstrap_server`]
+    /// runs BEFORE minting a fresh session/key, so re-running the bootstrap pipeline
+    /// against an ALREADY-paired server updates that same row (reusing its `id` and
+    /// `identity_file`) instead of duplicating it under a brand-new uuid every time
+    /// (B11 review finding). Matches `host` literally (no DNS/IP normalization,
+    /// exactly the string `add_machine`/the pipeline persisted it as) and returns the
+    /// most recently added match when more than one somehow exists. See
+    /// [`Self::machine_by_any_address`] for the broader lookup `add_machine`'s own
+    /// legacy pairing flow uses, which also matches a machine's recorded `addresses`.
+    pub fn machine_by_address(&self, host: &str, port: u16, user: &str) -> rusqlite::Result<Option<MachineRecord>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                        daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+                 FROM machines WHERE host = ?1 AND port = ?2 AND user = ?3
+                 ORDER BY added_at DESC LIMIT 1",
+                params![host, port, user],
+                |row| {
+                    Ok(MachineRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        host: row.get(2)?,
+                        port: row.get(3)?,
+                        user: row.get(4)?,
+                        identity_file: row.get(5)?,
+                        added_at: row.get(6)?,
+                        addresses: decode_addresses(row.get(7)?),
+                        daemon_mac_id: row.get(8)?,
+                        daemon_relay_url: row.get(9)?,
+                        daemon_label: row.get(10)?,
+                        phone_provisioned_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// The broader convergence lookup `add_machine`'s legacy ticket/manual pairing
+    /// flow uses (B_lifecycle-#1 review finding): unlike [`Self::machine_by_address`],
+    /// which only matches a machine's CURRENT `host` column, this also matches every
+    /// value in a machine's recorded `addresses` (Tailscale name / LAN IP / hostname —
+    /// see [`crate::ipc::commands::probe_candidates`]). Pairing the same physical
+    /// server twice can legitimately resolve to a DIFFERENT working address the
+    /// second time (candidates are tried in priority order and the first reachable
+    /// one wins; a Tailscale name that answered before might time out while the LAN
+    /// IP now does), so matching on `host` alone would still mint a duplicate row for
+    /// a server that is, in fact, already paired.
+    ///
+    /// `candidates` is every address value THIS pairing attempt is willing to accept
+    /// as "this host" (every candidate `add_machine` probed, not just the one that
+    /// worked) — a match against ANY of an existing machine's own `host`/`addresses`
+    /// converges. Matches literally, same discipline as `machine_by_address` (no DNS/IP
+    /// normalization). `port`/`user` must still match exactly: a different port or a
+    /// different login user is a different machine, never folded together. Returns the
+    /// most recently added match when more than one somehow qualifies.
+    pub fn machine_by_any_address(
+        &self,
+        candidates: &[String],
+        port: u16,
+        user: &str,
+    ) -> rusqlite::Result<Option<MachineRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+             FROM machines WHERE port = ?1 AND user = ?2 ORDER BY added_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![port, user], |row| {
+                Ok(MachineRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    user: row.get(4)?,
+                    identity_file: row.get(5)?,
+                    added_at: row.get(6)?,
+                    addresses: decode_addresses(row.get(7)?),
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for m in rows {
+            let known_to_this_machine =
+                std::iter::once(m.host.as_str()).chain(m.addresses.iter().map(|a| a.value.as_str()));
+            if known_to_this_machine.into_iter().any(|known| candidates.iter().any(|c| c == known)) {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
+    }
+
     /// Insert or update a remote server (idempotent by id). Connection coordinates
-    /// only — never key material (see [`MachineRecord`]).
+    /// only — never key material (see [`MachineRecord`]). `addresses` round-trips
+    /// through [`encode_addresses`]/[`decode_addresses`] as a JSON blob (see
+    /// [`migrate_v12`]). Re-checks `host`/every `addresses` value/`user`/`port` through
+    /// [`validate_machine_addresses`] before writing — the SAME ssh-option-injection
+    /// guard `ipc::commands::add_machine` runs before ever probing, enforced again here
+    /// so this invariant belongs to the boundary that actually owns it, not just to
+    /// today's one caller.
+    ///
+    /// The four daemon-metadata fields (`daemon_mac_id`/`daemon_relay_url`/
+    /// `daemon_label`/`phone_provisioned_at`) are PRESERVED on update when the incoming
+    /// value is `None`: `COALESCE(excluded.x, machines.x)`, mirroring how
+    /// [`Self::upsert_repo`] preserves `machine_id`. Every existing caller of this
+    /// method (adding a server, a probe re-save) knows nothing about the daemon and
+    /// always passes `None` for these — without the COALESCE, that wholesale rewrite
+    /// would silently erase metadata the dedicated setters wrote. `addresses` is
+    /// deliberately NOT preserved this way (see [`upsert_machine_round_trips_addresses`]
+    /// in the test module): a full re-pairing OWNS the whole address list, unlike the
+    /// daemon identity, which is populated by a separate, later step.
     pub fn upsert_machine(&self, m: &MachineRecord) -> rusqlite::Result<()> {
+        validate_machine_addresses(m).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
         self.conn.lock().unwrap().execute(
-            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses,
+                                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                  label = excluded.label, host = excluded.host, port = excluded.port,
-                 user = excluded.user, identity_file = excluded.identity_file",
-            params![m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at],
+                 user = excluded.user, identity_file = excluded.identity_file,
+                 addresses = excluded.addresses,
+                 daemon_mac_id = COALESCE(excluded.daemon_mac_id, machines.daemon_mac_id),
+                 daemon_relay_url = COALESCE(excluded.daemon_relay_url, machines.daemon_relay_url),
+                 daemon_label = COALESCE(excluded.daemon_label, machines.daemon_label),
+                 phone_provisioned_at = COALESCE(excluded.phone_provisioned_at, machines.phone_provisioned_at)",
+            params![
+                m.id,
+                m.label,
+                m.host,
+                m.port,
+                m.user,
+                m.identity_file,
+                m.added_at,
+                encode_addresses(&m.addresses),
+                m.daemon_mac_id,
+                m.daemon_relay_url,
+                m.daemon_label,
+                m.phone_provisioned_at,
+            ],
         )?;
         Ok(())
+    }
+
+    /// A6: persist the address a live session's reconnect loop just rotated onto and
+    /// proved working (`fd_attach` confirmed) as this machine's new preferred `host` —
+    /// so the NEXT spawn (a fresh conversation, a Mac restart, …) dials it FIRST
+    /// instead of re-trying the dead one and re-paying the backoff every single time.
+    /// A simple `UPDATE`, not the full `upsert_machine` (the caller — the session
+    /// actor, via the IPC-layer emitter that owns the `Store` — has no other machine
+    /// fields to hand and must not clobber them with stale/absent data).
+    ///
+    /// Re-validated through [`validate_address_value`] — the SAME ssh-option-injection
+    /// guard every other write of `host`/`addresses` goes through (see
+    /// [`Self::upsert_machine`]) — even though this value only ever comes from a
+    /// machine's OWN already-validated `addresses` list, never fresh user input: a
+    /// persistence-layer invariant should not depend on every caller upholding it.
+    /// Returns the number of rows touched (0 if the machine was deleted concurrently),
+    /// mirroring [`Self::set_repo_tosse_link`] — never an error for "nothing to update".
+    pub fn set_machine_preferred_host(&self, id: &str, host: &str) -> rusqlite::Result<usize> {
+        validate_address_value(host).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE machines SET host = ?2 WHERE id = ?1", params![id, host])
+    }
+
+    /// Store this machine's `flightdeckd whoami` identity — by convention the only
+    /// writer of the three `daemon_*` columns ([`Self::upsert_machine`]'s COALESCE
+    /// only keeps an incoming `None` from erasing what this sets; it does not stop a
+    /// caller from setting these columns directly through `upsert_machine`, since
+    /// every existing caller just happens to pass `None` for them). A focused UPDATE
+    /// (not a re-upsert of the whole record) so a later caller (the C9 daemon-init
+    /// flow) never needs to round-trip the rest of the [`MachineRecord`] just to
+    /// attach the identity it just learned.
+    /// Returns the number of rows touched, so the caller can tell "saved" from
+    /// "that machine id doesn't exist" instead of reporting success either way.
+    pub fn set_machine_daemon_identity(
+        &self,
+        id: &str,
+        mac_id: &str,
+        relay_url: &str,
+        label: &str,
+    ) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE machines SET daemon_mac_id = ?2, daemon_relay_url = ?3, daemon_label = ?4
+             WHERE id = ?1",
+            params![id, mac_id, relay_url, label],
+        )
+    }
+
+    /// Record when the mobile relay was (re)provisioned for this machine — by
+    /// convention the only writer of `phone_provisioned_at` (same caveat as
+    /// [`Self::set_machine_daemon_identity`]: the COALESCE in `upsert_machine`
+    /// prevents erasure, not direct writes). Same focused-UPDATE discipline as
+    /// [`Self::set_machine_daemon_identity`].
+    pub fn set_machine_phone_provisioned_at(&self, id: &str, ts_ms: i64) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE machines SET phone_provisioned_at = ?2 WHERE id = ?1",
+            params![id, ts_ms],
+        )
     }
 
     /// Remove a remote server and everything anchored to it. Deletes its repos first
@@ -667,7 +1105,111 @@ impl Store {
     pub fn delete_machine(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM repos WHERE machine_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM machines WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Every paired remote server, oldest first — the same rows [`Self::load_state`]
+    /// embeds in [`PersistedState`], as a standalone call for a caller (C10's
+    /// `appmcp::provision`) that needs to iterate every machine without pulling in
+    /// repos/conversations/accounts too.
+    pub fn all_machines(&self) -> rusqlite::Result<Vec<MachineRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, host, port, user, identity_file, added_at, addresses,
+                    daemon_mac_id, daemon_relay_url, daemon_label, phone_provisioned_at
+             FROM machines ORDER BY added_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MachineRecord {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                    user: row.get(4)?,
+                    identity_file: row.get(5)?,
+                    added_at: row.get(6)?,
+                    addresses: decode_addresses(row.get(7)?),
+                    daemon_mac_id: row.get(8)?,
+                    daemon_relay_url: row.get(9)?,
+                    daemon_label: row.get(10)?,
+                    phone_provisioned_at: row.get(11)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    /// Queue a phone token for `{type:"revoke_phone"}` on THIS Mac's own relay
+    /// connection (see [`migrate_v14`]'s doc) — idempotent by token (re-queuing the
+    /// same token just refreshes `created_at`), so a user who mashes "Regenerate"
+    /// while offline never accumulates duplicate rows for the same secret.
+    pub fn queue_relay_phone_revocation(&self, token: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pending_relay_phone_revocations (token, created_at) VALUES (?1, ?2)
+             ON CONFLICT(token) DO UPDATE SET created_at = excluded.created_at",
+            params![token, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every phone token still awaiting `revoke_phone` on this Mac's own relay
+    /// connection — drained (best-effort, no delivery ack exists on the wire; see
+    /// `appmcp::relay`'s module doc) on every reconnect via `RemoteConfig`.
+    pub fn pending_relay_phone_revocations(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT token FROM pending_relay_phone_revocations ORDER BY created_at ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+        rows
+    }
+
+    /// Forget a token queued via [`Self::queue_relay_phone_revocation`] — called once
+    /// it has actually been handed to a live relay connection to send.
+    pub fn clear_relay_phone_revocation(&self, token: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM pending_relay_phone_revocations WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
+    /// Queue a phone token for `flightdeckd remove-phone` on one paired server,
+    /// because it was unreachable when the revoke was first attempted (see
+    /// [`migrate_v14`]'s doc and `appmcp::provision::revoke_phone_on_machine`).
+    /// Idempotent by `(machine_id, token)`.
+    pub fn queue_daemon_phone_revocation(&self, machine_id: &str, token: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pending_daemon_phone_revocations (machine_id, token, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(machine_id, token) DO UPDATE SET created_at = excluded.created_at",
+            params![machine_id, token, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Every phone token still awaiting `remove-phone` on this one machine —
+    /// retried the next time that machine is successfully contacted (see
+    /// `appmcp::provision::provision_phone_on_machine`).
+    pub fn pending_daemon_phone_revocations(&self, machine_id: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token FROM pending_daemon_phone_revocations WHERE machine_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![machine_id], |row| row.get::<_, String>(0))?.collect();
+        rows
+    }
+
+    /// Forget a token queued via [`Self::queue_daemon_phone_revocation`] — called
+    /// once that machine has confirmed the removal.
+    pub fn clear_daemon_phone_revocation(&self, machine_id: &str, token: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1 AND token = ?2",
+            params![machine_id, token],
+        )?;
         Ok(())
     }
 
@@ -1056,6 +1598,11 @@ mod tests {
             user: "agent".into(),
             identity_file: Some("/keys/id".into()),
             added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
         };
         s.upsert_machine(&m).unwrap();
 
@@ -1091,6 +1638,834 @@ mod tests {
         assert!(after.machines.is_empty());
         assert!(after.repos.iter().all(|r| r.id != "r-remote"), "remote repo gone with its server");
         assert!(after.repos.iter().any(|r| r.id == "r-local"), "local repo stays");
+    }
+
+    /// C9: [`Store::remote_session_for_conversation`] resolves a conversation's
+    /// (cwd, session_id, machine) triple ONLY when all three conditions hold — remote
+    /// repo, known session_id, conversation exists — and stays `None` for every other
+    /// combination (local repo, never-spawned conversation, unknown id).
+    #[test]
+    fn remote_session_for_conversation_requires_a_remote_repo_and_a_known_session() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: Some("/keys/id".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let mut remote = repo_at("r-remote", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+
+        // Remote repo, but no session_id yet (never spawned there): None.
+        s.upsert_conversation(&conv("c-fresh", "r-remote", None)).unwrap();
+        assert!(s.remote_session_for_conversation("c-fresh").unwrap().is_none());
+
+        // Remote repo AND a session_id: resolves.
+        s.upsert_conversation(&conv("c-live", "r-remote", Some("sid-1"))).unwrap();
+        let (cwd, sid, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        assert_eq!(cwd, "/tmp/r-remote");
+        assert_eq!(sid, "sid-1");
+        assert_eq!(machine.id, "m1");
+        assert_eq!(machine.host, "h.example");
+
+        // Local repo, even WITH a session_id: None (nothing remote to push to).
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
+        assert!(s.remote_session_for_conversation("c-local").unwrap().is_none());
+
+        // Unknown conversation id: None, no error.
+        assert!(s.remote_session_for_conversation("no-such-conv").unwrap().is_none());
+    }
+
+    /// C9 journal gate: [`Store::conversation_repo_is_remote`] is looser than
+    /// [`Store::remote_session_for_conversation`] — no `session_id` required, since
+    /// even a conversation that hasn't produced one yet must still be gated the
+    /// moment it's remote. Unknown ids read as `false` (never silently drop an
+    /// event for a conversation this can't even place).
+    #[test]
+    fn conversation_repo_is_remote_needs_no_session_id() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        let mut remote = repo_at("r-remote", 1);
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+
+        s.upsert_conversation(&conv("c-fresh", "r-remote", None)).unwrap();
+        assert!(
+            s.conversation_repo_is_remote("c-fresh").unwrap(),
+            "remote even with no session_id yet",
+        );
+
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
+        assert!(!s.conversation_repo_is_remote("c-local").unwrap());
+
+        assert!(!s.conversation_repo_is_remote("no-such-conv").unwrap());
+    }
+
+    /// v12 — a machine's full candidate address list round-trips through every reader
+    /// (`machine_by_id`, `machine_for_repo_path`, `load_state`), not just the one that
+    /// happens to be queried by whichever call site exercises it.
+    #[test]
+    fn upsert_machine_round_trips_addresses() {
+        let s = Store::open_in_memory().unwrap();
+        let addresses = vec![
+            AddressCandidate { kind: AddressKind::Tailscale, value: "box.tailnet.ts.net".into() },
+            AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+        ];
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "box.tailnet.ts.net".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: addresses.clone(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        assert_eq!(s.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
+
+        let mut remote = repo_at("r1", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        assert_eq!(s.machine_for_repo_path("/work/demo").unwrap().unwrap().addresses, addresses);
+
+        assert_eq!(s.load_state().unwrap().machines[0].addresses, addresses);
+
+        // Re-upserting with a DIFFERENT list must replace it, not merge/append —
+        // ON CONFLICT sets `addresses = excluded.addresses` like every other column.
+        let mut updated = m.clone();
+        updated.addresses = vec![AddressCandidate { kind: AddressKind::Manual, value: "10.0.0.1".into() }];
+        s.upsert_machine(&updated).unwrap();
+        assert_eq!(s.machine_by_id("m1").unwrap().unwrap().addresses, updated.addresses);
+
+        // And an empty list round-trips too (stored as NULL — see `encode_addresses`).
+        let mut cleared = updated.clone();
+        cleared.addresses = Vec::new();
+        s.upsert_machine(&cleared).unwrap();
+        assert!(s.machine_by_id("m1").unwrap().unwrap().addresses.is_empty());
+    }
+
+    /// [`Store::machine_by_address`] — the B11 orchestrator idempotency lookup —
+    /// matches the exact (host, port, user) triple, ignores an unrelated machine, and
+    /// reports `None` for a host never paired.
+    #[test]
+    fn machine_by_address_matches_the_exact_triple() {
+        let s = Store::open_in_memory().unwrap();
+        let m1 = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            user: "deploy".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        let mut m2 = m1.clone();
+        m2.id = "m2".into();
+        m2.port = 2222; // same host, different port — must NOT match.
+        s.upsert_machine(&m1).unwrap();
+        s.upsert_machine(&m2).unwrap();
+
+        let found = s.machine_by_address("1.2.3.4", 22, "deploy").unwrap().expect("must find m1");
+        assert_eq!(found.id, "m1");
+        assert_eq!(found.identity_file.as_deref(), Some("/keys/m1"));
+
+        assert!(s.machine_by_address("1.2.3.4", 2222, "deploy").unwrap().is_some());
+        assert!(s.machine_by_address("1.2.3.4", 22, "someone-else").unwrap().is_none());
+        assert!(s.machine_by_address("never-paired.example", 22, "deploy").unwrap().is_none());
+    }
+
+    /// [`Store::machine_by_any_address`] — the B_lifecycle-#1 review finding's
+    /// convergence lookup for `add_machine`'s own legacy pairing flow — matches a
+    /// candidate against a machine's RECORDED `addresses`, not just its current `host`.
+    #[test]
+    fn machine_by_any_address_matches_on_a_recorded_address_not_just_the_current_host() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "box.tailnet.ts.net".into(), // the address that answered LAST time
+            port: 22,
+            user: "deploy".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: vec![
+                AddressCandidate { kind: AddressKind::Tailscale, value: "box.tailnet.ts.net".into() },
+                AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+            ],
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        // THIS attempt's working address is the LAN one, never tried as `host` before —
+        // still converges on the same machine because it's in its recorded `addresses`.
+        let found = s
+            .machine_by_any_address(&["192.168.1.5".to_string()], 22, "deploy")
+            .unwrap()
+            .expect("must find m1 via its recorded LAN address");
+        assert_eq!(found.id, "m1");
+
+        // A candidate list with SEVERAL values, only one of which matches, still finds it.
+        assert!(s
+            .machine_by_any_address(&["unrelated.example".to_string(), "192.168.1.5".to_string()], 22, "deploy")
+            .unwrap()
+            .is_some());
+    }
+
+    /// Same (host, port) but a DIFFERENT user is a genuinely different login — never
+    /// folded together, even though the address matches.
+    #[test]
+    fn machine_by_any_address_same_host_different_user_stays_separate() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            user: "root".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: vec![AddressCandidate { kind: AddressKind::Manual, value: "1.2.3.4".into() }],
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        assert!(
+            s.machine_by_any_address(&["1.2.3.4".to_string()], 22, "deploy").unwrap().is_none(),
+            "a different SSH user must never converge on someone else's machine row",
+        );
+        // Same reasoning for a different port.
+        assert!(s.machine_by_any_address(&["1.2.3.4".to_string()], 2222, "root").unwrap().is_none());
+        // The real (host, port, user) still matches.
+        assert!(s.machine_by_any_address(&["1.2.3.4".to_string()], 22, "root").unwrap().is_some());
+    }
+
+    #[test]
+    fn machine_by_any_address_no_match_is_none_not_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.machine_by_any_address(&["never-paired.example".to_string()], 22, "deploy").unwrap().is_none());
+    }
+
+    /// The ssh-option-injection guard belongs to the persistence boundary, not just
+    /// to `ipc::commands::add_machine` — a future write path (an "edit server" or
+    /// "import machines" command) must not be able to reintroduce it just by skipping
+    /// the IPC-layer check. `upsert_machine` re-validates `host` AND every
+    /// `addresses` value before ever reaching SQLite.
+    #[test]
+    fn upsert_machine_rejects_an_unsafe_address_value() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+
+        m.host = "-oProxyCommand=evil".into();
+        assert!(s.upsert_machine(&m).is_err(), "an unsafe host must be rejected before writing");
+        assert!(
+            s.machine_by_id("m1").unwrap().is_none(),
+            "the rejected row must not land in the db"
+        );
+
+        m.host = "h.example".into();
+        m.addresses = vec![AddressCandidate { kind: AddressKind::Lan, value: "has space".into() }];
+        assert!(
+            s.upsert_machine(&m).is_err(),
+            "an unsafe value inside `addresses` must be rejected too, not just `host`"
+        );
+        assert!(s.machine_by_id("m1").unwrap().is_none());
+    }
+
+    /// CRM holistic-review blocker #3 (chantier A `bd7ca709`): `user` gets the SAME
+    /// persistence-layer guard `host`/`addresses` already had — this is the last
+    /// line of defense, so a future write path (an "edit server" command, an
+    /// import) can't reintroduce the injection class just by skipping every
+    /// upstream check.
+    #[test]
+    fn upsert_machine_rejects_an_unsafe_user_value() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "-oProxyCommand=touch /tmp/pwned".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        assert!(s.upsert_machine(&m).is_err(), "an unsafe user must be rejected before writing");
+        assert!(s.machine_by_id("m1").unwrap().is_none(), "the rejected row must not land in the db");
+    }
+
+    /// `port` gets the SAME persistence-layer guard `host`/`addresses`/`user` already
+    /// have (review completeness finding on the ssh-injection fix): `port: 0` is never
+    /// a real listener, so it must not be persisted undetected.
+    #[test]
+    fn upsert_machine_rejects_an_invalid_port() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 0,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        assert!(s.upsert_machine(&m).is_err(), "port 0 must be rejected before writing");
+        assert!(s.machine_by_id("m1").unwrap().is_none(), "the rejected row must not land in the db");
+    }
+
+    /// A machines row that fails `validate_ssh_user` on READ (an older app version
+    /// that never had the check, or a manual DB edit) must NOT crash or vanish — the
+    /// row is written directly via raw SQL here, bypassing `upsert_machine`'s own
+    /// guard, to simulate exactly that legacy state. `machine_by_id`/`all_machines`
+    /// never validate on read (by design — see their own docs), so both must still
+    /// return the row intact; it is up to a CONNECT attempt (`Transport::spawn`,
+    /// `ipc::commands::spawn_session`, `bootstrap::orchestrator::diagnose`, …) to
+    /// surface the typed, actionable error instead — proven at those call sites'
+    /// own test suites (`supervisor::transport`'s
+    /// `spawn_refuses_a_legacy_row_with_an_invalid_user_without_spawning_ssh`).
+    #[test]
+    fn a_legacy_row_with_an_invalid_user_loads_intact_never_vanishes_or_panics() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
+                 VALUES ('legacy1', 'old box', 'h.example', 22, '-oProxyCommand=touch /tmp/pwned', NULL, 1, NULL)",
+                [],
+            )
+            .unwrap();
+
+        let loaded = s.machine_by_id("legacy1").unwrap();
+        assert!(loaded.is_some(), "a legacy row with an invalid user must still load, not vanish");
+        assert_eq!(loaded.unwrap().user, "-oProxyCommand=touch /tmp/pwned");
+
+        let all = s.all_machines().unwrap();
+        assert_eq!(all.len(), 1, "the row must still be listed");
+    }
+
+    /// A6: a rotation that wins persists the new `host`, round-tripping through
+    /// `machine_by_id` — and other fields (`label`, `port`, `addresses`, …) are left
+    /// untouched, since this is a targeted `UPDATE`, not a full `upsert_machine`.
+    #[test]
+    fn set_machine_preferred_host_round_trips_through_machine_by_id() {
+        let s = Store::open_in_memory().unwrap();
+        let addresses = vec![
+            AddressCandidate { kind: AddressKind::Manual, value: "203.0.113.1".into() },
+            AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.5".into() },
+        ];
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "203.0.113.1".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: addresses.clone(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let touched = s.set_machine_preferred_host("m1", "192.168.1.5").unwrap();
+        assert_eq!(touched, 1);
+        let after = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(after.host, "192.168.1.5");
+        // Untouched: label/port/addresses survive the targeted UPDATE.
+        assert_eq!(after.label, "vps");
+        assert_eq!(after.port, 22);
+        assert_eq!(after.addresses, addresses);
+
+        // A machine that no longer exists: 0 rows touched, never an error.
+        assert_eq!(s.set_machine_preferred_host("gone", "10.0.0.1").unwrap(), 0);
+    }
+
+    /// A6: the same ssh-option-injection guard `upsert_machine` enforces on `host`
+    /// applies to this narrower write too — a targeted `UPDATE` is still a write path
+    /// that could otherwise reintroduce the injection class [`validate_address_value`]
+    /// closes.
+    #[test]
+    fn set_machine_preferred_host_rejects_an_unsafe_value() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        assert!(s.set_machine_preferred_host("m1", "-oProxyCommand=evil").is_err());
+        assert_eq!(
+            s.machine_by_id("m1").unwrap().unwrap().host,
+            "h.example",
+            "the rejected value must not land in the db"
+        );
+    }
+
+    /// v12 — a row from BEFORE the `addresses` column existed (`ALTER TABLE ADD
+    /// COLUMN` leaves every pre-existing row NULL) must load with an empty `Vec`, not
+    /// an error — the whole point of [`decode_addresses`] treating NULL as "no
+    /// candidates recorded yet" rather than a decode failure.
+    #[test]
+    fn pre_migration_machines_row_reads_addresses_as_empty_vec() {
+        let tmp = TempDb::new("machines-v12-premigration");
+        // The v10 `machines` shape, pre-dating the v12 `addresses` column. Only `meta`
+        // + `machines` are needed: with the marker bridged to 11, the runner skips
+        // every migration up to and including v11 (already applied) and runs ONLY
+        // migrate_v12, which touches nothing but `machines`.
+        tmp.seed_raw(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE machines (
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                port          INTEGER NOT NULL,
+                user          TEXT NOT NULL,
+                identity_file TEXT,
+                added_at      INTEGER NOT NULL
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '11');
+            INSERT INTO machines (id, label, host, port, user, identity_file, added_at)
+                VALUES ('m1', 'vps', 'h.example', 22, 'agent', NULL, 1);
+            ",
+        );
+
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION, "marker 11 bridged, v12 applied");
+        let m = store.machine_by_id("m1").unwrap().expect("pre-migration row still loads");
+        assert!(m.addresses.is_empty(), "NULL addresses decodes to empty, never an error");
+        assert_eq!(m.host, "h.example", "every pre-existing column is untouched");
+    }
+
+    /// v12's `ALTER TABLE ... ADD COLUMN` is guarded by `add_column_if_absent` like
+    /// every other additive migration — reopening an already-migrated db (a second app
+    /// launch) must not error, re-add the column, or disturb the row.
+    #[test]
+    fn migrate_v12_reopen_is_idempotent() {
+        let tmp = TempDb::new("machines-v12-idempotent");
+        let addresses =
+            vec![AddressCandidate { kind: AddressKind::Lan, value: "192.168.1.9".into() }];
+        {
+            let store = tmp.open();
+            store
+                .upsert_machine(&MachineRecord {
+                    id: "m1".into(),
+                    label: "vps".into(),
+                    host: "192.168.1.9".into(),
+                    port: 22,
+                    user: "agent".into(),
+                    identity_file: None,
+                    added_at: 1,
+                    addresses: addresses.clone(),
+                    daemon_mac_id: None,
+                    daemon_relay_url: None,
+                    daemon_label: None,
+                    phone_provisioned_at: None,
+                })
+                .unwrap();
+        }
+        let store = tmp.open(); // second open over an already-migrated db
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().addresses, addresses);
+    }
+
+    /// v13 — a machine's daemon-relay metadata (identity + phone-provisioning
+    /// timestamp) round-trips through every reader (`machine_by_id`,
+    /// `machine_for_repo_path`, `load_state`), mirroring `upsert_machine_round_trips_addresses`.
+    #[test]
+    fn machine_daemon_metadata_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: Some("mac-abc".into()),
+            daemon_relay_url: Some("https://relay.example/".into()),
+            daemon_label: Some("josty-cc".into()),
+            phone_provisioned_at: Some(12_345),
+        };
+        s.upsert_machine(&m).unwrap();
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(got.daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(got.daemon_label, m.daemon_label);
+        assert_eq!(got.phone_provisioned_at, m.phone_provisioned_at);
+
+        let mut remote = repo_at("r1", 1);
+        remote.path = "/work/demo".into();
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        let via_repo = s.machine_for_repo_path("/work/demo").unwrap().unwrap();
+        assert_eq!(via_repo.daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(via_repo.daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(via_repo.daemon_label, m.daemon_label);
+        assert_eq!(via_repo.phone_provisioned_at, m.phone_provisioned_at);
+
+        let loaded = s.load_state().unwrap();
+        assert_eq!(loaded.machines[0].daemon_mac_id, m.daemon_mac_id);
+        assert_eq!(loaded.machines[0].daemon_relay_url, m.daemon_relay_url);
+        assert_eq!(loaded.machines[0].daemon_label, m.daemon_label);
+        assert_eq!(loaded.machines[0].phone_provisioned_at, m.phone_provisioned_at);
+    }
+
+    /// v13 — a row from BEFORE the daemon-metadata columns existed (`ALTER TABLE ADD
+    /// COLUMN` leaves every pre-existing row NULL) must load with `None` for all four
+    /// fields, never an error — the same degrade-gracefully discipline as v12's
+    /// `addresses` (see `pre_migration_machines_row_reads_addresses_as_empty_vec`).
+    #[test]
+    fn pre_migration_machines_row_reads_daemon_metadata_as_none() {
+        let tmp = TempDb::new("machines-v13-premigration");
+        // The v12 `machines` shape (addresses column present), pre-dating v13. Marker
+        // bridged to 12 so the runner skips every migration up to and including v12
+        // (already applied) and runs ONLY migrate_v13, which touches nothing but
+        // `machines`.
+        tmp.seed_raw(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE machines (
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                port          INTEGER NOT NULL,
+                user          TEXT NOT NULL,
+                identity_file TEXT,
+                added_at      INTEGER NOT NULL,
+                addresses     TEXT
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '12');
+            INSERT INTO machines (id, label, host, port, user, identity_file, added_at, addresses)
+                VALUES ('m1', 'vps', 'h.example', 22, 'agent', NULL, 1, NULL);
+            ",
+        );
+
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION, "marker 12 bridged, v13 applied");
+        let m = store.machine_by_id("m1").unwrap().expect("pre-migration row still loads");
+        assert_eq!(m.daemon_mac_id, None);
+        assert_eq!(m.daemon_relay_url, None);
+        assert_eq!(m.daemon_label, None);
+        assert_eq!(m.phone_provisioned_at, None);
+        assert_eq!(m.host, "h.example", "every pre-existing column is untouched");
+    }
+
+    /// v13's `ALTER TABLE ... ADD COLUMN` ×4 is guarded by `add_column_if_absent` like
+    /// every other additive migration — reopening an already-migrated db (a second app
+    /// launch) must not error, re-add a column, or disturb the row.
+    #[test]
+    fn migrate_v13_reopen_is_idempotent() {
+        let tmp = TempDb::new("machines-v13-idempotent");
+        {
+            let store = tmp.open();
+            store
+                .upsert_machine(&MachineRecord {
+                    id: "m1".into(),
+                    label: "vps".into(),
+                    host: "h.example".into(),
+                    port: 22,
+                    user: "agent".into(),
+                    identity_file: None,
+                    added_at: 1,
+                    addresses: Vec::new(),
+                    daemon_mac_id: Some("mac-abc".into()),
+                    daemon_relay_url: Some("https://relay.example/".into()),
+                    daemon_label: Some("josty-cc".into()),
+                    phone_provisioned_at: Some(99),
+                })
+                .unwrap();
+        }
+        let store = tmp.open(); // second open over an already-migrated db
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let m = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(m.daemon_mac_id.as_deref(), Some("mac-abc"));
+        assert_eq!(m.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(m.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(m.phone_provisioned_at, Some(99));
+    }
+
+    /// A wholesale `upsert_machine` with all four daemon fields `None` — exactly what
+    /// every existing caller (`add_machine`, the demo seed, a probe re-save) passes,
+    /// since none of them know about the daemon — must NOT erase metadata a dedicated
+    /// setter already wrote. Mirrors `repos.machine_id`'s COALESCE guard
+    /// (`machines_pair_repos_resolve_and_cascade`).
+    #[test]
+    fn upsert_machine_with_none_daemon_fields_preserves_existing_metadata() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        s.set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc").unwrap();
+        s.set_machine_phone_provisioned_at("m1", 555).unwrap();
+
+        // A caller that knows nothing about the daemon re-upserts the whole record,
+        // e.g. renaming the machine — every daemon field stays `None` on its end.
+        let mut renamed = m.clone();
+        renamed.label = "vps (renamed)".into();
+        s.upsert_machine(&renamed).unwrap();
+
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.label, "vps (renamed)");
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"), "daemon identity must survive a None-field upsert");
+        assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(got.phone_provisioned_at, Some(555), "phone-provisioned timestamp must survive too");
+    }
+
+    /// The two focused setters (`set_machine_daemon_identity` /
+    /// `set_machine_phone_provisioned_at`) round-trip independently of each other and
+    /// of a full `upsert_machine`, and report "no such machine" via their row count
+    /// rather than erroring.
+    #[test]
+    fn machine_daemon_setters_round_trip_and_report_missing_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+
+        let touched = s
+            .set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc")
+            .unwrap();
+        assert_eq!(touched, 1);
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"));
+        assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
+        assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
+        assert_eq!(got.phone_provisioned_at, None, "identity setter must not touch the phone timestamp");
+
+        let touched = s.set_machine_phone_provisioned_at("m1", 42).unwrap();
+        assert_eq!(touched, 1);
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.phone_provisioned_at, Some(42));
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"), "phone setter must not touch the identity");
+
+        // Neither setter errors against an unknown machine id — it just touches 0 rows.
+        assert_eq!(
+            s.set_machine_daemon_identity("no-such-machine", "x", "y", "z").unwrap(),
+            0
+        );
+        assert_eq!(s.set_machine_phone_provisioned_at("no-such-machine", 1).unwrap(), 0);
+    }
+
+    /// `all_machines` mirrors `load_state().machines` — same columns, same order —
+    /// as a standalone call `appmcp::provision` can iterate without paying for
+    /// repos/conversations/accounts too.
+    #[test]
+    fn all_machines_lists_every_paired_server_oldest_first() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.all_machines().unwrap(), Vec::new(), "no machines paired yet");
+
+        let m1 = MachineRecord {
+            id: "m1".into(),
+            label: "first".into(),
+            host: "h1".into(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            added_at: 10,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        let mut m2 = m1.clone();
+        m2.id = "m2".into();
+        m2.label = "second".into();
+        m2.added_at = 20;
+        // Insert out of order — the query must still come back oldest-first.
+        s.upsert_machine(&m2).unwrap();
+        s.upsert_machine(&m1).unwrap();
+
+        let got = s.all_machines().unwrap();
+        assert_eq!(got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["m1", "m2"]);
+    }
+
+    /// C10: the relay-side pending-revocation queue round-trips (queue → list →
+    /// clear) and re-queuing the SAME token is a no-op on the row count, not a
+    /// duplicate (the regenerate-pairing path may retry this if the app restarts
+    /// before the token is ever actually sent).
+    #[test]
+    fn relay_phone_revocation_queue_round_trips_and_dedupes_by_token() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.pending_relay_phone_revocations().unwrap(), Vec::<String>::new());
+
+        s.queue_relay_phone_revocation("old-token-1", 100).unwrap();
+        s.queue_relay_phone_revocation("old-token-2", 200).unwrap();
+        assert_eq!(
+            s.pending_relay_phone_revocations().unwrap(),
+            vec!["old-token-1".to_string(), "old-token-2".to_string()],
+            "oldest created_at first"
+        );
+
+        // Re-queuing the first token again (e.g. a second regenerate before the
+        // first one was ever delivered) must not duplicate the row — it REFRESHES
+        // created_at instead, which also moves it to the back of the oldest-first
+        // order (it is, after all, now the most recently queued one).
+        s.queue_relay_phone_revocation("old-token-1", 300).unwrap();
+        assert_eq!(
+            s.pending_relay_phone_revocations().unwrap(),
+            vec!["old-token-2".to_string(), "old-token-1".to_string()],
+            "still exactly 2 rows (no duplicate), reordered by the refreshed created_at"
+        );
+
+        s.clear_relay_phone_revocation("old-token-1").unwrap();
+        assert_eq!(s.pending_relay_phone_revocations().unwrap(), vec!["old-token-2".to_string()]);
+
+        // Clearing a token that was never queued (or already cleared) is a silent
+        // no-op, never an error — mirrors every other "forget this row" store method.
+        s.clear_relay_phone_revocation("never-queued").unwrap();
+    }
+
+    /// C10: the per-daemon pending-revocation queue is scoped by `machine_id` — the
+    /// same token queued for two different (unreachable) machines is tracked
+    /// independently, and `delete_machine` sweeps a machine's own queue (there is no
+    /// FK to cascade it, per this table's own doc in `migrate_v14`).
+    #[test]
+    fn daemon_phone_revocation_queue_is_scoped_per_machine_and_swept_on_delete() {
+        let s = Store::open_in_memory().unwrap();
+        let machine = |id: &str| MachineRecord {
+            id: id.into(),
+            label: id.into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&machine("m1")).unwrap();
+        s.upsert_machine(&machine("m2")).unwrap();
+
+        s.queue_daemon_phone_revocation("m1", "tok", 100).unwrap();
+        s.queue_daemon_phone_revocation("m2", "tok", 100).unwrap();
+        assert_eq!(s.pending_daemon_phone_revocations("m1").unwrap(), vec!["tok".to_string()]);
+        assert_eq!(s.pending_daemon_phone_revocations("m2").unwrap(), vec!["tok".to_string()]);
+
+        s.clear_daemon_phone_revocation("m1", "tok").unwrap();
+        assert_eq!(s.pending_daemon_phone_revocations("m1").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            s.pending_daemon_phone_revocations("m2").unwrap(),
+            vec!["tok".to_string()],
+            "clearing m1's queue must not touch m2's"
+        );
+
+        s.delete_machine("m2").unwrap();
+        assert_eq!(
+            s.pending_daemon_phone_revocations("m2").unwrap(),
+            Vec::<String>::new(),
+            "delete_machine must sweep its own pending revocations (no FK cascade exists)"
+        );
     }
 
     fn conv_at(

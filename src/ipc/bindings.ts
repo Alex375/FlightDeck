@@ -736,6 +736,18 @@ async tosseSetTaskStatus(taskId: string, status: string) : Promise<Result<null, 
 }
 },
 /**
+ * Reassign a task (Alexandre / Armand / Les deux) — a human picking a person in the
+ * conversation side panel's task card. Nothing in the agent surface calls it.
+ */
+async tosseSetTaskAssignee(taskId: string, assignedTo: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_set_task_assignee", { taskId, assignedTo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Move a project to another status — the Start / Pause / Finish control on a project card.
  */
 async tosseSetProjectStatus(projectId: string, status: string) : Promise<Result<null, string>> {
@@ -1995,10 +2007,8 @@ async deleteRepo(id: string) : Promise<Result<null, string>> {
 }
 },
 /**
- * Generate a dedicated ed25519 keypair for a remote server (Flight Deck's own access
- * key), stored under the app data dir. Returns the private-key path and the public
- * key to paste on the server. The private key never leaves this Mac. Wraps the system
- * `ssh-keygen`, matching the repo's "drive CLIs as black boxes" idiom.
+ * See [`generate_or_reuse_pending_key`] — this is the IPC wrapper that resolves the
+ * real app data dir.
  */
 async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> {
     try {
@@ -2009,21 +2019,55 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
- * Pair a remote server: probe it (SSH reachable + `claude` present), and on success
- * persist it as a [`MachineRecord`]. Returns the saved record so the UI lists it. The
- * probe runs FIRST so a bad host/key/paste or a missing `claude` fails loudly here,
- * not at the first message.
+ * Pair a remote server: probe the confirmed `host` first, then fall back through the
+ * rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
+ * then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
+ * first that's SSH-reachable with `claude` and a current `flightdeckd` present, and
+ * on success persist it as a [`MachineRecord`]. Returns the saved record so the UI
+ * lists it. Probing runs FIRST so a bad host/key/paste or a missing/outdated tool
+ * fails loudly here, not at the first message.
+ * 
+ * `addresses` is the full set of candidate hosts the pairing ticket discovered
+ * (Tailscale name, LAN IP, bare hostname). The address that actually worked is
+ * persisted as `host` — what every other part of the app dials — while the full
+ * ordered, deduplicated candidate list (including `host` itself) is persisted as
+ * `addresses`, carried for a later task (A6) to rotate through on a failed
+ * reconnect; the transport itself still only ever dials `host` today. When every
+ * candidate fails, the returned error names each one tried and why.
+ * 
+ * Converges on an already-paired server the SAME way the B11 bootstrap orchestrator
+ * does (B_lifecycle-#1 review finding — this used to always mint a fresh id, so
+ * pairing a server already paired by the wizard, or by an earlier legacy pairing of
+ * the same host, minted a DUPLICATE [`MachineRecord`]): before persisting, every
+ * candidate this attempt probed is checked against every OTHER machine's own
+ * `host`/`addresses` via [`crate::store::Store::machine_by_any_address`] — a
+ * different working address this time (a rotated Tailscale IP, or simply a different
+ * candidate answering first) still converges on the same row, keyed by (port, user).
+ * A different port or user is a different machine (a different login) and is never
+ * folded together.
+ * 
+ * Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
+ * finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
+ * `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+ * against the same server. Before this fix, this legacy/manual pairing command was
+ * the ONE entry point of the four that never claimed the lock at all, so it could
+ * still interleave ssh writes (key install, `AddMachine`'s pending-key rename) with
+ * one of the other three targeting the exact same host — precisely the race
+ * [`ServerLocks`] exists to prevent. Never blocks/waits; never pauses across separate
+ * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
+ * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null) : Promise<Result<MachineRecord, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Un-pair a remote server: removes it and every repo/conversation anchored to it.
+ * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
+ * and [`delete_machine_and_key`] (the delete itself).
  */
 async deleteMachine(id: string) : Promise<Result<null, string>> {
     try {
@@ -2083,6 +2127,31 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Best-effort push of a REMOTE conversation's CURRENT title to its daemon's
+ * authoritative record (C9) — the idle-rename path, for when the LOCAL rename
+ * (`upsert_conversation`) happens while this Mac isn't the one driving the
+ * conversation. `title` is passed explicitly rather than re-read from the store, so
+ * this never races that same rename's own `upsertConversation` write landing first.
+ * 
+ * See [`crate::supervisor::transport::push_remote_title`] for the wire mechanics and
+ * its SAFETY CONTRACT — most importantly: the caller (`renameConversation` in
+ * `conversationsStore.ts`) MUST have already confirmed this Mac holds no live
+ * session for `conversation_id` before ever calling this; that liveness
+ * (`conv.handle`) is front-end-only state this command cannot see, let alone check
+ * on its own.
+ * 
+ * Infallible from the caller's point of view (mirrors [`crate::supervisor::
+ * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * whenever there's nothing useful to do (unknown conversation, local repo, no
+ * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
+ * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+ * which already landed — the next real spawn carries the title anyway (see
+ * `spawn_session`'s `conversation_title` wiring).
+ */
+async pushRemoteConversationTitle(conversationId: string, title: string) : Promise<boolean> {
+    return await TAURI_INVOKE("push_remote_conversation_title", { conversationId, title });
 },
 /**
  * Forget a conversation's metadata.
@@ -2207,10 +2276,27 @@ async appControlRespond(requestId: string, result: JsonValue | null, error: stri
 }
 },
 /**
- * Publish one fleet event into the journal `wait_for_events` long-polls (the
- * voice bridge). The FRONT calls this from its settled notification point
- * (`fireAgentNotification`), so the voice agent hears exactly what the human
- * would have been pinged about.
+ * Publish one fleet event into the journal `wait_for_events` long-polls (the voice
+ * bridge) AND the phone relay's push (`appmcp::relay`'s `events_task` — the SAME
+ * journal feeds both). The FRONT calls this from its settled notification point
+ * (`fireAgentNotification`), so the voice agent (and the phone) hear exactly what
+ * the human would have been pinged about.
+ * 
+ * C9 gate: a conversation this Mac only RELAYS (its repo is remote — `machine_id`
+ * set) has its OWN host `flightdeckd` daemon emitting these SAME phone-facing
+ * events independently (it runs the actual session; the Mac here is just an SSH
+ * spectator) — publishing them HERE too would double the phone's push per turn.
+ * This is the SINGLE entry point every phone-facing journal event passes through
+ * (`turn_completed` / `needs_attention` / `attention_cleared` / `task_finished`,
+ * from every call site in `useGlobalSessionEvents.ts` / `appControl.ts` /
+ * `conversationsStore.ts`), so gating it here covers all of them without touching
+ * any of those call sites individually. The DESKTOP's own OS notifications and
+ * in-app voice announcements are UNCHANGED — both are fed from a SEPARATE point in
+ * `useGlobalSessionEvents.ts` that never goes through this journal at all, remote
+ * conversation or not; only the phone-facing paths (voice bridge + relay) are
+ * gated. `unwrap_or(false)` degrades toward PUBLISHING on a lookup error — a
+ * missed suppression is, at worst, one duplicate push; a wrongly-swallowed event
+ * for a conversation this couldn't even confirm as remote would be a silent loss.
  */
 async publishControlEvent(kind: string, conversationId: string, title: string, detail: JsonValue) : Promise<void> {
     await TAURI_INVOKE("publish_control_event", { kind, conversationId, title, detail });
@@ -2342,14 +2428,339 @@ async remoteStatus() : Promise<RemoteStatus> {
     return await TAURI_INVOKE("remote_status");
 },
 /**
- * Change the remote-access config (enable, relay URL, regenerate the pairing
- * token), persist it, and (re)connect or disconnect accordingly. Regenerating
- * the pairing token revokes every previously-paired phone. Returns the honest
- * post-apply status.
+ * Change the remote-access config (enable, relay URL, this Mac's node label,
+ * regenerate the pairing token), persist it, and (re)connect or disconnect
+ * accordingly. Returns the honest post-apply status.
+ * 
+ * Regenerating the pairing token mints a fresh one AND revokes the old one
+ * everywhere it was ever authorized (C10's critical fix — see the inline
+ * comments below): before this fix, `regenerate_pairing` only ever minted +
+ * authorized the new token, so a lost phone's OLD token stayed valid forever
+ * (verified against this file's history: nothing anywhere called
+ * `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
+ * token on every paired daemon when access just turned on or the token just
+ * changed (C10 hook (b)) — both run in the background so Settings never blocks
+ * on N ssh round trips, and every per-machine outcome is recorded into its
+ * registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
+ * 
+ * The relay-side half of the revoke (THIS Mac's own connection) is NOT
+ * resolved synchronously here — see the inline comment right after
+ * `apply_remote` below for why clearing it here was the original bug, and
+ * where it is actually cleared now (`appmcp::relay::connect_once`, only once
+ * the frame has genuinely gone out on a live socket).
  */
-async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean) : Promise<Result<RemoteStatus, string>> {
+async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean, macLabel: string | null) : Promise<Result<RemoteStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_remote", { enabled, relayUrl, regeneratePairing, macLabel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Every paired server's last phone-provisioning outcome this app run knows about
+ * (C10/C11) — Settings' per-server status row reads this back, joined against
+ * its own machine list by `machine_id`. A machine absent from the result has
+ * simply not been attempted yet this run (e.g. app just launched, remote access
+ * is off) — not a failure.
+ */
+async phoneProvisioningStatus() : Promise<MachineProvisionStatus[]> {
+    return await TAURI_INVOKE("phone_provisioning_status");
+},
+/**
+ * Every paired server's last phone-REVOCATION outcome this app run knows about
+ * — the revoke-side counterpart of [`phone_provisioning_status`], populated by
+ * [`set_remote`]'s regenerate-pairing revoke sweep (C10's critical fix). A
+ * machine absent from the result has simply never had a revoke attempted this
+ * run (most machines, most of the time) — not evidence it still holds a stale
+ * token. Settings reads this to flag a server that refused, was too old, or
+ * is still unreachable (queued for automatic retry) rather than silently
+ * assuming the old token is gone everywhere once `set_remote` returns.
+ */
+async phoneRevocationStatus() : Promise<MachineRevokeStatus[]> {
+    return await TAURI_INVOKE("phone_revocation_status");
+},
+/**
+ * Settings' "Retry" button: (re)attempt provisioning the current phone token on
+ * one server, synchronously — unlike the background hooks in [`set_remote`] /
+ * [`add_machine`], a manual retry click should show immediate feedback. Records
+ * `Pending` the moment it starts (so the row updates right away even though the
+ * ssh round trip itself takes a beat), then the real outcome.
+ */
+async retryPhoneProvisioning(machineId: string) : Promise<Result<MachineProvisionStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_phone_provisioning", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start driving the server-side `claude` sign-in for `machine_id` — or, if another
+ * surface already has one live for the SAME machine, ATTACH to it instead of starting
+ * a competing one (B-finding #4: a second start used to silently kill the first, with
+ * zero UI feedback). Returns immediately with an opaque [`LoginSession`] handle — the
+ * actual URL (or an immediate "already signed in" completion) arrives asynchronously
+ * as [`ServerLoginPromptEvent`] / [`ServerLoginResultEvent`], exactly like every other
+ * async login flow in this crate (`account_claude_login_start` is a synchronous
+ * exception only because ITS wait for the URL is bounded to a couple of seconds
+ * against a LOCAL process; this one crosses the network twice before it can even
+ * begin, so it does not block the caller on that).
+ * 
+ * On attach, the already-recognized URL (if any) is re-emitted as a fresh
+ * [`ServerLoginPromptEvent`] — a late-joining caller's own listener is registered by
+ * the time this returns (both `ClaudeSignInInline` call sites subscribe before
+ * calling this), but the ORIGINAL prompt may have already fired before that listener
+ * existed, so without this re-emit a second surface attaching to an in-progress
+ * session could be stuck showing "waiting for the sign-in link" even though one
+ * already exists. To replace, rather than attach to, an existing session, use
+ * [`restart_claude_login`] instead.
+ */
+async startClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_claude_login", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Explicitly REPLACE any live sign-in session for `machine_id` with a fresh one — the
+ * only thing in this module that supersedes rather than attaches (see
+ * [`LoginSessions`]'s own doc). The replaced session, if any, is told via a
+ * [`ServerLoginResultEvent`] (`ok:false`, `reason:Superseded`) — [`cancel_claude_login`]
+ * on a session the SAME caller started gets the same terminal-event treatment now
+ * (`reason:Cancelled`, since residual defect A8/R1), but that caller is expected to
+ * recognize and ignore its own echo, whereas a superseded surface never initiated
+ * anything and must always see this as new information. Used by the "Restart sign-in"
+ * action once a sign-in is already in flight.
+ */
+async restartClaudeLogin(machineId: string) : Promise<Result<LoginSession, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_claude_login", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Submit the code the user pasted for an in-flight [`start_claude_login`] session.
+ * The code is written to the remote CLI's stdin the instant the driver confirms it's
+ * actually at the `AwaitingCode` prompt (never blindly) — see
+ * [`ClaudeLoginDriver::submit_code`].
+ */
+async submitClaudeLoginCode(session: LoginSession, code: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("submit_claude_login_code", { session, code }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel an in-flight [`start_claude_login`] session — kills the remote process. Safe
+ * (a harmless no-op, not an error surfaced to the user) when the session already
+ * finished on its own. The actor still emits a terminal [`ServerLoginResultEvent`]
+ * (`reason:Cancelled`) for this session (residual defect A8/R1) — this command itself
+ * never surfaces that as an `Err` to ITS caller, who is expected to already know it
+ * asked for this and to ignore that event when it arrives (see `ClaudeSignInInline`'s
+ * own doc); an attached, non-owning surface still watching the same session gets the
+ * signal it never used to.
+ */
+async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_claude_login", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
+ * the user has confirmed the change is expected) so the next connection re-pins it
+ * TOFU. See [`forget_host_key`].
+ */
+async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start (or, on retry, re-run from scratch — every step is idempotent) the full
+ * bootstrap pipeline. See the module doc.
+ * 
+ * Looks up a [`MachineRecord`] ALREADY paired at this exact (`host`, `port`, `user`)
+ * BEFORE running anything (see [`run_pipeline_and_register`]'s own doc) — the
+ * convergence a bare re-run needs (B11 review finding): without it, a second call
+ * against an already-fully-paired server would generate and try to install a brand
+ * new key (the shared "pending" one was already claimed/renamed by the first run's
+ * `AddMachine` step) and persist a SECOND, duplicate `MachineRecord` for the same
+ * host under a fresh uuid, rather than converging on the one that already exists.
+ * 
+ * Claims this host's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+ * running a single ssh round trip — `Err` with [`server_busy_error`] when
+ * `bootstrap_server`/`bootstrap_resume`/`machine_repair` already has one in flight
+ * against the same server, rather than racing it (the previous behaviour: two
+ * concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
+ * against the same host, the loser typically failing opaquely at its very last
+ * step). Never blocks/waits.
+ */
+async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Resume a run paused at a BLOCKING step (today: [`StepId::EscalatePersistence`]
+ * needing a sudo password) — re-runs the same, idempotent pipeline with
+ * `sudo_password` now available.
+ * 
+ * Re-finds the [`MachineRecord`] the paused session already converged on via
+ * [`resolve_resume_machine`] — BY ID when the ORIGINAL `bootstrap_server` call found
+ * one (`StoredSession::machine_id`), never by re-deriving `(host, port, user)` from
+ * the FROZEN request the session was paused under (B_lifecycle-#8 review finding: A6's
+ * live address-rotation, `Store::set_machine_preferred_host`, can rewrite that same
+ * row's `host` column WHILE this session sits paused — an address lookup would then
+ * find nothing and this resume would proceed as if pairing a brand-new host, which,
+ * with B_lifecycle-#1 unfixed, minted a duplicate). Falls back to the address lookup
+ * [`bootstrap_server`] itself uses ONLY when no id was ever recorded — a genuinely
+ * first-contact host, paused before [`StepId::AddMachine`] had ever run once — which
+ * also covers a completely separate, already-finished pairing for that host existing
+ * by the time this resume happens (e.g. the same host paired again through a
+ * different session while this one sat paused).
+ * 
+ * [`ServerLocks`]: REUSES (never re-claims) the [`ServerLockGuard`] the original
+ * `bootstrap_server` call claimed and left held across the pause (B_lifecycle-#7) —
+ * see [`BootstrapSessions::resume`]'s own `lock_key`. A fresh `claim` here would
+ * simply collide with this very session's own still-held lock. That key is the
+ * MACHINE id whenever one was already known at the ORIGINAL `bootstrap_server` call
+ * (see [`server_lock_key`]) — carried forward verbatim from `StoredSession::lock_key`,
+ * never re-derived here, so [`resolve_and_sync_resume_machine`]'s own coordinate
+ * rewrite below can never disturb which lock this run holds.
+ * 
+ * [`resolve_and_sync_resume_machine`]: residual defect A8/R2 (CRM `1abfc028`) — once
+ * [`resolve_resume_machine`] re-finds the right, possibly-rotated [`MachineRecord`],
+ * its CURRENT `host`/`port`/`user` are copied onto the resumed `req` BEFORE the
+ * pipeline is built, so every step dials where the machine is reachable TODAY, not
+ * wherever it was when this session originally paused — see that function's own doc.
+ */
+async bootstrapResume(sessionId: string, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_resume", { sessionId, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
+ * releases the [`ServerLocks`] claim that paused run left held (B_lifecycle-#7 review
+ * finding) — no-op when nothing was paused under this id.
+ */
+async bootstrapCancel(sessionId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_cancel", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineDiagnose(machineId: string) : Promise<Result<ServerDiagnosis, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_diagnose", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
+ * running anything — `Err` with [`server_busy_error`] when a `bootstrap_server`/
+ * `bootstrap_resume`/another `machine_repair` is already in flight against it (the
+ * previous behaviour: the Settings UI kept every paired machine's Repair buttons
+ * clickable regardless of what else was running against that same host, including
+ * the "+ Add a server" wizard). Always released before this returns — `repair` itself
+ * never pauses across separate calls the way the bootstrap pipeline can.
+ */
+async machineRepair(machineId: string, action: RepairAction, sudoPassword: string | null) : Promise<Result<RepairOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_repair", { machineId, action, sudoPassword }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
+ * the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
+ * artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
+ * See [`crate::artifact_host`].
+ */
+async artifactHostShow(url: string, bounds: HostBounds, zoom: number) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_show", { url, bounds, zoom }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move/resize the artifact host (no-op when it doesn't exist).
+ */
+async artifactHostSetBounds(bounds: HostBounds) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_set_bounds", { bounds }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hide the artifact host, keeping its page alive (no-op when it doesn't exist).
+ */
+async artifactHostHide() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_hide") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-open the requested artifact in the host (refresh / back to the artifact).
+ */
+async artifactHostReload() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_reload") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Destroy the artifact host and free its web content process (no-op when it doesn't exist).
+ */
+async artifactHostClose() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_close") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Point the artifact host at a claude.ai sign-in link the user pasted (an emailed link opened in
+ * the browser would sign in a session this webview never sees). claude.ai URLs only.
+ */
+async artifactHostOpenClaudeUrl(url: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_open_claude_url", { url }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2363,8 +2774,13 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
 export const events = __makeEvents__<{
 accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
+artifactHostEvent: ArtifactHostEvent,
+bootstrapProgressEvent: BootstrapProgressEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
+hostKeyFingerprintEvent: HostKeyFingerprintEvent,
+serverLoginPromptEvent: ServerLoginPromptEvent,
+serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
 sessionCommandsEvent: SessionCommandsEvent,
 sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
@@ -2386,8 +2802,13 @@ workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
+artifactHostEvent: "artifact-host-event",
+bootstrapProgressEvent: "bootstrap-progress-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
+hostKeyFingerprintEvent: "host-key-fingerprint-event",
+serverLoginPromptEvent: "server-login-prompt-event",
+serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
 sessionCommandsEvent: "session-commands-event",
 sessionExtensionsChangedEvent: "session-extensions-changed-event",
@@ -2431,6 +2852,26 @@ export type AccountProfile = { email: string | null; orgName: string | null;
  * `organization.organization_type`. `None` for a type the CLI does not name either.
  */
 subscriptionType: string | null }
+/**
+ * The result of [`add_machine`]: the saved [`MachineRecord`], plus whether it
+ * UPDATED an already-paired server (`matched_existing: true`) rather than adding a
+ * brand-new one — see [`add_machine`]'s own doc (B_lifecycle-#1 review finding). The
+ * UI uses this to say "Updated the existing server …" instead of implying a second
+ * server was added.
+ */
+export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean }
+/**
+ * See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
+ */
+export type AddressCandidate = { kind: AddressKind; value: string }
+/**
+ * One discovered candidate address for a paired server — as printed in the pairing
+ * ticket's `addresses` array (see the "1 · Run this once on your server" command in
+ * `RemoteServersGroup`, `ControlSection.tsx`) or typed by hand. `Public` is reserved
+ * for a future discovery step (e.g. a public IP behind NAT) — nothing populates it
+ * yet, but the wire shape carries it so a later change is additive.
+ */
+export type AddressKind = "tailscale" | "lan" | "public" | "manual"
 /**
  * One sub-agent available to a repository (file-based or plugin-provided).
  */
@@ -2516,6 +2957,48 @@ configured_at_ms: number | null }
  * null for an external caller (the voice bridge).
  */
 export type AppControlRequestEvent = { request_id: string; tool: string; args: JsonValue; session: string | null }
+/**
+ * Emitted for every top-level page load of the host, and when a pop-up hand-off fails.
+ */
+export type ArtifactHostEvent = { kind: ArtifactHostEventKind; url: string }
+/**
+ * What happened in the host webview, for the viewer's status line.
+ */
+export type ArtifactHostEventKind = 
+/**
+ * A top-level page started loading (`url` = the page).
+ */
+"started" | 
+/**
+ * A top-level page finished loading (`url` = the page — e.g. claude.ai's sign-in page when
+ * the session is missing, which is how the front knows to say "sign in").
+ */
+"finished" | 
+/**
+ * A link the page opened in a new window could not be handed to the system browser.
+ */
+"external_open_failed" | 
+/**
+ * A pop-up (or a navigation) was refused because it targeted something other than the web —
+ * a custom URL scheme that would have launched another app. Surfaced so the click isn't
+ * silently dropped.
+ */
+"popup_refused" | 
+/**
+ * A pop-up with no page of its own (`about:blank`, `blob:`, `data:`) was refused because the
+ * host is not signing in — an artifact opening a chrome-less window it would fill itself.
+ * Its own kind so the front never explains it as "it would launch another app".
+ */
+"popup_blank_refused" | 
+/**
+ * This page asked to open more links than [`OPEN_BUDGET`] allows; the rest were dropped.
+ */
+"opens_throttled" | 
+/**
+ * A download was requested. The view can't show one, so it is refused — and said, rather
+ * than leaving the click to do nothing.
+ */
+"download_refused"
 /**
  * Which agent backend a new conversation runs on — the IPC discriminant
  * [`spawn_session`] dispatches on. Serialized lowercase to match the front's
@@ -2646,6 +3129,32 @@ export type BackgroundTaskStatus =
  * Cancelled via `TaskStop` / session end (`"stopped"`/`"cancelled"`).
  */
 "stopped"
+export type BootstrapProgressEvent = { session_id: string; host: string; steps: BootstrapProgressStep[] }
+/**
+ * B11's aggregated progress notice for `bootstrap::orchestrator`'s ONE resumable
+ * pipeline (`bootstrap_server` / `bootstrap_resume`) — carries the WHOLE step list on
+ * every emit, so a listener never has to reconstruct progress by accumulating a stream
+ * of partial deltas: the latest event alone is the complete picture. `steps[].status`
+ * is one of `"pending"`/`"running"`/`"ok"`/`"skipped"`/`"failed"`/`"needs_input"` (see
+ * `orchestrator::StepStatus::wire_str`, the one place that owns this exact wording).
+ * `session_id` is the opaque handle `bootstrap_server`'s own response carries — the
+ * SAME id `bootstrap_resume`/`bootstrap_cancel` take back.
+ * 
+ * (B8/B9's earlier, per-command `BootstrapStepEvent` — one event per `bootstrap_
+ * upload_daemon`/`bootstrap_install_service`/`bootstrap_escalate_persistence` call —
+ * was removed once B11's orchestrator superseded those granular commands and nothing
+ * in the front end listened to it any more; see B-finding #5.)
+ */
+export type BootstrapProgressStep = { id: string; status: string; detail: string | null }
+/**
+ * The full outcome of one `bootstrap_server`/`bootstrap_resume` call.
+ */
+export type BootstrapReport = { session_id: string; host: string; steps: StepState[]; 
+/**
+ * `Some(step)` only when the run is PAUSED and resumable at `step` — see the
+ * module doc's "two different kinds of needs-input".
+ */
+needs_input: StepId | null; machine_id: string | null; diagnosis: ServerDiagnosis | null }
 /**
  * One branch ref. `is_remote` distinguishes `refs/remotes/*` from local
  * `refs/heads/*`; `ahead`/`behind` come from the branch's upstream tracking
@@ -3187,6 +3696,16 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * The single headline verdict [`collapse_state`] reduces every independent fact to.
+ */
+export type DiagnosisState = { kind: "ready" } | 
+/**
+ * (B14) `claude` itself is missing — distinct from [`Self::NeedsClaudeSignIn`]
+ * (installed but signed out): [`RepairAction::InstallClaude`] is the fix here,
+ * [`RepairAction::SignInClaude`] there. See [`collapse_state`]'s doc.
+ */
+{ kind: "needs_claude_install" } | { kind: "needs_claude_sign_in" } | { kind: "running_not_reboot_safe" } | { kind: "failed"; reason: string }
+/**
  * One conversation discovered on disk — the cheap "head-read" row the history panel
  * lists. NO full parse here (that's [`load_history`], used by the preview). Field
  * names are snake_case to match the other IPC payloads; the front consumes this
@@ -3486,6 +4005,28 @@ condition: string;
  */
 reason: string | null }
 /**
+ * A rectangle in the main window's LOGICAL coordinates — CSS pixels of the app's document
+ * multiplied by the UI zoom (the front does that product; see `artifactHost.ts`).
+ */
+export type HostBounds = { x: number; y: number; width: number; height: number }
+/**
+ * `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+ * `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
+ * never on any `Err`, even one (like a wrong password) that still pinned a fresh host
+ * key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
+ * pipeline step that is the only caller of
+ * [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
+ * on the overall `Result`, not on "some fingerprint happens to be readable".
+ * DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
+ * confirmation step gating on this event, it never blocks the flow. `known` = the
+ * fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
+ * this particular connection attempt — `false` only on a server's genuine first
+ * contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
+ * it fails as `BootstrapError::HostKeyMismatch` instead (see
+ * `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+ */
+export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
+/**
  * An image joined to a user turn: base64 bytes + their MIME type. Sent inside the
  * message `content` array as an `image` block (spec §3.10) — verified accepted by
  * `claude` 2.1.187, which "sees" it and answers about its content. The `data` field
@@ -3518,6 +4059,10 @@ data_base64: string; too_large: boolean; size: number;
  * stamp (see [`FileStat`]). `None` when the platform doesn't report one.
  */
 mtime_ms: number | null }
+/**
+ * See [`StepId::AddMachine`]'s doc — probes BOTH unit locations, never assumes.
+ */
+export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
@@ -3616,6 +4161,67 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
+ * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
+ * ever having to match on `error`'s wording (free-text, display-only). `None` on a
+ * successful sign-in (`ok: true`) — there is nothing to discriminate there.
+ * 
+ * Added for residual defect A8/R1 (CRM `1abfc028`, counter-verification of the
+ * single-flight sign-in fix wave): `Cancelled` used to be the one [`LoginOutcome`]
+ * that emitted NO event at all, on the assumption "the caller who cancelled already
+ * knows" — true only while a session had exactly one caller. Once `attach_or_reserve`
+ * let a second, non-owning surface watch the SAME session, that assumption broke: an
+ * attached surface left watching after the OWNER cancels/unmounts needs the same
+ * terminal signal `Superseded` already gets. `Cancelled` is now ALWAYS emitted too —
+ * this discriminant is what lets the surface that INITIATED the cancel recognize and
+ * ignore its own echo (it already knows), while every other attached surface treats it
+ * as the "stop showing a dead session" signal it never got before. See
+ * `ClaudeSignInInline`'s own doc for the front-end split.
+ */
+export type LoginResultReason = 
+/**
+ * A `DriverCommand::Cancel` reached the actor — either the owning caller's own
+ * Cancel/unmount, or (going forward) anything else that ever sends one.
+ */
+"cancelled" | 
+/**
+ * An explicit "Restart sign-in" ([`crate::bootstrap::server_setup::
+ * restart_claude_login`]) replaced this session before it reached a terminal
+ * state.
+ */
+"superseded" | 
+/**
+ * The sign-in itself failed (wrong code, lost connection, timed out, …) — `error`
+ * carries the human-readable detail.
+ */
+"failed"
+/**
+ * Opaque handle [`start_claude_login`]/[`restart_claude_login`] return, threaded back
+ * through [`submit_claude_login_code`] / [`cancel_claude_login`].
+ */
+export type LoginSession = { session_id: string; machine_id: string; 
+/**
+ * ⚠️ Added by a follow-up review of the B-finding #4 single-flight fix: `true`
+ * only when THIS call actually reserved (originated) the session —
+ * `start_claude_login` finding nothing live and spawning a fresh
+ * [`run_login_actor`], or `restart_claude_login` (which always supersedes and
+ * registers itself as the replacement). `false` when this call merely ATTACHED to
+ * a session another surface already started ([`AttachOutcome::Attached`]).
+ * 
+ * The front MUST gate `cancel_claude_login` on this: only the owner may actually
+ * kill the underlying session on Cancel/unmount. An attached surface's
+ * Cancel/unmount is a local-only detach that leaves the session running for
+ * whoever still owns it — see `ClaudeSignInInline`'s own doc. Before this field
+ * existed, EVERY holder's Cancel/unmount killed the shared session unconditionally,
+ * reproducing the exact "second sign-in silently kills the first, zero UI
+ * feedback" bug class the single-flight fix was written to close in the first
+ * place, just via an attached surface's teardown instead of a competing Start.
+ */
+owned: boolean }
+/**
+ * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
+ */
+export type MachineProvisionStatus = { machine_id: string; state: ProvisionState; checked_at_ms: number }
+/**
  * A remote host (a "server") reached over SSH, on which repos can live and their
  * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
  * the connection coordinates so a user adds a server from the UI without editing any
@@ -3628,7 +4234,10 @@ export type MachineRecord = { id: string;
  */
 label: string; 
 /**
- * Hostname or IP reachable from this Mac.
+ * Hostname or IP reachable from this Mac. The address pairing (or the user)
+ * confirmed as WORKING — the one [`super::db::Store::upsert_machine`] persists
+ * after a successful probe, and what `RemoteTarget` connects with today (see
+ * `supervisor::transport`).
  */
 host: string; 
 /**
@@ -3648,7 +4257,62 @@ identity_file: string | null;
 /**
  * Unix ms timestamp the server was added.
  */
-added_at: number }
+added_at: number; 
+/**
+ * Every address candidate pairing discovered (or the user typed) for this server
+ * — Tailscale name, LAN IP, hostname, … — including `host` itself. Carried for a
+ * later task (A6) to rotate through on a failed reconnect; today only `host` is
+ * actually dialed. Defaults to an empty `Vec` for a pre-migration row or one whose
+ * stored JSON fails to decode — never an error, since a missing/corrupt address
+ * list must degrade to "just `host`", not break the machine (see
+ * [`super::db::Store::machine_by_id`]).
+ */
+addresses?: AddressCandidate[]; 
+/**
+ * This node's relay identity, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::mac_id`] so a result from that
+ * probe can be stored directly, no reshaping. `None` until a `flightdeckd init` /
+ * `whoami` round trip has succeeded for this machine (every machine paired before
+ * the daemon flow existed, and any machine whose `whoami` hasn't run yet). By
+ * convention, only [`super::db::Store::set_machine_daemon_identity`] populates
+ * this field — [`super::db::Store::upsert_machine`]'s COALESCE keeps a `None`
+ * there from erasing it, but nothing in the type system stops a caller from
+ * constructing a record with this field set and passing it to `upsert_machine`
+ * directly; every existing caller (add/rename/probe) just happens to pass `None`.
+ */
+daemon_mac_id?: string | null; 
+/**
+ * This node's relay URL, straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::relay_url`]. Same write/`None`
+ * convention as [`Self::daemon_mac_id`].
+ */
+daemon_relay_url?: string | null; 
+/**
+ * The label the daemon itself was initialized with (`flightdeckd init --label
+ * …`), straight off `flightdeckd whoami` — mirrors
+ * [`crate::bootstrap::server_setup::ServerIdentity::label`]. Deliberately a
+ * SEPARATE field from [`Self::label`] (the human-facing name Flight Deck shows for
+ * this server): the two can drift, and this one exists to compare against /
+ * display what the daemon believes its own identity is. Same write/`None`
+ * convention as [`Self::daemon_mac_id`].
+ */
+daemon_label?: string | null; 
+/**
+ * Unix ms timestamp the phone (mobile relay) was provisioned for this server, or
+ * `None` if it never has been. By convention, populated only by
+ * [`super::db::Store::set_machine_phone_provisioned_at`] — same non-erasure
+ * convention as the `daemon_*` fields above.
+ */
+phone_provisioned_at?: number | null }
+/**
+ * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
+ * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
+ * token actually get forgotten here". A machine absent from
+ * [`RevokeRegistry::all`] has simply never had a revocation attempted this
+ * run (most machines, most of the time — a revoke only runs when
+ * `regenerate_pairing` fires) — not evidence it still holds a stale token.
+ */
+export type MachineRevokeStatus = { machine_id: string; outcome: RevokeOutcome; checked_at_ms: number }
 /**
  * What the instructions file looks like right now.
  */
@@ -3918,6 +4582,32 @@ skill_count: number; agent_count: number; command_count: number; mcp_count: numb
  */
 export type Pong = { ok: boolean; echo: string; at_ms: number }
 /**
+ * One paired daemon's outcome, as Settings reads it back
+ * (`ipc::commands::phone_provisioning_status`).
+ */
+export type ProvisionState = 
+/**
+ * `add-phone` answered `ok:true` — the daemon now authorizes this Mac's
+ * current phone token.
+ */
+{ kind: "provisioned"; at_ms: number } | 
+/**
+ * An attempt is currently in flight (set by
+ * `ipc::commands::retry_phone_provisioning` the moment it starts, so a
+ * Settings click gets immediate feedback rather than a frozen row).
+ */
+{ kind: "pending" } | 
+/**
+ * The round trip completed but did not succeed — an ssh/connectivity error,
+ * or the daemon's own business-logic refusal (`ok:false`), verbatim.
+ */
+{ kind: "failed"; reason: string } | 
+/**
+ * The daemon answered `fd_detach` — too old to understand `add-phone`/
+ * `remove-phone` at all.
+ */
+{ kind: "daemon_too_old" }
+/**
  * Subscription rate-limit status, normalized from `rate_limit_event.rate_limit_info`.
  * Carries only what the stream-json protocol exposes: the coarse `status`, the
  * reset time, the window type, and whether overage is active. The precise usage
@@ -3981,7 +4671,32 @@ export type RemoteListing = { path: string; dirs: string[] }
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
  */
-export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; 
+/**
+ * This Mac's node display name (C11), as sent to the relay via `set_label`.
+ */
+mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+/**
+ * Every fix `machine_repair` can apply — see the module doc.
+ */
+export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_service" | "enable_linger" | "mask_sleep" | "run_init" | 
+/**
+ * (B14) Runs the official native installer — see
+ * [`server_setup::install_claude`]'s own doc. Distinct from [`Self::SignInClaude`]:
+ * this fixes [`DiagnosisState::NeedsClaudeInstall`], that one fixes
+ * [`DiagnosisState::NeedsClaudeSignIn`].
+ */
+"install_claude" | "sign_in_claude" | "provision_phone"
+/**
+ * One `machine_repair` outcome: what changed, plus a FRESH [`diagnose`] (never a stale
+ * one from before the fix).
+ */
+export type RepairOutcome = { action: RepairAction; 
+/**
+ * See [`repair_action_label`] — the same "what this repair does" text a UI can
+ * show alongside `summary` without hardcoding its own copy of these 8 strings.
+ */
+label: string; summary: string; diagnosis: ServerDiagnosis }
 /**
  * A working folder a conversation can be opened in.
  */
@@ -4021,6 +4736,41 @@ max: number | null;
  * Short human reason ("Connection error."), when one is available.
  */
 reason: string | null }
+/**
+ * One `revoke_phone_on_machine` outcome, as Settings reads it back
+ * (`ipc::commands::phone_revocation_status`) — the revoke-side counterpart of
+ * [`ProvisionState`].
+ */
+export type RevokeOutcome = 
+/**
+ * The daemon confirmed the token is gone (or was never authorized — `ok:true`
+ * either way).
+ */
+{ kind: "removed" } | 
+/**
+ * The daemon was unreachable right now, refused the removal, or is too old
+ * to understand `remove-phone` (see below) — in every one of these cases
+ * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
+ * retry the next time this machine is successfully contacted (see
+ * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * "genuinely could not reach it at all" case, so Settings can tell that
+ * apart from a business-logic refusal or an old daemon that answered but
+ * declined.
+ */
+{ kind: "queued" } | 
+/**
+ * The daemon answered `fd_detach` — too old to understand `remove-phone` at
+ * all. Still queued for retry (see `Queued`'s doc): a later `flightdeckd`
+ * update on that box makes the retry succeed for free.
+ */
+{ kind: "daemon_too_old" } | 
+/**
+ * The daemon answered `ok:false` — its own refusal, verbatim. Still queued
+ * for retry (see `Queued`'s doc): re-attempting a removal is idempotent, so
+ * queuing it even for a refusal that might be permanent costs nothing but
+ * an occasional extra ssh round trip.
+ */
+{ kind: "failed"; reason: string }
 /**
  * Outcome of a `rewind_files` request — the binary restoring the files it edited
  * since a given user message, from its own checkpoints. Also the shape of a
@@ -4112,6 +4862,91 @@ group: string | null; window: UsageWindow }
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
 export type SearchHit = { session_id: string; score: number; snippet: string }
+/**
+ * One `machine_diagnose` result — every field besides [`Self::state`]/
+ * [`Self::restart_pending`] is TRI-STATE (`Option<...>`): a missing/garbled marker in
+ * [`diagnose`]'s own accumulating script degrades to `None` ("unknown"), never a
+ * false `Some(false)` — see [`parse_diagnosis_fields`].
+ */
+export type ServerDiagnosis = { state: DiagnosisState; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+/**
+ * `true` only when BOTH versions are known and differ — an upload landed new
+ * bytes that the currently-running process hasn't picked up yet.
+ */
+restart_pending: boolean; reboot_safe: boolean | null; 
+/**
+ * The RAW `loginctl show-user -p Linger` marker — a sub-fact
+ * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
+ * (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
+ * `EnableLinger` summary can report "already enabled" precisely instead of a
+ * fixed claim (B11 review finding). Read unconditionally by [`diagnose_script`]
+ * regardless of [`installed_as`](Self::installed_as) — like
+ * [`sleep_masked`](Self::sleep_masked), it is meaningful only for a User-level
+ * install, but is never itself gated on that (never a false `Some(false)`
+ * manufactured for an install kind it doesn't apply to).
+ */
+linger: boolean | null; sleep_masked: boolean | null; 
+/**
+ * (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
+ * lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
+ * daemon started this way cannot resolve `claude` at all if it only lives in
+ * `~/.local/bin` (never on the unit's own minimal PATH). `None` when no user unit
+ * exists at all ([`InstalledAs`] isn't [`InstalledAs::User`]) — meaningless there,
+ * never a manufactured `Some(false)`, same discipline as
+ * [`sleep_masked`](Self::sleep_masked)/[`linger`](Self::linger). Read unconditionally
+ * by [`diagnose_script`] regardless of [`installed_as`](Self::installed_as).
+ * [`RepairAction::InstallService`] fixes it — re-running [`install::install_service`]
+ * against an already-User install re-renders (and overwrites) the unit file with
+ * [`crate::bootstrap::templates::render_user_unit`]'s current (PATH-including)
+ * template.
+ */
+user_unit_missing_path: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+/**
+ * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
+ * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
+ * by [`with_bundled_version`] AFTER [`diagnose`]'s ssh round trip, not inside
+ * [`parse_diagnosis_fields`] (which has no [`tauri::AppHandle`] to read it from —
+ * see the module doc's "`diagnose` / `repair`" section). `None` when this build has
+ * no daemon bundled at all (a fresh clone, no `pnpm daemon:build` ever run).
+ */
+bundled_daemon_version: string | null; 
+/**
+ * `true` only when BOTH [`Self::daemon_version_running`] and
+ * [`Self::bundled_daemon_version`] are known and the bundled one is strictly newer
+ * — the server needs [`RepairAction::ReuploadDaemon`] (then, once
+ * [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
+ * See [`daemon_is_outdated`].
+ */
+daemon_outdated: boolean }
+/**
+ * A `bootstrap::server_setup::start_claude_login` session recognized the remote
+ * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
+ * per session; a session that was ALREADY signed in never emits this (it jumps
+ * straight to [`ServerLoginResultEvent`]).
+ * 
+ * ⚠️ `session_id` (added for the B-finding #4 single-flight fix's own follow-up
+ * review) is what lets a listener tell THIS session apart from one it has already
+ * moved past for the same `machine_id` — at most one session is ever live per
+ * machine, but a just-superseded session's belated event can still arrive after a
+ * `restart_claude_login` replacement is already known. See `ClaudeSignInInline`'s and
+ * `claudeLoginSessions.ts`'s own filtering docs.
+ */
+export type ServerLoginPromptEvent = { session_id: string; machine_id: string; url: string }
+/**
+ * Terminal outcome of a `bootstrap::server_setup::start_claude_login` session:
+ * `ok: true` with `email` set on a confirmed sign-in, `ok: false` with `error`/`reason`
+ * set otherwise. Emitted for EVERY terminal [`LoginOutcome`] now, `Cancelled` included
+ * (see [`LoginResultReason`]'s own doc for why that changed) — a listener that
+ * initiated the cancel itself is expected to recognize `reason: "cancelled"` for ITS
+ * OWN session and render nothing for it, not have the backend stay silent.
+ * 
+ * ⚠️ `session_id` — see [`ServerLoginPromptEvent`]'s own doc: without it, a listener
+ * has no way to distinguish this session's OWN terminal event from a stale one
+ * belonging to a session it has already moved past (the exact "Restart sign-in"
+ * race a follow-up review of B-finding #4 caught: the just-superseded session's
+ * belated `superseded` result clobbering the brand-new session's state).
+ */
+export type ServerLoginResultEvent = { session_id: string; machine_id: string; ok: boolean; email: string | null; error: string | null; reason: LoginResultReason | null }
 /**
  * The Codex backend's subscription rate-limit % (5h + weekly windows) changed. Codex
  * pushes this over the live app-server (`account/rateLimits/updated`) — there is no
@@ -4332,7 +5167,17 @@ appControl: boolean;
 /**
  * Which Claude account to authenticate as; `None` = the default, un-scoped store.
  */
-claudeAccountId: string | null }
+claudeAccountId: string | null; 
+/**
+ * The conversation's CURRENT title (C9), so a REMOTE spawn's `attach --title`
+ * carries it from the very first attach — see
+ * [`crate::supervisor::transport::SpawnConfig::conversation_title`]. Ignored for
+ * a local conversation (Claude has no daemon-side title). The front omits this
+ * (or sends `None`) for a conversation that is still on its placeholder name, so
+ * an untitled conversation never stamps that placeholder as the daemon's
+ * authoritative title (see `spawn_session`'s wiring).
+ */
+conversationTitle: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -4393,6 +5238,21 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
+ * see the module doc's overview.
+ */
+export type StepId = "install_key" | "probe" | "install_claude" | "upload_daemon" | "run_init" | "install_service" | "escalate_persistence" | "claude_auth" | "add_machine" | "diagnose"
+/**
+ * One step's current/final state, as carried on [`BootstrapReport`] and (via
+ * [`StepState::to_wire`]) on every [`crate::ipc::events::BootstrapProgressEvent`].
+ */
+export type StepState = { id: StepId; status: StepStatus; detail: string | null }
+/**
+ * One step's status, as the brief specs it: `pending|running|ok|skipped|failed|
+ * needs_input`.
+ */
+export type StepStatus = "pending" | "running" | "ok" | "skipped" | "failed" | "needs_input"
 /**
  * What the two sub-agent env vars currently say, read straight from
  * `~/.claude/settings.json`.

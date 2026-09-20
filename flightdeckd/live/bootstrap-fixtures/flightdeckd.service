@@ -1,0 +1,16 @@
+[Unit]
+Description=Flight Deck server daemon (flightdeckd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=josty
+Environment=HOME=/home/josty
+Environment=PATH=/usr/local/bin:/home/josty/.local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/flightdeckd run
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

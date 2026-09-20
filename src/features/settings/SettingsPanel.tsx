@@ -9,10 +9,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
+import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, formatZoom, nextZoom, prevZoom } from "../../ui/zoom";
@@ -37,6 +39,7 @@ import { ComposerSection } from "./ComposerSection";
 import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
+import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -93,6 +96,7 @@ const DISPLAY_SUBS = [
   { id: "timing", label: "Durations", icon: "clock" },
   { id: "composer", label: "Composer", icon: "wand" },
   { id: "models", label: "Models", icon: "spark" },
+  { id: "ide", label: "IDE", icon: "ide" },
   { id: "order", label: "Order", icon: "reorder" },
 ] as const;
 
@@ -187,6 +191,11 @@ function SearchResults({
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const section = useSettingsUi((s) => s.section);
   const setSection = useSettingsUi((s) => s.setSection);
+  // Set by `ServerBootstrapWizard` while paused on a blocking `needs_input` (the
+  // sudo-password prompt) — see the store field's own doc. Non-null → closing must
+  // confirm first instead of silently abandoning that install.
+  const bootstrapGuard = useSettingsUi((s) => s.bootstrapGuard);
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
   // The Claude tab follows the last SUCCESSFUL status read: it appears on a positive
   // "logged in", goes away on a successful "signed out", and does NOT disappear on a
   // failed read — a Keychain hiccup must not evaporate a tab the user is standing in
@@ -239,7 +248,8 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   // preventDefaults Escape, so gating on `defaultPrevented` here would mean the panel
   // NEVER closes — that signal is now the guard's, not a "higher layer consumed it"
   // marker. One-Escape-one-layer is upheld instead by any ConfirmDialog mounted inside
-  // calling stopPropagation, so its Escape never reaches this window-level handler.
+  // calling stopPropagation, so its Escape never reaches this window-level handler
+  // (including the "close while a bootstrap install is paused" one rendered below).
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -250,12 +260,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
         setQuery("");
         return;
       }
-      close();
+      requestClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, busy, query]);
+  }, [open, busy, query, bootstrapGuard]);
 
   if (!open) return null;
 
@@ -272,14 +282,27 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
     }
   }
 
-  function close() {
-    if (busy) return;
+  /** Actually closes — bypasses the bootstrap-paused guard, since by the time this
+   *  runs the guard has either been cleared or the user already confirmed through it. */
+  function finishClose() {
+    setConfirmCloseOpen(false);
     setConfirming(false);
     onClose();
   }
 
+  /** Every close affordance (✕, Escape, the scrim) goes through this — never
+   *  `finishClose`/`onClose` directly — so none of them can bypass the confirm. */
+  function requestClose() {
+    if (busy) return;
+    if (bootstrapGuard) {
+      setConfirmCloseOpen(true);
+      return;
+    }
+    finishClose();
+  }
+
   return (
-    <div className={styles.scrim} onClick={close}>
+    <div className={styles.scrim} onClick={requestClose}>
       <div className={styles.panel} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal>
         <div className={styles.head}>
           <span className={styles.headIcon}>
@@ -297,7 +320,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               aria-label="Search settings"
             />
           </span>
-          <button className={styles.close} onClick={close} title="Close" aria-label="Close">
+          <button className={styles.close} onClick={requestClose} title="Close" aria-label="Close">
             ✕
           </button>
         </div>
@@ -404,6 +427,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 {displaySub === "timing" && <TimingPrefs />}
                 {displaySub === "composer" && <ComposerSection embedded />}
                 {displaySub === "models" && <ModelsSection embedded />}
+                {displaySub === "ide" && <IdePrefs />}
                 {displaySub === "order" && <OrderingPrefs />}
               </div>
             )}
@@ -541,6 +565,18 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmCloseOpen}
+        title="A server install is paused"
+        confirmLabel="Close anyway"
+        cancelLabel="Keep installing"
+        onCancel={() => setConfirmCloseOpen(false)}
+        onConfirm={finishClose}
+      >
+        {bootstrapGuard ?? "This server needs a sudo password to finish setting up."} Closing Settings now
+        abandons that install — you&apos;ll need to start over from Control → Remote.
+      </ConfirmDialog>
     </div>
   );
 }
@@ -565,6 +601,8 @@ function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
+  const sidebarStatePills = useDisplay((s) => s.sidebarStatePills);
+  const composerStatusBand = useDisplay((s) => s.composerStatusBand);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -580,6 +618,37 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+        />
+        <ToggleRow
+          title="Tinted conversation rows"
+          hint={
+            <>
+              In the sidebar, a conversation's state is <strong>the colour of its row</strong>:
+              green while it runs — with the working dots and the{" "}
+              <strong>time since your last message</strong> under its name — green-violet for
+              background work, amber when it needs you, blue to review, red on an error. Idle
+              and stopped conversations stay plain. Off → the classic status dot in front of
+              the name. <strong>On by default.</strong>
+            </>
+          }
+          checked={sidebarStatePills}
+          onChange={(v) => set({ sidebarStatePills: v })}
+          label="Show each conversation's state as its row colour"
+        />
+        <ToggleRow
+          title="Status inside the composer"
+          hint={
+            <>
+              “Conversation ended”, a question waiting for you, an error, background work: the
+              conversation's status shows as a <strong>band at the top of the composer</strong>,
+              whose border takes the state's colour, with <strong>Mark as seen</strong> (⌘↵)
+              and <strong>Continue</strong> right there. Off → the classic full-width bar
+              above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={composerStatusBand}
+          onChange={(v) => set({ composerStatusBand: v })}
+          label="Show the conversation's status inside the composer"
         />
         <ToggleRow
           title="Live workflow on the Flight Deck card"
@@ -620,6 +689,105 @@ function AppearancePrefs() {
   );
 }
 
+/** Bottom vs right for the IDE dock (Display → IDE → "Panel position"): the same "pick
+ *  one" shape as Caffeinate's mode and the minimap's hover mode, rendered through the
+ *  shared {@link OptionCardRail}. */
+const IDE_DOCK_POSITIONS: Array<{ id: DockPosition; label: string; desc: string }> = [
+  {
+    id: "bottom",
+    label: "Bottom",
+    desc: "Under the editor, like an IDE's terminal panel.",
+  },
+  {
+    id: "right",
+    label: "Right",
+    desc: "Beside the editor, as a right-hand margin — taller, better for reading a conversation.",
+  },
+];
+
+/** The "IDE" card of Display → IDE: the IDE view's own home. Holds the toggle that used
+ *  to sit in Appearance (unrelated to "how the app itself looks" — it is its own
+ *  feature), where its dock sits, and the hidden-file dimming it shares with the
+ *  conversation's side editor. `dockPosition` lives in the IDE store, not `useDisplay`
+ *  — see ideStore's `Layout` — because it is IDE layout, not a global display default. */
+function IdePrefs() {
+  const ideView = useDisplay((s) => s.ideView);
+  const explorerDimHidden = useDisplay((s) => s.explorerDimHidden);
+  const set = useDisplay((s) => s.set);
+  const dockPosition = useIdeStore((s) => s.dockPosition);
+  const setDockPosition = useIdeStore((s) => s.setDockPosition);
+  return (
+    <SettingsGroup title="IDE" icon="ide">
+      <ToggleRow
+        title="IDE view"
+        hint={
+          <>
+            A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
+            way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
+            <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
+            — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
+            buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
+            the tab and those buttons disappear; your open folders are kept for when you turn
+            it back on. <strong>On by default.</strong>
+          </>
+        }
+        checked={ideView}
+        onChange={(v) => set({ ideView: v })}
+        label="Show the IDE view"
+      />
+      {/* Not a ToggleRow: the IDE dock's own layout, not a display default, so it reads
+          from useIdeStore rather than useDisplay. Greyed out (rather than hidden) while
+          the IDE view is off — the reason lives in the always-visible note below, since a
+          disabled control's tooltip never shows. Guarding `onSelect` too: opacity + the
+          wrapper's `pointerEvents` block the mouse, but a Tab-focused card could still be
+          activated by the keyboard. */}
+      <div className={styles.modeBlock}>
+        <div className={styles.ttitle} style={ideView ? undefined : { opacity: 0.5 }}>
+          Panel position
+        </div>
+        <div
+          style={ideView ? undefined : { opacity: 0.5, pointerEvents: "none" }}
+          aria-disabled={ideView ? undefined : true}
+        >
+          <OptionCardRail
+            options={IDE_DOCK_POSITIONS}
+            selected={dockPosition}
+            onSelect={(id) => {
+              if (ideView) setDockPosition(id);
+            }}
+            ariaLabel="IDE dock position"
+          />
+        </div>
+        <div className={styles.note}>
+          {ideView ? (
+            <>
+              Can also be changed by dragging the grip at the left of the panel's header, or
+              with the button in that header.
+            </>
+          ) : (
+            <>Turn on “IDE view” above to change where the panel sits.</>
+          )}
+        </div>
+      </div>
+      <ToggleRow
+        title="Dim hidden files in the explorer"
+        hint={
+          <>
+            Fades every name starting with a dot (<code>.git</code>, <code>.claude</code>,{" "}
+            <code>.DS_Store</code>…) in the file explorer: paler text, a desaturated icon. The
+            entries stay <strong>listed and fully usable</strong> — they just stop competing
+            with the files you came for. Applies to <strong>every file tree</strong>: the IDE
+            view and the conversation's side editor. <strong>On by default.</strong>
+          </>
+        }
+        checked={explorerDimHidden}
+        onChange={(v) => set({ explorerDimHidden: v })}
+        label="Dim hidden files in the explorer"
+      />
+    </SettingsGroup>
+  );
+}
+
 /** The "Thread" card of Display → Thread: how the conversation itself reads. Every toggle
  *  here is a GLOBAL default — e.g. "clean output" folds each round's work behind a "Work"
  *  block, and a conversation's composer chip can still override its own. Rendered above
@@ -628,10 +796,12 @@ function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
+  const artifactsInApp = useDisplay((s) => s.artifactsInApp);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -677,6 +847,22 @@ function ThreadPrefs() {
           checked={showLastMessagePreview}
           onChange={(v) => set({ showLastMessagePreview: v })}
           label="Preview of the last sent message"
+        />
+        <ToggleRow
+          title="Conversation side panel"
+          hint={
+            <>
+              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
+              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
+              so the header only holds actions. Open or close it with its header button or{" "}
+              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              above the composer. Off → the previous layout: those chips in the header and the
+              composer, the todo list above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={conversationSidePanel}
+          onChange={(v) => set({ conversationSidePanel: v })}
+          label="Show the conversation side panel"
         />
         <ToggleRow
           title="Message minimap"
@@ -738,6 +924,22 @@ function ThreadPrefs() {
           checked={clickableFileMentions}
           onChange={(v) => set({ clickableFileMentions: v })}
           label="Make the filename on Read/Write rows clickable"
+        />
+        <ToggleRow
+          title="Show hosted artifacts in Flight Deck"
+          hint={
+            <>
+              Opens an artifact&apos;s <strong>claude.ai page</strong> in the side panel instead of
+              the browser — the only way to see a <strong>Claude Design</strong> (or any other
+              typed) artifact in the app, and the fallback when an artifact&apos;s local file is
+              gone. The first time, sign in to claude.ai inside the panel.{" "}
+              <strong>On by default.</strong> Off → those open in the browser; HTML/Markdown
+              artifacts with a local file still preview in the app.
+            </>
+          }
+          checked={artifactsInApp}
+          onChange={(v) => set({ artifactsInApp: v })}
+          label="Show claude.ai-hosted artifacts in the side panel"
         />
       </SettingsGroup>
 
@@ -952,9 +1154,25 @@ function TimingPrefs() {
   const showModelTime = useDisplay((s) => s.showModelTime);
   const showThinkingTime = useDisplay((s) => s.showThinkingTime);
   const showToolTime = useDisplay((s) => s.showToolTime);
+  const sidebarRowTimer = useDisplay((s) => s.sidebarRowTimer);
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Durations & timing" icon="clock">
+      <ToggleRow
+        title="Time on sidebar rows"
+        hint={
+          <>
+            On a conversation's row in the sidebar, next to the working dots: a{" "}
+            <strong>live counter</strong> while the agent works, then the time{" "}
+            <strong>frozen</strong> on how long the turn took once it stops on a state
+            (ready to review, a question, an error). Off → the dots alone. Needs{" "}
+            “Tinted conversation rows” (Appearance). <strong>On by default.</strong>
+          </>
+        }
+        checked={sidebarRowTimer}
+        onChange={(v) => set({ sidebarRowTimer: v })}
+        label="Show the time on conversation rows"
+      />
       <ToggleRow
         title="Turn duration"
         hint={

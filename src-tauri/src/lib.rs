@@ -1,6 +1,13 @@
 pub mod accounts;
 pub mod agentspend;
 pub mod appmcp;
+pub mod artifact_host;
+// Unix-only: `mkfifo`/process-group signalling/SSH have no Windows equivalent, and
+// nothing outside this module (no IPC command yet) needs it to exist cross-platform —
+// unlike e.g. `power/mod.rs`, which stubs itself per-OS because the front calls its
+// commands regardless of platform.
+#[cfg(unix)]
+pub mod bootstrap;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
@@ -47,7 +54,7 @@ use ipc::commands::{
     codex_load_history, codex_marketplace_add, codex_marketplace_remove,
     codex_marketplace_upgrade, codex_plugin_contents,
     codex_set_mcp_enabled, codex_set_plugin_enabled, codex_set_skill_enabled,
-    path_exists, ping, prime_history_index, publish_control_event,
+    path_exists, ping, prime_history_index, publish_control_event, push_remote_conversation_title,
     read_dir, read_file, read_image,
     read_task_output_file,
     refresh_plugin_marketplaces, reload_plugins,
@@ -63,22 +70,33 @@ use ipc::commands::{
     tosse_link_project_repo, tosse_live_start, tosse_live_stop,
     tosse_login_start, tosse_logout, tosse_project_repos,
     tosse_repo_links, tosse_set_project_status,
-    tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
+    tosse_set_task_assignee, tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url,
+    tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
-    remote_status, set_remote,
+    remote_status, set_remote, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
+    artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
+    artifact_host_set_bounds,
+    artifact_host_show,
     add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
+use bootstrap::connect::bootstrap_forget_host_key;
+use bootstrap::orchestrator::{
+    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
+    ServerLocks,
+};
+use bootstrap::server_setup::{cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
 use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    TerminalExitEvent, TerminalOutputEvent, TickEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -114,6 +132,11 @@ fn seed_remote_demo_if_requested(store: &store::Store) {
         user,
         identity_file,
         added_at: now,
+        addresses: Vec::new(),
+        daemon_mac_id: None,
+        daemon_relay_url: None,
+        daemon_label: None,
+        phone_provisioned_at: None,
     };
     if let Err(e) = store.upsert_machine(&machine) {
         eprintln!("[seed] failed to upsert remote demo machine: {e}");
@@ -219,6 +242,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_web_url,
             tosse_task_detail,
             tosse_set_task_status,
+            tosse_set_task_assignee,
             tosse_set_project_status,
             tosse_create_task,
             fetch_slash_commands,
@@ -322,6 +346,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             list_remote_dir,
             prepare_remote_dir,
             upsert_conversation,
+            push_remote_conversation_title,
             delete_conversation,
             set_active_conversation,
             wipe_all_data,
@@ -344,6 +369,25 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            phone_provisioning_status,
+            phone_revocation_status,
+            retry_phone_provisioning,
+            start_claude_login,
+            restart_claude_login,
+            submit_claude_login_code,
+            cancel_claude_login,
+            bootstrap_forget_host_key,
+            bootstrap_server,
+            bootstrap_resume,
+            bootstrap_cancel,
+            machine_diagnose,
+            machine_repair,
+            artifact_host_show,
+            artifact_host_set_bounds,
+            artifact_host_hide,
+            artifact_host_reload,
+            artifact_host_close,
+            artifact_host_open_claude_url,
         ])
         .events(collect_events![
             TickEvent,
@@ -368,6 +412,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             TerminalExitEvent,
             AppControlRequestEvent,
             WakeWordEvent,
+            ServerLoginPromptEvent,
+            ServerLoginResultEvent,
+            HostKeyFingerprintEvent,
+            BootstrapProgressEvent,
+            artifact_host::ArtifactHostEvent,
         ])
 }
 
@@ -621,6 +670,30 @@ pub fn run() {
         // The wake-word detector: sole owner of the always-on mic capture +
         // on-device inference. An Arc so a blocking `apply` can run off-thread.
         .manage(std::sync::Arc::new(wake::WakeController::new()))
+        // In-flight server-side `claude auth login` drives (bootstrap::server_setup).
+        // An Arc so `start_claude_login`'s spawned actor can hold it beyond the
+        // spawning command's own lifetime.
+        .manage(std::sync::Arc::new(bootstrap::server_setup::LoginSessions::new()))
+        // In-flight / paused B11 bootstrap-pipeline runs (`bootstrap_server`/
+        // `bootstrap_resume`/`bootstrap_cancel`). An Arc for the same reason as
+        // `LoginSessions` just above.
+        .manage(std::sync::Arc::new(BootstrapSessions::new()))
+        // B_lifecycle-#7: per-server serialization for `bootstrap_server`/
+        // `bootstrap_resume`/`machine_repair` — an Arc so a `ServerLockGuard` can
+        // outlive the spawning command's own lifetime across a paused pipeline run.
+        .manage(std::sync::Arc::new(ServerLocks::new()))
+        // C10: last known phone-provisioning outcome per paired daemon, for
+        // Settings' per-server status row. An Arc so the background hooks
+        // (`add_machine`, `set_remote`) can record into it after their spawning
+        // command has already returned.
+        .manage(std::sync::Arc::new(appmcp::provision::ProvisionRegistry::new()))
+        // Same idea, revoke-side (C10's critical fix): last known outcome of
+        // forgetting the OLD phone token per daemon, populated by `set_remote`'s
+        // regenerate-pairing sweep.
+        .manage(std::sync::Arc::new(appmcp::provision::RevokeRegistry::new()))
+        // The in-app claude.ai artifact host: the one native child webview the artifact viewer
+        // lays over the side region (created lazily, on the first hosted artifact shown).
+        .manage(artifact_host::ArtifactHost::new())
         .setup(move |app| {
             use tauri::Manager;
 
@@ -698,16 +771,44 @@ pub fn run() {
             // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
             // on a normal run (env vars unset).
             seed_remote_demo_if_requested(&store);
+            // Sweep orphaned SSH pairing keys left under ssh_keys/ by an abandoned
+            // pairing attempt (pre-A3 leak: `server-<uuid>` / `{slug}-{uuid}` files
+            // never claimed nor cleaned up — 7+ existed on Armand's machine). Runs once
+            // per app launch, here rather than gated per-call, since this is the
+            // earliest point the store (and so the referenced-key set) is open.
+            // `load_state` failing degrades to "skip the sweep entirely" (fail-safe —
+            // see `sweep_orphan_ssh_keys`), never to blocking startup — but, unlike a
+            // bare `.ok()`, the real error is logged first (mirrors the
+            // `backfill_last_activity` handling right above), so a genuine store-read
+            // failure (corrupt table, locked db, …) leaves a diagnostic trail instead
+            // of silently disabling the sweep.
+            let machines_for_sweep = match store.load_state() {
+                Ok(s) => Some(s.machines),
+                Err(e) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
+                    None
+                }
+            };
+            ipc::commands::sweep_orphan_ssh_keys(
+                &data_dir.join("ssh_keys"),
+                machines_for_sweep.as_deref(),
+            );
             app.manage(store);
 
-            // App-control hub: install its front outlet, then start the voice
-            // bridge if it was left enabled (the honest outcome — including a
-            // failed bind — lands in `voice_bridge_status` for the Settings UI).
+            // App-control hub: install its front outlet AND its revocation sink
+            // (C10's critical fix — `relay::connect_once` clears a queued phone
+            // revocation only once it has actually sent that frame, so the sink
+            // must be installed before `apply_remote` below can ever connect),
+            // then start the voice bridge if it was left enabled (the honest
+            // outcome — including a failed bind — lands in `voice_bridge_status`
+            // for the Settings UI).
             {
                 let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
-                hub.set_sink(std::sync::Arc::new(ipc::events::AppControlEmitter {
+                let emitter = std::sync::Arc::new(ipc::events::AppControlEmitter {
                     app: app.handle().clone(),
-                }));
+                });
+                hub.set_sink(emitter.clone());
+                hub.set_revocation_sink(emitter);
                 let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
@@ -785,6 +886,20 @@ pub fn run() {
                 // the child also self-terminates via `-w <pid>` if we somehow don't reach
                 // here — see `power::Caffeinate::hold`.)
                 let _ = app_handle.state::<power::Caffeinate>().set_awake(false);
+                // Cancel every in-flight server-side claude sign-in, so quitting Flight
+                // Deck never leaves the local ssh process — and the remote `claude auth
+                // login` it's driving, possibly still blocked on the "paste code" prompt
+                // — orphaned. Bounded the same way the session/Codex teardowns below are.
+                let login_sessions = app_handle
+                    .state::<std::sync::Arc<bootstrap::server_setup::LoginSessions>>();
+                tauri::async_runtime::block_on(async {
+                    login_sessions.cancel_all().await;
+                    let deadline = Duration::from_secs(6);
+                    let start = Instant::now();
+                    while !login_sessions.is_empty().await && start.elapsed() < deadline {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
                 let sessions = app_handle.state::<Sessions>();
                 let handles = sessions.handles();
                 if !handles.is_empty() {

@@ -10,6 +10,254 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+/// One discovered candidate address for a paired server — as printed in the pairing
+/// ticket's `addresses` array (see the "1 · Run this once on your server" command in
+/// `RemoteServersGroup`, `ControlSection.tsx`) or typed by hand. `Public` is reserved
+/// for a future discovery step (e.g. a public IP behind NAT) — nothing populates it
+/// yet, but the wire shape carries it so a later change is additive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressKind {
+    Tailscale,
+    Lan,
+    Public,
+    Manual,
+}
+
+/// See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AddressCandidate {
+    pub kind: AddressKind,
+    pub value: String,
+}
+
+/// Reject an address value that would be unsafe or meaningless to hand to `ssh` as
+/// part of `user@<value>`: empty (nothing to connect to), containing whitespace or a
+/// control character (never a valid hostname/IP — most likely a paste mistake), or
+/// starting with `-` (would be parsed as an `ssh` OPTION rather than the destination —
+/// e.g. a crafted `-oProxyCommand=...` value achieving arbitrary command execution).
+/// Pure and side-effect-free.
+///
+/// Enforced at TWO points so a future write path can't silently reintroduce the
+/// injection class this closes just by skipping one of them: the IPC boundary
+/// (`ipc::commands::add_machine` checks every probe candidate BEFORE any `ssh`
+/// process is even spawned) and the persistence boundary that actually owns the
+/// invariant (`super::db::Store::upsert_machine` checks `host`/`addresses` again
+/// right before writing the row).
+pub fn validate_address_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("A server address cannot be empty.".to_string());
+    }
+    if value.starts_with('-') {
+        return Err(format!("Invalid address \"{value}\": cannot start with \"-\"."));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "Invalid address \"{value}\": cannot contain whitespace or control characters."
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an SSH login name that would be unsafe to hand to `ssh` — the `user` half of
+/// [`validate_address_value`]'s own `user@host` injection class (CRM holistic-review
+/// blocker #3, chantier A `bd7ca709`): unlike `host`, `user` was never validated at
+/// all before this — a value such as `-oProxyCommand=<cmd>` makes the WHOLE
+/// `user@host` destination argument start with `-`, so the LOCAL OpenSSH client
+/// parses it as an option and runs `<cmd>` on this Mac. `user` is not only ever typed
+/// by a human either: a pairing ticket (`fdpair:<base64 json>`, see
+/// `ControlSection.tsx::parseTicket`) is SERVER-PRINTED, so a hostile or compromised
+/// server can hand back a ticket that pre-fills a malicious `user` and executes code
+/// locally the moment "Test & pair" runs.
+///
+/// Deliberately WHITELIST-based (every other validator in this crate up to now is a
+/// blacklist over a free-form string) rather than merely "doesn't start with `-`":
+/// `ssh -l <user> -- <host>` (see the builders this feeds — `ipc::commands::
+/// push_ssh_destination`) already keeps `user` out of the single positional
+/// `user@host` argument a leading `-` could hijack, but a login name has no business
+/// containing shell/ssh metacharacters (`@`, `:`, `/`, whitespace) either, and a
+/// whitelist is the only rule that can't be bypassed by a delimiter this function's
+/// author didn't think of. Allows the POSIX portable username charset
+/// (`[A-Za-z0-9._-]`) plus an optional single trailing `$` (Samba/Active-Directory
+/// machine accounts, e.g. `WORKGROUP$`, a real-world login-name shape this app should
+/// not refuse). Bounded at 64 characters — generous for any real login name, but
+/// bounded all the same (`useradd`'s own historical `LOGIN_NAME_MAX`-adjacent limit).
+/// Pure and side-effect-free, mirroring [`validate_address_value`]'s own contract.
+///
+/// Enforced at every entry point an SSH user can arrive through (never just one — see
+/// the review finding this closes): `ipc::commands::add_machine`, the bootstrap
+/// orchestrator's `bootstrap_server`/`bootstrap_resume` request (before ANY ssh is
+/// spawned), `bootstrap::connect`'s first-contact commands, `super::db::Store::
+/// upsert_machine` (the persistence boundary — last line of defense), `spawn_session`'s
+/// `RemoteTarget` construction, and re-asserted again inside every ssh-argv builder
+/// itself (`ipc::commands::push_ssh_destination`, `bootstrap::askpass::
+/// bootstrap_ssh_command`, `supervisor::transport::{Transport::spawn, run_remote_stop,
+/// push_remote_title}`) so a future caller that forgets to validate upstream still
+/// can't spawn anything built from an unchecked value.
+pub fn validate_ssh_user(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("An SSH user name cannot be empty.".to_string());
+    }
+    if value.chars().count() > 64 {
+        return Err(format!("Invalid SSH user \"{value}\": longer than 64 characters."));
+    }
+    if value.starts_with('-') {
+        return Err(format!("Invalid SSH user \"{value}\": cannot start with \"-\"."));
+    }
+    // A single optional trailing `$` (Samba/AD machine-account shape) is stripped
+    // before the charset check below applies to the rest.
+    let body = value.strip_suffix('$').unwrap_or(value);
+    if body.is_empty() {
+        return Err(format!(
+            "Invalid SSH user \"{value}\": must have characters before a trailing \"$\"."
+        ));
+    }
+    if !body.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err(format!(
+            "Invalid SSH user \"{value}\": only letters, digits, \".\", \"_\", \"-\" (and an \
+             optional trailing \"$\") are allowed."
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an SSH port outside the valid TCP range — `port` is a `u16` at every Rust
+/// boundary already (structurally 0..=65535), but a value parsed from an untrusted
+/// STRING before it ever becomes one (the wizard/legacy forms' own `Number(port)`, a
+/// pairing ticket's `t.port`) can still be `0`, which is never a real listener and
+/// which `Number("")` / a garbled ticket both coerce to via `|| 22`-style fallbacks on
+/// the front end — mirrored here so a caller reading a raw string has ONE place to
+/// check it before it is even parsed into the `u16` every `#[tauri::command]` boundary
+/// already narrows to. Pure.
+pub fn validate_ssh_port(value: u16) -> Result<(), String> {
+    if value == 0 {
+        return Err("Port must be between 1 and 65535.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ssh_validation_tests {
+    use super::*;
+
+    // ---- validate_ssh_user — the exploit strings the CRM holistic review named,
+    // plus the legitimate shapes this function must NOT refuse. Mirrored in
+    // `src/features/settings/sshValidation.test.ts` (TS side of the same rule). ----
+
+    #[test]
+    fn rejects_the_option_injection_exploit_string() {
+        let err = validate_ssh_user("-oProxyCommand=touch /tmp/pwned")
+            .expect_err("a value starting with '-' must never be accepted as a user name");
+        assert!(err.contains('-'), "the error should mention the offending value: {err}");
+    }
+
+    #[test]
+    fn rejects_a_short_option_exploit_string() {
+        assert!(validate_ssh_user("-F/etc/x").is_err());
+    }
+
+    #[test]
+    fn rejects_a_leading_space() {
+        assert!(validate_ssh_user(" user").is_err());
+    }
+
+    #[test]
+    fn rejects_an_embedded_space() {
+        assert!(validate_ssh_user("a b").is_err());
+    }
+
+    #[test]
+    fn rejects_an_at_sign() {
+        // `root@evil` would smuggle a second `@`-hop into the `user@host` positional
+        // argument even once `user` itself is delivered via `-l` — never allowed.
+        assert!(validate_ssh_user("root@evil").is_err());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_ssh_user("").is_err());
+    }
+
+    #[test]
+    fn rejects_65_characters() {
+        let user = "a".repeat(65);
+        assert!(validate_ssh_user(&user).is_err());
+    }
+
+    #[test]
+    fn accepts_64_characters() {
+        let user = "a".repeat(64);
+        assert!(validate_ssh_user(&user).is_ok());
+    }
+
+    #[test]
+    fn rejects_unicode() {
+        assert!(validate_ssh_user("josé").is_err());
+    }
+
+    #[test]
+    fn rejects_a_control_character() {
+        assert!(validate_ssh_user("user\tname").is_err());
+        assert!(validate_ssh_user("user\nname").is_err());
+    }
+
+    #[test]
+    fn rejects_a_colon() {
+        assert!(validate_ssh_user("user:pw").is_err());
+    }
+
+    #[test]
+    fn rejects_a_slash() {
+        assert!(validate_ssh_user("user/name").is_err());
+    }
+
+    #[test]
+    fn accepts_ordinary_login_names() {
+        for u in ["deploy", "josty", "root"] {
+            assert!(validate_ssh_user(u).is_ok(), "{u} should be a valid user name");
+        }
+    }
+
+    #[test]
+    fn accepts_a_dotted_login_name() {
+        assert!(validate_ssh_user("first.last").is_ok());
+    }
+
+    #[test]
+    fn accepts_underscores_and_hyphens_not_leading() {
+        assert!(validate_ssh_user("svc_build-2").is_ok());
+    }
+
+    #[test]
+    fn accepts_a_trailing_dollar_machine_account() {
+        assert!(validate_ssh_user("WORKGROUP$").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_bare_dollar_sign() {
+        assert!(validate_ssh_user("$").is_err());
+    }
+
+    #[test]
+    fn rejects_a_dollar_sign_in_the_middle() {
+        assert!(validate_ssh_user("wo$rk").is_err());
+    }
+
+    // ---- validate_ssh_port ----
+
+    #[test]
+    fn rejects_port_zero() {
+        assert!(validate_ssh_port(0).is_err());
+    }
+
+    #[test]
+    fn accepts_ordinary_ports() {
+        assert!(validate_ssh_port(22).is_ok());
+        assert!(validate_ssh_port(65535).is_ok());
+        assert!(validate_ssh_port(1).is_ok());
+    }
+}
+
 /// A remote host (a "server") reached over SSH, on which repos can live and their
 /// conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
 /// the connection coordinates so a user adds a server from the UI without editing any
@@ -20,7 +268,10 @@ pub struct MachineRecord {
     pub id: String,
     /// Human label shown in the UI (e.g. "my-vps").
     pub label: String,
-    /// Hostname or IP reachable from this Mac.
+    /// Hostname or IP reachable from this Mac. The address pairing (or the user)
+    /// confirmed as WORKING — the one [`super::db::Store::upsert_machine`] persists
+    /// after a successful probe, and what `RemoteTarget` connects with today (see
+    /// `supervisor::transport`).
     pub host: String,
     /// SSH port (usually 22).
     pub port: u16,
@@ -32,6 +283,47 @@ pub struct MachineRecord {
     pub identity_file: Option<String>,
     /// Unix ms timestamp the server was added.
     pub added_at: i64,
+    /// Every address candidate pairing discovered (or the user typed) for this server
+    /// — Tailscale name, LAN IP, hostname, … — including `host` itself. Carried for a
+    /// later task (A6) to rotate through on a failed reconnect; today only `host` is
+    /// actually dialed. Defaults to an empty `Vec` for a pre-migration row or one whose
+    /// stored JSON fails to decode — never an error, since a missing/corrupt address
+    /// list must degrade to "just `host`", not break the machine (see
+    /// [`super::db::Store::machine_by_id`]).
+    #[serde(default)]
+    pub addresses: Vec<AddressCandidate>,
+    /// This node's relay identity, straight off `flightdeckd whoami` — mirrors
+    /// [`crate::bootstrap::server_setup::ServerIdentity::mac_id`] so a result from that
+    /// probe can be stored directly, no reshaping. `None` until a `flightdeckd init` /
+    /// `whoami` round trip has succeeded for this machine (every machine paired before
+    /// the daemon flow existed, and any machine whose `whoami` hasn't run yet). By
+    /// convention, only [`super::db::Store::set_machine_daemon_identity`] populates
+    /// this field — [`super::db::Store::upsert_machine`]'s COALESCE keeps a `None`
+    /// there from erasing it, but nothing in the type system stops a caller from
+    /// constructing a record with this field set and passing it to `upsert_machine`
+    /// directly; every existing caller (add/rename/probe) just happens to pass `None`.
+    #[serde(default)]
+    pub daemon_mac_id: Option<String>,
+    /// This node's relay URL, straight off `flightdeckd whoami` — mirrors
+    /// [`crate::bootstrap::server_setup::ServerIdentity::relay_url`]. Same write/`None`
+    /// convention as [`Self::daemon_mac_id`].
+    #[serde(default)]
+    pub daemon_relay_url: Option<String>,
+    /// The label the daemon itself was initialized with (`flightdeckd init --label
+    /// …`), straight off `flightdeckd whoami` — mirrors
+    /// [`crate::bootstrap::server_setup::ServerIdentity::label`]. Deliberately a
+    /// SEPARATE field from [`Self::label`] (the human-facing name Flight Deck shows for
+    /// this server): the two can drift, and this one exists to compare against /
+    /// display what the daemon believes its own identity is. Same write/`None`
+    /// convention as [`Self::daemon_mac_id`].
+    #[serde(default)]
+    pub daemon_label: Option<String>,
+    /// Unix ms timestamp the phone (mobile relay) was provisioned for this server, or
+    /// `None` if it never has been. By convention, populated only by
+    /// [`super::db::Store::set_machine_phone_provisioned_at`] — same non-erasure
+    /// convention as the `daemon_*` fields above.
+    #[serde(default)]
+    pub phone_provisioned_at: Option<i64>,
 }
 
 /// A working folder a conversation can be opened in.

@@ -28,6 +28,7 @@ import { CardContext } from "./CardContext";
 import { CardGoal } from "./CardGoal";
 import { useFlightdeckModal } from "./flightdeckModalStore";
 import { boxOf } from "./modalZoom";
+import { dropZoneAttrs, useIsDropOver } from "../conversation/fileDrop";
 
 /** Relative "last activity" stamp — "14 min ago" / "2 h ago". `now` comes from
  *  the grid's shared ticker so idle/off cards advance without a per-card timer. */
@@ -56,6 +57,7 @@ export function StreamCard({
   const dot = agentStatusToDot(status);
   const attn = rowAttention(status);
   const openModal = useFlightdeckModal((s) => s.open);
+  const dropOver = useIsDropOver(conv.id, "card");
   // A few-word summary of the user's LAST message (live-only, this run). Complements
   // the activity line: it says what YOU last asked, not what the agent is doing now.
   const lastMsg = useLastMessageSummary(conv.id);
@@ -134,6 +136,10 @@ export function StreamCard({
       // by then the deck may have reordered or scrolled, so the box captured at open time
       // is only the fallback.
       data-conv-id={conv.id}
+      // Files dragged from the Finder onto the card attach to this conversation and open
+      // its reply modal (see fileDrop.ts / FileDropHost).
+      {...dropZoneAttrs(conv.id, "card")}
+      data-drop-over={dropOver || undefined}
       onClick={onCardClick}
       onClickCapture={guardReorderClick}
       {...listeners}

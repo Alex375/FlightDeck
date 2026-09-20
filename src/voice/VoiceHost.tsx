@@ -21,19 +21,28 @@ import type { View } from "../ui/shortcuts";
 
 export function VoiceHost({
   changeView,
+  currentView,
   tosseAvailable,
 }: {
   changeView: (view: View) => void;
+  /** The view on screen — same injection as AppControlHost, so "open that file" asked by
+   *  voice lands where the user is looking. */
+  currentView: View;
   tosseAvailable: boolean;
 }) {
   const changeViewRef = useRef(changeView);
   changeViewRef.current = changeView;
+  const currentViewRef = useRef(currentView);
+  currentViewRef.current = currentView;
   const tosseRef = useRef(tosseAvailable);
   tosseRef.current = tosseAvailable;
 
   useEffect(() => {
     const helpers: AppControlHelpers = {
       changeView: (view) => changeViewRef.current(view),
+      get currentView() {
+        return currentViewRef.current;
+      },
       get tosseAvailable() {
         return tosseRef.current;
       },

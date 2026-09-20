@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::process::{Child, ChildStderr, ChildStdin, Command};
+use tokio::sync::{mpsc, Notify};
 
 use super::protocol::CliMessage;
 
@@ -92,6 +92,18 @@ pub struct SpawnConfig {
     /// the first spawn; the session actor fills it from the daemon's
     /// `fd_attach` handshake to reconnect after a drop without losing stream.
     pub attach: Option<AttachPoint>,
+    /// The conversation's CURRENT title, threaded to a REMOTE daemon's `attach --title`
+    /// (C9) so it has a real name from the very first spawn instead of sitting on
+    /// `""`/its own placeholder until a rename explicitly pushes one (see
+    /// `ipc::commands::push_remote_conversation_title`). Ignored locally (Claude has no
+    /// daemon-side title to set) and ignored remotely too unless the paired machine's
+    /// `flightdeckd` is new enough (gated in `ipc::commands::spawn_session`, exactly
+    /// like [`AttachPoint::supports_skip`] — an older daemon's clap REJECTS the unknown
+    /// `--title` flag outright, so this must never be guessed). Blank/`None` omits the
+    /// flag entirely (see [`build_remote_command`]) — the daemon's own title (an earlier
+    /// authoritative rename, or its ai-title backfill for a still-untitled one) is left
+    /// alone rather than being overwritten with an empty string.
+    pub conversation_title: Option<String>,
     /// WHICH Claude account this session runs on. The default slot contributes no
     /// environment at all, so a single-account setup spawns byte-for-byte as before.
     ///
@@ -107,14 +119,26 @@ pub struct SpawnConfig {
 }
 
 /// Where to resume a remote attach stream: the daemon-side conversation, the
-/// claude-process epoch, and how many replayable lines this client has already
-/// received in that epoch (the cursor). See flightdeckd `frames.rs` — the
+/// claude-process epoch, and the reattach cursor — the wire POSITION (not a
+/// raw count) this client can prove it has fully received in that epoch, i.e.
+/// every replayable line up to and including that point either parsed or was
+/// explicitly given up on (see `session.rs::reattach_cursor_delta`, which
+/// composes it; never a bare `lines_seen`). See flightdeckd `frames.rs` — the
 /// replay-eligibility predicate ([`is_replayable_line`]) is a shared contract.
 #[derive(Debug, Clone, Default)]
 pub struct AttachPoint {
     pub conversation: Option<String>,
     pub epoch: Option<String>,
     pub cursor: u64,
+    /// Opt into the daemon's reattach-replay compaction (D6): the client can prove it
+    /// tracks `fd_skip{from,to}` frames instead of a literal replay of every line, so
+    /// [`build_remote_command`] appends `--supports-skip`. Decided ONCE, before the
+    /// FIRST spawn, from a cached per-machine version probe (`ipc::commands::
+    /// supports_skip_for_machine`) — an older daemon's clap REJECTS the unknown flag
+    /// outright, so this must never be guessed or flipped mid-session; every
+    /// reconnect for the same session carries the SAME value forward (see
+    /// `session.rs::run_actor`). Default `false`: the unchanged, pre-D6 wire.
+    pub supports_skip: bool,
 }
 
 /// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
@@ -139,6 +163,19 @@ pub struct RemoteTarget {
     /// remote PATH). Defaults to `"flightdeckd"`. The daemon resolves `claude`
     /// itself, server-side.
     pub daemon_bin: String,
+    /// Every candidate address for this server, `host` always FIRST (see
+    /// `ipc::commands::remote_target_addresses`), that [`super::session::run_actor`]'s
+    /// address-rotation policy (A6) rotates `host` through on a sustained reconnect
+    /// failure. Never empty, even for a paired-before-A5 machine with no recorded
+    /// candidates: that case falls back to the single known-good `host` (and A6's
+    /// rotation never fires, since there is nothing else to try).
+    pub addresses: Vec<String>,
+    /// The [`super::super::store::MachineRecord::id`] this target was built from, so a
+    /// SUCCESSFUL address rotation (A6) can report which machine's `host` to persist
+    /// back to. `None` for every test/fixture `RemoteTarget` that names no real
+    /// machine row — rotation still works (it only mutates `host` in memory for this
+    /// session), it just never emits a persist signal with nothing to key it by.
+    pub machine_id: Option<String>,
 }
 
 impl SpawnConfig {
@@ -158,6 +195,7 @@ impl SpawnConfig {
             allow_bypass_permissions: false,
             remote: None,
             attach: None,
+            conversation_title: None,
             // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
             claude_account: crate::accounts::AccountSlot::default_slot(),
         }
@@ -169,6 +207,31 @@ fn default_claude_bin() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("claude"))
 }
+
+/// The `ssh` binary a remote spawn execs. `$TOSSE_SSH_BIN` first — a test-only
+/// escape hatch mirroring `$TOSSE_CLAUDE_BIN` (see [`default_claude_bin`]), so a
+/// test can point a remote launch at a fake script (e.g. one that exits 127 to
+/// simulate a missing `flightdeckd`) without mutating `$PATH` — else the bare
+/// `"ssh"` resolved on `PATH`, exactly as before. Never set in production.
+fn resolve_ssh_bin() -> String {
+    std::env::var("TOSSE_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
+}
+
+/// Serialises EVERY test in the crate that mutates the process-wide `TOSSE_SSH_BIN`
+/// env var [`resolve_ssh_bin`] reads — shared across `transport::tests` (which spawns
+/// [`push_remote_title`]/[`run_remote_stop`] directly) AND `session::tests` (which
+/// drives real reconnects through the SAME env var via `run_actor`'s remote spawns),
+/// so their tests can never race each other's mutation of the ONE real process
+/// environment, even though the default test runner runs different modules'
+/// tests concurrently on different threads. A single, crate-visible lock — NOT two
+/// independent per-module ones — is the only way two different modules' tests can
+/// serialise against a variable neither of them owns exclusively; a std `Mutex`
+/// that panics while held gets POISONED, and each module's fake-ssh scripts are
+/// exercised often enough that two independent locks silently let one module's
+/// `set_var` stomp the other's mid-test (a real bug this fixes, not a hypothetical
+/// one — see the C9 task report).
+#[cfg(test)]
+pub(crate) static SSH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build the `claude` argv (everything after the binary) from a [`SpawnConfig`].
 /// Shared verbatim by the local and remote launchers: the SAME flags must run
@@ -233,16 +296,42 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
     a
 }
 
+/// Resolve `daemon_bin` into the POSIX-sh fragment [`build_remote_command`] (and
+/// [`run_remote_stop`]) `exec`s, searching the remote host in the SAME order
+/// `commands::probe_remote`'s script checks it in — `PATH` (as a non-interactive ssh
+/// shell sees it), then the two common non-PATH install spots, `~/.local/bin` and
+/// `/usr/local/bin` — so a passing probe is a genuine guarantee the later `attach`
+/// finds the same binary. Before this, the probe searched all three spots but the
+/// actual attach bare-`exec`'d `daemon_bin` with NO fallback, relying purely on PATH:
+/// a server with `flightdeckd` only under `~/.local/bin` (not on a non-interactive
+/// ssh shell's default PATH on Debian/Ubuntu) would pass pairing and then fail on the
+/// very first attach.
+///
+/// Applies ONLY to a bare name (the default `"flightdeckd"`, or any
+/// `TOSSE_REMOTE_FLIGHTDECKD_BIN` override without a `/`): an explicit path is used
+/// exactly as given, unsearched — mirroring [`resolve_bin`]'s local "an explicit path
+/// wins outright" rule. The bare name itself is shell-quoted throughout, so an
+/// unusual (but slash-free) override can't break the surrounding script.
+fn resolve_remote_daemon_bin(daemon_bin: &str) -> String {
+    // Delegates to the crate's ONE shared resolver (`ipc::commands::
+    // resolve_daemon_bin_expr`, B11's unification of what used to be four
+    // independent copies of this same search) — kept as a thin, locally-named
+    // wrapper so every existing call site / test in this module stays unchanged.
+    crate::ipc::commands::resolve_daemon_bin_expr(daemon_bin)
+}
+
 /// Build the single POSIX-sh command `ssh` runs on the remote host: `exec
 /// flightdeckd attach …`. The DAEMON owns the `claude` process server-side
 /// (spawning it with the argv passed after `--` if it isn't already running,
 /// env included) and bridges this ssh channel to it — replaying everything the
 /// client missed since [`AttachPoint::cursor`]. Every interpolated value is
 /// single-quote-escaped, so remote paths/args with spaces or metacharacters are
-/// safe.
+/// safe. `daemon_bin` itself goes through [`resolve_remote_daemon_bin`] rather than a
+/// bare `exec`, so this genuinely finds `flightdeckd` wherever `commands::probe_remote`
+/// found it — see that function's doc comment.
 fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String]) -> String {
     let attach = cfg.attach.clone().unwrap_or_default();
-    let mut s = format!("exec {} attach", shell_quote(&remote.daemon_bin));
+    let mut s = format!("exec {} attach", resolve_remote_daemon_bin(&remote.daemon_bin));
     s.push_str(&format!(" --cwd {}", shell_quote(&cfg.cwd.to_string_lossy())));
     if let Some(resume) = &cfg.resume {
         s.push_str(&format!(" --resume-session {}", shell_quote(resume)));
@@ -254,6 +343,25 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
         s.push_str(&format!(" --epoch {}", shell_quote(epoch)));
     }
     s.push_str(&format!(" --cursor {}", attach.cursor));
+    // Opt into fd_skip reattach-replay compaction (D6) — ONLY when the gate in
+    // `ipc::commands::supports_skip_for_machine` already confirmed the daemon's
+    // version accepts it. An older daemon's clap REJECTS an unknown flag outright
+    // (the whole attach fails), so this is never speculative.
+    if attach.supports_skip {
+        s.push_str(" --supports-skip");
+    }
+    // C9: the conversation's title, ONLY through `shell_quote` and joined with `=`
+    // (never a separate token) — `--title '-foo'` would let clap parse `-foo` as a
+    // new flag instead of the value; `--title='-foo'` cannot be misread that way
+    // regardless of what the title starts with. Blank/`None` omits the flag so an
+    // untitled conversation never overwrites the daemon's own title (its ai-title
+    // backfill, or an earlier authoritative rename) with nothing.
+    if let Some(title) = cfg.conversation_title.as_deref() {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            s.push_str(&format!(" --title={}", shell_quote(trimmed)));
+        }
+    }
     s.push_str(" --");
     for arg in args {
         s.push(' ');
@@ -270,7 +378,7 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
 /// command ran and exited 0; failures are logged, never surfaced (the session
 /// is already torn down locally).
 pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_ssh_bin());
     cmd.arg("-T")
         .arg("-p")
         .arg(remote.port.to_string())
@@ -286,9 +394,26 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     if let Some(identity) = &remote.identity_file {
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     }
-    cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(format!(
+    // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
+    // manual DB edit) must not reach a real ssh spawn here — degrade to the SAME
+    // "failed" outcome an unreachable host already reports, never a crash or a spawn
+    // built from it (CRM holistic-review blocker #3, chantier A `bd7ca709`). The `Err`
+    // is deliberately discarded (never interpolated into the log line): it is
+    // `validate_ssh_user`/`validate_address_value`'s own message, which embeds the raw
+    // offending value verbatim — printing it into this process's stderr would reopen a
+    // terminal-escape-injection surface on the very value this validator exists to
+    // neutralize (a hostile pairing ticket can carry ANSI/OSC bytes in `user`/`host`).
+    // Same discipline as `TransportError::InvalidRemoteTarget`'s own `Display` impl.
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] remote stop refused an invalid user/host — this server's saved \
+             connection details failed validation; remove and re-add it."
+        );
+        return false;
+    }
+    cmd.arg(format!(
         "exec {} stop --conversation {}",
-        shell_quote(&remote.daemon_bin),
+        resolve_remote_daemon_bin(&remote.daemon_bin),
         shell_quote(conversation),
     ));
     cmd.stdin(Stdio::null())
@@ -305,6 +430,187 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
             false
         }
     }
+}
+
+/// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
+/// record (C9), for a rename that happens while this Mac is NOT the one driving the
+/// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
+/// `--title` as an `attach` flag (see `flightdeckd/src/attach.rs`/`main.rs`) — so
+/// this borrows `attach` itself for a bounded, ONE-SHOT ssh
+/// round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
+/// success/failure — never a persistent bridge like a real live session).
+///
+/// The title write happens SYNCHRONOUSLY on the daemon's side, in its connection
+/// handler, strictly BEFORE it ever writes back the `fd_attach` acknowledgement (see
+/// `attach.rs::handle_conn`) — but that acknowledgement itself is NOT a reliable
+/// success signal to wait on: it is only queued once the daemon's actor reaches
+/// `on_attach`, which for the ONLY case this function is ever used for — an IDLE
+/// conversation — means cold-starting `claude --resume <id>` first, a spawn
+/// LIVE-VERIFIED (m1 fixture, C9 task) to sometimes take many seconds or never
+/// complete at all, while the title write itself never waits on it. See the grace
+/// window's doc on the read below for exactly how this is handled. This never sends
+/// `fd_stop` (that would ALSO stop the remote `claude` process, which a mere title
+/// push has no business doing). `--cursor` is set to `u64::MAX` purely defensively
+/// (see [`build_remote_command`]'s doc — without a matching `--epoch` it can never
+/// actually be honoured, but there's no reason to send a false "start from nothing"
+/// bound either).
+///
+/// ⚠️ SAFETY (caller contract): only call this when THIS Mac holds no live session for
+/// the conversation — `on_attach` on the daemon UNCONDITIONALLY `detach_current
+/// ("replaced", …)`s whoever is CURRENTLY attached, and `"replaced"` is a TERMINAL
+/// [`super::session`]`::reconnect_policy_for_reason` here: stealing this Mac's own
+/// live link out from under itself would kill it (until the conversation is reopened)
+/// rather than merely rename it. A live session's own next reattach already carries
+/// the current title forward (see [`SpawnConfig::conversation_title`]), so skipping
+/// this while live loses nothing. That liveness check is front-end-only state
+/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here.
+///
+/// ⚠️ KNOWN LIMITATION: a conversation the daemon has no RUNNING actor for right now
+/// still triggers the daemon's normal cold-start (`--resume-session`) as a side effect
+/// of merely attaching — a real, if mild, side effect (a resumed but message-less
+/// `claude` process left running server-side) this helper does not eliminate. A
+/// dedicated, title-only `set-title` verb (no session semantics at all) is the clean
+/// fix; see the C9 task report for the precise ask.
+pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
+    if title.trim().is_empty() {
+        return false;
+    }
+    let mut cmd = Command::new(resolve_ssh_bin());
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = &remote.known_hosts_file {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(identity) = &remote.identity_file {
+        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
+    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
+    // `Err` is discarded rather than logged (it embeds the raw offending value).
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] remote title push refused an invalid user/host — this server's \
+             saved connection details failed validation; remove and re-add it."
+        );
+        return false;
+    }
+    cmd.arg(format!(
+        "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
+        resolve_remote_daemon_bin(&remote.daemon_bin),
+        shell_quote(session_id),
+        shell_quote(cwd),
+        shell_quote(title.trim()),
+        u64::MAX,
+    ));
+    // ⚠️ LOAD-BEARING, live-verified: stdin must stay OPEN, never `Stdio::null()`. A
+    // null stdin puts ssh's local side at EOF instantly, which it forwards to the
+    // remote channel right away — `attach_client`'s stdin pump then closes its
+    // write-half to the daemon's unix socket almost immediately, and against a real
+    // daemon this consistently raced the daemon's own client-gone handling ahead of
+    // it ever sending anything: the reply (built and queued correctly — the title
+    // write itself, per the doc above, had ALREADY landed by then) was silently
+    // never flushed, and our read saw a clean EOF with zero bytes. Piping stdin
+    // instead and simply never writing to (or dropping) it keeps ssh's local side
+    // from ever signalling EOF, so the daemon gets the normal amount of time a real
+    // client would.
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[transport] remote title push failed to launch ssh: {e}");
+            return false;
+        }
+    };
+    // Held for the rest of this function so its pipe write-end stays open (see the
+    // doc above) — dropped only at the very end, alongside tearing the child down.
+    let _stdin_open = child.stdin.take();
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return false;
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    // Race three outcomes:
+    //  - a reply line arrives: an `fd_detach` is a real failure, anything else
+    //    (normally `fd_attach`) a real success;
+    //  - a CLEAN EOF (0 bytes, no error) with no line ever arriving: read as
+    //    SUCCESS, not failure, PROVIDED the child hasn't already exited non-zero
+    //    — see the load-bearing note below AND the `Ok(0)` arm's own comment
+    //    (a same-instant ssh connection failure closes its stdout pipe at
+    //    essentially the same instant it exits non-zero, so a bare EOF cannot
+    //    be trusted on its own without checking the child's exit status first);
+    //  - the ssh CHILD exits on its own before either: its own exit status is
+    //    the verdict (a connection-level failure — daemon down, host
+    //    unreachable, auth refused — makes `attach_client` return `Err` and the
+    //    process exit non-zero);
+    //  - none of the above within `ACK_GRACE`: the daemon's write is already
+    //    durable by then regardless (see the doc above), so this is read as
+    //    success too — never a timeout-as-failure the way a naive "wait for the
+    //    ack" read would.
+    // ⚠️ LOAD-BEARING, live-verified against a real daemon (m1 fixture, C9 task):
+    // resuming an IDLE conversation — the ONLY case this function is ever used
+    // for — cold-starts `claude --resume <id>` server-side. Against the real
+    // daemon this consistently produced a clean, fast (well under `ACK_GRACE`)
+    // EOF with ZERO bytes and no `fd_attach` ever sent — yet a `flightdeckd
+    // status` check straight after showed the title HAD landed every single
+    // time. The title write is a plain SQL statement run synchronously in the
+    // connection handler the instant `manager.attach()` returns — it does not
+    // wait on the daemon ever managing to reply, and neither does this. An
+    // earlier version of this function read a clean EOF (and a timeout) as
+    // failure — a false negative on a write that had, provably, already landed.
+    const ACK_GRACE: Duration = Duration::from_secs(3);
+    // How long to wait, right after observing a clean EOF, for the child's exit
+    // status to become available before falling back to the optimistic "still
+    // alive" reading. This is NOT a general grace window (see `ACK_GRACE` above)
+    // — it exists purely to disambiguate a same-instant EOF from a same-instant
+    // process exit; see the `Ok(0)` arm below.
+    const EOF_REAP_GRACE: Duration = Duration::from_millis(200);
+    let ok = tokio::select! {
+        res = reader.read_line(&mut first_line) => match res {
+            Ok(0) => {
+                // A clean EOF with zero bytes does NOT by itself mean success: a
+                // real connection failure (bad host/port/key, daemon down) makes
+                // ssh exit non-zero writing nothing to stdout (stderr is
+                // `Stdio::null()`), and closing a process's stdout pipe happens
+                // essentially AT process exit — so this branch and the sibling
+                // `child.wait()` branch below can become ready at the same
+                // instant, and `tokio::select!` would otherwise pick one at
+                // random (verified: ~50% false-positive "success" on a child
+                // that exits 1 with no output). Disambiguate by checking whether
+                // the child has ALREADY exited: if it has, its exit status is
+                // authoritative (mirrors the `child.wait()` branch's verdict,
+                // just reached from the other future); only when the child is
+                // still alive — the genuine "daemon accepted the attach, wrote
+                // the title, but `claude --resume` hasn't replied yet" case this
+                // redesign targets — does EOF read as the documented optimistic
+                // success.
+                match tokio::time::timeout(EOF_REAP_GRACE, child.wait()).await {
+                    Ok(status) => matches!(status, Ok(s) if s.success()),
+                    Err(_) => true,
+                }
+            }
+            Ok(_) => !first_line.contains("\"type\":\"fd_detach\""),
+            Err(_) => false,
+        },
+        status = child.wait() => matches!(status, Ok(s) if s.success()),
+        _ = tokio::time::sleep(ACK_GRACE) => true,
+    };
+    // Tear the ssh process down explicitly (never `fd_stop`) rather than relying on
+    // `kill_on_drop`'s best-effort background reap — same "no orphans" discipline as
+    // every other process this crate spawns.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    ok
 }
 
 /// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
@@ -481,6 +787,14 @@ pub enum TransportError {
     /// there. Kept distinct from [`Spawn`] because a missing cwd and a missing
     /// binary both surface as `NotFound`, and the two need different fixes.
     CwdMissing(std::path::PathBuf),
+    /// A remote (SSH) spawn's [`RemoteTarget::user`]/`.host` failed
+    /// [`crate::store::validate_ssh_user`]/[`crate::store::validate_address_value`] —
+    /// a `MachineRecord` on disk that predates that validator (an older app version,
+    /// or a manual DB edit), surfaced here so it never silently vanishes or crashes:
+    /// the machine stays listed, and any attempt to connect gets this clear, typed,
+    /// actionable error instead (CRM holistic-review blocker #3, chantier A
+    /// `bd7ca709`).
+    InvalidRemoteTarget(String),
     /// The writer channel is closed — the session is gone.
     Closed,
 }
@@ -505,6 +819,10 @@ impl std::fmt::Display for TransportError {
                  Its worktree may have been removed, or the folder moved.",
                 p.display(),
             ),
+            TransportError::InvalidRemoteTarget(_) => write!(
+                f,
+                "This server's saved user name is not valid — remove and re-add it.",
+            ),
             TransportError::Closed => write!(f, "claude session transport is closed"),
         }
     }
@@ -525,13 +843,45 @@ pub struct Transport {
     pumps: Vec<tokio::task::JoinHandle<()>>,
     /// Last N stderr lines, for surfacing the cause of an abnormal exit.
     stderr_tail: StderrTail,
+    /// Fired by `stderr_loop` right after it hits EOF (buffers one permit if
+    /// nobody is waiting yet, so this can never be missed). Lets a caller that
+    /// just reaped the child via [`Self::wait_status`] wait for the stderr
+    /// pump to have actually drained the pipe before reading
+    /// [`Self::stderr_tail`] — otherwise the two race (see
+    /// [`Self::wait_stderr_drained`]).
+    stderr_done: Arc<Notify>,
     /// Set if the stdout reader ended on an IO error (vs a clean EOF).
     reader_err: ErrSlot,
     /// Set if the stdin writer died on a write/flush/serialize failure.
     writer_err: ErrSlot,
-    /// Count of REPLAYABLE stdout lines received (see [`is_replayable_line`]) —
-    /// the reattach cursor for remote sessions. Always 0-based per transport.
+    /// Count of REPLAYABLE stdout lines successfully parsed and forwarded (see
+    /// [`is_replayable_line`]) — the reattach cursor for remote sessions. Always
+    /// 0-based per transport. ⚠️ Deliberately excludes a replayable line that
+    /// failed to parse (see [`Self::unparseable_replayable`]): counting it here
+    /// would tell the daemon we received a message we actually dropped, so it
+    /// would never be replayed again — permanently lost.
     lines_seen: Arc<AtomicU64>,
+    /// Count of REPLAYABLE stdout lines that failed `serde_json` parsing this
+    /// connection (excluded from [`Self::lines_seen`] on purpose — see there).
+    /// The session actor watches this across reconnects to bound how long it
+    /// keeps asking the daemon to replay something it can never parse.
+    unparseable_replayable: Arc<AtomicU64>,
+    /// `lines_seen`'s value at the moment the FIRST unparseable replayable line
+    /// hit this connection — i.e. how many replayable lines were successfully
+    /// parsed strictly BEFORE it. `u64::MAX` means no failure yet this
+    /// connection. ⚠️ Load-bearing for the reattach cursor: `lines_seen()`
+    /// alone is a raw success COUNT, not the daemon's wire POSITION, so it
+    /// silently overtakes an earlier unparsed line whenever later lines in the
+    /// SAME connection parse fine (session.rs's cursor math must roll back to
+    /// this offset instead — see `run_actor`).
+    first_unparseable_offset: Arc<AtomicU64>,
+    /// Set once by `reader_loop` when an `fd_skip{from,to}` frame's `from` did not
+    /// match this connection's recorded wire position (see [`apply_fd_skip`]) — a
+    /// protocol violation the daemon should never produce. `None` once
+    /// [`Self::take_skip_violation`] has consumed it (or nothing has gone wrong).
+    /// Surfaced by the session actor as a single `protocol_error` notice — see
+    /// `session.rs::run_actor`.
+    skip_violation: Arc<Mutex<Option<String>>>,
     /// Whether this transport is an ssh→flightdeckd attach stream (drives the
     /// `fd_stop` escalation in [`Transport::shutdown`]).
     is_remote: bool,
@@ -558,7 +908,7 @@ impl Transport {
             // are the ssh channel, so the reader/writer/stderr pumps below are reused
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
-            let mut cmd = Command::new("ssh");
+            let mut cmd = Command::new(resolve_ssh_bin());
             cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
                 .arg("-p")
                 .arg(remote.port.to_string())
@@ -585,7 +935,14 @@ impl Transport {
                 // authentication failures" when the agent holds many keys).
                 cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
             }
-            cmd.arg(format!("{}@{}", remote.user, remote.host)).arg(remote_cmd);
+            // The live session spawn itself — the MOST load-bearing entry point (CRM
+            // holistic-review blocker #3, chantier A `bd7ca709`): a `MachineRecord`
+            // that predates `validate_ssh_user` (older app version, manual DB edit)
+            // must never reach an actual ssh spawn built from its raw `user`/`host`.
+            if let Err(e) = crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host) {
+                return Err(TransportError::InvalidRemoteTarget(e));
+            }
+            cmd.arg(remote_cmd);
             cmd
         } else {
             // Local: a conversation whose cwd has vanished (e.g. its worktree was
@@ -641,14 +998,26 @@ impl Transport {
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Value>();
 
         let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX)));
+        let stderr_done: Arc<Notify> = Arc::new(Notify::new());
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let writer_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable_replayable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable_offset: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let pumps = vec![
-            tokio::spawn(reader_loop(stdout, msg_tx, reader_err.clone(), lines_seen.clone())),
+            tokio::spawn(reader_loop(
+                stdout,
+                msg_tx,
+                reader_err.clone(),
+                lines_seen.clone(),
+                unparseable_replayable.clone(),
+                first_unparseable_offset.clone(),
+                skip_violation.clone(),
+            )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
-            tokio::spawn(stderr_loop(stderr, stderr_tail.clone())),
+            tokio::spawn(stderr_loop(stderr, stderr_tail.clone(), stderr_done.clone())),
         ];
 
         Ok((
@@ -658,9 +1027,13 @@ impl Transport {
                 child,
                 pumps,
                 stderr_tail,
+                stderr_done,
                 reader_err,
                 writer_err,
                 lines_seen,
+                unparseable_replayable,
+                first_unparseable_offset,
+                skip_violation,
                 is_remote: cfg.remote.is_some(),
             },
             msg_rx,
@@ -672,6 +1045,38 @@ impl Transport {
     /// the daemon's `replay_from` base).
     pub fn lines_seen(&self) -> u64 {
         self.lines_seen.load(Ordering::Relaxed)
+    }
+
+    /// How many replayable stream lines this connection could NOT be parsed
+    /// (and so are missing from [`Self::lines_seen`]). The session actor uses
+    /// this to bound retrying a line it can never parse across reconnects —
+    /// see `session.rs::malformed_replay_step`.
+    pub fn unparseable_replayable(&self) -> u64 {
+        self.unparseable_replayable.load(Ordering::Relaxed)
+    }
+
+    /// How many replayable lines this connection parsed successfully BEFORE
+    /// the first one it could not — `None` if every replayable line so far
+    /// has parsed. This is the true rollback point for a reattach: unlike
+    /// [`Self::lines_seen`] (a raw success count), it does not creep forward
+    /// when later lines in the same connection happen to parse fine, so the
+    /// session actor can ask the daemon to replay starting right before the
+    /// line it lost instead of skipping past it — see `session.rs::run_actor`.
+    pub fn first_unparseable_offset(&self) -> Option<u64> {
+        match self.first_unparseable_offset.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            n => Some(n),
+        }
+    }
+
+    /// Take (and clear) a one-time note that this connection received an `fd_skip`
+    /// frame whose `from` did not match our recorded wire position — see
+    /// [`apply_fd_skip`]. `None` on every call after the first (or when nothing has
+    /// gone wrong this connection). The session actor polls this whenever it wakes up
+    /// to process the next inbound message and, if `Some`, surfaces it as a single
+    /// `protocol_error` notice — see `session.rs::run_actor`.
+    pub fn take_skip_violation(&self) -> Option<String> {
+        self.skip_violation.lock().ok().and_then(|mut g| g.take())
     }
 
     /// OS process id, while the child is alive.
@@ -686,6 +1091,20 @@ impl Transport {
             .lock()
             .map(|b| b.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Wait (bounded) for `stderr_loop` to have drained the pipe to EOF, so a
+    /// [`Self::stderr_tail`] read right after this reflects EVERYTHING the
+    /// process wrote before exiting. Without this, a caller that just reaped
+    /// the child via [`Self::wait_status`] and immediately calls
+    /// `stderr_tail()` races the independent pump task — in practice `wait`
+    /// only resolves once the OS has already delivered SIGCHLD, which gives
+    /// the pump (a much cheaper buffered read) ample opportunity to finish
+    /// first, but nothing GUARANTEES it. Bounded so a stuck pump (should
+    /// never happen — the pipe closes with the process) can never hang the
+    /// caller; on the happy path this returns almost instantly.
+    pub async fn wait_stderr_drained(&self) {
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.stderr_done.notified()).await;
     }
 
     /// The stdout reader's terminal IO error, if it ended on one (vs a clean EOF).
@@ -821,13 +1240,53 @@ impl Transport {
 /// Read stdout as newline-delimited JSON. Each non-empty line is parsed into a
 /// [`CliMessage`]; parse failures are logged and skipped, never fatal (spec
 /// §2.1). Ends when the stream closes or the consumer drops the receiver.
-async fn reader_loop(
-    stdout: ChildStdout,
+///
+/// Generic over the reader so this can be driven by a [`tokio::io::duplex`] half
+/// in tests, not just a real [`ChildStdout`].
+///
+/// ⚠️ `lines_seen` is incremented ONLY on a successful parse — see its doc on
+/// [`Transport`] for why counting an unparseable line there would silently and
+/// permanently drop it. A replayable line that fails to parse instead bumps
+/// `unparseable_replayable`, so the actor knows to ask the daemon to replay it
+/// again on the next reattach (and to bound that across reconnects — see
+/// `session.rs::malformed_replay_step`), and — the FIRST time only this
+/// connection — stamps `first_unparseable_offset` with `lines_seen`'s value at
+/// that moment, so a reattach can roll back to right before it even if MORE
+/// replayable lines go on to parse fine afterward (see
+/// `Transport::first_unparseable_offset`'s doc for why that distinction
+/// matters).
+///
+/// D6: an `fd_skip{from,to}` frame is intercepted HERE, never forwarded through
+/// `tx` — it folds `to-from+1` replayable lines straight into `lines_seen`
+/// (see [`apply_fd_skip`]) instead of being individually re-parsed, and a
+/// mismatch against the connection's recorded position is recorded once in
+/// `skip_violation` for the session actor to surface.
+///
+/// ⚠️ `fd_skip{from,to}` is in the DAEMON's session-absolute seq space (the same
+/// numbering as `fd_attach.replay_from`), while `lines_seen` is always 0-based
+/// PER CONNECTION (reset by every `Transport::spawn`, including every
+/// reconnect — see its doc). Reconciling the two requires this connection's own
+/// `attach_base`: the `replay_from` carried by the `fd_attach` frame the daemon
+/// always sends first on a remote attach stream (a local, non-remote session
+/// never sees `fd_attach`/`fd_skip` at all, so `attach_base` simply stays `0`
+/// and every check below degrades to the pre-D6, connection-relative-only math).
+/// Captured HERE, from the live wire message, rather than threaded in from
+/// `SpawnConfig` — the daemon's actual `replay_from` is the authoritative base,
+/// not the cursor we merely asked to resume from.
+async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
     tx: mpsc::UnboundedSender<CliMessage>,
     reader_err: ErrSlot,
     lines_seen: Arc<AtomicU64>,
+    unparseable_replayable: Arc<AtomicU64>,
+    first_unparseable_offset: Arc<AtomicU64>,
+    skip_violation: Arc<Mutex<Option<String>>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
+    // This connection's absolute base (see the doc above) — learned from the
+    // FIRST `fd_attach` frame it receives, `0` until then (and forever, for a
+    // local session or a remote one that never gets one).
+    let mut attach_base: u64 = 0;
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
@@ -835,18 +1294,67 @@ async fn reader_loop(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if is_replayable_line(trimmed) {
-                    lines_seen.fetch_add(1, Ordering::Relaxed);
-                }
+                let replayable = is_replayable_line(trimmed);
                 match serde_json::from_str::<CliMessage>(trimmed) {
+                    Ok(CliMessage::FdSkip(skip)) => {
+                        // D6: fold the skipped range directly into this connection's
+                        // position counter — `fd_skip` itself is never replayable (the
+                        // `fd_` prefix excludes it, like `fd_attach`/`fd_detach`) and is
+                        // NEVER forwarded to the UI (there is nothing for the assembler
+                        // to render). See `apply_fd_skip`'s doc for the invariant.
+                        let current = lines_seen.load(Ordering::Relaxed);
+                        let (new_position, violation) =
+                            apply_fd_skip(attach_base, current, skip.from, skip.to);
+                        lines_seen.store(new_position, Ordering::Relaxed);
+                        if violation {
+                            let expected = attach_base + current + 1;
+                            let note = format!(
+                                "server sent fd_skip{{from:{}, to:{}}} but this connection \
+                                 expected the next replayable seq to be {expected} \
+                                 (attach_base {attach_base} + position {current}) — \
+                                 resyncing to relative position {new_position}",
+                                skip.from, skip.to
+                            );
+                            eprintln!("[transport] {note}");
+                            if let Ok(mut slot) = skip_violation.lock() {
+                                if slot.is_none() {
+                                    *slot = Some(note);
+                                }
+                            }
+                        }
+                    }
                     Ok(msg) => {
+                        if let CliMessage::FdAttach(attach) = &msg {
+                            // Learn this connection's absolute base from the daemon's
+                            // own claim, BEFORE any `fd_skip` on this connection can
+                            // arrive (the daemon always sends `fd_attach` first).
+                            attach_base = attach.replay_from;
+                        }
+                        if replayable {
+                            lines_seen.fetch_add(1, Ordering::Relaxed);
+                        }
                         if tx.send(msg).is_err() {
                             break; // consumer gone
                         }
                     }
                     Err(e) => {
+                        if replayable {
+                            unparseable_replayable.fetch_add(1, Ordering::Relaxed);
+                            // Stamp the rollback point once, on the FIRST failure
+                            // this connection: `lines_seen` right now is exactly
+                            // "successes strictly before this line". A later
+                            // success must not move this — that is the whole
+                            // point of tracking it separately from `lines_seen`.
+                            let _ = first_unparseable_offset.compare_exchange(
+                                u64::MAX,
+                                lines_seen.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
                         eprintln!(
-                            "[transport] skipping unparseable stdout line: {e}: {}",
+                            "[transport] skipping unparseable {} stdout line: {e}: {}",
+                            message_type_hint(trimmed),
                             truncate(trimmed, 160)
                         );
                     }
@@ -864,6 +1372,59 @@ async fn reader_loop(
             }
         }
     }
+}
+
+/// Pure step function applying one `fd_skip{from,to}` frame (D6) to a connection's
+/// replayable-line position counter (mirrors [`Transport::lines_seen`]) — kept
+/// separate from [`reader_loop`] so the invariant is unit-testable without a live
+/// transport.
+///
+/// `from`/`to` are in the DAEMON's session-absolute seq space (same numbering as
+/// `fd_attach.replay_from` — see the flightdeckd sibling repo's `session.rs`/
+/// `replay.rs`), while `current` (and the returned `new_position`) are this
+/// connection's own 0-based [`Transport::lines_seen`]. `attach_base` — this
+/// connection's own `fd_attach.replay_from`, `0` if none was ever seen — bridges
+/// the two spaces: the absolute position this connection has actually reached is
+/// `attach_base + current`, so the daemon's next skip is only valid when
+/// `attach_base + current + 1 == from` (⚠️ NOT `current + 1 == from` — that bare
+/// form is only correct by coincidence when `attach_base` happens to be `0`, i.e.
+/// the very first attach of a session; every later reattach has a nonzero base,
+/// which is precisely when a skip actually fires in practice).
+///
+/// The daemon is contractually supposed to only ever skip a well-formed range
+/// (`to >= from`) starting exactly where our reported position left off. That
+/// should never fail, but a client that blindly trusted it anyway would silently
+/// corrupt its reattach cursor forever after a single dropped/reordered/malformed
+/// frame, so this verifies it instead of assuming it:
+///   - match (`attach_base + current + 1 == from` AND `to >= from`): the whole
+///     range is absorbed — `new_position = to - attach_base` (back in this
+///     connection's relative space; equivalently `current + (to - from + 1)`).
+///   - mismatch (bad `from`, OR a matching `from` with an inverted `to < from`):
+///     still resync to the daemon's own claim, converted into this connection's
+///     relative space (`to.saturating_sub(attach_base)`), so a transient
+///     disagreement cannot wedge the connection forever repeating the same
+///     mismatch, but NEVER move backwards — `current.max(...)` — a stale,
+///     reordered, or (for the inverted-range case) nonsensical `to` behind where
+///     we already are must not un-count lines we already have.
+///
+/// Returns `(new_position, violation)`; the caller surfaces `violation` as a one-time
+/// `protocol_error` notice (see [`Transport::take_skip_violation`]).
+fn apply_fd_skip(attach_base: u64, current: u64, from: u64, to: u64) -> (u64, bool) {
+    if attach_base + current + 1 == from && to >= from {
+        (to - attach_base, false)
+    } else {
+        (current.max(to.saturating_sub(attach_base)), true)
+    }
+}
+
+/// Best-effort `"type"` field of an unparseable line, for the skip log —
+/// pulled with a generic `Value` parse (which tolerates a shape `CliMessage`
+/// itself rejected) so the log names WHAT we dropped, not just that we did.
+fn message_type_hint(line: &str) -> String {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Drain the outbound queue onto stdin, one full JSON line at a time, flushing
@@ -904,7 +1465,10 @@ async fn writer_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Valu
 /// Forward the child's stderr to our log AND keep a bounded tail of it, so an
 /// abnormal exit (auth failure, panic, MCP error) can surface its cause in the UI
 /// instead of being lost to a Finder-launched bundle's invisible stderr.
-async fn stderr_loop(stderr: ChildStderr, tail: StderrTail) {
+///
+/// Notifies `done` once the pipe hits EOF, so [`Transport::wait_stderr_drained`]
+/// can be sure the tail is complete before a caller reads it.
+async fn stderr_loop(stderr: ChildStderr, tail: StderrTail, done: Arc<Notify>) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if !line.trim().is_empty() {
@@ -917,6 +1481,7 @@ async fn stderr_loop(stderr: ChildStderr, tail: StderrTail) {
             }
         }
     }
+    done.notify_one();
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -989,9 +1554,10 @@ mod tests {
     }
 
     /// The remote command hands the session to the server's daemon: `exec
-    /// flightdeckd attach` with the reattach coordinates, then the claude argv
-    /// after `--` (the daemon spawns claude with it when the session is cold).
-    /// Everything shell-quoted.
+    /// $(… flightdeckd lookup …) attach` with the reattach coordinates, then the
+    /// claude argv after `--` (the daemon spawns claude with it when the session is
+    /// cold). Everything shell-quoted; the daemon binary itself is resolved via
+    /// [`resolve_remote_daemon_bin`] (checked separately below), not a bare name.
     #[test]
     fn build_remote_command_execs_flightdeckd_attach() {
         let mut cfg = SpawnConfig::new("/work/demo");
@@ -1004,9 +1570,12 @@ mod tests {
             identity_file: None,
             known_hosts_file: None,
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
         };
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
-        assert!(cmd.starts_with("exec 'flightdeckd' attach"), "cmd was: {cmd}");
+        assert!(cmd.starts_with("exec $(FLIGHTDECKD_NAME='flightdeckd'"), "cmd was: {cmd}");
+        assert!(cmd.contains(") attach"), "the resolved-bin substitution feeds `attach`: {cmd}");
         assert!(cmd.contains("--cwd '/work/demo'"));
         assert!(cmd.contains("--resume-session 'sid-123'"));
         assert!(cmd.contains("--cursor 0"));
@@ -1019,11 +1588,133 @@ mod tests {
             conversation: Some("conv-1".into()),
             epoch: Some("ep-1".into()),
             cursor: 42,
+            supports_skip: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
         assert!(cmd.contains("--epoch 'ep-1'"));
         assert!(cmd.contains("--cursor 42"));
+        assert!(!cmd.contains("--supports-skip"), "must not opt in unless asked: {cmd}");
+
+        // Asking opts in — the flag rides at the end of the reattach coordinates,
+        // before the claude argv separator.
+        cfg.attach = Some(AttachPoint {
+            conversation: Some("conv-1".into()),
+            epoch: Some("ep-1".into()),
+            cursor: 42,
+            supports_skip: true,
+        });
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
+
+        // C9: an unset/blank title omits the flag entirely (never overwrite the
+        // daemon's own title with an empty string).
+        assert!(!cmd.contains("--title"), "no title set: {cmd}");
+        cfg.conversation_title = Some("   ".into());
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(!cmd.contains("--title"), "a blank title must still omit the flag: {cmd}");
+
+        // A real title rides `=`-joined and shell-quoted, right after the reattach
+        // coordinates and before the claude argv separator.
+        cfg.conversation_title = Some("My Feature".into());
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains("--title='My Feature'"), "cmd was: {cmd}");
+        assert!(cmd.find("--title=").unwrap() < cmd.find(" -- ").unwrap(), "title precedes claude argv: {cmd}");
+    }
+
+    /// C9 regression: `--title` MUST be `=`-joined (never a separate token) so a title
+    /// starting with `-` can never be misparsed as a new flag by clap — and every
+    /// interpolated value must survive a REAL POSIX shell's parsing of the whole
+    /// composed command byte-for-byte, since that is exactly what `ssh` hands the
+    /// remote shell. Runs the built command through a real local `sh -c`, with the
+    /// resolved "daemon binary" replaced by a tiny script that just echoes back the
+    /// `--title=` value verbatim (no trailing newline, so even a title that itself
+    /// ends in whitespace round-trips exactly).
+    #[cfg(unix)]
+    #[test]
+    fn build_remote_command_title_survives_a_real_shell_round_trip() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-quote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let echo_title = dir.join("echo-title.sh");
+        fs::write(
+            &echo_title,
+            r#"#!/bin/sh
+for a; do
+    case "$a" in
+        --title=*) printf '%s' "${a#--title=}" ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&echo_title, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            // An EXPLICIT path (contains '/') is used unsearched — see
+            // `resolve_remote_daemon_bin`'s doc — so `attach` execs our script.
+            daemon_bin: echo_title.to_string_lossy().into_owned(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        };
+
+        let adversarial = [
+            "simple",
+            "embedded 'single' quotes",
+            "embedded \"double\" quotes",
+            "$(rm -rf /)",
+            "`whoami`",
+            "line one\nline two",
+            "-looks-like-a-flag",
+            &"x".repeat(4096),
+        ];
+        for title in adversarial {
+            let mut cfg = SpawnConfig::new("/work/demo");
+            cfg.conversation_title = Some(title.to_string());
+            let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+                .expect("sh should run");
+            let got = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(got.as_ref(), title, "title round-trip broke for {title:?} — cmd was: {cmd}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`resolve_remote_daemon_bin`] must search the remote host the SAME way
+    /// `commands::probe_remote`'s script does (`PATH`, then `~/.local/bin`, then
+    /// `/usr/local/bin`) for a bare name — this is the fix for the gap where a passing
+    /// probe (which DID search all three) didn't guarantee `attach` (which previously
+    /// bare-`exec`'d the name, PATH-only) would find the same binary. An explicit path
+    /// override is left completely unsearched, exactly as given.
+    #[test]
+    fn resolve_remote_daemon_bin_searches_path_then_local_then_usr_local_for_a_bare_name() {
+        let resolved = resolve_remote_daemon_bin("flightdeckd");
+        assert!(resolved.starts_with("$(FLIGHTDECKD_NAME='flightdeckd';"), "got: {resolved}");
+        assert!(resolved.contains("command -v \"$FLIGHTDECKD_NAME\""), "checks PATH first: {resolved}");
+        assert!(
+            resolved.contains("$HOME/.local/bin/$FLIGHTDECKD_NAME"),
+            "falls back to ~/.local/bin: {resolved}"
+        );
+        assert!(
+            resolved.contains("/usr/local/bin/$FLIGHTDECKD_NAME"),
+            "falls back to /usr/local/bin: {resolved}"
+        );
+
+        // An explicit path (e.g. TOSSE_REMOTE_FLIGHTDECKD_BIN set to a full path) is
+        // used exactly as given, unsearched — mirrors `resolve_bin`'s local rule.
+        let explicit = resolve_remote_daemon_bin("/opt/flightdeckd/bin/flightdeckd");
+        assert_eq!(explicit, "'/opt/flightdeckd/bin/flightdeckd'", "no search for an explicit path");
     }
 
     /// The replay-cursor predicate — MUST mirror flightdeckd frames.rs
@@ -1040,8 +1731,791 @@ mod tests {
         assert!(!is_replayable_line(r#"{"type":"keep_alive"}"#));
         assert!(!is_replayable_line(r#"{"type":"fd_attach"}"#));
         assert!(!is_replayable_line(r#"{"type":"fd_detach"}"#));
+        assert!(!is_replayable_line(r#"{"type":"fd_skip","from":1,"to":2}"#));
         assert!(!is_replayable_line("not json"));
         assert!(!is_replayable_line(r#"{"no_type":true}"#));
+    }
+
+    fn test_remote_target(daemon_bin: impl Into<String>) -> RemoteTarget {
+        RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: daemon_bin.into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        }
+    }
+
+    /// A blank/whitespace-only title is rejected up front — no ssh is even spawned
+    /// (nothing to prove: `TOSSE_SSH_BIN` is deliberately left unset/invalid).
+    #[tokio::test]
+    async fn push_remote_title_rejects_a_blank_title_without_touching_ssh() {
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
+        let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        assert!(!ok, "a blank title must be rejected before ever spawning ssh");
+    }
+
+    /// The race this whole EOF-disambiguation exists for: an ssh process that fails
+    /// IMMEDIATELY (connection refused, auth rejected, daemon down — nothing written
+    /// to stdout, since stderr is `Stdio::null()`) and exits non-zero at essentially
+    /// the same instant its stdout pipe closes. Before the fix, `tokio::select!`
+    /// raced a bare `Ok(0)` EOF (read as unconditional success) against
+    /// `child.wait()` (correctly `false`) and picked the winner at random —
+    /// reproduced standalone at a ~50% false-positive rate. Run several iterations
+    /// so a reintroduced race shows up as a flake rather than being masked by
+    /// getting lucky once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_when_ssh_exits_immediately_with_no_output() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-failfast-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        // Exits non-zero writing NOTHING to stdout — the exact shape of a real ssh
+        // connection-level failure.
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        for i in 0..50 {
+            let ok = tokio::time::timeout(
+                Duration::from_secs(10),
+                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            )
+            .await
+            .expect("push_remote_title must not hang");
+            assert!(!ok, "iteration {i}: an ssh that exits non-zero with no output must never read as success");
+        }
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A title containing an embedded NUL byte can never survive to the remote shell
+    /// at all: `std::process::Command::spawn()` rejects any argument containing an
+    /// interior NUL byte before the process is even spawned (verified independently:
+    /// `Command::new("echo").arg("hello\0world").spawn()` errors with
+    /// `InvalidInput`/"nul byte found in provided data"). This proves the already-safe
+    /// behavior — graceful `false`, no panic, no hang — rather than a shell-injection
+    /// risk, since `push_remote_title`'s own `cmd.arg(format!(...))` construction hits
+    /// the same guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_for_a_title_containing_a_nul_byte() {
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+        )
+        .await
+        .expect("push_remote_title must not hang on a NUL-containing title");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        assert!(!ok, "a NUL-containing title must fail gracefully (Command::spawn rejects it), never panic or hang");
+    }
+
+    /// A clean daemon-side `fd_attach` acknowledgement (title already written by the
+    /// time it's sent — see the doc on [`push_remote_title`]) reads as success, and the
+    /// ssh child is torn down rather than left attached (fake daemon sleeps forever
+    /// after the ack; the test's own bounded timeout is the "no lingering" assertion).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_true_on_a_clean_ack() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang on a daemon that never closes its side");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(ok, "a clean fd_attach ack should read as success");
+    }
+
+    /// An error reply (`fd_detach`, e.g. the daemon rejecting the attach) reads as
+    /// failure — never mistaken for a successful title push. Exits non-zero AFTER
+    /// printing it (rather than just falling off the end at 0) so the assertion
+    /// holds regardless of which side of the `tokio::select!` race wins — reading
+    /// the `fd_detach` line, or observing the script's own exit status — both must
+    /// agree this is a failure; a script that exited 0 would make the exit-status
+    /// branch (mis)read as success if it happened to win.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_returns_false_on_an_error_reply() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"fd_detach\",\"reason\":\"error\",\"message\":\"no such conversation\"}'\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!ok, "an fd_detach error reply must not read as success");
+    }
+
+    /// The grace-window regression this whole redesign exists for (see
+    /// `push_remote_title`'s doc): a daemon that stays connected but sends NOTHING
+    /// back within the grace window (exactly what a slow/hung `claude --resume`
+    /// cold-start looks like — live-verified against a real daemon, see the C9
+    /// report) must read as SUCCESS, not a timeout-shaped failure. An earlier
+    /// version of this function got this wrong.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_is_optimistic_when_the_daemon_stays_silent() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-push-silent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        // Connects (this process stays alive) but never writes a byte — exactly a
+        // daemon that accepted the attach (and already wrote the title, per the
+        // doc) but whose `claude --resume` cold-start hasn't reached `on_attach` yet.
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let started = std::time::Instant::now();
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+        )
+        .await
+        .expect("push_remote_title must not hang past its own grace window");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(ok, "silence within the grace window must read as success, not a timeout failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "must return promptly once the grace window elapses, not hang for the outer test timeout",
+        );
+    }
+
+    /// Live M1 acceptance check (C9): [`push_remote_title`] against a REAL daemon,
+    /// end to end — spawn a throwaway conversation, fully STOP it (so the daemon has
+    /// no live actor for it — the "idle rename" case this helper exists for), push a
+    /// fresh title, and confirm `flightdeckd status` shows it.
+    ///
+    /// ALSO documents the KNOWN LIMITATION this helper's doc already calls out: since
+    /// the daemon had no running actor, `attach()`'s cold-start path spawns a new
+    /// `claude` process as an inherent side effect of merely attaching to set a
+    /// title — this test asserts that is EXACTLY what happens (`running` flips to
+    /// `true`), as evidence for the C9 report's request for a real title-only verb.
+    ///
+    /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    ///   cargo test -p tosse-code --lib -- --ignored push_remote_title_against_the_m1_daemon --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    async fn push_remote_title_against_the_m1_daemon() {
+        let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
+            format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
+        });
+        let remote = RemoteTarget {
+            host: "127.0.0.1".into(),
+            port: 2224,
+            user: "agent".into(),
+            identity_file: Some(identity),
+            known_hosts_file: Some("/dev/null".into()),
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
+        };
+
+        // 1. A throwaway live conversation, to learn a real session_id.
+        let mut cfg = SpawnConfig::new("/work/demo");
+        cfg.model = Some("claude-haiku-4-5-20251001".into());
+        cfg.permission_mode = Some("auto".into());
+        cfg.remote = Some(remote.clone());
+        let (mut transport, mut rx) = Transport::spawn(cfg).expect("remote spawn should start");
+        transport
+            .send_user_text("Reply with exactly the two words: hello world. Do not use any tools.")
+            .expect("send should queue");
+        let mut attach: Option<crate::supervisor::protocol::FdAttachMsg> = None;
+        let mut session_id: Option<String> = None;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(msg) = rx.recv().await {
+                match &msg {
+                    CliMessage::FdAttach(a) => attach = Some(a.clone()),
+                    CliMessage::System(crate::supervisor::protocol::SystemMsg::Init(i)) => {
+                        session_id = i.session_id.clone();
+                    }
+                    CliMessage::Result(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the throwaway turn should complete");
+        let attach = attach.expect("expected fd_attach");
+        let session_id = session_id.expect("expected a session_id from system/init");
+
+        // 2. Fully STOP it (daemon-side too) — no live actor left for it.
+        transport.shutdown(true).await;
+        // `flightdeckd stop` inside `shutdown` races the daemon actually tearing the
+        // claude process down; give it a moment before we check "not running".
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let status_line = |out: &str| -> serde_json::Value {
+            serde_json::from_str(out.trim()).expect("status should be valid JSON")
+        };
+        let run_status = || {
+            let remote = remote.clone();
+            async move {
+                let mut cmd = tokio::process::Command::new(resolve_ssh_bin());
+                cmd.arg("-T")
+                    .arg("-p")
+                    .arg(remote.port.to_string())
+                    .arg("-o")
+                    .arg("BatchMode=yes")
+                    .arg("-o")
+                    .arg("ConnectTimeout=10")
+                    .arg("-o")
+                    .arg("StrictHostKeyChecking=accept-new")
+                    .arg("-o")
+                    .arg("UserKnownHostsFile=/dev/null")
+                    .arg("-i")
+                    .arg(remote.identity_file.as_deref().unwrap_or_default())
+                    .arg("-o")
+                    .arg("IdentitiesOnly=yes");
+                crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host)
+                    .expect("a fixed literal test user/host must always validate");
+                let out = cmd
+                    .arg("exec flightdeckd status")
+                    .output()
+                    .await
+                    .expect("ssh status should run");
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+        let row_for = |status: &serde_json::Value, conv: &str| -> serde_json::Value {
+            status["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["conversation"] == conv)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let before = status_line(&run_status().await);
+        let row_before = row_for(&before, &attach.conversation);
+        eprintln!("[live] before push_remote_title: {row_before}");
+        assert_eq!(row_before["running"], false, "expected the stopped conversation to be idle");
+
+        // 3. Push a fresh title while idle.
+        let title = format!("tosse-c9-idle-push-{}", uuid::Uuid::new_v4());
+        let ok = push_remote_title(&remote, &session_id, "/work/demo", &title).await;
+        assert!(ok, "push_remote_title should report success against a real daemon");
+
+        let after = status_line(&run_status().await);
+        let row_after = row_for(&after, &attach.conversation);
+        eprintln!("[live] after push_remote_title: {row_after}");
+        assert_eq!(row_after["title"], title, "the daemon should now carry the pushed title");
+        // KNOWN LIMITATION (documented on `push_remote_title`): attaching to set the
+        // title, on a conversation with no live actor, cold-starts one as a side
+        // effect — this is what a real title-only verb would avoid.
+        assert_eq!(
+            row_after["running"], true,
+            "documents the known limitation: an idle push_remote_title cold-starts the claude process",
+        );
+
+        // Cleanup: stop the process this test's push incidentally started.
+        run_remote_stop(&remote, &attach.conversation).await;
+    }
+
+    /// The bug this guards against: a replayable-typed line that fails to parse
+    /// must NOT bump `lines_seen`, or the app tells the daemon "I got that" for a
+    /// message it actually dropped — never replayed again, permanently lost. Feeds
+    /// `reader_loop` directly over a `tokio::io::duplex` pipe (no process spawn
+    /// needed): one well-formed replayable line, then one that has a replayable
+    /// `"type"` but a body `CliMessage` cannot parse.
+    #[tokio::test]
+    async fn unparseable_replayable_line_is_not_counted_as_seen() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            Arc::new(Mutex::new(None)),
+        ));
+
+        // Well-formed and replayable: a bare `result` message parses with every
+        // field defaulted.
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .await
+            .unwrap();
+        // Replayable-TYPED ("result") but malformed: missing the required
+        // `subtype` field — `is_replayable_line` only probes `"type"`, so this
+        // still counts as replayable, but `CliMessage`'s Deserialize rejects it
+        // (a bad "type" tag would fall through to `Unknown` instead; this is a
+        // parse failure on an otherwise-recognized type).
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 1, "only the parseable line counts");
+        assert_eq!(
+            unparseable.load(Ordering::Relaxed),
+            1,
+            "the malformed replayable line is tracked separately, not silently dropped"
+        );
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            1,
+            "the failure happened right after 1 successful parse"
+        );
+        // The good message still reached the consumer; the bad one did not (and
+        // never will, under this name — see CliMessage's Deserialize impl).
+        let msg = rx.recv().await.expect("the well-formed line should be forwarded");
+        assert!(matches!(msg, CliMessage::Result(_)));
+        assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
+    }
+
+    /// The blocker this guards against: `lines_seen` is a raw success COUNT, not
+    /// the daemon's wire POSITION — so if MORE replayable lines parse fine
+    /// AFTER an unparseable one in the same connection, a cursor built from
+    /// `lines_seen` alone creeps past the failure and the daemon judges it
+    /// "already delivered", never replaying it again (permanently, silently
+    /// lost — see `session.rs::run_actor`'s cursor math). Ordering here is
+    /// OK, FAIL, OK, OK: `first_unparseable_offset` must freeze at the count
+    /// BEFORE the failure (1) and not be dragged forward by the two later
+    /// successes, even though `lines_seen` legitimately keeps counting them.
+    #[tokio::test]
+    async fn first_unparseable_offset_freezes_before_the_first_failure() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            Arc::new(Mutex::new(None)),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (1)
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (2)
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK (3)
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(
+            lines_seen.load(Ordering::Relaxed),
+            3,
+            "all 3 well-formed lines parse, including the two after the failure"
+        );
+        assert_eq!(unparseable.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            1,
+            "must stay at the count BEFORE the failure (1), not creep forward to 3 \
+             just because later lines happened to parse fine"
+        );
+        assert_ne!(
+            first_unparseable.load(Ordering::Relaxed),
+            lines_seen.load(Ordering::Relaxed),
+            "this is exactly the case where the two diverge — a cursor computed from \
+             lines_seen alone would wrongly skip past the still-unrecovered failure"
+        );
+
+        for _ in 0..3 {
+            rx.recv().await.expect("the 3 well-formed lines should be forwarded");
+        }
+        assert!(rx.try_recv().is_err(), "the malformed line must not be forwarded");
+    }
+
+    // --- D6: fd_skip reattach-replay compaction ---------------------------------
+
+    /// [`apply_fd_skip`] on the happy path with `attach_base == 0` (this
+    /// connection's very first attach — no prior backlog, `from`/`to` and
+    /// `current`/`new_position` coincide numerically): the range starts exactly
+    /// where our position left off, so it is fully absorbed and the position
+    /// becomes `to`.
+    #[test]
+    fn apply_fd_skip_absorbs_a_matching_range() {
+        assert_eq!(apply_fd_skip(0, 1, 2, 5), (5, false));
+        // The degenerate single-line "range" (from == to) still just works.
+        assert_eq!(apply_fd_skip(0, 0, 1, 1), (1, false));
+    }
+
+    /// The realistic, common case this whole function exists for (a reattach with
+    /// backlog — every previous test in this module used an implicit
+    /// `attach_base` of 0, i.e. a first-ever attach, which is the ONE case a skip
+    /// essentially never fires in practice): a NONZERO `attach_base`, learned from
+    /// this connection's own `fd_attach.replay_from`, composes with the
+    /// connection-relative `current`/`new_position` exactly like the daemon's own
+    /// `attach.rs` integration test (`flightdeckd/src/attach.rs`, seeded from
+    /// `replay_from`, not 0). `attach_base + new_position` must equal the
+    /// daemon's absolute `to` — the true wire position this connection has
+    /// reached — which is what `session.rs::run_actor` composes into the next
+    /// reattach cursor.
+    #[test]
+    fn apply_fd_skip_composes_correctly_with_a_nonzero_attach_base() {
+        let attach_base = 100u64;
+        let current = 2u64; // 2 replayable lines already parsed on THIS connection
+        // Absolute position so far: attach_base + current = 102. The daemon's next
+        // skip must therefore start at 103 to be valid.
+        let (new_position, violation) = apply_fd_skip(attach_base, current, 103, 110);
+        assert!(!violation, "from == attach_base + current + 1 is a valid, matching skip");
+        assert_eq!(
+            new_position,
+            current + (110 - 103 + 1),
+            "relative position advances by the skipped range's size, not by the raw absolute `to`"
+        );
+        assert_eq!(attach_base + new_position, 110, "composed absolute position must equal the daemon's `to`");
+    }
+
+    /// Violation: `from` does not follow the recorded position by exactly one —
+    /// checked in the SAME (attach_base-composed) space as the match branch, not
+    /// against a bare `current`, or every reattach with backlog would misfire (see
+    /// the nonzero-attach_base test above). Still resyncs to the daemon's claimed
+    /// `to` (converted into this connection's relative space) so the connection
+    /// doesn't wedge forever on the same mismatch, and flags it — the caller turns
+    /// this into the one-time `protocol_error` notice.
+    #[test]
+    fn apply_fd_skip_flags_a_mismatched_from_and_resyncs_to_to() {
+        let attach_base = 0u64;
+        let cursor = 10u64;
+        let (new_position, violation) = apply_fd_skip(attach_base, cursor, cursor + 3, cursor + 3 + 20);
+        assert!(violation);
+        assert_eq!(new_position, cursor + 3 + 20, "cursor must become `to` (attach_base is 0 here)");
+    }
+
+    /// Never regress: a violation whose claimed `to` is BEHIND our current position
+    /// must not un-count lines we already have — `current.max(to)`.
+    #[test]
+    fn apply_fd_skip_never_moves_the_position_backwards() {
+        let (new_position, violation) = apply_fd_skip(0, 10, 3, 4);
+        assert!(violation);
+        assert_eq!(new_position, 10, "a stale/behind `to` must not roll the position back");
+    }
+
+    /// Major finding: a matching `from` with an INVERTED `to < from` must still be
+    /// flagged as a violation, not silently accepted — `from` alone is not enough
+    /// to trust the frame. `apply_fd_skip(0, 5, 6, 3)`: `current=5` expects
+    /// `from=6` (matches), but `to=3 < from` — this must resync-with-violation,
+    /// never regress the position, and never report `violation: false`.
+    #[test]
+    fn apply_fd_skip_rejects_a_matching_from_with_an_inverted_to() {
+        let (new_position, violation) = apply_fd_skip(0, 5, 6, 3);
+        assert!(violation, "a matching `from` does not excuse a malformed to < from range");
+        assert!(new_position >= 5, "must not regress below the current position");
+    }
+
+    /// End-to-end through `reader_loop` (D6 spec example): lines
+    /// `[OK, fd_skip{2,5}, OK]` → the skip is folded into `lines_seen` (1 → 5),
+    /// the trailing OK bumps it to 6, and the UI (the `tx`/`rx` channel) receives
+    /// ONLY the two OK messages — the `fd_skip` frame itself is never forwarded.
+    #[tokio::test]
+    async fn reader_loop_folds_fd_skip_into_lines_seen_without_forwarding_it() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":5}\n") // absorbed: lines_seen -> 5
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 5 -> 6
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 6, "wire position after the skip + trailing OK");
+        assert!(skip_violation.lock().unwrap().is_none(), "the range matched — no violation");
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(received.len(), 2, "the UI must receive exactly the 2 OK messages, never the skip");
+        assert!(received.iter().all(|m| matches!(m, CliMessage::Result(_))));
+    }
+
+    /// Blocker regression test: the realistic reattach case — a NONZERO
+    /// `attach_base`, learned from a real `fd_attach` line at the top of the
+    /// stream (mirroring flightdeckd's own `attach.rs` integration test, which
+    /// seeds its cursor from `replay_from`, never 0). Before the fix, `reader_loop`
+    /// checked a well-formed skip against the bare connection-relative `current`
+    /// instead of `attach_base + current`, so this exact well-formed frame would
+    /// have misfired as a "violation" and corrupted `lines_seen` into an
+    /// already-absolute number — silently doubling `attach_base` on the NEXT
+    /// reattach (see `session.rs::run_actor`'s `cursor = attach_base +
+    /// reattach_cursor_delta(transport.lines_seen(), …)`). This is the case every
+    /// OTHER `fd_skip` test in this module skips, by construction (none of them
+    /// send an `fd_attach` first, so they all run with an implicit `attach_base`
+    /// of 0 — the one case a skip essentially never fires in practice).
+    #[tokio::test]
+    async fn reader_loop_composes_fd_skip_with_a_nonzero_attach_base_from_fd_attach() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        // Always line 1 of a real remote attach stream: this connection resumes at
+        // absolute position 100 (a reattach with backlog, NOT a first-ever attach).
+        writer
+            .write_all(
+                b"{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":100}\n",
+            )
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1 (absolute 101)
+            .await
+            .unwrap();
+        // Valid, well-formed skip in the DAEMON's absolute space: after the OK above,
+        // current == 1, so the next expected seq is attach_base(100) + current(1) + 1
+        // == 102 — exactly this frame's `from`.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":102,\"to\":105}\n") // absorbed: lines_seen -> 5
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 5 -> 6 (absolute 106)
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert!(
+            skip_violation.lock().unwrap().is_none(),
+            "a well-formed skip composed against the nonzero attach_base must not violate"
+        );
+        let relative = lines_seen.load(Ordering::Relaxed);
+        assert_eq!(relative, 6, "connection-relative position: 1 (pre-skip) + 4 (skip) + 1 (post-skip)");
+        let attach_base = 100u64;
+        assert_eq!(
+            attach_base + relative,
+            106,
+            "composed absolute position (what session.rs::run_actor adds attach_base to) must be exact"
+        );
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        // fd_attach itself is never replayable and never forwarded past reader_loop
+        // as anything OTHER than a normal CliMessage — it IS forwarded (session.rs
+        // needs it to sync its own attach_base/busy/pending state), just not counted.
+        assert_eq!(received.len(), 3, "fd_attach + the 2 OK messages; the fd_skip itself is never forwarded");
+        assert!(matches!(received[0], CliMessage::FdAttach(_)));
+        assert!(matches!(received[1], CliMessage::Result(_)));
+        assert!(matches!(received[2], CliMessage::Result(_)));
+    }
+
+    /// Cursor composition: an `fd_skip` followed by a LATER unparseable line must
+    /// still roll the reattach cursor back to the right offset — `lines_seen` has
+    /// already absorbed the skip by the time the failure is recorded, so
+    /// `first_unparseable_offset` freezes at the POST-skip count, not some stale
+    /// pre-skip value.
+    #[tokio::test]
+    async fn fd_skip_then_a_later_unparseable_line_rolls_back_past_the_skip() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 0 -> 1
+            .await
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":9}\n") // absorbed: lines_seen -> 9
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL right after the skip
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — lines_seen: 9 -> 10
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            first_unparseable.load(Ordering::Relaxed),
+            9,
+            "must freeze at the POST-skip count (9), the true position right before the failure"
+        );
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(received.len(), 2, "the 2 OK messages, never the skip or the malformed line");
+    }
+
+    /// A violated `fd_skip{from}` (not `current + 1`) resyncs the position AND
+    /// records exactly one violation note — a SECOND violation in the same
+    /// connection must not overwrite the first (the "once" in "one-time notice").
+    #[tokio::test]
+    async fn reader_loop_flags_a_skip_violation_once_and_resyncs() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, _rx) = mpsc::unbounded_channel::<CliMessage>();
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+        ));
+
+        // Wildly out-of-range `from` (should be 1): current is 0, so the only
+        // non-violating `from` would be 1.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":9,\"to\":20}\n")
+            .await
+            .unwrap();
+        // A second violation must not clobber the first note.
+        writer
+            .write_all(b"{\"type\":\"fd_skip\",\"from\":50,\"to\":60}\n")
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 60, "resynced to the second frame's `to`");
+        let note = skip_violation.lock().unwrap().clone();
+        assert!(
+            note.as_deref().unwrap_or_default().contains("from:9"),
+            "must record the FIRST violation's detail, not the second: {note:?}"
+        );
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real
@@ -1122,6 +2596,54 @@ mod tests {
             Err(other) => panic!("expected CwdMissing, got error: {other:?}"),
             Ok(_) => panic!("expected CwdMissing, but spawn succeeded"),
         }
+    }
+
+    /// The MOST load-bearing entry point (CRM holistic-review blocker #3, chantier A
+    /// `bd7ca709`): a `RemoteTarget` built from a legacy `MachineRecord` row that
+    /// predates `validate_ssh_user` (older app version, manual DB edit — see
+    /// `store::db`'s own `a_legacy_row_with_an_invalid_user_loads_intact_never_
+    /// vanishes_or_panics` test for that half of the story) must NEVER reach an
+    /// actual ssh spawn: `Transport::spawn` itself refuses it with the clear, typed
+    /// `InvalidRemoteTarget` error the brief asks for, proven here with a fake `ssh`
+    /// that would leave a marker file behind if it were EVER invoked.
+    #[test]
+    fn spawn_refuses_a_legacy_row_with_an_invalid_user_without_spawning_ssh() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = SSH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tosse-spawn-invalid-user-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("invoked.marker");
+        let script = dir.join("fake-ssh.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nexit 0\n", shell_quote(&marker.to_string_lossy())))
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+
+        let mut cfg = SpawnConfig::new(std::env::temp_dir());
+        cfg.remote = Some(RemoteTarget {
+            host: "example.com".into(),
+            port: 22,
+            user: "-oProxyCommand=touch /tmp/pwned".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.com".into()],
+            machine_id: Some("legacy1".into()),
+        });
+        let result = Transport::spawn(cfg);
+        std::env::remove_var("TOSSE_SSH_BIN");
+
+        match result {
+            Err(TransportError::InvalidRemoteTarget(_)) => {}
+            Err(other) => panic!("expected InvalidRemoteTarget, got: {other}"),
+            Ok(_) => panic!("expected InvalidRemoteTarget, but spawn succeeded"),
+        }
+        assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ACCEPTANCE (zero orphans): a session's grandchild — the kind `claude`
@@ -1266,7 +2788,7 @@ mod tests {
     /// cursor, and expect NO duplicated stream (replay resumes exactly).
     ///
     /// Ignored by default: needs the `flightdeck-m1` container up with fresh creds
-    /// (flightdeck-server: `m1-daemon/scripts/up.sh`). Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`). Run with:
     ///   cargo test -p tosse-code --lib -- --ignored remote_transport_streams_over_ssh --nocapture
     #[tokio::test]
     #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container)"]
@@ -1285,6 +2807,8 @@ mod tests {
             ),
             known_hosts_file: Some("/dev/null".into()),
             daemon_bin: "flightdeckd".into(),
+            addresses: vec!["127.0.0.1".into()],
+            machine_id: None,
         };
         let mut cfg = SpawnConfig::new("/work/demo");
         cfg.model = Some("claude-haiku-4-5-20251001".into());
@@ -1346,6 +2870,7 @@ mod tests {
             conversation: Some(attach.conversation.clone()),
             epoch: Some(attach.epoch.clone()),
             cursor,
+            supports_skip: false,
         });
         let (mut transport2, mut rx2) =
             Transport::spawn(cfg2).expect("reattach spawn should start");

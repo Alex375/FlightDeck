@@ -55,10 +55,106 @@ describe("routeArtifactOpen", () => {
     });
   });
 
-  it("falls back to the browser when the temp file is gone", () => {
+  it("shows the HOSTED page in-app when the temp file is gone", () => {
     expect(routeArtifactOpen({ ...base, filePath: null })).toEqual({
+      kind: "viewer",
+      view: { ...base, filePath: null, kind: "hosted" },
+    });
+  });
+
+  it("falls back to the browser when the temp file is gone and the in-app hosted view is OFF", () => {
+    expect(routeArtifactOpen({ ...base, filePath: null, hostedInApp: false })).toEqual({
       kind: "browser",
       url: base.url,
+    });
+  });
+
+  it("still previews a local PAGE in-app with the hosted view OFF (the pref only governs hosted)", () => {
+    expect(routeArtifactOpen({ ...base, hostedInApp: false })).toEqual({
+      kind: "viewer",
+      view: { ...base, kind: "html" },
+    });
+  });
+
+  describe("typed artifacts (Claude Design…)", () => {
+    // The real fill publish of a Design canvas: its file_path is the DATA index, not a page.
+    const typed = {
+      ...base,
+      title: "Flight Deck — sidebar conversation",
+      url: "https://claude.ai/artifact/EB7RRtdoZg1CDk4L3R1Nqg",
+      filePath: "/private/tmp/claude-501/x/scratchpad/sidebar-canvas/project/canvas.json",
+      typed: true,
+    };
+
+    it("NEVER renders the local data file — shows the hosted page in-app instead", () => {
+      // Rendering canvas.json as HTML in the iframe was the broken screen this fixes.
+      expect(routeArtifactOpen(typed)).toEqual({
+        kind: "viewer",
+        view: {
+          convId: typed.convId,
+          title: typed.title,
+          favicon: typed.favicon,
+          url: typed.url,
+          filePath: null,
+          kind: "hosted",
+        },
+      });
+    });
+
+    it("goes to the browser with the in-app hosted view OFF", () => {
+      expect(routeArtifactOpen({ ...typed, hostedInApp: false })).toEqual({ kind: "browser", url: typed.url });
+    });
+
+    it("goes to the browser on an inert host", () => {
+      expect(routeArtifactOpen({ ...typed, inert: true })).toEqual({ kind: "browser", url: typed.url });
+    });
+
+    it("⚠️ a MULTI-FILE page artifact is hosted too — the local preview can't serve its siblings", () => {
+      // A page published with `files` loads them relatively; a srcDoc document under our CSP has
+      // no origin to resolve them against, so the preview would silently drop its stylesheet,
+      // its script or its data.
+      const multi = { ...base, multiFile: true };
+      expect(routeArtifactOpen(multi)).toEqual({
+        kind: "viewer",
+        view: { convId: multi.convId, title: multi.title, favicon: multi.favicon, url: multi.url, filePath: null, kind: "hosted" },
+      });
+    });
+
+    it("has no route while its creation has no URL yet", () => {
+      expect(routeArtifactOpen({ ...typed, url: null, filePath: null })).toEqual({ kind: "none" });
+    });
+  });
+
+  describe("a prose link is canonicalised before the in-app host sees it", () => {
+    // `isArtifactUrl` (what turns a link into a card) is tolerant; the Rust host takes the exact
+    // shape only. Without this, a perfectly good link opened an error panel — before the host
+    // existed, it opened the browser.
+    const prose = { ...base, filePath: null };
+    const canonical = "https://claude.ai/artifact/EB7RRtdoZg1CDk4L3R1Nqg";
+
+    it("drops a trailing slash", () => {
+      expect(routeArtifactOpen({ ...prose, url: `${canonical}/` })).toEqual({
+        kind: "viewer",
+        view: { ...prose, url: canonical, filePath: null, kind: "hosted" },
+      });
+    });
+
+    it("drops an extra path segment and fixes drifted casing", () => {
+      expect(routeArtifactOpen({ ...prose, url: `${canonical}/preview` })).toMatchObject({
+        kind: "viewer",
+        view: { url: canonical },
+      });
+      expect(routeArtifactOpen({ ...prose, url: "HTTPS://Claude.ai/Artifact/EB7RRtdoZg1CDk4L3R1Nqg" })).toMatchObject({
+        kind: "viewer",
+        view: { url: canonical },
+      });
+    });
+
+    it("sends anything that isn't an artifact URL to the browser rather than erroring in-app", () => {
+      expect(routeArtifactOpen({ ...prose, url: "https://claude.ai/artifacts" })).toEqual({
+        kind: "browser",
+        url: "https://claude.ai/artifacts",
+      });
     });
   });
 

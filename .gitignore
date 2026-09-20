@@ -14,6 +14,16 @@ target/
 # === Tauri generated artifacts ===
 src-tauri/gen/
 
+# === Bundled flightdeckd daemon binaries (B2/B3) ===
+# `pnpm daemon:build` (scripts/build-daemon.mjs) writes the static musl binaries + their
+# manifest.json here so tauri.conf.json's bundle.resources can embed them in the app —
+# built locally (needs Docker) or downloaded from CI. The directory itself IS committed
+# (with only a README) so a fresh clone with no Docker still has a `bundle.resources`
+# source to bundle from (an empty/placeholder resources dir — the app then reports
+# DaemonBinaryNotBundled at runtime instead of failing the build).
+src-tauri/resources/flightdeckd/flightdeckd-*
+src-tauri/resources/flightdeckd/manifest.json
+
 # === Playwright (dev/test visual artifacts, not committed) ===
 .playwright-mcp/
 *.local.png
@@ -36,3 +46,16 @@ screenshots/
 
 # === tauri-specta bindings: COMMITTED on purpose, do NOT ignore ===
 # src/ipc/bindings.ts
+
+# === flightdeckd (imported from flightdeck-server) — local env / secrets ===
+# Its own tests/live fixtures generate real-looking SSH keys, tokens and env
+# files; these patterns were already in flightdeck-server's .gitignore and are
+# ported here so nothing there gets committed by accident now that it lives
+# in this repo. `target/` above already covers `flightdeckd/target/`.
+.env
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+pairing-ticket*.json
+.colima/

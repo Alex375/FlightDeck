@@ -83,6 +83,9 @@ function emptyEntry(session: string): SessionEntry {
     seq: 0,
     replayAnchor: 0,
     turnStartedAt: null,
+    lastTurnStartedAt: null,
+    lastTurnEndedAt: null,
+    awaitingSince: null,
     turnCount: 0,
     thinkingMs: 0,
     thinkingSince: null,
@@ -314,16 +317,36 @@ export const useConversationStore = create<ConversationState>((set) => {
         // cumulative thinking time — see thinkingWords.ts). Left untouched on true→false /
         // mid-turn re-emits.
         let turnCount = entry.turnCount;
+        // The same two edges also keep the SETTLED timing the sidebar row freezes on a
+        // conversation that stopped on a state (review / error / question): unlike
+        // `turnStartedAt`, `lastTurnStartedAt` survives the end of the turn, and
+        // `lastTurnEndedAt` stamps that end. `awaitingSince` stamps the moment the agent
+        // blocked on the user (permission / questionnaire), which pauses the counter
+        // mid-turn — the agent is waiting, not working.
+        let lastTurnStartedAt = entry.lastTurnStartedAt;
+        let lastTurnEndedAt = entry.lastTurnEndedAt;
         if (state.busy && !entry.state.busy) {
           turnStartedAt = Date.now();
+          lastTurnStartedAt = turnStartedAt;
+          lastTurnEndedAt = null;
           turnCount = entry.turnCount + 1;
         } else if (!state.busy && entry.state.busy) {
           turnStartedAt = null;
+          lastTurnEndedAt = Date.now();
           thinkingStartedAt = null; // a turn ending also ends any in-flight thinking
+        }
+        let awaitingSince = entry.awaitingSince;
+        if (state.awaiting_permission && !entry.state.awaiting_permission) {
+          awaitingSince = Date.now();
+        } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
+          awaitingSince = null;
         }
         return {
           ...entry,
           turnStartedAt,
+          lastTurnStartedAt,
+          lastTurnEndedAt,
+          awaitingSince,
           turnCount,
           thinkingStartedAt,
           state: {
@@ -354,6 +377,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           ...entry,
           state: { ...connectingState },
           turnStartedAt: null,
+          awaitingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
           toolStartedAt: {},
@@ -773,11 +797,22 @@ export const useConversationStore = create<ConversationState>((set) => {
               subtype: item.subtype,
               detail: item.detail,
             };
+            const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
+            // A notice landing AT the anchor (nothing of the current turn sits above it) is
+            // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
+            // the anchor past it so a LATER remote echo splices below it, not above — else a
+            // "Background task failed" would read as happening after a message the user only
+            // sent afterwards. A notice arriving MID-response (anchor already behind the
+            // streaming reply) leaves the anchor alone: the late echo of the prompt that
+            // caused that reply still belongs before the whole response.
+            // See `SessionEntry.replayAnchor`.
+            const atBoundary = entry.replayAnchor >= entry.timeline.length;
             return {
               ...entry,
               seq: entry.seq + 1,
               notices: { ...entry.notices, [id]: notice },
-              timeline: [...entry.timeline, { kind: "notice", id }],
+              timeline,
+              replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
             };
           }
 
@@ -885,9 +920,12 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *
  *  Keeping `command_output` soft matters: these lines used to arrive as fake USER bubbles,
  *  which split one response into two folded rounds. Turning them into hard notices would
- *  have preserved exactly that split under a new name. */
+ *  have preserved exactly that split under a new name.
+ *
+ *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
+ *  tool step, and like one it sits inside the work instead of cutting the response in two. */
 function isSoftNotice(subtype: string | undefined): boolean {
-  return subtype === "control_change" || subtype === "command_output";
+  return subtype === "control_change" || subtype === "command_output" || subtype === "task_failed";
 }
 
 /**
