@@ -797,11 +797,22 @@ export const useConversationStore = create<ConversationState>((set) => {
               subtype: item.subtype,
               detail: item.detail,
             };
+            const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
+            // A notice landing AT the anchor (nothing of the current turn sits above it) is
+            // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
+            // the anchor past it so a LATER remote echo splices below it, not above — else a
+            // "Background task failed" would read as happening after a message the user only
+            // sent afterwards. A notice arriving MID-response (anchor already behind the
+            // streaming reply) leaves the anchor alone: the late echo of the prompt that
+            // caused that reply still belongs before the whole response.
+            // See `SessionEntry.replayAnchor`.
+            const atBoundary = entry.replayAnchor >= entry.timeline.length;
             return {
               ...entry,
               seq: entry.seq + 1,
               notices: { ...entry.notices, [id]: notice },
-              timeline: [...entry.timeline, { kind: "notice", id }],
+              timeline,
+              replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
             };
           }
 

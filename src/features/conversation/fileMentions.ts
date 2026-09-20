@@ -39,6 +39,12 @@ const PATH_RE = new RegExp(
     ")$",
 );
 
+/** Whether a token is path-shaped. A token carrying whitespace is never one: that is
+ *  prose or a shell line, and every false positive also costs a `pathExists` probe. */
+function isPathShaped(s: string): boolean {
+  return !/\s/.test(s) && PATH_RE.test(s);
+}
+
 /**
  * Parse a single token (e.g. the text of an inline-code span, or a tool's
  * `file_path` argument) into a file mention, or null when it doesn't look like a
@@ -48,7 +54,7 @@ const PATH_RE = new RegExp(
  */
 export function parseFileMention(raw: string): FileMention | null {
   const s = raw.trim();
-  if (!s || /\s/.test(s) || SCHEME.test(s)) return null;
+  if (!s || SCHEME.test(s)) return null;
 
   let path = s;
   let line: number | undefined;
@@ -57,14 +63,14 @@ export function parseFileMention(raw: string): FileMention | null {
   const m = LINE_SUFFIX.exec(path);
   if (m) {
     const head = path.slice(0, m.index);
-    if (PATH_RE.test(head)) {
+    if (isPathShaped(head)) {
       path = head;
       line = Number(m[1]);
       if (m[2] !== undefined) column = Number(m[2]);
     }
   }
 
-  if (!PATH_RE.test(path)) return null;
+  if (!isPathShaped(path)) return null;
   return column !== undefined ? { path, line, column } : line !== undefined ? { path, line } : { path };
 }
 

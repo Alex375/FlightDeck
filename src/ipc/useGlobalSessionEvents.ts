@@ -679,7 +679,11 @@ export function useGlobalSessionEvents(): void {
       // background task failing is common and benign — Claude is told via its
       // `<task-notification>` and handles it — so it must not read as the conversation
       // itself failing. Nor may it clear the queued badges the way `addErrorTurn` does: a
-      // failed background task doesn't stop a queued message from being delivered.
+      // failed background task doesn't stop a queued message from being delivered. When it
+      // lands AT a turn boundary it does move the remote-replay anchor, like an error turn
+      // (handled in `applyItem`'s notice case), so a message sent from the phone afterwards
+      // renders below the failure; one raised mid-response deliberately leaves the anchor
+      // alone, so the late echo of the prompt still sits above the reply it caused.
       useConversationStore
         .getState()
         .applyItem(session, { kind: "notice", subtype: "task_failed", detail: taskFailedDetail(task) });

@@ -2,8 +2,10 @@ import { useEffect } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isTauri } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
+import { useConversationStore } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useDisplay } from "../../store/display";
+import { effectiveCwd } from "../git/worktree";
 import { useFlightdeckModal } from "../flightdeck/flightdeckModalStore";
 import { boxOf } from "../flightdeck/modalZoom";
 import { attachPaths } from "./composerAttachments";
@@ -28,7 +30,14 @@ export async function deliverDrop(zone: DropTarget & { el: HTMLElement }, paths:
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === zone.convId);
   if (!conv) return;
   if (zone.kind === "card") useFlightdeckModal.getState().open(conv.id, boxOf(zone.el));
-  const { mentions } = await attachPaths(conv.id, paths, conv.cwd ?? null);
+  // The mention has to be relative to where the agent IS, not to its spawn anchor: after
+  // an EnterWorktree it lives in the worktree, and a mention made relative to `conv.cwd`
+  // would resolve there to a DIFFERENT file with no error at all. `effectiveCwd` is the
+  // same answer the "+" picker gets.
+  const cwd = effectiveCwd(conv, useConversationStore.getState().sessions[conv.id]?.state);
+  const { mentions } = await attachPaths(conv.id, paths, cwd, {
+    isAlive: () => useConversationsStore.getState().conversations.some((c) => c.id === conv.id),
+  });
   // The reply modal focuses its own composer on open; a column already on screen is
   // asked to, with the caret after any mention just appended.
   if (zone.kind === "pane" || mentions > 0) useFileDrop.getState().requestFocus(conv.id);

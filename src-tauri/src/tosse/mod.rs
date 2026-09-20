@@ -1463,14 +1463,75 @@ pub struct TosseRepository {
     pub projects: Vec<TosseProjectRef>,
 }
 
+/// The absolute URL of a first-party endpoint, built segment by segment from `path`.
+///
+/// ⚠️ Structural, not cosmetic. `format!("{BASE_URL}{path}")` let an interpolated VALUE
+/// escape the position its caller put it in: the `url` crate resolves `..` while parsing,
+/// so a task id of `"../clients"` turned `GET /api/v1/tasks/{id}` into
+/// `GET /api/v1/clients` — any endpoint of the CRM origin, reached with the human's Bearer
+/// token. Here the path is split on `/`, a dot segment is REFUSED outright (it is the
+/// escape itself, and no legitimate path has one), and every segment is pushed through
+/// `path_segments_mut` so anything else inside it is percent-encoded into data. The query
+/// string is kept verbatim: callers that carry one already encode their values
+/// ([`percent_encode`]).
+///
+/// Returns a `Url`, not a `String`, so the caller hands reqwest an already-parsed URL and
+/// nothing re-runs the parser (which is where `..` would be resolved).
+fn api_url(path: &str) -> R<url::Url> {
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let segments: Vec<&str> = raw_path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| *s == "." || *s == "..") {
+        return Err(TosseError::Local(format!(
+            "« {} » is not a TOSSE endpoint this app requests",
+            snippet(path)
+        )));
+    }
+    let mut url = url::Url::parse(BASE_URL)
+        .map_err(|e| TosseError::Local(format!("the TOSSE address is not a URL ({e})")))?;
+    {
+        let mut out = url
+            .path_segments_mut()
+            .map_err(|_| TosseError::Local("the TOSSE address cannot carry a path".to_string()))?;
+        out.clear();
+        for segment in segments {
+            out.push(segment);
+        }
+    }
+    url.set_query(query);
+    Ok(url)
+}
+
+/// The hex-group lengths of a canonical UUID (`8-4-4-4-12`).
+const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `id` is a canonical UUID — the only shape a TOSSE row id ever takes.
+///
+/// Case-insensitive, and the exact counterpart of the front's
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` (defence in depth: the
+/// IPC commands are reachable from the whole webview, so the front's check is a courtesy
+/// and this one is the fence).
+fn is_canonical_uuid(id: &str) -> bool {
+    let mut groups = id.split('-');
+    for len in UUID_GROUPS {
+        match groups.next() {
+            Some(g) if g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    groups.next().is_none()
+}
+
 /// GET a first-party `/api/v1/*` endpoint with our Bearer token, parsed as JSON.
 ///
 /// The single entry point for TOSSE data reads (the Tasks view will reuse it), so the
 /// token handling, the error shaping and the `{success, data}` envelope live in one place.
 async fn api_get(path: &str) -> R<Value> {
     let token = access_token().await?;
-    let url = format!("{BASE_URL}{path}");
-    let (status, body) = send_text(http()?.get(&url).bearer_auth(token)).await?;
+    let url = api_url(path)?;
+    let (status, body) = send_text(http()?.get(url).bearer_auth(token)).await?;
     if !status.is_success() {
         return Err(TosseError::Http {
             status: status.as_u16(),
@@ -2053,10 +2114,12 @@ fn parse_project(v: &Value) -> R<TosseProject> {
 /// snake_case — the difference is real and silently drops fields if mixed up.
 async fn api_write(method: reqwest::Method, path: &str, body: &Value) -> R<Value> {
     let token = access_token().await?;
-    let url = format!("{BASE_URL}{path}");
+    // Same builder as the reads: an id interpolated into `path` must not be able to move
+    // the request to another endpoint (see [`api_url`]) — all the more so for a write.
+    let url = api_url(path)?;
     let (status, text) = send_text(
         http()?
-            .request(method, &url)
+            .request(method, url)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string()),
@@ -2186,6 +2249,16 @@ pub struct TosseTaskDetail {
 /// Fetch one task in full. Called when a row is opened, never for a list — this is the
 /// request that carries the Markdown the briefing deliberately leaves out.
 pub async fn task_detail(task_id: &str) -> R<TosseTaskDetail> {
+    // ⚠️ Checked BEFORE anything goes on the wire: this is an IPC command, so the id comes
+    // from wherever the webview got it, and a bad one must cost a local error rather than a
+    // request carrying our Bearer token. The id lands in the path, and only a UUID is a
+    // task id (see [`is_canonical_uuid`]).
+    if !is_canonical_uuid(task_id) {
+        return Err(TosseError::Local(format!(
+            "« {} » is not a TOSSE task id",
+            snippet(task_id)
+        )));
+    }
     let v = api_get(&format!("/api/v1/tasks/{task_id}")).await?;
     let data = v.pointer("/data").ok_or_else(|| {
         TosseError::Protocol(format!(
@@ -2861,6 +2934,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The URL builder must keep an interpolated value INSIDE the segment its caller meant
+    /// it to occupy. Before this, `format!("{BASE_URL}{path}")` handed the string straight to
+    /// the parser, which resolves `..` — a task id of `"../clients"` made us GET
+    /// `/api/v1/clients` with the human's Bearer token, and `"../../v1/finances"` reached the
+    /// CRM's money. Nothing outside `/api/v1/tasks/` may be reachable from a task id.
+    #[test]
+    fn api_url_cannot_climb_out_of_a_path_segment() {
+        for escape in [
+            "../clients",
+            "../../v1/finances",
+            "..%2Fclients", // already-encoded traversal: it is DATA, not a separator
+            "../",
+        ] {
+            let path = format!("/api/v1/tasks/{escape}");
+            match api_url(&path) {
+                Err(TosseError::Local(_)) => {}
+                Err(other) => panic!("`{path}` should be refused locally, got {other}"),
+                Ok(url) => assert!(
+                    url.path().starts_with("/api/v1/tasks/")
+                        && !url.path().contains("/clients")
+                        && !url.path().contains("/finances"),
+                    "`{path}` escaped its segment: {url}"
+                ),
+            }
+        }
+
+        // A legitimate id lands exactly where the caller put it.
+        let id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+        let url = api_url(&format!("/api/v1/tasks/{id}")).expect("a UUID is a fine segment");
+        assert_eq!(url.path(), format!("/api/v1/tasks/{id}"));
+        assert_eq!(url.host_str(), url::Url::parse(BASE_URL).unwrap().host_str());
+    }
+
+    /// Every path the callers build must come out of the builder byte-identical to what the
+    /// old `format!` produced — query strings (already percent-encoded by the caller)
+    /// included, or a working endpoint would break silently.
+    #[test]
+    fn api_url_preserves_the_paths_its_callers_build() {
+        for path in [
+            "/api/v1/repositories",
+            "/api/v1/briefing/morning",
+            "/api/v1/tasks",
+            "/api/v1/tasks?status=En%20attente&active_projects_only=true",
+            "/api/v1/tasks/3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "/api/v1/projects/3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+        ] {
+            assert_eq!(
+                api_url(path).expect("a first-party path").as_str(),
+                format!("{BASE_URL}{path}"),
+                "`{path}` must reach the same URL as before"
+            );
+        }
+    }
+
+    /// The Rust half of the id check: `tosse_task_detail` is an IPC command, so the id comes
+    /// from the webview and the front's own regex is not a fence. Anything that is not a
+    /// canonical UUID must fail LOCALLY — before a request carrying our token exists.
+    #[tokio::test]
+    async fn task_detail_refuses_anything_but_a_canonical_uuid() {
+        for bad in [
+            "../clients",
+            "../../v1/finances",
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301/../clients",
+            "3f2504e04f8911d39a0c0305e82c3301",
+            "3f2504e0-4f89-11d3-9a0c-0305e82c330",
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301 ",
+            "zf2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "",
+        ] {
+            match task_detail(bad).await {
+                Err(TosseError::Local(msg)) => {
+                    assert!(msg.contains("task id"), "unhelpful refusal for `{bad}`: {msg}")
+                }
+                other => panic!("`{bad}` must be refused before any request, got {other:?}"),
+            }
+        }
+
+        // The shape a real id has, in both cases, is accepted by the check itself.
+        assert!(is_canonical_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c3301"));
+        assert!(is_canonical_uuid("3F2504E0-4F89-11D3-9A0C-0305E82C3301"));
     }
 
     /// A subtask names its parent (`parentTaskId`, a scalar column the route returns as-is);
