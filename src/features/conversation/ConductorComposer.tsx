@@ -107,6 +107,7 @@ import {
   PermissionFace,
   WorktreeFace,
 } from "./composerChipFaces";
+import { ComposerStatusBand } from "./ComposerStatusBand";
 import styles from "./ConductorComposer.module.css";
 
 // Exact Claude Code permission modes (Shift+Tab selector), in the same order/labels.
@@ -1135,6 +1136,10 @@ export const ConductorComposer = forwardRef<
 
   return (
     <div className="cv-composer">
+      {/* The conversation's settled status (review / question / error / background), as a
+          header band of this card — it also tints the card's border via CSS `:has()`.
+          Its own leaf: the composer never re-renders on a status change. */}
+      <ComposerStatusBand session={session} />
       {slashOpen ? (
         <SlashCommandMenu
           items={slashMatches}

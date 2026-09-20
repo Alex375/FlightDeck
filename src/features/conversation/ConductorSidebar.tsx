@@ -19,21 +19,26 @@ import { ideBlockedReason, openRepoInIde } from "../ide/openInIde";
 import { useAppErrors } from "../../store/appErrors";
 import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
 import { useAgentStatus } from "../../agent/useAgentStatus";
-import { useRunningTaskCount } from "../../store/backgroundTasksStore";
+import { useBackgroundWorkSince, useRunningTaskCount } from "../../store/backgroundTasksStore";
 import {
   agentStatusToDot,
   backgroundCount,
   isActivelyRunning,
   isDismissable,
+  railState,
   rowAttention,
   type AgentStatus,
 } from "../../agent/status";
+import { useConversationStore } from "../../store/conversationStore";
+import { rowTiming } from "../../agent/rowTiming";
+import { fmtFrozenElapsed, useLiveElapsed } from "../../ui/liveElapsed";
+import { useShallow } from "zustand/react/shallow";
 import { useSettingsUi } from "../../store/settingsUi";
 import { TosseRepoBadge } from "../tosse/TosseRepoBadge";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
-import { Dot, Ico, Menu, MenuItem, MenuLabel, RunPulse } from "../../ui/kit";
+import { Dot, Ico, Menu, MenuItem, MenuLabel, RunDots, RunPulse } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
 import { deleteReasonFor } from "./deleteGuard";
@@ -54,6 +59,88 @@ function StatusDot({ status }: { status: AgentStatus }) {
   return <Dot s={agentStatusToDot(status)} pulse ring={backgroundCount(status) > 0} />;
 }
 
+/** The live counter on a working row (tinted-pill style). Its own leaf: the shared clock
+ *  re-renders this <span>, never the row. A frozen counter is plain text, so it needs no
+ *  clock at all and is rendered inline by {@link RowLive}. */
+function RowTimer({ startedAt }: { startedAt: number }) {
+  const label = useLiveElapsed(startedAt);
+  if (!label) return null;
+  return <span className="cv-sess-time">{label}</span>;
+}
+
+/** The row's second line: the thread's working dots + the time. Bouncing and ticking while
+ *  the agent works; still and frozen once it stopped on a state that wants the user ("it
+ *  ran this long, then stopped here"); absent on the two calm states. */
+function RowLive({ convId, status }: { convId: string; status: AgentStatus }) {
+  const showTime = useDisplay((d) => d.sidebarRowTimer);
+  const backgroundSince = useBackgroundWorkSince(convId);
+  const clock = useConversationStore(
+    useShallow((s) => {
+      const e = s.sessions[convId];
+      return e
+        ? {
+            turnStartedAt: e.turnStartedAt,
+            lastTurnStartedAt: e.lastTurnStartedAt,
+            lastTurnEndedAt: e.lastTurnEndedAt,
+            awaitingSince: e.awaitingSince,
+          }
+        : undefined;
+    }),
+  );
+  const timing = rowTiming(status, clock && { ...clock, backgroundSince });
+  if (timing.mode === "none") return null;
+  const live = timing.mode === "live";
+  return (
+    <span className={"cv-sess-live" + (live ? "" : " paused")}>
+      <RunDots />
+      {showTime && live ? <RowTimer startedAt={timing.startedAt} /> : null}
+      {showTime && !live && timing.elapsedMs != null ? (
+        <span className="cv-sess-time">{fmtFrozenElapsed(timing.elapsedMs)}</span>
+      ) : null}
+    </span>
+  );
+}
+
+/** The glyph at the end of a row that is waiting on the user but CANNOT be marked as seen:
+ *  a question mark for a questionnaire, a key for a permission prompt. Not a button — it
+ *  says "this one needs an answer, in the conversation", where the other states offer ✓. */
+function RowAskGlyph({ status }: { status: AgentStatus }) {
+  const form = status.kind === "needInput" && status.via === "questionnaire";
+  const permission = status.kind === "needIntervention";
+  if (!form && !permission) return null;
+  return (
+    <span
+      className="cv-sess-ask"
+      title={form ? "Questions to answer in the conversation" : "Permission to answer in the conversation"}
+      aria-hidden="true"
+    >
+      <Ico name={form ? "ask" : "key"} className="sm" />
+    </span>
+  );
+}
+
+/** The state in words, for assistive tech: the tinted-pill rows carry it as colour only. */
+function statusWords(s: AgentStatus): string {
+  switch (s.kind) {
+    case "running":
+      return "running";
+    case "backgrounding":
+      return "working in the background";
+    case "needInput":
+      return "waiting for your reply";
+    case "needIntervention":
+      return "waiting for your permission";
+    case "error":
+      return "error";
+    case "review":
+      return "ready for review";
+    case "idle":
+      return "idle";
+    case "off":
+      return "stopped";
+  }
+}
+
 function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   // Rich status keyed by the conversation's stable id (the message store routes
   // live events back to it). Drives the dot colour, the whole-row highlight, and
@@ -67,6 +154,17 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   // the friction-free × silently killing that live work.
   const runningBgTasks = useRunningTaskCount(conv.id);
   const attn = rowAttention(status);
+  // Tinted-pill rows (Settings → Display → Appearance): the state IS the row's colour —
+  // no leading dot, no attention tint. `pill` reuses the importance classifier (the same
+  // five loud states); the two calm ones stay plain, `off` a touch dimmer than `idle`.
+  const pills = useDisplay((d) => d.sidebarStatePills);
+  const pill = pills ? railState(status) : null;
+  const calm = pills && !pill ? (status.kind === "off" ? "off" : "idle") : undefined;
+  const rowState = {
+    "data-attn": pills ? undefined : (attn ?? undefined),
+    "data-pill": pill ?? undefined,
+    "data-calm": calm,
+  };
   const select = useConversationsStore((s) => s.selectConversation);
   const rename = useConversationsStore((s) => s.renameConversation);
   const remove = useConversationsStore((s) => s.removeConversation);
@@ -92,6 +190,8 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : undefined,
+    // Above the tinted-pill rows, which sit at z-index 1 so their halo isn't clipped.
+    zIndex: isDragging ? 2 : undefined,
   };
 
   // "Busy" for delete-safety: a turn in flight OR any background work still running.
@@ -129,10 +229,10 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         ref={setNodeRef}
         style={dragStyle}
         className={"cv-sess-row" + (active ? " on" : "")}
-        data-attn={attn ?? undefined}
+        {...rowState}
       >
         <span className="cv-sess" style={{ cursor: "default" }}>
-          <StatusDot status={status} />
+          {pills ? null : <StatusDot status={status} />}
           <input
             className="cv-sess-edit"
             value={draft}
@@ -155,7 +255,7 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
       ref={setNodeRef}
       style={dragStyle}
       className={"cv-sess-row cv-draggable" + (active ? " on" : "")}
-      data-attn={attn ?? undefined}
+      {...rowState}
       {...listeners}
       onClickCapture={guardReorderClick}
     >
@@ -164,17 +264,31 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         className="cv-sess"
         onClick={() => select(conv.id)}
         onDoubleClick={startEdit}
+        aria-label={pills ? `${conv.name} — ${statusWords(status)}` : undefined}
       >
-        <StatusDot status={status} />
+        {pills ? null : <StatusDot status={status} />}
         {/* Keyed by the name so an incoming auto-title (applyAutoTitle) REMOUNTS this
             node instead of mutating its text in place. WebKit fails to repaint a
             text-overflow:ellipsis box when only its text content changes at an identical
             box size — old and new glyphs superimpose (the "ghost title" that only a
             sidebar resize cleared). A fresh node gets a clean paint region. Repo titles
             never change, which is why they never ghosted. */}
-        <span key={conv.name} className="cv-sess-n">{conv.name}</span>
+        {pills ? (
+          <span className="cv-sess-main">
+            <span key={conv.name} className="cv-sess-n">{conv.name}</span>
+            {/* The thread's "Claude is working" dots + the time: ticking while it works,
+                frozen once it stopped on a state, gone when it is calm again. Nothing
+                else — the state itself is the pill colour. */}
+            <RowLive convId={conv.id} status={status} />
+          </span>
+        ) : (
+          <span key={conv.name} className="cv-sess-n">{conv.name}</span>
+        )}
       </button>
       <WorktreeBadge conv={conv} />
+      {/* Where ✓ cannot apply (a questionnaire / a permission is answered in the thread,
+          not dismissed), the row still says so — with a glyph, not a button. */}
+      {pills ? <RowAskGlyph status={status} /> : null}
       {isDismissable(status) ? (
         <button
           type="button"
@@ -410,6 +524,7 @@ export function ConductorSidebar() {
   const openHistory = useHistoryUi((s) => s.openPanel);
   const openSettings = useSettingsUi((s) => s.openSettings);
   const showFleet = useDisplay((s) => s.fleetBannerConversation);
+  const statePills = useDisplay((s) => s.sidebarStatePills);
   // Paired remote servers → the "+ new conversation" flow can start a folder on one of
   // them, not just on this Mac.
   const machines = useMachines();
@@ -431,6 +546,7 @@ export function ConductorSidebar() {
     <div
       ref={rootRef}
       className="wf-col cv-side"
+      data-rows={statePills ? "pills" : undefined}
       style={{
         width,
         flex: `0 0 ${width}px`,

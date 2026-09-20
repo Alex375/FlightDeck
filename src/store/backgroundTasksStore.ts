@@ -36,6 +36,9 @@ function taskEqual(a: BackgroundTask, b: BackgroundTask): boolean {
 interface BackgroundTasksState {
   /** convId → (task_id → latest cumulative snapshot). */
   sessions: Record<string, Record<string, BackgroundTask>>;
+  /** convId → (task_id → when this task was FIRST seen). The wire carries no start time;
+   *  this is what "working since" counts from (see {@link useBackgroundWorkSince}). */
+  firstSeen: Record<string, Record<string, number>>;
   /** Apply a `session_task` snapshot (replace by `task_id`). */
   applyTask: (session: string, task: BackgroundTask) => void;
   /**
@@ -53,14 +56,25 @@ interface BackgroundTasksState {
 
 export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
   sessions: {},
+  firstSeen: {},
 
   applyTask: (session, task) =>
     set((s) => {
       const cur = s.sessions[session] ?? {};
       const prev = cur[task.task_id];
       if (prev && taskEqual(prev, task)) return s; // idempotent re-delivery
+      // First snapshot of this task = when we learned the work started. The wire carries no
+      // start timestamp, and the turn that launched it is a moving target (a follow-up turn
+      // restarts that clock while the same work keeps running), so the sidebar's "working
+      // since" counter reads from here. Stamped once per task_id, never moved.
+      const seen = s.firstSeen[session] ?? {};
+      const firstSeen =
+        seen[task.task_id] == null
+          ? { ...s.firstSeen, [session]: { ...seen, [task.task_id]: Date.now() } }
+          : s.firstSeen;
       return {
         sessions: { ...s.sessions, [session]: { ...cur, [task.task_id]: task } },
+        firstSeen,
       };
     }),
 
@@ -87,10 +101,12 @@ export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
       if (!s.sessions[session]) return s;
       const next = { ...s.sessions };
       delete next[session];
-      return { sessions: next };
+      const seen = { ...s.firstSeen };
+      delete seen[session];
+      return { sessions: next, firstSeen: seen };
     }),
 
-  clear: () => set({ sessions: {} }),
+  clear: () => set({ sessions: {}, firstSeen: {} }),
 }));
 
 // ---- Selector hooks --------------------------------------------------------
@@ -207,6 +223,33 @@ export function runningBashCountFor(
 
 export const useRunningTaskCount = (session: string): number =>
   useBackgroundTasksStore((s) => runningCountFor(s.sessions, session));
+
+/**
+ * When the background work still RUNNING for a conversation started — the earliest task
+ * we saw among those still running, or `null` when none is. This is what the sidebar's
+ * green "backgrounding" counter reads: the work itself outlives the turn that launched it
+ * (and any turn the user runs meanwhile), so the turn's own clock would keep restarting it.
+ * A plain number → referentially stable, so the row re-renders only when it really moves.
+ */
+export function backgroundWorkSinceFor(
+  sessions: Record<string, Record<string, BackgroundTask>>,
+  firstSeen: Record<string, Record<string, number>>,
+  convId: string,
+): number | null {
+  const tasks = sessions[convId];
+  const seen = firstSeen[convId];
+  if (!tasks || !seen) return null;
+  let min: number | null = null;
+  for (const [id, t] of Object.entries(tasks)) {
+    if (t.status !== "running") continue;
+    const at = seen[id];
+    if (at != null && (min == null || at < min)) min = at;
+  }
+  return min;
+}
+
+export const useBackgroundWorkSince = (session: string): number | null =>
+  useBackgroundTasksStore((s) => backgroundWorkSinceFor(s.sessions, s.firstSeen, session));
 
 /** How many background *Bash commands* (`kind: "bash"`) are currently RUNNING for a
  *  conversation. A SUBSET of {@link useRunningTaskCount}; when the two are equal (and

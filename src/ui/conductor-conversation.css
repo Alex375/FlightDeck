@@ -141,6 +141,111 @@
 .cv-sess-edit { flex:1; min-width:0; font:inherit; font-size:13px; color:var(--wf-tx-hi); background:var(--wf-bg); border:1px solid var(--wf-accent); border-radius:5px; padding:4px 6px; outline:none; }
 .cv-side-foot { display:flex; align-items:center; gap:8px; padding:11px 14px; border-top:1px solid var(--wf-line); margin-top:0; }
 
+/* ---- Tinted-pill rows (Settings → Display → Appearance → "Tinted conversation rows") ----
+   A row's state IS its colour: a rounded pill — a tint over an opaque base, ringed by a 1px
+   border drawn as a border-box gradient (so background work can be green→violet) — for the
+   five loud states, nothing for idle / off. Needs-you, review and error are the loudest
+   (stronger tint + ring, a soft halo, the name in a light tint of the colour); running and
+   background stay calm. No leading dot. Scoped under [data-rows="pills"], so the classic dot
+   + attention-tint style above is untouched when the pref is off. */
+.cv-side[data-rows="pills"] .cv-sess-row { --pill-base:var(--wf-bg-2); align-items:flex-start; border:1px solid transparent; border-radius:10px; }
+.cv-side[data-rows="pills"] .cv-sess { padding:7px 9px; gap:8px; }
+.cv-side[data-rows="pills"] .cv-sess-n { line-height:20px; }
+/* The trailing controls sit on the NAME line (a running row is two lines tall): the name
+   line is centred 17px down (7px padding + half its 20px), hence these offsets. */
+.cv-side[data-rows="pills"] .cv-wt-badge { margin-top:7px; }
+.cv-side[data-rows="pills"] .cv-sess-seen,
+.cv-side[data-rows="pills"] .cv-sess-ask,
+.cv-side[data-rows="pills"] .cv-sess-del { margin-top:6px; }
+/* ✓ is rendered only where "mark as seen" applies (review / error / open question): always
+   shown there, tinted like the row. The × stays reveal-on-hover. */
+.cv-side[data-rows="pills"] .cv-sess-seen { opacity:1; color:var(--pill-ink, var(--wf-tx-lo)); }
+.cv-side[data-rows="pills"] .cv-sess-seen:hover { color:var(--wf-tx-hi); background:rgb(255 255 255 / .08); }
+.cv-sess-main { flex:1; min-width:0; display:flex; flex-direction:column; }
+.cv-sess-main .cv-sess-n { flex:0 0 auto; }
+/* Running only: the thread's working dots, then the time since your last message. */
+.cv-sess-live { display:flex; align-items:center; gap:7px; height:16px; margin-top:1px; font-size:11.5px; line-height:16px; color:var(--wf-tx); }
+.cv-sess-live .cv-bgrun { width:auto; gap:3.5px; padding-top:2px; }
+.cv-sess-time { font-variant-numeric:tabular-nums; letter-spacing:.1px; white-space:nowrap; }
+/* Stopped on a state: the dots stand still and the time is frozen on how long it ran —
+   the line reads "it worked this long, then stopped here", not "it is working". */
+.cv-sess-live.paused { color:var(--wf-tx-lo); }
+.cv-sess-live.paused .cv-bgrun i { animation:none; opacity:.5; }
+/* Waiting on an answer that ✓ cannot give (questionnaire / permission): a glyph, not a
+   button — it sits where ✓ would, in the state's own colour. */
+/* Hit-testable (so its tooltip can actually appear) but not focusable and not a button:
+   the answer is given in the conversation, not here. */
+.cv-sess-ask { flex:0 0 auto; width:22px; height:22px; margin-right:2px; display:inline-flex; align-items:center; justify-content:center; color:var(--pill-ink, var(--wf-att)); opacity:.9; cursor:default; }
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill] {
+  --pill-tint-img:linear-gradient(color-mix(in srgb, var(--pill-c) var(--pill-t), transparent), color-mix(in srgb, var(--pill-c) var(--pill-t), transparent));
+  --pill-ring-img:linear-gradient(color-mix(in srgb, var(--pill-c) var(--pill-r), transparent), color-mix(in srgb, var(--pill-c) var(--pill-r), transparent));
+  background:var(--pill-tint-img) padding-box, linear-gradient(var(--pill-base), var(--pill-base)) padding-box, var(--pill-ring-img) border-box;
+  box-shadow:var(--pill-glow, 0 0 0 transparent), var(--pill-lift, 0 0 0 transparent);
+}
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill] .cv-sess-n { color:var(--pill-ink, var(--wf-tx-hi)); font-weight:500; }
+/* Calm: running green (it also carries the live second line). */
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="run"] { --pill-c:var(--wf-run); --pill-t:4.5%; --pill-r:20%; }
+.cv-side[data-rows="pills"] .cv-sess-row.on[data-pill="run"] { --pill-t:15%; --pill-r:85%; --pill-glow:0 0 0 2px color-mix(in srgb, var(--wf-run) 22%, transparent); }
+/* Calm: background work — the SAME green as a running row (it is still working, dots and
+   counter included), with violet washing in on its right end only: the Flight Deck card's
+   green→violet pairing, as an accent rather than a different state. */
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="bg"] {
+  --pill-c:var(--wf-run);
+  --pill-tint-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-run) 4.5%, transparent) 0 62%, color-mix(in srgb, #a78bfa 9%, transparent) 100%);
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-run) 20%, transparent) 0 48%, color-mix(in srgb, #a78bfa 62%, transparent) 100%);
+}
+/* Loud: needs you (amber), review (blue), error (red). */
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="att"]    { --pill-c:var(--wf-att);  --pill-ink:#f0cd97; }
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="review"] { --pill-c:var(--wf-wait); --pill-ink:#b4caf2; }
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="err"]    { --pill-c:var(--wf-err);  --pill-ink:#f0a9af; }
+/* Raised above their neighbours: the next row's opaque pill base would otherwise paint over
+   the lower half of this row's halo. */
+.cv-side[data-rows="pills"] .cv-sess-row:is([data-pill="att"], [data-pill="review"], [data-pill="err"]) {
+  --pill-t:16%; --pill-r:50%;
+  --pill-glow:0 0 14px -5px color-mix(in srgb, var(--pill-c) 55%, transparent);
+  z-index:1;
+}
+.cv-side[data-rows="pills"] .cv-sess-row.on:is([data-pill="att"], [data-pill="review"], [data-pill="err"]) {
+  --pill-t:32%; --pill-r:95%;
+  /* An outer ring in the state's colour on top of the halo: the selected row reads as
+     "this one" from across the list, not as a slightly brighter neighbour. */
+  --pill-glow:0 0 0 2px color-mix(in srgb, var(--pill-c) 26%, transparent), 0 0 16px -6px color-mix(in srgb, var(--pill-c) 60%, transparent);
+}
+.cv-side[data-rows="pills"] .cv-sess-row.on:is([data-pill="att"], [data-pill="review"], [data-pill="err"]) .cv-sess-n { color:var(--wf-tx-hi); }
+.cv-side[data-rows="pills"] .cv-sess-row:is([data-pill="att"], [data-pill="review"], [data-pill="err"]) .cv-sess-n { font-weight:600; }
+/* Needs you breathes — only its halo's opacity animates (GPU-composited). */
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="att"]::after { content:""; position:absolute; inset:-1px; border-radius:11px; pointer-events:none; box-shadow:0 0 16px -3px color-mix(in srgb, var(--wf-att) 55%, transparent); animation:cv-pill-breathe 3.2s ease-in-out infinite; }
+@keyframes cv-pill-breathe { 0%,100% { opacity:.25; } 50% { opacity:.9; } }
+/* Three distinct rungs, so "which one am I in?" never competes with "which one is under
+   the pointer?": at REST the row is dark with a thin tinted ring; HOVER lifts the base one
+   step (panel-2); SELECTED lifts it further (panel-3), turns the ring nearly solid in the
+   state's colour and adds a top highlight. */
+.cv-side[data-rows="pills"] .cv-sess-row.on[data-pill] { --pill-base:var(--wf-panel-3); --pill-lift:inset 0 0 0 1px rgb(255 255 255 / .09), inset 0 1px 0 rgb(255 255 255 / .12); }
+.cv-side[data-rows="pills"] .cv-sess-row.on[data-pill] .cv-sess-n { font-weight:600; }
+/* A calm row carries no colour, so its selected state is the lighter base + a white ring. */
+.cv-side[data-rows="pills"] .cv-sess-row.on:not([data-pill]) { background:var(--wf-panel-3); box-shadow:0 0 0 2px rgb(255 255 255 / .05), inset 0 0 0 1px rgb(255 255 255 / .14), inset 0 1px 0 rgb(255 255 255 / .1); }
+.cv-side[data-rows="pills"] .cv-sess-row.on:not([data-pill]) .cv-sess-n { color:var(--wf-tx-hi); font-weight:600; }
+/* Hover on a coloured row: a lifted base plus a slightly stronger tint and ring (quiet rows
+   keep the plain panel hover). Not a brightness filter — on these near-black bases it moved
+   the colour by 2-3 levels, i.e. nothing visible. The selected row keeps its own look. */
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill]:hover:not(.on) { --pill-base:var(--wf-panel-2); }
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="run"]:hover:not(.on) { --pill-t:6%; --pill-r:30%; }
+.cv-side[data-rows="pills"] .cv-sess-row[data-pill="bg"]:hover:not(.on) {
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-run) 30%, transparent) 0 48%, color-mix(in srgb, #a78bfa 72%, transparent) 100%);
+}
+.cv-side[data-rows="pills"] .cv-sess-row.on[data-pill="bg"] {
+  /* The bg row writes its own gradients, so --pill-t would never be read: restate both. */
+  --pill-tint-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-run) 15%, transparent) 0 62%, color-mix(in srgb, #a78bfa 22%, transparent) 100%);
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-run) 85%, transparent) 0 48%, color-mix(in srgb, #a78bfa 95%, transparent) 100%);
+  --pill-glow:0 0 0 2px color-mix(in srgb, #a78bfa 20%, transparent);
+}
+.cv-side[data-rows="pills"] .cv-sess-row:is([data-pill="att"], [data-pill="review"], [data-pill="err"]):hover:not(.on) { --pill-t:19%; --pill-r:58%; }
+/* Stopped recedes a touch more than idle — the only whisper between the two calm states. */
+.cv-side[data-rows="pills"] .cv-sess-row[data-calm="off"]:not(:hover):not(.on) .cv-sess-n { color:color-mix(in srgb, var(--wf-tx) 78%, var(--wf-bg-2)); }
+@media (prefers-reduced-motion: reduce) {
+  .cv-side[data-rows="pills"] .cv-sess-row[data-pill="att"]::after { animation:none; opacity:.6; }
+}
+
 /* Running-conversation indicator (a more elaborate run indicator): a steady, softly
    breathing green core emitting two staggered sonar rings. More presence than the plain
    pulsing status dot, but still cheap — only transform/opacity animate (GPU-composited),
@@ -1006,6 +1111,49 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
    row AND the controls row live inside the same elevated block, centred on the
    conversation width and lifted off the window edge with a soft shadow. */
 .cv-composer { position:relative; margin:6px auto 14px; max-width:var(--cv-max,840px); width:calc(100% - 52px); padding:6px 8px 7px; background:var(--wf-panel); border:1px solid var(--wf-line-2); border-radius:20px; box-shadow:0 18px 44px -20px #000, 0 6px 16px -10px #0009, inset 0 1px 0 #ffffff0a; container:composer / inline-size; }
+
+/* ---- Status inside the composer (Settings → Display → Appearance → "Status inside the composer") ----
+   ComposerStatusBand is the card's FIRST child: a header band flush with the card's edges (it
+   cancels the card padding), and the card's own border takes the state colour through :has()
+   — so the composer never re-renders on a status change. The halo is the card's ::after,
+   whose OPACITY alone animates (question); faint and static for review / error. Background
+   work stays neutral: a green dot and plain text, no tint. */
+.cv-sband { --sband-c:var(--wf-wait); display:flex; align-items:center; gap:9px; min-width:0; height:42px; box-sizing:border-box; margin:-6px -8px 6px; padding:0 7px 0 15px; border-radius:19px 19px 0 0; background:color-mix(in srgb, var(--sband-c) 4%, transparent); border-bottom:1px solid color-mix(in srgb, var(--sband-c) 12%, transparent); font-size:12.5px; white-space:nowrap; }
+.cv-sband[data-tone="need"]  { --sband-c:var(--wf-att); }
+.cv-sband[data-tone="error"] { --sband-c:var(--wf-err); }
+.cv-sband[data-tone="bg"]    { height:34px; background:transparent; border-bottom-color:var(--wf-line); }
+.cv-sband-ico { width:14px; height:14px; color:var(--sband-c); stroke-width:1.5; }
+.cv-sband-dot { width:7px; height:7px; flex:0 0 auto; margin:0 3px 0 4px; border-radius:50%; background:var(--wf-run); box-shadow:0 0 0 3px var(--wf-run-bg); }
+.cv-sband-label { flex:0 0 auto; font-weight:600; color:var(--sband-c); }
+.cv-sband[data-tone="bg"] .cv-sband-label { font-weight:500; color:var(--wf-tx); }
+.cv-sband-sep { flex:0 0 auto; color:var(--wf-tx-xlo); }
+.cv-sband-detail { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx-hi); }
+.cv-sband:is([data-tone="review"], [data-tone="bg"]) .cv-sband-detail { color:var(--wf-tx); }
+.cv-sband-num { font-variant-numeric:tabular-nums; }
+.cv-sband-fill { flex:1 1 0; min-width:0; }
+.cv-sband-bgchip { flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 9px 0 8px; border-radius:999px; background:color-mix(in srgb, var(--wf-ultra) 10%, transparent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--wf-ultra) 24%, transparent); color:var(--wf-ultra); font-size:11.5px; font-weight:500; }
+.cv-sband-bgchip i { width:6px; height:6px; flex:0 0 auto; border-radius:50%; background:var(--wf-ultra); }
+.cv-sband-btn { flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 11px 0 9px; border:0; border-radius:8px; font:inherit; font-size:12px; font-weight:600; cursor:pointer; background:var(--wf-panel-3); color:var(--wf-tx-hi); box-shadow:inset 0 0 0 1px var(--wf-line-2); transition:filter .12s ease; }
+.cv-sband-btn:hover { filter:brightness(1.15); }
+.cv-sband-btn .wf-ico { width:12px; height:12px; }
+.cv-sband-btn.seen { padding-right:6px; background:color-mix(in srgb, var(--sband-c) 12%, transparent); color:var(--sband-c); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--sband-c) 28%, transparent); }
+.cv-sband-btn kbd { display:inline-flex; align-items:center; height:16px; padding:0 5px; border-radius:4px; background:color-mix(in srgb, var(--sband-c) 12%, transparent); font:inherit; font-size:10.5px; font-weight:500; letter-spacing:.5px; }
+/* A narrow composer keeps the actions: the shortcut hint and the chip's words go first. */
+@container composer (max-width: 600px) {
+  .cv-sband-btn kbd { display:none; }
+  .cv-sband-bgchip { padding:0 7px; font-size:0; gap:0; }
+}
+.cv-composer::after { content:""; position:absolute; inset:-1px; border-radius:20px; pointer-events:none; opacity:0; }
+.cv-composer:has(> .cv-sband[data-tone="review"]) { border-color:color-mix(in srgb, var(--wf-wait) 42%, transparent); }
+.cv-composer:has(> .cv-sband[data-tone="need"])   { border-color:color-mix(in srgb, var(--wf-att) 50%, transparent); }
+.cv-composer:has(> .cv-sband[data-tone="error"])  { border-color:color-mix(in srgb, var(--wf-err) 45%, transparent); }
+.cv-composer:has(> .cv-sband[data-tone="review"])::after { opacity:1; box-shadow:0 0 20px -8px color-mix(in srgb, var(--wf-wait) 50%, transparent); }
+.cv-composer:has(> .cv-sband[data-tone="error"])::after  { opacity:1; box-shadow:0 0 20px -8px color-mix(in srgb, var(--wf-err) 50%, transparent); }
+.cv-composer:has(> .cv-sband[data-tone="need"])::after   { box-shadow:0 0 0 1px color-mix(in srgb, var(--wf-att) 30%, transparent), 0 0 24px -6px color-mix(in srgb, var(--wf-att) 50%, transparent); animation:cv-sband-breathe 3.2s ease-in-out infinite; }
+@keyframes cv-sband-breathe { 0%,100% { opacity:.2; } 50% { opacity:.85; } }
+@media (prefers-reduced-motion: reduce) {
+  .cv-composer:has(> .cv-sband[data-tone="need"])::after { animation:none; opacity:.6; }
+}
 /* Text row inside the card: no border/background of its own — the card is the box. */
 .cv-input { display:flex; align-items:center; gap:8px; padding:5px 6px; background:transparent; border:0; }
 

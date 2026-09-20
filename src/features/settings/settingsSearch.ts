@@ -44,6 +44,8 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "Tinted conversation rows", section: "display", sub: "appearance", group: "Appearance", keywords: "sidebar state colour color pill running timer chrono dot status couleur etat pastille ligne conversation display affichage" },
+  { title: "Status inside the composer", section: "display", sub: "appearance", group: "Appearance", keywords: "review bar mark as seen question error banner encadre statut composeur vu display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
@@ -56,6 +58,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Animate the conversation", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
   { title: "Message controls", section: "display", sub: "thread", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
   { title: "Clickable filename on Read/Write rows", section: "display", sub: "thread", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
+  { title: "Time on sidebar rows", section: "display", sub: "timing", group: "Durations & timing", keywords: "sidebar row timer counter chrono temps ligne conversation barre laterale" },
   { title: "Turn duration", section: "display", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
   { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
   { title: "Thinking time", section: "display", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
