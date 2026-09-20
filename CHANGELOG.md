@@ -15,7 +15,8 @@ by `release.yml` and stays **only** on the GitHub page — it does not appear in
 - New: an **IDE view** — folders opened as workspaces, with a dock holding your terminals and conversations, and closable tabs; an agent can open a file there without moving what you were looking at.
 - New: **artifacts designed by Claude (typed artifacts) display inside the app**, no longer only as a link.
 - New: **drag files from the Finder** straight onto a conversation or a Flight Deck card to attach them.
-- Changed: a conversation's **state is now its colour in the sidebar**, its status moved into the composer, and a side panel gathers everything about the current conversation.
+- New: a **side panel on the right of a conversation** (⌘I) gathers its state in one place — its TOSSE task with status, assignee and tickable subtasks, its goal, its todo list and its artifacts, plus the stream and worktree controls. The header keeps actions only.
+- Changed: a conversation's **state is now the colour of its row** in the sidebar, with a live counter of how long the turn has run, and its status moved from a full-width bar into the composer itself.
 - Fix: a **background task that fails** shows up as a discreet inline notice instead of a full error bubble.
 
 ## v2.4.0
