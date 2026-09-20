@@ -124,6 +124,43 @@ export function looksLikeQuestion(text: string | null): boolean {
   return stripped.endsWith("?");
 }
 
+/**
+ * The question itself, out of an assistant message that {@link looksLikeQuestion}: the
+ * trailing sentence(s) ending in "?" on its last line, with Markdown markers dropped and
+ * whitespace collapsed, capped at `max` characters. `null` when there is none. Shown as the
+ * detail of the "Waiting for your reply" status — the message's opening lines are rarely
+ * the question, which by the heuristic's own definition is at the END.
+ */
+export function questionExcerpt(text: string | null, max = 200): string | null {
+  if (!text) return null;
+  const lines = text
+    .replace(/```[\s\S]*?```/gu, " ") // a fenced block is never the question
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const last = lines[lines.length - 1];
+  if (!last) return null;
+  const plain = last
+    .replace(/^(?:[-*+]|\d+[.)]|>|#{1,6})\s+/u, "") // list / quote / heading marker
+    .replace(/\[([^\]]*)\]\([^)]*\)/gu, "$1") // [label](url) → label
+    .replace(/[*_`~]+/gu, "") // emphasis / code markers
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[\s)\]"'>]+$/u, "");
+  if (!plain.endsWith("?")) return null;
+  // Keep the trailing run of sentences that are themselves questions ("A? Or B?").
+  // Split by MATCHING sentences rather than a lookbehind: WKWebView only gained lookbehind
+  // in Safari 16.4, and an unsupported one throws at PARSE time — taking the module with it.
+  const sentences = (plain.match(/[^.!?]+[.!?]+(?:\s+|$)/gu) ?? [plain]).map((s) => s.trim());
+  const keep: string[] = [];
+  for (let i = sentences.length - 1; i >= 0 && sentences[i].endsWith("?"); i--) {
+    keep.unshift(sentences[i]);
+  }
+  // A closer peeled off the end above leaves its opener dangling: "(Shall I?)".
+  const q = keep.join(" ").replace(/^\((?!.*\))/u, "");
+  return q.length > max ? `${q.slice(0, max - 1).trimEnd()}…` : q;
+}
+
 /** Human label for an error turn_result subtype. */
 function errorMessage(subtype: string | null): string {
   switch (subtype) {

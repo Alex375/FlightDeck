@@ -3,6 +3,7 @@ import { useAgentStatus } from "../../agent/useAgentStatus";
 import { isDismissable, type AgentStatus } from "../../agent/status";
 import { acknowledgeConversation } from "../../store/conversationsStore";
 import { useSendMessage } from "../../ipc/useCommands";
+import { useDisplay } from "../../store/display";
 import { Ico } from "../../ui/kit";
 
 /**
@@ -34,19 +35,17 @@ function reviewTone(s: AgentStatus): "review" | "input" | "error" {
   return "review";
 }
 
-export function ReviewBar({ session }: { session: string }) {
-  const status = useAgentStatus(session);
-  const send = useSendMessage(session);
-  const dismissable = isDismissable(status);
-
-  // ⌘/Ctrl+Enter = "Mark as seen" for the visible reminder bar (review / error /
-  // open question), whatever its tone (blue / yellow / red). Captured at the window
-  // level so it wins over the composer's Enter-to-send handler (same capture trick
-  // the composer uses for Escape — WKWebView can swallow keys inside the textarea).
-  // Only wired while a dismissable bar is actually shown; otherwise ⌘Enter is left
-  // untouched (falls through to the composer).
+/**
+ * ⌘/Ctrl+Enter = "Mark as seen" while a dismissable reminder (review / error / open
+ * question) is on screen, whatever its tone. Captured at the window level so it wins over
+ * the composer's Enter-to-send handler (same capture trick the composer uses for Escape —
+ * WKWebView can swallow keys inside the textarea). Wired only while `active`; otherwise
+ * ⌘Enter is left untouched (falls through to the composer). Shared by this bar and the
+ * in-composer {@link ComposerStatusBand} — exactly one of the two is active at a time.
+ */
+export function useMarkSeenShortcut(session: string, active: boolean) {
   useEffect(() => {
-    if (!dismissable) return;
+    if (!active) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
         e.preventDefault();
@@ -56,7 +55,22 @@ export function ReviewBar({ session }: { session: string }) {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [dismissable, session]);
+  }, [active, session]);
+}
+
+/** Reads only the pref: when the status lives inside the composer instead (Settings →
+ *  Display → Appearance), the band there renders these same states and this bar stands
+ *  down entirely — nothing below is mounted, so no second status derivation or ⌘↵ handler. */
+export function ReviewBar({ session }: { session: string }) {
+  const inComposer = useDisplay((d) => d.composerStatusBand);
+  return inComposer ? null : <ClassicReviewBar session={session} />;
+}
+
+function ClassicReviewBar({ session }: { session: string }) {
+  const status = useAgentStatus(session);
+  const send = useSendMessage(session);
+  const dismissable = isDismissable(status);
+  useMarkSeenShortcut(session, dismissable);
 
   // Background work still running while the main turn is done: a calm GREEN (running-family)
   // bar, NOT the blue "to review" — there is nothing to review yet, the agent resumes on its

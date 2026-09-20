@@ -83,6 +83,9 @@ function emptyEntry(session: string): SessionEntry {
     seq: 0,
     replayAnchor: 0,
     turnStartedAt: null,
+    lastTurnStartedAt: null,
+    lastTurnEndedAt: null,
+    awaitingSince: null,
     turnCount: 0,
     thinkingMs: 0,
     thinkingSince: null,
@@ -314,16 +317,36 @@ export const useConversationStore = create<ConversationState>((set) => {
         // cumulative thinking time — see thinkingWords.ts). Left untouched on true→false /
         // mid-turn re-emits.
         let turnCount = entry.turnCount;
+        // The same two edges also keep the SETTLED timing the sidebar row freezes on a
+        // conversation that stopped on a state (review / error / question): unlike
+        // `turnStartedAt`, `lastTurnStartedAt` survives the end of the turn, and
+        // `lastTurnEndedAt` stamps that end. `awaitingSince` stamps the moment the agent
+        // blocked on the user (permission / questionnaire), which pauses the counter
+        // mid-turn — the agent is waiting, not working.
+        let lastTurnStartedAt = entry.lastTurnStartedAt;
+        let lastTurnEndedAt = entry.lastTurnEndedAt;
         if (state.busy && !entry.state.busy) {
           turnStartedAt = Date.now();
+          lastTurnStartedAt = turnStartedAt;
+          lastTurnEndedAt = null;
           turnCount = entry.turnCount + 1;
         } else if (!state.busy && entry.state.busy) {
           turnStartedAt = null;
+          lastTurnEndedAt = Date.now();
           thinkingStartedAt = null; // a turn ending also ends any in-flight thinking
+        }
+        let awaitingSince = entry.awaitingSince;
+        if (state.awaiting_permission && !entry.state.awaiting_permission) {
+          awaitingSince = Date.now();
+        } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
+          awaitingSince = null;
         }
         return {
           ...entry,
           turnStartedAt,
+          lastTurnStartedAt,
+          lastTurnEndedAt,
+          awaitingSince,
           turnCount,
           thinkingStartedAt,
           state: {
@@ -354,6 +377,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           ...entry,
           state: { ...connectingState },
           turnStartedAt: null,
+          awaitingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
           toolStartedAt: {},
