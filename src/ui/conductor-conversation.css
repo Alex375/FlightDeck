@@ -755,6 +755,24 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-artview-btn:hover { background:var(--wf-panel-3, var(--wf-panel)); color:var(--wf-tx-hi); }
 .cv-artview-btn .wf-ico { width:15px; height:15px; }
 .cv-artview-body { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+/* The box the native claude.ai host is laid over (artifactHost.ts follows it). Its content only
+   shows while the host isn't painting — loading, stepped aside for a menu, or failed. */
+.cv-artview-host { flex:1; min-height:0; display:flex; flex-direction:column; }
+.cv-artview-status { flex:none; max-width:45%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; color:var(--wf-tx-lo); }
+.cv-artview-status[data-phase="signin"] { color:var(--wf-accent); }
+.cv-artview-status[data-phase="error"] { color:var(--wf-err); }
+.cv-artview-status[data-phase="offsite"] { color:var(--wf-warn, var(--wf-accent)); }
+/* The sign-in strip: it sits ABOVE the native view's box (which it must never be inside — the
+   page paints over that box entirely). */
+.cv-artview-signin { flex:none; padding:10px 12px; border-bottom:1px solid var(--wf-line); background:var(--wf-panel); display:flex; flex-direction:column; gap:8px; }
+.cv-artview-signin p { margin:0; font-size:12px; line-height:1.45; color:var(--wf-tx-lo); }
+.cv-artview-signin strong { color:var(--wf-tx-hi); font-weight:600; }
+.cv-artview-signin-row { display:flex; gap:8px; align-items:center; }
+.cv-artview-signin input { flex:1; min-width:0; height:28px; padding:0 9px; border:1px solid var(--wf-line); border-radius:8px; background:var(--wf-bg); color:var(--wf-tx-hi); font:inherit; font-size:12px; }
+.cv-artview-signin input:focus { outline:none; border-color:var(--wf-accent); }
+.cv-artview-signin .cv-artview-open { flex:none; padding:5px 10px; }
+.cv-artview-signin .cv-artview-open:disabled { opacity:.5; cursor:default; border-color:var(--wf-line); color:var(--wf-tx-lo); }
+.cv-artview-signin-err { color:var(--wf-err); }
 .cv-artview-frame { flex:1; width:100%; border:0; background:#fff; }
 .cv-artview-md { flex:1; min-height:0; overflow-y:auto; padding:14px 16px; }
 .cv-artview-msg { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:24px; text-align:center; color:var(--wf-tx-lo); font-size:12.5px; }

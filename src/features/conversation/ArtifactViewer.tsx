@@ -1,17 +1,30 @@
-// The side-region ARTIFACT VIEWER: reads an artifact's local file and renders it in place —
-// self-contained HTML in a sandboxed (null-origin) iframe under our own CSP, Markdown via the
-// thread renderer. The local file is an ephemeral temp path, so when it can't be rendered (gone,
-// too large, not text, unreadable) the viewer says WHICH of those happened and degrades to an
-// "Open on claude.ai" button (the durable hosted copy). READ-ONLY: it never writes anything, and
-// the iframe's scripts can reach neither the app nor the network.
+// The side-region ARTIFACT VIEWER, in one of two modes:
+//  - LOCAL: reads a page artifact's local file and renders it in place — self-contained HTML in a
+//    sandboxed (null-origin) iframe under our own CSP, Markdown via the thread renderer. READ-ONLY,
+//    and the iframe's scripts can reach neither the app nor the network.
+//  - HOSTED: the artifact's claude.ai page itself, in the native webview the artifact host lays
+//    over the panel (see artifactHost.ts). The only way to see a TYPED artifact (Claude Design…)
+//    in-app — its page exists nowhere else — and the fallback whenever the local file can't be
+//    rendered (the temp path is ephemeral: gone, too large, not text, unreadable).
+// When neither works (no hosted link, or the user turned the in-app hosted view off) the viewer
+// says WHICH local failure happened and offers the browser.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { commands } from "../../ipc/client";
 import type { FileStat } from "../../ipc/client";
+import { useDisplay } from "../../store/display";
 import { Ico } from "../../ui/kit";
 import type { ArtifactView } from "../editor/editorStore";
 import { withArtifactCsp } from "./artifactCsp";
+import {
+  attachArtifactHost,
+  pageHost,
+  retryArtifactHost,
+  signInWithPastedLink,
+  useArtifactHostStatus,
+  type HostPhase,
+} from "./artifactHost";
 import { StreamMarkdown } from "./StreamMarkdown";
 
 /** How often the local file is re-checked for a rewrite. No fs watch reaches it:
@@ -99,7 +112,7 @@ function ArtifactUnavailable({
       {detail ? <p style={{ opacity: 0.75 }}>{detail}</p> : null}
       {url ? (
         <button type="button" className="cv-artview-open" onClick={() => void openUrl(url)}>
-          <Ico name="external" className="sm" /> Open on claude.ai
+          <Ico name="external" className="sm" /> Open in browser
         </button>
       ) : (
         <p style={{ opacity: 0.75 }}>No hosted link is known for it either.</p>
@@ -108,7 +121,212 @@ function ArtifactUnavailable({
   );
 }
 
+/**
+ * What the header says about the hosted page (null: nothing to say).
+ *
+ * ⚠️ `offsite` names the page's REAL host and never claims it is claude.ai: the app's own chrome
+ * saying "sign in to claude.ai" over a page on some other domain is exactly the frame a fake
+ * credential form would want.
+ */
+export function hostStatusText(phase: HostPhase, host: string | null): string | null {
+  switch (phase) {
+    case "loading":
+      return "Loading…";
+    case "ready":
+      return null;
+    case "signin":
+      return "Sign in to claude.ai to see it — once";
+    case "offsite":
+      return host ? `Showing ${host} — not the artifact` : "Showing another site — not the artifact";
+    case "error":
+      return "Couldn’t show it here";
+  }
+}
+
+/**
+ * The HOSTED mode's body: a placeholder the native artifact host is laid over (it follows this
+ * element's box and steps aside for any overlay). What renders here is only seen while the host
+ * is not painting — loading, hidden under a menu, or failed.
+ */
+/**
+ * What the panel offers while claude.ai asks for a sign-in.
+ *
+ * It says plainly what does NOT work here and why — macOS reserves passkeys-on-this-Mac and
+ * password AutoFill for apps with Apple's browser entitlement, which a self-signed app cannot
+ * hold — because the alternative is the user fighting a passkey prompt that can only ever fall
+ * back to their phone. And it carries the one path a browser would otherwise steal: the emailed
+ * link, which opens in the default browser and signs in a session this webview never sees.
+ */
+function SignInHelp() {
+  const [link, setLink] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  const submit = () => {
+    if (!link.trim()) return;
+    void signInWithPastedLink(link).then((reason) => {
+      setProblem(reason);
+      if (!reason) setLink("");
+    });
+  };
+  return (
+    <div className="cv-artview-signin">
+      <p>
+        Sign in with your <strong>password</strong>, a passkey <strong>from your phone</strong>, or the link claude.ai
+        emails you. Passkeys on this Mac and saved-password autofill only work in a browser — macOS doesn’t offer them
+        to this window.
+      </p>
+      <div className="cv-artview-signin-row">
+        <input
+          type="url"
+          value={link}
+          spellCheck={false}
+          placeholder="Paste the sign-in link from your email"
+          aria-label="Paste the sign-in link from your email"
+          onChange={(e) => setLink(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submit();
+          }}
+        />
+        <button type="button" className="cv-artview-open" onClick={submit} disabled={!link.trim()}>
+          Open it here
+        </button>
+      </div>
+      {problem ? <p className="cv-artview-signin-err">{problem}</p> : null}
+    </div>
+  );
+}
+
+function HostedArtifact({ url, favicon }: { url: string; favicon: string | null }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const phase = useArtifactHostStatus((s) => (s.url === url ? s.phase : "loading"));
+  const error = useArtifactHostStatus((s) => (s.url === url ? s.error : null));
+  const pageUrl = useArtifactHostStatus((s) => (s.url === url ? s.pageUrl : null));
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    return attachArtifactHost(el, url);
+  }, [url]);
+  return (
+    <>
+      {/* ⚠️ OUTSIDE the tracked box: the native view covers that box entirely while it is up, so
+          anything rendered inside it during sign-in would be invisible behind the page. */}
+      {phase === "signin" ? <SignInHelp /> : null}
+      <div ref={ref} className="cv-artview-host">
+      {phase === "error" ? (
+        <div className="cv-artview-msg">
+          <span className="cv-artview-fav cv-artview-msgfav" aria-hidden="true">
+            {favicon || "🎨"}
+          </span>
+          <p>This artifact’s claude.ai page couldn’t be shown here.</p>
+          {error ? <p style={{ opacity: 0.75 }}>{error}</p> : null}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" className="cv-artview-open" onClick={retryArtifactHost}>
+              <Ico name="refresh" className="sm" /> Try again
+            </button>
+            <button type="button" className="cv-artview-open" onClick={() => void openUrl(url)}>
+              <Ico name="external" className="sm" /> Open in browser
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="cv-artview-msg">
+          <span className="cv-artview-fav cv-artview-msgfav" aria-hidden="true">
+            {favicon || "🎨"}
+          </span>
+          {/* Same source as the header — this shows whenever the native view steps aside (a menu,
+              a toast, a folded panel), and it must not call another site "claude.ai". */}
+          <p>{phase === "loading" ? "Loading from claude.ai…" : hostStatusText(phase, pageHost(pageUrl)) ?? "claude.ai"}</p>
+        </div>
+      )}
+      </div>
+    </>
+  );
+}
+
 export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: () => void }) {
+  // Hosted view: nothing local to read — the whole body is the claude.ai page.
+  if (view.kind === "hosted") return <HostedArtifactViewer view={view} onClose={onClose} />;
+  return <LocalArtifactViewer view={view} onClose={onClose} />;
+}
+
+/** The viewer's header: favicon, title, the hosted page's status and its actions. */
+function ViewerHeader({
+  view,
+  hosted,
+  onClose,
+}: {
+  view: ArtifactView;
+  /** True while the body shows the claude.ai page (adds its status + a reload). */
+  hosted: boolean;
+  onClose: () => void;
+}) {
+  const url = view.url;
+  const live = useArtifactHostStatus((s) => (hosted && url && s.url === url ? s : null));
+  const phase = live?.phase ?? null;
+  const status = phase ? hostStatusText(phase, pageHost(live?.pageUrl ?? null)) : null;
+  return (
+    <div className="cv-artview-h">
+      <span className="cv-artview-fav" aria-hidden="true">
+        {view.favicon || "🎨"}
+      </span>
+      <span className="cv-artview-title" title={view.title}>
+        {view.title}
+      </span>
+      {status ? (
+        // `title`: the panel can be narrow enough to ellipse the host name away, and that name is
+        // the whole point of the offsite warning.
+        <span className="cv-artview-status" data-phase={phase ?? undefined} title={status}>
+          {status}
+        </span>
+      ) : null}
+      {hosted ? (
+        <button
+          type="button"
+          className="cv-artview-btn"
+          // Off-site, this button is the way BACK: it re-opens the artifact's own URL.
+          title={phase === "offsite" ? "Back to the artifact" : "Reload from claude.ai"}
+          aria-label={phase === "offsite" ? "Back to the artifact" : "Reload from claude.ai"}
+          onClick={retryArtifactHost}
+        >
+          <Ico name="refresh" className="sm" />
+        </button>
+      ) : null}
+      {url ? (
+        <button
+          type="button"
+          className="cv-artview-btn"
+          title="Open in browser"
+          aria-label="Open in browser"
+          onClick={() => void openUrl(url)}
+        >
+          <Ico name="external" className="sm" />
+        </button>
+      ) : null}
+      <button type="button" className="cv-artview-btn" title="Close" aria-label="Close artifact viewer" onClick={onClose}>
+        <Ico name="x" className="sm" />
+      </button>
+    </div>
+  );
+}
+
+function HostedArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: () => void }) {
+  return (
+    <div className="cv-artview">
+      <ViewerHeader view={view} hosted={!!view.url} onClose={onClose} />
+      <div className="cv-artview-body">
+        {view.url ? (
+          <HostedArtifact url={view.url} favicon={view.favicon} />
+        ) : (
+          // Unreachable by construction (routing only builds a hosted view from a URL) — kept
+          // so a malformed view still explains itself instead of rendering a blank panel.
+          <ArtifactUnavailable failure={{ status: "nopath" }} favicon={view.favicon} url={null} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LocalArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: () => void }) {
+  const hostedInApp = useDisplay((s) => s.artifactsInApp);
   const [load, setLoad] = useState<Load>({ status: "loading" });
   /** Bumped when the file changed underneath us, to re-run the load effect. */
   const [rev, setRev] = useState(0);
@@ -225,32 +443,19 @@ export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose:
     [load, view.kind],
   );
 
+  // The local file can't be rendered (gone, too large, not text, unreadable) but the artifact has
+  // a hosted copy → show THAT, in-app, rather than a dead end. Off (pref), or no URL → the
+  // failure panel below, which names what went wrong and offers the browser.
+  const hostedFallback =
+    hostedInApp && !!url && load.status !== "loading" && load.status !== "ready" ? url : null;
+
   return (
     <div className="cv-artview">
-      <div className="cv-artview-h">
-        <span className="cv-artview-fav" aria-hidden="true">
-          {view.favicon || "🎨"}
-        </span>
-        <span className="cv-artview-title" title={view.title}>
-          {view.title}
-        </span>
-        {url ? (
-          <button
-            type="button"
-            className="cv-artview-btn"
-            title="Open on claude.ai"
-            aria-label="Open on claude.ai"
-            onClick={() => void openUrl(url)}
-          >
-            <Ico name="external" className="sm" />
-          </button>
-        ) : null}
-        <button type="button" className="cv-artview-btn" title="Close" aria-label="Close artifact viewer" onClick={onClose}>
-          <Ico name="x" className="sm" />
-        </button>
-      </div>
+      <ViewerHeader view={view} hosted={!!hostedFallback} onClose={onClose} />
       <div className="cv-artview-body">
-        {load.status === "loading" ? (
+        {hostedFallback ? (
+          <HostedArtifact url={hostedFallback} favicon={view.favicon} />
+        ) : load.status === "loading" ? (
           <div className="cv-artview-msg">Loading…</div>
         ) : load.status === "ready" ? (
           view.kind === "md" ? (

@@ -14,7 +14,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `unstable` = multi-webview: the in-app claude.ai artifact host is a CHILD webview of the main
+# window (see `artifact_host/`), which only `Window::add_child` can create.
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # Secure auto-update: verifies a cryptographic signature on each artifact before

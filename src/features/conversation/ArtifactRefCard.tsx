@@ -1,8 +1,10 @@
 // A compact, pretty clickable card for an artifact LINK that Claude writes in its prose
 // (`[label](https://claude.ai/artifact/<id>)`, or the pre-2.1.272 `…/code/artifact/<uuid>`) — rendered in place of a plain anchor by
 // StreamMarkdown's link renderer. When the artifact belongs to this conversation it is enriched
-// from the registry (favicon + title) and opens in the in-app viewer; otherwise it opens the
-// hosted page in the browser. Inline-block so it flows inside a paragraph.
+// from the registry (favicon + title) and previewed from its local file; otherwise — a link to
+// another conversation's artifact — the hosted claude.ai page opens IN-APP too, in the side
+// panel's native view, and only an inert host or the `artifactsInApp` pref off sends it to the
+// browser. Inline-block so it flows inside a paragraph.
 
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -46,8 +48,9 @@ export function ArtifactRefCard({
     e.stopPropagation();
     if (e.type === "click" && !window.getSelection()?.isCollapsed) return;
     e.preventDefault();
-    if (convId && (filePath || url)) {
-      openArtifactView({ convId, title, favicon, url, filePath, inert });
+    // `url` is a required prop, so a conversation is all that's missing for the in-app route.
+    if (convId) {
+      openArtifactView({ convId, title, favicon, url, filePath, typed: match?.typed, multiFile: match?.multiFile, inert });
     } else {
       void openUrl(url);
     }

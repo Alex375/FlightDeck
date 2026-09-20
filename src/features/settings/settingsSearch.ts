@@ -58,6 +58,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Animate the conversation", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
   { title: "Message controls", section: "display", sub: "thread", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
   { title: "Clickable filename on Read/Write rows", section: "display", sub: "thread", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
+  { title: "Show hosted artifacts in Flight Deck", section: "display", sub: "thread", group: "Thread", keywords: "artifact artefact claude design canvas claude.ai webview browser navigateur panel panneau" },
   { title: "Time on sidebar rows", section: "display", sub: "timing", group: "Durations & timing", keywords: "sidebar row timer counter chrono temps ligne conversation barre laterale" },
   { title: "Turn duration", section: "display", sub: "timing", group: "Durations & timing", keywords: "time elapsed seconds duree tour" },
   { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },

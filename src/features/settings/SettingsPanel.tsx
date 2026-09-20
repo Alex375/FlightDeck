@@ -801,6 +801,7 @@ function ThreadPrefs() {
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
+  const artifactsInApp = useDisplay((s) => s.artifactsInApp);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -923,6 +924,22 @@ function ThreadPrefs() {
           checked={clickableFileMentions}
           onChange={(v) => set({ clickableFileMentions: v })}
           label="Make the filename on Read/Write rows clickable"
+        />
+        <ToggleRow
+          title="Show hosted artifacts in Flight Deck"
+          hint={
+            <>
+              Opens an artifact&apos;s <strong>claude.ai page</strong> in the side panel instead of
+              the browser — the only way to see a <strong>Claude Design</strong> (or any other
+              typed) artifact in the app, and the fallback when an artifact&apos;s local file is
+              gone. The first time, sign in to claude.ai inside the panel.{" "}
+              <strong>On by default.</strong> Off → those open in the browser; HTML/Markdown
+              artifacts with a local file still preview in the app.
+            </>
+          }
+          checked={artifactsInApp}
+          onChange={(v) => set({ artifactsInApp: v })}
+          label="Show claude.ai-hosted artifacts in the side panel"
         />
       </SettingsGroup>
 
