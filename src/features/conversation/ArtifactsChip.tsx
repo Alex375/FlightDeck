@@ -11,9 +11,10 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useDisplay } from "../../store/display";
 import { Dot, Ico } from "../../ui/kit";
 import { useArtifacts, type Artifact } from "./artifacts";
-import { openArtifactView } from "./artifactOpen";
+import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
 
 /** Fixed placement of the portaled popover, anchored to the chip. */
 interface ArtifactPopPos {
@@ -63,17 +64,22 @@ function ArtifactRow({
   onOpened: () => void;
 }) {
   const [showVersions, setShowVersions] = useState(false);
+  const hostedInApp = useDisplay((s) => s.artifactsInApp);
   const url = art.url;
   const vcount = art.versions.length;
+  const meta = {
+    convId: session,
+    title: art.title,
+    favicon: art.favicon,
+    url,
+    filePath: art.latestFilePath,
+    typed: art.typed,
+    inert,
+    hostedInApp,
+  };
+  const inApp = routeArtifactOpen(meta).kind === "viewer";
   const open = () => {
-    openArtifactView({
-      convId: session,
-      title: art.title,
-      favicon: art.favicon,
-      url,
-      filePath: art.latestFilePath,
-      inert,
-    });
+    openArtifactView(meta);
     onOpened();
   };
   return (
@@ -84,7 +90,7 @@ function ArtifactRow({
           className="cv-artpop-open"
           disabled={!url}
           onClick={open}
-          title={url ? (inert ? "Open on claude.ai" : "Open in Flight Deck") : "Not published yet"}
+          title={url ? (inApp ? "Open in Flight Deck" : "Open in the browser") : "Not published yet"}
         >
           <span className="cv-artpop-fav" aria-hidden="true">
             {art.favicon || "🎨"}
@@ -236,7 +242,10 @@ export function ArtifactsChip({
                   .reverse()
                   .map((a) => (
                     <ArtifactRow
-                      key={a.url ?? a.latestFilePath}
+                      // `a.id` — NOT url/file, which are both null for a publish still in flight
+                      // (a null key drops React to index reconciliation, and one row's expanded
+                      // versions then jump to another when URLs land).
+                      key={a.id}
                       art={a}
                       session={session}
                       inert={inert}

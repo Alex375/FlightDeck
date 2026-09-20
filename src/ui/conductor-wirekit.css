@@ -34,6 +34,7 @@
   --wf-wait-bg:   #1c2740;
   --wf-done:      #7f8593;   /* completed */
   --wf-done-bg:   #23252c;
+  --wf-warn:      #d7a24a;   /* warning — something to look at, but not a failure */
   --wf-err:       #e0727c;   /* error */
   --wf-err-bg:    #3a1f23;
   --wf-msg:       #6fbfcf;   /* a message between two agent conversations */

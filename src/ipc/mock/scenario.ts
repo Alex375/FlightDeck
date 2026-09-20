@@ -941,6 +941,120 @@ export class ScenarioDriver {
   }
 
   /**
+   * Typed-artifact demo (`?demo=design`): a Claude Design canvas, as the real CLI publishes one —
+   * a quickstart, the typed CREATE (`type_url`, no file) and the FILL (`url` + a DATA
+   * `file_path` + `files`). Opening it must show the hosted page (the mock host only replays
+   * page loads), never the local `canvas.json`.
+   */
+  startTypedArtifact() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const own = "https://claude.ai/artifact/EB7RRtdoZg1CDk4L3R1Nqg";
+    const type = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+    const canvas = "/private/tmp/claude-501/demo/scratchpad/sidebar-canvas/project/canvas.json";
+    this.step(200, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "I'll lay the three layouts out on a Design canvas.\n\n";
+    this.streamText("m1", t1);
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          { type: "tool_use", id: "toolu_qs", name: "Artifact", input: { action: "quickstart", intent: "design" } },
+          {
+            type: "tool_use",
+            id: "toolu_create",
+            name: "Artifact",
+            input: { action: "publish", type_url: type, title: "Flight Deck — sidebar conversation", auto_open: "after_first_write" },
+          },
+        ],
+      }),
+    );
+    this.step(300, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_qs",
+        content: [
+          {
+            type: "text",
+            text: `Quickstart for a design.\n\nThe Artifact type to start from:\n- Design [core] — Design canvas for websites, screens and UI mockups: live artboards laid out on a canvas. — type_url: ${type}`,
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(300, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_create",
+        content: [
+          {
+            type: "text",
+            text: `Created a new Artifact at ${own} (version 1789733111-c4c6) from the Artifact type ${type} (release 1789673869-b48e). The type's files (fixed on it, its page included): "SKILL.md", "artifact-type/app.js", "index.html".`,
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(260, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [
+          {
+            type: "tool_use",
+            id: "toolu_fill",
+            name: "Artifact",
+            input: {
+              action: "publish",
+              url: own,
+              root: "/private/tmp/claude-501/demo/scratchpad/sidebar-canvas",
+              file_path: canvas,
+              files: { "project/Main.dc.html": "project/Main.dc.html", "project/A-Onglets.dc.html": "project/A-Onglets.dc.html" },
+            },
+          },
+        ],
+      }),
+    );
+    this.step(400, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "toolu_fill",
+        content: [
+          {
+            type: "text",
+            text: `Updated the Artifact at ${own} (Version 2) with ${canvas} (and any \`files\` listed). Its page comes from the Artifact type ${type} (release 1789673869-b48e) and can't be changed here.`,
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(260, () =>
+      this.emit.item({ kind: "message_started", id: "m3", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t3 = "The canvas is up — three layouts side by side, plus the closed-panel variants below.";
+    this.streamText("m3", t3, 3, 18);
+    this.step(150, () =>
+      this.emit.item({ kind: "assistant_message", id: "m3", parent_tool_use_id: null, blocks: [{ type: "text", text: t3 }] }),
+    );
+    this.step(200, () =>
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 3, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500 }),
+    );
+    this.step(40, () => this.emit.state(idleState()));
+  }
+
+  /**
    * Background-monitor demo (`?demo=monitor`): the agent launches the `Monitor` tool —
    * a live watch whose every stdout line is an event (read from disk, NOT the wire). One
    * watch KEEPS streaming (persistent → Stop button + live event tail) and a second one

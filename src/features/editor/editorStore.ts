@@ -177,9 +177,12 @@ export interface ArtifactView {
   favicon: string | null;
   /** Hosted claude.ai URL — the durable copy, for "open in browser" and the missing-file fallback. */
   url: string | null;
-  /** Local temp file to render, or null (→ the viewer shows the open-in-browser fallback). */
+  /** Local temp file to render, or null (a `hosted` view never has one). */
   filePath: string | null;
-  kind: "html" | "md";
+  /** How the viewer renders it: the local file as HTML / Markdown, or `hosted` — the claude.ai
+   *  page itself in the viewer's native webview (a TYPED artifact, whose page only exists
+   *  hosted, or an artifact with no local file). */
+  kind: "html" | "md" | "hosted";
 }
 
 interface EditorState {

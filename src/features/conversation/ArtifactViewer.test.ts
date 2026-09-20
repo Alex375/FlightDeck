@@ -19,11 +19,23 @@ vi.mock("../../ipc/client", () => ({
   events: { fsChangeEvent: { listen: vi.fn(async () => () => {}) } },
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
+// The native artifact host has no place in jsdom: stub the manager and assert WHICH body the
+// viewer mounts (and with which URL), which is the viewer's half of the contract.
+const hostMock = vi.hoisted(() => ({
+  attach: vi.fn((_el: HTMLElement, _url: string) => () => {}),
+}));
+vi.mock("./artifactHost", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./artifactHost")>();
+  return { ...actual, attachArtifactHost: hostMock.attach };
+});
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { commands } from "../../ipc/client";
+import { useDisplay } from "../../store/display";
+
+const attachArtifactHost = hostMock.attach;
 
 const readFile = commands.readFile as unknown as ReturnType<typeof vi.fn>;
 const statFiles = commands.statFiles as unknown as ReturnType<typeof vi.fn>;
@@ -153,5 +165,100 @@ describe("ArtifactViewer refresh poll", () => {
     await tick(); // rewritten → new stamp → re-read
     expect(readFile).toHaveBeenCalledTimes(2);
     expect(container.querySelector("iframe")?.getAttribute("srcdoc")).toContain("<h1>v2</h1>");
+  });
+});
+
+// ---- The hosted fallback ---------------------------------------------------------------------
+//
+// When the local file can't be read (its temp path is ephemeral) and the artifact has a hosted
+// copy, the viewer shows THAT — in the side panel's native view — instead of a dead end. The
+// `artifactsInApp` pref turns it back into the old "open in browser" panel. The native host is
+// mocked here: what matters is which body the viewer mounts, and with which URL.
+
+const URL_HOSTED = "https://claude.ai/artifact/EB7RRtdoZg1CDk4L3R1Nqg";
+
+function mountWith(view: Partial<Parameters<typeof ArtifactViewer>[0]["view"]>) {
+  act(() => {
+    root.render(
+      createElement(ArtifactViewer, {
+        view: { convId: "c1", title: "Demo", favicon: "🎨", url: URL_HOSTED, filePath: PATH, kind: "html", ...view },
+        onClose: () => {},
+      }),
+    );
+  });
+}
+
+describe("ArtifactViewer — hosted fallback", () => {
+  beforeEach(() => {
+    useDisplay.setState({ artifactsInApp: true });
+    attachArtifactHost.mockClear();
+  });
+
+  it("a `hosted` view mounts the native host on the artifact's URL", async () => {
+    mountWith({ kind: "hosted", filePath: null });
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).not.toBeNull();
+    expect(attachArtifactHost).toHaveBeenCalledTimes(1);
+    expect(attachArtifactHost.mock.calls[0][1]).toBe(URL_HOSTED);
+    expect(readFile).not.toHaveBeenCalled(); // nothing local to read
+  });
+
+  it("shows the hosted page when the local file can't be read", async () => {
+    readFile.mockResolvedValue({ status: "error", error: "No such file" });
+    statFiles.mockResolvedValue({ status: "ok", data: [{ path: PATH, exists: false, size: 0, mtime_ms: null }] });
+    mountWith({});
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).not.toBeNull();
+    expect(attachArtifactHost.mock.calls[0][1]).toBe(URL_HOSTED);
+  });
+
+  it("does NOT reach for the hosted page while the first read is still in flight", async () => {
+    let resolveRead: ((v: unknown) => void) | null = null;
+    readFile.mockImplementation(() => new Promise((r) => (resolveRead = r)));
+    statFiles.mockResolvedValue(okStat(10, 1));
+    mountWith({});
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).toBeNull(); // "Loading…", not a webview
+    expect(attachArtifactHost).not.toHaveBeenCalled();
+    await act(async () => {
+      resolveRead?.(okRead("<p>hi</p>", 10, 1));
+      await Promise.resolve();
+    });
+    expect(container.querySelector("iframe")).not.toBeNull();
+  });
+
+  it("goes back to the local preview when the file comes back", async () => {
+    readFile.mockResolvedValueOnce({ status: "error", error: "No such file" });
+    statFiles.mockResolvedValue(okStat(12, 2));
+    readFile.mockResolvedValue(okRead("<p>back</p>", 12, 2));
+    mountWith({});
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).not.toBeNull();
+    await tick(1);
+    expect(container.querySelector(".cv-artview-host")).toBeNull();
+    expect(container.querySelector("iframe")).not.toBeNull();
+  });
+
+  it("with the pref OFF, says what went wrong and offers the browser instead", async () => {
+    useDisplay.setState({ artifactsInApp: false });
+    readFile.mockResolvedValue({ status: "error", error: "No such file" });
+    statFiles.mockResolvedValue({ status: "ok", data: [{ path: PATH, exists: false, size: 0, mtime_ms: null }] });
+    mountWith({});
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).toBeNull();
+    expect(attachArtifactHost).not.toHaveBeenCalled();
+    const text = container.textContent ?? "";
+    expect(text).toContain("couldn’t be read"); // the REASON, not a generic message
+    expect(text).toContain("No such file");
+    expect(text).toContain("Open in browser");
+  });
+
+  it("with no hosted link at all, keeps the failure panel", async () => {
+    readFile.mockResolvedValue({ status: "error", error: "No such file" });
+    statFiles.mockResolvedValue({ status: "ok", data: [{ path: PATH, exists: false, size: 0, mtime_ms: null }] });
+    mountWith({ url: null });
+    await settle();
+    expect(container.querySelector(".cv-artview-host")).toBeNull();
+    expect(container.textContent).toContain("No hosted link is known");
   });
 });

@@ -2613,7 +2613,10 @@ fn applescript_escape(s: &str) -> String {
 #[tauri::command]
 #[specta::specta]
 pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(), String> {
-    let Some(window) = app.get_webview_window("main") else {
+    // ⚠️ `get_window`, NOT `get_webview_window`: once the artifact host adds its child webview,
+    // the main window is multi-webview and `get_webview_window("main")` returns None — this would
+    // silently stop bouncing the Dock. See `crate::artifact_host`.
+    let Some(window) = app.get_window("main") else {
         return Ok(()); // window already closed — nothing to flash
     };
     let kind = if critical {
@@ -2646,10 +2649,13 @@ pub fn set_ui_zoom(app: tauri::AppHandle, factor: f64) -> Result<(), String> {
     if !factor.is_finite() || !(MIN_UI_ZOOM..=MAX_UI_ZOOM).contains(&factor) {
         return Err(format!("zoom factor out of range: {factor}"));
     }
-    let Some(window) = app.get_webview_window("main") else {
+    // ⚠️ `get_webview("main")`, NOT `get_webview_window`: once the artifact host adds its child
+    // webview, `get_webview_window("main")` returns None and the zoom would silently stop
+    // applying. Scaling the MAIN webview only — the host follows via `artifact_host_show`.
+    let Some(webview) = app.get_webview("main") else {
         return Ok(()); // window already closed — nothing to scale
     };
-    window.set_zoom(factor).map_err(|e| e.to_string())
+    webview.set_zoom(factor).map_err(|e| e.to_string())
 }
 
 // ---- Git worktrees --------------------------------------------------------
@@ -4182,4 +4188,80 @@ mod tests {
         );
         assert!(!resolved.contains("/./"), "should not keep a literal '.' segment");
     }
+}
+
+// ---- In-app claude.ai artifact host -------------------------------------------------------
+//
+// The front's single boundary to the native webview that shows an artifact's hosted page over
+// the side region. All forward to [`crate::artifact_host::ArtifactHost`]. ASYNC on purpose:
+// creating a child webview (`Window::add_child`) blocks until the main thread has built it, and
+// a sync command RUNS on the main thread — it would wait on itself.
+
+/// Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
+/// the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
+/// artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
+/// See [`crate::artifact_host`].
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_show(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+    url: String,
+    bounds: crate::artifact_host::HostBounds,
+    zoom: f64,
+) -> Result<bool, String> {
+    host.show(&app, &url, bounds, zoom)
+}
+
+/// Move/resize the artifact host (no-op when it doesn't exist).
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_set_bounds(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+    bounds: crate::artifact_host::HostBounds,
+) -> Result<(), String> {
+    host.set_bounds(&app, bounds)
+}
+
+/// Hide the artifact host, keeping its page alive (no-op when it doesn't exist).
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_hide(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+) -> Result<(), String> {
+    host.hide(&app)
+}
+
+/// Re-open the requested artifact in the host (refresh / back to the artifact).
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_reload(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+) -> Result<(), String> {
+    host.reload(&app)
+}
+
+/// Point the artifact host at a claude.ai sign-in link the user pasted (an emailed link opened in
+/// the browser would sign in a session this webview never sees). claude.ai URLs only.
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_open_claude_url(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+    url: String,
+) -> Result<(), String> {
+    host.open_claude_url(&app, &url)
+}
+
+/// Destroy the artifact host and free its web content process (no-op when it doesn't exist).
+#[tauri::command]
+#[specta::specta]
+pub async fn artifact_host_close(
+    app: tauri::AppHandle,
+    host: tauri::State<'_, crate::artifact_host::ArtifactHost>,
+) -> Result<(), String> {
+    host.close(&app)
 }

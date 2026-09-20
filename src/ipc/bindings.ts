@@ -2354,6 +2354,76 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
+ * the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
+ * artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
+ * See [`crate::artifact_host`].
+ */
+async artifactHostShow(url: string, bounds: HostBounds, zoom: number) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_show", { url, bounds, zoom }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Move/resize the artifact host (no-op when it doesn't exist).
+ */
+async artifactHostSetBounds(bounds: HostBounds) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_set_bounds", { bounds }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hide the artifact host, keeping its page alive (no-op when it doesn't exist).
+ */
+async artifactHostHide() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_hide") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-open the requested artifact in the host (refresh / back to the artifact).
+ */
+async artifactHostReload() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_reload") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Destroy the artifact host and free its web content process (no-op when it doesn't exist).
+ */
+async artifactHostClose() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_close") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Point the artifact host at a claude.ai sign-in link the user pasted (an emailed link opened in
+ * the browser would sign in a session this webview never sees). claude.ai URLs only.
+ */
+async artifactHostOpenClaudeUrl(url: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("artifact_host_open_claude_url", { url }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -2363,6 +2433,7 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
 export const events = __makeEvents__<{
 accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
+artifactHostEvent: ArtifactHostEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -2386,6 +2457,7 @@ workflowJournalEvent: WorkflowJournalEvent
 }>({
 accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
+artifactHostEvent: "artifact-host-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -2516,6 +2588,48 @@ configured_at_ms: number | null }
  * null for an external caller (the voice bridge).
  */
 export type AppControlRequestEvent = { request_id: string; tool: string; args: JsonValue; session: string | null }
+/**
+ * Emitted for every top-level page load of the host, and when a pop-up hand-off fails.
+ */
+export type ArtifactHostEvent = { kind: ArtifactHostEventKind; url: string }
+/**
+ * What happened in the host webview, for the viewer's status line.
+ */
+export type ArtifactHostEventKind = 
+/**
+ * A top-level page started loading (`url` = the page).
+ */
+"started" | 
+/**
+ * A top-level page finished loading (`url` = the page — e.g. claude.ai's sign-in page when
+ * the session is missing, which is how the front knows to say "sign in").
+ */
+"finished" | 
+/**
+ * A link the page opened in a new window could not be handed to the system browser.
+ */
+"external_open_failed" | 
+/**
+ * A pop-up (or a navigation) was refused because it targeted something other than the web —
+ * a custom URL scheme that would have launched another app. Surfaced so the click isn't
+ * silently dropped.
+ */
+"popup_refused" | 
+/**
+ * A pop-up with no page of its own (`about:blank`, `blob:`, `data:`) was refused because the
+ * host is not signing in — an artifact opening a chrome-less window it would fill itself.
+ * Its own kind so the front never explains it as "it would launch another app".
+ */
+"popup_blank_refused" | 
+/**
+ * This page asked to open more links than [`OPEN_BUDGET`] allows; the rest were dropped.
+ */
+"opens_throttled" | 
+/**
+ * A download was requested. The view can't show one, so it is refused — and said, rather
+ * than leaving the click to do nothing.
+ */
+"download_refused"
 /**
  * Which agent backend a new conversation runs on — the IPC discriminant
  * [`spawn_session`] dispatches on. Serialized lowercase to match the front's
@@ -3485,6 +3599,11 @@ condition: string;
  * before the first post-turn evaluation.
  */
 reason: string | null }
+/**
+ * A rectangle in the main window's LOGICAL coordinates — CSS pixels of the app's document
+ * multiplied by the UI zoom (the front does that product; see `artifactHost.ts`).
+ */
+export type HostBounds = { x: number; y: number; width: number; height: number }
 /**
  * An image joined to a user turn: base64 bytes + their MIME type. Sent inside the
  * message `content` array as an `image` block (spec §3.10) — verified accepted by

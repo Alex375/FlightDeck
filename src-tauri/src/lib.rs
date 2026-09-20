@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod agentspend;
 pub mod appmcp;
+pub mod artifact_host;
 pub mod cli_update;
 pub mod extensions;
 pub mod fs;
@@ -69,6 +70,9 @@ use ipc::commands::{
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
     remote_status, set_remote,
+    artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
+    artifact_host_set_bounds,
+    artifact_host_show,
     add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -344,6 +348,12 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            artifact_host_show,
+            artifact_host_set_bounds,
+            artifact_host_hide,
+            artifact_host_reload,
+            artifact_host_close,
+            artifact_host_open_claude_url,
         ])
         .events(collect_events![
             TickEvent,
@@ -368,6 +378,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             TerminalExitEvent,
             AppControlRequestEvent,
             WakeWordEvent,
+            artifact_host::ArtifactHostEvent,
         ])
 }
 
@@ -621,6 +632,9 @@ pub fn run() {
         // The wake-word detector: sole owner of the always-on mic capture +
         // on-device inference. An Arc so a blocking `apply` can run off-thread.
         .manage(std::sync::Arc::new(wake::WakeController::new()))
+        // The in-app claude.ai artifact host: the one native child webview the artifact viewer
+        // lays over the side region (created lazily, on the first hosted artifact shown).
+        .manage(artifact_host::ArtifactHost::new())
         .setup(move |app| {
             use tauri::Manager;
 

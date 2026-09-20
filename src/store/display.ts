@@ -155,6 +155,14 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
+   *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
+   *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
+   *  any artifact without a local file. Off → those open in the browser, as they did before;
+   *  page artifacts with their local file still preview in-app either way. Read by
+   *  {@link openArtifactView} and the {@link ArtifactViewer}'s missing-file fallback. */
+  artifactsInApp: boolean;
+
   /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
    *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
    *  associate it by hand). Clicking it opens that repository's TOSSE card. ON by default.
@@ -301,6 +309,7 @@ const DEFAULTS: DisplayPrefs = {
   conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
+  artifactsInApp: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
   tosseStartStaysOnTasks: true,
@@ -374,6 +383,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         tosseStartStaysOnTasks: patch.tosseStartStaysOnTasks ?? s.tosseStartStaysOnTasks,
