@@ -545,6 +545,13 @@
   font-size: 15px;
   line-height: 1;
 }
+/* The generic mark (no icon on the publish, no type to name it) — see <ArtifactFace>: it
+   carries no size class, so each tile states its own. */
+.artTile :global(.wf-ico) {
+  width: 15px;
+  height: 15px;
+  color: var(--wf-tx-lo);
+}
 .artMain {
   flex: 1;
   min-width: 0;

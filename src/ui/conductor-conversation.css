@@ -674,6 +674,10 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-art[data-open] { cursor:pointer; }
 .cv-art[data-open]:hover { border-color:color-mix(in srgb, var(--wf-accent) 45%, var(--wf-line)); background:var(--wf-panel-3, var(--wf-panel)); }
 .cv-art-tile { flex:none; width:34px; height:34px; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1; border:1px solid var(--wf-line); border-radius:9px; background:var(--wf-bg-2); }
+/* The generic mark, when the publish named no icon and no type says what it is. Sized per
+   tile rather than by a class on the element: `.wf-ico.sm` would TIE these on specificity and
+   leave the winner to stylesheet order (see <ArtifactFace>). */
+.cv-art-tile .wf-ico { width:17px; height:17px; color:var(--wf-tx-lo); }
 .cv-art-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
 .cv-art-title { font-size:12.5px; color:var(--wf-tx-hi); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .cv-art-sub { display:flex; align-items:center; min-width:0; font-size:11px; color:var(--wf-tx-lo); }
@@ -747,6 +751,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-artpop-open:disabled { cursor:default; opacity:.7; }
 .cv-artpop-open .wf-ico:last-child { flex:none; width:13px; height:13px; color:var(--wf-tx-lo); }
 .cv-artpop-fav { flex:none; width:20px; text-align:center; font-size:15px; line-height:1; }
+.cv-artpop-fav .wf-ico { width:14px; height:14px; color:var(--wf-tx-lo); vertical-align:-2px; }
 .cv-artpop-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px; }
 .cv-artpop-title { font-size:12px; color:var(--wf-tx-hi); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .cv-artpop-desc { font-size:11px; color:var(--wf-tx-lo); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -775,6 +780,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-artview { flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:var(--wf-bg); border-left:1px solid var(--wf-line); }
 .cv-artview-h { flex:none; display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--wf-line); background:var(--wf-panel); }
 .cv-artview-fav { flex:none; font-size:15px; line-height:1; }
+.cv-artview-fav .wf-ico { width:15px; height:15px; color:var(--wf-tx-lo); }
 .cv-artview-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; color:var(--wf-tx-hi); }
 .cv-artview-btn { flex:none; display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border:0; border-radius:6px; background:transparent; color:var(--wf-tx-lo); cursor:pointer; transition:background .12s ease, color .12s ease; }
 .cv-artview-btn:hover { background:var(--wf-panel-3, var(--wf-panel)); color:var(--wf-tx-hi); }
@@ -803,6 +809,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-artview-msg { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:24px; text-align:center; color:var(--wf-tx-lo); font-size:12.5px; }
 .cv-artview-msg p { margin:0; max-width:34ch; }
 .cv-artview-msgfav { font-size:28px; opacity:.7; }
+.cv-artview-msgfav .wf-ico { width:30px; height:30px; }
 .cv-artview-open { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; border:1px solid var(--wf-line); border-radius:8px; background:var(--wf-panel); color:var(--wf-tx-hi); cursor:pointer; font:inherit; font-size:12px; }
 .cv-artview-open:hover { border-color:var(--wf-accent); color:var(--wf-accent); }
 .cv-artview-open .wf-ico { width:14px; height:14px; }

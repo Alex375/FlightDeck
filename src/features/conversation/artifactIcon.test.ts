@@ -46,6 +46,19 @@ describe("artifactFace", () => {
     expect(artifactFace("board", null)).toBe("📋");
   });
 
+  it("falls back to the TYPE's name — a typed artifact names no icon at all", () => {
+    // Verified over all 16 `Artifact` calls of a real Claude Design conversation: not one
+    // carries `icon` or `favicon` (the tool ignores `icon` for an artifact made from a type).
+    expect(artifactFace(null, null, "Design")).toBe("🎨");
+    expect(artifactFace(null, null, "Slides")).toBe("📽️");
+    expect(artifactFace(null, null, "Docs")).toBe("📄");
+  });
+
+  it("prefers the publish's OWN icon over its type", () => {
+    expect(artifactFace("chart", null, "Design")).toBe("📊");
+    expect(artifactFace(null, "🛬", "Design")).toBe("🛬");
+  });
+
   it("says nothing rather than guessing when there is nothing to work with", () => {
     expect(artifactFace(null, null)).toBeNull();
     expect(artifactFace("", "  ")).toBeNull();

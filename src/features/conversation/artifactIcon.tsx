@@ -14,7 +14,18 @@
 // fallback, which is the very bug being fixed — and a conversation mixing pre- and post-change
 // publishes renders as ONE list instead of half emoji, half line art.
 //
-// Pure, no React: the resolution is a data question, testable on its own.
+// ⚠️ A TYPED artifact (Claude Design…) names NEITHER field — verified over all 16 `Artifact`
+// calls of a real Design conversation, and the tool's own contract says `icon` is "ignored on an
+// Artifact created from an Artifact type". So the icon wire fix alone still left every Design
+// canvas on the blank tile. Its third source is its TYPE's name ("Design" → 🎨), which is
+// exactly what that artifact IS — run through the same table, so a future type needs no code.
+//
+// The resolution is pure and testable on its own; <ArtifactFace> is only the ONE rendering of
+// it, so the fallback can no longer differ between the thread, the popover and the panel (it
+// did: 🎨 in two of them — which collides with a real Design artifact's face — and the kit glyph
+// in the third).
+
+import { Ico } from "../../ui/kit";
 
 /** Emoji for a word, keyed by a normalised stem (letters only, lowercase).
  *
@@ -245,26 +256,48 @@ function isPictograph(value: string): boolean {
   return /\p{Extended_Pictographic}/u.test(value);
 }
 
+/** The emoji a single word resolves to, or null. Normalised to letters first, so `bar-chart`,
+ *  `Bar Chart` and `barchart` agree; looked up whole, then by its longest matching stem. */
+function faceForWord(word: string | null | undefined): string | null {
+  const w = (word ?? "").toLowerCase().replace(/[^a-z]/g, "");
+  if (!w) return null;
+  const exact = FACES[w];
+  if (exact) return exact;
+  for (const stem of STEMS) if (w.includes(stem)) return FACES[stem];
+  return null;
+}
+
 /**
- * The emoji face for one publish, from its `icon` (word) and/or its `favicon` (legacy emoji),
- * or null when neither says anything usable — callers then show their own generic fallback.
+ * The emoji face for an artifact, from its `icon` (a word) and/or its `favicon` (a legacy
+ * emoji), falling back to its TYPE's name for a typed artifact — which names neither. Null when
+ * nothing says anything usable; {@link ArtifactFace} then draws the generic mark.
  *
  * An emoji on either field is taken verbatim: a picture the CLI chose beats one we derive.
- * A word is normalised to letters (so `bar-chart`, `Bar Chart` and `barchart` agree) and looked
- * up whole, then by its longest matching stem.
  */
 export function artifactFace(
   icon: string | null | undefined,
   favicon: string | null | undefined,
+  typeName?: string | null,
 ): string | null {
   for (const raw of [favicon, icon]) {
     const v = raw?.trim();
     if (v && isPictograph(v)) return v;
   }
-  const word = (icon ?? favicon ?? "").toLowerCase().replace(/[^a-z]/g, "");
-  if (!word) return null;
-  const exact = FACES[word];
-  if (exact) return exact;
-  for (const stem of STEMS) if (word.includes(stem)) return FACES[stem];
-  return null;
+  return faceForWord(icon ?? favicon) ?? faceForWord(typeName);
+}
+
+/**
+ * The ONE way an artifact's face is drawn: the emoji when there is one, else the kit's
+ * `artifact` mark.
+ *
+ * ⚠️ The generic mark is deliberately NOT an emoji any more. It used to be 🎨 on three surfaces
+ * — which is also the honest face of a real Claude Design artifact, so "we were told nothing"
+ * and "this is a design" were indistinguishable.
+ */
+export function ArtifactFace({ face }: { face: string | null }) {
+  if (face) return <>{face}</>;
+  // ⚠️ No size class on purpose. Each tile sizes it from its OWN rule (`.cv-art-tile .wf-ico`
+  // and friends), and `.wf-ico.sm` would tie those on specificity — leaving which one wins to
+  // stylesheet order. Bare, the tile's rule outranks the base one outright.
+  return <Ico name="artifact" />;
 }

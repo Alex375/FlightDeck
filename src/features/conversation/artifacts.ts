@@ -435,6 +435,10 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
     let lastLabel: string | null = null;
     for (const v of a.versions) if (v.label && v.label.trim()) lastLabel = v.label;
     a.typeName = a.typeUrl ? typeNames.get(a.typeUrl) ?? null : null;
+    // ⚠️ A TYPED artifact names NO icon at all (the tool ignores `icon` when the artifact comes
+    // from a type — verified over every publish of a real Design conversation), so the icon-wire
+    // fix alone still left it on the blank tile. Its type IS what it is: "Design" → 🎨.
+    a.favicon ??= artifactFace(null, null, a.typeName);
     a.title = artifactTitle(titles.get(a) ?? null, lastLabel, a.latestFilePath, {
       typed: a.typed,
       typeName: a.typeName,

@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 import { useDisplay } from "../../store/display";
 import { Dot, Ico } from "../../ui/kit";
 import { useArtifacts, type Artifact } from "./artifacts";
+import { ArtifactFace } from "./artifactIcon";
 import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
 
 /** Fixed placement of the portaled popover, anchored to the chip. */
@@ -97,7 +98,7 @@ function ArtifactRow({
           title={url ? (inApp ? "Open in Flight Deck" : "Open in the browser") : "Not published yet"}
         >
           <span className="cv-artpop-fav" aria-hidden="true">
-            {art.favicon || "🎨"}
+            <ArtifactFace face={art.favicon} />
           </span>
           <span className="cv-artpop-main">
             <span className="cv-artpop-title">{art.title}</span>

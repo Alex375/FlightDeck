@@ -636,6 +636,47 @@ describe("the artifact icon wire (favicon → icon)", () => {
     expect(selectArtifacts(e)[0].favicon).toBe("🛬");
   });
 
+  it("gives a TYPED artifact its type's face — it names no icon at all", () => {
+    // ⚠️ Verified over all 16 `Artifact` calls of a real Claude Design conversation: not one
+    // carries `icon` or `favicon`. The icon-wire fix alone still left every canvas blank.
+    const type = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+    const own = "https://claude.ai/artifact/RERMMCbeNkCTyL7i8WgZrB";
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("q", { action: "quickstart", intent: "design" }),
+            tuse("c", { action: "publish", type_url: type, title: "Sidebar layouts" }),
+          ],
+        },
+      ],
+      {
+        q: `Quickstart for a design.\n\n- Design [core] — Design canvas for websites and screens. — type_url: ${type}`,
+        c: `Created a new Artifact at ${own} from the Artifact type ${type} (release 1789673869-b48e).`,
+      },
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.typed).toBe(true);
+    expect(a.typeName).toBe("Design");
+    expect(a.favicon).toBe("🎨");
+  });
+
+  it("leaves a typed artifact faceless rather than guessing when its type is unnamed", () => {
+    // No quickstart in this conversation → nothing ever named the type. The surfaces then draw
+    // the generic mark, which must stay distinguishable from a real Design artifact's 🎨.
+    const type = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+    const own = "https://claude.ai/artifact/RERMMCbeNkCTyL7i8WgZrB";
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("c", { action: "publish", type_url: type, title: "Canvas" })] }],
+      { c: `Created a new Artifact at ${own} from the Artifact type ${type}.` },
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.typed).toBe(true);
+    expect(a.typeName).toBeNull();
+    expect(a.favicon).toBeNull();
+  });
+
   it("keeps last-known-good across a republish that drops the icon", () => {
     const e = entryOf(
       [

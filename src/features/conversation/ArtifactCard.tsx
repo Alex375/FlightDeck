@@ -19,7 +19,7 @@ import { useToolResult } from "../../store/conversationStore";
 import { Dot, Ico } from "../../ui/kit";
 import { useDisplay } from "../../store/display";
 import { artifactHeadline, publishInfo, useArtifacts } from "./artifacts";
-import { artifactFace } from "./artifactIcon";
+import { ArtifactFace, artifactFace } from "./artifactIcon";
 import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
 import { useHostInert } from "./FileMention";
 import { basename } from "./toolMeta";
@@ -128,7 +128,7 @@ export function ArtifactCard({
       }
     >
       <span className="cv-art-tile" aria-hidden="true">
-        {favicon || "🎨"}
+        <ArtifactFace face={favicon} />
       </span>
       <span className="cv-art-body">
         <span className="cv-art-title">{headline}</span>

@@ -17,6 +17,7 @@ import { useDisplay } from "../../store/display";
 import { Ico } from "../../ui/kit";
 import type { ArtifactView } from "../editor/editorStore";
 import { withArtifactCsp } from "./artifactCsp";
+import { ArtifactFace } from "./artifactIcon";
 import {
   attachArtifactHost,
   pageHost,
@@ -106,7 +107,7 @@ function ArtifactUnavailable({
   return (
     <div className="cv-artview-msg">
       <span className="cv-artview-fav cv-artview-msgfav" aria-hidden="true">
-        {favicon || "🎨"}
+        <ArtifactFace face={favicon} />
       </span>
       <p>{headline}</p>
       {detail ? <p style={{ opacity: 0.75 }}>{detail}</p> : null}
@@ -214,7 +215,7 @@ function HostedArtifact({ url, favicon }: { url: string; favicon: string | null 
       {phase === "error" ? (
         <div className="cv-artview-msg">
           <span className="cv-artview-fav cv-artview-msgfav" aria-hidden="true">
-            {favicon || "🎨"}
+            <ArtifactFace face={favicon} />
           </span>
           <p>This artifact’s claude.ai page couldn’t be shown here.</p>
           {error ? <p style={{ opacity: 0.75 }}>{error}</p> : null}
@@ -230,7 +231,7 @@ function HostedArtifact({ url, favicon }: { url: string; favicon: string | null 
       ) : (
         <div className="cv-artview-msg">
           <span className="cv-artview-fav cv-artview-msgfav" aria-hidden="true">
-            {favicon || "🎨"}
+            <ArtifactFace face={favicon} />
           </span>
           {/* Same source as the header — this shows whenever the native view steps aside (a menu,
               a toast, a folded panel), and it must not call another site "claude.ai". */}
@@ -266,7 +267,7 @@ function ViewerHeader({
   return (
     <div className="cv-artview-h">
       <span className="cv-artview-fav" aria-hidden="true">
-        {view.favicon || "🎨"}
+        <ArtifactFace face={view.favicon} />
       </span>
       <span className="cv-artview-title" title={view.title}>
         {view.title}

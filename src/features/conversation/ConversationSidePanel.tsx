@@ -36,6 +36,7 @@ import { TaskStatusActions, TaskStatusChip, TaskSubtaskRows } from "../tosse/Tos
 import { AssigneePicker } from "../tosse/AssigneePicker";
 import { TodoList } from "../todos/TodoList";
 import { useArtifacts, type Artifact } from "./artifacts";
+import { ArtifactFace } from "./artifactIcon";
 import { artifactKind, openArtifactView } from "./artifactOpen";
 import { openConversationAt } from "../../store/threadJump";
 import { useClearGoalAction } from "./GoalPopover";
@@ -357,7 +358,7 @@ function ArtifactCard({ convId, art }: { convId: string; art: Artifact }) {
           title={art.url ? "Open in Flight Deck" : "Not published yet"}
         >
           <span className={s.artTile} aria-hidden="true">
-            {art.favicon ? art.favicon : <Ico name="artifact" className="sm" />}
+            <ArtifactFace face={art.favicon} />
           </span>
           <span className={s.artMain}>
             <span className={s.artTitle}>{art.title}</span>
