@@ -1229,6 +1229,97 @@ export class ScenarioDriver {
   }
 
   /**
+   * Page-artifact demo (`?demo=artifacts`): TWO different artifacts in one conversation, one of
+   * them republished twice — the case the side panel's list and its version history exist for.
+   *
+   * Acks are the CURRENT wire, verbatim: the 2.1.272+ URL shape, the `(Version N)` suffix, the
+   * `Icon: "…"` line — and inputs carrying `icon` (a WORD) with NO `favicon`, which is what the
+   * binary sends since 2026-09-15. The last publish still uses the legacy `favicon` emoji, so
+   * one run shows both halves of the wire resolving to a face side by side.
+   */
+  startPageArtifacts() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const dir = "/private/tmp/claude-501/demo/scratchpad";
+    const reportUrl = "https://claude.ai/artifact/8cvJy8RumYUbh22HJSWarK";
+    const deckUrl = "https://claude.ai/artifact/VscjxCuqtLtw9eKDgNwrPu";
+    const publish = (id: string, path: string, input: Record<string, unknown>) =>
+      ({ type: "tool_use", id, name: "Artifact", input: { file_path: `${dir}/${path}`, ...input } }) as const;
+    const ack = (id: string, path: string, url: string, n: number, icon?: string) =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: id,
+        content: [
+          {
+            type: "text",
+            text:
+              `Published ${dir}/${path} at ${url} (Version ${n})` +
+              (icon ? ` Icon: "${icon}".` : "") +
+              "\n\nLive subscription: none — this is a print (-p), cloud, subagent, or teammate session.",
+          },
+        ],
+        is_error: false,
+        parent_tool_use_id: null,
+      });
+
+    this.step(200, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "I've published the audit report and the launch deck.\n\n";
+    this.streamText("m1", t1);
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          publish("toolu_r1", "audit-report.html", { icon: "report", description: "Q3 accessibility audit" }),
+          publish("toolu_d1", "launch-deck.html", { icon: "plane", description: "Launch readiness" }),
+        ],
+      }),
+    );
+    this.step(320, () => ack("toolu_r1", "audit-report.html", reportUrl, 1, "report"));
+    this.step(260, () => ack("toolu_d1", "launch-deck.html", deckUrl, 1, "plane"));
+
+    this.step(300, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [publish("toolu_r2", "audit-report.html", { icon: "report", label: "contrast pass" })],
+      }),
+    );
+    this.step(320, () => ack("toolu_r2", "audit-report.html", reportUrl, 2));
+
+    this.step(300, () =>
+      this.emit.item({ kind: "message_started", id: "m3", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t3 = "Third pass on the report — the tables now read at 320px.";
+    this.streamText("m3", t3, 3, 18);
+    this.step(150, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m3",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t3 },
+          // The LEGACY field, on purpose: a conversation can hold both wires at once.
+          publish("toolu_r3", "audit-report.html", { favicon: "📑", label: "responsive tables" }),
+        ],
+      }),
+    );
+    this.step(320, () => ack("toolu_r3", "audit-report.html", reportUrl, 3));
+    this.step(200, () =>
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.006, num_turns: 3, duration_ms: 4200, duration_api_ms: 3300, ttft_ms: 460 }),
+    );
+    this.step(40, () => this.emit.state(idleState()));
+  }
+
+  /**
    * Background-monitor demo (`?demo=monitor`): the agent launches the `Monitor` tool —
    * a live watch whose every stdout line is an event (read from disk, NOT the wire). One
    * watch KEEPS streaming (persistent → Stop button + live event tail) and a second one

@@ -47,6 +47,11 @@ function locate(
   sent: { toolUseId: string | null },
 ): HTMLElement | null {
   if (anchor.kind === "received") return byData(root, "data-agent-msg", "agentMsg", anchor.messageId);
+  // An artifact publish is its own segment — never folded by clean output — so the card is
+  // already mounted whenever its turn is; no fold to open, unlike a `send_message` card.
+  if (anchor.kind === "artifact") {
+    return byData(root, "data-artifact-publish", "artifactPublish", anchor.toolUseId);
+  }
   sent.toolUseId ??= findSentMessageToolUse(
     useConversationStore.getState().sessions[session],
     anchor.messageId,
@@ -135,7 +140,9 @@ export function useThreadJumpTarget(
         pushInfoToast(
           anchor.kind === "sent"
             ? "Couldn't find where that message was sent in this conversation."
-            : "Couldn't find that message in this conversation.",
+            : anchor.kind === "artifact"
+              ? "Couldn't find where that version was published in this conversation."
+              : "Couldn't find that message in this conversation.",
         );
         return;
       }

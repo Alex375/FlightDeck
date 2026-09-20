@@ -17,7 +17,12 @@ export type JumpAnchor =
   /** The recipient's card for a message (`data-agent-msg`). */
   | { kind: "received"; messageId: string }
   /** The sender's `send_message` card, found through the message id its result echoes. */
-  | { kind: "sent"; messageId: string };
+  | { kind: "sent"; messageId: string }
+  /** One publish of an artifact — its inline card (`data-artifact-publish`). How an older
+   *  VERSION is reached: claude.ai only ever serves the latest, and the local temp file is
+   *  overwritten on every republish, so the card where that version was published is the one
+   *  place its contents are still on show. */
+  | { kind: "artifact"; toolUseId: string };
 
 export interface JumpRequest {
   convId: string;

@@ -30,7 +30,13 @@ import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
 import { ConversationSidePanel } from "./ConversationSidePanel";
-import { SIDE_PANEL_PX, SIDE_REGION_MIN_PX, sidePanelDocks } from "./sidePanelLayout";
+import {
+  clampSidePanelWidth,
+  dockedSidePanelWidth,
+  floatingSidePanelWidth,
+  SIDE_REGION_MIN_PX,
+  sidePanelDocks,
+} from "./sidePanelLayout";
 import { useDisplay } from "../../store/display";
 import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
 
@@ -147,6 +153,8 @@ function ConversationArea({
   const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
   const panelShown = useConvPanelShown();
   const sideRegionOpen = useSideRegionOpen(conv.id);
+  const convPanelWidth = useEditorStore((s) => s.convPanelWidth);
+  const setConvPanelWidth = useEditorStore((s) => s.setConvPanelWidth);
   const areaRef = useRef<HTMLDivElement>(null);
   const areaWidth = useLayoutWidth(areaRef);
   // Unmeasured (first commit) → assume it docks: the common case, and a wrong guess is
@@ -168,12 +176,36 @@ function ConversationArea({
   const docksRef = useRef(docks);
   const docksChanged = docksRef.current !== docks;
   docksRef.current = docks;
+  // The width the user dragged the panel to, held inside its own bounds AND inside the room
+  // actually left beside the conversation — a stored 560 on a narrow window renders at the
+  // room available, never by pushing the composer under its floor.
+  const width =
+    areaWidth === null
+      ? clampSidePanelWidth(convPanelWidth)
+      : docks
+        ? dockedSidePanelWidth(convPanelWidth, areaWidth, sideRegionOpen)
+        : floatingSidePanelWidth(convPanelWidth, areaWidth);
   const slide = usePanelSlide({
     open: want && docks,
     axis: "x",
     enabled: !docksChanged,
-    restStyle: { flex: `0 0 ${SIDE_PANEL_PX}px`, minWidth: 0, minHeight: 0, display: "flex" },
+    restStyle: { flex: `0 0 ${width}px`, minWidth: 0, minHeight: 0, display: "flex" },
   });
+
+  // The slot's left edge IS the divider, so the width the user is asking for is simply the
+  // distance from the pointer to the area's right edge. Zoom needs no correction: the webview
+  // zooms CSS pixels themselves (see ui/zoom.ts), so client coordinates stay in the same space
+  // as the widths — unlike a `transform`, which would need visualScale.
+  const onPanelDrag = (clientX: number) => {
+    const rect = areaRef.current?.getBoundingClientRect();
+    if (rect) setConvPanelWidth(rect.right - clientX);
+  };
+  const panel = (
+    <>
+      <Splitter axis="x" onMove={onPanelDrag} />
+      <ConversationSidePanel conv={conv} />
+    </>
+  );
 
   return (
     <div
@@ -184,10 +216,10 @@ function ConversationArea({
         <MainArea conv={conv} composerRef={composerRef} onBackgroundClick={onBackgroundClick} />
       </div>
       {slide.mounted ? (
+        // The splitter travels INSIDE the animated slot, as the side region's does, so the
+        // divider slides in with the panel instead of blinking into place 6px early.
         <div ref={slide.slotRef} style={slide.slotStyle}>
-          <div style={slide.paneStyle}>
-            <ConversationSidePanel conv={conv} />
-          </div>
+          <div style={slide.paneStyle}>{panel}</div>
         </div>
       ) : null}
       {want && !docks ? (
@@ -197,13 +229,13 @@ function ConversationArea({
             top: 0,
             right: 0,
             bottom: 0,
-            width: SIDE_PANEL_PX,
+            width,
             zIndex: 20,
             display: "flex",
             boxShadow: "-18px 0 36px -20px #000",
           }}
         >
-          <ConversationSidePanel conv={conv} />
+          {panel}
         </div>
       ) : null}
     </div>

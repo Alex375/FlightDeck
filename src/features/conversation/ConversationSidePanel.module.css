@@ -9,7 +9,8 @@
   display: flex;
   flex-direction: column;
   background: var(--wf-bg-2);
-  border-left: 1px solid var(--wf-line);
+  /* No left border: the drag splitter now sits there and draws the divider itself (its ::after
+     is a 1px line in the same token), so keeping one would paint two rules side by side. */
 }
 
 /* ---- Header: a single tab-like title + close ------------------------------------------- */
@@ -396,25 +397,140 @@
   flex-direction: column;
   gap: 8px;
 }
+/* The card is a CONTAINER (open + version badge + the expanded history), not one button:
+   nesting a button inside a button is invalid, and the badge must not open the artifact. */
 .artCard {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
+  flex-direction: column;
   min-width: 0;
-  padding: 7px 8px;
   border-radius: 8px;
   background: var(--wf-panel);
   border: 1px solid var(--wf-line);
+  transition: border-color 0.12s ease;
+}
+.artCard:hover,
+.artCard[data-open] {
+  border-color: var(--wf-line-2);
+}
+.artHead {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 6px 0 0;
+}
+.artOpen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 7px 4px 7px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition: background 0.12s ease;
 }
-.artCard:hover {
+.artOpen:hover {
   background: var(--wf-panel-2);
-  border-color: var(--wf-line-2);
+}
+
+/* « v3 ⌄ » — the version history's disclosure. A single-version artifact keeps the same
+   badge slot as static text, so the cards line up whether or not they have a history. */
+.artVbtn,
+.artV1 {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 22px;
+  padding: 0 4px 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.artVbtn {
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.artVbtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.artV1 {
+  padding-right: 6px;
+  color: var(--wf-tx-xlo);
+}
+.artVchev {
+  width: 11px;
+  height: 11px;
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+.artVbtn[aria-expanded="true"] .artVchev {
+  transform: rotate(0deg);
+}
+
+/* The history itself: one row per publish, newest first. Each row GOES TO the message that
+   published it — the only place that version's contents still exist (see ArtifactVersions). */
+.artVersions {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 4px 4px;
+  border-top: 1px solid color-mix(in srgb, var(--wf-line) 70%, var(--wf-panel));
+}
+.artVrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.artVrow:hover {
+  background: var(--wf-panel-2);
+}
+.artVn {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
+.artVrow[data-state="error"] .artVn,
+.artVrow[data-state="error"] .artVlabel {
+  color: var(--wf-err);
+}
+.artVlabel {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--wf-tx);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artVgo {
+  flex: 0 0 auto;
+  color: var(--wf-tx-lo);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.artVrow:hover .artVgo {
+  opacity: 1;
 }
 .artTile {
   flex: 0 0 28px;
@@ -453,7 +569,7 @@
   opacity: 0;
   transition: opacity 0.12s ease;
 }
-.artCard:hover .artGo {
+.artOpen:hover .artGo {
   opacity: 1;
 }
 

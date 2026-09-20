@@ -37,6 +37,7 @@ import { AssigneePicker } from "../tosse/AssigneePicker";
 import { TodoList } from "../todos/TodoList";
 import { useArtifacts, type Artifact } from "./artifacts";
 import { artifactKind, openArtifactView } from "./artifactOpen";
+import { openConversationAt } from "../../store/threadJump";
 import { useClearGoalAction } from "./GoalPopover";
 import { useStreamActions } from "./StreamControl";
 import s from "./ConversationSidePanel.module.css";
@@ -311,38 +312,114 @@ function ArtifactsSection({ convId, artifacts }: { convId: string; artifacts: Ar
   );
 }
 
-/** One published artifact: favicon tile, title, kind + version count. Opens like every other
- *  artifact surface (in-app viewer when the local file is still there, else the hosted page). */
+/**
+ * One published artifact: its face, title, kind and version count. The card opens the artifact
+ * like every other artifact surface (in-app viewer when the local file is still there, else the
+ * hosted page); the version badge expands its HISTORY.
+ *
+ * ⚠️ The typed/multi-file flags are passed on. Without them a Claude Design canvas would be
+ * routed to the local preview and render its `canvas.json` as a page — the broken screen
+ * `routeArtifactOpen` exists to avoid. Every surface must hand it the same facts.
+ */
 function ArtifactCard({ convId, art }: { convId: string; art: Artifact }) {
-  const kind = artifactKind(art.latestFilePath) === "md" ? "Markdown" : "HTML";
-  const versions = art.versions.length;
-  const open = () =>
+  const [open, setOpen] = useState(false);
+  const kind = art.typed
+    ? art.typeName
+      ? `${art.typeName} artifact`
+      : "Artifact"
+    : artifactKind(art.latestFilePath) === "md"
+      ? "Markdown"
+      : "HTML";
+  const count = art.versions.length;
+  // The badge shows the ARTIFACT's version number, which is the highest any ack named — not the
+  // last one, whose publish may have failed (and so carries no number at all). Falls back to the
+  // count for transcripts written before the CLI put "(Version N)" in the ack.
+  const latest =
+    art.versions.reduce<number | null>((m, v) => (v.version && (m === null || v.version > m) ? v.version : m), null) ??
+    count;
+  const openArtifact = () =>
     openArtifactView({
       convId,
       title: art.title,
       favicon: art.favicon,
       url: art.url,
       filePath: art.latestFilePath,
+      typed: art.typed,
+      multiFile: art.multiFile,
     });
   return (
-    <button
-      type="button"
-      className={s.artCard}
-      onClick={open}
-      title={art.url ? "Open in Flight Deck" : "Not published yet"}
-    >
-      <span className={s.artTile} aria-hidden="true">
-        {art.favicon ? art.favicon : <Ico name="artifact" className="sm" />}
-      </span>
-      <span className={s.artMain}>
-        <span className={s.artTitle}>{art.title}</span>
-        <span className={s.artSub}>
-          {kind} · v{versions}
-          {art.url ? "" : " · publishing…"}
-        </span>
-      </span>
-      <Ico name="external" className={`sm ${s.artGo}`} />
-    </button>
+    <div className={s.artCard} data-open={open || undefined}>
+      <div className={s.artHead}>
+        <button
+          type="button"
+          className={s.artOpen}
+          onClick={openArtifact}
+          title={art.url ? "Open in Flight Deck" : "Not published yet"}
+        >
+          <span className={s.artTile} aria-hidden="true">
+            {art.favicon ? art.favicon : <Ico name="artifact" className="sm" />}
+          </span>
+          <span className={s.artMain}>
+            <span className={s.artTitle}>{art.title}</span>
+            <span className={s.artSub}>
+              {kind}
+              {art.url ? "" : " · publishing…"}
+            </span>
+          </span>
+          <Ico name="external" className={`sm ${s.artGo}`} />
+        </button>
+        {count > 1 ? (
+          <button
+            type="button"
+            className={s.artVbtn}
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            title={open ? "Hide the version history" : "Show the version history"}
+          >
+            <span className="wf-mono">v{latest}</span>
+            <Ico name="chev" className={`sm ${s.artVchev}`} />
+          </button>
+        ) : (
+          <span className={`${s.artV1} wf-mono`}>v{latest}</span>
+        )}
+      </div>
+      {count > 1 && open ? <ArtifactVersions convId={convId} art={art} /> : null}
+    </div>
+  );
+}
+
+/**
+ * The version history of one artifact, newest first — the only way to reach an OLDER version.
+ *
+ * ⚠️ There is no per-version link to fabricate: the wire gives ONE canonical URL (claude.ai
+ * always serves the latest), and each republish overwrites the same local temp file, so an
+ * earlier version's bytes exist nowhere the app can read. What does survive is the message that
+ * published it, card and all — so a row scrolls the thread there rather than pretending to open
+ * something. A version whose publish FAILED says so instead of looking like one you can visit.
+ */
+function ArtifactVersions({ convId, art }: { convId: string; art: Artifact }) {
+  return (
+    <div className={s.artVersions}>
+      {art.versions
+        .map((v, i) => ({ v, n: v.version ?? i + 1 }))
+        .reverse()
+        .map(({ v, n }) => (
+          <button
+            key={v.toolUseId}
+            type="button"
+            className={s.artVrow}
+            data-state={v.isError ? "error" : undefined}
+            onClick={() => openConversationAt(convId, { kind: "artifact", toolUseId: v.toolUseId })}
+            title="Go to where this version was published"
+          >
+            <span className={`${s.artVn} wf-mono`}>v{n}</span>
+            <span className={s.artVlabel}>
+              {v.isError ? "Publishing failed" : v.label || v.description || "—"}
+            </span>
+            <Ico name="reply" className={`sm ${s.artVgo}`} />
+          </button>
+        ))}
+    </div>
   );
 }
 

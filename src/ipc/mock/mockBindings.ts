@@ -1647,6 +1647,7 @@ export const mockCommands = {
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
     else if (demo === "remotelinkblockedhost") driver.startRemoteLinkBlocked("ssh_host_key_changed");
+    else if (demo === "artifacts") driver.startPageArtifacts();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).

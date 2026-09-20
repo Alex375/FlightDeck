@@ -779,6 +779,7 @@ function ThreadPrefs() {
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const artifactsInApp = useDisplay((s) => s.artifactsInApp);
+  const artifactHidesSidePanel = useDisplay((s) => s.artifactHidesSidePanel);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -917,6 +918,20 @@ function ThreadPrefs() {
           checked={artifactsInApp}
           onChange={(v) => set({ artifactsInApp: v })}
           label="Show claude.ai-hosted artifacts in the side panel"
+        />
+        <ToggleRow
+          title="Hide the conversation panel while previewing an artifact"
+          hint={
+            <>
+              Puts the <strong>conversation panel</strong> away while an artifact preview is open,
+              and brings it back when you close the preview — side by side they leave the thread a
+              sliver. <strong>On by default.</strong> It only ever hides a panel that was already
+              on screen, so an artifact never opens one you had closed. Off → both stay up.
+            </>
+          }
+          checked={artifactHidesSidePanel}
+          onChange={(v) => set({ artifactHidesSidePanel: v })}
+          label="Hide the conversation panel while an artifact is open"
         />
       </SettingsGroup>
 

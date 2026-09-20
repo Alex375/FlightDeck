@@ -20,6 +20,7 @@ import type { FileStat, FsEntry } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
 import { baseName, dirName, imageMimeForPath, isImagePath, isPdfPath, languageForPath } from "./language";
 import { isWithin, joinPath, uniqueDest, validateName } from "./fileOps";
+import { clampSidePanelWidth, SIDE_PANEL_PX } from "../conversation/sidePanelLayout";
 
 /** Debounce before an edited buffer is autosaved to disk (ms). */
 const AUTOSAVE_MS = 1000;
@@ -253,12 +254,24 @@ interface EditorState {
    *  never competes with the editor/terminal/Git for the same space. Only read while the
    *  `conversationSidePanel` display pref is on. */
   convPanelOpen: boolean;
+  /** Width of the conversation side panel's slot (splitter included), px — dragged by its
+   *  divider, persisted like `treeWidth`. Held inside the panel's own bounds here; the room
+   *  actually available is applied at render (see sidePanelLayout). */
+  convPanelWidth: number;
+  setConvPanelWidth: (w: number) => void;
   /** The open panel has STEPPED ASIDE because it cannot dock (not enough width beside the
    *  conversation and the side region). Transient, never persisted: set and cleared by the
    *  layout as the room comes and goes; an explicit open (toggle, ⌘I, summary line) clears
    *  it so the panel floats over the edge instead. Read through {@link useConvPanelShown}. */
   convPanelYielded: boolean;
   setConvPanelYielded: (yielded: boolean) => void;
+  /** The open panel has been PUT AWAY for the length of an artifact preview: an artifact and
+   *  the panel are both "what this conversation produced", and showing them at once leaves the
+   *  thread a sliver. Transient, never persisted — `convPanelOpen` keeps the user's own answer,
+   *  so closing the artifact brings the panel back exactly as it was, and a panel that was
+   *  already closed is never opened by an artifact. Cleared by any explicit toggle (the user
+   *  asking for the panel outranks this) and whenever the artifact goes away. */
+  convPanelPreempted: boolean;
 
   // ---- Artifact viewer (in-memory, transient) ----
   /** The artifact open in the side-region viewer, or null. Cleared by every side-region toggle
@@ -266,8 +279,11 @@ interface EditorState {
    *  whichever way they flip. */
   artifactView: ArtifactView | null;
   /** Open an artifact in the side-region viewer (closes Git FIRST — see the ordering trap in the
-   *  implementation — then takes over the side region). */
-  openArtifact: (view: ArtifactView) => void;
+   *  implementation — then takes over the side region). `preemptPanel` asks for the conversation
+   *  side panel to be put away for the length of the preview (see {@link convPanelPreempted});
+   *  the caller owns that decision because it is a display PREFERENCE, which this store doesn't
+   *  read. */
+  openArtifact: (view: ArtifactView, opts?: { preemptPanel?: boolean }) => void;
   /** Close the artifact viewer (the side region falls back to editor/terminal if open). */
   closeArtifact: () => void;
 
@@ -424,6 +440,8 @@ interface LayoutPrefs {
   treeCollapsed: boolean;
   /** The conversation side panel is shown. */
   convPanelOpen: boolean;
+  /** Width of its slot, px (the splitter included). */
+  convPanelWidth: number;
 }
 
 const DEFAULT_LAYOUT: LayoutPrefs = {
@@ -443,6 +461,7 @@ const DEFAULT_LAYOUT: LayoutPrefs = {
   // Open by default: it is where the conversation's state now lives (the header only
   // carries actions), so a first launch must show it rather than hide it behind a toggle.
   convPanelOpen: true,
+  convPanelWidth: SIDE_PANEL_PX,
 };
 
 function loadLayout(): LayoutPrefs {
@@ -474,6 +493,8 @@ function loadLayout(): LayoutPrefs {
       treeWidth: typeof p.treeWidth === "number" ? clamp(p.treeWidth, 120, 600) : DEFAULT_LAYOUT.treeWidth,
       treeCollapsed: typeof p.treeCollapsed === "boolean" ? p.treeCollapsed : DEFAULT_LAYOUT.treeCollapsed,
       convPanelOpen: typeof p.convPanelOpen === "boolean" ? p.convPanelOpen : DEFAULT_LAYOUT.convPanelOpen,
+      convPanelWidth:
+        typeof p.convPanelWidth === "number" ? clampSidePanelWidth(p.convPanelWidth) : DEFAULT_LAYOUT.convPanelWidth,
     };
   } catch {
     return DEFAULT_LAYOUT;
@@ -497,6 +518,7 @@ function saveLayout(s: EditorState): void {
     treeWidth: s.treeWidth,
     treeCollapsed: s.treeCollapsed,
     convPanelOpen: s.convPanelOpen,
+    convPanelWidth: s.convPanelWidth,
   };
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(prefs));
@@ -845,6 +867,9 @@ export const useEditorStore = create<EditorState>()((set, get) => {
   const clearArtifact = () => {
     if (get().artifactView) set({ artifactView: null });
     if (get().tosseTaskView) set({ tosseTaskView: null });
+    // The panel was only put away FOR the preview: whichever way the preview ends — the close
+    // button, or a side-region toggle taking the region over — it comes straight back.
+    if (get().convPanelPreempted) set({ convPanelPreempted: false });
   };
 
   return {
@@ -854,22 +879,29 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     artifactView: null,
     tosseTaskView: null,
 
-    openArtifact: (view) => {
+    openArtifact: (view, opts) => {
       // ⚠️ ORDER MATTERS — close Git BEFORE setting the view, never after. `setGitOpen` clears the
       // artifact view UNCONDITIONALLY (see clearArtifact), so the old "set, then close Git"
       // ordering would immediately wipe the artifact we were just asked to open. Do not swap
-      // these two lines back.
+      // these two lines back. Same reason the preemption is decided AFTER: setGitOpen →
+      // clearArtifact would reset it.
       if (get().gitOpen) get().setGitOpen(false); // viewer and Git are mutually exclusive
-      set({ artifactView: view });
+      // Put the side panel away only if it is actually ON SCREEN: an artifact must never OPEN a
+      // panel the user had closed (or one that had already stepped aside), because closing the
+      // artifact would then reveal a panel nobody asked for.
+      const preempt =
+        !!opts?.preemptPanel && get().convPanelOpen && !get().convPanelYielded;
+      set({ artifactView: view, convPanelPreempted: preempt });
     },
-    closeArtifact: () => set({ artifactView: null }),
+    closeArtifact: () => set({ artifactView: null, convPanelPreempted: false }),
 
     openTosseTask: (view) => {
       // Same ordering trap as `openArtifact`: `setGitOpen` clears the transient side-region
       // views unconditionally, so Git must be closed BEFORE the view is set, never after.
       if (get().gitOpen) get().setGitOpen(false);
-      // One transient view at a time — the side region cannot show two things.
-      set({ artifactView: null, tosseTaskView: view });
+      // One transient view at a time — the side region cannot show two things. The artifact
+      // leaving takes its panel preemption with it (only artifacts put the panel away).
+      set({ artifactView: null, tosseTaskView: view, convPanelPreempted: false });
     },
     closeTosseTask: () => set({ tosseTaskView: null }),
 
@@ -922,22 +954,26 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     // as closed, so pressing the toggle then brings it back (floating) rather than persisting
     // "closed" for a panel that was already invisible — one press, one visible effect.
     toggleConvPanel: () => {
-      const { convPanelOpen, convPanelYielded } = get();
-      if (convPanelOpen && !convPanelYielded) {
+      const { convPanelOpen, convPanelYielded, convPanelPreempted } = get();
+      if (convPanelOpen && !convPanelYielded && !convPanelPreempted) {
         withLayout({ convPanelOpen: false });
         return;
       }
-      set({ convPanelYielded: false });
+      // Asking for the panel outranks both reasons it was taken away: no room (→ float) and an
+      // artifact preview (→ share the row with it).
+      set({ convPanelYielded: false, convPanelPreempted: false });
       withLayout({ convPanelOpen: true });
     },
     setConvPanelOpen: (convPanelOpen) => {
-      if (convPanelOpen) set({ convPanelYielded: false });
+      if (convPanelOpen) set({ convPanelYielded: false, convPanelPreempted: false });
       withLayout({ convPanelOpen });
     },
+    setConvPanelWidth: (w) => withLayout({ convPanelWidth: clampSidePanelWidth(w) }),
     convPanelYielded: false,
     setConvPanelYielded: (convPanelYielded) => {
       if (get().convPanelYielded !== convPanelYielded) set({ convPanelYielded });
     },
+    convPanelPreempted: false,
 
     ensureConv: (convId, root) => {
       const cur = get().byConv[convId];
@@ -1521,11 +1557,12 @@ export const useSideRegionOpen = (convId: string | null) =>
       (convId !== null &&
         (s.artifactView?.convId === convId || s.tosseTaskView?.convId === convId)),
   );
-/** Whether the conversation side panel is ON SCREEN (docked or floating): open, and not
- *  stepped aside for lack of room. What every surface keyed on "is the panel visible" reads —
- *  the header toggle's lit state, the summary line that stands in for a hidden panel. */
+/** Whether the conversation side panel is ON SCREEN (docked or floating): open, not stepped
+ *  aside for lack of room, and not put away for an artifact preview. What every surface keyed
+ *  on "is the panel visible" reads — the header toggle's lit state, the summary line that
+ *  stands in for a hidden panel. */
 export const useConvPanelShown = () =>
-  useEditorStore((s) => s.convPanelOpen && !s.convPanelYielded);
+  useEditorStore((s) => s.convPanelOpen && !s.convPanelYielded && !s.convPanelPreempted);
 export const useEditorLayout = () =>
   useEditorStore(
     useShallow((s) => ({
