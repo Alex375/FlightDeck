@@ -691,6 +691,47 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-art[data-state="error"] .cv-art-detail,
 .cv-art[data-state="error"] .cv-art-go { color:var(--wf-err); }
 
+/* ── TOSSE action card (a CRM write in the thread) ───────────────────────────
+   Same anatomy as the artifact card above — mark tile, headline, eyebrow, trailing glyph — so
+   the two read as one family of "the agent produced something durable". What it adds is the
+   CRM's own furniture on a task: the board's status pill and the assignee mark, lifted
+   verbatim from the TOSSE view (their styles travel with them, via the CSS module). */
+.cv-tosseact { display:flex; align-items:center; gap:11px; padding:10px 12px; border:1px solid var(--wf-line); border-radius:10px; background:var(--wf-panel); transition:border-color .14s ease, background .14s ease; }
+.cv-tosseact[data-open] { cursor:pointer; }
+.cv-tosseact[data-open]:hover { border-color:color-mix(in srgb, var(--wf-accent) 45%, var(--wf-line)); background:var(--wf-panel-3, var(--wf-panel)); }
+.cv-tosseact-tile { flex:none; width:34px; height:34px; display:flex; align-items:center; justify-content:center; border:1px solid var(--wf-line); border-radius:9px; background:var(--wf-bg-2); }
+/* The rose is landscape; size it on HEIGHT inside the tile so it keeps its own ratio (the same
+   reasoning as `.wf-tosse-mark.sm`) instead of being squared into the plate. */
+.cv-tosseact-tile .wf-tosse-mark { width:24px; height:17px; color:var(--wf-tx-hi); }
+.cv-tosseact-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.cv-tosseact-title { font-size:12.5px; color:var(--wf-tx-hi); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cv-tosseact-sub { display:flex; align-items:center; min-width:0; font-size:11px; color:var(--wf-tx-lo); }
+.cv-tosseact-kind { flex:none; }
+.cv-tosseact-detail { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cv-tosseact-detail::before { content:"·"; margin:0 5px; opacity:.55; }
+.cv-tosseact-tool { flex:none; font-size:10.5px; color:var(--wf-tx-xlo); }
+.cv-tosseact-tool::before { content:"·"; margin:0 5px; opacity:.55; }
+/* The status MOVE: where the task came from, an arrow, where it landed. The origin is dimmed
+   so the eye lands on the current state; with no known origin only the landing pill renders
+   (see StatusMove — an origin is never invented). */
+.cv-tosseact-move { flex:none; display:inline-flex; align-items:center; gap:5px; }
+.cv-tosseact-move[data-pending] { opacity:.6; }
+.cv-tosseact-arrow { flex:none; color:var(--wf-tx-xlo); }
+.cv-tosseact-move .wf-ico { width:13px; height:13px; }
+.cv-tosseact-move [data-was] { opacity:.5; }
+.cv-tosseact-who { flex:none; display:inline-flex; align-items:center; }
+.cv-tosseact-go { flex:none; display:inline-flex; align-items:center; color:var(--wf-tx-lo); transition:color .14s ease; }
+.cv-tosseact[data-open]:hover .cv-tosseact-go { color:var(--wf-accent); }
+.cv-tosseact-go .wf-ico { width:15px; height:15px; }
+/* A refused / failed write is surfaced as an error, never as a quiet success — the CRM's own
+   answer rides the sub-line, in full on hover (title attr). Zero-silent-error. */
+.cv-tosseact[data-state="error"] { border-color:color-mix(in srgb, var(--wf-err) 40%, var(--wf-line)); background:var(--wf-err-bg); }
+.cv-tosseact[data-state="error"] .cv-tosseact-tile { border-color:color-mix(in srgb, var(--wf-err) 45%, var(--wf-line)); }
+.cv-tosseact[data-state="error"] .cv-tosseact-tile .wf-tosse-mark { --logo-accent:currentColor; color:var(--wf-err); }
+.cv-tosseact[data-state="error"] .cv-tosseact-kind,
+.cv-tosseact[data-state="error"] .cv-tosseact-detail,
+.cv-tosseact[data-state="error"] .cv-tosseact-go { color:var(--wf-err); }
+
 /* ── Artifacts popover (composer "Artifacts (N)" chip) ───────────────────────
    Portal-rendered under the chip (fixed-positioned, opens upward from the composer).
    Lists every artifact of the conversation newest-first, each with its version history. */

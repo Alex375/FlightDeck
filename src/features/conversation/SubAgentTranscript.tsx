@@ -1,6 +1,7 @@
 // Read-only renderer for a `ConversationItem[]` transcript — the reusable brick for the
 // sub-agent drill-in (live + disk), the history-panel preview, and the future Workflow /
-// Fleet views. Pure: a function of the items handed in, no store reads.
+// Fleet views. A function of the items handed in — it reads no CONVERSATION state; the only
+// store it touches is the display preferences, which say how to render, not what.
 //
 // It renders the SAME "clean output" shape as the live thread: each user message is its own
 // row, and every assistant turn until the next user message is concatenated into ONE
@@ -29,6 +30,7 @@ import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { AgentMessageSentView } from "./AgentMessageCards";
+import { TosseToolView, useTosseToolCards } from "./TosseToolCard";
 import { NoticeBlock } from "./noticeView";
 
 interface JoinedResult {
@@ -39,7 +41,11 @@ interface JoinedResult {
 /** Render grouped segments statically (no store): prose / thinking inline, runs of tool
  *  calls coalesced into one collapsed section, a sub-agent as a single step. Shared by the
  *  folded work and the concluding message. */
-function renderSegments(segments: Segment[], results: Map<string, JoinedResult>): ReactNode {
+function renderSegments(
+  segments: Segment[],
+  results: Map<string, JoinedResult>,
+  tosse: boolean,
+): ReactNode {
   return segments.map((seg) => {
     if (seg.kind === "text") return <StreamMarkdown key={seg.key} text={seg.text} />;
     if (seg.kind === "thinking") return <ThinkingBlock key={seg.key} text={seg.text} finalized />;
@@ -73,12 +79,24 @@ function renderSegments(segments: Segment[], results: Map<string, JoinedResult>)
           result={results.get(seg.step.id)}
         />
       );
+    // A write to the TOSSE CRM: the same action card as the live thread. Not clickable here —
+    // a settled transcript (history preview, sub-agent drill-in) has no conversation to open a
+    // task INTO, and a card that navigated out of the preview would lose what you were reading.
+    if (seg.kind === "tosse")
+      return (
+        <TosseToolView
+          key={seg.key}
+          name={seg.step.name}
+          input={seg.step.input}
+          result={results.get(seg.step.id)}
+        />
+      );
     // In-band markers only exist in the LIVE thread (interleaveMarkers); a disk transcript
     // has none, but the union requires the branch — render nothing.
     if (seg.kind === "marker") return null;
     const errored = seg.steps.some((s) => results.get(s.id)?.isError ?? false);
     return (
-      <ToolSection key={seg.key} title={runHeader(seg.steps)} errored={errored}>
+      <ToolSection key={seg.key} title={runHeader(seg.steps, tosse)} errored={errored}>
         {seg.steps.map((step) => (
           <StaticToolStep key={step.id} step={step} result={results.get(step.id)} />
         ))}
@@ -98,7 +116,8 @@ function ClaudeResponse({
   blocks: NormalizedBlock[];
   results: Map<string, JoinedResult>;
 }) {
-  const segments = groupBlocks(blocks, true);
+  const tosseCards = useTosseToolCards();
+  const segments = groupBlocks(blocks, true, undefined, tosseCards);
   if (segments.length === 0) return null;
   const { work, final } = splitFinalMessage(segments);
   const fold = work.length > 0 && final.length > 0;
@@ -110,12 +129,12 @@ function ClaudeResponse({
       <div className="cv-aibody">
         {fold ? (
           <ClaudeWorkBlock count={countWorkSteps(work)}>
-            {renderSegments(work, results)}
+            {renderSegments(work, results, tosseCards)}
           </ClaudeWorkBlock>
         ) : (
-          renderSegments(work, results)
+          renderSegments(work, results, tosseCards)
         )}
-        {renderSegments(final, results)}
+        {renderSegments(final, results, tosseCards)}
       </div>
     </div>
   );
