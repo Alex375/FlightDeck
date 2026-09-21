@@ -162,6 +162,20 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Render the TOSSE (CRM) MCP calls as CRM actions instead of anonymous MCP steps: a write
+   *  (task filed, status moved, context updated) becomes its own card carrying the CRM's rose,
+   *  the exact tool, the status it moved from → to and the assignee mark, and a lookup keeps
+   *  its step row but reads "Read tasks · 12 tasks" with the rose instead of "claude ai TOSSE :
+   *  get_tasks" with a plug. ON by default. Off → every TOSSE call renders exactly as it did
+   *  before the feature, grouped in its run.
+   *
+   *  ⚠️ Only ever MATTERS while signed in to TOSSE: the effective value ANDs this with the CRM
+   *  session ({@link useTosseToolCards}), because the toggle lives in Settings → TOSSE, a tab
+   *  that does not exist while signed out — leaving the rendering on there would hand someone
+   *  cards with no switch to turn them off. Signed out, TOSSE calls render as plain MCP steps.
+   *  Read by the conversation thread and the off-thread transcript. */
+  tosseToolCards: boolean;
+
   /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
    *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
    *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
@@ -347,6 +361,7 @@ const DEFAULTS: DisplayPrefs = {
   conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseToolCards: true,
   artifactsInApp: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
@@ -427,6 +442,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
         artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,

@@ -17,6 +17,7 @@ import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
 import { isAgentMessagingTool } from "./agentMessage";
 import { isArtifactPublish } from "./artifacts";
+import { isTosseMcpTool, isTosseWriteTool, tosseReadCount, tosseStepLabel } from "./tosseTool";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
  *  step rows and the static transcript pick the same glyph for a given tool. */
@@ -44,8 +45,12 @@ export const TOOL_ICON: Record<string, string> = {
 
 /** Icon token for a step's glyph. MCP tools have variable `mcp__server__tool` names that
  *  can't be table-keyed, so they all resolve to one plug glyph; everything else uses
- *  TOOL_ICON, falling back to a cog for unknown tools. */
-export function stepIcon(name: string): string {
+ *  TOOL_ICON, falling back to a cog for unknown tools.
+ *
+ *  `tosse` — the dedicated CRM rendering, following the user's pref — swaps that anonymous
+ *  plug for the CRM's own rose on a TOSSE call. Off, the row is exactly what it always was. */
+export function stepIcon(name: string, tosse = true): string {
+  if (tosse && isTosseMcpTool(name)) return "tosse";
   if (parseMcpToolName(name)) return "plug";
   return TOOL_ICON[name] ?? "cog";
 }
@@ -103,6 +108,13 @@ export type Segment =
   // anonymous MCP step. Unlike a plan or an artifact it is ordinary work: under clean output it
   // folds with the rest of the round.
   | { kind: "message"; key: string; step: ToolStep }
+  // A WRITE to the TOSSE CRM (a task filed, a status moved, a context updated) is its own
+  // action card instead of an anonymous MCP step, so what the agent changed in shared data is
+  // readable at a glance. Like a message it is ordinary work: under clean output it folds with
+  // the rest of the round — a `/pickup` or a `/done` fires a burst of these, and holding them
+  // all in clear would empty the fold of its purpose. TOSSE READS are NOT this: they stay
+  // steps inside their run (see isTosseWriteTool).
+  | { kind: "tosse"; key: string; step: ToolStep }
   // `AskUserQuestion` — an interactive question to the user — is a DECISION artifact exactly
   // like a plan: it renders as its OWN inline card (question + chosen answer once settled)
   // instead of an anonymous "Question" step row buried in a collapsed run, and it is peeled
@@ -145,11 +157,16 @@ export function isHiddenInline(name: string, input: JsonValue): boolean {
  * `backgroundToolUseIds` are extra tool_use ids to hide as background even when their
  * `input` doesn't say so — a detached sub-agent recovered from its launch ack (see
  * `bgAgentIds` in the store). Ignored under `includeBackground` (the disk view shows them).
+ *
+ * `tosseCards` follows the user's "TOSSE action cards" preference: on (the default), a write
+ * to the CRM breaks the run and becomes its own card; off, it stays an ordinary MCP step
+ * inside its run — the exact behaviour that predates the feature.
  */
 export function groupBlocks(
   blocks: ReadonlyArray<GroupInput>,
   includeBackground = false,
   backgroundToolUseIds?: ReadonlySet<string>,
+  tosseCards = true,
 ): Segment[] {
   const out: Segment[] = [];
   let run: ToolStep[] | null = null;
@@ -216,6 +233,14 @@ export function groupBlocks(
       if (isAgentMessagingTool(b.name)) {
         run = null;
         out.push({ kind: "message", key: `msg-${i}`, step: { id: b.id, name: b.name, input: b.input } });
+        return;
+      }
+      // A TOSSE write is its own action card — it breaks the run so a task filed or a status
+      // moved reads as the change it is, not as one more anonymous MCP step. Reads fall
+      // through on purpose: they are intermediate work and stay grouped in the run.
+      if (tosseCards && isTosseWriteTool(b.name)) {
+        run = null;
+        out.push({ kind: "tosse", key: `ts-${i}`, step: { id: b.id, name: b.name, input: b.input } });
         return;
       }
       // AskUserQuestion is a decision artifact (question + answer) — its own inline card,
@@ -316,6 +341,8 @@ export type WorkAtom =
   | { kind: "artifact"; key: string; step: ToolStep }
   // A "message sent" card: folds with the surrounding work like any tool.
   | { kind: "message"; key: string; step: ToolStep }
+  // A TOSSE action card: folds with the surrounding work like any tool (see the Segment note).
+  | { kind: "tosse"; key: string; step: ToolStep }
   // A question card: a non-step atom (like plan) — folds only when buried mid-work, never
   // counts as a step nor holds the live window open.
   | { kind: "question"; key: string; step: ToolStep }
@@ -376,6 +403,8 @@ export function flattenWork(segs: Segment[]): WorkAtom[] {
       out.push({ kind: "artifact", key: seg.key, step: seg.step });
     } else if (seg.kind === "message") {
       out.push({ kind: "message", key: seg.key, step: seg.step });
+    } else if (seg.kind === "tosse") {
+      out.push({ kind: "tosse", key: seg.key, step: seg.step });
     } else if (seg.kind === "question") {
       out.push({ kind: "question", key: seg.key, step: seg.step });
     } else if (seg.kind === "thinking") {
@@ -420,6 +449,7 @@ export function atomsToSegments(atoms: WorkAtom[], keyPrefix: string): Segment[]
     else if (a.kind === "plan") out.push({ kind: "plan", key: a.key, step: a.step });
     else if (a.kind === "artifact") out.push({ kind: "artifact", key: a.key, step: a.step });
     else if (a.kind === "message") out.push({ kind: "message", key: a.key, step: a.step });
+    else if (a.kind === "tosse") out.push({ kind: "tosse", key: a.key, step: a.step });
     else if (a.kind === "question") out.push({ kind: "question", key: a.key, step: a.step });
     else if (a.kind === "thinking") out.push({ kind: "thinking", key: a.key, text: a.text });
     else if (a.kind === "marker")
@@ -472,7 +502,11 @@ export function liveVisibleStart(
   for (let i = 0; i < atoms.length; i++) {
     const a = atoms[i];
     if (
-      (a.kind === "step" || a.kind === "agent" || a.kind === "workflow" || a.kind === "message") &&
+      (a.kind === "step" ||
+        a.kind === "agent" ||
+        a.kind === "workflow" ||
+        a.kind === "message" ||
+        a.kind === "tosse") &&
       isRunning(a.step.id)
     ) {
       runningStart = i;
@@ -520,14 +554,15 @@ export function atomStillRunning(opts: {
 }
 
 /** How many "steps" a stretch of work represents, for the "Claude's work — N
- *  steps" header: every tool step across its runs PLUS each sub-agent and each message sent
- *  (in clean-output they fold into the block too, so they count as work). Prose and thinking
- *  are not steps and are not counted. */
+ *  steps" header: every tool step across its runs PLUS each sub-agent, each message sent and
+ *  each TOSSE action (in clean-output they fold into the block too, so they count as work).
+ *  Prose and thinking are not steps and are not counted. */
 export function countWorkSteps(segments: Segment[]): number {
   let n = 0;
   for (const s of segments) {
     if (s.kind === "run") n += s.steps.length;
-    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message") n += 1;
+    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message" || s.kind === "tosse")
+      n += 1;
   }
   return n;
 }
@@ -547,7 +582,8 @@ export function workStepIds(segments: Segment[]): string[] {
   const ids: string[] = [];
   for (const s of segments) {
     if (s.kind === "run") for (const st of s.steps) ids.push(st.id);
-    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message") ids.push(s.step.id);
+    else if (s.kind === "agent" || s.kind === "workflow" || s.kind === "message" || s.kind === "tosse")
+      ids.push(s.step.id);
   }
   return ids;
 }
@@ -592,8 +628,8 @@ export function toolVerb(name: string): string {
  * "claude ai TOSSE · 3 tools · playwright · 1 tool" — since their raw `mcp__…` names
  * are too verbose to list. Capped so it stays one line.
  */
-export function runHeader(steps: ToolStep[]): string {
-  if (steps.length === 1) return stepLabel(steps[0].name, steps[0].input);
+export function runHeader(steps: ToolStep[], tosse = true): string {
+  if (steps.length === 1) return stepLabel(steps[0].name, steps[0].input, tosse);
   // A group is either a native action verb or one MCP server; keyed so the two never
   // collide. `display` holds the human label, `mcp` flags the count-style rendering.
   const order: string[] = [];
@@ -605,7 +641,11 @@ export function runHeader(steps: ToolStep[]): string {
     const key = m ? `mcp:${m.server}` : `verb:${toolVerb(s.name)}`;
     if (!counts.has(key)) {
       order.push(key);
-      display.set(key, m ? prettyMcpServer(m.server) : toolVerb(s.name));
+      // The CRM reaches us under several server segments (`claude_ai_TOSSE`, a plugin
+      // variant, plain `tosse`): under the dedicated rendering they all read "TOSSE", so a
+      // run of lookups doesn't name the transport instead of the product.
+      const server = m ? (tosse && isTosseMcpTool(s.name) ? "TOSSE" : prettyMcpServer(m.server)) : null;
+      display.set(key, server ?? toolVerb(s.name));
       if (m) mcpKeys.add(key);
     }
     counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -627,10 +667,16 @@ export function runHeader(steps: ToolStep[]): string {
  * the same English name+arg phrasing as the live activity indicator ("Edit foo.ts"),
  * so the in-flight line and the settled step read identically.
  */
-export function stepLabel(name: string, input: JsonValue): string {
+export function stepLabel(name: string, input: JsonValue, tosse = true): string {
   if (name === "Bash" || name === "Agent" || name === "Task") {
     const desc = field(input, "description");
     if (desc && desc.trim()) return desc.trim();
+  }
+  // A CRM lookup reads as what it looked up ("Read tasks") rather than as its wire name
+  // ("claude ai TOSSE : get_tasks"), when the dedicated rendering is on.
+  if (tosse) {
+    const t = tosseStepLabel(name);
+    if (t) return t;
   }
   return toolActivityLabel(name, input);
 }
@@ -667,7 +713,15 @@ export function stepSummary(
   name: string,
   input: JsonValue,
   resultText: string | null,
+  tosse = true,
 ): StepSummary {
+  // A CRM lookup says how much it brought back ("12 tasks") — the compact answer to "what did
+  // that read return?" without opening the row. `resultText` is already the flattened text, and
+  // `tosseReadCount` re-flattens a string to itself, so it can be handed straight through.
+  if (tosse && resultText) {
+    const count = tosseReadCount(name, resultText);
+    if (count) return { kind: "text", text: count };
+  }
   switch (name) {
     case "Edit": {
       const c = diffCounts(

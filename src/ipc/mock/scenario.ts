@@ -819,6 +819,179 @@ export class ScenarioDriver {
    * arrives (the received card), then the agent answers through `send_message` — one send
    * delivered, one refused (the failed card). Exercises both cards and their jump chips.
    */
+  /**
+   * `?demo=tosse` — the TOSSE action cards, in one pass: the LOOKUPS grouped in a run (rose
+   * glyph, "Read tasks · 12 tasks"), then a card per write — a task filed, a status moved, a
+   * context updated — plus the two states that must never pass for a success: a write the CRM
+   * REFUSED, and one still in flight. Mirrors what a real `/pickup` does to the CRM.
+   */
+  startTosse() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+
+    const TASK = {
+      id: "6edf5907-048b-4b61-a6fc-b85bc14253c9",
+      title: "Style the TOSSE MCP calls in the thread",
+      projectId: "ef02be22-fe30-4463-9450-ec3b20746a35",
+      type: "Code",
+      status: "En cours",
+      priority: "Moyenne",
+      assignedTo: "Alexandre",
+      project: { id: "ef02be22-fe30-4463-9450-ec3b20746a35", name: "Tosse Code" },
+    };
+    const json = (v: unknown) => [{ type: "text" as const, text: JSON.stringify(v, null, 2) }];
+    const tosse = (tool: string) => `mcp__claude_ai_TOSSE__${tool}`;
+
+    this.step(240, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "Picking the task up — let me read the board and the context first.\n\n";
+    this.streamText("m1", t1);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          { type: "tool_use", id: "ts_read1", name: tosse("get_tasks"), input: { project_id: "ef02be22" } },
+          { type: "tool_use", id: "ts_read2", name: tosse("get_context_chain"), input: { repository_id: "8c509e62" } },
+          { type: "tool_use", id: "ts_read3", name: tosse("list_subtasks"), input: { parent_task_id: TASK.id } },
+        ],
+      }),
+    );
+    this.step(420, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read1",
+        // The board as it stood BEFORE the move — including the target task in « À faire ».
+        // This sighting is what lets the status card render the arrow: the CRM never sends a
+        // previous status back, so the card reads it out of the thread (see priorTaskStatus).
+        content: json([
+          { id: TASK.id, title: TASK.title, status: "À faire", priority: "Moyenne" },
+          ...Array.from({ length: 11 }, (_, i) => ({ id: `t${i}`, title: `Task ${i}`, status: "Backlog" })),
+        ]),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read2",
+        content: json({ repository: { name: "tosse-code" }, project: { name: "Tosse Code" } }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read3",
+        content: json([]),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t2 = "No blockers. Moving it to **En cours**, filing the follow-up and recording the decision.\n\n";
+    this.streamText("m2", t2, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t2 },
+          {
+            type: "tool_use",
+            id: "ts_status",
+            name: tosse("update_task_status"),
+            input: { task_id: TASK.id, status: "En cours" },
+          },
+          {
+            type: "tool_use",
+            id: "ts_create",
+            name: tosse("create_task"),
+            input: {
+              title: "Write an English README",
+              project_id: "ef02be22",
+              type: "Rédaction",
+              priority: "Basse",
+            },
+          },
+          {
+            type: "tool_use",
+            id: "ts_ctx",
+            name: tosse("update_context"),
+            input: { entity_type: "project", entity_id: "ef02be22", context: "…" },
+          },
+          // Refused by the CRM — must read as a failure, never as a quiet success.
+          {
+            type: "tool_use",
+            id: "ts_fail",
+            name: tosse("archive_task"),
+            input: { task_id: "00000000-0000-0000-0000-000000000000" },
+          },
+          // Never answered: the card stays pending while the turn runs.
+          {
+            type: "tool_use",
+            id: "ts_pending",
+            name: tosse("update_task"),
+            input: { task_id: TASK.id, priority: "Haute", due_date: "2026-10-01" },
+          },
+        ],
+      }),
+    );
+    this.step(420, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_status",
+        content: json(TASK),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_create",
+        content: json({
+          id: "b1d0c0de-1111-2222-3333-444455556666",
+          title: "Write an English README",
+          type: "Rédaction",
+          status: "À faire",
+          priority: "Basse",
+          assignedTo: "Armand",
+          project: { id: "ef02be22", name: "Tosse Code" },
+        }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_ctx",
+        content: json({ ok: true, entity_type: "project", name: "Tosse Code" }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_fail",
+        content: [{ type: "text", text: "Error: no task with id 00000000-0000-0000-0000-000000000000" }],
+        is_error: true,
+        parent_tool_use_id: null,
+      }),
+    );
+  }
+
   startAgentMessage() {
     this.reset();
     this.emit.state({ ...this.busyState });

@@ -1588,6 +1588,7 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
+    else if (demo === "tosse") driver.startTosse();
     else if (demo === "design") driver.startTypedArtifact();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"

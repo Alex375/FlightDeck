@@ -114,6 +114,11 @@ const WF_PATHS: Record<string, string> = {
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
 export function Ico({ name, className }: { name: string; className?: string }) {
+  // `tosse` is not a path in the glyph table: the CRM's rose is a multi-shape brand mark, and
+  // routing it through <Ico> is what lets the shared, table-driven surfaces (a tool step row,
+  // a card tile) ask for it by name like any other icon. Its own class carries the sizing and
+  // the bichrome accent — see `.wf-tosse-mark`.
+  if (name === "tosse") return <TosseCrmMark className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">

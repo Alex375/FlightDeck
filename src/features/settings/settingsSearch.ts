@@ -80,6 +80,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Auto-switch account near usage limit", section: "general", sub: "accounts", group: "Switching", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
   { title: "Switch at", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "threshold trigger percent seuil declenchement pourcentage auto-switch" },
   { title: "Target below", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "ceiling hysteresis target oscillation plafond cible auto-switch" },
+  { title: "TOSSE actions in the conversation", section: "tosse", group: "In the app", keywords: "mcp thread fil carte card task tache statut status contexte context lecture read logo rose crm" },
   { title: "TOSSE mark on repositories", section: "tosse", group: "In the app", keywords: "badge repo crm" },
   { title: "TOSSE tasks view", section: "tosse", group: "In the app", keywords: "tasks board kanban taches" },
   { title: "Stay on the tasks view when you press Start", section: "tosse", group: "In the app", keywords: "pickup start navigation" },
