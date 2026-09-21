@@ -44,8 +44,6 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
-  { title: "Tinted conversation rows", section: "display", sub: "appearance", group: "Appearance", keywords: "sidebar state colour color pill running timer chrono dot status couleur etat pastille ligne conversation display affichage" },
-  { title: "Status inside the composer", section: "display", sub: "appearance", group: "Appearance", keywords: "review bar mark as seen question error banner encadre statut composeur vu display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },

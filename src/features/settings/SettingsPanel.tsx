@@ -601,8 +601,6 @@ function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
-  const sidebarStatePills = useDisplay((s) => s.sidebarStatePills);
-  const composerStatusBand = useDisplay((s) => s.composerStatusBand);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -618,37 +616,6 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
-        />
-        <ToggleRow
-          title="Tinted conversation rows"
-          hint={
-            <>
-              In the sidebar, a conversation's state is <strong>the colour of its row</strong>:
-              green while it runs — with the working dots and the{" "}
-              <strong>time since your last message</strong> under its name — green-violet for
-              background work, amber when it needs you, blue to review, red on an error. Idle
-              and stopped conversations stay plain. Off → the classic status dot in front of
-              the name. <strong>On by default.</strong>
-            </>
-          }
-          checked={sidebarStatePills}
-          onChange={(v) => set({ sidebarStatePills: v })}
-          label="Show each conversation's state as its row colour"
-        />
-        <ToggleRow
-          title="Status inside the composer"
-          hint={
-            <>
-              “Conversation ended”, a question waiting for you, an error, background work: the
-              conversation's status shows as a <strong>band at the top of the composer</strong>,
-              whose border takes the state's colour, with <strong>Mark as seen</strong> (⌘↵)
-              and <strong>Continue</strong> right there. Off → the classic full-width bar
-              above the composer. <strong>On by default.</strong>
-            </>
-          }
-          checked={composerStatusBand}
-          onChange={(v) => set({ composerStatusBand: v })}
-          label="Show the conversation's status inside the composer"
         />
         <ToggleRow
           title="Live workflow on the Flight Deck card"
@@ -1165,8 +1132,8 @@ function TimingPrefs() {
             On a conversation's row in the sidebar, next to the working dots: a{" "}
             <strong>live counter</strong> while the agent works, then the time{" "}
             <strong>frozen</strong> on how long the turn took once it stops on a state
-            (ready to review, a question, an error). Off → the dots alone. Needs{" "}
-            “Tinted conversation rows” (Appearance). <strong>On by default.</strong>
+            (ready to review, a question, an error). Off → the dots alone.{" "}
+            <strong>On by default.</strong>
           </>
         }
         checked={sidebarRowTimer}

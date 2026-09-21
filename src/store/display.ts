@@ -296,22 +296,10 @@ export interface DisplayPrefs {
    *  default. OFF → the swimlanes keep a MANUAL, drag-and-drop order. Read by {@link useFleetLanes}. */
   autoOrderFleetRepos: boolean;
 
-  /** Sidebar conversation rows show their state as a TINTED PILL (green running with a live
-   *  "time since your last message" counter under the name, green→violet background work,
-   *  amber needs you, blue to review, red error; idle/off stay plain) instead of the classic
-   *  leading status dot + attention tint. ON by default. Read by {@link ConductorSidebar}. */
-  sidebarStatePills: boolean;
-
   /** Show the TIME on a sidebar conversation row's second line — ticking while the agent
    *  works, frozen on how long the turn took once it stopped on a state. ON by default.
-   *  Off → the working dots alone. Only applies to {@link sidebarStatePills} rows. */
+   *  Off → the working dots alone. */
   sidebarRowTimer: boolean;
-
-  /** The review / question / error / background status lives INSIDE the composer — a header
-   *  band on the composer card, whose border takes the state colour — instead of the classic
-   *  full-width bar above it. ON by default. Read by {@link ComposerStatusBand} and
-   *  {@link ReviewBar} (exactly one of the two renders). */
-  composerStatusBand: boolean;
 
   /** Whether the sidebar and the Flight Deck SHARE one manual order (drag in one reorders both)
    *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
@@ -370,9 +358,7 @@ const DEFAULTS: DisplayPrefs = {
   autoOrderFleetConvs: true,
   autoOrderFleetRepos: true,
   sharedManualOrder: true,
-  sidebarStatePills: true,
   sidebarRowTimer: true,
-  composerStatusBand: true,
 };
 
 function load(): DisplayPrefs {
@@ -445,9 +431,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
         autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
         sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
-        sidebarStatePills: patch.sidebarStatePills ?? s.sidebarStatePills,
         sidebarRowTimer: patch.sidebarRowTimer ?? s.sidebarRowTimer,
-        composerStatusBand: patch.composerStatusBand ?? s.composerStatusBand,
       };
       save(next);
       return next;

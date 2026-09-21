@@ -1,23 +1,44 @@
 // The conversation's settled status, carried INSIDE the composer card: a header band on
 // top of the card (icon · label · detail · actions), and — via `.cv-composer:has(...)` in
 // the stylesheet — the card's own border tinted in the state colour, with a soft halo
-// (breathing for a question). It replaces the full-width ReviewBar above the composer when
-// the `composerStatusBand` display pref is on (the default); exactly one of the two renders.
+// (breathing for a question). It makes "Mark as seen" obvious (the sidebar ✓ is only a
+// shortcut).
 //
-// Same states and actions as the ReviewBar: review / open question / error are dismissable
-// ("Mark as seen", ⌘↵), an error also offers "Continue", and background work still running
-// after the turn is a calm, non-dismissable band. Blocking states (permission, questionnaire)
-// render nothing — they are answered in the thread.
+// Review / open question / error are dismissable ("Mark as seen", ⌘↵), an error also offers
+// "Continue", and background work still running after the turn is a calm, non-dismissable
+// band. Blocking states (permission, questionnaire) render nothing — they are answered in
+// the thread.
 
+import { useEffect } from "react";
 import { lastTurnResultMeta, useAgentStatus } from "../../agent/useAgentStatus";
 import { backgroundCount, isDismissable, questionExcerpt } from "../../agent/status";
 import { acknowledgeConversation } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useSendMessage } from "../../ipc/useCommands";
-import { useDisplay } from "../../store/display";
 import { fmtDuration } from "../../agent/subagentMeta";
 import { Ico } from "../../ui/kit";
-import { useMarkSeenShortcut } from "./ReviewBar";
+
+/**
+ * ⌘/Ctrl+Enter = "Mark as seen" while a dismissable reminder (review / error / open
+ * question) is on screen, whatever its tone. Captured at the window level so it wins over
+ * the composer's Enter-to-send handler (same capture trick the composer uses for Escape —
+ * WKWebView can swallow keys inside the textarea). Wired only while `active`; otherwise
+ * ⌘Enter is left untouched (falls through to the composer).
+ */
+function useMarkSeenShortcut(session: string, active: boolean) {
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        acknowledgeConversation(session);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [active, session]);
+}
 
 /** The finished turn's wall-clock, next to "Conversation ended". Its own leaf, mounted only
  *  in the review state. Live-only: a conversation restored from disk has no `turn_result`
@@ -39,14 +60,7 @@ function EndedAfter({ session }: { session: string }) {
   );
 }
 
-/** Reads only the pref: when the classic bar is chosen, nothing below is mounted — no
- *  second status derivation, no second ⌘↵ handler. */
 export function ComposerStatusBand({ session }: { session: string }) {
-  const enabled = useDisplay((d) => d.composerStatusBand);
-  return enabled ? <StatusBand session={session} /> : null;
-}
-
-function StatusBand({ session }: { session: string }) {
   const status = useAgentStatus(session);
   const send = useSendMessage(session);
   const dismissable = isDismissable(status);

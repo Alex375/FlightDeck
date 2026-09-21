@@ -5,7 +5,6 @@ import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
 import { ConversationMinimap } from "./MessageMinimap";
 import { FileMentionProvider, type MentionOpener } from "./FileMention";
-import { ReviewBar } from "./ReviewBar";
 import { AuthWarningBar } from "./AuthWarningBar";
 import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
@@ -125,7 +124,6 @@ export function ConversationPane({
       ) : !panelOpen ? (
         <ConversationSummaryLine session={session} />
       ) : null}
-      <ReviewBar session={session} />
       <AuthWarningBar session={session} />
       <ConductorComposer
           ref={composerRef}
