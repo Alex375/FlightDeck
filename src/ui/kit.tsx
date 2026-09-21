@@ -1105,9 +1105,10 @@ export interface ContextUsageData {
   onRefreshUsage?: () => void;
 }
 
-/** The popover BODY (context window + plan usage + "Compact context"),
- *  factored out so the ring and the card's clickable meter show an identical panel. */
-function ContextUsageBody({
+/** The popover BODY (context window + plan usage + "Compact context"), factored out so the
+ *  ring, the card's clickable meter and the conversation panel's context section all show an
+ *  identical panel — three surfaces, one answer about the same conversation. */
+export function ContextUsageBody({
   ctx,
   plan,
   onCompact,

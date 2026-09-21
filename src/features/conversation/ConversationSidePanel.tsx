@@ -10,7 +10,7 @@
 // Only mounted while the `conversationSidePanel` display pref is on — see ConductorConversation.
 
 import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Dot, Ico, TosseCrmMark } from "../../ui/kit";
+import { ContextUsageBody, Dot, Ico, Menu, TosseCrmMark } from "../../ui/kit";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
 import {
   useSetTosseTaskAssignee,
@@ -19,6 +19,7 @@ import {
   useTosseTaskDetail,
 } from "../../ipc/useTosse";
 import { useWorktrees } from "../../ipc/useWorktrees";
+import { useContextData } from "../../store/contextData";
 import { useActiveGoal } from "../../store/goalStore";
 import { useSessionState, useTodos, useTodoSummary } from "../../store/conversationStore";
 import { useConversationRepo, type Conversation } from "../../store/conversationsStore";
@@ -36,6 +37,7 @@ import { TaskStatusActions, TaskStatusChip, TaskSubtaskRows } from "../tosse/Tos
 import { AssigneePicker } from "../tosse/AssigneePicker";
 import { TodoList } from "../todos/TodoList";
 import { useArtifacts, type Artifact } from "./artifacts";
+import { useBackendUsage } from "./backendUsage";
 import { ArtifactFace } from "./artifactIcon";
 import { artifactKind, openArtifactView } from "./artifactOpen";
 import { openConversationAt } from "../../store/threadJump";
@@ -49,10 +51,13 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
   const goal = useActiveGoal(conv.id);
   const todos = useTodos(conv.id);
   const artifacts = useArtifacts(conv.id);
+  // The context section appears once there IS a token count to show — an untouched
+  // conversation has nothing to report, and "— / —" is not a reading.
+  const contextKnown = useContextData(conv.id).ctx.usedKnown;
 
   // Same gate as the header chip it replaces: a linked task only shows while TOSSE exists.
   const showTask = tosseAvailable && !!conv.tosseTaskId && !!conv.tosseTaskTitle;
-  const empty = !showTask && !goal && todos.length === 0 && artifacts.length === 0;
+  const empty = !showTask && !goal && todos.length === 0 && artifacts.length === 0 && !contextKnown;
 
   return (
     <aside className={s.panel} aria-label="Conversation panel">
@@ -81,10 +86,13 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
         ) : null}
         {todos.length > 0 ? <TodoSection convId={conv.id} /> : null}
         {artifacts.length > 0 ? <ArtifactsSection convId={conv.id} artifacts={artifacts} /> : null}
+        {/* Last of the scrolling sections: what the conversation IS (its task, goal, work and
+            output) comes before how much room it has left. */}
+        {contextKnown ? <ContextSection convId={conv.id} /> : null}
         {empty ? (
           <p className={s.empty}>
-            Nothing to track yet. This conversation's TOSSE task, goal, todo list and artifacts
-            show up here as they appear.
+            Nothing to track yet. This conversation's TOSSE task, goal, todo list, artifacts
+            and context use show up here as they appear.
           </p>
         ) : null}
       </div>
@@ -259,6 +267,86 @@ function GoalSection({
       </div>
       <div className={s.goalCond}>{condition}</div>
       {reason ? <div className={s.goalReason}>{reason}</div> : null}
+    </section>
+  );
+}
+
+/**
+ * How full this conversation's context window is — the one figure that decides when a
+ * conversation has to be compacted or forked, and until now readable only from the composer's
+ * 16px ring.
+ *
+ * ⚠️ Two figures that arrive at DIFFERENT times, and the section says which it has: the token
+ * count lands with the first model call of a turn (and survives a reload), the WINDOW only at
+ * the end of a turn. Until both are in there is no honest percentage, so the bar is withheld
+ * and the row reads "— of an unknown window" rather than drawing a fill from a guess.
+ *
+ * Clicking opens the SAME popover as the composer's ring and the Flight Deck card's meter
+ * (plan usage + « Compact context »), through the same backend-aware hook — a third surface
+ * answering the same question must not be a third implementation of it.
+ */
+function ContextSection({ convId }: { convId: string }) {
+  const { ctx, ready, plan } = useContextData(convId);
+  const usage = useBackendUsage(convId, { enabled: ready });
+  const warn = ctx.windowKnown && ctx.pct >= 70;
+  return (
+    <section className={s.section}>
+      <div className={s.label}>
+        <Ico name="gauge" className="sm" />
+        Context
+        <span className={`${s.meta} wf-mono`}>{ctx.windowKnown ? `${ctx.pct}%` : "—"}</span>
+      </div>
+      {/* Portalled: the sections scroll (`.body` is an `overflow-y:auto` box), so an in-flow
+          popover would be clipped by it — the same reason the Flight Deck's meter portals. */}
+      <Menu
+        portal
+        align="right"
+        onOpen={usage.onOpenUsage}
+        trigger={
+          <button
+            className={s.ctxBtn}
+            data-warn={warn || undefined}
+            title={
+              ctx.windowKnown
+                ? `Context ${ctx.used} / ${ctx.max}`
+                : "The context window is only known once a turn ends"
+            }
+          >
+            <span
+              className={s.progress}
+              role="progressbar"
+              aria-label="Context window used"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={ctx.windowKnown ? ctx.pct : undefined}
+            >
+              {ctx.windowKnown ? (
+                <span className={s.ctxFill} style={{ width: `${ctx.pct}%` }} />
+              ) : null}
+            </span>
+            <span className={s.ctxRow}>
+              <span className={`${s.ctxUsed} wf-mono`}>
+                {ctx.used} / {ctx.max}
+              </span>
+              <span className={s.ctxHint}>
+                {ctx.windowKnown ? "tokens" : "window known at turn end"}
+              </span>
+            </span>
+          </button>
+        }
+      >
+        <ContextUsageBody
+          ctx={ctx}
+          plan={usage.isCodex ? null : plan}
+          onCompact={usage.onCompact}
+          usage={usage.usage}
+          usageLoading={usage.usageLoading}
+          usageError={usage.usageError}
+          usageUpdatedAt={usage.usageUpdatedAt}
+          usageBackend={usage.usageBackend}
+          onRefreshUsage={usage.onRefreshUsage}
+        />
+      </Menu>
     </section>
   );
 }

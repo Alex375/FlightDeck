@@ -59,6 +59,29 @@ export const EASE_SLIDE_OUT = EASE_EXIT;
  *  frame of latency to a panel that is already where it belongs). */
 const NEGLIGIBLE_PX = 1;
 
+/** A duration + curve, for a caller that must override what the direction would choose. */
+export interface SlideTiming {
+  durationMs: number;
+  easing: string;
+}
+
+/**
+ * The timing BOTH halves of a HAND-OFF run on — one panel leaving precisely because another
+ * is arriving in its place (opening an artifact puts the conversation panel away; closing it
+ * gives the panel back).
+ *
+ * ⚠️ Why it has to exist. Two panels are two `usePanelSlide`s, and each picks its timing from
+ * its OWN direction: the one leaving takes the 135ms exit curve, the one arriving the 190ms
+ * entrance. Independently that is right; as a swap it is not one movement but two, on
+ * different clocks and opposite curves — so the region between them lurches one way as the
+ * first frees its column and back the other way as the second claims it, then waits out the
+ * 55ms the shorter one has already finished. Given the same clock, the edge travels once.
+ *
+ * The ENTRANCE timing, both ways: the panel being revealed is what the user asked for, and it
+ * is the arrival that should set the pace of the exchange.
+ */
+export const SWAP_TIMING: SlideTiming = { durationMs: SLIDE_IN_MS, easing: EASE_SLIDE_IN };
+
 /** A resolved animation: where the slot starts, where it ends, and how it gets there. */
 export interface SlidePlan {
   /** Slot size at the first frame, in CSS px. */
@@ -78,7 +101,7 @@ export interface SlidePlan {
  * that it would silently drop — leaving the panel stuck at its start size with no
  * `onfinish` to release it.
  */
-export function slidePlan(from: number, to: number): SlidePlan | null {
+export function slidePlan(from: number, to: number, timing?: SlideTiming): SlidePlan | null {
   if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
   const a = Math.max(0, from);
   const b = Math.max(0, to);
@@ -87,8 +110,10 @@ export function slidePlan(from: number, to: number): SlidePlan | null {
   return {
     from: a,
     to: b,
-    durationMs: opening ? SLIDE_IN_MS : SLIDE_OUT_MS,
-    easing: opening ? EASE_SLIDE_IN : EASE_SLIDE_OUT,
+    // `timing` overrides the direction's own choice — see {@link SWAP_TIMING}, the one
+    // reason to: a hand-off is a single movement and must run on a single clock.
+    durationMs: timing?.durationMs ?? (opening ? SLIDE_IN_MS : SLIDE_OUT_MS),
+    easing: timing?.easing ?? (opening ? EASE_SLIDE_IN : EASE_SLIDE_OUT),
   };
 }
 

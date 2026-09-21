@@ -325,6 +325,9 @@
 /* ---- Todo ------------------------------------------------------------------------------ */
 
 .progress {
+  /* `display` stated, not inherited from the element: the todo bar is a <div> but the context
+     bar is a <span> inside a button, and an inline box ignores `height`. */
+  display: block;
   height: 3px;
   border-radius: 2px;
   background: var(--wf-line);
@@ -388,6 +391,67 @@
 }
 .todos :global(.cv-todo-i.in_progress .cv-todo-t) {
   font-weight: 500;
+}
+
+/* ---- Context ---------------------------------------------------------------------------- */
+
+/* The whole reading is the trigger for the shared usage popover (plan + « Compact context »),
+   so there is no separate affordance to hunt for. */
+.ctxBtn {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ctxFill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--wf-accent);
+  transition: width 0.3s ease;
+}
+/* Past 70% the bar stops being information and becomes a warning — the same threshold the
+   composer's ring and the Flight Deck meter turn on. */
+.ctxBtn[data-warn] .ctxFill {
+  background: var(--wf-att);
+}
+.ctxRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.ctxUsed {
+  font-size: 12px;
+  color: var(--wf-tx-hi);
+  font-variant-numeric: tabular-nums;
+}
+.ctxBtn[data-warn] .ctxUsed {
+  color: var(--wf-att);
+}
+.ctxHint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctxBtn:hover .ctxHint {
+  color: var(--wf-tx);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ctxFill {
+    transition: none;
+  }
 }
 
 /* ---- Artifacts ------------------------------------------------------------------------- */
