@@ -835,6 +835,23 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   addConversation: (c) => {
+    // A conversation entering the store with NO session id has no on-disk transcript
+    // yet: everything it will ever show arrives LIVE. Mark it hydrated right away so
+    // the select-time loader never replays a transcript ON TOP of turns already
+    // streamed — `loadConversationHistory` is ADDITIVE (see its own doc), so a late
+    // first open would append the whole past again: the same user prompt a second
+    // time at the tail, and every assistant block duplicated inside its turn.
+    //
+    // ⚠️ Load-bearing for any conversation that runs BEFORE it is ever opened — the
+    // TOSSE tasks view's "Start" is the everyday case (it stays on the tasks page by
+    // default, so the thread is only opened once the agent has worked for a while).
+    // It is the same order-of-operations the app-control `send_message` /
+    // `read_conversation` paths get by pre-hydrating.
+    //
+    // NOT for a conversation that arrives WITH a session id (undo of a delete,
+    // `reactivateDiskConversation`, a Codex fork): those have real history on disk
+    // that the loader must still read.
+    if (!c.sessionId) historyLoaded.add(c.id);
     set((s) => ({ conversations: [...s.conversations, c], activeId: c.id }));
     syncToCore("upsertConversation", () => commands.upsertConversation(convToRecord(c)));
     syncToCore("setActive", () => commands.setActiveConversation(c.id));
@@ -1874,7 +1891,9 @@ export function demoteBypassConversations(): void {
   }
 }
 
-// Conversations whose on-disk transcript has already been replayed this run.
+// Conversations whose on-disk transcript has already been replayed this run — plus
+// those BORN in this run (seeded by `addConversation` when the row has no session id),
+// which never had a transcript to replay in the first place.
 const historyLoaded = new Set<string>();
 
 /**

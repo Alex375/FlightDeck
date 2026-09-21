@@ -616,6 +616,61 @@ describe("conversationsStore — persisted reminder", () => {
     markSeen.mockRestore();
   });
 
+  it("a conversation BORN in this run never replays a transcript over its live turns", async () => {
+    // Regression (TOSSE tasks view → "Start"): the launch creates the conversation and
+    // sends its first message while the view STAYS on the tasks page, so the thread is
+    // only opened later — by then the session has a transcript. `loadConversationHistory`
+    // is additive, so replaying it on top of the turns already streamed appended the same
+    // prompt a SECOND time at the tail ("message, work, message") and doubled every
+    // assistant block. A conversation created here has no cold history by construction:
+    // it must be hydrated from birth, whatever happens to its session id afterwards.
+    const id = createConversationInRepo("/tmp/r1");
+    useConversationsStore.getState().noteSessionId(id, "sess-born");
+    const cs = useConversationStore.getState();
+    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    vi.mocked(commands.loadSessionHistory).mockResolvedValueOnce({
+      status: "ok",
+      data: [{}],
+    } as never);
+
+    await loadConversationHistory(id);
+
+    expect(commands.loadSessionHistory).not.toHaveBeenCalled();
+    expect(applyItem).not.toHaveBeenCalled();
+    applyItem.mockRestore();
+  });
+
+  it("a conversation reactivated FROM DISK still replays its transcript", async () => {
+    // The other side of the guard above: a row that arrives WITH a session id has real
+    // history on disk, and marking it hydrated at insert time would leave it blank.
+    const id = reactivateDiskConversation({
+      session_id: "sess-disk",
+      cwd: "/tmp/r1",
+      repo_root: "/tmp/r1",
+      title: "From disk",
+      excerpt: "hello",
+      backend: "claude",
+    } as unknown as DiskConversation);
+    const cs = useConversationStore.getState();
+    const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
+    const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
+    vi.mocked(commands.loadSessionHistory).mockResolvedValueOnce({
+      status: "ok",
+      data: [{}],
+    } as never);
+
+    await loadConversationHistory(id);
+
+    expect(commands.loadSessionHistory).toHaveBeenCalledWith("sess-disk");
+    expect(applyItem).toHaveBeenCalled();
+    ensureSession.mockRestore();
+    applyItem.mockRestore();
+    applyContextFill.mockRestore();
+    markSeen.mockRestore();
+  });
+
   it("acknowledgeConversation clears the persisted reminder AND marks the live turn seen", () => {
     seed(baseConv({ pendingReminder: "review" }));
     // The helper exists to do BOTH halves; lock in the live one too, so a future
