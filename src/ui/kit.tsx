@@ -74,6 +74,8 @@ const WF_PATHS: Record<string, string> = {
   // An IDE window: explorer column on the left, a panel under the editor — the IDE view
   // and every "Open in IDE" entry point. Distinct from `code` (the conversation's editor).
   ide: "M4 5h14v12H4zM9 5v12M9 12.5h9",
+  sidebarR: "M4 5h14v12H4zM13 5v12",
+  power: "M11 4v7M7.3 6.8a6 6 0 1 0 7.4 0",
   globe: "M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM3 11h16M11 3c2.4 2.2 2.4 13.8 0 16M11 3c-2.4 2.2-2.4 13.8 0 16",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",
@@ -112,6 +114,11 @@ const WF_PATHS: Record<string, string> = {
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
 export function Ico({ name, className }: { name: string; className?: string }) {
+  // `tosse` is not a path in the glyph table: the CRM's rose is a multi-shape brand mark, and
+  // routing it through <Ico> is what lets the shared, table-driven surfaces (a tool step row,
+  // a card tile) ask for it by name like any other icon. Its own class carries the sizing and
+  // the bichrome accent — see `.wf-tosse-mark`.
+  if (name === "tosse") return <TosseCrmMark className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">

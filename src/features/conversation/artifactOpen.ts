@@ -1,14 +1,18 @@
 // Shared "open this artifact" action, used by every artifact surface (the inline card, the
-// composer chip rows, and the prose link card). It routes to the IN-APP viewer when a local
-// file is available to render AND the host has a side region to render it in, and falls back
-// to opening the hosted claude.ai page in the browser otherwise (e.g. a link to an artifact
-// from another conversation, an inert host, or after a reload once the ephemeral temp file is
-// gone and we only have the URL).
+// composer chip rows, and the prose link card). It routes to the IN-APP viewer whenever the host
+// has a side region to render in:
+//  - a PAGE artifact (self-contained HTML/Markdown) with its local temp file → rendered locally;
+//  - otherwise the HOSTED page on claude.ai, shown in-app in a native webview — a TYPED artifact
+//    (Claude Design…, whose page belongs to its type and only exists hosted), a link to an
+//    artifact from another conversation, or a page artifact whose temp file is gone.
+// It falls back to the browser only when the host has no side region (an inert host) or the user
+// turned the in-app hosted view off (`artifactsInApp`).
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAppErrors } from "../../store/appErrors";
+import { useDisplay } from "../../store/display";
 import { useEditorStore, type ArtifactView } from "../editor/editorStore";
-import { ARTIFACT_URL_RE } from "./artifacts";
+import { ARTIFACT_URL_RE, canonicalArtifactUrl } from "./artifacts";
 
 /**
  * {@link ARTIFACT_URL_RE} anchored at the start, compiled ONCE at module load.
@@ -24,8 +28,9 @@ import { ARTIFACT_URL_RE } from "./artifacts";
  * an href, on the other hand, is prose the model (or the user) typed, where scheme/host casing
  * legitimately drifts (`HTTPS://Claude.ai/…` is the SAME resource per RFC 3986). A false negative
  * here silently downgrades a real artifact link to a plain anchor, so recognition is tolerant.
- * The tolerance is safe downstream: a case-drifted URL simply fails the exact `a.url === url`
- * lookup in ArtifactRefCard and degrades to opening the hosted page in the browser.
+ * The tolerance is safe downstream because `routeArtifactOpen` canonicalises before handing a URL
+ * to the in-app host (see {@link canonicalArtifactUrl}): a case-drifted link still opens the right
+ * artifact, and anything that can't be canonicalised goes to the browser rather than erroring.
  *
  * No `g` flag — a shared `/g/` regex carries `lastIndex` between `.test()` calls and would
  * alternate true/false on the same input. Keep it stateless.
@@ -50,10 +55,27 @@ export interface ArtifactOpenMeta {
   /** Local temp file to render in the viewer, or null. */
   filePath: string | null;
   /**
+   * True for a TYPED artifact (Claude Design…): its page is the type's, hosted on claude.ai, and
+   * its local file is DATA (`canvas.json`…). Rendering that file as a page is what showed a broken
+   * screen — so a typed artifact is only ever shown hosted, whatever `filePath` says.
+   */
+  typed?: boolean;
+  /**
+   * True when the artifact was published WITH sibling files. Its page loads them relatively, and
+   * the local preview (a `srcDoc` document with no origin, under our CSP) can serve none of them
+   * — it would render the page missing its stylesheet, its script or its data, silently. Hosted.
+   */
+  multiFile?: boolean;
+  /**
    * True when the host mounts NO side region (the Flight Deck reply modal). Mirrors
    * FileMentionProvider's `inert`, the same gate every other click-to-reveal surface honours.
    */
   inert?: boolean;
+  /**
+   * Whether a HOSTED page may be shown in-app (the `artifactsInApp` display pref). False → the
+   * hosted page opens in the browser, as before the in-app host existed. Defaults to true.
+   */
+  hostedInApp?: boolean;
 }
 
 /** Where a click on an artifact must go. Pure, so the routing rule is testable on its own. */
@@ -63,8 +85,11 @@ export type ArtifactRoute =
   | { kind: "none" };
 
 /**
- * Decide where an artifact opens: the in-app viewer when there is a local file to render AND a
- * side region to render it in, else the hosted page, else nowhere.
+ * Decide where an artifact opens, most in-app first:
+ *  1. the local PAGE (a non-typed artifact's HTML/Markdown temp file) in the viewer;
+ *  2. the HOSTED page in the viewer's native webview (typed artifacts, links without a local
+ *     file) — unless the user turned that off, in which case the browser;
+ *  3. nowhere.
  *
  * ⚠️ The `inert` branch is load-bearing, not defensive. An inert host (the reply modal mounts a
  * bare pane, no MainArea) has no side region, so routing there was a DEAD CLICK — and worse, it
@@ -72,20 +97,23 @@ export type ArtifactRoute =
  * conversation was opened full-screen.
  */
 export function routeArtifactOpen(meta: ArtifactOpenMeta): ArtifactRoute {
-  if (meta.filePath && !meta.inert) {
-    return {
-      kind: "viewer",
-      view: {
-        convId: meta.convId,
-        title: meta.title,
-        favicon: meta.favicon,
-        url: meta.url,
-        filePath: meta.filePath,
-        kind: artifactKind(meta.filePath),
-      },
-    };
+  if (meta.inert) return meta.url ? { kind: "browser", url: meta.url } : { kind: "none" };
+  const base = { convId: meta.convId, title: meta.title, favicon: meta.favicon, url: meta.url };
+  const localPage = meta.typed || meta.multiFile ? null : meta.filePath;
+  if (localPage) {
+    return { kind: "viewer", view: { ...base, filePath: localPage, kind: artifactKind(localPage) } };
   }
-  if (meta.url) return { kind: "browser", url: meta.url };
+  if (meta.url) {
+    // ⚠️ The hosted view takes the CANONICAL URL only. `isArtifactUrl` (which lets a prose link
+    // become an artifact card) is tolerant of casing and a trailing slash, while the Rust host
+    // refuses anything but the exact shape — so a link the front accepted could land on an error
+    // panel for a perfectly good artifact. Canonicalise; if it can't be, the browser takes it,
+    // exactly as it did before the in-app host existed.
+    const canonical = canonicalArtifactUrl(meta.url);
+    return meta.hostedInApp === false || !canonical
+      ? { kind: "browser", url: meta.url }
+      : { kind: "viewer", view: { ...base, url: canonical, filePath: null, kind: "hosted" } };
+  }
   return { kind: "none" };
 }
 
@@ -95,7 +123,10 @@ export function routeArtifactOpen(meta: ArtifactOpenMeta): ArtifactRoute {
  * (a click that does nothing at all reads as a broken app).
  */
 export function openArtifactView(meta: ArtifactOpenMeta): void {
-  const route = routeArtifactOpen(meta);
+  const route = routeArtifactOpen({
+    ...meta,
+    hostedInApp: meta.hostedInApp ?? useDisplay.getState().artifactsInApp,
+  });
   if (route.kind === "viewer") {
     useEditorStore.getState().openArtifact(route.view);
     return;

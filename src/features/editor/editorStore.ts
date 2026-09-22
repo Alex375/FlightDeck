@@ -207,9 +207,12 @@ export interface ArtifactView {
   favicon: string | null;
   /** Hosted claude.ai URL — the durable copy, for "open in browser" and the missing-file fallback. */
   url: string | null;
-  /** Local temp file to render, or null (→ the viewer shows the open-in-browser fallback). */
+  /** Local temp file to render, or null (a `hosted` view never has one). */
   filePath: string | null;
-  kind: "html" | "md";
+  /** How the viewer renders it: the local file as HTML / Markdown, or `hosted` — the claude.ai
+   *  page itself in the viewer's native webview (a TYPED artifact, whose page only exists
+   *  hosted, or an artifact with no local file). */
+  kind: "html" | "md" | "hosted";
 }
 
 interface EditorState {
@@ -245,6 +248,17 @@ interface EditorState {
   treeWidth: number;
   /** The file tree is hidden (focus-on-files mode); the editor still shows. */
   treeCollapsed: boolean;
+  /** The conversation side panel (TOSSE task, goal, todo, artifacts, session) is shown.
+   *  Independent of the side region above: it is its own column at the far right, so it
+   *  never competes with the editor/terminal/Git for the same space. Only read while the
+   *  `conversationSidePanel` display pref is on. */
+  convPanelOpen: boolean;
+  /** The open panel has STEPPED ASIDE because it cannot dock (not enough width beside the
+   *  conversation and the side region). Transient, never persisted: set and cleared by the
+   *  layout as the room comes and goes; an explicit open (toggle, ⌘I, summary line) clears
+   *  it so the panel floats over the edge instead. Read through {@link useConvPanelShown}. */
+  convPanelYielded: boolean;
+  setConvPanelYielded: (yielded: boolean) => void;
 
   // ---- Artifact viewer (in-memory, transient) ----
   /** The artifact open in the side-region viewer, or null. Cleared by every side-region toggle
@@ -292,6 +306,8 @@ interface EditorState {
   setTreeWidth: (w: number) => void;
   setTreeCollapsed: (collapsed: boolean) => void;
   toggleTree: () => void;
+  toggleConvPanel: () => void;
+  setConvPanelOpen: (open: boolean) => void;
 
   // ---- Tree ----
   /** Initialise a conversation's tree at `root`, resetting it if the root moved. */
@@ -406,6 +422,8 @@ interface LayoutPrefs {
   treeWidth: number;
   /** The file tree is collapsed (focus-on-files mode) — the editor still shows. */
   treeCollapsed: boolean;
+  /** The conversation side panel is shown. */
+  convPanelOpen: boolean;
 }
 
 const DEFAULT_LAYOUT: LayoutPrefs = {
@@ -422,6 +440,9 @@ const DEFAULT_LAYOUT: LayoutPrefs = {
   gitHistFraction: 0.3,
   treeWidth: 220,
   treeCollapsed: false,
+  // Open by default: it is where the conversation's state now lives (the header only
+  // carries actions), so a first launch must show it rather than hide it behind a toggle.
+  convPanelOpen: true,
 };
 
 function loadLayout(): LayoutPrefs {
@@ -452,6 +473,7 @@ function loadLayout(): LayoutPrefs {
         typeof p.gitHistFraction === "number" ? clamp(p.gitHistFraction, 0.18, 0.5) : DEFAULT_LAYOUT.gitHistFraction,
       treeWidth: typeof p.treeWidth === "number" ? clamp(p.treeWidth, 120, 600) : DEFAULT_LAYOUT.treeWidth,
       treeCollapsed: typeof p.treeCollapsed === "boolean" ? p.treeCollapsed : DEFAULT_LAYOUT.treeCollapsed,
+      convPanelOpen: typeof p.convPanelOpen === "boolean" ? p.convPanelOpen : DEFAULT_LAYOUT.convPanelOpen,
     };
   } catch {
     return DEFAULT_LAYOUT;
@@ -474,6 +496,7 @@ function saveLayout(s: EditorState): void {
     gitHistFraction: s.gitHistFraction,
     treeWidth: s.treeWidth,
     treeCollapsed: s.treeCollapsed,
+    convPanelOpen: s.convPanelOpen,
   };
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(prefs));
@@ -892,6 +915,29 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     setTreeWidth: (w) => withLayout({ treeWidth: clamp(w, 120, 600) }),
     setTreeCollapsed: (treeCollapsed) => withLayout({ treeCollapsed }),
     toggleTree: () => withLayout({ treeCollapsed: !get().treeCollapsed }),
+    // Deliberately NOT routed through clearArtifact: the conversation panel is its own column,
+    // so opening or closing it must leave whatever the side region shows untouched.
+    //
+    // The toggle acts on what the user SEES: a panel that stepped aside for lack of room reads
+    // as closed, so pressing the toggle then brings it back (floating) rather than persisting
+    // "closed" for a panel that was already invisible — one press, one visible effect.
+    toggleConvPanel: () => {
+      const { convPanelOpen, convPanelYielded } = get();
+      if (convPanelOpen && !convPanelYielded) {
+        withLayout({ convPanelOpen: false });
+        return;
+      }
+      set({ convPanelYielded: false });
+      withLayout({ convPanelOpen: true });
+    },
+    setConvPanelOpen: (convPanelOpen) => {
+      if (convPanelOpen) set({ convPanelYielded: false });
+      withLayout({ convPanelOpen });
+    },
+    convPanelYielded: false,
+    setConvPanelYielded: (convPanelYielded) => {
+      if (get().convPanelYielded !== convPanelYielded) set({ convPanelYielded });
+    },
 
     ensureConv: (convId, root) => {
       const cur = get().byConv[convId];
@@ -1462,6 +1508,24 @@ export const useEditorStore = create<EditorState>()((set, get) => {
 // ---- Selectors --------------------------------------------------------------
 
 export const useEditorOpen = () => useEditorStore((s) => s.open);
+/** Whether the side region beside conversation `convId` shows anything — the editor, the
+ *  terminal, Git, or (for THIS conversation) an artifact or a TOSSE task. The one rule the
+ *  region opens on, shared by the layout-orientation button (which must be offered whatever
+ *  the region holds) and the conversation side panel's docking test. */
+export const useSideRegionOpen = (convId: string | null) =>
+  useEditorStore(
+    (s) =>
+      s.open ||
+      s.terminalOpen ||
+      s.gitOpen ||
+      (convId !== null &&
+        (s.artifactView?.convId === convId || s.tosseTaskView?.convId === convId)),
+  );
+/** Whether the conversation side panel is ON SCREEN (docked or floating): open, and not
+ *  stepped aside for lack of room. What every surface keyed on "is the panel visible" reads —
+ *  the header toggle's lit state, the summary line that stands in for a hidden panel. */
+export const useConvPanelShown = () =>
+  useEditorStore((s) => s.convPanelOpen && !s.convPanelYielded);
 export const useEditorLayout = () =>
   useEditorStore(
     useShallow((s) => ({

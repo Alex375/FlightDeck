@@ -353,21 +353,21 @@ describe("runHeader", () => {
   it("aggregates MCP tools of one server as a count", () => {
     expect(
       runHeader([
-        mkStep("mcp__claude_ai_TOSSE__create_task"),
-        mkStep("mcp__claude_ai_TOSSE__get_tasks"),
-        mkStep("mcp__claude_ai_TOSSE__update_task"),
+        mkStep("mcp__notion_api__create_page"),
+        mkStep("mcp__notion_api__get_page"),
+        mkStep("mcp__notion_api__update_page"),
       ]),
-    ).toBe("claude ai TOSSE · 3 tools");
+    ).toBe("notion api · 3 tools");
   });
 
   it("keeps separate MCP servers apart, singularising the count", () => {
     expect(
       runHeader([
-        mkStep("mcp__claude_ai_TOSSE__create_task"),
-        mkStep("mcp__claude_ai_TOSSE__get_tasks"),
+        mkStep("mcp__notion_api__create_page"),
+        mkStep("mcp__notion_api__get_page"),
         mkStep("mcp__playwright__browser_click"),
       ]),
-    ).toBe("claude ai TOSSE · 2 tools · playwright · 1 tool");
+    ).toBe("notion api · 2 tools · playwright · 1 tool");
   });
 
   it("mixes native verbs and MCP server groups", () => {
@@ -375,16 +375,16 @@ describe("runHeader", () => {
       runHeader([
         mkStep("Read"),
         mkStep("Read"),
-        mkStep("mcp__claude_ai_TOSSE__create_task"),
-        mkStep("mcp__claude_ai_TOSSE__get_tasks"),
-        mkStep("mcp__claude_ai_TOSSE__update_task"),
+        mkStep("mcp__notion_api__create_page"),
+        mkStep("mcp__notion_api__get_page"),
+        mkStep("mcp__notion_api__update_page"),
       ]),
-    ).toBe("Read ×2 · claude ai TOSSE · 3 tools");
+    ).toBe("Read ×2 · notion api · 3 tools");
   });
 
   it("uses the full `<server> : <tool>` label for a single MCP step", () => {
-    expect(runHeader([mkStep("mcp__claude_ai_TOSSE__create_task")])).toBe(
-      "claude ai TOSSE : create_task",
+    expect(runHeader([mkStep("mcp__notion_api__create_page")])).toBe(
+      "notion api : create_page",
     );
   });
 });
@@ -393,7 +393,7 @@ describe("stepIcon", () => {
   it("maps known tools, MCP tools (plug) and unknowns (cog)", () => {
     expect(stepIcon("Read")).toBe("file");
     expect(stepIcon("Skill")).toBe("wand");
-    expect(stepIcon("mcp__claude_ai_TOSSE__create_task")).toBe("plug");
+    expect(stepIcon("mcp__notion_api__create_page")).toBe("plug");
     expect(stepIcon("Frobnicate")).toBe("cog");
   });
 });
@@ -715,5 +715,67 @@ describe("question segments", () => {
     expect(back.map((s) => s.kind)).toEqual(["run", "question", "run"]);
     expect(countWorkSteps(segs)).toBe(2); // the two Bash steps only
     expect(workStepIds(segs)).toEqual(["a", "b"]); // the question id is not "work"
+  });
+});
+
+describe("TOSSE CRM calls", () => {
+  const write = (id: string, tool_: string, input: unknown = {}) =>
+    tool(id, `mcp__claude_ai_TOSSE__${tool_}`, input);
+
+  it("gives a write its own card and leaves a read in the run", () => {
+    const segs = groupBlocks([
+      write("r", "get_tasks"),
+      write("w", "create_task", { title: "T" }),
+      write("r2", "list_subtasks"),
+    ]);
+    expect(segs.map((s) => s.kind)).toEqual(["run", "tosse", "run"]);
+  });
+
+  it("renders every TOSSE call as a plain step when the preference is off", () => {
+    const blocks = [write("r", "get_tasks"), write("w", "create_task", { title: "T" })];
+    // The pref's whole promise: the thread goes back to exactly what it was.
+    const segs = groupBlocks(blocks, false, undefined, false);
+    expect(segs.map((s) => s.kind)).toEqual(["run"]);
+    if (segs[0].kind === "run") expect(segs[0].steps.map((s) => s.id)).toEqual(["r", "w"]);
+  });
+
+  it("folds a TOSSE write with the work instead of holding it in clear", () => {
+    // Deliberate, and the opposite of an artifact/plan: a `/pickup` or `/done` fires a burst
+    // of CRM writes, and keeping them all in clear would empty clean output of its purpose.
+    const segs = groupBlocks([write("w", "update_task_status", { status: "Review" }), text("done")]);
+    const { work, final } = splitFinalMessage(segs);
+    expect(work.map((s) => s.kind)).toEqual(["tosse"]);
+    expect(final.map((s) => s.kind)).toEqual(["text"]);
+  });
+
+  it("survives the atoms round-trip and counts as work", () => {
+    const segs = groupBlocks([tool("a", "Bash"), write("w", "create_task"), tool("b", "Bash")]);
+    const atoms = flattenWork(segs);
+    expect(atoms.map((a) => a.kind)).toEqual(["step", "tosse", "step"]);
+    expect(atomsToSegments(atoms, "k").map((s) => s.kind)).toEqual(["run", "tosse", "run"]);
+    // Unlike a question, a CRM write IS work: it counts in the fold's header and its result is
+    // watched, so the fold can't close over a write still in flight.
+    expect(countWorkSteps(segs)).toBe(3);
+    expect(workStepIds(segs)).toEqual(["a", "w", "b"]);
+  });
+
+  it("dresses a read row with the CRM's own mark, wording and count", () => {
+    const name = "mcp__claude_ai_TOSSE__get_tasks";
+    expect(stepIcon(name)).toBe("tosse");
+    expect(stepLabel(name, {})).toBe("Read tasks");
+    expect(stepSummary(name, {}, "[{},{}]")).toEqual({ kind: "text", text: "2 tasks" });
+    // …and hands every one of them back when the preference is off.
+    expect(stepIcon(name, false)).toBe("plug");
+    expect(stepLabel(name, {}, false)).toBe("claude ai TOSSE : get_tasks");
+    expect(stepSummary(name, {}, "[{},{}]", false)).toBeNull();
+  });
+
+  it("names the product, not the transport, in a run header", () => {
+    const steps = [
+      mkStep("mcp__claude_ai_TOSSE__get_tasks"),
+      mkStep("mcp__claude_ai_TOSSE__get_context"),
+    ];
+    expect(runHeader(steps)).toBe("TOSSE · 2 tools");
+    expect(runHeader(steps, false)).toBe("claude ai TOSSE · 2 tools");
   });
 });

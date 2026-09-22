@@ -24,7 +24,8 @@ import { TosseView } from "./features/tosse/TosseView";
 import { TosseLiveHost } from "./features/tosse/TosseLiveHost";
 import { TosseTaskChip } from "./features/tosse/TosseTaskChip";
 import { LinkedTaskSync } from "./features/tosse/LinkedTaskSync";
-import { useTosseConnection } from "./ipc/useTosse";
+import { useTosseAvailable } from "./ipc/useTosse";
+import { ConversationPanelToggle } from "./features/conversation/ConversationPanelToggle";
 import { HistoryPanel } from "./features/history/HistoryPanel";
 import { useHistoryUi } from "./features/history/historyUiStore";
 import { IdeView } from "./features/ide/IdeView";
@@ -101,9 +102,10 @@ export default function App() {
   // shell, which is the whole point: the app is fully usable without TOSSE. Passing the
   // preference as `enabled` means switching the feature off costs nothing either — the
   // status query never runs.
-  const tosseTabEnabled = useDisplay((s) => s.tosseTasksView);
-  const { data: tosseConnection } = useTosseConnection(tosseTabEnabled);
-  const tosseAvailable = tosseTabEnabled && tosseConnection?.connected === true;
+  const tosseAvailable = useTosseAvailable();
+  // With the conversation side panel on, the header carries ACTIONS only: the task chip,
+  // the worktree indicator and the stream control move into the panel.
+  const sidePanel = useDisplay((s) => s.conversationSidePanel);
 
   // The IDE tab is conditional too, on its display preference alone (Settings → General →
   // Display). Off → no tab, no "Open in IDE" entry points, and the view is never mounted.
@@ -331,9 +333,11 @@ export default function App() {
           <CaffeinateToggle />
           {view === "conversation" && activeRepo ? (
             <>
+              {/* App-wide toggles | this conversation's actions. */}
+              {active ? <span className="wf-tb-sep" aria-hidden="true" /> : null}
               {/* Which TOSSE task this conversation carries. Only for a conversation
                   started from the tasks view; a click goes back to it. */}
-              {active && tosseAvailable ? (
+              {active && tosseAvailable && !sidePanel ? (
                 <TosseTaskChip
                   conv={active}
                   // Reads in the side panel rather than switching views: you are working IN
@@ -346,9 +350,11 @@ export default function App() {
                   }
                 />
               ) : null}
-              {active ? <WorktreeIndicator conv={active} repoPath={activeRepo.path} /> : null}
-              {active ? <StreamControl key={active.id} conv={active} /> : null}
-              {active ? <EditorToggle /> : null}
+              {active && !sidePanel ? (
+                <WorktreeIndicator conv={active} repoPath={activeRepo.path} />
+              ) : null}
+              {active && !sidePanel ? <StreamControl key={active.id} conv={active} /> : null}
+              {active ? <EditorToggle convId={active.id} /> : null}
               {active ? <TerminalToggle /> : null}
               {active ? <GitToggle /> : null}
               {/* Continue this conversation — and the files open beside it — in the IDE view. */}
@@ -359,6 +365,12 @@ export default function App() {
                   cwd={active.cwd}
                   backend={active.kind}
                 />
+              ) : null}
+              {active && sidePanel ? (
+                <>
+                  <span className="wf-tb-sep" aria-hidden="true" />
+                  <ConversationPanelToggle />
+                </>
               ) : null}
             </>
           ) : null}

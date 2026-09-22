@@ -86,6 +86,13 @@ export interface DisplayPrefs {
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
 
+  /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
+   *  worktree) into a side panel at the far right, leaving the header with actions only. ON
+   *  by default. Off → the previous layout: those chips back in the header and the composer,
+   *  the todo list pinned above the composer. Read by {@link ConversationSidePanel} and every
+   *  surface it replaces. */
+  conversationSidePanel: boolean;
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -154,6 +161,28 @@ export interface DisplayPrefs {
    *  stay clickable everywhere (conversation, Flight Deck…) whatever this pref says. Read by
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
+
+  /** Render the TOSSE (CRM) MCP calls as CRM actions instead of anonymous MCP steps: a write
+   *  (task filed, status moved, context updated) becomes its own card carrying the CRM's rose,
+   *  the exact tool, the status it moved from → to and the assignee mark, and a lookup keeps
+   *  its step row but reads "Read tasks · 12 tasks" with the rose instead of "claude ai TOSSE :
+   *  get_tasks" with a plug. ON by default. Off → every TOSSE call renders exactly as it did
+   *  before the feature, grouped in its run.
+   *
+   *  ⚠️ Only ever MATTERS while signed in to TOSSE: the effective value ANDs this with the CRM
+   *  session ({@link useTosseToolCards}), because the toggle lives in Settings → TOSSE, a tab
+   *  that does not exist while signed out — leaving the rendering on there would hand someone
+   *  cards with no switch to turn them off. Signed out, TOSSE calls render as plain MCP steps.
+   *  Read by the conversation thread and the off-thread transcript. */
+  tosseToolCards: boolean;
+
+  /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
+   *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
+   *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
+   *  any artifact without a local file. Off → those open in the browser, as they did before;
+   *  page artifacts with their local file still preview in-app either way. Read by
+   *  {@link openArtifactView} and the {@link ArtifactViewer}'s missing-file fallback. */
+  artifactsInApp: boolean;
 
   /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
    *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
@@ -281,6 +310,11 @@ export interface DisplayPrefs {
    *  default. OFF → the swimlanes keep a MANUAL, drag-and-drop order. Read by {@link useFleetLanes}. */
   autoOrderFleetRepos: boolean;
 
+  /** Show the TIME on a sidebar conversation row's second line — ticking while the agent
+   *  works, frozen on how long the turn took once it stopped on a state. ON by default.
+   *  Off → the working dots alone. */
+  sidebarRowTimer: boolean;
+
   /** Whether the sidebar and the Flight Deck SHARE one manual order (drag in one reorders both)
    *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
    *  that are in manual mode. Read via {@link slotFor}. */
@@ -301,6 +335,7 @@ const DEFAULTS: DisplayPrefs = {
   agentMessageToasts: true,
   agentCreationToasts: true,
   showLastMessagePreview: true,
+  conversationSidePanel: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -314,6 +349,8 @@ const DEFAULTS: DisplayPrefs = {
   conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseToolCards: true,
+  artifactsInApp: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
   ideView: true,
@@ -336,6 +373,7 @@ const DEFAULTS: DisplayPrefs = {
   autoOrderFleetConvs: true,
   autoOrderFleetRepos: true,
   sharedManualOrder: true,
+  sidebarRowTimer: true,
 };
 
 function load(): DisplayPrefs {
@@ -380,6 +418,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
@@ -389,6 +428,8 @@ export const useDisplay = create<DisplayState>((set) => ({
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
+        artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         ideView: patch.ideView ?? s.ideView,
@@ -406,6 +447,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
         autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
         sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
+        sidebarRowTimer: patch.sidebarRowTimer ?? s.sidebarRowTimer,
       };
       save(next);
       return next;

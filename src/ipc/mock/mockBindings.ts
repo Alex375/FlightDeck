@@ -98,6 +98,8 @@ import type {
   SlashCommand,
   AppControlRequestEvent,
   WakeWordEvent,
+  ArtifactHostEvent,
+  HostBounds,
   TerminalExitEvent,
   TerminalOutputEvent,
   TickEvent,
@@ -220,6 +222,10 @@ const hostKeyFingerprintEvent = new MockEmitter<HostKeyFingerprintEvent>();
 // `submitClaudeLoginCode` below.
 const serverLoginPromptEvent = new MockEmitter<ServerLoginPromptEvent>();
 const serverLoginResultEvent = new MockEmitter<ServerLoginResultEvent>();
+const artifactHostEvent = new MockEmitter<ArtifactHostEvent>();
+/** The page the mock artifact host is "on" — mirrors the real host's `requested`/`page` state so
+ *  reload and the no-op re-show behave as they do in the app. */
+let mockArtifactHostPage: string | null = null;
 
 export const mockEvents = {
   sessionMessageEvent,
@@ -248,6 +254,7 @@ export const mockEvents = {
   hostKeyFingerprintEvent,
   serverLoginPromptEvent,
   serverLoginResultEvent,
+  artifactHostEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
@@ -1417,6 +1424,14 @@ export const mockCommands = {
       blocks: [],
     });
   },
+  // Written INTO the demo task (the briefing's own object), so the refetch that follows the
+  // write shows the new person — a mock that only answered ok would hide a lost write.
+  async tosseSetTaskAssignee(taskId: string, assignedTo: string): Promise<Result<null, string>> {
+    const found = demoAllTasks().find((row) => row.task.id === taskId);
+    if (!found) return err(`no task with id ${taskId}`);
+    found.task.assignedTo = assignedTo;
+    return ok(null);
+  },
   async tosseSetTaskStatus(taskId: string, status: string): Promise<Result<null, string>> {
     // One id always refuses, so the demo can show what a rejected write looks like.
     if (taskId === "t-blocked") return err("Task is blocked by « Lot 1 » and cannot be started");
@@ -1573,6 +1588,8 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
+    else if (demo === "tosse") driver.startTosse();
+    else if (demo === "design") driver.startTypedArtifact();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).
@@ -2490,6 +2507,48 @@ export const mockCommands = {
     mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockRemote.phone_token}`;
     mockRemote.connected = mockRemote.enabled;
     return ok({ ...mockRemote });
+  },
+
+  // The in-app artifact host is a NATIVE webview — there is none in the browser mock, so these
+  // only replay the page-load events the real host emits (the viewer's status line reacts to
+  // them). A URL containing `__signin__` lands on a fake sign-in page, `__fail__` refuses.
+  async artifactHostShow(url: string, _bounds: HostBounds, _zoom: number): Promise<Result<null, string>> {
+    if (url.includes("__fail__")) return { status: "error", error: "mock artifact host failed" };
+    const page = url.includes("__signin__") ? "https://claude.ai/login?returnTo=%2Fartifact" : url;
+    if (page !== mockArtifactHostPage) {
+      mockArtifactHostPage = page;
+      setTimeout(() => {
+        artifactHostEvent.emit({ kind: "started", url: page });
+        artifactHostEvent.emit({ kind: "finished", url: page });
+      }, 50);
+    }
+    return ok(null);
+  },
+
+  async artifactHostSetBounds(_bounds: HostBounds): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
+  async artifactHostHide(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
+  async artifactHostReload(): Promise<Result<null, string>> {
+    // Like the real one: a reload NAVIGATES, so it replays the page-load events the viewer's
+    // status waits on. Without them the demo's Reload button parked on "Loading…" forever —
+    // behaviour production doesn't have. Nothing loaded → the same error Rust returns.
+    const page = mockArtifactHostPage;
+    if (!page) return { status: "error", error: "no artifact is loaded in the view" };
+    setTimeout(() => {
+      artifactHostEvent.emit({ kind: "started", url: page });
+      artifactHostEvent.emit({ kind: "finished", url: page });
+    }, 50);
+    return ok(null);
+  },
+
+  async artifactHostClose(): Promise<Result<null, string>> {
+    mockArtifactHostPage = null;
+    return ok(null);
   },
 
   async setAwake(_awake: boolean): Promise<Result<null, string>> {

@@ -25,6 +25,7 @@ import { useCollapseAnim } from "../../ui/useCollapseAnim";
 import { DiffView } from "./DiffView";
 import { applyPatchChanges, parseUnifiedDiff } from "./unifiedDiff";
 import { MentionPathChip } from "./FileMention";
+import { useTosseToolCards } from "./TosseToolCard";
 import { QuestionnaireCard } from "./QuestionnaireAsk";
 import { resultContentText } from "./resultText";
 import { StreamMarkdown } from "./StreamMarkdown";
@@ -270,13 +271,21 @@ export function LiveToolStep({
   const result = useToolResult(session, step.id);
   const state = useSessionState(session);
   const showToolTime = useDisplay((s) => s.showToolTime);
+  // A TOSSE lookup wears the CRM's rose and reads "Read tasks · 12 tasks"; off, it is the
+  // anonymous plug + `claude ai TOSSE : get_tasks` it always was.
+  const tosseCards = useTosseToolCards();
   const frozen = useToolDuration(session, step.id);
   const joined: StepResult | undefined = result
     ? { content: result.content, isError: result.isError }
     : undefined;
   const running = active && !result && (state?.busy ?? false);
   const isError = result?.isError ?? false;
-  const summary = stepSummary(step.name, step.input, joined ? resultContentText(joined.content) : null);
+  const summary = stepSummary(
+    step.name,
+    step.input,
+    joined ? resultContentText(joined.content) : null,
+    tosseCards,
+  );
   // Timing chip: live counter while running, frozen value once the result lands. Gated on
   // the pref; nothing for a resultless past step (no result, not running → unknown).
   const time = !showToolTime ? null : running ? (
@@ -286,8 +295,8 @@ export function LiveToolStep({
   ) : null;
   return (
     <ToolStepRow
-      icon={stepIcon(step.name)}
-      label={stepLabel(step.name, step.input)}
+      icon={stepIcon(step.name, tosseCards)}
+      label={stepLabel(step.name, step.input, tosseCards)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}
@@ -303,11 +312,17 @@ export function LiveToolStep({
 /** A step in a settled transcript (disk): result handed in, never running. */
 export function StaticToolStep({ step, result }: { step: ToolStep; result: StepResult | undefined }) {
   const isError = result?.isError ?? false;
-  const summary = stepSummary(step.name, step.input, result ? resultContentText(result.content) : null);
+  const tosseCards = useTosseToolCards();
+  const summary = stepSummary(
+    step.name,
+    step.input,
+    result ? resultContentText(result.content) : null,
+    tosseCards,
+  );
   return (
     <ToolStepRow
-      icon={stepIcon(step.name)}
-      label={stepLabel(step.name, step.input)}
+      icon={stepIcon(step.name, tosseCards)}
+      label={stepLabel(step.name, step.input, tosseCards)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}

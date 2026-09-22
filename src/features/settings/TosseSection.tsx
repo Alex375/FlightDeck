@@ -58,9 +58,28 @@ function TosseDisplayPrefs() {
   const tosseStartStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const tosseTaskDeleteWarning = useDisplay((d) => d.tosseTaskDeleteWarning);
   const tosseClientFavicons = useDisplay((d) => d.tosseClientFavicons);
+  const tosseToolCards = useDisplay((d) => d.tosseToolCards);
   const set = useDisplay((d) => d.set);
   return (
     <SettingsGroup title="In the app" icon="list">
+      <ToggleRow
+        title="TOSSE actions in the conversation"
+        hint={
+          <>
+            Renders the agent&apos;s calls to the CRM as what they did, instead of anonymous MCP
+            steps. A <strong>write</strong> becomes its own card — the task&apos;s title, the
+            exact tool, the status it moved <strong>from → to</strong>, and the assignee — and
+            clicking it opens the task in the conversation&apos;s side panel. A{" "}
+            <strong>lookup</strong> keeps its step row but reads{" "}
+            <strong>&quot;Read tasks · 12 tasks&quot;</strong> with the TOSSE mark.{" "}
+            <strong>On by default.</strong> Off → they render as plain MCP steps, grouped in
+            their run. Nothing is shown either way while you are not connected to TOSSE.
+          </>
+        }
+        checked={tosseToolCards}
+        onChange={(v) => set({ tosseToolCards: v })}
+        label="Show TOSSE actions as cards"
+      />
       <ToggleRow
         title="TOSSE mark on repositories"
         hint={

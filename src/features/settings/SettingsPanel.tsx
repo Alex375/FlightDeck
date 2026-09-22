@@ -39,6 +39,7 @@ import { ComposerSection } from "./ComposerSection";
 import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
+import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -762,10 +763,12 @@ function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
+  const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
+  const artifactsInApp = useDisplay((s) => s.artifactsInApp);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -811,6 +814,22 @@ function ThreadPrefs() {
           checked={showLastMessagePreview}
           onChange={(v) => set({ showLastMessagePreview: v })}
           label="Preview of the last sent message"
+        />
+        <ToggleRow
+          title="Conversation side panel"
+          hint={
+            <>
+              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
+              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
+              so the header only holds actions. Open or close it with its header button or{" "}
+              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              above the composer. Off → the previous layout: those chips in the header and the
+              composer, the todo list above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={conversationSidePanel}
+          onChange={(v) => set({ conversationSidePanel: v })}
+          label="Show the conversation side panel"
         />
         <ToggleRow
           title="Message minimap"
@@ -872,6 +891,22 @@ function ThreadPrefs() {
           checked={clickableFileMentions}
           onChange={(v) => set({ clickableFileMentions: v })}
           label="Make the filename on Read/Write rows clickable"
+        />
+        <ToggleRow
+          title="Show hosted artifacts in Flight Deck"
+          hint={
+            <>
+              Opens an artifact&apos;s <strong>claude.ai page</strong> in the side panel instead of
+              the browser — the only way to see a <strong>Claude Design</strong> (or any other
+              typed) artifact in the app, and the fallback when an artifact&apos;s local file is
+              gone. The first time, sign in to claude.ai inside the panel.{" "}
+              <strong>On by default.</strong> Off → those open in the browser; HTML/Markdown
+              artifacts with a local file still preview in the app.
+            </>
+          }
+          checked={artifactsInApp}
+          onChange={(v) => set({ artifactsInApp: v })}
+          label="Show claude.ai-hosted artifacts in the side panel"
         />
       </SettingsGroup>
 
@@ -1086,9 +1121,25 @@ function TimingPrefs() {
   const showModelTime = useDisplay((s) => s.showModelTime);
   const showThinkingTime = useDisplay((s) => s.showThinkingTime);
   const showToolTime = useDisplay((s) => s.showToolTime);
+  const sidebarRowTimer = useDisplay((s) => s.sidebarRowTimer);
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Durations & timing" icon="clock">
+      <ToggleRow
+        title="Time on sidebar rows"
+        hint={
+          <>
+            On a conversation's row in the sidebar, next to the working dots: a{" "}
+            <strong>live counter</strong> while the agent works, then the time{" "}
+            <strong>frozen</strong> on how long the turn took once it stops on a state
+            (ready to review, a question, an error). Off → the dots alone.{" "}
+            <strong>On by default.</strong>
+          </>
+        }
+        checked={sidebarRowTimer}
+        onChange={(v) => set({ sidebarRowTimer: v })}
+        label="Show the time on conversation rows"
+      />
       <ToggleRow
         title="Turn duration"
         hint={

@@ -838,3 +838,46 @@ describe("explorer mutations — folder rename rebases open buffers", () => {
     expect(c.tabs).toContain("/repo/renamed/child.txt");
   });
 });
+
+describe("conversation side panel toggle", () => {
+  const shown = () => {
+    const s = useEditorStore.getState();
+    return s.convPanelOpen && !s.convPanelYielded;
+  };
+
+  beforeEach(() => {
+    useEditorStore.setState({ convPanelOpen: true, convPanelYielded: false });
+  });
+
+  it("closes a visible panel and reopens a closed one", () => {
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(false);
+    expect(useEditorStore.getState().convPanelOpen).toBe(false);
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(true);
+  });
+
+  it("brings back a panel that stepped aside instead of persisting it closed", () => {
+    // Not enough room: the layout made the open panel step aside — it is off screen.
+    useEditorStore.getState().setConvPanelYielded(true);
+    expect(shown()).toBe(false);
+    // One press = one visible effect: the panel comes back (floating), still open.
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(true);
+    expect(useEditorStore.getState().convPanelOpen).toBe(true);
+  });
+
+  it("an explicit open also clears a step-aside", () => {
+    useEditorStore.setState({ convPanelOpen: false, convPanelYielded: true });
+    useEditorStore.getState().setConvPanelOpen(true);
+    expect(shown()).toBe(true);
+  });
+
+  it("leaves the side region alone (it is its own column)", () => {
+    useEditorStore.setState({ open: true, terminalOpen: true });
+    useEditorStore.getState().toggleConvPanel();
+    const s = useEditorStore.getState();
+    expect(s.open).toBe(true);
+    expect(s.terminalOpen).toBe(true);
+  });
+});

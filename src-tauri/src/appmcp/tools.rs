@@ -373,7 +373,14 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
-                            "task_id": { "type": "string", "description": "The TOSSE task id (UUID)." },
+                            // ⚠️ The pattern is the same fence the Rust side enforces
+                            // (`tosse::is_canonical_uuid`): the id ends up in the CRM
+                            // request path, so anything but a UUID is refused. Declared
+                            // here so the model is framed at call time rather than
+                            // discovering it through an error.
+                            "task_id": { "type": "string",
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "description": "The TOSSE task id (canonical UUID)." },
                             "title": { "type": "string",
                                 "description": "The task's title — used only when the app cannot read the CRM itself." },
                             "status": { "type": "string",
@@ -544,6 +551,22 @@ mod tests {
         }
         assert!(voice.contains(&"wait_for_events"));
         assert!(!app.contains(&"wait_for_events"));
+    }
+
+    /// `link_tosse_task`'s id reaches the CRM inside a request PATH, so the schema states
+    /// the shape it must have. The pattern is the one the Rust side enforces
+    /// (`tosse::is_canonical_uuid`) and the front mirrors — three copies of one rule, so
+    /// this guards the copy a model reads.
+    #[test]
+    fn the_task_id_schema_asks_for_a_uuid() {
+        let link = for_surface(Surface::App)
+            .into_iter()
+            .find(|t| t.name == "link_tosse_task")
+            .expect("link_tosse_task is an app tool");
+        assert_eq!(
+            link.schema["properties"]["task_id"]["pattern"],
+            json!("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+        );
     }
 
     /// Every schema is a well-formed object schema whose required keys exist in

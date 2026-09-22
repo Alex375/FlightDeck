@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
-import { planTimelineRender, coalesceCleanRounds, type RenderItem } from "./conversationStore";
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  planTimelineRender,
+  coalesceCleanRounds,
+  useConversationStore,
+  type RenderItem,
+} from "./conversationStore";
+import type { ConversationItem } from "../ipc/client";
 import type { SessionEntry, TimelineEntry, Turn } from "./types";
 
 function turn(id: string, role: "user" | "assistant"): Turn {
@@ -200,5 +206,89 @@ describe("coalesceCleanRounds", () => {
       { kind: "ai", ids: ["a1", "a2"] },
       { kind: "turn_result", id: "r1" },
     ]);
+  });
+});
+
+// Timeline ORDER around a notice: a notice committed at a turn boundary must not be
+// jumped over by a user turn replayed later (a message typed on the phone with Remote
+// Control on), which is spliced at `SessionEntry.replayAnchor`. This is about ordering
+// only — the clean-output folding of a soft notice is a separate question (isSoftNotice).
+describe("replay anchor around a notice", () => {
+  const store = () => useConversationStore.getState();
+
+  /** Timeline as a flat shape: a turn shows its id, anything else its kind. */
+  const shape = (session: string) =>
+    (store().sessions[session]?.timeline ?? []).map((e) => (e.kind === "turn" ? e.id : e.kind));
+
+  const messageStarted = (session: string, id: string) =>
+    store().applyItem(session, {
+      kind: "message_started",
+      id,
+      role: "assistant",
+      parent_tool_use_id: null,
+    } as ConversationItem);
+
+  const turnResult = (session: string) =>
+    store().applyItem(session, {
+      kind: "turn_result",
+      subtype: "success",
+      is_error: false,
+      result: null,
+      api_error_status: null,
+      total_cost_usd: null,
+      num_turns: null,
+      duration_ms: null,
+    } as ConversationItem);
+
+  const notice = (session: string, subtype: string) =>
+    store().applyItem(session, { kind: "notice", subtype, detail: null } as ConversationItem);
+
+  const remoteTurn = (session: string, id: string) =>
+    store().applyItem(session, {
+      kind: "user_message",
+      id,
+      text: "typed on the phone",
+      parent_tool_use_id: null,
+      replay: true,
+    } as ConversationItem);
+
+  beforeEach(() => {
+    useConversationStore.setState({ sessions: {} } as never);
+  });
+
+  it("a remote turn sent AFTER a failed background task renders below it", () => {
+    const s = "conv-notice-anchor";
+    store().ensureSession(s);
+    messageStarted(s, "a1");
+    turnResult(s); // anchor freezes at the end of the finished turn
+    notice(s, "task_failed"); // the background task fails after the turn settled
+    messageStarted(s, "a2");
+    remoteTurn(s, "remote"); // its echo arrives once the reply already streams
+    // The failure precedes the message the user sent afterwards — not the reverse.
+    expect(shape(s)).toEqual(["a1", "turn_result", "notice", "remote", "a2"]);
+  });
+
+  it("a notice arriving MID-response does not push the anchor past that response", () => {
+    // The echo of the prompt that caused the running reply must still land before it,
+    // notice or no notice.
+    const s = "conv-notice-midturn";
+    store().ensureSession(s);
+    messageStarted(s, "a1");
+    turnResult(s);
+    messageStarted(s, "a2"); // reply in flight
+    notice(s, "task_failed"); // a background task dies mid-work
+    remoteTurn(s, "remote");
+    expect(shape(s)).toEqual(["a1", "turn_result", "remote", "a2", "notice"]);
+  });
+
+  it("consecutive notices at the boundary each push the anchor", () => {
+    const s = "conv-notice-chain";
+    store().ensureSession(s);
+    messageStarted(s, "a1");
+    turnResult(s);
+    notice(s, "task_failed");
+    notice(s, "task_failed");
+    remoteTurn(s, "remote");
+    expect(shape(s)).toEqual(["a1", "turn_result", "notice", "notice", "remote"]);
   });
 });

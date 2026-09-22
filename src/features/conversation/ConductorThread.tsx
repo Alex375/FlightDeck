@@ -83,6 +83,7 @@ import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
 import { ArtifactCard } from "./ArtifactCard";
 import { AgentMessageSentCard } from "./AgentMessageCards";
+import { TosseToolCard, useTosseToolCards } from "./TosseToolCard";
 import { resolveTranscriptSource } from "./transcriptSource";
 import type { StickToBottom } from "./useStickToBottom";
 import styles from "./ConductorThread.module.css";
@@ -586,8 +587,9 @@ function LiveRunSection({
     session,
     steps.map((s) => s.id),
   );
+  const tosseCards = useTosseToolCards();
   return (
-    <ToolSection title={runHeader(steps)} errored={errored} live={live}>
+    <ToolSection title={runHeader(steps, tosseCards)} errored={errored} live={live}>
       {steps.map((step) =>
         motion ? (
           <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>
@@ -782,6 +784,19 @@ function renderSegment(
     // delivery state), the recipient jumping to where the message arrived.
     return (
       <AgentMessageSentCard
+        key={seg.key}
+        session={session}
+        name={seg.step.name}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+        active={active}
+      />
+    );
+  if (seg.kind === "tosse")
+    // A write to the TOSSE CRM renders as its own action card (what changed, on which task,
+    // with the CRM's own status pill), clicking through to the task.
+    return (
+      <TosseToolCard
         key={seg.key}
         session={session}
         name={seg.step.name}
@@ -1046,7 +1061,10 @@ function AssistantBlocks({
   // background agent into the thread. Shallow-compared → stable ref unless a new one appears.
   const bgAgentIds = useBackgroundAgentIds(session);
   const bgSet = useMemo(() => new Set(bgAgentIds), [bgAgentIds]);
-  const segments = groupBlocks(blocks, false, bgSet);
+  // Off → a TOSSE write stays an ordinary MCP step inside its run, exactly as before the
+  // dedicated CRM rendering existed.
+  const tosseCards = useTosseToolCards();
+  const segments = groupBlocks(blocks, false, bgSet, tosseCards);
 
   if (!cleanOutput) {
     const lastIdx = segments.length - 1;

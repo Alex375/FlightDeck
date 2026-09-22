@@ -5,7 +5,6 @@ import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
 import { ConversationMinimap } from "./MessageMinimap";
 import { FileMentionProvider, type MentionOpener } from "./FileMention";
-import { ReviewBar } from "./ReviewBar";
 import { AuthWarningBar } from "./AuthWarningBar";
 import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
@@ -13,8 +12,10 @@ import { MonitorBar } from "./MonitorBar";
 import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
-import { useEffectiveCleanOutput } from "../../store/display";
+import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
+import { useConvPanelShown } from "../editor/editorStore";
+import { ConversationSummaryLine } from "./ConversationSummaryLine";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -36,6 +37,7 @@ export function ConversationPane({
   disableMessageControls = false,
   onOpenMention,
   hasPanels,
+  panelHost = false,
 }: {
   session: string;
   cwd: string;
@@ -57,6 +59,12 @@ export function ConversationPane({
    *  for the composer's buttons to toggle. Defaults to "yes unless mentions are inert"
    *  (the reply modal); the IDE view passes false — its panels are its own. */
   hasPanels?: boolean;
+  /** The host mounts the conversation side panel next to this pane (the conversation view,
+   *  Git mode included). While the display pref keeps the panel on, the todo list and the
+   *  composer's goal/artifact chips live THERE, and a one-line summary stands in for them
+   *  here while the panel is closed. Hosts without the panel (the Flight Deck reply modal,
+   *  the IDE view) keep them inline. */
+  panelHost?: boolean;
 }) {
   // Toggling "clean output" folds/unfolds every round → big height change. Pass the
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
@@ -71,6 +79,11 @@ export function ConversationPane({
   // The whole column is a drop zone for files dragged from the Finder (see fileDrop.ts):
   // they attach to THIS conversation exactly as the composer's "+" would.
   const dropOver = useIsDropOver(session, "pane");
+  const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
+  // "Shown", not "open": a panel that stepped aside for lack of room is off screen, and the
+  // summary line must stand in for it exactly as for a closed one.
+  const panelOpen = useConvPanelShown();
+  const inPanel = panelHost && sidePanelPref;
   return (
     <div
       ref={paneRef}
@@ -106,14 +119,18 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
-      <TodoBar session={session} />
-      <ReviewBar session={session} />
+      {!inPanel ? (
+        <TodoBar session={session} />
+      ) : !panelOpen ? (
+        <ConversationSummaryLine session={session} />
+      ) : null}
       <AuthWarningBar session={session} />
       <ConductorComposer
           ref={composerRef}
           session={session}
           onSent={scrollToBottom}
           hasPanels={hasPanels ?? !inertMentions}
+          stateInPanel={inPanel}
         />
     </div>
   );

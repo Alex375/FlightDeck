@@ -9,6 +9,16 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.5.0
+
+- New: **run your agents on a remote server** — a Settings wizard sets up a Linux machine end to end (install, service, Claude sign-in), and conversations keep running there even when the Mac is closed. Your phone can be paired to each server.
+- New: an **IDE view** — folders opened as workspaces, with a dock holding your terminals and conversations, and closable tabs; an agent can open a file there without moving what you were looking at.
+- New: **artifacts designed by Claude (typed artifacts) display inside the app**, no longer only as a link.
+- New: **drag files from the Finder** straight onto a conversation or a Flight Deck card to attach them.
+- New: a **side panel on the right of a conversation** (⌘I) gathers its state in one place — its TOSSE task with status, assignee and tickable subtasks, its goal, its todo list and its artifacts, plus the stream and worktree controls. The header keeps actions only.
+- Changed: a conversation's **state is now the colour of its row** in the sidebar, with a live counter of how long the turn has run, and its status moved from a full-width bar into the composer itself.
+- Fix: a **background task that fails** shows up as a discreet inline notice instead of a full error bubble.
+
 ## v2.4.0
 
 - New: an agent can **link its conversation to a TOSSE task** itself (e.g. after a `/pickup` run by hand), so the task chip and status tracking follow; a link can also be removed from the task panel.

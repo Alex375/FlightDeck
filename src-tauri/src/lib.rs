@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod agentspend;
 pub mod appmcp;
+pub mod artifact_host;
 // Unix-only: `mkfifo`/process-group signalling/SSH have no Windows equivalent, and
 // nothing outside this module (no IPC command yet) needs it to exist cross-platform —
 // unlike e.g. `power/mod.rs`, which stubs itself per-OS because the front calls its
@@ -69,12 +70,16 @@ use ipc::commands::{
     tosse_link_project_repo, tosse_live_start, tosse_live_stop,
     tosse_login_start, tosse_logout, tosse_project_repos,
     tosse_repo_links, tosse_set_project_status,
-    tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url, tosse_tasks_by_status,
+    tosse_set_task_assignee, tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url,
+    tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
     remote_status, set_remote, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
+    artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
+    artifact_host_set_bounds,
+    artifact_host_show,
     add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
@@ -237,6 +242,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_web_url,
             tosse_task_detail,
             tosse_set_task_status,
+            tosse_set_task_assignee,
             tosse_set_project_status,
             tosse_create_task,
             fetch_slash_commands,
@@ -376,6 +382,12 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             bootstrap_cancel,
             machine_diagnose,
             machine_repair,
+            artifact_host_show,
+            artifact_host_set_bounds,
+            artifact_host_hide,
+            artifact_host_reload,
+            artifact_host_close,
+            artifact_host_open_claude_url,
         ])
         .events(collect_events![
             TickEvent,
@@ -404,6 +416,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
+            artifact_host::ArtifactHostEvent,
         ])
 }
 
@@ -678,6 +691,9 @@ pub fn run() {
         // forgetting the OLD phone token per daemon, populated by `set_remote`'s
         // regenerate-pairing sweep.
         .manage(std::sync::Arc::new(appmcp::provision::RevokeRegistry::new()))
+        // The in-app claude.ai artifact host: the one native child webview the artifact viewer
+        // lays over the side region (created lazily, on the first hosted artifact shown).
+        .manage(artifact_host::ArtifactHost::new())
         .setup(move |app| {
             use tauri::Manager;
 

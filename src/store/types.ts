@@ -263,6 +263,22 @@ export interface SessionEntry {
    */
   turnStartedAt: number | null;
   /**
+   * Start of the LAST turn, kept after that turn ends (unlike {@link turnStartedAt}, which
+   * is cleared). With {@link lastTurnEndedAt} it gives the duration a settled sidebar row
+   * freezes its counter on ("it ran for 4m 12s, then stopped on this state"). `null` until
+   * the first turn — and after a reload, since it is measured live, never persisted.
+   */
+  lastTurnStartedAt: number | null;
+  /** Wall-clock end of the last turn (`busy` true→false edge), `null` while one runs. */
+  lastTurnEndedAt: number | null;
+  /**
+   * Wall-clock moment the agent BLOCKED on the user (`awaiting_permission` false→true):
+   * a permission prompt or a questionnaire. The turn is still in flight, but nothing is
+   * being done, so the sidebar counter freezes here instead of running on. Cleared when
+   * the answer lands (true→false) and when the session is cleared.
+   */
+  awaitingSince: number | null;
+  /**
    * Number of turns started in this conversation, incremented on each `state.busy` false→true
    * edge (same edge as {@link turnStartedAt}). `0` before the first turn. Feeds the playful
    * "Thinking…" word rotation as a per-turn seed (the word re-draws on every new turn); the

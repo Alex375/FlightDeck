@@ -83,12 +83,14 @@ export const RIGHT_CHIPS: readonly ChipDescriptor[] = [
     condition: "Only when more than one Claude account is signed in" },
   { id: "outputStyle", side: "right", label: "Output style", icon: "pencil", backend: "claude" },
   { id: "artifacts", side: "right", label: "Artifacts", icon: "artifact", backend: "claude",
-    condition: "Only once this conversation has published an artifact" },
+    condition:
+      "Only once this conversation has published an artifact, and only while the conversation side panel is off (it lists them instead)" },
   { id: "extensions", side: "right", label: "Extensions", icon: "layers", backend: "both" },
   { id: "cleanOutput", side: "right", label: "Clean output", icon: "list", backend: "both" },
   { id: "remoteControl", side: "right", label: "Remote control", icon: "globe", backend: "both" },
   { id: "goal", side: "right", label: "Goal", icon: "target", backend: "claude",
-    condition: "Only while a /goal is active" },
+    condition:
+      "Only while a /goal is active, and only while the conversation side panel is off (it shows the goal instead)" },
   // 2 slots: measured at 52px — it keeps its tick box beside the icon when collapsed.
   { id: "worktree", side: "right", label: "Worktree", icon: "branch", backend: "both",
     condition: "Only before the first message is sent", slots: 2 },
