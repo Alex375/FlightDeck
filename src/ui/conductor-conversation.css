@@ -31,19 +31,14 @@
 .cv-repo-h { display:flex; align-items:center; gap:1px; padding:8px 5px 6px 4px; }
 .cv-repo-h .wf-ico { color:var(--wf-tx-lo); }
 /* Chevron + title — the collapse toggle. Flexes to fill all the space the buttons leave, so
-   at rest the name runs right up to the + at the edge.
-   ⚠️ `1 1 auto`, not `1`: with a zero basis the title absorbed the WHOLE shortfall on its
-   own (shrink is weighted by basis, and zero weighs nothing), so the remote-machine chip
-   beside it kept its full width while the repo NAME truncated — backwards, the name is what
-   you navigate by. On the content basis the weights are real and the chip, which shrinks far
-   faster (see .wf-remote), gives way first. Same full-width behaviour at rest. */
-.cv-repo-title { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px; border:0; background:transparent; font:inherit; color:inherit; padding:3px 5px; margin:-3px -3px -3px -5px; border-radius:6px; cursor:pointer; text-align:left; }
+   at rest the name runs right up to the + at the edge. */
+.cv-repo-title { flex:1; min-width:0; display:flex; align-items:center; gap:6px; border:0; background:transparent; font:inherit; color:inherit; padding:3px 5px; margin:-3px -3px -3px -5px; border-radius:6px; cursor:pointer; text-align:left; }
 .cv-repo-title:hover { background:var(--wf-panel-2); }
 /* The title itself — the important element: normal case (fits more than the old uppercase).
    Deliberately headlines its group: notably larger (15px), bold (700), a touch of tracking,
    in the strong text colour, so it clearly outranks the conversation names below it (which
    sit dimmer, at --wf-tx). */
-.cv-repo-n { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:15px; font-weight:700; letter-spacing:.2px; text-transform:none; color:var(--wf-tx-hi); }
+.cv-repo-n { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:15px; font-weight:700; letter-spacing:.2px; text-transform:none; color:var(--wf-tx-hi); }
 /* Fold chevron — points down when expanded, rotates to point right when collapsed. Kept a
    step brighter than the default header icon so the header unit reads as present, not muted. */
 .cv-repo-fold-chev { flex:0 0 auto; color:var(--wf-tx); transition:transform .16s ease; }
@@ -72,14 +67,6 @@
    .cv-repo-reveal, so it behaves like the secondary tools above (nothing at rest) and reads
    as hollow — an offer to associate, not a state. ATTENTION (ambiguous match / a pinned
    repository gone): stays visible, muted, with a small warning flag. */
-/* Remote-machine chip (features/machines/RemoteRepoMark.tsx) on a sidebar repo header.
-   At rest it shows globe + server name — standing information, like the linked TOSSE mark.
-   On HEADER HOVER it drops to the globe alone: hovering is when the secondary tools slide
-   in, and the header has no room for both them and a named server, so the space goes back
-   to the repo NAME rather than being taken from it. Nothing is lost — the tooltip still
-   carries the server and its ssh target, and you are looking at the row anyway. */
-.cv-repo-h:hover .wf-remote { min-width:0; }
-.cv-repo-h:hover .wf-remote-n { display:none; }
 .cv-tosse-badge { position:relative; }
 .cv-tosse-badge .wf-tosse-mark { width:17px; height:12px; }
 /* Linked = the mark in its REAL bichrome livery (body in the text colour, north needle in

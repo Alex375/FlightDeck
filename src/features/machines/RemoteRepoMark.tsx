@@ -9,25 +9,31 @@
 // on your Mac while it runs on a server.
 //
 // Deliberate shape, per Alexandre:
-//  - GLOBE + MACHINE NAME, not a bare icon. On a fleet with several servers, knowing
-//    WHICH one matters as much as "this is remote"; host/user/port stay in the tooltip.
+//  - A QUIET GLOBE, and nothing else, at rest. At a glance the only question worth
+//    answering is "is this on this Mac?", and one small glyph answers it without
+//    competing with the repo name beside it.
+//  - WHICH server is answered on HOVER, in the app's own tooltip (ui/Tooltip.tsx):
+//    machine name plus its ssh target. Not the native `title` — that waits about a
+//    second, which reads as nothing happening for information deliberately hidden at
+//    rest.
 //  - LOCAL IS UNMARKED. Local is the default and the overwhelming majority — badging it
-//    too would put a permanent chip on nearly every row and dilute the one signal that
+//    too would put a permanent glyph on nearly every row and dilute the one signal that
 //    carries information.
 //  - NO SETTING. This is a missing piece of information, not a deliberate change of
 //    experience: not seeing that an agent runs on a server is a defect, so there is
 //    nothing to opt back out of (the project's reversibility principle covers real
 //    features, not fixes).
 //
-// ⚠️ Colour is RESERVED. At rest this mark is neutral (panel + line + muted text) on
-// purpose: the sibling task puts a HEALTH state on it (a machine gone unreachable or
-// degraded), and health needs the attention/error colours to itself. Spending them here
-// on the plain "this is remote" fact would leave "this server is down" nothing louder to
-// say. The single exception below is a genuine fault, not a state.
+// ⚠️ Colour is RESERVED. At rest this mark is the quietest text tone on purpose: the
+// sibling task puts a HEALTH state on it (a machine gone unreachable or degraded), and
+// health needs the attention/error colours to itself. Spending them here on the plain
+// "this is remote" fact would leave "this server is down" nothing louder to say. The
+// single exception below is a genuine fault, not a state.
 import { Ico } from "../../ui/kit";
+import { Tooltip } from "../../ui/Tooltip";
 import { useMachines, type Machine } from "../../store/conversationsStore";
 
-/** What the mark should say about one repository — derived once, so the chip and its
+/** What the mark should say about one repository — derived once, so the glyph and its
  *  tooltip can never disagree. Pure; exported for the unit test. */
 export type RemoteMark =
   /** No `machineId`: an ordinary folder on this Mac. Renders nothing. */
@@ -57,28 +63,34 @@ export function remoteMarkFor(
  *  remote. */
 export function RemoteRepoMark({ machineId }: { machineId: string | null | undefined }) {
   if (!machineId) return null;
-  return <RemoteMachineChip machineId={machineId} />;
+  return <RemoteMachineGlyph machineId={machineId} />;
 }
 
-function RemoteMachineChip({ machineId }: { machineId: string }) {
+function RemoteMachineGlyph({ machineId }: { machineId: string }) {
   const machines = useMachines();
   const mark = remoteMarkFor(machineId, machines);
   if (mark.kind === "local") return null;
 
   const unknown = mark.kind === "unknown";
-  const label = unknown ? "unknown server" : mark.label;
-  const title = unknown
-    ? `Remote repository — this server is no longer paired\nIts path is on a server, not on this Mac. Pair it again in Settings → Control.`
-    : `Remote repository — ${mark.label}\n${mark.target}\nIts path is on that server, and its agents run there.`;
+  // One flat string for assistive tech, the two-line version for the eye — same facts.
+  const label = unknown
+    ? "Remote repository — this server is no longer paired. Its path is on a server, not on this Mac."
+    : `Remote repository on ${mark.label} (${mark.target})`;
+  const content = unknown ? (
+    <>
+      Server no longer paired
+      <span className="wf-tip-sub">Its path is on a server, not on this Mac</span>
+    </>
+  ) : (
+    <>
+      {mark.label}
+      <span className="wf-tip-sub">{mark.target}</span>
+    </>
+  );
 
   return (
-    <span
-      className={"wf-remote" + (unknown ? " unknown" : "")}
-      title={title}
-      aria-label={title}
-    >
+    <Tooltip content={content} label={label} className={"wf-remote" + (unknown ? " unknown" : "")}>
       <Ico name="globe" className="sm" />
-      <span className="wf-remote-n">{label}</span>
-    </span>
+    </Tooltip>
   );
 }

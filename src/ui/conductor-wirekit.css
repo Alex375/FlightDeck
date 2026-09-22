@@ -547,23 +547,36 @@
 .wf-review.bg { border-color:#27513f; background:var(--wf-run-bg); }
 .wf-review.bg .wf-review-h { color:#9fe0c0; }
 
+/* ---- hover tooltip (ui/Tooltip.tsx) ------------------------ */
+/* The app's own tooltip, portaled to <body>. Fixed-positioned: `tooltipPlacement` owns
+   left/top, so nothing here may set them. Above the portaled menus' z-index (200) because
+   a tooltip is the most transient layer of all — it is never what a menu should cover.
+   `visibility` (not display) while unplaced: the box must be laid out to be measured, but
+   must not be seen at 0,0 for one frame. */
+.wf-tip { position:fixed; z-index:260; visibility:hidden; pointer-events:none; max-width:260px;
+  padding:6px 9px; border-radius:8px; border:1px solid var(--wf-line-2); background:var(--wf-panel-2);
+  color:var(--wf-tx-hi); font-size:11.5px; line-height:1.45; box-shadow:0 10px 26px -10px #000, 0 0 0 1px #0006; }
+.wf-tip.placed { visibility:visible; animation:wf-tip-in .09s ease-out; }
+@keyframes wf-tip-in { from { opacity:0; transform:translateY(2px); } to { opacity:1; transform:none; } }
+/* The secondary line (an ssh target, a path) — same box, quieter and monospaced. */
+.wf-tip-sub { display:block; margin-top:2px; font-family:var(--wf-mono); font-size:10.5px; color:var(--wf-tx-lo); }
+
 /* ---- remote-machine mark ----------------------------------- */
-/* The chip a repository carries when its files live on a paired SERVER rather than on
-   this Mac (see features/machines/RemoteRepoMark.tsx). Same shape on all three surfaces
-   it appears on — sidebar repo header, Flight Deck swimlane header, stream card — so the
-   answer to "where does this run?" always looks the same.
+/* The glyph a repository carries when its files live on a paired SERVER rather than on
+   this Mac (see features/machines/RemoteRepoMark.tsx). Same on all three surfaces it
+   appears on — sidebar repo header, Flight Deck swimlane header, stream card.
+   DELIBERATELY just the globe, and a quiet one: at rest it only has to say "not this
+   Mac", which a single glyph does without stealing room from the repo name. WHICH server
+   is a question you ask by pointing at it, and the answer comes back in the app's own
+   tooltip (ui/Tooltip.tsx) — immediately, unlike the native `title` this replaced.
    ⚠️ Neutral on purpose: the accent/attention/error colours are RESERVED for the machine
-   HEALTH state that lands on this same chip next (unreachable / degraded). Presence and
-   shape carry "this is remote"; colour will carry "and something is wrong with it". */
-/* `flex:0 8 auto` — grows never, shrinks EIGHT times faster than the repo name beside
-   it. In a narrow sidebar something has to give, and it must be this chip, not the
-   name: the name is what you navigate by. The floor keeps the globe plus a couple of
-   characters, below which the icon alone still answers "remote?" and the tooltip the rest. */
-.wf-remote { flex:0 8 auto; display:inline-flex; align-items:center; gap:3px; min-width:40px; max-width:140px; padding:1px 5px 1px 4px; border-radius:999px; border:1px solid var(--wf-line); background:var(--wf-panel); color:var(--wf-tx); }
-.wf-remote .wf-ico { flex:0 0 auto; width:12px; height:12px; color:var(--wf-tx-lo); }
-/* Truncates rather than pushing the repo name out — the name still outranks it. */
-.wf-remote-n { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10.5px; font-weight:600; letter-spacing:.2px; }
+   HEALTH state that lands on this same glyph next (unreachable / degraded). Presence
+   carries "this is remote"; colour will carry "and something is wrong with it". */
+.wf-remote { flex:0 0 auto; display:inline-flex; align-items:center; color:var(--wf-tx-xlo);
+  transition:color .12s ease; }
+.wf-remote .wf-ico { width:13px; height:13px; }
+/* Brightens when you point at it, so the glyph confirms it is the thing being described. */
+.wf-remote:hover { color:var(--wf-tx); }
 /* A `machineId` naming no paired machine: a real fault, not a state — the repo IS remote
-   and we cannot say where. Flagged so it never reads as an ordinary server. */
-.wf-remote.unknown { border-color:var(--wf-att-bg); color:var(--wf-att); }
-.wf-remote.unknown .wf-ico { color:var(--wf-att); }
+   and we cannot say where. Tinted so it never reads as an ordinary server. */
+.wf-remote.unknown, .wf-remote.unknown:hover { color:var(--wf-att); }
