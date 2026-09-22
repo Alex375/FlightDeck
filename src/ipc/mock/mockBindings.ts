@@ -1986,10 +1986,80 @@ export const mockCommands = {
     if (demoParam === null)
       return ok({ machines: [...mockMachines], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
+    // `?demo=remote` — visual check for the remote-machine mark (sidebar row, Flight Deck
+    // lane header, stream card). Three folders that must read DIFFERENTLY at a glance:
+    // a local one (unmarked), one on a paired server (globe + its name), and one whose
+    // `machine_id` names nothing — the case that must NOT quietly look local.
+    // Deliberately pairs the server here rather than reusing `?demo=servers`: the point is
+    // a repo that CARRIES a machine, which that fixture has no repos for.
+    const remoteDemo = demoParam === "remote";
+    if (remoteDemo && mockMachines.length === 0) {
+      findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
+    }
+    const remoteRepos: RepoRecord[] = remoteDemo
+      ? [
+          {
+            id: "repo-remote",
+            // A path that looks just like a local one once truncated — the confusion the
+            // mark exists to end.
+            path: "/home/deploy/demo-repo",
+            added_at: now - 1,
+            machine_id: mockMachines[0]?.id ?? null,
+          },
+          { id: "repo-orphan", path: "/srv/app", added_at: now - 2, machine_id: "machine-deleted" },
+        ]
+      : [];
     return ok({
       machines: [...mockMachines],
-      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
+      repos: [
+        { id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null },
+        ...remoteRepos,
+      ],
       conversations: [
+        ...(remoteDemo
+          ? ([
+              {
+                id: "conv-remote",
+                name: "Deploy on the server",
+                repo_id: "repo-remote",
+                cwd: "/home/deploy/demo-repo",
+                created_at: now - 1,
+                last_activity_at: now - 1,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+              {
+                id: "conv-orphan",
+                name: "Paired server gone",
+                repo_id: "repo-orphan",
+                cwd: "/srv/app",
+                created_at: now - 2,
+                last_activity_at: now - 2,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+            ] as ConversationRecord[])
+          : []),
         {
           id: "conv-demo",
           name: "Background tasks demo",

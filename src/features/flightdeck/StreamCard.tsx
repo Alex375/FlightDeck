@@ -16,6 +16,7 @@ import { deleteReasonFor } from "../conversation/deleteGuard";
 import { useDisplay } from "../../store/display";
 import { TosseTaskChip } from "../tosse/TosseTaskChip";
 import { WorktreeIndicator } from "../git/WorktreeIndicator";
+import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { StateBlock } from "./StateBlock";
 import { StateActions } from "./StateActions";
@@ -45,11 +46,14 @@ function fmtAgo(ts: number, now: number): string {
 export function StreamCard({
   conv,
   repoPath,
+  machineId,
   now,
   onOpen,
 }: {
   conv: Conversation;
   repoPath: string;
+  /** The repo's machine, straight from the lane — `null`/`undefined` for a local folder. */
+  machineId: string | null | undefined;
   now: number;
   onOpen: (id: string) => void;
 }) {
@@ -173,6 +177,11 @@ export function StreamCard({
         >
           {conv.kind === "codex" ? <CodexMark /> : <ClaudeMark />}
         </span>
+        {/* Where this agent actually runs. The card is what you click to reply, so it is
+            also where mistaking a server for this Mac costs you — the answer belongs here,
+            next to the backend mark, not only on the lane header above. Nothing for a
+            local repository. */}
+        <RemoteRepoMark machineId={machineId} />
         <WorktreeIndicator conv={conv} repoPath={repoPath} />
         {/* The TOSSE task this agent is on, if any — compact: the mark plus the task's
             own status colour, with the title in the tooltip. */}

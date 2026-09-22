@@ -32,6 +32,7 @@ import { fmtFrozenElapsed, useLiveElapsed } from "../../ui/liveElapsed";
 import { useShallow } from "zustand/react/shallow";
 import { useSettingsUi } from "../../store/settingsUi";
 import { TosseRepoBadge } from "../tosse/TosseRepoBadge";
+import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
@@ -381,6 +382,11 @@ function RepoGroup({
           <Ico name="chev" className="sm cv-repo-fold-chev" />
           <span className="cv-repo-n">{repoName(repo.path)}</span>
         </button>
+        {/* Which machine this folder lives on — globe + server name, always visible, and
+            nothing at all for a local folder. Sits OUTSIDE the title button (no button
+            inside a button) and right after the name, so "where does this run?" is read
+            with the name rather than hunted for. */}
+        <RemoteRepoMark machineId={repo.machineId} />
         {/* TOSSE — renders nothing unless the CRM is connected. Solid and always visible
             when this folder maps to a repository there; otherwise it behaves like the
             secondary tools below (revealed on hover) and offers to associate it by hand. */}
