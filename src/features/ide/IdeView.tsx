@@ -120,7 +120,7 @@ function OpenFolderMenu({ trigger }: { trigger: React.ReactElement }) {
         return (
           <MenuItem
             key={r.id}
-            icon={r.machineId ? "globe" : "folder"}
+            icon={r.machineId ? "server" : "folder"}
             disabled={!!blocked}
             hint={blocked ? "remote" : undefined}
             onClick={() => openRepoInIde(r)}
@@ -164,7 +164,7 @@ function Welcome() {
                   title={blocked ?? r.path}
                   onClick={() => openRepoInIde(r)}
                 >
-                  <Ico name={r.machineId ? "globe" : "folder"} className="sm" />
+                  <Ico name={r.machineId ? "server" : "folder"} className="sm" />
                   <span className={styles.welcomeRepoName}>{repoName(r.path)}</span>
                   <span className={styles.welcomeRepoPath}>
                     <bdi>{blocked ? "Remote — not available" : r.path}</bdi>

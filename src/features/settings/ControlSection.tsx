@@ -371,7 +371,7 @@ export function RemoteServersGroup() {
   }, []);
 
   return (
-    <SettingsGroup title="Remote servers (SSH)" icon="globe">
+    <SettingsGroup title="Remote servers (SSH)" icon="server">
       {machines.length === 0 && !wizardOpen && (
         <div className={styles.remoteEmpty}>
           No remote server yet. Pair a Linux box and run conversations on it, over SSH.

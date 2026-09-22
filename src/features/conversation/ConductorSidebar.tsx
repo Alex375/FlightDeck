@@ -571,7 +571,7 @@ export function ConductorSidebar() {
                 This Mac…
               </MenuItem>
               {machines.map((m) => (
-                <MenuItem key={m.id} icon="globe" onClick={() => setRemoteDialogMachine(m)}>
+                <MenuItem key={m.id} icon="server" onClick={() => setRemoteDialogMachine(m)}>
                   {m.label}…
                 </MenuItem>
               ))}

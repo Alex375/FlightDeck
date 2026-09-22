@@ -7,8 +7,15 @@ import { create } from "zustand";
 const STORAGE_KEY = "tosse:sidebar";
 
 /** Drag bounds for the sidebar width (px). The default matches the historical fixed
- *  width, so a user who never drags sees no change. */
-export const SIDEBAR_MIN = 190;
+ *  width, so a user who never drags sees no change.
+ *
+ *  The floor is 150, not the original 190: measured at every width down to 120, NOTHING in
+ *  the sidebar overflows its box — repo and conversation names simply ellipsis earlier, and
+ *  the header's buttons are `flex:0 0 auto`. 190 was a guess, and it stopped people from
+ *  reclaiming horizontal space they were entitled to. 150 is where a repo name still shows
+ *  enough characters to be told apart; below that the list stops being navigable, which is
+ *  a reason to stop, unlike "it might break" (it doesn't). */
+export const SIDEBAR_MIN = 150;
 export const SIDEBAR_MAX = 460;
 const DEFAULT_WIDTH = 224;
 

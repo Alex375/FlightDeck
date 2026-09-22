@@ -9,9 +9,10 @@
 // on your Mac while it runs on a server.
 //
 // Deliberate shape, per Alexandre:
-//  - A QUIET GLOBE, and nothing else, at rest. At a glance the only question worth
+//  - A QUIET SERVER GLYPH, and nothing else, at rest. At a glance the only question worth
 //    answering is "is this on this Mac?", and one small glyph answers it without
-//    competing with the repo name beside it.
+//    competing with the repo name beside it. A rack unit, not a globe: a VPS of your
+//    own is a MACHINE, and a globe both says "the internet" and turns to mush at 13px.
 //  - WHICH server is answered on HOVER, in the app's own tooltip (ui/Tooltip.tsx):
 //    machine name plus its ssh target. Not the native `title` — that waits about a
 //    second, which reads as nothing happening for information deliberately hidden at
@@ -90,7 +91,7 @@ function RemoteMachineGlyph({ machineId }: { machineId: string }) {
 
   return (
     <Tooltip content={content} label={label} className={"wf-remote" + (unknown ? " unknown" : "")}>
-      <Ico name="globe" className="sm" />
+      <Ico name="server" className="sm" />
     </Tooltip>
   );
 }
