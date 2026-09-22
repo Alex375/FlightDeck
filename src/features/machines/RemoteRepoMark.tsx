@@ -11,8 +11,9 @@
 // Deliberate shape, per Alexandre:
 //  - A QUIET SERVER GLYPH, and nothing else, at rest. At a glance the only question worth
 //    answering is "is this on this Mac?", and one small glyph answers it without
-//    competing with the repo name beside it. A rack unit, not a globe: a VPS of your
-//    own is a MACHINE, and a globe both says "the internet" and turns to mush at 13px.
+//    competing with the repo name beside it. A transmitting mast, not a globe: what
+//    matters at a glance is that the thing is REACHING you from somewhere, and a globe
+//    both says "the internet" and turns to mush at 13px.
 //  - WHICH server is answered on HOVER, in the app's own tooltip (ui/Tooltip.tsx):
 //    machine name plus its ssh target. Not the native `title` — that waits about a
 //    second, which reads as nothing happening for information deliberately hidden at

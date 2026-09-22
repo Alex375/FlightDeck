@@ -77,13 +77,15 @@ const WF_PATHS: Record<string, string> = {
   sidebarR: "M4 5h14v12H4zM13 5v12",
   power: "M11 4v7M7.3 6.8a6 6 0 1 0 7.4 0",
   globe: "M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM3 11h16M11 3c2.4 2.2 2.4 13.8 0 16M11 3c-2.4 2.2-2.4 13.8 0 16",
-  // A paired SERVER — a rack unit with its status light, the conventional server
-  // pictogram. Distinct from `globe`, which stays for the NETWORK sense (the claude.ai
-  // bridge, a phone relay, an MCP server reached over http): a VPS of your own is a
-  // machine, not the internet. It is also the readable one at the 13px the remote mark
-  // renders at, where the globe's four crossing strokes turn to mush — and two stacked
-  // units with a light read as a server, where a bare stack of bars reads as a list.
-  server: "M4.5 5.5h13v4.5h-13zM4.5 12h13v4.5h-13zM7.5 7.75h.02M7.5 14.25h.02",
+  // A paired SERVER — a mast on a base, broadcasting. Distinct from `globe`, which stays
+  // for the NETWORK sense (the claude.ai bridge, a phone relay, an MCP server reached over
+  // http): a VPS of your own is a machine you reach, not the internet. Alexandre picked
+  // this one over a rack unit: what matters at a glance is that the thing is REACHING you
+  // from somewhere, and a transmitting mast says that where a stack of bars says "list".
+  // ⚠️ The two arcs are spaced for the 13px this renders at — arcs any closer than these
+  // land under a pixel apart once scaled down, and merge into one smudge. Don't add a
+  // third, and don't tighten the gap.
+  server: "M11 9.6v8.9M8.5 18.5h5M7.9 7.6a4.4 4.4 0 0 1 6.2 0M5.4 5.2a8 8 0 0 1 11.2 0",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",
   // A document with a sparkle — a published `Artifact` (a generated, hosted deliverable).
