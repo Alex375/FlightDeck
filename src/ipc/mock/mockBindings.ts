@@ -1339,6 +1339,10 @@ export const mockCommands = {
         manualRepositoryId: null,
         ambiguous: [],
         remoteError: null,
+        // The demo folder is on this Mac. A folder on a paired server carries its machine
+        // here instead, and then no url was ever read — the probe is skipped rather than
+        // run against a path that does not exist locally.
+        machine: null,
       },
     ];
     return ok({ connected: true, links, repositories, error: null });

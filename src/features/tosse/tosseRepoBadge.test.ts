@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { badgeStateFor } from "./TosseRepoBadge";
-import { orderForPicker } from "./TosseRepoCard";
-import type { TosseRepository } from "../../ipc/client";
+import { orderForPicker, whyUnmatched } from "./TosseRepoCard";
+import type { TosseRepoLink, TosseRepository } from "../../ipc/client";
 
 const link = (over: Partial<Parameters<typeof badgeStateFor>[0]> = {}) => ({
   resolved: true,
@@ -9,6 +9,7 @@ const link = (over: Partial<Parameters<typeof badgeStateFor>[0]> = {}) => ({
   ambiguous: [],
   manualRepositoryId: null,
   remoteError: null,
+  machine: null,
   ...over,
 });
 
@@ -54,10 +55,68 @@ describe("badgeStateFor", () => {
     expect(badgeStateFor(link({ resolved: false }))).toBe("unlinked");
   });
 
+  it("does not flag a folder that lives on a paired server", () => {
+    // The bug: this Mac's git was run on a path that only exists on the server, failed with
+    // "cannot change to …" — indistinguishable from a deleted folder — and the badge showed
+    // a warning on a repository whose remote matches the CRM perfectly. No automatic match
+    // is possible from here, which is an ordinary limit, not a fault.
+    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower" } }))).toBe("unlinked");
+  });
+
+  it("still shows a repository pinned by hand on a remote folder", () => {
+    // The manual pin is pure local SQLite, so it works over there exactly as it does here.
+    expect(
+      badgeStateFor(link({ machine: { id: "m1", label: "tower" }, repository: { id: "r" } })),
+    ).toBe("linked");
+  });
+
   it("is unknown for a folder with no entry at all", () => {
     // A repo added since the last fetch: we have not looked at it, so we say nothing
     // about it — least of all that it has no git remote.
     expect(badgeStateFor(undefined)).toBe("unknown");
+  });
+});
+
+describe("whyUnmatched", () => {
+  const cardLink = (over: Partial<TosseRepoLink> = {}): TosseRepoLink =>
+    ({
+      repoId: "r",
+      resolved: true,
+      remoteUrl: null,
+      repository: null,
+      source: null,
+      manualRepositoryId: null,
+      ambiguous: [],
+      notARepository: false,
+      remoteError: null,
+      machine: null,
+      ...over,
+    }) as TosseRepoLink;
+
+  it("names the server, instead of claiming the folder has no git remote", () => {
+    // It has one — we simply never read it, because the path lives on that machine. Saying
+    // "no git remote" sent the user hunting for a remote that is right there.
+    const said = whyUnmatched(cardLink({ machine: { id: "m1", label: "tower" } }));
+    expect(said).toContain("tower");
+    expect(said).toContain("pick a TOSSE repository by hand");
+    expect(said).not.toContain("no git remote");
+  });
+
+  it("does not pass an un-paired server off as this Mac", () => {
+    // Only the id survives on the folder. The folder is still over there, and the sentence
+    // must not quietly become the local one.
+    expect(whyUnmatched(cardLink({ machine: { id: "m1", label: null } }))).toContain(
+      "no longer paired",
+    );
+  });
+
+  it("keeps the local answers it already gave", () => {
+    expect(whyUnmatched(cardLink({ notARepository: true }))).toContain("not a git repository");
+    expect(whyUnmatched(cardLink({ remoteError: "fatal: …" }))).toContain("could not be read");
+    expect(whyUnmatched(cardLink({ remoteUrl: "git@github.com:a/b.git" }))).toContain(
+      "git@github.com:a/b.git",
+    );
+    expect(whyUnmatched(cardLink())).toContain("has no git remote");
   });
 });
 

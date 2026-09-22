@@ -72,6 +72,7 @@ function link(over: Partial<TosseRepoLink> = {}): TosseRepoLink {
     ambiguous: [],
     notARepository: false,
     remoteError: null,
+    machine: null,
     ...over,
   };
 }

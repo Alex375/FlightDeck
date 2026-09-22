@@ -1239,22 +1239,34 @@ pub async fn tosse_repo_links(
         rows.into_iter()
             .map(|row| {
                 use crate::git::RemoteLookup;
-                // Three ordinary answers, one fault. A folder that is not a repository is
-                // COMMON here (Flight Deck opens folders, not only clones) and must not be
-                // dressed up as a failure; a folder that vanished, or that git cannot read,
-                // must SAY so rather than pass for "simply un-associated".
-                let (remote_url, not_a_repository, remote_error) =
-                    match crate::git::remote_url(&row.path) {
-                        Ok(RemoteLookup::Url(url)) => (Some(url), false, None),
-                        Ok(RemoteLookup::NoRemote) => (None, false, None),
-                        Ok(RemoteLookup::NotARepository) => (None, true, None),
-                        Err(e) => (None, false, Some(e.to_string())),
+                use crate::tosse::RemoteProbe;
+                // Three ordinary answers, one fault — and, before any of them, the question
+                // of whether this Mac is even the right machine to ask. A folder that is not
+                // a repository is COMMON here (Flight Deck opens folders, not only clones)
+                // and must not be dressed up as a failure; a folder that vanished, or that
+                // git cannot read, must SAY so rather than pass for "simply un-associated".
+                let (remote_url, not_a_repository, remote_error, machine) =
+                    match crate::tosse::remote_probe(
+                        row.machine_id.as_deref(),
+                        row.machine_label.as_deref(),
+                    ) {
+                        // Not a fault, and not a spawn either: the folder lives on a server,
+                        // so we skip the probe and say WHERE it is. The manual pin still
+                        // works on it (pure SQLite), which is what the card offers instead.
+                        RemoteProbe::Skip(machine) => (None, false, None, Some(machine)),
+                        RemoteProbe::Locally => match crate::git::remote_url(&row.path) {
+                            Ok(RemoteLookup::Url(url)) => (Some(url), false, None, None),
+                            Ok(RemoteLookup::NoRemote) => (None, false, None, None),
+                            Ok(RemoteLookup::NotARepository) => (None, true, None, None),
+                            Err(e) => (None, false, Some(e.to_string()), None),
+                        },
                     };
                 (
                     crate::tosse::LocalRepo {
                         repo_id: row.repo_id,
                         remote_url,
                         manual_repository_id: row.tosse_repository_id,
+                        machine,
                     },
                     (not_a_repository, remote_error),
                 )

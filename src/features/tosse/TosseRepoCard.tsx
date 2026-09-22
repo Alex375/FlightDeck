@@ -52,6 +52,35 @@ export function orderForPicker(
   });
 }
 
+/** Name a paired server for a sentence: its label, or an honest stand-in when the server
+ *  was un-paired and only its id survives on the folder. */
+function machineName(machine: { label: string | null }): string {
+  return machine.label ?? "a server that is no longer paired";
+}
+
+/** Why this folder could not be matched automatically, in one sentence.
+ *
+ *  Pure and exported so the reason has ONE definition and a test. Each branch names a
+ *  different situation, and the order is load-bearing: a folder that lives on a server was
+ *  never probed at all, so nothing may be said about its remote — reading it as "this
+ *  folder has no git remote" is what the card did, and it was simply untrue. */
+export function whyUnmatched(link: TosseRepoLink | undefined): string {
+  // Checked FIRST: we did not look, so every claim below is about a probe that never ran.
+  if (link?.machine) {
+    return `This folder lives on ${machineName(link.machine)}. Flight Deck reads git remotes on this Mac only, so it cannot be matched automatically — pick a TOSSE repository by hand.`;
+  }
+  if (link?.remoteError) {
+    return "This folder's git remote could not be read, so it cannot be matched automatically.";
+  }
+  if (link?.notARepository) {
+    return "This folder is not a git repository, so there is no remote to match on. You can still pick a TOSSE repository by hand.";
+  }
+  if (link?.remoteUrl) {
+    return `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`;
+  }
+  return "This folder has no git remote, so it cannot be matched automatically.";
+}
+
 export function TosseRepoCard() {
   const repoId = useTosseRepoUi((s) => s.repoId);
   const close = useTosseRepoUi((s) => s.closeCard);
@@ -275,8 +304,14 @@ export function TosseRepoCard() {
                     <span className={styles.muted}>no url in TOSSE</span>
                   )}
                 </Fact>
-                <Fact label="Local folder">
+                {/* "Local folder" is a lie for a path that only exists on a server — and a
+                    dangerous one, since a remote path can look exactly like one of yours.
+                    The label follows the folder, and the server is named next to it. */}
+                <Fact label={link?.machine ? "Folder" : "Local folder"}>
                   <span className={styles.mono}>{repoPath}</span>
+                  {link?.machine ? (
+                    <span className={styles.muted}> · on {machineName(link.machine)}</span>
+                  ) : null}
                 </Fact>
                 <Fact label="Association">
                   <span className={styles.muted}>
@@ -316,15 +351,7 @@ export function TosseRepoCard() {
               <div className={styles.empty}>
                 <Ico name="link" className={styles.emptyIco} />
                 <div className={styles.emptyTitle}>This folder is not associated with TOSSE</div>
-                <div className={styles.emptyBody}>
-                  {link?.remoteError
-                    ? `This folder's git remote could not be read, so it cannot be matched automatically.`
-                    : link?.notARepository
-                      ? "This folder is not a git repository, so there is no remote to match on. You can still pick a TOSSE repository by hand."
-                      : link?.remoteUrl
-                        ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
-                        : "This folder has no git remote, so it cannot be matched automatically."}
-                </div>
+                <div className={styles.emptyBody}>{whyUnmatched(link)}</div>
               </div>
             ) : (
               // Not checked: say exactly that, and nothing about the folder's remote or
@@ -338,6 +365,15 @@ export function TosseRepoCard() {
                     ? "TOSSE could not be read, so this folder's association could not be verified. Nothing has changed — retry once TOSSE is reachable."
                     : "This folder has not been matched against TOSSE yet. Refresh to check it."}
                 </div>
+                {/* WHERE the folder lives is a local fact — it stays true through an
+                    outage. Said here too, so "Refresh" does not read as a promise: no
+                    refresh will ever match this folder automatically. */}
+                {link?.machine ? (
+                  <div className={styles.emptyBody}>
+                    It lives on {machineName(link.machine)}, so only a manual pick can
+                    associate it.
+                  </div>
+                ) : null}
                 <button
                   type="button"
                   className={styles.ghostBtn}
