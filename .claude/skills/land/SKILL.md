@@ -142,12 +142,23 @@ else
     "$HOME/Library/Preferences/$ID.plist" \
     "$HOME/Library/WebKit/$ID" \
     "$HOME/Library/HTTPStorages/$ID" \
+    "$HOME/Library/HTTPStorages/$ID.binarycookies" \
     "$HOME/Library/Saved Application State/$ID.savedState"
   echo "Données de test isolées purgées : $ID"
 fi
 ```
 
 Si `/build-app` n'a jamais tourné pour ce slug, ces chemins n'existent pas — le `rm -rf` est un no-op inoffensif. Lance-le quand même : c'est le **point unique** qui garantit que `~/Library` ne se remplit pas d'identités mortes. (Note ce résultat pour la ligne optionnelle du tableau final.)
+
+## Étape 7c — Purger les artefacts de build (délègue à `/cleanup`)
+
+Le worktree supprimé à l'étape 7 a emporté **son** `src-tauri/target` avec lui — dont le `.app` produit par `/build-app`, qui vivait dedans. Restent les artefacts du **worktree principal** et des autres repos, que rien ne vide jamais : le 22/09/2026 ils avaient atteint **21 Go** à eux seuls.
+
+Lance le skill **`/cleanup`** (outil Skill). C'est le point unique qui connaît tous les emplacements (les quatre `target`, les identités `com.tosse.desktop.<slug>` orphelines, les dépôts jamais `gc`) et tous les garde-fous (identités protégées, features vivantes, build en cours). Ne réimplémente pas la purge ici.
+
+Un land est **exactement** le bon moment pour ça : le travail est posé et vérifié, donc repayer une compilation complète ne bloque personne. Lance `/cleanup` en mode par défaut (tout effacer) sauf si l'utilisateur a demandé à garder l'incrémental.
+
+Reporte son résultat dans le tableau final (espace rendu + ce qui repartira de zéro au prochain build).
 
 ## Étape 8 — Clôturer la tâche
 
@@ -172,7 +183,7 @@ Règles de ce tableau :
 - **Reflète la réalité, pas l'intention.** Chaque statut décrit ce qui s'est *effectivement* passé (push réellement effectué, worktree réellement supprimé), pas ce qui aurait dû arriver. Si une étape a échoué ou a été sautée, dis-le franchement (❌ + raison) plutôt que de cocher ✅.
 - **Si un conflit a eu lieu** (⚠️), ajoute **sous le tableau** un court récap : quels fichiers, et comment tu as tranché (surtout les conflits complexes) — cohérent avec ce que tu as déjà expliqué à l'étape 5.
 - **Ligne « modif de contexte »** : c'est une **recommandation**, pas un fait mécanique. Réponds `💡 Oui` seulement si le travail a révélé quelque chose qui mérite d'être écrit dans un contexte TOSSE — nouvelle décision structurante, changement de stack/pattern, info durable — en respectant la règle d'or (une info à UN SEUL niveau, pas de redondance avec un contexte parent). Sinon `✅ Non`. Si `/done` (étape 8) a déjà proposé ou appliqué une mise à jour de contexte via `tosse-manager`, reprends-la ici (contexte visé + ce qui change) plutôt que de la réinventer. En cas de doute, cite ta suggestion et laisse l'utilisateur trancher — n'édite pas un contexte de ta propre initiative dans cette ligne.
-- **Tu peux ajouter d'autres lignes** utiles au-dessus ou en dessous des quatre obligatoires (ex : `typecheck + tests` verts, `cargo test --lib` lancé, build vérifié via `/build-dev`, données de test isolées purgées (`com.tosse.desktop.<slug>`, étape 7b), tâche passée en **Review** par `/done`…). Elles enrichissent le rapport mais ne remplacent jamais les quatre lignes cœur.
+- **Tu peux ajouter d'autres lignes** utiles au-dessus ou en dessous des quatre obligatoires (ex : `typecheck + tests` verts, `cargo test --lib` lancé, build vérifié via `/build-dev`, données de test isolées purgées (`com.tosse.desktop.<slug>`, étape 7b), artefacts de build purgés via `/cleanup` + espace rendu (étape 7c), tâche passée en **Review** par `/done`…). Elles enrichissent le rapport mais ne remplacent jamais les quatre lignes cœur.
 - Marqueurs visuels : `✅` ok / rien à signaler · `⚠️` a nécessité une intervention · `❌` échec/non fait · `➖` sans objet · `💡` suggestion à valider. But : l'état se lit en un clin d'œil.
 
 ## Ce que ce skill ne fait PAS
