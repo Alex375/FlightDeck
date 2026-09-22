@@ -18,7 +18,12 @@ import { Ico, TosseCrmMark } from "../../ui/kit";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TosseRepoLink, TosseRepository } from "../../ipc/client";
-import { repoLinkFor, useLinkTosseRepository, useTosseRepoLinks } from "../../ipc/useTosse";
+import {
+  repoLinkFor,
+  useLinkTosseRepository,
+  useRefreshRemoteOrigins,
+  useTosseRepoLinks,
+} from "../../ipc/useTosse";
 import { repoName, useConversationsStore } from "../../store/conversationsStore";
 import { useTosseRepoUi } from "./tosseRepoUiStore";
 import styles from "./TosseRepoCard.module.css";
@@ -65,9 +70,16 @@ function machineName(machine: { label: string | null }): string {
  *  never probed at all, so nothing may be said about its remote — reading it as "this
  *  folder has no git remote" is what the card did, and it was simply untrue. */
 export function whyUnmatched(link: TosseRepoLink | undefined): string {
-  // Checked FIRST: we did not look, so every claim below is about a probe that never ran.
-  if (link?.machine) {
-    return `This folder lives on ${machineName(link.machine)}. Flight Deck reads git remotes on this Mac only, so it cannot be matched automatically — pick a TOSSE repository by hand.`;
+  // Checked FIRST, and only while the server has not answered: nothing was read, so every
+  // claim below would be about a probe that never ran. Once it HAS answered, a folder over
+  // there is an ordinary candidate and falls through to the same sentences as a local one.
+  if (link?.machine && !link.machine.originRead) {
+    return `This folder lives on ${machineName(link.machine)}, and Flight Deck has not been able to read its git remote there yet — so it cannot be matched automatically. Pick a TOSSE repository by hand, or try again once the server is reachable.`;
+  }
+  if (link?.machine && !link.remoteUrl && !link.remoteError) {
+    // The server DID answer, and this folder has no origin. A fact about the folder, not
+    // about our reach — the previous branch would have blamed the server for it.
+    return `This folder has no git remote on ${machineName(link.machine)}, so it cannot be matched automatically.`;
   }
   if (link?.remoteError) {
     return "This folder's git remote could not be read, so it cannot be matched automatically.";
@@ -87,6 +99,15 @@ export function TosseRepoCard() {
   const repoPath = useConversationsStore((s) => s.repos.find((r) => r.id === repoId)?.path ?? null);
   const { data, isFetching, refetch, error: queryError } = useTosseRepoLinks(repoId != null);
   const linkRepository = useLinkTosseRepository();
+  // Refresh re-ASKS the servers as well as re-running the match: for a remote folder the
+  // url is cached, so a plain refetch would re-read the same answer and the button would
+  // be a no-op exactly where someone presses it (an origin that moved, a server that was
+  // off when the app started).
+  const refreshRemoteOrigins = useRefreshRemoteOrigins();
+  const refresh = () => {
+    refreshRemoteOrigins();
+    void refetch();
+  };
   const [picking, setPicking] = useState(false);
   const [query, setQuery] = useState("");
 
@@ -170,7 +191,7 @@ export function TosseRepoCard() {
             className={styles.iconBtn}
             title="Refresh"
             disabled={isFetching}
-            onClick={() => void refetch()}
+            onClick={refresh}
           >
             <Ico name="refresh" className="sm" />
           </button>
@@ -366,19 +387,19 @@ export function TosseRepoCard() {
                     : "This folder has not been matched against TOSSE yet. Refresh to check it."}
                 </div>
                 {/* WHERE the folder lives is a local fact — it stays true through an
-                    outage. Said here too, so "Refresh" does not read as a promise: no
-                    refresh will ever match this folder automatically. */}
-                {link?.machine ? (
+                    outage. Only said while the server has yet to answer: once it has,
+                    this folder matches like any other and the note would be misleading. */}
+                {link?.machine && !link.machine.originRead ? (
                   <div className={styles.emptyBody}>
-                    It lives on {machineName(link.machine)}, so only a manual pick can
-                    associate it.
+                    It lives on {machineName(link.machine)}, whose git remotes could not be
+                    read yet.
                   </div>
                 ) : null}
                 <button
                   type="button"
                   className={styles.ghostBtn}
                   disabled={isFetching}
-                  onClick={() => void refetch()}
+                  onClick={refresh}
                 >
                   {isFetching ? "Checking…" : "Refresh"}
                 </button>

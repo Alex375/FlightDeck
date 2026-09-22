@@ -1249,11 +1249,17 @@ pub async fn tosse_repo_links(
                     match crate::tosse::remote_probe(
                         row.machine_id.as_deref(),
                         row.machine_label.as_deref(),
+                        row.remote_origin_probed_at.is_some(),
                     ) {
-                        // Not a fault, and not a spawn either: the folder lives on a server,
-                        // so we skip the probe and say WHERE it is. The manual pin still
-                        // works on it (pure SQLite), which is what the card offers instead.
-                        RemoteProbe::Skip(machine) => (None, false, None, Some(machine)),
+                        // Not a fault, and not a spawn either: the folder lives on a
+                        // server, so the url comes from what that server last told us
+                        // (`tosse_probe_remote_origins`, out of band) instead of from a
+                        // `git` here. Cached rather than fetched on this path because
+                        // the sidebar calls it at load — and because a cached answer
+                        // still matches with the server switched off.
+                        RemoteProbe::Skip(machine) => {
+                            (row.remote_origin_url.clone(), false, None, Some(machine))
+                        }
                         RemoteProbe::Locally => match crate::git::remote_url(&row.path) {
                             Ok(RemoteLookup::Url(url)) => (Some(url), false, None, None),
                             Ok(RemoteLookup::NoRemote) => (None, false, None, None),
@@ -1294,6 +1300,144 @@ pub async fn tosse_repo_links(
         repositories,
         error: listed.err(),
     })
+}
+
+/// Refresh, over SSH, the `origin` of every folder that lives on a paired server, and
+/// cache each answer in SQLite.
+///
+/// This is what makes the automatic TOSSE match work on a remote repository at all: a
+/// folder over there has a perfectly good `origin`, it simply cannot be read by this
+/// Mac's `git` (see [`crate::tosse::remote_probe`]). The read is deliberately NOT on
+/// [`tosse_repo_links`]'s path — that one is called when the sidebar loads, and an SSH
+/// round trip per server does not belong there. It runs beside it and, when something
+/// actually changed, the front refetches.
+///
+/// Returns whether any cached url MOVED, so a run that confirms what we already knew —
+/// the overwhelmingly common one, since a repository's origin is set once — costs the UI
+/// nothing. Never returns `Err` for an unreachable server: that is the server's state,
+/// not a failure of this call, and turning it into one would resurrect exactly the false
+/// alarm the machine-aware probe removed.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<bool, String> {
+    // One sweep at a time. A second caller is told "nothing moved" rather than made to
+    // wait: the in-flight sweep will report the change itself, and React Query already
+    // de-duplicates concurrent fetches of the same key.
+    static SWEEPING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    {
+        let mut busy = SWEEPING.lock().unwrap();
+        if *busy {
+            return Ok(false);
+        }
+        *busy = true;
+    }
+    let done = ProbeGuard(&SWEEPING);
+
+    let store = app.state::<Store>();
+    let rows = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    // Group by server: the SSH handshake dwarfs the `git` calls, so ten folders on one
+    // machine are one connection, not ten.
+    let mut by_machine: std::collections::HashMap<
+        String,
+        Vec<crate::store::model::RepoTosseLink>,
+    > = std::collections::HashMap::new();
+    for row in rows {
+        if let Some(id) = row.machine_id.clone() {
+            by_machine.entry(id).or_default().push(row);
+        }
+    }
+    if by_machine.is_empty() {
+        return Ok(false);
+    }
+    let known_hosts = remote_known_hosts_path(&app);
+    let machines: Vec<_> = by_machine
+        .into_iter()
+        .filter_map(|(id, rows)| {
+            // A row whose server was un-paired keeps its cached url (it was true when it
+            // was read); there is simply nothing left to ask.
+            match store.machine_by_id(&id) {
+                Ok(Some(m)) => Some((m, rows)),
+                _ => None,
+            }
+        })
+        .collect();
+    drop(store);
+
+    let sweeps = machines.into_iter().map(|(machine, rows)| {
+        let known_hosts = known_hosts.clone();
+        async move {
+            let paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
+            let script = crate::git::remote_origin_script(&paths, |p| shq(p));
+            // `ConnectTimeout` only bounds the handshake. A server that answers and then
+            // stalls (a hung filesystem under one of the folders) would leave this future
+            // pending forever, and with it the query the sidebar's refresh waits on.
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                run_ssh_on_machine(&machine, known_hosts.as_deref(), &script),
+            )
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string()));
+            let out = match probe {
+                Ok(out) => out,
+                Err(e) => {
+                    // Said out loud in the log, but NOT to the user as a fault: a server
+                    // that is off is not a broken repository. The card keeps saying the
+                    // folder lives over there and offers the manual pin.
+                    eprintln!("[tosse] could not read origins on {}: {e}", machine.label);
+                    return Vec::new();
+                }
+            };
+            let answers = crate::git::parse_remote_origin_script(&out);
+            // `nogit` answers for the whole machine (empty path), so it cannot be paired
+            // with a folder — and it is not an answer ABOUT any folder either.
+            if answers.iter().any(|(_, a)| *a == crate::git::RemoteOriginAnswer::NoGit) {
+                eprintln!("[tosse] {} has no git, so no origin could be read", machine.label);
+                return Vec::new();
+            }
+            rows.into_iter()
+                .filter_map(|row| {
+                    let answer = answers.iter().find(|(p, _)| *p == row.path).map(|(_, a)| a)?;
+                    match answer {
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::Url(u)) => {
+                            Some((row.repo_id, Some(u.clone())))
+                        }
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::NoRemote) => {
+                            Some((row.repo_id, None))
+                        }
+                        // Not a repository / gone / no git: we learned nothing about an
+                        // origin, so nothing is cached. These re-ask on the next sweep —
+                        // an absent folder can come back, and writing "no origin" for one
+                        // would quietly un-match a repository that is merely unmounted.
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+    });
+    let results = futures_util::future::join_all(sweeps).await;
+
+    let store = app.state::<Store>();
+    let now = now_ms();
+    let mut changed = false;
+    for (repo_id, url) in results.into_iter().flatten() {
+        match store.set_repo_remote_origin(&repo_id, url.as_deref(), now) {
+            Ok(moved) => changed |= moved,
+            Err(e) => eprintln!("[tosse] could not cache the origin of {repo_id}: {e}"),
+        }
+    }
+    drop(done);
+    Ok(changed)
+}
+
+/// Releases [`tosse_probe_remote_origins`]'s one-sweep-at-a-time flag however the sweep
+/// ends — an early `?` included. A bare `*busy = false` at the bottom would leave the
+/// flag stuck on after the first error, and no origin would ever refresh again.
+struct ProbeGuard(&'static std::sync::Mutex<bool>);
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = false;
+    }
 }
 
 /// Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.

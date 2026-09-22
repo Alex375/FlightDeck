@@ -35,7 +35,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -71,6 +71,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v12,
     migrate_v13,
     migrate_v14,
+    migrate_v15,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -508,6 +509,37 @@ fn migrate_v14(conn: &Connection) -> rusqlite::Result<()> {
              created_at INTEGER NOT NULL,
              PRIMARY KEY (machine_id, token)
          );",
+    )
+}
+
+/// v15 — the `origin` of a repo that lives on a paired server, read OVER THERE.
+///
+/// A folder on this Mac has its remote read on every call (a local `git` is instant);
+/// a folder on a server costs an SSH round trip, on a path the sidebar calls at load.
+/// So the answer is cached here and the probe runs in the background — matching is
+/// then instant, and it still WORKS with the server switched off, which is the whole
+/// point of persisting rather than memoising.
+///
+/// Two columns, not one: `remote_origin_probed_at` says whether we ever LOOKED, and
+/// `remote_origin_url` what we found. A single nullable url would make "never asked"
+/// and "asked, this repo has no origin" the same row — the distinction this feature's
+/// every other surface is built to keep (see `tosse::resolve_links`). An empty string
+/// as a sentinel would be the same collapse, spelled differently.
+///
+/// Only ever written for a repo with a `machine_id`. A local folder's url is not
+/// cached: reading it is free, and a stale cache could only invent a wrong match.
+fn migrate_v15(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "remote_origin_url",
+        "ALTER TABLE repos ADD COLUMN remote_origin_url TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "repos",
+        "remote_origin_probed_at",
+        "ALTER TABLE repos ADD COLUMN remote_origin_probed_at INTEGER",
     )
 }
 
@@ -1224,7 +1256,8 @@ impl Store {
     pub fn repo_tosse_links(&self) -> rusqlite::Result<Vec<RepoTosseLink>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT r.id, r.path, r.tosse_repository_id, r.machine_id, m.label
+            "SELECT r.id, r.path, r.tosse_repository_id, r.machine_id, m.label,
+                    r.remote_origin_url, r.remote_origin_probed_at
              FROM repos r LEFT JOIN machines m ON m.id = r.machine_id
              ORDER BY r.added_at ASC",
         )?;
@@ -1236,10 +1269,48 @@ impl Store {
                     tosse_repository_id: row.get(2)?,
                     machine_id: row.get(3)?,
                     machine_label: row.get(4)?,
+                    remote_origin_url: row.get(5)?,
+                    remote_origin_probed_at: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Record what a SERVER answered for one repo's `origin`, and when we asked.
+    ///
+    /// `url: None` means the probe RAN and the repo has no origin — which is why the
+    /// timestamp is written on both outcomes: it is the field that says we looked, and
+    /// without it a repo with no origin would be re-probed on every single load.
+    ///
+    /// Returns whether the stored url actually CHANGED, so the caller can skip telling
+    /// the UI to refetch when nothing moved — the common case, since a repo's origin is
+    /// set once and then never again.
+    ///
+    /// ⚠️ Like [`Self::set_repo_tosse_link`], the only writer of these columns, and kept
+    /// out of `RepoRecord`: `upsert_repo` rewrites that record wholesale from callers
+    /// (add a folder, rename, undo) that know nothing about a remote origin, and would
+    /// blank a perfectly good cached answer.
+    pub fn set_repo_remote_origin(
+        &self,
+        repo_id: &str,
+        url: Option<&str>,
+        now_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT remote_origin_url FROM repos WHERE id = ?1",
+                params![repo_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        conn.execute(
+            "UPDATE repos SET remote_origin_url = ?2, remote_origin_probed_at = ?3 WHERE id = ?1",
+            params![repo_id, url, now_ms],
+        )?;
+        Ok(before.as_deref() != url)
     }
 
     /// Pin a repo to a TOSSE repository, or clear the pin with `None`.
@@ -2098,13 +2169,20 @@ mod tests {
     #[test]
     fn pre_migration_machines_row_reads_addresses_as_empty_vec() {
         let tmp = TempDb::new("machines-v12-premigration");
-        // The v10 `machines` shape, pre-dating the v12 `addresses` column. Only `meta`
-        // + `machines` are needed: with the marker bridged to 11, the runner skips
-        // every migration up to and including v11 (already applied) and runs ONLY
-        // migrate_v12, which touches nothing but `machines`.
+        // The v10 `machines` shape, pre-dating the v12 `addresses` column. With the
+        // marker bridged to 11, the runner skips every migration up to and including
+        // v11 (already applied) and runs the later ones — v12/v13 on `machines`, and
+        // v15 on `repos`, which is why that table is seeded too: a real database left
+        // by an older app has always had it (v1 creates it), so leaving it out made
+        // the fixture describe a state that cannot exist.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE repos (
+                id       TEXT PRIMARY KEY,
+                path     TEXT NOT NULL,
+                added_at INTEGER NOT NULL
+            );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
                 label         TEXT NOT NULL,
@@ -2212,11 +2290,16 @@ mod tests {
         let tmp = TempDb::new("machines-v13-premigration");
         // The v12 `machines` shape (addresses column present), pre-dating v13. Marker
         // bridged to 12 so the runner skips every migration up to and including v12
-        // (already applied) and runs ONLY migrate_v13, which touches nothing but
-        // `machines`.
+        // (already applied) and runs the later ones — v13 on `machines`, and v15 on
+        // `repos`, seeded here for the same reason as the v12 fixture above.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE repos (
+                id       TEXT PRIMARY KEY,
+                path     TEXT NOT NULL,
+                added_at INTEGER NOT NULL
+            );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
                 label         TEXT NOT NULL,
@@ -2850,6 +2933,47 @@ mod tests {
         assert_eq!(links[1].machine_id.as_deref(), Some("m1"));
         // Named, so the card can say WHERE the folder is rather than only that it is away.
         assert_eq!(links[1].machine_label.as_deref(), Some("vps"));
+    }
+
+    /// The cached `origin` of a folder that lives on a server — what makes the automatic
+    /// TOSSE match work over there at all, since this Mac's `git` cannot read that path.
+    #[test]
+    fn a_remote_origin_is_cached_and_says_whether_it_was_ever_read() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo_at("r1", 1)).unwrap();
+
+        // Never asked: BOTH columns null. Distinct from "asked, no origin" below — the
+        // whole reason the timestamp exists.
+        let never = &store.repo_tosse_links().unwrap()[0];
+        assert_eq!(never.remote_origin_url, None);
+        assert_eq!(never.remote_origin_probed_at, None);
+
+        let url = "https://github.com/Alex375/FlightDeck.git";
+        assert!(store.set_repo_remote_origin("r1", Some(url), 1_000).unwrap(), "first read moved it");
+        let got = &store.repo_tosse_links().unwrap()[0];
+        assert_eq!(got.remote_origin_url.as_deref(), Some(url));
+        assert_eq!(got.remote_origin_probed_at, Some(1_000));
+
+        // The common case: the server confirms what we already knew. Reporting "changed"
+        // here would make the UI refetch on every single sweep, forever.
+        assert!(!store.set_repo_remote_origin("r1", Some(url), 2_000).unwrap());
+
+        // Asked, and this repo has no origin: url null, timestamp SET. Reading only the
+        // url would send us back to the server on every load for a settled answer.
+        assert!(store.set_repo_remote_origin("r1", None, 3_000).unwrap());
+        let cleared = &store.repo_tosse_links().unwrap()[0];
+        assert_eq!(cleared.remote_origin_url, None);
+        assert_eq!(cleared.remote_origin_probed_at, Some(3_000));
+
+        // ⚠️ The regression the column shape is chosen to avoid: re-upserting the repo
+        // (rename, undo, a path fix) knows nothing about origins and must not blank one.
+        store.set_repo_remote_origin("r1", Some(url), 4_000).unwrap();
+        store.upsert_repo(&repo_at("r1", 1)).unwrap();
+        assert_eq!(
+            store.repo_tosse_links().unwrap()[0].remote_origin_url.as_deref(),
+            Some(url),
+            "upsert_repo must not clear a cache it knows nothing about"
+        );
     }
 
     #[test]

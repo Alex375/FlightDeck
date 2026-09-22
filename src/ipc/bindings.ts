@@ -603,6 +603,31 @@ async tosseRepoLinks() : Promise<Result<TosseRepoLinksPayload, string>> {
 }
 },
 /**
+ * Refresh, over SSH, the `origin` of every folder that lives on a paired server, and
+ * cache each answer in SQLite.
+ * 
+ * This is what makes the automatic TOSSE match work on a remote repository at all: a
+ * folder over there has a perfectly good `origin`, it simply cannot be read by this
+ * Mac's `git` (see [`crate::tosse::remote_probe`]). The read is deliberately NOT on
+ * [`tosse_repo_links`]'s path — that one is called when the sidebar loads, and an SSH
+ * round trip per server does not belong there. It runs beside it and, when something
+ * actually changed, the front refetches.
+ * 
+ * Returns whether any cached url MOVED, so a run that confirms what we already knew —
+ * the overwhelmingly common one, since a repository's origin is set once — costs the UI
+ * nothing. Never returns `Err` for an unreachable server: that is the server's state,
+ * not a failure of this call, and turning it into one would resurrect exactly the false
+ * alarm the machine-aware probe removed.
+ */
+async tosseProbeRemoteOrigins() : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_probe_remote_origins") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
  * 
  * Local only — the CRM has no field for a machine path, and this is never written back.
@@ -5553,7 +5578,15 @@ export type TosseRepoMachine = { id: string;
  * machine any more. Unnamed is NOT local: a folder whose server was unpaired still
  * sits over there, and reading it as local is exactly the confusion this type ends.
  */
-label: string | null }
+label: string | null; 
+/**
+ * Whether that server has ever ANSWERED about this folder's `origin`.
+ * 
+ * Splits the two silences the UI must not blur: "we have not managed to ask yet"
+ * (never swept, or the server is off) from "we asked, and this folder has no
+ * origin". Both show no url; only the second is a fact about the folder.
+ */
+originRead: boolean }
 /**
  * A repository as TOSSE knows it.
  * 

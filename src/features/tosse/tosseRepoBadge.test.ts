@@ -60,13 +60,13 @@ describe("badgeStateFor", () => {
     // "cannot change to …" — indistinguishable from a deleted folder — and the badge showed
     // a warning on a repository whose remote matches the CRM perfectly. No automatic match
     // is possible from here, which is an ordinary limit, not a fault.
-    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower" } }))).toBe("unlinked");
+    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true } }))).toBe("unlinked");
   });
 
   it("still shows a repository pinned by hand on a remote folder", () => {
     // The manual pin is pure local SQLite, so it works over there exactly as it does here.
     expect(
-      badgeStateFor(link({ machine: { id: "m1", label: "tower" }, repository: { id: "r" } })),
+      badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true }, repository: { id: "r" } })),
     ).toBe("linked");
   });
 
@@ -94,20 +94,45 @@ describe("whyUnmatched", () => {
     }) as TosseRepoLink;
 
   it("names the server, instead of claiming the folder has no git remote", () => {
-    // It has one — we simply never read it, because the path lives on that machine. Saying
-    // "no git remote" sent the user hunting for a remote that is right there.
-    const said = whyUnmatched(cardLink({ machine: { id: "m1", label: "tower" } }));
+    // It has one — we simply have not read it yet, because the path lives on that machine.
+    // Saying "no git remote" sent the user hunting for a remote that is right there.
+    const said = whyUnmatched(
+      cardLink({ machine: { id: "m1", label: "tower", originRead: false } }),
+    );
     expect(said).toContain("tower");
-    expect(said).toContain("pick a TOSSE repository by hand");
-    expect(said).not.toContain("no git remote");
+    expect(said).toContain("Pick a TOSSE repository by hand");
+    expect(said).not.toContain("has no git remote");
   });
 
   it("does not pass an un-paired server off as this Mac", () => {
     // Only the id survives on the folder. The folder is still over there, and the sentence
     // must not quietly become the local one.
-    expect(whyUnmatched(cardLink({ machine: { id: "m1", label: null } }))).toContain(
-      "no longer paired",
+    expect(
+      whyUnmatched(cardLink({ machine: { id: "m1", label: null, originRead: false } })),
+    ).toContain("no longer paired");
+  });
+
+  it("stops blaming the server once it has answered", () => {
+    // The sweep read this folder's origin and nothing in the CRM carries it. That is a
+    // fact about the CRM, not about our reach — keeping the "could not read it there yet"
+    // sentence would send the user to fix a server that is working fine.
+    const said = whyUnmatched(
+      cardLink({
+        machine: { id: "m1", label: "tower", originRead: true },
+        remoteUrl: "https://github.com/Alex375/FlightDeck.git",
+      }),
     );
+    expect(said).toContain("No TOSSE repository carries");
+    expect(said).not.toContain("tower");
+  });
+
+  it("tells a server that has no origin for the folder from one it could not reach", () => {
+    // Same empty url, two different truths. Answered: the folder genuinely has no origin.
+    const answered = whyUnmatched(
+      cardLink({ machine: { id: "m1", label: "tower", originRead: true } }),
+    );
+    expect(answered).toContain("has no git remote on tower");
+    expect(answered).not.toContain("not been able to read");
   });
 
   it("keeps the local answers it already gave", () => {

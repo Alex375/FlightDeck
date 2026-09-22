@@ -6,6 +6,7 @@
 // completes through the same app-global `account_login` event — whose handler invalidates
 // that prefix (see `useGlobalSessionEvents`), so the card refreshes itself for free.
 
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
 import type {
@@ -130,6 +131,7 @@ export function useTosseRepoLinks(enabled = true) {
   // folder now re-runs the match instead of waiting out `staleTime`.
   // `tosseRepoLinksKey` stays the PREFIX, so invalidating by it still matches every variant.
   const repoKey = useConversationsStore((s) => s.repos.map((r) => r.id).join(","));
+  useRemoteOriginSweep(enabled, repoKey);
   return useQuery<TosseRepoLinksPayload>({
     queryKey: [...tosseRepoLinksKey, repoKey],
     enabled,
@@ -138,6 +140,55 @@ export function useTosseRepoLinks(enabled = true) {
     // this stays deliberately cold; the mutation below invalidates it on a real change.
     staleTime: 5 * 60_000,
   });
+}
+
+export const tosseRemoteOriginsKey = ["tosse-remote-origins"] as const;
+
+/**
+ * Ask each paired server for the `origin` of the folders that live on it, so a remote
+ * repository matches its TOSSE entry BY ITSELF — the way a local one always has.
+ *
+ * It runs beside `useTosseRepoLinks`, never inside it: that query is what the sidebar
+ * waits on at load, and an SSH round trip does not belong on that path. The answer lands
+ * in SQLite, so the match is instant on every later load and still works with the server
+ * switched off — the reason it is cached rather than merely awaited.
+ *
+ * Once per app run (`staleTime: Infinity`) — a repository's origin is set once and then
+ * never again, so re-asking on every render would be pure noise on someone's server. The
+ * folder list is in the key, so adding a remote folder does ask about it; the card's
+ * Refresh button forces a re-ask for the rare case where an origin genuinely moved.
+ *
+ * ⚠️ The refetch is gated on `changed`. Invalidating unconditionally would put the app in
+ * a loop: refetch → sweep → invalidate → refetch.
+ */
+/**
+ * Force the next sweep to ASK the servers again, instead of settling for what they said
+ * last time. Behind a hook so the card stays free of query plumbing — and so the key has
+ * one owner.
+ *
+ * The card's Refresh button needs it: a remote folder's url is cached, so re-running the
+ * match alone would re-read the same answer and the button would do nothing in the exact
+ * situation someone presses it (the server was off at launch; an origin really moved).
+ */
+export function useRefreshRemoteOrigins(): () => void {
+  const qc = useQueryClient();
+  return () => void qc.invalidateQueries({ queryKey: tosseRemoteOriginsKey });
+}
+
+function useRemoteOriginSweep(enabled: boolean, repoKey: string): void {
+  const qc = useQueryClient();
+  const { data: changed } = useQuery({
+    queryKey: [...tosseRemoteOriginsKey, repoKey],
+    enabled,
+    queryFn: () => unwrap(commands.tosseProbeRemoteOrigins()),
+    staleTime: Infinity,
+    // A server that is off is not a failure worth hammering: the folders keep their
+    // cached answer, and the card says where they live.
+    retry: false,
+  });
+  useEffect(() => {
+    if (changed) void qc.invalidateQueries({ queryKey: tosseRepoLinksKey });
+  }, [changed, qc]);
 }
 
 /** One folder's link, or `undefined` while the query is still loading / disabled. */

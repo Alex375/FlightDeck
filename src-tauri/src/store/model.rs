@@ -369,6 +369,15 @@ pub struct RepoTosseLink {
     /// to "local" would bring back the very misreading this field exists to end), we
     /// just cannot name the server.
     pub machine_label: Option<String>,
+    /// For a remote folder: the `origin` a SERVER last reported, cached so matching is
+    /// instant at load and survives the server being switched off. Always `None` for a
+    /// local folder, whose remote is read live.
+    pub remote_origin_url: Option<String>,
+    /// When that probe last ran (unix ms). ⚠️ This — not the url — is what says we ever
+    /// LOOKED: `probed_at: Some, url: None` is "asked, this repo has no origin", while
+    /// both `None` is "never asked". Collapsing the two re-probes a repo forever and
+    /// lets the UI state a verdict it never obtained.
+    pub remote_origin_probed_at: Option<i64>,
 }
 
 /// A TOSSE project pinned to one of the app's local folders.

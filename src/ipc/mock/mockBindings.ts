@@ -1340,12 +1340,19 @@ export const mockCommands = {
         ambiguous: [],
         remoteError: null,
         // The demo folder is on this Mac. A folder on a paired server carries its machine
-        // here instead, and then no url was ever read — the probe is skipped rather than
-        // run against a path that does not exist locally.
+        // here instead, and its url is whatever that server last reported — read over SSH
+        // by `tosseProbeRemoteOrigins`, never by a `git` run against a path that does not
+        // exist locally.
         machine: null,
       },
     ];
     return ok({ connected: true, links, repositories, error: null });
+  },
+  // No server to ask in the browser, and nothing moved — which is the answer that keeps
+  // the front from refetching. Returning `true` here would loop the demo: sweep →
+  // invalidate → refetch → sweep.
+  async tosseProbeRemoteOrigins(): Promise<Result<boolean, string>> {
+    return ok(false);
   },
   async tosseLinkRepository(): Promise<Result<null, string>> {
     return ok(null);

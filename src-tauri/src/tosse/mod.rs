@@ -1623,6 +1623,12 @@ pub struct TosseRepoMachine {
     /// machine any more. Unnamed is NOT local: a folder whose server was unpaired still
     /// sits over there, and reading it as local is exactly the confusion this type ends.
     pub label: Option<String>,
+    /// Whether that server has ever ANSWERED about this folder's `origin`.
+    ///
+    /// Splits the two silences the UI must not blur: "we have not managed to ask yet"
+    /// (never swept, or the server is off) from "we asked, and this folder has no
+    /// origin". Both show no url; only the second is a fact about the folder.
+    pub origin_read: bool,
 }
 
 /// Whether this Mac's `git` has anything to say about a folder.
@@ -1643,11 +1649,16 @@ pub enum RemoteProbe {
 /// ⚠️ A `machine_id` whose label is gone still means REMOTE. Falling back to `Locally`
 /// because the server was unpaired would restore the false fault for exactly the folders
 /// the user can no longer reach to check.
-pub fn remote_probe(machine_id: Option<&str>, machine_label: Option<&str>) -> RemoteProbe {
+pub fn remote_probe(
+    machine_id: Option<&str>,
+    machine_label: Option<&str>,
+    origin_read: bool,
+) -> RemoteProbe {
     match machine_id {
         Some(id) => RemoteProbe::Skip(TosseRepoMachine {
             id: id.to_string(),
             label: machine_label.map(str::to_string),
+            origin_read,
         }),
         None => RemoteProbe::Locally,
     }
@@ -2401,15 +2412,30 @@ mod tests {
         }
     }
 
-    /// Same folder, but sitting on a paired server: no url was read (the probe was skipped),
-    /// and the machine travels with it.
+    /// Same folder, but sitting on a paired server, and the server never answered about
+    /// its `origin` yet — so no url travels with it, only the machine.
     fn on_machine(repo_id: &str, manual: Option<&str>, label: Option<&str>) -> LocalRepo {
         LocalRepo {
             machine: Some(TosseRepoMachine {
                 id: "m-1".into(),
                 label: label.map(str::to_string),
+                origin_read: false,
             }),
             ..local(repo_id, None, manual)
+        }
+    }
+
+    /// The same folder AFTER a sweep read its origin on the server: from here on it is an
+    /// ordinary candidate for the automatic match, url and all.
+    fn on_machine_with_origin(repo_id: &str, url: &str) -> LocalRepo {
+        LocalRepo {
+            remote_url: Some(url.to_string()),
+            machine: Some(TosseRepoMachine {
+                id: "m-1".into(),
+                label: Some("tower".into()),
+                origin_read: true,
+            }),
+            ..local(repo_id, None, None)
         }
     }
 
@@ -2534,18 +2560,46 @@ mod tests {
     /// and the badge raised a fault on a perfectly healthy repository.
     #[test]
     fn a_folder_on_a_server_is_never_probed_with_this_macs_git() {
-        assert_eq!(remote_probe(None, None), RemoteProbe::Locally);
+        assert_eq!(remote_probe(None, None, false), RemoteProbe::Locally);
         assert_eq!(
-            remote_probe(Some("m-1"), Some("tower")),
-            RemoteProbe::Skip(TosseRepoMachine { id: "m-1".into(), label: Some("tower".into()) }),
+            remote_probe(Some("m-1"), Some("tower"), true),
+            RemoteProbe::Skip(TosseRepoMachine {
+                id: "m-1".into(),
+                label: Some("tower".into()),
+                origin_read: true,
+            }),
         );
         // A server that was unpaired leaves the id behind. The folder is still over there:
         // falling back to a local probe would restore the false fault precisely for the
         // repositories the user can no longer look at.
         assert_eq!(
-            remote_probe(Some("m-gone"), None),
-            RemoteProbe::Skip(TosseRepoMachine { id: "m-gone".into(), label: None }),
+            remote_probe(Some("m-gone"), None, false),
+            RemoteProbe::Skip(TosseRepoMachine {
+                id: "m-gone".into(),
+                label: None,
+                origin_read: false,
+            }),
         );
+    }
+
+    /// The point of the whole remote sweep: once a server has told us a folder's `origin`,
+    /// that folder matches its TOSSE repository BY ITSELF — same rule, same normalisation,
+    /// as a folder on this Mac. Nothing about the matcher is remote-aware; the url simply
+    /// arrives from elsewhere.
+    #[test]
+    fn a_remote_folder_matches_automatically_once_its_origin_is_known() {
+        let repositories = vec![repo("r-fd", "FlightDeck", Some("https://github.com/Alex375/FlightDeck"))];
+        // The server reports the `.git` form over HTTPS; the CRM holds it without. Both
+        // normalise to the same key — the real production pair on Alexandre's server.
+        let links = resolve_links(
+            &[on_machine_with_origin("remote", "https://github.com/Alex375/FlightDeck.git")],
+            Some(&repositories),
+        );
+        assert_eq!(links[0].repository.as_ref().map(|r| r.id.as_str()), Some("r-fd"));
+        assert_eq!(links[0].source, Some(TosseLinkSource::Remote), "matched on the remote, not pinned");
+        // Still known to live over there: the card says so next to the match, and the
+        // folder fact must not go back to reading "Local folder".
+        assert_eq!(links[0].machine.as_ref().map(|m| m.origin_read), Some(true));
     }
 
     /// Skipping the probe must not cost the folder its association: a manual pin is pure
