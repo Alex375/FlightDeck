@@ -1614,6 +1614,45 @@ pub enum TosseLinkSource {
     Remote,
 }
 
+/// The paired server a folder lives on — everything the UI needs to say "not on this Mac".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TosseRepoMachine {
+    pub id: String,
+    /// The server's label as the user named it, or `None` when the id names no paired
+    /// machine any more. Unnamed is NOT local: a folder whose server was unpaired still
+    /// sits over there, and reading it as local is exactly the confusion this type ends.
+    pub label: Option<String>,
+}
+
+/// Whether this Mac's `git` has anything to say about a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteProbe {
+    /// Run `git` on the path — the folder is on this Mac.
+    Locally,
+    /// Do not run it: the path exists only on that server, so the local answer would be a
+    /// lie. `git -C <remote path>` exits 128 with "cannot change to …", which is BYTE FOR
+    /// BYTE what a deleted folder returns — the very reason this must be decided before
+    /// the spawn rather than guessed from its stderr afterwards.
+    Skip(TosseRepoMachine),
+}
+
+/// Decide it from where the repo lives. Pure, so the one rule that matters has a single
+/// definition and a test, instead of living inside an async command nothing can call.
+///
+/// ⚠️ A `machine_id` whose label is gone still means REMOTE. Falling back to `Locally`
+/// because the server was unpaired would restore the false fault for exactly the folders
+/// the user can no longer reach to check.
+pub fn remote_probe(machine_id: Option<&str>, machine_label: Option<&str>) -> RemoteProbe {
+    match machine_id {
+        Some(id) => RemoteProbe::Skip(TosseRepoMachine {
+            id: id.to_string(),
+            label: machine_label.map(str::to_string),
+        }),
+        None => RemoteProbe::Locally,
+    }
+}
+
 /// What the caller knows about one local folder, gathered before matching. Keeping this an
 /// INPUT is what lets [`resolve_links`] stay pure: git and SQLite are read by the IPC layer.
 #[derive(Debug, Clone)]
@@ -1621,9 +1660,15 @@ pub struct LocalRepo {
     /// Flight Deck's own repo id (the SQLite primary key).
     pub repo_id: String,
     /// `origin`'s URL, or `None` for a repository with no remote.
+    ///
+    /// ⚠️ Also `None` for a folder on a paired server (see `machine`): this Mac's `git`
+    /// cannot read a path that only exists over there, so the url is UNKNOWN, not absent.
+    /// The two are told apart by `machine`, never by this field alone.
     pub remote_url: Option<String>,
     /// A repository id the user pinned by hand, if any.
     pub manual_repository_id: Option<String>,
+    /// The paired server this folder lives on, `None` for a folder on this Mac.
+    pub machine: Option<TosseRepoMachine>,
 }
 
 /// One local folder's relationship to TOSSE, as the UI shows it.
@@ -1658,7 +1703,18 @@ pub struct TosseRepoLink {
     /// Why the folder's remote could not be read — a genuine FAULT only (the folder has
     /// vanished, permissions, git missing). `None` on the happy path, when the repository
     /// simply has no remote, AND when the folder is not a repository: those are answers.
+    ///
+    /// ⚠️ Never set for a folder on a paired server (see `machine`). This Mac's `git`
+    /// fails on a remote path with the same "cannot change to …" as a deleted folder, and
+    /// reporting that verbatim put a red flag on every remote repository — a fault that
+    /// was ours, blamed on the user's folder.
     pub remote_error: Option<String>,
+    /// The paired server this folder lives on, `None` for a folder on this Mac.
+    ///
+    /// Set means the automatic match cannot RUN from here (we read git remotes on this
+    /// Mac only) — an ordinary limit like `not_a_repository`, not a failure: the manual
+    /// pin still works, and it is pure SQLite so it works on a remote folder too.
+    pub machine: Option<TosseRepoMachine>,
 }
 
 /// Pair local folders with CRM repositories. Pure — no IO, no globals — so the matching
@@ -1688,6 +1744,10 @@ pub fn resolve_links(
                 ambiguous: Vec::new(),
                 not_a_repository: false,
                 remote_error: None,
+                // Where the folder lives is a LOCAL fact — it stays true while the CRM is
+                // unreachable, so the UI can still explain why no automatic match ran
+                // instead of adding "unchecked" on top of it.
+                machine: local.machine.clone(),
             })
             .collect();
     };
@@ -1741,6 +1801,7 @@ pub fn resolve_links(
                 ambiguous,
                 not_a_repository: false,
                 remote_error: None,
+                machine: local.machine.clone(),
             }
         })
         .collect()
@@ -2336,6 +2397,19 @@ mod tests {
             repo_id: repo_id.to_string(),
             remote_url: remote.map(str::to_string),
             manual_repository_id: manual.map(str::to_string),
+            machine: None,
+        }
+    }
+
+    /// Same folder, but sitting on a paired server: no url was read (the probe was skipped),
+    /// and the machine travels with it.
+    fn on_machine(repo_id: &str, manual: Option<&str>, label: Option<&str>) -> LocalRepo {
+        LocalRepo {
+            machine: Some(TosseRepoMachine {
+                id: "m-1".into(),
+                label: label.map(str::to_string),
+            }),
+            ..local(repo_id, None, manual)
         }
     }
 
@@ -2453,6 +2527,58 @@ mod tests {
         // count as a verdict.
         let empty = resolve_links(&locals, Some(&[]));
         assert!(empty.iter().all(|l| l.resolved), "an empty CRM is still an answer");
+    }
+
+    /// The bug this exists to end: a folder on a paired server was probed with THIS Mac's
+    /// git, which exits 128 "cannot change to …" — the same answer a deleted folder gives —
+    /// and the badge raised a fault on a perfectly healthy repository.
+    #[test]
+    fn a_folder_on_a_server_is_never_probed_with_this_macs_git() {
+        assert_eq!(remote_probe(None, None), RemoteProbe::Locally);
+        assert_eq!(
+            remote_probe(Some("m-1"), Some("tower")),
+            RemoteProbe::Skip(TosseRepoMachine { id: "m-1".into(), label: Some("tower".into()) }),
+        );
+        // A server that was unpaired leaves the id behind. The folder is still over there:
+        // falling back to a local probe would restore the false fault precisely for the
+        // repositories the user can no longer look at.
+        assert_eq!(
+            remote_probe(Some("m-gone"), None),
+            RemoteProbe::Skip(TosseRepoMachine { id: "m-gone".into(), label: None }),
+        );
+    }
+
+    /// Skipping the probe must not cost the folder its association: a manual pin is pure
+    /// SQLite and works on a remote folder exactly as on a local one. What it does cost is
+    /// the AUTOMATIC match — hence `machine`, so the card can say why instead of leaving
+    /// the user to read "this folder has no git remote", which is not true.
+    #[test]
+    fn a_remote_folder_still_resolves_through_its_manual_pin() {
+        let repositories = vec![repo("r-fd", "FlightDeck", Some("https://github.com/Alex375/FlightDeck"))];
+        let links = resolve_links(
+            &[on_machine("remote-pinned", Some("r-fd"), Some("tower")), on_machine("remote-plain", None, None)],
+            Some(&repositories),
+        );
+
+        assert_eq!(links[0].repository.as_ref().map(|r| r.id.as_str()), Some("r-fd"));
+        assert_eq!(links[0].source, Some(TosseLinkSource::Manual));
+        assert_eq!(links[0].machine.as_ref().map(|m| m.id.as_str()), Some("m-1"));
+
+        // Unpinned: no verdict about a remote either way, and above all no fault.
+        assert!(links[1].repository.is_none());
+        assert_eq!(links[1].remote_url, None);
+        assert_eq!(links[1].remote_error, None, "a server folder is not a git failure");
+        assert!(!links[1].not_a_repository, "we did not look — we cannot claim that either");
+        assert!(links[1].machine.is_some(), "the UI must be able to say WHERE it lives");
+    }
+
+    /// Where a folder lives is a local fact: it survives a CRM outage, so the card can still
+    /// explain the missing automatic match instead of stacking "unchecked" on top of it.
+    #[test]
+    fn an_unreadable_crm_still_says_the_folder_is_on_a_server() {
+        let links = resolve_links(&[on_machine("remote", None, Some("tower"))], None);
+        assert!(!links[0].resolved);
+        assert_eq!(links[0].machine.as_ref().and_then(|m| m.label.as_deref()), Some("tower"));
     }
 
     /// The `{success, data}` envelope, the nested N-N project join, and a null url — the

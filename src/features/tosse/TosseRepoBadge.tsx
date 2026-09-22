@@ -26,8 +26,11 @@ interface BadgeLink {
   repository: unknown;
   ambiguous: unknown[];
   manualRepositoryId: string | null;
-  /** A genuine git FAULT only — never set for a plain folder (see `notARepository`). */
+  /** A genuine git FAULT only — never set for a plain folder (see `notARepository`), and
+   *  never for a folder on a server (see `machine`). */
   remoteError: string | null;
+  /** The server this folder lives on, when it is not on this Mac. */
+  machine: unknown;
 }
 
 export function badgeStateFor(link: BadgeLink | undefined): BadgeState {
@@ -46,6 +49,10 @@ export function badgeStateFor(link: BadgeLink | undefined): BadgeState {
   // Two situations that are NOT "simply not associated": several CRM repositories match
   // this remote, or a pinned one really has vanished server-side (the list WAS read).
   if (link.ambiguous.length > 0 || link.manualRepositoryId) return "attention";
+  // A folder on a paired server lands here too, and that is the point: no automatic match
+  // was possible, which is an ordinary limit — exactly like a folder that is not a clone.
+  // It used to arrive as `remoteError` (this Mac's git run on a path that only exists over
+  // there) and raised a warning flag on a repository nothing was wrong with.
   return "unlinked";
 }
 

@@ -1215,16 +1215,27 @@ impl Store {
 
     /// Every repo with the TOSSE repository it is pinned to, if any. Feeds the
     /// association matcher, which also needs `path` to read each folder's git remote.
+    ///
+    /// ⚠️ `machine_id` is part of the answer, not a detail: without it the caller reads
+    /// every row as a folder on this Mac and probes a remote path with the local `git`
+    /// — which fails indistinguishably from a deleted folder. The `LEFT JOIN` is what
+    /// keeps a repo whose server was unpaired in the list (still remote, just unnamed)
+    /// instead of dropping it from the association view entirely.
     pub fn repo_tosse_links(&self) -> rusqlite::Result<Vec<RepoTosseLink>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, path, tosse_repository_id FROM repos ORDER BY added_at ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.path, r.tosse_repository_id, r.machine_id, m.label
+             FROM repos r LEFT JOIN machines m ON m.id = r.machine_id
+             ORDER BY r.added_at ASC",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(RepoTosseLink {
                     repo_id: row.get(0)?,
                     path: row.get(1)?,
                     tosse_repository_id: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    machine_label: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2803,6 +2814,42 @@ mod tests {
 
         // A repo that does not exist reports zero rows rather than a silent success.
         assert_eq!(store.set_repo_tosse_link("ghost", Some("x")).unwrap(), 0);
+    }
+
+    /// The association view must be able to tell a folder on this Mac from one on a server:
+    /// their paths look alike, and probing a remote one with the local `git` fails exactly
+    /// like a deleted folder — which is how a healthy repository came to be flagged broken.
+    #[test]
+    fn tosse_links_say_which_machine_each_folder_lives_on() {
+        let store = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        store.upsert_machine(&m).unwrap();
+        store.upsert_repo(&repo_at("r-local", 1)).unwrap();
+        let mut remote = repo_at("r-remote", 2);
+        remote.path = "/home/agent/FlightDeck".into();
+        remote.machine_id = Some("m1".into());
+        store.upsert_repo(&remote).unwrap();
+
+        let links = store.repo_tosse_links().unwrap();
+        assert_eq!(links.len(), 2, "the LEFT JOIN must not drop either kind of folder");
+        assert_eq!(links[0].machine_id, None);
+        assert_eq!(links[0].machine_label, None);
+        assert_eq!(links[1].machine_id.as_deref(), Some("m1"));
+        // Named, so the card can say WHERE the folder is rather than only that it is away.
+        assert_eq!(links[1].machine_label.as_deref(), Some("vps"));
     }
 
     #[test]

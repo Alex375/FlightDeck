@@ -5502,8 +5502,21 @@ notARepository: boolean;
  * Why the folder's remote could not be read — a genuine FAULT only (the folder has
  * vanished, permissions, git missing). `None` on the happy path, when the repository
  * simply has no remote, AND when the folder is not a repository: those are answers.
+ * 
+ * ⚠️ Never set for a folder on a paired server (see `machine`). This Mac's `git`
+ * fails on a remote path with the same "cannot change to …" as a deleted folder, and
+ * reporting that verbatim put a red flag on every remote repository — a fault that
+ * was ours, blamed on the user's folder.
  */
-remoteError: string | null }
+remoteError: string | null; 
+/**
+ * The paired server this folder lives on, `None` for a folder on this Mac.
+ * 
+ * Set means the automatic match cannot RUN from here (we read git remotes on this
+ * Mac only) — an ordinary limit like `not_a_repository`, not a failure: the manual
+ * pin still works, and it is pure SQLite so it works on a remote folder too.
+ */
+machine: TosseRepoMachine | null }
 /**
  * How each of Flight Deck's folders relates to TOSSE, in one call.
  * 
@@ -5531,6 +5544,16 @@ repositories: TosseRepository[];
  * as un-associated — which would look like the association was lost.
  */
 error: string | null }
+/**
+ * The paired server a folder lives on — everything the UI needs to say "not on this Mac".
+ */
+export type TosseRepoMachine = { id: string; 
+/**
+ * The server's label as the user named it, or `None` when the id names no paired
+ * machine any more. Unnamed is NOT local: a folder whose server was unpaired still
+ * sits over there, and reading it as local is exactly the confusion this type ends.
+ */
+label: string | null }
 /**
  * A repository as TOSSE knows it.
  * 

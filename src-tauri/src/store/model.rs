@@ -357,6 +357,18 @@ pub struct RepoTosseLink {
     pub path: String,
     /// The CRM repository id, or `None` when the user never pinned one.
     pub tosse_repository_id: Option<String>,
+    /// The paired server this folder lives on, or `None` for a folder on this Mac.
+    ///
+    /// ⚠️ Carried here because `path` alone is MACHINE-BLIND: a remote folder's path
+    /// exists only on that server, so running this Mac's `git` on it fails exactly like
+    /// a folder that was deleted. Without this field the association check reports a
+    /// fault on every remote repository.
+    pub machine_id: Option<String>,
+    /// That server's label, when it is still paired. `None` while `machine_id` is set
+    /// means the id names no machine any more — the folder is STILL remote (degrading it
+    /// to "local" would bring back the very misreading this field exists to end), we
+    /// just cannot name the server.
+    pub machine_label: Option<String>,
 }
 
 /// A TOSSE project pinned to one of the app's local folders.
