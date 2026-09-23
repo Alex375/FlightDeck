@@ -24,6 +24,7 @@ import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
 import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
+import { GlobalExtensions } from "../extensions/ExtensionsManager";
 import { useClaudeAccount } from "../../ipc/useAccounts";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
@@ -69,6 +70,10 @@ const TABS: Array<{
   // would be its own tab. Holds what used to be the top-level "Behavior" tab (output
   // style, bypass permissions) — both are Claude-only and do nothing for Codex.
   { id: "claudeCode", label: "Claude Code", icon: "code", needsClaude: true },
+  // The global counterpart of a conversation's ⌘E panel: cloud connectors and MCP servers
+  // (with their global per-tool permissions), plugins, the user's skills and sub-agents.
+  // Claude-only like the tab above — Codex's own extensions stay in its ⌘E panel.
+  { id: "extensions", label: "Extensions", icon: "layers", needsClaude: true },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
   { id: "control", label: "Control", icon: "wand" },
@@ -457,6 +462,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   </>
                 )}
                 {claudeCodeSub === "helpers" && <ClaudeCodeHelpers />}
+              </div>
+            )}
+
+            {!searching && section === "extensions" && (
+              <div>
+                <PageHead
+                  title="Extensions"
+                  subtitle="What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A conversation's own panel (⌘E) can tighten these for it alone."
+                />
+                <GlobalExtensions />
               </div>
             )}
 

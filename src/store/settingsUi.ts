@@ -22,6 +22,9 @@ export type SettingsSection =
    *  ⚠️ Consequence, accepted: with no Claude account signed in, "Output style" and
    *  "Allow Bypass permissions mode" are not reachable — neither does anything to Codex. */
   | "claudeCode"
+  /** The global extensions picture (connectors + global per-tool permissions, plugins,
+   *  skills, sub-agents) — the counterpart of a conversation's ⌘E panel. Claude-only. */
+  | "extensions"
   | "shortcuts"
   | "control"
   // "notifications" bundles the OS channels, the fleet readout and the background-task

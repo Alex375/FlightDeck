@@ -73,6 +73,7 @@ export type {
   PermissionRequestPayload,
   PermissionRule,
   PermissionRulesView,
+  SessionToolRules,
   ToolRuleKind,
   PersistedState,
   PlanUsage,

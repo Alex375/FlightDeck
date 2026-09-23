@@ -235,6 +235,21 @@ export function useMcpStatus(handle: string | null) {
   });
 }
 
+/**
+ * The MCP servers + tools a conversation-less `claude` sees — the global Settings page's
+ * list. Costs a short-lived process (a few seconds while the connectors connect), so it is
+ * kept for a while and refreshed on demand, never polled.
+ */
+export function useGlobalMcpStatus(enabled: boolean) {
+  return useQuery<McpServerLive[]>({
+    queryKey: ["global-mcp-status"],
+    enabled,
+    queryFn: () => unwrap(commands.fetchGlobalMcpStatus()),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
 /** Query key for the MCP permission rules a repository sees. */
 export const mcpPermissionRulesKey = (repoPath: string | null) => ["mcp-permission-rules", repoPath] as const;
 

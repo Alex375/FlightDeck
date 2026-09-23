@@ -8,8 +8,10 @@ import {
   resolvePermission,
   ruleMatchesTool,
   serverSummary,
+  setAll,
   toolNature,
   toolPermissionState,
+  type ToolRule,
 } from "./mcpToolPermissions";
 
 const SEND = "mcp__claude_ai_Gmail__send_message";
@@ -167,7 +169,52 @@ describe("batch actions", () => {
   });
 
   it("summarizes what applies across a server's tools", () => {
-    const view = { rules: [rule(SEND, "deny"), rule(SEARCH, "ask")], warnings: [], user_error: null };
-    expect(serverSummary("claude.ai Gmail", tools, view)).toEqual({ deny: 1, ask: 1, allow: 0 });
+    expect(serverSummary("claude.ai Gmail", tools, [rule(SEND, "deny"), rule(SEARCH, "ask")])).toEqual({
+      deny: 1,
+      ask: 1,
+      allow: 0,
+    });
+  });
+
+  it("allow / ask / block all — only what would hold, only what changes", () => {
+    expect(setAll("claude.ai Gmail", tools, [], "deny").changes).toEqual([
+      { tool: SEARCH, kind: "deny" },
+      { tool: SEND, kind: "deny" },
+    ]);
+    // A global ask on the server: "allow all" can't hold for either tool.
+    const r = setAll("claude.ai Gmail", tools, [rule("mcp__claude_ai_Gmail", "ask")], "allow");
+    expect(r).toEqual({ changes: [], skipped: 2 });
+  });
+});
+
+describe("the conversation scope", () => {
+  const conv = (r: string, kind: ToolRule["kind"]): ToolRule => ({ rule: r, kind, source: "conversation", path: "" });
+
+  it("manages the conversation's own rules, not the user file's", () => {
+    const s = toolPermissionState(SEND, [rule(SEND, "allow"), conv(SEND, "deny")], "conversation");
+    expect(s.choice).toBe("deny");
+    expect(s.inherited.kind).toBe("allow"); // what the conversation gets from the global rules
+    expect(toolPermissionState(SEND, [rule(SEND, "allow"), conv(SEND, "deny")], "global").choice).toBe("allow");
+  });
+
+  it("can tighten a global rule but never loosen it", () => {
+    const s = toolPermissionState(SEND, [rule(SEND, "ask")], "conversation");
+    expect(s.options.deny.holds).toBe(true);
+    expect(s.options.allow.holds).toBe(false);
+    expect(s.options.allow.blockedBy?.source).toBe("user");
+  });
+
+  it("a conversation's rule shows up in the global view as something that applies there", () => {
+    const s = toolPermissionState(SEND, [conv(SEND, "deny")], "global");
+    expect(s.choice).toBe("default");
+    expect(s.effective.kind).toBe("deny");
+  });
+
+  it("read-only preset and reset work on the conversation's own rules", () => {
+    const tools = [{ name: "send_message", read_only: null, destructive: null }];
+    expect(readOnlyPreset("claude.ai Gmail", tools, [], "conversation").changes).toEqual([{ tool: SEND, kind: "ask" }]);
+    expect(resetServer("claude.ai Gmail", tools, [rule(SEND, "deny"), conv(SEND, "ask")], "conversation")).toEqual([
+      { tool: SEND, kind: null },
+    ]);
   });
 });

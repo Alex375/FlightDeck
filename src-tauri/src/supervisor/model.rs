@@ -156,6 +156,63 @@ pub struct McpServerLive {
     pub failure_reason: Option<String>,
 }
 
+/// Per-tool permission rules scoped to ONE conversation: they live in the session's flag
+/// settings layer (`apply_flag_settings{settings:{permissions}}`), never in a file, so they
+/// reach that conversation alone. Verified live (2.1.280): a second apply REPLACES the
+/// `permissions` key (a rule can be removed), `null` clears it, and `list_permission_rules`
+/// then reports them with source `flagSettings`. The layer dies with the process, so the
+/// app keeps them per conversation and re-applies them after every `initialize`.
+///
+/// Like a file rule, one can only ADD to what applies: deny > ask > allow across every
+/// source, so a conversation can tighten a global rule but never loosen it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct SessionToolRules {
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl SessionToolRules {
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty()
+    }
+
+    /// Only exact MCP tool names — the conversation panel manages nothing else, and this
+    /// keeps a caller from slipping a broad rule (`*`, `Bash`) into a live session.
+    pub fn validate(&self) -> Result<(), String> {
+        for tool in self.allow.iter().chain(&self.ask).chain(&self.deny) {
+            if !is_mcp_tool_name(tool) {
+                return Err(format!("not an MCP tool name: {tool:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `permissions` value for `apply_flag_settings`: the three lists (empty ones
+    /// omitted), or `null` to clear the conversation's rules altogether.
+    pub fn flag_permissions(&self) -> Value {
+        if self.is_empty() {
+            return Value::Null;
+        }
+        let mut map = serde_json::Map::new();
+        for (key, list) in [("allow", &self.allow), ("ask", &self.ask), ("deny", &self.deny)] {
+            if !list.is_empty() {
+                map.insert(key.to_string(), serde_json::json!(list));
+            }
+        }
+        Value::Object(map)
+    }
+}
+
+/// `mcp__<server>__<tool>`: both parts non-empty, no glob, no parentheses, no whitespace.
+pub fn is_mcp_tool_name(tool: &str) -> bool {
+    tool.strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .is_some_and(|(server, name)| !server.is_empty() && !name.is_empty())
+        && !tool.contains(['*', '(', ')'])
+        && !tool.chars().any(char::is_whitespace)
+}
+
 /// One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
 /// SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
 /// get them wrong, so the UI treats them as a suggestion, never as a guarantee.

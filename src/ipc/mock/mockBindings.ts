@@ -58,6 +58,7 @@ import type {
   McpToolPermissionChange,
   PermissionRule,
   PermissionRulesView,
+  SessionToolRules,
   RewindFilesResult,
   PluginContents,
   PermissionDecision,
@@ -3090,6 +3091,12 @@ export const mockCommands = {
   // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
   async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {
     return ok({ rules: mockPermissionRules, warnings: [], user_error: null });
+  },
+  async applySessionPermissions(_session: string, _rules: SessionToolRules): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async fetchGlobalMcpStatus(): Promise<Result<McpServerLive[], string>> {
+    return ok([]);
   },
   async setMcpToolPermissions(changes: McpToolPermissionChange[]): Promise<Result<null, string>> {
     for (const c of changes) {

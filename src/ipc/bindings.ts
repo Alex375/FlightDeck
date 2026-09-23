@@ -1616,6 +1616,33 @@ async setMcpToolPermissions(changes: McpToolPermissionChange[]) : Promise<Result
 }
 },
 /**
+ * Replace a RUNNING conversation's own per-tool permission rules (its flag settings
+ * layer — never a file, so no other conversation sees them). Effective from its next
+ * tool call; a CLI rejection is returned, not swallowed.
+ */
+async applySessionPermissions(session: string, rules: SessionToolRules) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_session_permissions", { session, rules }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
+ * less `claude` sees them — what the global Settings page lists. A throwaway process in
+ * the home directory, polled until the connectors settle (they connect asynchronously,
+ * a few seconds after start) or ~15 s pass; no model turn, no tokens.
+ */
+async fetchGlobalMcpStatus() : Promise<Result<McpServerLive[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_global_mcp_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Everything a single plugin provides (skills / sub-agents / MCP servers) for the
  * per-plugin explorer — scanned regardless of the plugin's enabled state so a
  * disabled plugin stays browsable. `repo_path` selects the install relevant to the
@@ -5245,6 +5272,18 @@ export type SessionTaskEvent = { session: string; task: BackgroundTask }
  */
 export type SessionTitleEvent = { session: string; title: string; seq: number }
 /**
+ * Per-tool permission rules scoped to ONE conversation: they live in the session's flag
+ * settings layer (`apply_flag_settings{settings:{permissions}}`), never in a file, so they
+ * reach that conversation alone. Verified live (2.1.280): a second apply REPLACES the
+ * `permissions` key (a rule can be removed), `null` clears it, and `list_permission_rules`
+ * then reports them with source `flagSettings`. The layer dies with the process, so the
+ * app keeps them per conversation and re-applies them after every `initialize`.
+ * 
+ * Like a file rule, one can only ADD to what applies: deny > ask > allow across every
+ * source, so a conversation can tighten a global rule but never loosen it.
+ */
+export type SessionToolRules = { allow: string[]; ask: string[]; deny: string[] }
+/**
  * One skill available to a repository (file-based or plugin-provided).
  */
 export type SkillInfo = { name: string; description: string | null; scope: ExtScope; 
@@ -5312,7 +5351,13 @@ claudeAccountId: string | null;
  * an untitled conversation never stamps that placeholder as the daemon's
  * authoritative title (see `spawn_session`'s wiring).
  */
-conversationTitle: string | null }
+conversationTitle: string | null; 
+/**
+ * This conversation's own per-tool permission rules, re-applied to the new process
+ * right after `initialize` (they live in its flag settings layer, which dies with
+ * the previous one). Claude only; `None`/empty = no rule of its own.
+ */
+sessionPermissions?: SessionToolRules | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

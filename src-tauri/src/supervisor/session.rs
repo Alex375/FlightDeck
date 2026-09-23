@@ -23,6 +23,7 @@ use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
     PermissionResolvedPayload, RemoteControlState, RewindFilesResult, SessionEmitter, SessionEvent,
+    SessionToolRules,
 };
 use super::protocol::CliMessage;
 use super::transport::{self, SpawnConfig, Transport, TransportError};
@@ -144,6 +145,10 @@ pub struct InitialControls {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub ultracode: bool,
+    /// The conversation's own per-tool permission rules. They live in the process's flag
+    /// settings layer, which dies with it — so they are re-applied after every
+    /// `initialize` (a resume, a rewind, an account switch all spawn afresh).
+    pub session_permissions: Option<SessionToolRules>,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -180,6 +185,10 @@ enum PendingControl {
     /// A `reload_plugins` request — its failure surfaces as a control error so the user
     /// knows the freshly-updated plugin was NOT hot-applied (a restart is still needed).
     ReloadPlugins,
+    /// The conversation's per-tool rules re-applied after `initialize` — a failure
+    /// surfaces, since the conversation would otherwise run WITHOUT the restrictions the
+    /// user set for it.
+    SessionPermissions,
 }
 
 impl PendingControl {
@@ -199,6 +208,7 @@ impl PendingControl {
             PendingControl::McpReconnect => "reconnecting an MCP server",
             PendingControl::McpClearAuth => "resetting MCP authentication",
             PendingControl::ReloadPlugins => "reloading plugins",
+            PendingControl::SessionPermissions => "applying this conversation's tool permissions",
         }
     }
 }
@@ -350,6 +360,19 @@ impl SessionHandle {
             Ok(Ok(Err(msg))) => Err(SessionError::Rejected(msg)),
             _ => Err(SessionError::Closed),
         }
+    }
+
+    /// Replace this conversation's per-tool permission rules in the RUNNING session
+    /// (`apply_flag_settings`), awaiting the CLI's answer so a rejection reaches the
+    /// caller. Effective from the next tool call — verified live against 2.1.280.
+    pub async fn apply_session_permissions(&self, rules: &SessionToolRules) -> Result<(), SessionError> {
+        self.control_query(
+            "apply_flag_settings",
+            control::session_permissions_request("", rules),
+            15,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The session's live model catalogue (`list_models`). Authoritative — it reflects
@@ -1336,6 +1359,9 @@ struct SessionCore {
     /// Whether to restore the ultracode flag after init (the `--effort` spawn flag
     /// sets the effort level but not the separate ultracode flag).
     restore_ultracode: bool,
+    /// The conversation's per-tool rules, to re-apply after `initialize` (see
+    /// [`InitialControls::session_permissions`]). `None` when it has none.
+    restore_session_permissions: Option<SessionToolRules>,
     /// In-flight `mcp_status` queries, keyed by their outbound `request_id`. The
     /// matching `control_response` fulfills (and removes) the reply channel.
     pending_mcp: HashMap<String, oneshot::Sender<Result<Vec<McpServerLive>, String>>>,
@@ -1386,6 +1412,7 @@ impl SessionCore {
             pending_control: HashMap::new(),
             init_request_id: None,
             restore_ultracode: initial.ultracode,
+            restore_session_permissions: initial.session_permissions.filter(|r| !r.is_empty()),
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1626,6 +1653,14 @@ impl SessionCore {
                 control::set_ultracode_request(rid, true)
             });
         }
+        // The conversation's own tool rules live in the process's flag layer — gone with
+        // the previous process, so put them back before the first turn can run. Written
+        // right after `initialize` on the same stdin, ahead of any user message.
+        if let Some(rules) = self.restore_session_permissions.clone() {
+            self.send_tracked(PendingControl::SessionPermissions, |rid| {
+                control::session_permissions_request(rid, &rules)
+            });
+        }
         // Read the applied settings back so effort + ultracode (and the resolved
         // model id) reflect reality, not just the optimistic seed.
         self.refresh_settings();
@@ -1818,7 +1853,8 @@ impl SessionCore {
             | PendingControl::StopTask
             | PendingControl::McpToggle
             | PendingControl::McpReconnect
-            | PendingControl::McpClearAuth => {}
+            | PendingControl::McpClearAuth
+            | PendingControl::SessionPermissions => {}
             // A hot-reload's ack is NOT bare: it returns the same
             // `response.response.commands` catalogue as `initialize`, freshly rescanned
             // (a plugin's skills appear/disappear here). Harvesting it means the `/`

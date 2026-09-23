@@ -202,13 +202,7 @@ pub fn set_mcp_tool_permissions(changes: &[McpToolPermissionChange]) -> Result<(
 /// parentheses, no whitespace. The app manages per-tool rules and nothing else — this is
 /// what keeps a caller from slipping a broad rule (`*`, `Bash`) into the user's settings.
 fn validate_tool_name(tool: &str) -> Result<(), String> {
-    let ok = tool
-        .strip_prefix("mcp__")
-        .and_then(|rest| rest.split_once("__"))
-        .is_some_and(|(server, name)| !server.is_empty() && !name.is_empty())
-        && !tool.contains(['*', '(', ')'])
-        && !tool.chars().any(char::is_whitespace);
-    if ok {
+    if crate::supervisor::model::is_mcp_tool_name(tool) {
         Ok(())
     } else {
         Err(format!("not an MCP tool name: {tool:?}"))

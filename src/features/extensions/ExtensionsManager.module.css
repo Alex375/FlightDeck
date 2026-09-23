@@ -241,6 +241,10 @@
   padding: 16px 18px 20px;
   overflow-y: auto;
 }
+/* The same sections inside Settings → Extensions: the settings page scrolls, not this. */
+.globalBody {
+  padding-top: 4px;
+}
 
 /* Muted footer note (e.g. the Codex read-only / deferred hint). */
 .codexHint {
@@ -1232,17 +1236,23 @@
 .permPanel {
   padding: 2px 14px 13px 32px;
 }
-.permBar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
 .permHint {
-  flex: 1 1 auto;
-  min-width: 0;
   font-size: 11px;
   color: var(--wf-tx-xlo);
+  margin-bottom: 7px;
+}
+.permBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+/* Never squeezed below their label: a flex row would shrink them until the text spills
+   out of the pill. They wrap to a second line instead. */
+.permBar .actBtn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .permMsg {
   font-size: 11px;
