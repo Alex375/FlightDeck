@@ -10,7 +10,6 @@ import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
 import { MonitorBar } from "./MonitorBar";
 import { WorkflowBar } from "./WorkflowBar";
-import { RemoteServerBar } from "./RemoteServerBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
@@ -125,7 +124,6 @@ export function ConversationPane({
       ) : !panelOpen ? (
         <ConversationSummaryLine session={session} />
       ) : null}
-      <RemoteServerBar session={session} />
       <AuthWarningBar session={session} />
       <ConductorComposer
           ref={composerRef}
