@@ -1603,14 +1603,14 @@ async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRul
 }
 },
 /**
- * Set (or clear) MCP permission rules — per tool, or a whole server — in the global
- * `~/.claude/settings.json` or in this repository's `.claude/settings.local.json`
- * (`target`). One atomic write for the batch, read back and verified. Running sessions
- * pick it up from their next tool call (the CLI watches both files).
+ * Set (or clear) MCP permission rules in the user's `~/.claude/settings.json`. Flight
+ * Deck applies its own permissions per session; this serves to clean up a rule found in
+ * that file (which Claude Code enforces on its own, above Flight Deck's). One atomic write
+ * for the batch, read back and verified.
  */
-async setMcpToolPermissions(changes: McpToolPermissionChange[], target: SettingsTarget, repoPath: string | null) : Promise<Result<null, string>> {
+async setMcpToolPermissions(changes: McpToolPermissionChange[]) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes, target, repoPath }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1625,19 +1625,6 @@ async setMcpToolPermissions(changes: McpToolPermissionChange[], target: Settings
 async applySessionOverrides(session: string, overrides: SessionOverrides, reloadPlugins: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("apply_session_overrides", { session, overrides, reloadPlugins }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Turn a plugin on/off in the global or this repository's local settings file, or remove
- * that file's say (`enabled: null`) so the plugin follows the files below again. Read
- * back and verified; a live session applies it on `reload_plugins`.
- */
-async setPluginOverride(pluginId: string, enabled: boolean | null, target: SettingsTarget, repoPath: string | null) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_plugin_override", { pluginId, enabled, target, repoPath }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -5323,13 +5310,6 @@ export type SessionTaskEvent = { session: string; task: BackgroundTask }
  * fresher title.
  */
 export type SessionTitleEvent = { session: string; title: string; seq: number }
-/**
- * Which file a change is written to. Global = the user's `~/.claude/settings.json`;
- * Repository = the project's `.claude/settings.local.json` — this repository, on this
- * machine, never committed (the app makes git ignore it before writing it). The shared
- * `.claude/settings.json` is never written: it would change the team's setup.
- */
-export type SettingsTarget = "global" | "repository"
 /**
  * One skill available to a repository (file-based or plugin-provided).
  */

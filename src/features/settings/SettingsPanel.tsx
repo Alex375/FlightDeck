@@ -469,7 +469,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               <div>
                 <PageHead
                   title="Extensions"
-                  subtitle="What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A conversation's own panel (⌘E) can tighten these for it alone."
+                  subtitle="What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
                 />
                 <GlobalExtensions />
               </div>

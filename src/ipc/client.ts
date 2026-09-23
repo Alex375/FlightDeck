@@ -75,7 +75,6 @@ export type {
   PermissionRulesView,
   SessionOverrides,
   PluginOverride,
-  SettingsTarget,
   ToolRuleKind,
   PersistedState,
   PlanUsage,

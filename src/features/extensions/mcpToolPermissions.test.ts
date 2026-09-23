@@ -1,286 +1,201 @@
 import { describe, expect, it } from "vitest";
 import type { PermissionRule } from "../../ipc/client";
 import {
+  EMPTY_LEVEL,
   mcpToolRuleName,
+  nativeResolve,
   normalizeServerName,
-  pluginScopeState,
+  pluginAt,
   pluginWrite,
   readOnlyPreset,
   resetServer,
-  resolvePermission,
   ruleMatchesTool,
-  serverOffState,
+  serverAt,
+  serverInherited,
   serverRuleName,
   serverSummary,
+  sessionOverridesFrom,
   setAll,
+  toolAt,
   toolNature,
-  toolPermissionState,
-  type ToolRule,
+  toolRowState,
+  type Cascade,
+  type LevelPolicy,
 } from "./mcpToolPermissions";
 
+const GMAIL = "claude.ai Gmail";
 const SEND = "mcp__claude_ai_Gmail__send_message";
 const SEARCH = "mcp__claude_ai_Gmail__search_threads";
+const SERVER = "mcp__claude_ai_Gmail";
 
-const rule = (r: string, kind: PermissionRule["kind"], source: PermissionRule["source"] = "user"): PermissionRule => ({
-  rule: r,
+const lvl = (p: Partial<LevelPolicy>): LevelPolicy => ({ ...EMPTY_LEVEL, ...p });
+const ext = (rule: string, kind: PermissionRule["kind"], source: PermissionRule["source"] = "user"): PermissionRule => ({
+  rule,
   kind,
   source,
-  path: `/${source}.json`,
+  path: "",
 });
 
-describe("tool rule names (mirror of the CLI's normalization)", () => {
-  it("names a claude.ai connector's tools the way the CLI does", () => {
-    expect(normalizeServerName("claude.ai Gmail")).toBe("claude_ai_Gmail");
+describe("names (mirror of the CLI's normalization)", () => {
+  it("names a claude.ai connector's tools and server the way the CLI does", () => {
     expect(normalizeServerName("claude.ai Google Calendar")).toBe("claude_ai_Google_Calendar");
-    expect(mcpToolRuleName("claude.ai Gmail", "send_message")).toBe(SEND);
-  });
-
-  it("keeps a plugin server's separators as the CLI does (no collapsing outside claude.ai)", () => {
+    expect(mcpToolRuleName(GMAIL, "send_message")).toBe(SEND);
+    expect(serverRuleName(GMAIL)).toBe(SERVER);
     expect(normalizeServerName("plugin:railway:railway")).toBe("plugin_railway_railway");
-    expect(mcpToolRuleName("Railway", "list-projects")).toBe("mcp__Railway__list-projects");
-  });
-
-  it("leaves an already-qualified name alone", () => {
-    expect(mcpToolRuleName("claude.ai Gmail", SEND)).toBe(SEND);
   });
 });
 
-describe("which rules reach a tool", () => {
-  it("exact name, whole server, and globs", () => {
-    expect(ruleMatchesTool(SEND, "deny", SEND)).toBe(true);
-    expect(ruleMatchesTool("mcp__claude_ai_Gmail", "ask", SEND)).toBe(true);
-    expect(ruleMatchesTool("mcp__claude_ai_Gmail__*", "allow", SEND)).toBe(true);
-    expect(ruleMatchesTool("mcp__*", "deny", SEND)).toBe(true);
-    expect(ruleMatchesTool("*", "ask", SEND)).toBe(true);
+describe("the cascade: the narrowest level wins, both ways", () => {
+  it("a repository can LOOSEN a cautious global setting", () => {
+    const c: Cascade = { global: lvl({ tools: { [SEND]: "deny" } }), repository: lvl({ tools: { [SEND]: "allow" } }) };
+    expect(toolAt(c, "global", SEND).kind).toBe("deny");
+    expect(toolAt(c, "repository", SEND).kind).toBe("allow");
+    expect(toolAt(c, "conversation", SEND)).toEqual({ kind: "allow", from: { level: "repository", via: "tool" } });
   });
 
-  it("does not let one tool's rule or a sibling server reach another", () => {
-    expect(ruleMatchesTool(SEARCH, "deny", SEND)).toBe(false);
-    expect(ruleMatchesTool("mcp__claude_ai_Gmai", "deny", SEND)).toBe(false);
+  it("a scope never sees a narrower level's setting", () => {
+    const c: Cascade = { conversation: lvl({ tools: { [SEND]: "deny" } }) };
+    expect(toolAt(c, "repository", SEND).kind).toBeNull();
+    expect(toolAt(c, "global", SEND).kind).toBeNull();
+    expect(toolAt(c, "conversation", SEND).kind).toBe("deny");
+  });
+
+  it("within a level, a tool's own setting beats its server's", () => {
+    const c: Cascade = { global: lvl({ servers: { [SERVER]: false }, tools: { [SEARCH]: "allow" } }) };
+    expect(toolAt(c, "global", SEARCH).kind).toBe("allow");
+    expect(toolAt(c, "global", SEND)).toEqual({ kind: "deny", from: { level: "global", via: "server" } });
+  });
+
+  it("a server turned off globally can be turned back on for one conversation", () => {
+    const c: Cascade = { global: lvl({ servers: { [SERVER]: false } }), conversation: lvl({ servers: { [SERVER]: true } }) };
+    expect(serverAt(c, "global", GMAIL).on).toBe(false);
+    expect(serverAt(c, "conversation", GMAIL)).toEqual({ on: true, own: true, from: "conversation" });
+    expect(serverInherited(c, "conversation", GMAIL)).toBe(false);
+    expect(toolAt(c, "conversation", SEND).kind).toBeNull();
+  });
+});
+
+describe("a tool row", () => {
+  it("shows the scope's own choice, else what it inherits and from where", () => {
+    const c: Cascade = { global: lvl({ tools: { [SEND]: "ask" } }) };
+    const s = toolRowState(c, "repository", SEND, []);
+    expect(s.choice).toBe("default");
+    expect(s.shown).toBe("ask");
+    expect(s.from).toEqual({ level: "global", via: "tool" });
+  });
+
+  it("only Claude Code's own stricter files can block a choice — and it says which", () => {
+    const s = toolRowState({}, "conversation", SEND, [ext(SERVER, "ask", "project")]);
+    expect(s.blockedBy.allow?.rule).toBe(SERVER);
+    expect(s.blockedBy.ask).toBeNull();
+    expect(s.blockedBy.deny).toBeNull();
+    expect(s.overriddenBy?.kind).toBe("ask"); // nothing set here → the file's ask applies
+  });
+});
+
+describe("what a conversation's session receives", () => {
+  it("one rule per tool, the narrowest one", () => {
+    const c: Cascade = {
+      global: lvl({ tools: { [SEND]: "deny", [SEARCH]: "ask" } }),
+      repository: lvl({ tools: { [SEND]: "allow" } }),
+    };
+    expect(sessionOverridesFrom(c, {})).toEqual({ allow: [SEND], ask: [SEARCH], deny: [], enabled_plugins: {} });
+  });
+
+  it("a server off is one deny — or a deny per OTHER tool when some are re-allowed below", () => {
+    const off: Cascade = { global: lvl({ servers: { [SERVER]: false } }) };
+    expect(sessionOverridesFrom(off, {}).deny).toEqual([SERVER]);
+    const except: Cascade = { ...off, conversation: lvl({ tools: { [SEARCH]: "allow" } }) };
+    const o = sessionOverridesFrom(except, { [SERVER]: ["search_threads", "send_message", "get_message"] });
+    expect(o.allow).toEqual([SEARCH]);
+    expect(o.deny).toEqual(["mcp__claude_ai_Gmail__get_message", SEND]);
+  });
+
+  it("a server back on below undoes the broader off", () => {
+    const c: Cascade = { global: lvl({ servers: { [SERVER]: false } }), repository: lvl({ servers: { [SERVER]: true } }) };
+    expect(sessionOverridesFrom(c, {}).deny).toEqual([]);
+  });
+
+  it("plugins: the conversation's say beats the repository's", () => {
+    const c: Cascade = {
+      repository: lvl({ plugins: { "a@m": false, "b@m": true } }),
+      conversation: lvl({ plugins: { "a@m": true } }),
+    };
+    expect(sessionOverridesFrom(c, {}).enabled_plugins).toEqual({ "a@m": true, "b@m": true });
+  });
+});
+
+describe("plugins per scope", () => {
+  const files = [{ source: "user" as const, enabled: true }];
+
+  it("Global is Claude Code's own setting; narrower levels override it both ways", () => {
+    const c: Cascade = { repository: lvl({ plugins: { "p@m": false } }) };
+    expect(pluginAt(c, "global", "p@m", files, false).enabled).toBe(true);
+    expect(pluginAt(c, "repository", "p@m", files, false)).toMatchObject({ enabled: false, own: true, inherited: true });
+    expect(pluginAt(c, "conversation", "p@m", files, false)).toMatchObject({ enabled: false, own: false });
+  });
+
+  it("writes nothing of its own when it matches what it would follow", () => {
+    const st = pluginAt({}, "conversation", "p@m", files, false);
+    expect(pluginWrite(st, true, "conversation")).toBeNull();
+    expect(pluginWrite(st, false, "conversation")).toBe(false);
+    expect(pluginWrite(pluginAt({}, "global", "p@m", files, false), true, "global")).toBe(true);
+  });
+
+  it("the organization's policy locks it", () => {
+    expect(pluginAt({}, "conversation", "p@m", [{ source: "managed", enabled: false }], true).lockedByPolicy).toBe(true);
+  });
+});
+
+describe("Claude Code's own rules", () => {
+  it("match exact names, whole servers and globs — and not a sibling", () => {
+    expect(ruleMatchesTool(SERVER, "deny", SEND)).toBe(true);
+    expect(ruleMatchesTool("mcp__claude_ai_Gmail__*", "allow", SEND)).toBe(true);
+    expect(ruleMatchesTool("mcp__*", "allow", SEND)).toBe(false); // the CLI skips it
     expect(ruleMatchesTool("mcp__claude_ai_Gmail__send", "deny", SEND)).toBe(false);
   });
 
-  it("ignores an allow glob with no literal server prefix, as the CLI does", () => {
-    expect(ruleMatchesTool("mcp__*", "allow", SEND)).toBe(false);
-    expect(ruleMatchesTool("*", "allow", SEND)).toBe(false);
+  it("resolve deny > ask > allow, whatever the file", () => {
+    expect(nativeResolve(SEND, [ext(SEND, "allow"), ext(SERVER, "deny", "project")])?.kind).toBe("deny");
   });
 });
 
-describe("resolution: deny > ask > allow, whatever the file", () => {
-  it("a project deny beats the user's allow", () => {
-    const r = resolvePermission(SEND, [rule(SEND, "allow"), rule("mcp__claude_ai_Gmail", "deny", "project")]);
-    expect(r.kind).toBe("deny");
-    expect(r.rule?.source).toBe("project");
-  });
-
-  it("a server-wide ask beats a per-tool allow", () => {
-    expect(resolvePermission(SEND, [rule(SEND, "allow"), rule("mcp__claude_ai_Gmail", "ask")]).kind).toBe("ask");
-  });
-
-  it("no rule: the mode decides", () => {
-    expect(resolvePermission(SEND, [rule(SEARCH, "deny")])).toEqual({ kind: null, rule: null });
-  });
-});
-
-describe("toolPermissionState", () => {
-  it("reads the user's own exact rule as the current choice", () => {
-    const s = toolPermissionState(SEND, [rule(SEND, "ask")]);
-    expect(s.choice).toBe("ask");
-    expect(s.effective.kind).toBe("ask");
-    expect(s.inherited.kind).toBeNull();
-    expect(Object.values(s.options).every((o) => o.holds)).toBe(true);
-  });
-
-  it("never offers a choice another rule would override, and says which rule", () => {
-    const s = toolPermissionState(SEND, [rule("mcp__claude_ai_Gmail", "deny", "project")]);
-    expect(s.choice).toBe("default");
-    expect(s.options.allow.holds).toBe(false);
-    expect(s.options.ask.holds).toBe(false);
-    expect(s.options.deny.holds).toBe(true);
-    expect(s.options.allow.blockedBy?.rule).toBe("mcp__claude_ai_Gmail");
-  });
-
-  it("an ask elsewhere still lets the user block, but not allow", () => {
-    const s = toolPermissionState(SEND, [rule("mcp__claude_ai_Gmail__*", "ask")]);
-    expect(s.options.deny.holds).toBe(true);
-    expect(s.options.ask.holds).toBe(true);
-    expect(s.options.allow.holds).toBe(false);
-  });
-
-  it("'Default' shows what applies without the user's rule", () => {
-    const s = toolPermissionState(SEND, [rule(SEND, "deny"), rule("mcp__claude_ai_Gmail", "allow")]);
-    expect(s.choice).toBe("deny");
-    expect(s.inherited.kind).toBe("allow");
-  });
-
-  it("a rule with the same name in a project file is not the user's own", () => {
-    const s = toolPermissionState(SEND, [rule(SEND, "ask", "project")]);
-    expect(s.choice).toBe("default");
-    expect(s.effective.kind).toBe("ask");
-  });
-});
-
-describe("toolNature", () => {
-  it("trusts the server's annotations first", () => {
-    expect(toolNature({ name: "send_message", read_only: true, destructive: null })).toEqual({ nature: "read", from: "annotation" });
-    expect(toolNature({ name: "search", read_only: null, destructive: true })).toEqual({ nature: "write", from: "annotation" });
-  });
-
-  it("guesses from the name otherwise, erring toward write", () => {
-    const n = (name: string) => toolNature({ name, read_only: null, destructive: null }).nature;
-    expect(n("search_threads")).toBe("read");
-    expect(n("slack_read_channel")).toBe("read");
-    expect(n("list_drafts")).toBe("read");
-    expect(n("get_draft")).toBe("read");
-    expect(n("send_message")).toBe("write");
-    expect(n("slack_send_message")).toBe("write");
-    expect(n("create_draft")).toBe("write");
-    expect(n("mark_thread_spam")).toBe("write");
-    expect(n("listEvents")).toBe("read");
-    expect(n("suggest_time")).toBe("write"); // neither word → ask, never silently allowed
-    expect(toolNature({ name: "search_threads", read_only: null, destructive: null }).from).toBe("name");
-  });
-});
-
-describe("batch actions", () => {
+describe("batch actions write the scope's own settings", () => {
   const tools = [
     { name: "search_threads", read_only: true, destructive: null },
     { name: "send_message", read_only: false, destructive: true },
   ];
 
-  it("read-only preset: reads allowed, the rest asks", () => {
-    const { changes, skipped } = readOnlyPreset("claude.ai Gmail", tools, []);
-    expect(changes).toEqual([
+  it("read-only preset: reads allowed, the rest asks — only what changes", () => {
+    expect(readOnlyPreset({}, "conversation", GMAIL, tools)).toEqual([
       { tool: SEARCH, kind: "allow" },
       { tool: SEND, kind: "ask" },
     ]);
-    expect(skipped).toBe(0);
+    const c: Cascade = { conversation: lvl({ tools: { [SEND]: "ask" } }) };
+    expect(readOnlyPreset(c, "conversation", GMAIL, tools)).toEqual([{ tool: SEARCH, kind: "allow" }]);
   });
 
-  it("read-only preset skips what a stricter rule overrides, and what is already set", () => {
-    const { changes, skipped } = readOnlyPreset("claude.ai Gmail", tools, [
-      rule("mcp__claude_ai_Gmail", "ask", "project"), // allow can't hold for search
-      rule(SEND, "ask"), // already the preset's value
-    ]);
-    expect(changes).toEqual([]);
-    expect(skipped).toBe(1);
+  it("allow / ask / block all, and reset clears only this scope's own", () => {
+    expect(setAll({}, "global", GMAIL, tools, "deny").map((c) => c.kind)).toEqual(["deny", "deny"]);
+    const c: Cascade = { global: lvl({ tools: { [SEND]: "deny" } }), repository: lvl({ tools: { [SEARCH]: "ask" } }) };
+    expect(resetServer(c, "repository", GMAIL, tools)).toEqual([{ tool: SEARCH, kind: null }]);
   });
 
-  it("reset clears only the user's own rules", () => {
-    expect(resetServer("claude.ai Gmail", tools, [rule(SEND, "deny"), rule(SEARCH, "ask", "project")])).toEqual([
-      { tool: SEND, kind: null },
-    ]);
-  });
-
-  it("summarizes what applies across a server's tools", () => {
-    expect(serverSummary("claude.ai Gmail", tools, [rule(SEND, "deny"), rule(SEARCH, "ask")])).toEqual({
-      deny: 1,
-      ask: 1,
-      allow: 0,
-    });
-  });
-
-  it("allow / ask / block all — only what would hold, only what changes", () => {
-    expect(setAll("claude.ai Gmail", tools, [], "deny").changes).toEqual([
-      { tool: SEARCH, kind: "deny" },
-      { tool: SEND, kind: "deny" },
-    ]);
-    // A global ask on the server: "allow all" can't hold for either tool.
-    const r = setAll("claude.ai Gmail", tools, [rule("mcp__claude_ai_Gmail", "ask")], "allow");
-    expect(r).toEqual({ changes: [], skipped: 2 });
+  it("summarizes what a server's tools get at a scope", () => {
+    const c: Cascade = { global: lvl({ tools: { [SEND]: "deny" } }), repository: lvl({ tools: { [SEARCH]: "ask" } }) };
+    expect(serverSummary(c, "repository", GMAIL, tools)).toEqual({ deny: 1, ask: 1, allow: 0 });
+    expect(serverSummary(c, "global", GMAIL, tools)).toEqual({ deny: 1, ask: 0, allow: 0 });
   });
 });
 
-describe("the conversation scope", () => {
-  const conv = (r: string, kind: ToolRule["kind"]): ToolRule => ({ rule: r, kind, source: "conversation", path: "" });
-
-  it("manages the conversation's own rules, not the user file's", () => {
-    const s = toolPermissionState(SEND, [rule(SEND, "allow"), conv(SEND, "deny")], "conversation");
-    expect(s.choice).toBe("deny");
-    expect(s.inherited.kind).toBe("allow"); // what the conversation gets from the global rules
-    expect(toolPermissionState(SEND, [rule(SEND, "allow"), conv(SEND, "deny")], "global").choice).toBe("allow");
-  });
-
-  it("can tighten a global rule but never loosen it", () => {
-    const s = toolPermissionState(SEND, [rule(SEND, "ask")], "conversation");
-    expect(s.options.deny.holds).toBe(true);
-    expect(s.options.allow.holds).toBe(false);
-    expect(s.options.allow.blockedBy?.source).toBe("user");
-  });
-
-  it("a conversation's rule shows up in the global view as something that applies there", () => {
-    const s = toolPermissionState(SEND, [conv(SEND, "deny")], "global");
-    expect(s.choice).toBe("default");
-    expect(s.effective.kind).toBe("deny");
-  });
-
-  it("read-only preset and reset work on the conversation's own rules", () => {
-    const tools = [{ name: "send_message", read_only: null, destructive: null }];
-    expect(readOnlyPreset("claude.ai Gmail", tools, [], "conversation").changes).toEqual([{ tool: SEND, kind: "ask" }]);
-    expect(resetServer("claude.ai Gmail", tools, [rule(SEND, "deny"), conv(SEND, "ask")], "conversation")).toEqual([
-      { tool: SEND, kind: null },
-    ]);
-  });
-});
-
-describe("the repository scope", () => {
-  it("manages the repository's local file — not the shared one, not the user's", () => {
-    const rules = [rule(SEND, "ask", "local"), rule(SEARCH, "deny", "project"), rule(SEND, "allow", "user")];
-    expect(toolPermissionState(SEND, rules, "repository").choice).toBe("ask");
-    expect(toolPermissionState(SEARCH, rules, "repository").choice).toBe("default");
-    expect(toolPermissionState(SEND, rules, "global").choice).toBe("allow");
-  });
-});
-
-describe("a whole server on/off", () => {
-  const GMAIL = "claude.ai Gmail";
-
-  it("is a deny on the server's own rule name", () => {
-    expect(serverRuleName(GMAIL)).toBe("mcp__claude_ai_Gmail");
-  });
-
-  it("off at this scope: the toggle can turn it back on", () => {
-    const s = serverOffState(GMAIL, [{ rule: "mcp__claude_ai_Gmail", kind: "deny", source: "conversation", path: "" }], "conversation");
-    expect(s).toEqual({ off: true, ownOff: true, offBy: null });
-  });
-
-  it("off from a broader scope: this one can't turn it back on, and says who did it", () => {
-    const s = serverOffState(GMAIL, [rule("mcp__claude_ai_Gmail", "deny", "user")], "conversation");
-    expect(s.off).toBe(true);
-    expect(s.ownOff).toBe(false);
-    expect(s.offBy?.source).toBe("user");
-    // A glob covering every tool counts too; one tool's deny doesn't.
-    expect(serverOffState(GMAIL, [rule("mcp__*", "deny", "project")], "repository").off).toBe(true);
-    expect(serverOffState(GMAIL, [rule(SEND, "deny", "user")], "global").off).toBe(false);
-  });
-});
-
-describe("plugins per scope", () => {
-  const say = (source: ToolRule["source"], enabled: boolean) => ({ source, enabled });
-
-  it("each scope shows its own say, else what it inherits", () => {
-    const says = [say("user", true), say("local", false)];
-    expect(pluginScopeState(says, "global", false).enabled).toBe(true);
-    expect(pluginScopeState(says, "repository", false)).toMatchObject({ enabled: false, own: true, inherited: true });
-    expect(pluginScopeState(says, "conversation", false)).toMatchObject({ enabled: false, own: false, effective: false });
-  });
-
-  it("notes when a level above decides differently for this conversation", () => {
-    const says = [say("user", true), say("conversation", false)];
-    expect(pluginScopeState(says, "global", false).overriddenBy).toBe("conversation");
-    expect(pluginScopeState(says, "repository", false).overriddenBy).toBe("conversation");
-    expect(pluginScopeState(says, "conversation", false).overriddenBy).toBeNull();
-  });
-
-  it("the organization's policy locks it everywhere", () => {
-    expect(pluginScopeState([say("managed", false)], "conversation", true).lockedByPolicy).toBe(true);
-  });
-
-  it("writes nothing of its own when the choice matches what it would follow", () => {
-    const st = pluginScopeState([say("user", true)], "conversation", false);
-    expect(pluginWrite(st, true, "conversation")).toBeNull();
-    expect(pluginWrite(st, false, "conversation")).toBe(false);
-    // The global file always holds an explicit value.
-    expect(pluginWrite(pluginScopeState([say("user", true)], "global", false), true, "global")).toBe(true);
+describe("toolNature", () => {
+  it("trusts the server's annotations first, else guesses from the name erring toward write", () => {
+    expect(toolNature({ name: "send_message", read_only: true, destructive: null })).toEqual({ nature: "read", from: "annotation" });
+    const n = (name: string) => toolNature({ name, read_only: null, destructive: null }).nature;
+    expect(n("search_threads")).toBe("read");
+    expect(n("get_draft")).toBe("read");
+    expect(n("slack_send_message")).toBe("write");
+    expect(n("listEvents")).toBe("read");
+    expect(n("suggest_time")).toBe("write");
   });
 });

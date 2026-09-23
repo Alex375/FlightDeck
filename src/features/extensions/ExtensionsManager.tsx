@@ -46,6 +46,7 @@ import {
 import {
   McpPermissionSummary,
   McpToolPermissions,
+  ExternalRules,
   ScopeSwitcher,
   ServerScopeToggle,
   pluginAtScope,
@@ -53,6 +54,7 @@ import {
   type PermissionTarget,
 } from "./McpToolPermissionRows";
 import type { PermissionScope } from "./mcpToolPermissions";
+import { noteServerTools } from "../../store/mcpPolicy";
 import { homeDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useConversationsStore, type BackendKind, type Conversation } from "../../store/conversationsStore";
@@ -637,6 +639,31 @@ function ProjectBody({
   );
 }
 
+// ---- What each scope lists -----------------------------------------------------
+//
+// A scope lists only what can be set at its level. Global: what is configured for the user
+// (their skills / sub-agents, user-scope servers, cloud connectors, user-installed plugins)
+// — a repository's own things don't exist there. Repository: its own skills / sub-agents,
+// and every server / plugin a conversation in it can use (a global connector can be tuned
+// per repository). Conversation: everything this conversation sees.
+
+/** A skill / sub-agent defined at `scope` (config scope `user` / `project` / `local`). */
+function definedAtScope(scope: PermissionScope, defined: ExtScope): boolean {
+  if (scope === "global") return defined === "user";
+  if (scope === "repository") return defined === "project" || defined === "local";
+  return true;
+}
+
+/** A plugin (by the scope it's installed in) that can be switched at `scope`. */
+function visibleAtScope(scope: PermissionScope, installed: ExtScope): boolean {
+  return scope !== "global" || installed === "user";
+}
+
+/** A live MCP server (by `mcp_status` scope) that can be tuned at `scope`. */
+function serverVisibleAtScope(scope: PermissionScope, serverScope: string | null): boolean {
+  return scope !== "global" || serverScope === "user" || serverScope === "claudeai";
+}
+
 // ---- Conversation view: this session's live picture ---------------------------
 
 function ConversationBody({
@@ -668,36 +695,42 @@ function ConversationBody({
   resetToken: string;
 }) {
   const actions = useMcpActions(handle);
-  // WHERE the changes made below apply — picked at the top, "This conversation" by default:
-  // the conversation's own session layer, this repository's local settings file, or the
-  // global one. Tool rules, servers on/off and plugins on/off all follow it.
+  // WHERE the changes made below apply — picked at the top, "This conversation" by default.
+  // Each scope shows its own value (else the broader one it inherits — never a narrower
+  // one), and only what exists at that level; tool rules, servers and plugins follow it.
   const [scope, setScope] = useState<PermissionScope>("conversation");
-  const perms = useExtensionScope(scope, path, convId, handle);
+  const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
+  const perms = useExtensionScope(scope, path, repoId, convId);
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     const write = pluginAtScope(p, perms).write(next);
-    // The conversation's own change reloads its session by itself; a file change is
-    // offered to the repository's live conversations through the reload bar.
-    if (scope === "conversation") void perms.setPlugin(p.id, write).catch(() => {});
-    else onPluginWritten(p.id, perms.setPlugin(p.id, write));
+    // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
+    // plugin reload). Global is Claude Code's own file: offered through the reload bar.
+    if (scope === "global") onPluginWritten(p.id, perms.setPlugin(p.id, write));
+    else void perms.setPlugin(p.id, write).catch(() => {});
   };
+  // Remember each server's tools — how "server off, except these tools" reaches a spawn.
+  useEffect(() => {
+    for (const s of live.data ?? []) noteServerTools(s.name, s.tools);
+  }, [live.data]);
   // A live session lets an update hot-apply via reload_plugins (handle non-null);
   // otherwise it lands on the next spawn.
   const updatePlugin = useUpdatePlugin(path, handle);
   // Order FROZEN at window-open (enabled/connected first), then stable — toggling an
   // item must not make it jump under the cursor (see useStableOrder).
   const plugins = useStableOrder(
-    ext.data?.plugins ?? [],
+    (ext.data?.plugins ?? []).filter((p) => visibleAtScope(scope, p.scope)),
     (p) => p.id,
     (p) => (p.enabled ? 0 : 1),
     resetToken,
   );
   const allPlugins = ext.data?.plugins ?? [];
   // File-based only — plugin skills/agents are summarized as boxes below + live in
-  // the per-plugin explorer (never mixed in as if they were normal rows).
-  const skills = (ext.data?.skills ?? []).filter((s) => s.source == null);
-  const agents = (ext.data?.agents ?? []).filter((a) => a.source == null);
+  // the per-plugin explorer (never mixed in as if they were normal rows). Only what is
+  // defined at the picked level: Global lists the user's own, Repository the repo's.
+  const skills = (ext.data?.skills ?? []).filter((s) => s.source == null && definedAtScope(scope, s.scope));
+  const agents = (ext.data?.agents ?? []).filter((a) => a.source == null && definedAtScope(scope, a.scope));
   const orderedServers = useStableOrder(
-    live.data ?? [],
+    (live.data ?? []).filter((s) => serverVisibleAtScope(scope, s.scope)),
     // Two servers can share a name across scopes (e.g. a `local` and a `project`
     // `playwright`, both folded into the "repo" bucket) — key by scope+name so they
     // don't collide in the freeze order nor as React keys below.
@@ -741,6 +774,7 @@ function ConversationBody({
           <span className={styles.sectionT}>MCP servers</span>
           <span className={styles.sectionC}>{mcpTotal + sum(mcpContribs, (p) => p.mcp_count)}</span>
         </div>
+        <ExternalRules target={perms} />
         {handle == null ? (
           <div className={styles.sectionEmpty}>
             Start the conversation (send a message) to see the live MCP server status.
@@ -1731,7 +1765,7 @@ function McpLiveRow({
         <span className={styles.rowName}>{mcp.name}</span>
         <Badge label={b.label} cls={b.cls} />
         <span className={styles.spacer} />
-        <McpPermissionSummary server={mcp} rules={perms.rules} />
+        <McpPermissionSummary server={mcp} target={perms} />
         {mcp.tool_count > 0 ? <span className={styles.toolPill}>{mcp.tool_count} tools</span> : null}
         {canExpand ? (
           <button
@@ -1799,7 +1833,7 @@ function McpLiveRow({
             </span>
           ) : null}
           {enabled ? (
-            <ServerScopeToggle server={mcp} perms={perms} busy={busy} />
+            <ServerScopeToggle server={mcp} target={perms} busy={busy} />
           ) : (
             // Turned off in Claude Code itself (`/mcp`, saved for this FOLDER in
             // ~/.claude.json) — not by any scope here. Offer the way back.
@@ -2305,7 +2339,7 @@ function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTar
         <span className={styles.rowName}>{mcp.name}</span>
         <Badge label={b.label} cls={b.cls} />
         <span className={styles.spacer} />
-        <McpPermissionSummary server={mcp} rules={perms.rules} />
+        <McpPermissionSummary server={mcp} target={perms} />
         {mcp.tool_count > 0 ? <span className={styles.toolPill}>{mcp.tool_count} tools</span> : null}
         {canExpand ? (
           <button
@@ -2335,7 +2369,7 @@ function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTar
               Managed by the Claude app
             </span>
           ) : null}
-          <ServerScopeToggle server={mcp} perms={perms} />
+          <ServerScopeToggle server={mcp} target={perms} />
         </div>
       </div>
       {open ? <McpToolPermissions server={mcp} target={perms} /> : null}
@@ -2356,6 +2390,9 @@ export function GlobalExtensions() {
   const ext = useExtensions(home);
   const mcp = useGlobalMcpStatus(true);
   const perms = useExtensionScope("global", null, null, null);
+  useEffect(() => {
+    for (const s of mcp.data ?? []) noteServerTools(s.name, s.tools);
+  }, [mcp.data]);
   const updatePlugin = useUpdatePlugin(home ?? "~", null);
   const [doc, setDoc] = useState<OpenDoc | null>(null);
   const [pluginView, setPluginView] = useState<{ plugin: PluginInfo; section: ExplorerSectionKey } | null>(null);
@@ -2396,7 +2433,7 @@ export function GlobalExtensions() {
   // The home directory is not a project: only what is global shows here.
   const servers = (mcp.data ?? []).filter((m) => m.scope === "claudeai" || m.scope === "user");
   const groups = bucketizeLive(servers);
-  const plugins = ext.data?.plugins ?? [];
+  const plugins = (ext.data?.plugins ?? []).filter((p) => visibleAtScope("global", p.scope));
   const skills = (ext.data?.skills ?? []).filter((s) => s.source == null && s.scope === "user");
   const agents = (ext.data?.agents ?? []).filter((a) => a.source == null && a.scope === "user");
 
@@ -2436,6 +2473,7 @@ export function GlobalExtensions() {
             <Ico name="refresh" className={"sm" + (mcp.isFetching ? " " + styles.spin : "")} />
           </button>
         </div>
+        <ExternalRules target={perms} />
         {mcp.isLoading ? (
           <div className={styles.sectionEmpty}>Starting Claude to list your connectors — a few seconds…</div>
         ) : mcp.isError ? (

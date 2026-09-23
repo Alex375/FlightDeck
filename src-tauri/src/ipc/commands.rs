@@ -3434,37 +3434,17 @@ pub async fn mcp_permission_rules(
     .map_err(|e| e.to_string())
 }
 
-/// Set (or clear) MCP permission rules — per tool, or a whole server — in the global
-/// `~/.claude/settings.json` or in this repository's `.claude/settings.local.json`
-/// (`target`). One atomic write for the batch, read back and verified. Running sessions
-/// pick it up from their next tool call (the CLI watches both files).
+/// Set (or clear) MCP permission rules in the user's `~/.claude/settings.json`. Flight
+/// Deck applies its own permissions per session; this serves to clean up a rule found in
+/// that file (which Claude Code enforces on its own, above Flight Deck's). One atomic write
+/// for the batch, read back and verified.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_mcp_tool_permissions(
     changes: Vec<crate::extensions::permissions::McpToolPermissionChange>,
-    target: crate::extensions::permissions::SettingsTarget,
-    repo_path: Option<String>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        crate::extensions::permissions::set_mcp_tool_permissions(&changes, target, repo_path.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// Turn a plugin on/off in the global or this repository's local settings file, or remove
-/// that file's say (`enabled: null`) so the plugin follows the files below again. Read
-/// back and verified; a live session applies it on `reload_plugins`.
-#[tauri::command]
-#[specta::specta]
-pub async fn set_plugin_override(
-    plugin_id: String,
-    enabled: Option<bool>,
-    target: crate::extensions::permissions::SettingsTarget,
-    repo_path: Option<String>,
-) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        crate::extensions::permissions::set_plugin_override(&plugin_id, enabled, target, repo_path.as_deref())
+        crate::extensions::permissions::set_mcp_tool_permissions(&changes)
     })
     .await
     .map_err(|e| e.to_string())?

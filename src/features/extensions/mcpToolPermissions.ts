@@ -1,49 +1,49 @@
-// Per-tool permission for MCP tools — the pure half. Resolves Claude Code's own
-// `permissions.allow` / `ask` / `deny` rules into what the UI needs for one tool: the
-// panel's own choice, what REALLY applies, and which choices would actually hold.
+// MCP permissions and plugins per scope — the pure half.
 //
-// Rules come from two kinds of place:
-//   • the settings files (managed, local, project, user) — read by the Rust
-//     `extensions::permissions` module; the GLOBAL panel (Settings → Extensions) manages
-//     the user file's exact-name rules;
-//   • one conversation's session layer (`apply_flag_settings`, the Rust `SessionToolRules`)
-//     — the CONVERSATION panel (⌘E) manages those, and they reach that conversation alone.
+// Flight Deck keeps its OWN three-level cascade — Global → Repository → Conversation — and
+// the narrowest level that says something wins, in BOTH directions: a repository can loosen
+// a cautious global setting as well as tighten a permissive one. Claude Code can't express
+// that itself (its rules resolve deny > ask > allow whatever their source, so a broad deny
+// could never be undone), so the app resolves the cascade and hands each conversation ONE
+// consistent rule per tool through its session layer (`apply_flag_settings`, the Rust
+// `SessionOverrides`).
 //
-// The CLI's semantics, mirrored here (docs + binary 2.1.280):
-//   • deny > ask > allow — whatever the rule's specificity or where it sits, so a project
-//     `deny` beats a user `allow`, a global `ask` beats a conversation `allow`: a
-//     conversation can tighten the global rules, never loosen them.
-//   • `mcp__<server>` matches every tool of that server; deny/ask accept a glob anywhere in
-//     the tool name (`*`, `mcp__*`), allow only after a literal `mcp__<server>__` prefix.
-//   • A choice another rule would override is never offered as if it would take effect.
-import type { McpToolInfo, PermissionRule, ToolRuleKind } from "../../ipc/client";
+// What each level holds:
+//   • tools   — `mcp__<server>__<tool>` → allow / ask / deny;
+//   • servers — `mcp__<server>` → on / off (off = every tool of the server leaves Claude's
+//     context; "on" at a narrower level undoes a broader "off");
+//   • plugins — plugin id → on / off (Repository and Conversation; the Global plugin state is
+//     Claude Code's own `enabledPlugins` in ~/.claude/settings.json).
+// Within one level a tool's own setting beats its server's; across levels the narrowest wins.
+//
+// Claude Code's settings FILES keep applying underneath ("external" rules here): Claude
+// enforces them itself, deny > ask > allow, so an external deny/ask can't be loosened from
+// Flight Deck — the rows say so, and the global view offers to remove such a rule.
+import type { McpToolInfo, PermissionRule, SessionOverrides, ToolRuleKind } from "../../ipc/client";
 
-/** Where a rule sits: one of the settings files, or the conversation's own session layer. */
-export type ToolRuleSource = PermissionRule["source"] | "conversation";
+/** A level of the cascade — what the panel's scope picker selects. */
+export type PermissionScope = "global" | "repository" | "conversation";
 
-/** A permission rule from any source — a file rule, or one of the conversation's own. */
-export interface ToolRule {
-  rule: string;
-  kind: ToolRuleKind;
-  source: ToolRuleSource;
-  path: string;
+/** What one level of the cascade says. */
+export interface LevelPolicy {
+  tools: Record<string, ToolRuleKind>;
+  servers: Record<string, boolean>;
+  plugins: Record<string, boolean>;
 }
 
-/** Which rules a panel manages: one conversation's session layer, this repository's local
- *  file (`.claude/settings.local.json`, this machine only), or the user's settings file
- *  (every conversation). The other sources' rules still apply and are shown. */
-export type PermissionScope = "conversation" | "repository" | "global";
+export const EMPTY_LEVEL: LevelPolicy = { tools: {}, servers: {}, plugins: {} };
 
-const OWN_SOURCE: Record<PermissionScope, ToolRuleSource> = {
-  conversation: "conversation",
-  repository: "local",
-  global: "user",
+/** The levels that apply to one context (absent = says nothing). */
+export type Cascade = Partial<Record<PermissionScope, LevelPolicy>>;
+
+/** A scope sees itself and the broader levels — never a narrower one. Narrowest first. */
+const LEVELS_FROM: Record<PermissionScope, readonly PermissionScope[]> = {
+  conversation: ["conversation", "repository", "global"],
+  repository: ["repository", "global"],
+  global: ["global"],
 };
 
-/** What the user picks for one tool: one of the three rule lists, or no rule at all. */
-export type ToolChoice = "default" | ToolRuleKind;
-
-export const TOOL_CHOICES: readonly ToolChoice[] = ["default", "allow", "ask", "deny"];
+// ---- Names -------------------------------------------------------------------------------
 
 /**
  * The CLI's server-name normalization (`hn`, binary 2.1.280): every character outside
@@ -61,10 +61,69 @@ export function mcpToolRuleName(server: string, tool: string): string {
   return tool.startsWith("mcp__") ? tool : `mcp__${normalizeServerName(server)}__${tool}`;
 }
 
+/** The rule name of a whole server (`mcp__claude_ai_Gmail`). */
+export function serverRuleName(server: string): string {
+  return `mcp__${normalizeServerName(server)}`;
+}
+
+/** `mcp__S__t` → `mcp__S`. */
+const serverOfTool = (toolRule: string) => {
+  const rest = toolRule.slice(5);
+  const i = rest.indexOf("__");
+  return i < 0 ? toolRule : `mcp__${rest.slice(0, i)}`;
+};
+
+// ---- The cascade --------------------------------------------------------------------------
+
+/** What the user picks for one tool at a scope: a rule, or nothing of the scope's own. */
+export type ToolChoice = "default" | ToolRuleKind;
+
+export const TOOL_CHOICES: readonly ToolChoice[] = ["default", "allow", "ask", "deny"];
+
+/** Where a value comes from: a level, and whether the tool's own setting or its server's. */
+export interface From {
+  level: PermissionScope;
+  via: "tool" | "server";
+}
+
+/** What a tool gets at a scope, from the scope itself or a broader level (null: nothing —
+ *  the conversation's permission mode decides). */
+export function toolAt(cascade: Cascade, scope: PermissionScope, toolRule: string): { kind: ToolRuleKind | null; from: From | null } {
+  const server = serverOfTool(toolRule);
+  for (const level of LEVELS_FROM[scope]) {
+    const p = cascade[level];
+    if (!p) continue;
+    const own = p.tools[toolRule];
+    if (own) return { kind: own, from: { level, via: "tool" } };
+    const s = p.servers[server];
+    if (s !== undefined) return { kind: s ? null : "deny", from: { level, via: "server" } };
+  }
+  return { kind: null, from: null };
+}
+
+/** A server's on/off at a scope (on unless a level says off). */
+export function serverAt(cascade: Cascade, scope: PermissionScope, server: string): { on: boolean; own: boolean | null; from: PermissionScope | null } {
+  const rule = serverRuleName(server);
+  const own = cascade[scope]?.servers[rule];
+  for (const level of LEVELS_FROM[scope]) {
+    const v = cascade[level]?.servers[rule];
+    if (v !== undefined) return { on: v, own: own ?? null, from: level };
+  }
+  return { on: true, own: null, from: null };
+}
+
+/** What a server would be at a scope WITHOUT the scope's own say. */
+export function serverInherited(cascade: Cascade, scope: PermissionScope, server: string): boolean {
+  const below: Cascade = { ...cascade, [scope]: undefined };
+  return serverAt(below, scope, server).on;
+}
+
+// ---- Claude Code's own files (external rules) ---------------------------------------------
+
 const globToRegExp = (glob: string) =>
   new RegExp(`^${glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
 
-/** Whether a rule from the `kind` list reaches the MCP tool `tool` (a full rule name). */
+/** Whether a Claude Code rule from the `kind` list reaches the MCP tool `tool`. */
 export function ruleMatchesTool(rule: string, kind: ToolRuleKind, tool: string): boolean {
   if (rule === tool) return true;
   if (!rule.includes("*")) {
@@ -76,72 +135,185 @@ export function ruleMatchesTool(rule: string, kind: ToolRuleKind, tool: string):
   return globToRegExp(rule).test(tool);
 }
 
-/** What applies to a tool, and the rule responsible (null: no rule — the mode decides). */
-export interface Resolution {
-  kind: ToolRuleKind | null;
-  rule: ToolRule | null;
-}
-
 const KIND_RANK: Record<ToolRuleKind, number> = { deny: 0, ask: 1, allow: 2 };
-const SOURCE_RANK: Record<ToolRuleSource, number> = { managed: 0, conversation: 1, local: 2, project: 3, user: 4 };
+const SOURCE_RANK: Record<PermissionRule["source"], number> = { managed: 0, local: 1, project: 2, user: 3 };
 
-/** deny > ask > allow; among equals, the most authoritative source is the one named. */
-export function resolvePermission(tool: string, rules: readonly ToolRule[]): Resolution {
-  const best = rules
-    .filter((r) => ruleMatchesTool(r.rule, r.kind, tool))
-    .sort((a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind] || SOURCE_RANK[a.source] - SOURCE_RANK[b.source])[0];
-  return best ? { kind: best.kind, rule: best } : { kind: null, rule: null };
+/** How Claude Code itself resolves a set of rules: deny > ask > allow, any source. */
+export function nativeResolve(tool: string, rules: readonly PermissionRule[]): PermissionRule | null {
+  return (
+    rules
+      .filter((r) => ruleMatchesTool(r.rule, r.kind, tool))
+      .sort((a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind] || SOURCE_RANK[a.source] - SOURCE_RANK[b.source])[0] ?? null
+  );
 }
 
-/** A rule the panel manages for this tool: its exact name, in the scope's own source. */
-const isOwn = (r: ToolRule, tool: string, scope: PermissionScope) =>
-  r.source === OWN_SOURCE[scope] && r.rule === tool;
-
-export interface ChoiceOption {
-  /** Picking it would really be what applies. */
-  holds: boolean;
-  /** When it wouldn't: the rule that wins instead. */
-  blockedBy: ToolRule | null;
+/** An external rule that would override `kind` for `tool` (a stricter one), if any. */
+export function externalOverride(tool: string, kind: ToolRuleKind | null, external: readonly PermissionRule[]): PermissionRule | null {
+  const ext = nativeResolve(tool, external);
+  if (!ext) return null;
+  if (kind === null) return ext.kind === "allow" ? null : ext; // an external allow is only looser
+  return KIND_RANK[ext.kind] < KIND_RANK[kind] ? ext : null;
 }
 
-export interface ToolPermissionState {
-  /** The full rule name (`mcp__claude_ai_Gmail__send_message`). */
-  tool: string;
-  /** The scope's own rule for the tool, or "default" when it has none. */
+// ---- One tool row -------------------------------------------------------------------------
+
+export interface ToolRowState {
+  /** The scope's own setting for the tool, or "default" (follow the broader levels). */
   choice: ToolChoice;
-  /** What really applies, every source considered. */
-  effective: Resolution;
-  /** What would apply with no rule of the scope's own — what "Default" means here. */
-  inherited: Resolution;
-  options: Record<ToolChoice, ChoiceOption>;
+  /** What the tool gets at this scope (own, else inherited); null = the mode decides. */
+  shown: ToolRuleKind | null;
+  /** Where `shown` comes from, when not the scope's own tool setting. */
+  from: From | null;
+  /** Per choice: a stricter rule in Claude Code's files that would win over it. */
+  blockedBy: Record<ToolChoice, PermissionRule | null>;
+  /** The external rule that wins over what this scope shows right now, if any. */
+  overriddenBy: PermissionRule | null;
 }
 
-export function toolPermissionState(
-  tool: string,
-  rules: readonly ToolRule[],
-  scope: PermissionScope = "global",
-): ToolPermissionState {
-  const own = rules.filter((r) => isOwn(r, tool, scope));
-  const others = rules.filter((r) => !isOwn(r, tool, scope));
-  const choice: ToolChoice = own.length
-    ? [...own].sort((a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind])[0].kind
-    : "default";
-  const option = (kind: ToolRuleKind): ChoiceOption => {
-    const mine: ToolRule = { rule: tool, kind, source: OWN_SOURCE[scope], path: "" };
-    const r = resolvePermission(tool, [...others, mine]);
-    return r.kind === kind ? { holds: true, blockedBy: null } : { holds: false, blockedBy: r.rule };
+export function toolRowState(
+  cascade: Cascade,
+  scope: PermissionScope,
+  toolRule: string,
+  external: readonly PermissionRule[],
+): ToolRowState {
+  const own = cascade[scope]?.tools[toolRule];
+  const at = toolAt(cascade, scope, toolRule);
+  const inherited = toolAt({ ...cascade, [scope]: { ...(cascade[scope] ?? EMPTY_LEVEL), tools: {} } }, scope, toolRule);
+  const blockedBy = {
+    default: externalOverride(toolRule, inherited.kind, external),
+    allow: externalOverride(toolRule, "allow", external),
+    ask: externalOverride(toolRule, "ask", external),
+    deny: null,
   };
   return {
-    tool,
-    choice,
-    effective: resolvePermission(tool, rules),
-    inherited: resolvePermission(tool, others),
-    // "Default" always holds: it only removes the scope's own rule.
-    options: { default: { holds: true, blockedBy: null }, allow: option("allow"), ask: option("ask"), deny: option("deny") },
+    choice: own ?? "default",
+    shown: at.kind,
+    from: own ? null : at.from,
+    blockedBy,
+    overriddenBy: externalOverride(toolRule, at.kind, external),
   };
 }
 
-// ---- Read vs write --------------------------------------------------------------------
+// ---- Plugins ------------------------------------------------------------------------------
+
+/** Claude Code's own say on a plugin: `enabledPlugins[id]` in one of its settings files. */
+export interface PluginFileSay {
+  source: PermissionRule["source"];
+  enabled: boolean;
+}
+
+export interface PluginScopeState {
+  /** On at this scope (its own say, else what it inherits). */
+  enabled: boolean;
+  /** The scope has a say of its own. */
+  own: boolean;
+  /** What it would be without the scope's own say. */
+  inherited: boolean;
+  /** Claude Code's organization policy decides — nothing here can change it. */
+  lockedByPolicy: boolean;
+}
+
+/**
+ * A plugin seen from a scope. Global = Claude Code's own files (user, then the project's
+ * shared/local ones do NOT count — they're a repository's, not global); Repository and
+ * Conversation = Flight Deck's cascade over that. `fallback` = the configuration scan's
+ * answer when no file says anything.
+ */
+export function pluginAt(
+  cascade: Cascade,
+  scope: PermissionScope,
+  pluginId: string,
+  files: readonly PluginFileSay[],
+  fallback: boolean,
+): PluginScopeState {
+  const file = (s: PluginFileSay["source"]) => files.find((f) => f.source === s)?.enabled;
+  const globalValue = file("user") ?? fallback;
+  const valueFrom = (levels: readonly PermissionScope[]) => {
+    for (const level of levels) {
+      if (level === "global") return globalValue;
+      const v = cascade[level]?.plugins[pluginId];
+      if (v !== undefined) return v;
+    }
+    return globalValue;
+  };
+  const levels = LEVELS_FROM[scope];
+  const own = scope === "global" ? file("user") !== undefined : cascade[scope]?.plugins[pluginId] !== undefined;
+  return {
+    enabled: valueFrom(levels),
+    own,
+    inherited: scope === "global" ? fallback : valueFrom(levels.slice(1)),
+    lockedByPolicy: file("managed") !== undefined,
+  };
+}
+
+/** What to write when the user flips a plugin at a scope: nothing of its own (null) when
+ *  that's what it would follow anyway; the global file always holds an explicit value. */
+export function pluginWrite(state: PluginScopeState, enabled: boolean, scope: PermissionScope): boolean | null {
+  return scope !== "global" && enabled === state.inherited ? null : enabled;
+}
+
+// ---- What a conversation's session receives -------------------------------------------------
+
+/**
+ * The one consistent rule set a conversation runs under: for every tool any level talks
+ * about, its narrowest setting. A server turned off becomes one `deny` on the server — or,
+ * when a narrower level re-allows some of its tools, a `deny` on each of its OTHER known
+ * tools (Claude's deny > allow would otherwise swallow the exception). `toolCache` = the
+ * tools each server was last seen with.
+ */
+export function sessionOverridesFrom(cascade: Cascade, toolCache: Readonly<Record<string, readonly string[]>>): SessionOverrides {
+  const out: SessionOverrides = { allow: [], ask: [], deny: [], enabled_plugins: {} };
+  const servers = new Set<string>();
+  const toolsOf = new Map<string, Set<string>>();
+  for (const level of ["global", "repository", "conversation"] as const) {
+    const p = cascade[level];
+    if (!p) continue;
+    for (const s of Object.keys(p.servers)) servers.add(s);
+    for (const t of Object.keys(p.tools)) {
+      const s = serverOfTool(t);
+      servers.add(s);
+      if (!toolsOf.has(s)) toolsOf.set(s, new Set());
+      toolsOf.get(s)!.add(t);
+    }
+  }
+  const push = (tool: string, kind: ToolRuleKind | null) => {
+    if (kind) out[kind].push(tool);
+  };
+  for (const server of [...servers].sort()) {
+    const named = toolsOf.get(server) ?? new Set<string>();
+    const on = (() => {
+      for (const level of LEVELS_FROM.conversation) {
+        const v = cascade[level]?.servers[server];
+        if (v !== undefined) return v;
+      }
+      return true;
+    })();
+    if (on) {
+      for (const t of [...named].sort()) push(t, toolAt(cascade, "conversation", t).kind);
+      continue;
+    }
+    const exceptions = [...named].filter((t) => {
+      const r = toolAt(cascade, "conversation", t);
+      return r.from?.via === "tool" && r.kind !== "deny";
+    });
+    if (!exceptions.length) {
+      out.deny.push(server);
+      continue;
+    }
+    const known = new Set([...(toolCache[server] ?? []).map((t) => `${server}__${t}`), ...named]);
+    for (const t of [...known].sort()) push(t, toolAt(cascade, "conversation", t).kind ?? "deny");
+  }
+  const plugins: Record<string, boolean> = {};
+  for (const level of ["repository", "conversation"] as const) Object.assign(plugins, cascade[level]?.plugins ?? {});
+  out.enabled_plugins = Object.fromEntries(Object.entries(plugins).sort(([a], [b]) => a.localeCompare(b)));
+  return out;
+}
+
+export function isEmptyOverrides(o: SessionOverrides): boolean {
+  return !o.allow.length && !o.ask.length && !o.deny.length && !Object.keys(o.enabled_plugins ?? {}).length;
+}
+
+// ---- Read vs write --------------------------------------------------------------------------
 
 /** Whether a tool reads or acts, and how we know. */
 export interface ToolNature {
@@ -180,7 +352,7 @@ export function toolNature(t: Pick<McpToolInfo, "name" | "read_only" | "destruct
   return { nature: "write", from: "name" };
 }
 
-// ---- Batch actions ----------------------------------------------------------------------
+// ---- Batch actions (they write the scope's OWN tool settings) --------------------------------
 
 export interface ToolChange {
   tool: string;
@@ -189,192 +361,68 @@ export interface ToolChange {
 
 type ToolLike = Pick<McpToolInfo, "name" | "read_only" | "destructive">;
 
-/**
- * Set every tool of a server to what `pick` wants for it. Only choices that would hold are
- * written (one a stricter rule elsewhere overrides is skipped, and counted, rather than
- * written as a rule that does nothing), and only where the choice changes.
- */
-function bulk(
-  server: string,
-  tools: readonly ToolLike[],
-  rules: readonly ToolRule[],
-  scope: PermissionScope,
-  pick: (t: ToolLike) => ToolRuleKind,
-): { changes: ToolChange[]; skipped: number } {
-  const changes: ToolChange[] = [];
-  let skipped = 0;
-  for (const t of tools) {
-    const tool = mcpToolRuleName(server, t.name);
-    const want = pick(t);
-    const s = toolPermissionState(tool, rules, scope);
-    if (!s.options[want].holds) skipped++;
-    else if (s.choice !== want) changes.push({ tool, kind: want });
-  }
-  return { changes, skipped };
+/** Set every tool of a server to what `pick` wants for it — only where the choice changes. */
+function bulk(cascade: Cascade, scope: PermissionScope, server: string, tools: readonly ToolLike[], pick: (t: ToolLike) => ToolRuleKind): ToolChange[] {
+  return tools
+    .map((t) => ({ tool: mcpToolRuleName(server, t.name), kind: pick(t) }))
+    .filter((c) => cascade[scope]?.tools[c.tool] !== c.kind);
 }
 
 /** The "read-only" preset: reads allowed, everything else asks first. */
-export function readOnlyPreset(
-  server: string,
-  tools: readonly ToolLike[],
-  rules: readonly ToolRule[],
-  scope: PermissionScope = "global",
-): { changes: ToolChange[]; skipped: number } {
-  return bulk(server, tools, rules, scope, (t) => (toolNature(t).nature === "read" ? "allow" : "ask"));
+export function readOnlyPreset(cascade: Cascade, scope: PermissionScope, server: string, tools: readonly ToolLike[]): ToolChange[] {
+  return bulk(cascade, scope, server, tools, (t) => (toolNature(t).nature === "read" ? "allow" : "ask"));
 }
 
 /** Every tool of the server to the same rule (Allow all / Ask for all / Block all). */
-export function setAll(
-  server: string,
-  tools: readonly ToolLike[],
-  rules: readonly ToolRule[],
-  kind: ToolRuleKind,
-  scope: PermissionScope = "global",
-): { changes: ToolChange[]; skipped: number } {
-  return bulk(server, tools, rules, scope, () => kind);
+export function setAll(cascade: Cascade, scope: PermissionScope, server: string, tools: readonly ToolLike[], kind: ToolRuleKind): ToolChange[] {
+  return bulk(cascade, scope, server, tools, () => kind);
 }
 
-/** Remove every rule of the scope's own for this server's tools. */
-export function resetServer(
-  server: string,
-  tools: readonly Pick<McpToolInfo, "name">[],
-  rules: readonly ToolRule[],
-  scope: PermissionScope = "global",
-): ToolChange[] {
+/** Remove the scope's own settings for this server's tools. */
+export function resetServer(cascade: Cascade, scope: PermissionScope, server: string, tools: readonly Pick<McpToolInfo, "name">[]): ToolChange[] {
   return tools
     .map((t) => mcpToolRuleName(server, t.name))
-    .filter((tool) => toolPermissionState(tool, rules, scope).choice !== "default")
+    .filter((tool) => cascade[scope]?.tools[tool] !== undefined)
     .map((tool) => ({ tool, kind: null }));
 }
 
-/** How many of a server's tools are blocked / ask / allowed, for its collapsed row. */
+/** How many of a server's tools are blocked / ask / allowed at a scope, for its row. */
 export function serverSummary(
+  cascade: Cascade,
+  scope: PermissionScope,
   server: string,
   tools: readonly Pick<McpToolInfo, "name">[],
-  rules: readonly ToolRule[] | undefined,
 ): { deny: number; ask: number; allow: number } {
   const out = { deny: 0, ask: 0, allow: 0 };
-  if (!rules) return out;
   for (const t of tools) {
-    const k = resolvePermission(mcpToolRuleName(server, t.name), rules).kind;
+    const k = toolAt(cascade, scope, mcpToolRuleName(server, t.name)).kind;
     if (k) out[k]++;
   }
   return out;
 }
 
-// ---- A whole server on/off --------------------------------------------------------------
+// ---- Words ------------------------------------------------------------------------------------
 
-/** The rule that names a whole server (`mcp__claude_ai_Gmail`) — a `deny` on it turns the
- *  server off: every one of its tools leaves Claude's context. */
-export function serverRuleName(server: string): string {
-  return `mcp__${normalizeServerName(server)}`;
-}
-
-export interface ServerOffState {
-  /** The server is off for this conversation, every source considered. */
-  off: boolean;
-  /** The scope itself turned it off (its own `deny` on the server rule). */
-  ownOff: boolean;
-  /** Another source turned it off — the scope can't turn it back on. */
-  offBy: ToolRule | null;
-}
-
-/** Whether a server is off, and who turned it off. A server-wide deny is the server rule
- *  itself, `mcp__<server>__*`, or a broader glob (`mcp__*`, `*`) — never one tool's deny. */
-export function serverOffState(server: string, rules: readonly ToolRule[], scope: PermissionScope): ServerOffState {
-  const name = serverRuleName(server);
-  // A tool name no real server uses: only a rule covering EVERY tool of the server matches it.
-  const anyTool = `${name}__\u0001`;
-  const wide = rules.filter((r) => r.kind === "deny" && ruleMatchesTool(r.rule, "deny", anyTool));
-  const ownOff = wide.some((r) => r.source === OWN_SOURCE[scope] && r.rule === name);
-  const offBy = wide.find((r) => !(r.source === OWN_SOURCE[scope] && r.rule === name)) ?? null;
-  return { off: ownOff || offBy != null, ownOff, offBy };
-}
-
-// ---- Plugins on/off per scope -------------------------------------------------------------
-
-/** One source's say on a plugin (`enabledPlugins[id]`): a settings file, or the
- *  conversation's session layer. */
-export interface PluginSay {
-  source: ToolRuleSource;
-  enabled: boolean;
-}
-
-/** Highest precedence first — the flag layer (a conversation) ranks above every file but
- *  the organization's. */
-const PLUGIN_ORDER: readonly ToolRuleSource[] = ["managed", "conversation", "local", "project", "user"];
-/** The sources each scope inherits from when it says nothing itself. */
-const PLUGIN_BELOW: Record<PermissionScope, readonly ToolRuleSource[]> = {
-  conversation: ["local", "project", "user"],
-  repository: ["project", "user"],
-  global: [],
+export const LEVEL_LABEL: Record<PermissionScope, string> = {
+  global: "Global",
+  repository: "this repository",
+  conversation: "this conversation",
 };
 
-export interface PluginScopeState {
-  /** On at this scope's level (its own say, else what it inherits). */
-  enabled: boolean;
-  /** The scope has a say of its own (else it follows the levels below). */
-  own: boolean;
-  /** What this scope would follow without a say of its own. */
-  inherited: boolean;
-  /** What this conversation actually gets, every level considered. */
-  effective: boolean;
-  /** The organization decides — nothing here can change it. */
-  lockedByPolicy: boolean;
-  /** A level ABOVE this scope decides differently for this conversation (e.g. the
-   *  conversation overrides the repository's choice). */
-  overriddenBy: ToolRuleSource | null;
-}
-
-/**
- * A plugin seen from one scope. `fallback` is what applies when no source says anything
- * (the plugin's installed state as the configuration scan reports it).
- */
-export function pluginScopeState(
-  says: readonly PluginSay[],
-  scope: PermissionScope,
-  fallback: boolean,
-): PluginScopeState {
-  const at = (s: ToolRuleSource) => says.find((x) => x.source === s)?.enabled;
-  const firstOf = (order: readonly ToolRuleSource[]) => order.map(at).find((v) => v !== undefined);
-  const ownVal = at(OWN_SOURCE[scope]);
-  const inherited = firstOf(PLUGIN_BELOW[scope]) ?? fallback;
-  const enabled = ownVal ?? inherited;
-  const managed = at("managed");
-  const effective = firstOf(PLUGIN_ORDER) ?? fallback;
-  const above = PLUGIN_ORDER.slice(0, PLUGIN_ORDER.indexOf(OWN_SOURCE[scope]));
-  const overriddenBy = above.find((s) => at(s) !== undefined && at(s) !== enabled) ?? null;
-  return {
-    enabled,
-    own: ownVal !== undefined,
-    inherited,
-    effective,
-    lockedByPolicy: managed !== undefined,
-    overriddenBy,
-  };
-}
-
-/** What to write when the user flips a plugin to `enabled` at a scope: nothing of its own
- *  (null) when that's what it would follow anyway — the files stay minimal — else the
- *  value. The global file always holds an explicit value. */
-export function pluginWrite(state: PluginScopeState, enabled: boolean, scope: PermissionScope): boolean | null {
-  return scope !== "global" && enabled === state.inherited ? null : enabled;
-}
-
-const SOURCE_LABEL: Record<ToolRuleSource, string> = {
-  managed: "organization policy",
-  conversation: "this conversation's settings",
-  local: "this repository's local settings",
-  project: "this repository's shared settings",
-  user: "your global settings",
+const FILE_LABEL: Record<PermissionRule["source"], string> = {
+  managed: "your organization's policy",
+  local: "the repository's .claude/settings.local.json",
+  project: "the repository's .claude/settings.json",
+  user: "~/.claude/settings.json",
 };
 
-/** "this conversation's settings" — who decides, for a note or tooltip. */
-export function describeSource(s: ToolRuleSource): string {
-  return SOURCE_LABEL[s];
+/** "`mcp__x` in ~/.claude/settings.json" — names a Claude Code rule for a tooltip. */
+export function describeRule(r: PermissionRule): string {
+  return `${r.rule} in ${FILE_LABEL[r.source]}`;
 }
 
-/** "`mcp__claude_ai_Gmail` in this project's shared settings" — names a rule for a tooltip. */
-export function describeRule(r: ToolRule): string {
-  return `${r.rule} in ${SOURCE_LABEL[r.source]}`;
+/** "Global" / "this repository (server off)" — names where a value comes from. */
+export function describeFrom(f: From): string {
+  const where = f.level === "global" ? "Global" : LEVEL_LABEL[f.level];
+  return f.via === "server" ? `${where} (the whole server)` : where;
 }

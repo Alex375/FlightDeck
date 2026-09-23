@@ -62,11 +62,7 @@ import {
   clearAllArtifactsCache,
 } from "../features/conversation/artifacts";
 import { clearCodexControls, clearAllCodexControls } from "../features/conversation/codexControls";
-import {
-  clearAllConvToolPermissions,
-  clearConvToolPermissions,
-  sessionOverridesFor,
-} from "./convToolPermissions";
+import { clearAllPolicy, clearConvPolicy, sessionOverridesForConv } from "./mcpPolicy";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
 import {
   clearPlanAnnotations,
@@ -692,7 +688,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   clearComposerDraft(id);
   clearComposerAttachments(id);
   clearCodexControls(id);
-  clearConvToolPermissions(id);
+  clearConvPolicy(id);
   clearWorkFold(id);
   clearPlanAnnotations(id);
   useGitViewStore.getState().clear(id);
@@ -1753,10 +1749,11 @@ export async function ensureConversationSession(
     // placeholder name, so an untitled conversation never stamps that placeholder
     // as the daemon's authoritative title (see `conversationTitleForSpawn`'s doc).
     const conversationTitle = conversationTitleForSpawn(atSpawn.name);
-    // This conversation's own extension settings (its ⌘E panel, "This conversation"): they
-    // live in the process's flag layer, so every spawn carries them to be re-applied right
-    // after `initialize`.
-    const sessionOverrides = atSpawn.kind === "claude" ? sessionOverridesFor(convId) : null;
+    // Flight Deck's MCP permission / plugin cascade (Global → repository → this
+    // conversation), resolved for this conversation: it lives in the process's flag layer,
+    // so every spawn carries it to be re-applied right after `initialize`.
+    const sessionOverrides =
+      atSpawn.kind === "claude" ? sessionOverridesForConv(convId, atSpawn.repoId ?? null) : null;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -2222,7 +2219,7 @@ export async function wipeAllData(): Promise<void> {
   clearAllComposerDrafts();
   clearAllComposerAttachments();
   clearAllCodexControls();
-  clearAllConvToolPermissions();
+  clearAllPolicy();
   clearAllWorkFold();
   clearAllPlanAnnotations();
   clearAllSidebarFold();
