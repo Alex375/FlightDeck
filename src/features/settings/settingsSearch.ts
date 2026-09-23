@@ -36,7 +36,7 @@ export interface SettingEntry {
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
   general: ["accounts", "system"],
   display: ["appearance", "thread", "timing", "composer", "models", "ide", "order"],
-  claudeCode: ["instructions", "behavior", "helpers"],
+  claudeCode: ["instructions", "behavior", "helpers", "extensions"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
@@ -148,8 +148,8 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Show in the Flight Deck", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout counters banner alerts alertes" },
   { title: "Show in the Conversation", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout sidebar counters alerts alertes" },
   { title: "Alert for background shell commands", section: "notifications", sub: "background", group: "Background tasks", keywords: "bash monitor background notification alerts alertes" },
-  { title: "Connectors & MCP servers", section: "extensions", group: "Extensions", keywords: "cloud connectors mcp tools outils permissions allow ask block autoriser bloquer gmail slack claude.ai" },
-  { title: "Plugins", section: "extensions", group: "Extensions", keywords: "plugins marketplaces extensions enable" },
+  { title: "Connectors & MCP servers", section: "claudeCode", sub: "extensions", group: "Extensions", keywords: "cloud connectors mcp tools outils permissions allow ask block autoriser bloquer gmail slack claude.ai" },
+  { title: "Plugins", section: "claudeCode", sub: "extensions", group: "Extensions", keywords: "plugins marketplaces extensions enable" },
   { title: "Flight Deck", section: "updates", group: "Flight Deck", keywords: "app update version mise a jour" },
   { title: "Claude Code CLI", section: "updates", group: "Claude Code CLI", keywords: "binary update version cli" },
   { title: "Automatic updates", section: "updates", group: "Claude Code CLI", keywords: "auto update cli" },

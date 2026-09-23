@@ -2304,7 +2304,7 @@ function DocViewer({ doc, onClose }: { doc: OpenDoc; onClose: () => void }) {
   );
 }
 
-// ---- Global view (Settings → Extensions) -----------------------------------------
+// ---- Global view (Settings → Claude Code → Extensions) --------------------------
 
 /** The user's home directory — the "project" a conversation-less `claude` runs in. */
 function useHomeDir(): string | null {
@@ -2378,7 +2378,7 @@ function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTar
 const CLAUDE_CONNECTORS_URL = "https://claude.ai/settings/connectors";
 
 /**
- * Settings → Extensions: the GLOBAL picture every Claude conversation starts from — cloud
+ * Settings → Claude Code → Extensions: the GLOBAL picture every Claude conversation starts from — cloud
  * connectors and MCP servers with their global per-tool permissions, plugins (enabling one
  * is user-global), and the user's own skills and sub-agents. A conversation's ⌘E panel
  * shows the same things live and can add rules for that conversation alone.

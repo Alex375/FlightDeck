@@ -68,12 +68,9 @@ const TABS: Array<{
   // page is Claude model names, Claude file layout and Claude-only CLI flags end to end,
   // so an abstraction over both backends would have to speak in euphemisms. A Codex twin
   // would be its own tab. Holds what used to be the top-level "Behavior" tab (output
-  // style, bypass permissions) — both are Claude-only and do nothing for Codex.
+  // style, bypass permissions) — both are Claude-only and do nothing for Codex — and the
+  // global extensions page (its "Extensions" sub-tab).
   { id: "claudeCode", label: "Claude Code", icon: "code", needsClaude: true },
-  // The global counterpart of a conversation's ⌘E panel: cloud connectors and MCP servers
-  // (with their global per-tool permissions), plugins, the user's skills and sub-agents.
-  // Claude-only like the tab above — Codex's own extensions stay in its ⌘E panel.
-  { id: "extensions", label: "Extensions", icon: "layers", needsClaude: true },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
   { id: "control", label: "Control", icon: "wand" },
@@ -106,11 +103,14 @@ const DISPLAY_SUBS = [
 ] as const;
 
 /** Claude Code, widest scope first: the instructions every conversation starts from, then
- *  how Claude itself behaves, then the helpers it delegates to and what they cost. */
+ *  how Claude itself behaves, then the helpers it delegates to and what they cost, then
+ *  the extensions (connectors, plugins, skills, sub-agents) every conversation starts with.
+ *  Extensions lives here because it is Claude's — Codex's own stay in its ⌘E panel. */
 const CLAUDE_CODE_SUBS = [
   { id: "instructions", label: "Instructions", icon: "file" },
   { id: "behavior", label: "Behavior", icon: "shield" },
   { id: "helpers", label: "Helpers", icon: "bot" },
+  { id: "extensions", label: "Extensions", icon: "layers" },
 ] as const;
 
 const CONTROL_SUBS = [
@@ -441,7 +441,11 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               <div>
                 <PageHead
                   title="Claude Code"
-                  subtitle="The instructions Claude works from, how it behaves, and which model each of its helpers runs on."
+                  subtitle={
+                    claudeCodeSub === "extensions"
+                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
+                      : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
+                  }
                 />
                 {/* Claude-only, all of it: the output style and the bypass-permissions
                     unlock came from the old top-level "Behavior" tab — one writes
@@ -462,16 +466,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   </>
                 )}
                 {claudeCodeSub === "helpers" && <ClaudeCodeHelpers />}
-              </div>
-            )}
-
-            {!searching && section === "extensions" && (
-              <div>
-                <PageHead
-                  title="Extensions"
-                  subtitle="What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
-                />
-                <GlobalExtensions />
+                {claudeCodeSub === "extensions" && <GlobalExtensions />}
               </div>
             )}
 
