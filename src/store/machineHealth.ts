@@ -91,13 +91,19 @@ interface MachineHealthState {
 
 export const useMachineHealthStore = create<MachineHealthState>((set) => ({
   byMachine: {},
-  record: (machineId, diagnosis) =>
+  record: (machineId, diagnosis) => {
+    // Any recorded verdict counts as "just probed", whoever paid for it — the Settings
+    // server card calls `machine_diagnose` itself (it needs the full diagnosis back, which
+    // `probeMachine` does not hand over). Without this the ambient poll would dial the
+    // same server again seconds after the user hit Refresh.
+    lastProbeAtMs.set(machineId, Date.now());
     set((s) => ({
       byMachine: {
         ...s.byMachine,
         [machineId]: healthFromDiagnosis(s.byMachine[machineId], diagnosis, Date.now()),
       },
-    })),
+    }));
+  },
   recordProbeError: (machineId, error) =>
     set((s) => {
       const prev = s.byMachine[machineId];

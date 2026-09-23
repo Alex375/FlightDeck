@@ -68,6 +68,7 @@ import { DiagnosisSummary, ServerStatusPanel } from "./ServerStatusPanel";
 import type { Machine } from "../../store/conversationsStore";
 import type { RepairAction, ServerDiagnosis } from "../../ipc/client";
 import type { ProvisionStatusLabel } from "./provisionStatus";
+import { isUnreachable, useMachineHealthStore } from "../../store/machineHealth";
 import sharedStyles from "./SettingsPanel.module.css";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
 
@@ -230,7 +231,11 @@ function baseMachine(over: Partial<Machine> = {}): Machine {
 
 const NEUTRAL_LABEL: ProvisionStatusLabel = { text: "not checked yet", canRetry: false, isProblem: false };
 
-function mountPanel(machine: Machine = baseMachine(), onRemove: () => void = () => {}) {
+function mountPanel(
+  machine: Machine = baseMachine(),
+  onRemove: () => void = () => {},
+  recheckToken = 0,
+) {
   act(() => {
     root.render(
       createElement(ServerStatusPanel, {
@@ -238,6 +243,7 @@ function mountPanel(machine: Machine = baseMachine(), onRemove: () => void = () 
         provisionLabel: NEUTRAL_LABEL,
         revokeLabel: null,
         isRetrying: false,
+        recheckToken,
         onRetryProvisioning: () => {},
         onNewConversation: () => {},
         onRemove,
@@ -498,5 +504,67 @@ describe("ServerStatusPanel — Claude sign-in single-flight (B-finding #4)", ()
 
     expect(container.textContent).not.toContain("Sign-in in progress");
     expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.includes("Sign in to Claude"))).toBe(true);
+  });
+});
+
+describe("ServerStatusPanel — recheckToken", () => {
+  const unreachable = () =>
+    baseDiagnosis({
+      reachable: false,
+      state: { kind: "failed", reason: "could not reach the server" },
+      installed_as: "unknown",
+      daemon_running: null,
+      claude_installed: null,
+      claude_logged_in: null,
+      claude_email: null,
+    });
+
+  beforeEach(() => useMachineHealthStore.setState({ byMachine: {} }));
+
+  // The reason this prop exists: "Retry" (phone access) lives in the PARENT's state, so a
+  // retry that visibly worked used to leave this card — and the sidebar mark, and the
+  // composer band — still saying "could not reach the server".
+  it("re-diagnoses when the parent bumps it, and the machine-health store follows", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: unreachable() });
+    mountPanel(baseMachine(), () => {}, 0);
+    await settle();
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(true);
+
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    mountPanel(baseMachine(), () => {}, 1);
+    await settle();
+
+    expect(machineDiagnose).toHaveBeenCalledTimes(2);
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(false);
+    expect(container.textContent).toContain("Ready");
+  });
+
+  // A re-render that does NOT bump the token (the parent re-rendering for any other
+  // reason) must not spend an ssh round trip.
+  it("does not re-diagnose when the token is unchanged", async () => {
+    machineDiagnose.mockResolvedValue({ status: "ok", data: baseDiagnosis() });
+    mountPanel(baseMachine(), () => {}, 3);
+    await settle();
+    mountPanel(baseMachine(), () => {}, 3);
+    await settle();
+    expect(machineDiagnose).toHaveBeenCalledTimes(1);
+  });
+
+  // It re-checks, it does not blank the card: the user is looking straight at these facts
+  // while the round trip runs.
+  it("keeps the facts on screen while re-checking", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: baseDiagnosis() });
+    mountPanel(baseMachine(), () => {}, 0);
+    await settle();
+
+    let resolve: ((v: unknown) => void) | undefined;
+    machineDiagnose.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    mountPanel(baseMachine(), () => {}, 1);
+    expect(container.textContent).not.toContain("Checking…");
+    expect(container.textContent).toContain("Ready");
+    await act(async () => {
+      resolve?.({ status: "ok", data: baseDiagnosis() });
+      await Promise.resolve();
+    });
   });
 });

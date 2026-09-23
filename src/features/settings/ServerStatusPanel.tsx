@@ -3,7 +3,7 @@
 // per actionable diagnosis (`machine_repair`). Replaces the old plain `.remoteRow` —
 // everything that row already did (phone-provisioning status, New conversation…,
 // Remove) is folded in here so there is one card per server, not two.
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Ico } from "../../ui/kit";
 import { commands, type RepairAction, type ServerDiagnosis } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
@@ -119,6 +119,7 @@ export function ServerStatusPanel({
   onRetryProvisioning,
   onNewConversation,
   onRemove,
+  recheckToken = 0,
   children,
 }: {
   machine: Machine;
@@ -128,6 +129,13 @@ export function ServerStatusPanel({
   onRetryProvisioning: () => void;
   onNewConversation: () => void;
   onRemove: () => void;
+  /** Bumped by the parent whenever something IT owns finished a round trip to this
+   *  server — today only "Retry" (phone access), which lives in the parent's state. A
+   *  change re-runs this card's own `refresh`, so the headline stops contradicting what
+   *  just visibly worked AND the machine-health store (hence the sidebar mark and the
+   *  composer band) learns the server answered. Everything this card owns already
+   *  refreshes itself (Refresh, a repair, a server sign-in). */
+  recheckToken?: number;
   /** The inline "New conversation…" folder picker, rendered by the parent when open —
    *  kept out of this component (unrelated to B12, pre-existing feature). */
   children?: ReactNode;
@@ -212,6 +220,17 @@ export function ServerStatusPanel({
       setRefreshing(false);
     }
   }, [machine.id]);
+
+  // Re-check when the parent says one of ITS actions finished a round trip to this server
+  // (see `recheckToken`). Goes through `refresh`, not the mount effect: this is a
+  // re-check of a card already on screen, so it must not blank the facts back to
+  // "Checking…" — the user is looking straight at them.
+  const seenRecheck = useRef(recheckToken);
+  useEffect(() => {
+    if (recheckToken === seenRecheck.current) return;
+    seenRecheck.current = recheckToken;
+    void refresh();
+  }, [recheckToken, refresh]);
 
   const runRepair = useCallback(
     async (action: RepairAction, password: string | null) => {
