@@ -401,7 +401,7 @@
 .wf-mi-lbl-brand .wf-claude, .wf-mi-lbl-brand .wf-codex { width:11px; height:11px; }
 .wf-mi-lbl-brand .wf-claude { color:var(--wf-accent); }
 /* "not connected" badge in a backend section label — the account is definitively
-   logged out, a model picked here WILL fail on send (composer AuthWarningBar's twin).
+   logged out, a model picked here WILL fail on send (the composer band's twin).
    Red (not amber): a hard blocker, not a soft warning. */
 .wf-mi-lbl-warn { margin-left:4px; padding:1px 6px; border-radius:99px; font-size:9px;
   letter-spacing:.02em; color:var(--wf-err); border:1px solid

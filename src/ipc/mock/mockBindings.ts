@@ -1007,7 +1007,7 @@ export const mockCommands = {
   // so the composer's backend-aware controls render without a real `claude`/`codex`
   // binary. Both twins MUST exist: `binaryAvailable.probe()` calls `commands.xxx()`
   // synchronously, so a missing method throws a TypeError before its `.catch` is attached
-  // → the always-mounted AuthWarningBar / Settings → Accounts crash the mock UI.
+  // → the always-mounted composer band / Settings → Accounts crash the mock UI.
   async claudeAvailable(): Promise<boolean> {
     return true;
   },

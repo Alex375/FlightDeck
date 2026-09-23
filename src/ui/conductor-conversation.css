@@ -1302,29 +1302,6 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-check.doing { border-color:var(--wf-att); border-style:dashed; }
 .cv-check.todo { border-color:var(--wf-line-2); }
 
-/* ---- Warning bar: floating card above the composer ----
-   The conversation's own status lives in the composer band (.cv-sband); what is left here
-   is the out-of-band warning AuthWarningBar raises, always in the error tone. */
-.cv-reviewbar {
-  flex:0 0 auto;
-  display:flex;
-  align-items:center;
-  gap:10px;
-  margin:10px auto 4px;
-  max-width:var(--cv-max,840px);
-  width:calc(100% - 52px);
-  padding:9px 13px;
-  border-radius:12px;
-  border:1px solid;
-  font-size:12.5px;
-  box-shadow:0 10px 26px -16px #000, 0 2px 8px -6px #000a, inset 0 1px 0 #ffffff08;
-}
-.cv-reviewbar[data-tone="error"]  { background:var(--wf-err-bg);  border-color:#5c3036; color:var(--wf-err); }
-.cv-reviewbar-dot { width:8px; height:8px; border-radius:50%; background:currentColor; flex:0 0 auto; box-shadow:0 0 0 3px color-mix(in srgb, currentColor 22%, transparent); }
-.cv-reviewbar-label { min-width:0; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.cv-reviewbar-btn { margin-left:auto; flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; padding:5px 11px; border-radius:8px; border:1px solid currentColor; background:transparent; color:inherit; font:inherit; font-size:12px; font-weight:600; cursor:pointer; transition:background .12s ease; }
-.cv-reviewbar-btn:hover { background:color-mix(in srgb, currentColor 16%, transparent); }
-.cv-reviewbar-btn .wf-ico { width:14px; height:14px; }
 
 /* ---- task bar (the agent's todo list): floating card above the composer ---- */
 .cv-todobar {
