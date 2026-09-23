@@ -120,18 +120,9 @@ export function latestClaudeModel(family: ClaudeFamily): ModelOption | undefined
   return CLAUDE_MODELS.find((m) => m.family === family);
 }
 
-/**
- * What the picker shows on a fresh install: the NEWEST model of each family — today
- * Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 — and never Mythos. Derived, not listed, so a
- * model added at the top of its family replaces its predecessor in the factory picker
- * with no other edit. Everything else starts in Settings → Models' "Available" list, one
- * click away.
- *
- * Stored as the HIDDEN set rather than the shown one, on purpose: a model added to the
- * catalogue later then appears on its own instead of staying invisible until someone
- * notices. The user's own choices are persisted the same way (see store/modelPrefs).
- */
-export const FACTORY_HIDDEN_MODELS: readonly string[] = CLAUDE_MODELS.filter(
+/** The Claude half of FACTORY_HIDDEN_MODELS: everything but each family's newest row,
+ *  and Mythos whatever its age. */
+const FACTORY_HIDDEN_CLAUDE: readonly string[] = CLAUDE_MODELS.filter(
   (m) =>
     !m.family ||
     FACTORY_EXCLUDED_FAMILIES.includes(m.family) ||
@@ -148,28 +139,92 @@ export const FACTORY_CLAUDE_MODEL: string = latestClaudeModel("opus")!.value;
 // `model/list` response; they are per MODEL, not per family. The ids are the true wire ids,
 // so a pick takes effect at `thread/start` (see the Rust `codex_model` plumbing).
 //
-// Transcribed verbatim from codex-cli 0.144.4, newest-first — which is also the order
-// `model/list` itself returns. `gpt-5.4` is deliberately ABSENT: the binary no longer
-// offers it, and listing a model it would reject is how a pick during the dynamic list's
-// loading window turns into a failed turn. It lives on in RETIRED_CODEX_MODELS below,
-// which the resolvers read but the picker never does — so a conversation still pinned to
-// it keeps its real name instead of showing the raw wire id.
+// Transcribed verbatim from codex-cli 0.156.1, newest-first — which is also the order
+// `model/list` itself returns. `gpt-5.4` and `gpt-5.4-mini` are deliberately ABSENT: the
+// binary no longer offers them, and listing a model it would reject is how a pick during
+// the dynamic list's loading window turns into a failed turn. They live on in
+// RETIRED_CODEX_MODELS below, which the resolvers read but the picker never does — so a
+// conversation still pinned to one keeps its real name instead of showing the raw wire id.
 export const CODEX_MODELS: ModelOption[] = [
   // GPT-6 Astra: the binary's own `isDefault` model, and the first to declare a 2× "Fast"
   // service tier (the gpt-5.6 family is 1.5×). Effort ladder runs the full low→ultra.
   { label: "GPT-6 Astra", value: "gpt-6-astra", backend: "codex", provider: "OpenAI" },
+  { label: "GPT-6 Sol", value: "gpt-6-sol", backend: "codex", provider: "OpenAI" },
+  { label: "GPT-6 Luna", value: "gpt-6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Luna", value: "gpt-5.6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.5", value: "gpt-5.5", backend: "codex", provider: "OpenAI" },
-  { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
+];
+
+/** `gpt-5.6-sol` → version [5, 6], line "sol"; `gpt-5.5` → [5, 5], no line. `null` for an
+ *  id that doesn't follow the `gpt-<version>[-<line>]` shape. */
+function codexLineOf(id: string): { version: number[]; line: string | null } | null {
+  const m = /^gpt-(\d+(?:\.\d+)*)(?:-([a-z][a-z0-9]*))?$/.exec(id.toLowerCase());
+  if (!m) return null;
+  return { version: m[1].split(".").map(Number), line: m[2] ?? null };
+}
+
+const compareVersions = (a: number[], b: number[]): number => {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+
+/**
+ * The Codex models a fresh install keeps out of the picker: the newest model of each
+ * LINE is shown — Astra, Sol, Terra, Luna, Mini read like Opus / Sonnet / Haiku — and a
+ * line-less model (`gpt-5.5`) only while it is the newest generation of all, since a
+ * later generation replaces it outright. An id of any other shape stays shown: nothing
+ * is known about what supersedes it.
+ *
+ * Takes the list as an argument because the live one (`model/list`) is the authority —
+ * the static CODEX_MODELS only stands in for it until it loads.
+ */
+export function codexFactoryHidden(models: readonly Pick<ModelOption, "value">[]): string[] {
+  const parsed = models
+    .map((m) => ({ value: m.value, id: codexLineOf(m.value) }))
+    .filter((x): x is { value: string; id: { version: number[]; line: string | null } } => !!x.id);
+  const newest = (xs: typeof parsed) =>
+    xs.reduce<number[] | null>(
+      (best, x) => (best === null || compareVersions(x.id.version, best) > 0 ? x.id.version : best),
+      null,
+    );
+  const newestOverall = newest(parsed);
+  return parsed
+    .filter(({ id }) => {
+      const peers = id.line === null ? parsed : parsed.filter((x) => x.id.line === id.line);
+      const top = id.line === null ? newestOverall : newest(peers);
+      return top !== null && compareVersions(id.version, top) < 0;
+    })
+    .map((x) => x.value);
+}
+
+/**
+ * What the picker hides on a fresh install. Claude: all but the NEWEST model of each
+ * family — today Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 are shown — and never Mythos.
+ * Codex: all but the newest of each line (codexFactoryHidden), re-applied to the live list
+ * when it loads. Derived, not listed, so a model added at the top of its family replaces
+ * its predecessor in the factory picker with no other edit. Everything else starts in
+ * Settings → Models' "Available" list, one click away.
+ *
+ * Stored as the HIDDEN set rather than the shown one, on purpose: a model added to the
+ * catalogue later then appears on its own instead of staying invisible until someone
+ * notices. The user's own choices are persisted the same way (see store/modelPrefs).
+ */
+export const FACTORY_HIDDEN_MODELS: readonly string[] = [
+  ...FACTORY_HIDDEN_CLAUDE,
+  ...codexFactoryHidden(CODEX_MODELS),
 ];
 
 /** The Codex backend's default model — seeds a Codex conversation so its persisted
  *  `model` is always a real Codex id (never a Claude alias the binary would reject).
- *  gpt-6-astra: the model `model/list` itself flags `isDefault`, and the top of the
- *  ladder (full low→ultra effort range). Only NEW conversations are seeded from here;
- *  an existing one keeps the model persisted on its record. */
+ *  gpt-6-astra: the model `model/list` itself flags `isDefault` (codex 0.153+), and the
+ *  top of the ladder (full low→ultra effort range). Only NEW conversations are seeded
+ *  from here; an existing one keeps the model persisted on its record. An older binary
+ *  that doesn't offer it gets ITS OWN default instead (store/modelPrefs `codexOffered`). */
 export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
 
 /**
@@ -180,6 +235,7 @@ export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
  * composer highlighted no row. A retired row costs nothing and keeps those readable.
  */
 export const RETIRED_CODEX_MODELS: ModelOption[] = [
+  { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.4", value: "gpt-5.4", backend: "codex", provider: "OpenAI" },
 ];
 

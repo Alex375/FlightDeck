@@ -25,6 +25,7 @@ import {
   CODEX_MODELS,
   FACTORY_CLAUDE_MODEL,
   FACTORY_HIDDEN_MODELS,
+  codexFactoryHidden,
   modelIdentity,
   modelOption,
   type ModelOption,
@@ -70,22 +71,48 @@ interface ModelPrefsState extends ModelPrefsData {
   setDefaultEffort: (backend: BackendKind, effort: EffortLevel) => void;
   /** Back to the factory arrangement. */
   reset: () => void;
+  /**
+   * The Codex models the INSTALLED binary offers (its live `model/list`) and the one it
+   * flags as its default — `null` until that list has loaded. Runtime only, never stored:
+   * it describes the binary, not the user's choices.
+   */
+  codexOffered: CodexOffered | null;
+  /** Record the live Codex list, and give the models the user has never seen in it the
+   *  factory treatment (codexFactoryHidden). Called when `model/list` answers. */
+  noteCodexOffered: (models: readonly Pick<ModelOption, "value">[], defaultId: string | null) => void;
 }
 
-/** The static catalogue (both backends) — what `seen` tracks. The live Codex list is
- *  left out on purpose: none of its models is factory-hidden, so none needs tracking. */
-const STATIC_CATALOGUE: readonly ModelOption[] = [...CLAUDE_MODELS, ...CODEX_MODELS];
+export interface CodexOffered {
+  ids: string[];
+  defaultId: string | null;
+}
 
-const currentSeen = (): Record<string, string> =>
-  Object.fromEntries(STATIC_CATALOGUE.map((m) => [m.value, modelIdentity(m)]));
+/** Claude catalogue value → the model it runs: what `seen` records for Claude. Codex
+ *  models are marked seen as the live `model/list` reports them (noteCodexOffered). */
+const claudeSeen = (): Record<string, string> =>
+  Object.fromEntries(CLAUDE_MODELS.map((m) => [m.value, modelIdentity(m)]));
+
+/** The identity `seen` records for a value: the model it runs (a Codex id is its own). */
+const identityOf = (value: string): string => {
+  const m = modelOption(value);
+  return m ? modelIdentity(m) : value;
+};
 
 /**
- * What a blob written BEFORE `seen` existed had seen: the Claude catalogue as it stood,
- * each alias on the model its row was LABELLED as then (`opus` read "Opus 5"). Frozen —
- * it describes the past and must not follow later catalogue edits. Codex rows are absent:
- * none is factory-hidden, so an unseen one just stays shown, as it always did.
+ * What a blob written BEFORE `seen` existed had seen: the catalogue as it stood, each
+ * alias on the model its row was LABELLED as then (`opus` read "Opus 5"). Frozen — it
+ * describes the past and must not follow later catalogue edits. The Codex models of that
+ * era are in it too: every one of them was on show then, so whatever the user did with
+ * them since is a choice, not something for the factory to redo.
  */
 const LEGACY_SEEN: Readonly<Record<string, string>> = {
+  "gpt-6-astra": "gpt-6-astra",
+  "gpt-5.6-sol": "gpt-5.6-sol",
+  "gpt-5.6-terra": "gpt-5.6-terra",
+  "gpt-5.6-luna": "gpt-5.6-luna",
+  "gpt-5.5": "gpt-5.5",
+  "gpt-5.4-mini": "gpt-5.4-mini",
+  "gpt-5.4": "gpt-5.4",
   fable: "claude-fable-5-1",
   opus: "claude-opus-5",
   "claude-opus-4-8": "claude-opus-4-8",
@@ -112,13 +139,14 @@ const factory = (): ModelPrefsData => ({
   claudeEffort: FACTORY_DEFAULTS.claudeEffort,
   codexModel: FACTORY_DEFAULTS.codexModel,
   codexEffort: FACTORY_DEFAULTS.codexEffort,
-  seen: currentSeen(),
+  seen: claudeSeen(),
 });
 
 /**
- * Give every catalogue row the user has not seen the factory treatment, then mark the
- * whole catalogue seen. A row is unseen when its value is new, or when it is an alias
- * that now runs a different model than the one the user last saw under it.
+ * Give every Claude catalogue row the user has not seen the factory treatment, then mark
+ * the whole catalogue seen. A row is unseen when its value is new, or when it is an alias
+ * that now runs a different model than the one the user last saw under it. (Codex models
+ * go through the same test against the live list — see noteCodexOffered.)
  *
  *  - Factory-hidden (an older version, Mythos) → hidden, as on a fresh install.
  *  - Factory-shown (the newest of its family) → shown. A brand-new value already is; a
@@ -133,16 +161,68 @@ export function reconcileSeen(
 ): { hidden: string[]; seen: Record<string, string> } {
   const next = new Set(hidden);
   const factoryHidden = new Set(FACTORY_HIDDEN_MODELS);
-  for (const m of STATIC_CATALOGUE) {
+  for (const m of CLAUDE_MODELS) {
     const was = seen[m.value];
     if (was === modelIdentity(m)) continue;
     if (factoryHidden.has(m.value)) next.add(m.value);
     else if (was !== undefined) next.delete(m.value);
   }
-  // Already-hidden values keep their stored order; newly hidden ones follow.
-  const kept = hidden.filter((v) => next.has(v));
-  const added = [...next].filter((v) => !hidden.includes(v));
-  return { hidden: [...kept, ...added], seen: currentSeen() };
+  return { hidden: stableHidden(hidden, next), seen: { ...seen, ...claudeSeen() } };
+}
+
+/** `next` as a list: already-hidden values keep their stored order, new ones follow. */
+function stableHidden(before: readonly string[], next: ReadonlySet<string>): string[] {
+  const kept = before.filter((v) => next.has(v));
+  return [...kept, ...[...next].filter((v) => !before.includes(v))];
+}
+
+/**
+ * The live-list counterpart of reconcileSeen, pure: every Codex model the user has not
+ * seen gets the factory verdict for THIS list (newest of each line shown, the rest
+ * hidden), and the whole list is marked seen. A model the user has seen keeps whatever
+ * they made of it.
+ */
+export function reconcileCodexOffered(
+  hidden: readonly string[],
+  seen: Readonly<Record<string, string>>,
+  models: readonly Pick<ModelOption, "value">[],
+): { hidden: string[]; seen: Record<string, string> } {
+  const next = new Set(hidden);
+  const factoryHidden = new Set(codexFactoryHidden(models));
+  const nextSeen = { ...seen };
+  for (const { value } of models) {
+    if (nextSeen[value] === value) continue;
+    if (factoryHidden.has(value)) next.add(value);
+    else next.delete(value);
+    nextSeen[value] = value;
+  }
+  return { hidden: stableHidden(hidden, next), seen: nextSeen };
+}
+
+/**
+ * The model a new conversation on `backend` REALLY starts on. Claude: the stored default.
+ * Codex: the stored default while the installed binary offers it — otherwise the binary's
+ * own default. A default is only worth anything if the binary can run it: an older Codex
+ * that has never heard of the stored model would fail the first turn, and a Settings
+ * screen naming a model absent from every list is a promise the app cannot keep.
+ */
+export function effectiveDefaultModel(
+  s: Pick<ModelPrefsState, "claudeModel" | "codexModel" | "codexOffered">,
+  backend: BackendKind,
+): string {
+  if (backend !== "codex") return s.claudeModel;
+  const offered = s.codexOffered;
+  if (!offered || offered.ids.length === 0 || offered.ids.includes(s.codexModel)) return s.codexModel;
+  return offered.defaultId && offered.ids.includes(offered.defaultId) ? offered.defaultId : offered.ids[0];
+}
+
+/** The effort that goes with effectiveDefaultModel, clamped to that model's ladder. */
+export function effectiveDefaultEffort(
+  s: Pick<ModelPrefsState, "claudeModel" | "codexModel" | "codexOffered" | "claudeEffort" | "codexEffort">,
+  backend: BackendKind,
+): EffortLevel {
+  if (backend !== "codex") return s.claudeEffort;
+  return clampEffort(s.codexEffort, effectiveDefaultModel(s, "codex"));
 }
 
 const seenMap = (v: unknown): Record<string, string> | null =>
@@ -222,12 +302,15 @@ function save(data: ModelPrefsData) {
 
 export const useModelPrefs = create<ModelPrefsState>((set, get) => ({
   ...load(),
+  codexOffered: null,
 
   setHidden: (value, hidden) => {
     const cur = get().hidden;
     const next = hidden ? (cur.includes(value) ? cur : [...cur, value]) : cur.filter((v) => v !== value);
     if (next === cur) return;
-    set({ hidden: next });
+    // A model the user just moved is SEEN, whatever the lists have loaded so far — the
+    // factory must never overrule this choice when the live Codex list turns up later.
+    set({ hidden: next, seen: { ...get().seen, [value]: identityOf(value) } });
     persist(get());
     // Hiding the model a backend defaults to would leave new conversations seeded on a
     // model the picker no longer offers — move that default to the first one still shown.
@@ -255,7 +338,21 @@ export const useModelPrefs = create<ModelPrefsState>((set, get) => ({
 
   reset: () => {
     set(factory());
+    const offered = get().codexOffered;
+    // Back to the factory means the live Codex list gets the factory verdict too.
+    if (offered) set(reconcileCodexOffered(get().hidden, get().seen, offered.ids.map((value) => ({ value }))));
     persist(get());
+  },
+
+  noteCodexOffered: (models, defaultId) => {
+    if (models.length === 0) return;
+    const s = get();
+    // Not persisted: the verdict is recomputed identically on every launch until the user
+    // saves a choice, which then records it along with everything else.
+    set({
+      ...reconcileCodexOffered(s.hidden, s.seen, models),
+      codexOffered: { ids: models.map((m) => m.value), defaultId },
+    });
   },
 }));
 
@@ -296,21 +393,22 @@ function repairDefaults(
  * is not a reason to send nothing at all.
  */
 function fallbackModel(backend: BackendKind, hidden: readonly string[]): string {
-  const catalogue: ModelOption[] = backend === "codex" ? CODEX_MODELS : CLAUDE_MODELS;
-  const first = catalogue.find((m) => !hidden.includes(m.value));
-  return first?.value ?? (backend === "codex" ? FACTORY_DEFAULTS.codexModel : FACTORY_DEFAULTS.claudeModel);
+  // Codex: what the installed binary offers when known — the static list is only a guess.
+  const offered = useModelPrefs.getState().codexOffered?.ids;
+  const catalogue: string[] =
+    backend === "codex" ? (offered ?? CODEX_MODELS.map((m) => m.value)) : CLAUDE_MODELS.map((m) => m.value);
+  const first = catalogue.find((v) => !hidden.includes(v));
+  return first ?? (backend === "codex" ? FACTORY_DEFAULTS.codexModel : FACTORY_DEFAULTS.claudeModel);
 }
 
-/** The model a new conversation on `backend` starts on. */
+/** The model a new conversation on `backend` starts on (see effectiveDefaultModel). */
 export function defaultModelFor(backend: BackendKind): string {
-  const s = useModelPrefs.getState();
-  return backend === "codex" ? s.codexModel : s.claudeModel;
+  return effectiveDefaultModel(useModelPrefs.getState(), backend);
 }
 
 /** The effort a new conversation on `backend` starts on, clamped to its model's ladder. */
 export function defaultEffortFor(backend: BackendKind): EffortLevel {
-  const s = useModelPrefs.getState();
-  return backend === "codex" ? s.codexEffort : s.claudeEffort;
+  return effectiveDefaultEffort(useModelPrefs.getState(), backend);
 }
 
 /** Effort rungs offerable as a default for `model` — the gauge's ladder, plus nothing:

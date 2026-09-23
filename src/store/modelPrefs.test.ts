@@ -11,6 +11,7 @@ import {
   CLAUDE_MODELS,
   CODEX_MODELS,
   FACTORY_HIDDEN_MODELS,
+  codexFactoryHidden,
   latestClaudeModel,
   modelLabel,
   visibleModels,
@@ -20,7 +21,7 @@ const factoryState = () => normalize(null);
 
 beforeEach(() => {
   localStorage.clear();
-  useModelPrefs.setState(factoryState());
+  useModelPrefs.setState({ ...factoryState(), codexOffered: null });
 });
 
 /** What the picker shows for a set of prefs (Claude section, the user's order applied). */
@@ -53,8 +54,74 @@ describe("factory arrangement", () => {
     expect(shown).toContain(FACTORY_DEFAULTS.claudeModel);
   });
 
-  it("hides no Codex model", () => {
-    for (const m of CODEX_MODELS) expect(FACTORY_HIDDEN_MODELS).not.toContain(m.value);
+  it("shows the newest Codex model of each line out of the box", () => {
+    const shown = visibleModels(CODEX_MODELS, new Set(FACTORY_HIDDEN_MODELS)).map((m) => m.value);
+    // GPT-5.6 Terra has no GPT-6 successor yet, so it is still its line's newest.
+    expect(shown).toEqual(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra"]);
+  });
+});
+
+describe("codexFactoryHidden (the Codex half of 'newest by default')", () => {
+  const ids = (...v: string[]) => v.map((value) => ({ value }));
+
+  it("keeps each line's newest and retires a line-less model behind a newer generation", () => {
+    // codex-cli 0.156.1, verbatim.
+    const live = ids("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5");
+    expect(codexFactoryHidden(live).sort()).toEqual(["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol"]);
+  });
+
+  it("judges an older binary by what IT offers", () => {
+    // codex-cli 0.144.4: no GPT-6 at all, so the 5.6 lineup is the newest there is.
+    expect(codexFactoryHidden(ids("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"))).toEqual(["gpt-5.5"]);
+  });
+
+  it("keeps a line of its own (mini) and anything it cannot parse", () => {
+    expect(codexFactoryHidden(ids("gpt-6-astra", "gpt-5.4-mini", "o3", "gpt-5.5"))).toEqual(["gpt-5.5"]);
+  });
+});
+
+describe("the live Codex list", () => {
+  const V156 = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+  const V144 = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+  const offer = (ids: string[], def: string) =>
+    useModelPrefs.getState().noteCodexOffered(ids.map((value) => ({ value })), def);
+  const codexShown = () =>
+    visibleModels(
+      useModelPrefs.getState().codexOffered!.ids.map((value) => ({ value, label: value, backend: "codex" as const })),
+      new Set(useModelPrefs.getState().hidden),
+    ).map((m) => m.value);
+
+  it("gives a fresh install the newest of each line", () => {
+    offer(V156, "gpt-6-astra");
+    expect(codexShown()).toEqual(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra"]);
+  });
+
+  it("never overrules what the user did with a Codex model", () => {
+    // Legacy blob: they had GPT-5.5 on show — they keep it, and the new GPT-6 Sol arrives.
+    useModelPrefs.setState({ ...normalize({ hidden: [] }), codexOffered: null });
+    offer(V156, "gpt-6-astra");
+    expect(codexShown()).toContain("gpt-5.5");
+    expect(codexShown()).toContain("gpt-6-sol");
+    // A model they hid before the live list even loaded stays hidden.
+    useModelPrefs.setState({ ...normalize(null), codexOffered: null });
+    useModelPrefs.getState().setHidden("gpt-6-sol", true);
+    offer(V156, "gpt-6-astra");
+    expect(codexShown()).not.toContain("gpt-6-sol");
+  });
+
+  it("starts new Codex conversations on the binary's own default when it lacks the stored one", () => {
+    expect(defaultModelFor("codex")).toBe("gpt-6-astra"); // list not loaded: the stored default
+    offer(V144, "gpt-5.6-sol"); // an older binary with no GPT-6
+    expect(defaultModelFor("codex")).toBe("gpt-5.6-sol");
+    expect(useModelPrefs.getState().codexModel).toBe("gpt-6-astra"); // the choice is kept…
+    offer(V156, "gpt-6-astra"); // …and wins again once the binary can run it
+    expect(defaultModelFor("codex")).toBe("gpt-6-astra");
+  });
+
+  it("clamps the default effort to the model actually used", () => {
+    useModelPrefs.getState().setDefaultEffort("codex", "ultra");
+    offer(["gpt-5.5"], "gpt-5.5"); // tops out at xhigh
+    expect(defaultEffortFor("codex")).toBe("xhigh");
   });
 });
 

@@ -36,7 +36,7 @@ import { useCodexModels } from "../conversation/codexModels";
 import { useCodexAvailable } from "../../store/binaryAvailable";
 import { effortLevelsForModel, type EffortLevel } from "../conversation/EffortGauge";
 import { EFFORT_LABELS } from "../../agent/subagentMeta";
-import { useModelPrefs } from "../../store/modelPrefs";
+import { effectiveDefaultEffort, effectiveDefaultModel, useModelPrefs } from "../../store/modelPrefs";
 import type { BackendKind } from "../../store/conversationsStore";
 import styles from "./SettingsPanel.module.css";
 import "./models-section.css";
@@ -321,8 +321,10 @@ function BackendDefault({
   label: string;
   models: ModelOption[];
 }) {
-  const model = useModelPrefs((s) => (backend === "codex" ? s.codexModel : s.claudeModel));
-  const effort = useModelPrefs((s) => (backend === "codex" ? s.codexEffort : s.claudeEffort));
+  // What a new conversation REALLY starts on — for Codex, the binary's own default when it
+  // doesn't offer the stored one (see effectiveDefaultModel).
+  const model = useModelPrefs((s) => effectiveDefaultModel(s, backend));
+  const effort = useModelPrefs((s) => effectiveDefaultEffort(s, backend));
   const setDefaultModel = useModelPrefs((s) => s.setDefaultModel);
   const setDefaultEffort = useModelPrefs((s) => s.setDefaultEffort);
   const efforts = effortLevelsForModel(model);

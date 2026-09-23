@@ -8,6 +8,7 @@ import { commands } from "../../ipc/client";
 import type { CodexServiceTier } from "../../ipc/bindings";
 import { effortLevelsForModel, type EffortLevel } from "./EffortGauge";
 import { CODEX_MODELS, type ModelOption } from "./models";
+import { useModelPrefs } from "../../store/modelPrefs";
 
 export interface CodexModelsData {
   /** Picker options (dynamic when loaded, else the static fallback). */
@@ -39,6 +40,12 @@ export function useCodexModels(enabled: boolean): CodexModelsData {
     queryFn: async () => {
       const res = await commands.codexListModels();
       if (res.status === "error") throw new Error(res.error);
+      // The picker prefs need the real list: which models are new to the user, and
+      // whether the stored default is one this binary can actually run.
+      useModelPrefs.getState().noteCodexOffered(
+        res.data.map((m) => ({ value: m.id })),
+        res.data.find((m) => m.isDefault)?.id ?? null,
+      );
       return res.data;
     },
   });

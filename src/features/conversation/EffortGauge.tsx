@@ -33,7 +33,7 @@ const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", 
 
 /**
  * The effort steps each Codex model REALLY declares, transcribed verbatim from
- * `model/list`'s `supportedReasoningEfforts` (codex-cli 0.144.4). This is only the
+ * `model/list`'s `supportedReasoningEfforts` (codex-cli 0.156.1). This is only the
  * STATIC fallback — `codexModels.ts` supersedes it per model with the live response.
  *
  * A table keyed by model id, NOT a family heuristic, because the ladder is per MODEL:
@@ -45,6 +45,8 @@ const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", 
  */
 const CODEX_EFFORTS: Record<string, EffortLevel[]> = {
   "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
   "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
   "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
   "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
