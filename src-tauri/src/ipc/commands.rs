@@ -1260,6 +1260,7 @@ pub async fn tosse_repo_links(
                         row.machine_id.as_deref(),
                         row.machine_label.as_deref(),
                         row.remote_origin_probed_at.is_some(),
+                        row.remote_origin_note.as_deref(),
                     ) {
                         // Not a fault, and not a spawn either: the folder lives on a
                         // server, so the url comes from what that server last told us
@@ -1312,6 +1313,32 @@ pub async fn tosse_repo_links(
     })
 }
 
+/// What one run of [`tosse_probe_remote_origins`] did.
+///
+/// Three facts, deliberately not collapsed into the single `bool` this used to be:
+///  - `changed` — a folder's visible state moved (a url, an answer, or the first probe
+///    ever), so the UI should refetch;
+///  - `skipped` — the sweep never ran (another one held the lock). NOT the same as
+///    "nothing changed", and the caller must not treat it as a verdict;
+///  - `write_errors` — answers that were obtained and then LOST on the way to SQLite,
+///    verbatim. Silence here would turn a broken database into "Refresh does nothing".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOriginSweep {
+    pub changed: bool,
+    pub skipped: bool,
+    pub write_errors: Vec<String>,
+}
+
+impl RemoteOriginSweep {
+    fn skipped() -> Self {
+        Self { changed: false, skipped: true, write_errors: Vec::new() }
+    }
+    fn ran(changed: bool, write_errors: Vec<String>) -> Self {
+        Self { changed, skipped: false, write_errors }
+    }
+}
+
 /// Refresh, over SSH, the `origin` of every folder that lives on a paired server, and
 /// cache each answer in SQLite.
 ///
@@ -1322,22 +1349,26 @@ pub async fn tosse_repo_links(
 /// round trip per server does not belong there. It runs beside it and, when something
 /// actually changed, the front refetches.
 ///
-/// Returns whether any cached url MOVED, so a run that confirms what we already knew —
-/// the overwhelmingly common one, since a repository's origin is set once — costs the UI
-/// nothing. Never returns `Err` for an unreachable server: that is the server's state,
-/// not a failure of this call, and turning it into one would resurrect exactly the false
-/// alarm the machine-aware probe removed.
+/// Reports what the sweep did — see [`RemoteOriginSweep`]. Never returns `Err` for an
+/// unreachable server: that is the server's state, not a failure of this call, and
+/// turning it into one would resurrect exactly the false alarm the machine-aware probe
+/// removed.
 #[tauri::command]
 #[specta::specta]
-pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<bool, String> {
-    // One sweep at a time. A second caller is told "nothing moved" rather than made to
-    // wait: the in-flight sweep will report the change itself, and React Query already
+pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<RemoteOriginSweep, String> {
+    // One sweep at a time. A second caller is told it was SKIPPED and made to wait for
+    // nothing: the in-flight sweep will report its own result, and React Query already
     // de-duplicates concurrent fetches of the same key.
+    //
+    // ⚠️ Skipped is not "nothing moved". This used to answer `false`, which reads as a
+    // verdict — "we looked, everything is where it was" — for a call that never looked
+    // at all. A folder added while a sweep was in flight is not in that sweep, so it
+    // would have waited for an unrelated trigger to ever be asked about.
     static SWEEPING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
     {
         let mut busy = SWEEPING.lock().unwrap();
         if *busy {
-            return Ok(false);
+            return Ok(RemoteOriginSweep::skipped());
         }
         *busy = true;
     }
@@ -1357,7 +1388,7 @@ pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<bool, S
         }
     }
     if by_machine.is_empty() {
-        return Ok(false);
+        return Ok(RemoteOriginSweep::ran(false, Vec::new()));
     }
     let known_hosts = remote_known_hosts_path(&app);
     let machines: Vec<_> = by_machine
@@ -1399,26 +1430,40 @@ pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<bool, S
             };
             let answers = crate::git::parse_remote_origin_script(&out);
             // `nogit` answers for the whole machine (empty path), so it cannot be paired
-            // with a folder — and it is not an answer ABOUT any folder either.
+            // with a folder — but it IS an answer about every folder on it: the server
+            // was reached and told us it has no git. Filed as such on each row, rather
+            // than dropped, which used to leave them all looking like "we never managed
+            // to ask" and had the card blame the server's reachability.
             if answers.iter().any(|(_, a)| *a == crate::git::RemoteOriginAnswer::NoGit) {
                 eprintln!("[tosse] {} has no git, so no origin could be read", machine.label);
-                return Vec::new();
+                return rows
+                    .into_iter()
+                    .map(|row| (row.repo_id, None, Some("no-git")))
+                    .collect::<Vec<_>>();
             }
             rows.into_iter()
                 .filter_map(|row| {
                     let answer = answers.iter().find(|(p, _)| *p == row.path).map(|(_, a)| a)?;
                     match answer {
                         crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::Url(u)) => {
-                            Some((row.repo_id, Some(u.clone())))
+                            // Redacted at the point of capture: this string is about to be
+                            // persisted and shown, and a clone's remote can carry a token.
+                            Some((row.repo_id, Some(crate::git::redact_remote_url(u)), None))
                         }
                         crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::NoRemote) => {
-                            Some((row.repo_id, None))
+                            Some((row.repo_id, None, Some("no-remote")))
                         }
-                        // Not a repository / gone / no git: we learned nothing about an
-                        // origin, so nothing is cached. These re-ask on the next sweep —
-                        // an absent folder can come back, and writing "no origin" for one
-                        // would quietly un-match a repository that is merely unmounted.
-                        _ => None,
+                        // ⚠️ These are FIRM answers, not silence. Dropping them left
+                        // `remote_origin_probed_at` NULL — the field that means "we could
+                        // not ask" — so the card told the user to "try again once the
+                        // server is reachable" about a server that had just answered. The
+                        // note is carried through to the UI instead; the cached url is
+                        // left alone, so an unmounted folder keeps the origin it had.
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::NotARepository) => {
+                            Some((row.repo_id, None, Some("not-a-repository")))
+                        }
+                        crate::git::RemoteOriginAnswer::Gone => Some((row.repo_id, None, Some("gone"))),
+                        crate::git::RemoteOriginAnswer::NoGit => Some((row.repo_id, None, Some("no-git"))),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1429,14 +1474,22 @@ pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<bool, S
     let store = app.state::<Store>();
     let now = now_ms();
     let mut changed = false;
-    for (repo_id, url) in results.into_iter().flatten() {
-        match store.set_repo_remote_origin(&repo_id, url.as_deref(), now) {
+    let mut write_errors = Vec::new();
+    for (repo_id, url, note) in results.into_iter().flatten() {
+        match store.set_repo_remote_origin(&repo_id, url.as_deref(), note, now) {
             Ok(moved) => changed |= moved,
-            Err(e) => eprintln!("[tosse] could not cache the origin of {repo_id}: {e}"),
+            // ⚠️ Carried back, not just logged. A failed write means the answer we paid
+            // an SSH round trip for was LOST: the folder keeps reading as never-probed,
+            // the next sweep asks again, and "Refresh" looks like it does nothing. A
+            // line in a log nobody reads is how that becomes a permanent mystery.
+            Err(e) => {
+                eprintln!("[tosse] could not cache the origin of {repo_id}: {e}");
+                write_errors.push(format!("{repo_id}: {e}"));
+            }
         }
     }
     drop(done);
-    Ok(changed)
+    Ok(RemoteOriginSweep::ran(changed, write_errors))
 }
 
 /// Releases [`tosse_probe_remote_origins`]'s one-sweep-at-a-time flag however the sweep
@@ -1540,7 +1593,17 @@ pub async fn scan_local_git_repos(
     // Where to look: the home directory covers the usual cases, plus the PARENT of every
     // folder already in Flight Deck — that is where this user demonstrably keeps clones,
     // including outside home (an external volume, /Volumes/…).
-    let known = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    // ⚠️ LOCAL folders only. A folder on a paired server has a path that means nothing
+    // here (`/home/agent/projects/FlightDeck`): taken as a scan root it makes this Mac
+    // look for clones in a directory that belongs to another machine, tells the user
+    // macOS is blocking access to it, and — since `/home` is an autofs mount point —
+    // can stall the scan's whole time budget waiting on a lookup that will never resolve.
+    let known: Vec<_> = store
+        .repo_tosse_links()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.machine_id.is_none())
+        .collect();
     let scan = tauri::async_runtime::spawn_blocking(move || {
         let mut roots: Vec<PathBuf> = Vec::new();
         // `$HOME` directly, as every other module here resolves it — no new dependency
@@ -4981,6 +5044,11 @@ pub(crate) async fn run_ssh_on_machine(
 ) -> Result<String, String> {
     let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
     cmd.arg("-T");
+    // A caller may bound this call with `tokio::time::timeout` (the remote-origin sweep
+    // does, at 30s). Dropping the future does NOT stop the child on its own: `ssh` and
+    // the remote command behind it would keep running, holding the connection, with
+    // nobody left to read them. Same reaping `cli_update` and `accounts` already do.
+    cmd.kill_on_drop(true);
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
     let out = cmd

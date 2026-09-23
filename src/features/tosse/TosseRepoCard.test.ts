@@ -43,6 +43,7 @@ vi.mock("../../ipc/useTosse", () => ({
   // Refresh also re-asks the paired servers for their folders' origins. Stubbed here for
   // the same reason as the hook above: the card must render without a QueryClient.
   useRefreshRemoteOrigins: () => vi.fn(),
+  useRemoteOriginWriteErrors: () => [],
 }));
 
 // The opener plugin has no Tauri host under vitest.

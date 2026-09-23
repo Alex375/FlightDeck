@@ -22,6 +22,7 @@ import {
   repoLinkFor,
   useLinkTosseRepository,
   useRefreshRemoteOrigins,
+  useRemoteOriginWriteErrors,
   useTosseRepoLinks,
 } from "../../ipc/useTosse";
 import { repoName, useConversationsStore } from "../../store/conversationsStore";
@@ -70,9 +71,32 @@ function machineName(machine: { label: string | null }): string {
  *  never probed at all, so nothing may be said about its remote — reading it as "this
  *  folder has no git remote" is what the card did, and it was simply untrue. */
 export function whyUnmatched(link: TosseRepoLink | undefined): string {
-  // Checked FIRST, and only while the server has not answered: nothing was read, so every
-  // claim below would be about a probe that never ran. Once it HAS answered, a folder over
-  // there is an ordinary candidate and falls through to the same sentences as a local one.
+  // ⚠️ Before anything about reach: what the server actually ANSWERED, when that answer
+  // was not a url. These are facts about the folder, obtained from a server that replied
+  // perfectly well — and they used to be thrown away, which left `originRead` false and
+  // sent the branch below to blame the server's reachability and advise "try again once
+  // the server is reachable", advice that could never work. See `remote_origin_note`.
+  const note = link?.machine?.originNote;
+  if (link?.machine && note) {
+    const where = machineName(link.machine);
+    switch (note) {
+      case "not-a-repository":
+        return `This folder is not a git repository on ${where}, so there is no remote to match on. You can still pick a TOSSE repository by hand.`;
+      case "gone":
+        return `This folder is no longer there on ${where}, so its git remote cannot be read. Pick a TOSSE repository by hand, or check the folder on that server.`;
+      case "no-git":
+        return `${where} has no git installed, so Flight Deck cannot read this folder's remote there. Pick a TOSSE repository by hand, or install git on that server.`;
+      case "no-remote":
+        return `This folder has no git remote on ${where}, so it cannot be matched automatically.`;
+      // An answer a newer backend knows and this build does not: say it rather than
+      // dress it up as one of the cases above.
+      default:
+        return `${where} answered "${note}" for this folder, so its git remote could not be read. Pick a TOSSE repository by hand.`;
+    }
+  }
+  // Only while the server has not answered at all: nothing was read, so every claim below
+  // would be about a probe that never ran. Once it HAS answered, a folder over there is an
+  // ordinary candidate and falls through to the same sentences as a local one.
   if (link?.machine && !link.machine.originRead) {
     return `This folder lives on ${machineName(link.machine)}, and Flight Deck has not been able to read its git remote there yet — so it cannot be matched automatically. Pick a TOSSE repository by hand, or try again once the server is reachable.`;
   }
@@ -104,6 +128,7 @@ export function TosseRepoCard() {
   // be a no-op exactly where someone presses it (an origin that moved, a server that was
   // off when the app started).
   const refreshRemoteOrigins = useRefreshRemoteOrigins();
+  const originWriteErrors = useRemoteOriginWriteErrors();
   const refresh = () => {
     refreshRemoteOrigins();
     void refetch();
@@ -224,6 +249,26 @@ export function TosseRepoCard() {
                 </div>
                 <div className={styles.problemBody}>
                   {String(queryError)} — what is shown below may be out of date.
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* An answer the sweep paid an SSH round trip for and then failed to cache. It
+              is invisible everywhere else: the folder simply keeps reading as
+              never-probed, and Refresh looks inert for a reason nobody can see. */}
+          {originWriteErrors.length > 0 ? (
+            <div className={styles.problem}>
+              <Ico name="alert" className="sm" />
+              <div>
+                <div className={styles.problemTitle}>
+                  {originWriteErrors.length === 1
+                    ? "A server's answer could not be saved"
+                    : `${originWriteErrors.length} server answers could not be saved`}
+                </div>
+                <div className={styles.problemBody}>
+                  {originWriteErrors.join(" · ")} — those folders will keep asking their
+                  server on every refresh until this is fixed.
                 </div>
               </div>
             </div>
@@ -389,7 +434,7 @@ export function TosseRepoCard() {
                 {/* WHERE the folder lives is a local fact — it stays true through an
                     outage. Only said while the server has yet to answer: once it has,
                     this folder matches like any other and the note would be misleading. */}
-                {link?.machine && !link.machine.originRead ? (
+                {link?.machine && !link.machine.originRead && !link.machine.originNote ? (
                   <div className={styles.emptyBody}>
                     It lives on {machineName(link.machine)}, whose git remotes could not be
                     read yet.

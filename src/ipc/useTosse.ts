@@ -158,8 +158,14 @@ export const tosseRemoteOriginsKey = ["tosse-remote-origins"] as const;
  * folder list is in the key, so adding a remote folder does ask about it; the card's
  * Refresh button forces a re-ask for the rare case where an origin genuinely moved.
  *
- * ⚠️ The refetch is gated on `changed`. Invalidating unconditionally would put the app in
- * a loop: refetch → sweep → invalidate → refetch.
+ * ⚠️ The refetch is driven by a sweep COMPLETING (`dataUpdatedAt`), not by the VALUE of
+ * `changed` changing. Watching the value silently lost the signal on a repeat: the server
+ * is off at launch, the first sweep returns `changed: true` for some other folder, then
+ * the user starts the server and presses Refresh — the second sweep reaches it, writes the
+ * url, and returns `true` again. Same value, so the effect never fired and Refresh did
+ * visibly nothing, in the exact situation it exists for. There is no loop to fear either
+ * way: the two queries have different keys and the sweep is `staleTime: Infinity`, so
+ * invalidating the links cannot re-trigger it.
  */
 /**
  * Force the next sweep to ASK the servers again, instead of settling for what they said
@@ -175,9 +181,20 @@ export function useRefreshRemoteOrigins(): () => void {
   return () => void qc.invalidateQueries({ queryKey: tosseRemoteOriginsKey });
 }
 
+/** The sweep whose answer this app run has already acted on, so ONE sweep costs ONE
+ *  refetch however many components are observing it.
+ *
+ *  ⚠️ Module-level on purpose. This hook runs inside `useTosseRepoLinks`, which every
+ *  repo badge calls: with the effect alone, a sidebar of 8 repositories fired 8
+ *  `invalidateQueries` in the same commit — 8 `tosse_repo_links` invocations, each one an
+ *  HTTPS request to the CRM plus a `git remote get-url` per local folder, for a single
+ *  logical refresh. Keyed by the sweep's completion stamp, which is exactly "this
+ *  answer", so a later sweep still gets its one refetch. */
+let actedOnSweepAt = 0;
+
 function useRemoteOriginSweep(enabled: boolean, repoKey: string): void {
   const qc = useQueryClient();
-  const { data: changed } = useQuery({
+  const { data: sweep, dataUpdatedAt } = useQuery({
     queryKey: [...tosseRemoteOriginsKey, repoKey],
     enabled,
     queryFn: () => unwrap(commands.tosseProbeRemoteOrigins()),
@@ -187,8 +204,28 @@ function useRemoteOriginSweep(enabled: boolean, repoKey: string): void {
     retry: false,
   });
   useEffect(() => {
-    if (changed) void qc.invalidateQueries({ queryKey: tosseRepoLinksKey });
-  }, [changed, qc]);
+    if (!dataUpdatedAt || !sweep) return;
+    // A sweep that never ran (another one held the lock) is not an answer: the one that
+    // DID run reports for itself.
+    if (sweep.skipped) return;
+    if (dataUpdatedAt <= actedOnSweepAt) return;
+    actedOnSweepAt = dataUpdatedAt;
+    void qc.invalidateQueries({ queryKey: tosseRepoLinksKey });
+  }, [dataUpdatedAt, sweep, qc]);
+}
+
+/** What a sweep lost on its way to SQLite, for the surface that shows the folder.
+ *
+ *  An answer we paid an SSH round trip for and then failed to cache is invisible
+ *  otherwise: the folder keeps reading as never-probed and Refresh looks inert. */
+export function useRemoteOriginWriteErrors(): string[] {
+  const repoKey = useConversationsStore((s) => s.repos.map((r) => r.id).join(","));
+  const { data } = useQuery({
+    queryKey: [...tosseRemoteOriginsKey, repoKey],
+    enabled: false,
+    queryFn: () => unwrap(commands.tosseProbeRemoteOrigins()),
+  });
+  return data?.writeErrors ?? [];
 }
 
 /** One folder's link, or `undefined` while the query is still loading / disabled. */

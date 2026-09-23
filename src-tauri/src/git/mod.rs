@@ -297,6 +297,38 @@ pub fn toplevel(path: &str) -> Option<String> {
 }
 
 
+/// Strip the credentials out of a remote URL, keeping it a usable, showable URL.
+///
+/// A clone can perfectly well carry a token in its remote — `https://user:ghp_xxx@github
+/// .com/o/r.git` is what `gh` writes for a PAT clone, and `git remote get-url` hands it
+/// back verbatim. Everything downstream of a probe either PERSISTS the url (SQLite, kept
+/// indefinitely, copied into every backup of the database) or SHOWS it (the TOSSE card
+/// prints the remote when no CRM repository carries it), so the secret must not get past
+/// the point of capture.
+///
+/// Matching is unaffected: [`normalize_remote_url`] already drops the userinfo segment
+/// before comparing, so a redacted url and its original produce the same key.
+///
+/// Only the `scheme://` form is touched. The scp form's `git@host:path` is an SSH USER
+/// NAME, not a secret — SSH authenticates by key there, no password can appear — and
+/// amputating it would mangle the canonical way these remotes are written.
+pub fn redact_remote_url(url: &str) -> String {
+    let s = url.trim();
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    // The userinfo lives in the AUTHORITY only: an `@` later in the path is part of the
+    // path (`https://host/a@b`) and must survive untouched.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    // `rsplit_once`: a password may itself contain an `@`, and the host is what follows
+    // the LAST one.
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
+        None => s.to_string(),
+    }
+}
+
 /// Reduce a git remote URL to a comparison key, so the SAME repository written in
 /// different notations compares equal. `None` for anything that carries no
 /// identity (empty, or a URL with no path part).
@@ -1192,6 +1224,34 @@ mod tests {
             normalize_remote_url(url),
             normalize_remote_url("https://github.com/Alex375/FlightDeck")
         );
+    }
+
+    /// A remote read off a server is PERSISTED and SHOWN, so a token in it would outlive
+    /// the probe in SQLite and appear on the TOSSE card. It goes at the point of capture.
+    #[test]
+    fn a_remote_url_loses_its_credentials_but_stays_the_same_repository() {
+        let secret = "https://Alex375:ghp_0123456789@github.com/Alex375/FlightDeck.git";
+        let clean = "https://github.com/Alex375/FlightDeck.git";
+        assert_eq!(redact_remote_url(secret), clean);
+        // Matching is untouched: `normalize_remote_url` already drops the userinfo.
+        assert_eq!(normalize_remote_url(secret), normalize_remote_url(clean));
+
+        // A bare username carries no secret but nothing needs it either.
+        assert_eq!(
+            redact_remote_url("https://Alex375@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        // An `@` in the PATH is part of the path. Cutting at it would mangle the url.
+        assert_eq!(redact_remote_url("https://host/a@b/r.git"), "https://host/a@b/r.git");
+        // The scp form's `git@` is an ssh USER, not a credential — left alone, or the
+        // canonical way half these remotes are written would come back amputated.
+        assert_eq!(
+            redact_remote_url("git@github.com:Alex375/FlightDeck.git"),
+            "git@github.com:Alex375/FlightDeck.git"
+        );
+        // Nothing to redact, nothing changed.
+        assert_eq!(redact_remote_url(clean), clean);
+        assert_eq!(redact_remote_url(""), "");
     }
 
     /// Nothing is ever guessed from a line we do not recognise: a folder with no readable

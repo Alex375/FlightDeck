@@ -81,17 +81,43 @@ interface MachineHealthState {
   byMachine: Record<string, MachineHealth>;
   /** Record a diagnosis — from the ambient poll, from the Settings server card, from
    *  anywhere that already paid for one. Every producer funnels through here so the
-   *  badge can never disagree with the panel. */
-  record: (machineId: string, diagnosis: ServerDiagnosis) => void;
+   *  badge can never disagree with the panel.
+   *
+   *  `startedAtMs` is when THIS probe was fired, and it is what orders two answers that
+   *  are in flight at once (see `isStaleProbe`). Omit it only where no newer probe can
+   *  possibly exist. */
+  record: (machineId: string, diagnosis: ServerDiagnosis, startedAtMs?: number) => void;
   /** A probe that never produced a verdict. Keeps whatever we already knew. */
-  recordProbeError: (machineId: string, error: string) => void;
+  recordProbeError: (machineId: string, error: string, startedAtMs?: number) => void;
   /** Drop a machine's row — it was unpaired. */
   forget: (machineId: string) => void;
 }
 
+/** When the probe whose answer we ACCEPTED for each machine was fired. */
+const appliedProbeStartMs = new Map<string, number>();
+
+/** Is this answer older than one we already applied?
+ *
+ *  ⚠️ Two probes of the same machine overlap routinely — the panel diagnoses on mount
+ *  (bounded at 20s against a dead server) while the user clicks Retry two seconds later
+ *  and gets an answer in five. Whoever lands LAST used to win, so the slow "unreachable"
+ *  landed on top of the fresh "ready" and re-reddened three surfaces — undoing the very
+ *  re-check the user had just asked for. Order by when each probe was FIRED, not by when
+ *  it came back.
+ *
+ *  A caller that passes no `startedAtMs` is treated as current: an answer with no
+ *  provenance is never silently dropped. */
+function isStaleProbe(machineId: string, startedAtMs: number | undefined): boolean {
+  if (startedAtMs === undefined) return false;
+  const applied = appliedProbeStartMs.get(machineId);
+  return applied !== undefined && startedAtMs < applied;
+}
+
 export const useMachineHealthStore = create<MachineHealthState>((set) => ({
   byMachine: {},
-  record: (machineId, diagnosis) => {
+  record: (machineId, diagnosis, startedAtMs) => {
+    if (isStaleProbe(machineId, startedAtMs)) return;
+    appliedProbeStartMs.set(machineId, startedAtMs ?? Date.now());
     // Any recorded verdict counts as "just probed", whoever paid for it — the Settings
     // server card calls `machine_diagnose` itself (it needs the full diagnosis back, which
     // `probeMachine` does not hand over). Without this the ambient poll would dial the
@@ -104,8 +130,11 @@ export const useMachineHealthStore = create<MachineHealthState>((set) => ({
       },
     }));
   },
-  recordProbeError: (machineId, error) =>
+  recordProbeError: (machineId, error, startedAtMs) =>
     set((s) => {
+      // Same ordering rule as a verdict: a stale "we could not ask" must not land on top
+      // of a fresher answer that did get through.
+      if (isStaleProbe(machineId, startedAtMs)) return s;
       const prev = s.byMachine[machineId];
       return {
         byMachine: {
@@ -185,13 +214,16 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
   const last = lastProbeAtMs.get(machineId) ?? 0;
   if (!force && Date.now() - last < PROBE_MIN_GAP_MS) return;
   inFlight.add(machineId);
-  lastProbeAtMs.set(machineId, Date.now());
+  const startedAtMs = Date.now();
+  lastProbeAtMs.set(machineId, startedAtMs);
   try {
     const res = await commands.machineDiagnose(machineId);
-    if (res.status === "ok") useMachineHealthStore.getState().record(machineId, res.data);
-    else useMachineHealthStore.getState().recordProbeError(machineId, res.error);
+    if (res.status === "ok") useMachineHealthStore.getState().record(machineId, res.data, startedAtMs);
+    else useMachineHealthStore.getState().recordProbeError(machineId, res.error, startedAtMs);
   } catch (e) {
-    useMachineHealthStore.getState().recordProbeError(machineId, e instanceof Error ? e.message : String(e));
+    useMachineHealthStore
+      .getState()
+      .recordProbeError(machineId, e instanceof Error ? e.message : String(e), startedAtMs);
   } finally {
     inFlight.delete(machineId);
   }
@@ -202,4 +234,5 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
 export function resetProbeStateForTests(): void {
   inFlight.clear();
   lastProbeAtMs.clear();
+  appliedProbeStartMs.clear();
 }

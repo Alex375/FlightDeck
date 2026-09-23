@@ -19,56 +19,81 @@ Le développement de Flight Deck accumule **beaucoup** de gras : chaque feature 
 
 1. **Jamais de source non committée.** Ce skill ne supprime que des chemins gitignorés (`target/`, bundles, overlays) et des dossiers de `~/Library`. Avant toute suppression dans un repo, `git status --porcelain` doit être vide — s'il ne l'est pas, **n'y touche pas** et dis-le : le travail en cours passe avant l'espace disque.
 2. **Jamais une identité protégée.** `com.tosse.desktop` est la **prod** (les vraies conversations d'Alexandre, ~17 Mo) et `com.tosse.desktop.dev` est l'identité fixe de `/build-dev`. Elles ne se purgent **jamais**, et on ne s'en approche pas avec un glob (`com.tosse.desktop*` les attraperait toutes les deux).
-3. **Jamais l'identité d'une feature vivante.** Une identité `com.tosse.desktop.<slug>` dont le worktree `.claude/worktrees/<slug>` existe encore appartient à une feature en cours : ce sont ses données de test, ne les supprime pas.
+3. **Jamais l'identité d'une feature vivante.** Une identité `com.tosse.desktop.<slug>` dont le worktree `<slug>` existe encore appartient à une feature en cours : ce sont ses données de test, ne les supprime pas.
 4. **Jamais pendant un build.** Le worktree principal est partagé avec les autres agents : supprimer `target` sous les pieds d'un `tauri build` en cours le casse. Vérifie d'abord, et si un build tourne, **saute la purge des `target`** (les autres étapes restent possibles).
-5. **Jamais de réécriture d'historique.** Le `git gc` de l'étape 4 n'expire que les entrées de reflog **inatteignables depuis un ref** : aucun commit d'aucune branche ne peut disparaître. Pas de `filter-branch`, pas de `--expire=now` global, pas de force-push.
+5. **Jamais de réécriture d'historique, jamais un stash perdu.** Le `git gc` de l'étape 4 n'expire que les reflogs **de branches** : aucun commit d'aucune branche, et **aucun stash**, ne peut disparaître. Pas de `filter-branch`, pas de `--expire=now` global, **pas de `--all`** (il inclut `refs/stash`), pas de force-push.
+6. **Un chemin qu'on n'a pas trouvé n'a pas été purgé.** Toute racine est **dérivée**, jamais écrite en dur : un chemin en dur qui n'existe pas fait passer un garde-fou pour vert et fait annoncer un espace qu'on n'a jamais rendu. Si une racine est introuvable, **ne purge rien pour elle** et dis-le dans le rapport.
 
-## Étape 0 — Mesurer avant (pour pouvoir reporter)
+## Étape 0 — Dériver les racines, puis mesurer
+
+⚠️ **Rien n'est codé en dur ici.** Les racines se dérivent du dépôt courant. (Ce skill a déjà planté pour cette raison : il visait `~/Documents/repositories/tosse-code`, qui n'existe sur aucune machine — tous ses `rm -rf`, son `git gc` et son garde-fou « feature vivante » tapaient à côté.)
+
+```bash
+# Racine du checkout PRINCIPAL de tosse-code (même lancé depuis un worktree).
+ROOT=$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')
+# Garde-fou : c'est bien tosse-code ? Sinon on s'arrête, on ne devine pas.
+[ -f "$ROOT/src-tauri/Cargo.toml" ] || { echo "REFUS : $ROOT n'est pas tosse-code"; exit 1; }
+
+# Le repo serveur est un voisin du même parent — absent = on n'y touche pas.
+SERVER="$(dirname "$ROOT")/flightdeck-server"
+[ -d "$SERVER/.git" ] || SERVER=""
+
+echo "ROOT=$ROOT"; echo "SERVER=${SERVER:-<introuvable, sera SAUTÉ>}"
+```
 
 ```bash
 df -h / | tail -1
-du -sh ~/Documents/repositories/tosse-code ~/Documents/repositories/flightdeck-server 2>/dev/null
-pgrep -fl "cargo|rustc|tauri" | grep -v pgrep    # vide = aucun build en cours (invariant 4)
+du -sh "$ROOT" ${SERVER:+"$SERVER"} 2>/dev/null
+pgrep -x "cargo|rustc|cargo-tauri"      # vide (exit 1) = aucun build en cours (invariant 4)
 ```
+
+⚠️ Le test de build se fait sur le **nom** du process (`pgrep -x`), pas sur la ligne de commande complète (`pgrep -f "cargo|rustc|tauri"`) : cette dernière matche le PATH hérité de n'importe quel process (il contient `.cargo/bin`), le chemin du bundle `.app` de dev, et le `pgrep` lui-même — elle renvoyait 27 lignes **sans aucun build**, donc l'étape 2 était systématiquement sautée et les ~19 Go jamais rendus.
 
 Si un build tourne : saute l'étape 2, fais le reste, et dis-le franchement dans le rapport.
 
 ## Étape 1 — Vérifier que rien n'est en jeu (invariant 1)
 
 ```bash
-git -C ~/Documents/repositories/tosse-code status --porcelain
-git -C ~/Documents/repositories/flightdeck-server status --porcelain
+git -C "$ROOT" status --porcelain
+[ -n "$SERVER" ] && git -C "$SERVER" status --porcelain
 ```
 
 Un repo sale n'empêche pas de purger ses `target` (gitignorés), mais **empêche son `git gc`** de l'étape 4. Note lequel est sale.
 
 ## Étape 2 — Purger les `target` (le gros morceau)
 
-Quatre `target` existent, et on les oublie tous les quatre. Ordres de grandeur mesurés le 22/09/2026 :
+Quatre `target` peuvent exister, et on les oublie tous les quatre. Ordres de grandeur mesurés le 22/09/2026 :
 
 | Chemin | Produit par | Taille observée |
 |---|---|---|
-| `tosse-code/src-tauri/target/debug` | `cargo test --lib`, `tauri dev` | **12 G** (incremental 4,3 G · deps 6,2 G) |
-| `tosse-code/src-tauri/target/release` | `/build-dev`, `/build-app` | **1,9 G** + un `.dmg` de 27 M par version |
-| `tosse-code/flightdeckd/target` | crate dupliquée du serveur | **1,2 G** |
-| `flightdeck-server/flightdeckd/target` | debug · musl · release · deploy | **5,6 G** |
+| `<ROOT>/src-tauri/target/debug` | `cargo test --lib`, `tauri dev` | **12 G** (incremental 4,3 G · deps 6,2 G) |
+| `<ROOT>/src-tauri/target/release` | `/build-dev`, `/build-app` | **1,9 G** + un `.dmg` de 27 M par version |
+| `<ROOT>/flightdeckd/target` | crate dupliquée du serveur | **1,2 G** |
+| `<SERVER>/flightdeckd/target` | debug · musl · release · deploy | **5,6 G** |
 
 **Mode par défaut — tout effacer.** C'est le comportement voulu : on lance ce skill à un moment où le travail est posé, donc c'est le bon moment pour repayer une compilation.
 
 ```bash
-rm -rf ~/Documents/repositories/tosse-code/src-tauri/target \
-       ~/Documents/repositories/tosse-code/flightdeckd/target \
-       ~/Documents/repositories/flightdeck-server/flightdeckd/target
+for T in "$ROOT/src-tauri/target" "$ROOT/flightdeckd/target" ${SERVER:+"$SERVER/flightdeckd/target"}; do
+  if [ -d "$T" ]; then
+    echo "purge $T ($(du -sh "$T" | cut -f1))"
+    rm -rf "$T"
+  else
+    echo "absent, RIEN purgé : $T"
+  fi
+done
 ```
+
+⚠️ Reporte les `absent` tels quels. Annoncer l'espace d'un `target` qui n'existait pas est un mensonge sur une opération destructive.
 
 Dis explicitement à l'utilisateur ce que ça coûte : le prochain `cargo test --lib` et le prochain `/build-dev` ou `/build-app` repartent d'un build Rust **complet** (~10 min chacun).
 
 **Mode conservateur — `/cleanup --caches`.** Si l'utilisateur a demandé à garder l'incrémental, ne prends que le pur cache (~4 Go rendus, aucune recompilation complète à repayer) :
 
 ```bash
-rm -rf ~/Documents/repositories/tosse-code/src-tauri/target/{debug,release}/incremental \
-       ~/Documents/repositories/tosse-code/flightdeckd/target/*/incremental \
-       ~/Documents/repositories/flightdeck-server/flightdeckd/target/*/incremental
+rm -rf "$ROOT"/src-tauri/target/{debug,release}/incremental \
+       "$ROOT"/flightdeckd/target/*/incremental \
+       ${SERVER:+"$SERVER"/flightdeckd/target/*/incremental}
 ```
 
 ⚠️ Un `rm -rf` sur un `target` peut sortir en `Directory not empty` sans avoir échoué : le Finder recrée un `.DS_Store` pendant la suppression. Relance simplement la commande et vérifie avec `ls -d` que le chemin a disparu.
@@ -77,28 +102,53 @@ rm -rf ~/Documents/repositories/tosse-code/src-tauri/target/{debug,release}/incr
 
 Chaque `/build-app` crée une identité macOS `com.tosse.desktop.<slug>` éparpillée dans six emplacements de `~/Library`. `/land` la purge normalement à son étape 7b, mais une feature abandonnée sans `/land` la laisse orpheline pour toujours.
 
+⚠️ **L'inventaire liste des IDENTITÉS, pas des fichiers.** Un `find -name "com.tosse.desktop.*"` ramasse aussi les **fichiers annexes de la prod** — `Preferences/com.tosse.desktop.plist` et `HTTPStorages/com.tosse.desktop.binarycookies` existent bel et bien — et le garde-fou d'identité protégée ne peut pas les attraper, puisque `$ID` vaudrait alors `com.tosse.desktop.plist`. Le suffixe se retire **avant** le filtre :
+
 ```bash
-# Inventaire : ce qui existe, moins les deux identités protégées.
-for d in "Application Support" Caches Preferences WebKit HTTPStorages "Saved Application State"; do
-  find ~/Library/"$d" -maxdepth 1 -name "com.tosse.desktop.*" 2>/dev/null
-done | grep -vE "com\.tosse\.desktop\.dev(\.|$)"
+{
+  for d in "Application Support" Caches WebKit HTTPStorages; do ls -1 ~/Library/"$d" 2>/dev/null; done
+  ls -1 ~/Library/Preferences 2>/dev/null              | sed 's/\.plist$//'
+  ls -1 ~/Library/"Saved Application State" 2>/dev/null | sed 's/\.savedState$//'
+} | sed 's/\.binarycookies$//' \
+  | grep -xE 'com\.tosse\.desktop\.[a-z0-9][a-z0-9-]*' \
+  | grep -vxF 'com.tosse.desktop.dev' \
+  | sort -u
 ```
 
-Pour **chaque** slug trouvé, avant de supprimer : vérifie que `~/Documents/repositories/tosse-code/.claude/worktrees/<slug>` **n'existe pas** (invariant 3). Puis, slug par slug — jamais en glob (invariants 2 et 3) :
+Les deux identités protégées disparaissent par construction : `com.tosse.desktop.plist` et `com.tosse.desktop.binarycookies` redeviennent `com.tosse.desktop`, que la regex (qui exige un 4ᵉ segment) rejette, et `com.tosse.desktop.dev` est exclu nommément.
+
+Ensuite, la liste des **slugs vivants**, énumérés depuis git — jamais un chemin construit à la main :
+
+```bash
+LIVE=$(git -C "$ROOT" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | xargs -n1 basename)
+echo "$LIVE"
+```
+
+⚠️ Si cette commande échoue ou sort vide, **n'efface aucune identité** : sans la liste des features vivantes, le garde-fou 3 n'existe plus. Fail closed.
+
+Puis, slug par slug — jamais en glob (invariants 2 et 3) :
 
 ```bash
 ID="com.tosse.desktop.<slug>"
-if [ "$ID" = "com.tosse.desktop" ] || [ "$ID" = "com.tosse.desktop.dev" ]; then
-  echo "REFUS : $ID est une identité protégée."
-else
-  rm -rf "$HOME/Library/Application Support/$ID" \
-         "$HOME/Library/Caches/$ID" \
-         "$HOME/Library/Preferences/$ID.plist" \
-         "$HOME/Library/WebKit/$ID" \
-         "$HOME/Library/HTTPStorages/$ID" \
-         "$HOME/Library/HTTPStorages/$ID.binarycookies" \
-         "$HOME/Library/Saved Application State/$ID.savedState"
-fi
+SLUG="${ID#com.tosse.desktop.}"
+case "$ID" in
+  com.tosse.desktop|com.tosse.desktop.dev)
+    echo "REFUS : $ID est une identité protégée." ;;
+  *.plist|*.binarycookies|*.savedState)
+    echo "REFUS : $ID est un fichier annexe, pas une identité." ;;
+  *)
+    if echo "$LIVE" | grep -qxF "$SLUG"; then
+      echo "REFUS : le worktree $SLUG est vivant — ce sont les données de test d'une feature en cours."
+    else
+      rm -rf "$HOME/Library/Application Support/$ID" \
+             "$HOME/Library/Caches/$ID" \
+             "$HOME/Library/Preferences/$ID.plist" \
+             "$HOME/Library/WebKit/$ID" \
+             "$HOME/Library/HTTPStorages/$ID" \
+             "$HOME/Library/HTTPStorages/$ID.binarycookies" \
+             "$HOME/Library/Saved Application State/$ID.savedState"
+    fi ;;
+esac
 ```
 
 ⚠️ La ligne `$ID.binarycookies` est facile à oublier : macOS écrit les cookies **à côté** du dossier `HTTPStorages/$ID`, pas dedans.
@@ -116,24 +166,32 @@ Un repo jamais `gc` garde ses objets en loose et, s'il a un jour vu un `git add 
 Diagnostic :
 
 ```bash
-git -C <repo> count-objects -vH                      # loose élevé + 0 pack = jamais gc
-git -C <repo> log --all --oneline -- '**/target'      # vide = les blobs ne sont QUE dans le reflog
+git -C "$REPO" count-objects -vH                      # loose élevé + 0 pack = jamais gc
+git -C "$REPO" log --all --oneline -- '**/target'     # vide = les blobs ne sont QUE dans le reflog
 ```
 
-Si le repo est clean (étape 1) :
+⚠️ **Porte d'entrée obligatoire : les stashs.** Le stash est partagé entre le checkout principal et **tous** les worktrees, et d'autres agents peuvent en poser un. `git status --porcelain` ne le voit pas.
 
 ```bash
-git -C <repo> reflog expire --expire-unreachable=now --all
-git -C <repo> gc --prune=now
+git -C "$REPO" stash list      # NON VIDE → saute l'étape 4 pour ce repo et dis-le
 ```
 
-`--expire-unreachable` (et pas `--expire`) est le point clé : il ne jette que les entrées de reflog pointant vers des commits qu'aucun ref n'atteint. L'historique d'annulation des branches vivantes survit.
+Si le repo est clean (étape 1) **et** sans stash :
+
+```bash
+git -C "$REPO" reflog expire --expire-unreachable=now \
+    $(git -C "$REPO" for-each-ref --format='%(refname)' refs/heads)
+git -C "$REPO" gc --prune=now
+```
+
+⚠️ **Ne passe JAMAIS `--all` à `reflog expire` ici.** `--all` traite *tous* les reflogs, y compris `refs/stash` : les entrées `stash@{1}` et suivantes ne sont atteignables que par leur reflog, donc elles sont expirées puis élaguées par le `gc --prune=now`. Le travail stashé est alors irrécupérable — et la vérification prescrite ci-dessous (fsck + branches) le rate complètement, puisqu'aucune branche n'a bougé. Restreindre aux reflogs de `refs/heads` donne le même gain d'espace sans ce risque.
 
 **Vérifie après coup, et rapporte la vérification** — c'est une opération destructive, un « ça a marché » non vérifié ne vaut rien :
 
 ```bash
-git -C <repo> fsck --no-progress                     # aucune erreur attendue
-git -C <repo> for-each-ref --format='%(refname:short)' refs/heads   # toutes les branches encore là
+git -C "$REPO" fsck --no-progress                     # aucune erreur attendue
+git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads   # toutes les branches encore là
+git -C "$REPO" stash list                             # même nombre d'entrées qu'avant
 # et le compte de commits hors origin pour chaque branche non poussée, inchangé
 ```
 
@@ -144,8 +202,8 @@ Termine par un rapport court et **factuel** :
 - espace rendu, par repo (avant → après) et espace libre sur le disque avant → après ;
 - ce qui a été supprimé, par catégorie (`target`, identités de test, git) ;
 - **ce que ça coûtera** : quels prochains builds repartent de zéro ;
-- ce qui a été **sauté** et pourquoi (build en cours, repo sale, identité d'une feature vivante) — ne présente jamais une étape sautée comme faite ;
-- la vérification post-`gc` (fsck + branches intactes) si l'étape 4 a tourné.
+- ce qui a été **sauté** et pourquoi (build en cours, repo sale, stash présent, identité d'une feature vivante, racine introuvable) — ne présente jamais une étape sautée comme faite, et ne compte jamais l'espace d'un chemin absent comme rendu ;
+- la vérification post-`gc` (fsck + branches + stashs intacts) si l'étape 4 a tourné.
 
 ## Ce que ce skill ne fait PAS
 

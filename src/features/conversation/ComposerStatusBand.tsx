@@ -24,8 +24,14 @@ import { Ico } from "../../ui/kit";
  * the composer's Enter-to-send handler (same capture trick the composer uses for Escape —
  * WKWebView can swallow keys inside the textarea). Wired only while `active`; otherwise
  * ⌘Enter is left untouched (falls through to the composer).
+ *
+ * ⚠️ Called by `ComposerBand`, one level UP, not from this component. A warning band (CLI
+ * missing, account signed out, server unreachable) renders INSTEAD of this one, so wiring the
+ * chord here left it unarmed in exactly those states: pressing ⌘Enter out of habit to clear
+ * the red band sent the half-written draft instead — a message that then failed for the very
+ * reason the band was warning about.
  */
-function useMarkSeenShortcut(session: string, active: boolean) {
+export function useMarkSeenShortcut(session: string, active: boolean) {
   useEffect(() => {
     if (!active) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
@@ -64,7 +70,6 @@ export function ComposerStatusBand({ session }: { session: string }) {
   const status = useAgentStatus(session);
   const send = useSendMessage(session);
   const dismissable = isDismissable(status);
-  useMarkSeenShortcut(session, dismissable);
 
   // Turn done, background work still running: calm and neutral — nothing to review yet,
   // the agent resumes on its own when the work lands. No action to offer.

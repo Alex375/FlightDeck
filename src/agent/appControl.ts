@@ -61,6 +61,9 @@ import { agentStatusForEntry } from "./useAgentStatus";
 import type { AgentStatus } from "./status";
 import type { NoticeItem, SessionEntry, Turn } from "../store/types";
 import type { View } from "../ui/shortcuts";
+// The single gate for a task id that will become a URL — shared with the thread card, which
+// builds the same CRM link from the same agent-supplied field. See its module doc.
+import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
@@ -1063,37 +1066,6 @@ function callerOnly(tool: string, session: string | null): Conversation {
   return conv;
 }
 
-/**
- * A TOSSE task id is a canonical UUID, and nothing else.
- *
- * `tosse_task_detail` builds its CRM URL by concatenating this id onto the tasks path, so an
- * id of `../clients` reaches ANY endpoint of the CRM carrying the human's Bearer token — and
- * the answer comes back to the agent, because a failed read's error text embeds the first 300
- * characters of the response body (`snippet()`, `tosse/mod.rs`). The SAME pattern is enforced
- * in Rust: two independent checks on purpose, neither one load-bearing alone.
- */
-const TOSSE_TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * The canonical (lower-case) form of a task id, or `null` when it is not one.
- *
- * The regex is case-INSENSITIVE, so the same task can be named `A1B2…` or `a1b2…`; normalizing
- * here, once, at the single gate every id passes through, is what makes the comparisons
- * downstream mean anything. Compared raw, one spelling of a task reads as a DIFFERENT task
- * from the other: re-linking the task already linked would be refused as "already linked to
- * another task", and the guard that stops an unverified guess from erasing a CRM-verified
- * title/status would miss.
- */
-function canonicalTosseTaskId(raw: string): string | null {
-  return TOSSE_TASK_ID_RE.test(raw) ? raw.toLowerCase() : null;
-}
-
-/** Do these two ids name the same task? A stored id came either from the CRM (whatever case
- *  it serializes in) or from an agent (normalized above), so identity is decided on the
- *  canonical form, never on the bytes. */
-function sameTaskId(a: string | null | undefined, b: string | null | undefined): boolean {
-  return !!a && !!b && a.toLowerCase() === b.toLowerCase();
-}
 
 /**
  * The whole CRM budget of ONE `link_tosse_task` call.

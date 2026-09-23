@@ -112,8 +112,12 @@ export function TosseToolView({
   // The view is built from the input ALONE when the call failed: a refused write's "result" is
   // an error message, and parsing it for a task would dress the failure up as a success.
   const view = tosseCardView(name, input, errored ? undefined : result?.content);
+  // ⚠️ `verb` is PAST tense by contract ("created", "moved") — it cannot follow "refused to".
+  // The fallback fires exactly when the CRM sent no text with its refusal, i.e. on the one
+  // card that has to be clearest, where it read "refused to created this task".
   const reason = errored
-    ? resultText(result?.content).trim() || `The CRM refused to ${view.action.verb} this ${view.action.entity}`
+    ? resultText(result?.content).trim() ||
+      `The CRM refused this ${view.action.entity}${view.tool ? ` (${view.tool})` : ""}`
     : null;
   const pending = !result;
   const task = view.task;
@@ -123,7 +127,18 @@ export function TosseToolView({
   // "TOSSE task · update_task_status · Tosse Code" — the eyebrow names the exact tool, because
   // the CRM exposes about sixty of them and "moved" alone does not identify the call.
   const kind = `TOSSE ${view.action.entity}`;
-  const detail = errored ? reason : pending ? "Saving…" : view.detail;
+  // ⚠️ "Saving…" only while the call really is in flight. A resultless call in a SETTLED turn
+  // (session torn down mid-call, truncated transcript, a tool_result that never came) is not
+  // saving anything — it read "Saving…" for ever, in the past tense of a thread nobody is
+  // going to finish. The `running` prop exists for exactly this, and the dot already honoured
+  // it; the text did not. Saying what happened beats an animation that never ends.
+  const detail = errored
+    ? reason
+    : pending
+      ? running
+        ? "Saving…"
+        : "No result recorded"
+      : view.detail;
 
   return (
     <div
@@ -148,8 +163,17 @@ export function TosseToolView({
       {/* The CRM's own marks, and only for what the payload actually carried — a missing
           assignee is left out rather than filled with a placeholder, and a FAILED call shows
           no status at all (it moved nothing). */}
+      {/* The arrow is only drawn for a call that CARRIED a status change (`movedStatus`) —
+          otherwise the landing pill stands alone. The CRM echoes the whole task back after
+          any write, so a title edit arrives with a status that may well differ from the last
+          one this thread sighted, and the arrow would credit this call with a move made
+          somewhere else entirely (Flight Deck's own TOSSE view, or a sub-agent). */}
       {!errored && view.statusTo ? (
-        <StatusMove from={previousStatus} to={view.statusTo} pending={pending} />
+        <StatusMove
+          from={view.movedStatus ? previousStatus : null}
+          to={view.statusTo}
+          pending={pending}
+        />
       ) : null}
       {!errored && task?.assignedTo ? (
         <span className="cv-tosseact-who">

@@ -3,6 +3,7 @@ import type { ServerDiagnosis } from "../ipc/client";
 import {
   healthFromDiagnosis,
   isUnreachable,
+  resetProbeStateForTests,
   useMachineHealthStore,
   type MachineHealth,
 } from "./machineHealth";
@@ -119,7 +120,10 @@ describe("isUnreachable", () => {
 });
 
 describe("the store", () => {
-  beforeEach(() => useMachineHealthStore.setState({ byMachine: {} }));
+  beforeEach(() => {
+    useMachineHealthStore.setState({ byMachine: {} });
+    resetProbeStateForTests();
+  });
 
   it("keeps the previous verdict when a probe could not even run", () => {
     useMachineHealthStore.getState().record("m1", diagnosis());
@@ -142,5 +146,35 @@ describe("the store", () => {
     useMachineHealthStore.getState().record("m2", diagnosis());
     expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(true);
     expect(isUnreachable(useMachineHealthStore.getState().byMachine.m2)).toBe(false);
+  });
+
+  // ⚠️ The mount probe of the Settings card is bounded at 20s against a dead server,
+  // and "Retry" is clickable while it is still in flight. Ordering by ARRIVAL let the
+  // slow "unreachable" land on top of the fresh "ready" and re-redden the sidebar mark,
+  // the composer band and the card — undoing the re-check the user had just asked for.
+  it("ignores a verdict from a probe that was fired before the one already applied", () => {
+    useMachineHealthStore.getState().record("m1", diagnosis(), 5_000); // Retry, fired late, answered first
+    useMachineHealthStore.getState().record("m1", unreachable(), 1_000); // mount probe, fired first, times out later
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(false);
+  });
+
+  it("still applies a verdict from a probe fired after the one already applied", () => {
+    useMachineHealthStore.getState().record("m1", diagnosis(), 1_000);
+    useMachineHealthStore.getState().record("m1", unreachable(), 5_000);
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(true);
+  });
+
+  // A caller with no provenance to give is treated as current rather than dropped: an
+  // answer must never be swallowed just because it arrived unlabelled.
+  it("applies a verdict recorded without a start stamp", () => {
+    useMachineHealthStore.getState().record("m1", diagnosis(), 5_000);
+    useMachineHealthStore.getState().record("m1", unreachable());
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(true);
+  });
+
+  it("ignores a stale probe ERROR too, so it cannot shadow a fresher answer", () => {
+    useMachineHealthStore.getState().record("m1", diagnosis(), 5_000);
+    useMachineHealthStore.getState().recordProbeError("m1", "ssh timed out", 1_000);
+    expect(useMachineHealthStore.getState().byMachine.m1.probeError).toBeNull();
   });
 });

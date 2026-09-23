@@ -1629,6 +1629,15 @@ pub struct TosseRepoMachine {
     /// (never swept, or the server is off) from "we asked, and this folder has no
     /// origin". Both show no url; only the second is a fact about the folder.
     pub origin_read: bool,
+    /// What the server answered when it did not hand over a url — `no-remote`,
+    /// `not-a-repository`, `gone`, `no-git` — and `None` when a url WAS read.
+    ///
+    /// The third state `origin_read` alone cannot express. "We asked and got an answer"
+    /// (`origin_read: true`) covers both "this folder has no origin" and "this folder is
+    /// not a repository over there", which call for different sentences — and the UI was
+    /// inferring the first from the absence of the second. Passed through verbatim, never
+    /// matched on in Rust.
+    pub origin_note: Option<String>,
 }
 
 /// Whether this Mac's `git` has anything to say about a folder.
@@ -1653,12 +1662,14 @@ pub fn remote_probe(
     machine_id: Option<&str>,
     machine_label: Option<&str>,
     origin_read: bool,
+    origin_note: Option<&str>,
 ) -> RemoteProbe {
     match machine_id {
         Some(id) => RemoteProbe::Skip(TosseRepoMachine {
             id: id.to_string(),
             label: machine_label.map(str::to_string),
             origin_read,
+            origin_note: origin_note.map(str::to_string),
         }),
         None => RemoteProbe::Locally,
     }
@@ -2420,6 +2431,7 @@ mod tests {
                 id: "m-1".into(),
                 label: label.map(str::to_string),
                 origin_read: false,
+                origin_note: None,
             }),
             ..local(repo_id, None, manual)
         }
@@ -2434,6 +2446,7 @@ mod tests {
                 id: "m-1".into(),
                 label: Some("tower".into()),
                 origin_read: true,
+                origin_note: None,
             }),
             ..local(repo_id, None, None)
         }
@@ -2560,24 +2573,37 @@ mod tests {
     /// and the badge raised a fault on a perfectly healthy repository.
     #[test]
     fn a_folder_on_a_server_is_never_probed_with_this_macs_git() {
-        assert_eq!(remote_probe(None, None, false), RemoteProbe::Locally);
+        assert_eq!(remote_probe(None, None, false, None), RemoteProbe::Locally);
         assert_eq!(
-            remote_probe(Some("m-1"), Some("tower"), true),
+            remote_probe(Some("m-1"), Some("tower"), true, None),
             RemoteProbe::Skip(TosseRepoMachine {
                 id: "m-1".into(),
                 label: Some("tower".into()),
                 origin_read: true,
+                origin_note: None,
+            }),
+        );
+        // A firm answer that is not a url travels WITH the machine: "we asked, and this
+        // folder is not a repository over there" must not read as "we could not ask".
+        assert_eq!(
+            remote_probe(Some("m-1"), Some("tower"), true, Some("not-a-repository")),
+            RemoteProbe::Skip(TosseRepoMachine {
+                id: "m-1".into(),
+                label: Some("tower".into()),
+                origin_read: true,
+                origin_note: Some("not-a-repository".into()),
             }),
         );
         // A server that was unpaired leaves the id behind. The folder is still over there:
         // falling back to a local probe would restore the false fault precisely for the
         // repositories the user can no longer look at.
         assert_eq!(
-            remote_probe(Some("m-gone"), None, false),
+            remote_probe(Some("m-gone"), None, false, None),
             RemoteProbe::Skip(TosseRepoMachine {
                 id: "m-gone".into(),
                 label: None,
                 origin_read: false,
+                origin_note: None,
             }),
         );
     }

@@ -60,13 +60,13 @@ describe("badgeStateFor", () => {
     // "cannot change to …" — indistinguishable from a deleted folder — and the badge showed
     // a warning on a repository whose remote matches the CRM perfectly. No automatic match
     // is possible from here, which is an ordinary limit, not a fault.
-    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true } }))).toBe("unlinked");
+    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true, originNote: null } }))).toBe("unlinked");
   });
 
   it("still shows a repository pinned by hand on a remote folder", () => {
     // The manual pin is pure local SQLite, so it works over there exactly as it does here.
     expect(
-      badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true }, repository: { id: "r" } })),
+      badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true, originNote: null }, repository: { id: "r" } })),
     ).toBe("linked");
   });
 
@@ -97,7 +97,7 @@ describe("whyUnmatched", () => {
     // It has one — we simply have not read it yet, because the path lives on that machine.
     // Saying "no git remote" sent the user hunting for a remote that is right there.
     const said = whyUnmatched(
-      cardLink({ machine: { id: "m1", label: "tower", originRead: false } }),
+      cardLink({ machine: { id: "m1", label: "tower", originRead: false, originNote: null } }),
     );
     expect(said).toContain("tower");
     expect(said).toContain("Pick a TOSSE repository by hand");
@@ -108,7 +108,7 @@ describe("whyUnmatched", () => {
     // Only the id survives on the folder. The folder is still over there, and the sentence
     // must not quietly become the local one.
     expect(
-      whyUnmatched(cardLink({ machine: { id: "m1", label: null, originRead: false } })),
+      whyUnmatched(cardLink({ machine: { id: "m1", label: null, originRead: false, originNote: null } })),
     ).toContain("no longer paired");
   });
 
@@ -118,7 +118,7 @@ describe("whyUnmatched", () => {
     // sentence would send the user to fix a server that is working fine.
     const said = whyUnmatched(
       cardLink({
-        machine: { id: "m1", label: "tower", originRead: true },
+        machine: { id: "m1", label: "tower", originRead: true, originNote: null },
         remoteUrl: "https://github.com/Alex375/FlightDeck.git",
       }),
     );
@@ -129,10 +129,40 @@ describe("whyUnmatched", () => {
   it("tells a server that has no origin for the folder from one it could not reach", () => {
     // Same empty url, two different truths. Answered: the folder genuinely has no origin.
     const answered = whyUnmatched(
-      cardLink({ machine: { id: "m1", label: "tower", originRead: true } }),
+      cardLink({ machine: { id: "m1", label: "tower", originRead: true, originNote: null } }),
     );
     expect(answered).toContain("has no git remote on tower");
     expect(answered).not.toContain("not been able to read");
+  });
+
+  // ⚠️ The sweep used to THROW these answers away, which left `originRead` false — the
+  // flag that means "we could not ask" — so the card blamed the server's reachability for
+  // something the server had just told us, and advised "try again once the server is
+  // reachable": a fix that could never work.
+  it("says what the server actually answered, instead of blaming its reachability", () => {
+    const on = (originNote: string) =>
+      whyUnmatched(
+        cardLink({ machine: { id: "m1", label: "tower", originRead: true, originNote } }),
+      );
+
+    expect(on("not-a-repository")).toContain("not a git repository on tower");
+    expect(on("gone")).toContain("no longer there on tower");
+    expect(on("no-git")).toContain("has no git installed");
+    expect(on("no-remote")).toContain("has no git remote on tower");
+    for (const note of ["not-a-repository", "gone", "no-git", "no-remote"]) {
+      expect(on(note)).not.toContain("try again once the server is reachable");
+    }
+  });
+
+  // An answer a newer backend knows and this build does not must still reach the user.
+  it("passes an unknown answer through rather than dressing it up", () => {
+    const said = whyUnmatched(
+      cardLink({
+        machine: { id: "m1", label: "tower", originRead: true, originNote: "permission-denied" },
+      }),
+    );
+    expect(said).toContain("permission-denied");
+    expect(said).toContain("tower");
   });
 
   it("keeps the local answers it already gave", () => {

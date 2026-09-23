@@ -35,7 +35,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// A single schema migration: a forward, data-preserving step. It receives the
@@ -72,6 +72,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v13,
     migrate_v14,
     migrate_v15,
+    migrate_v16,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -540,6 +541,30 @@ fn migrate_v15(conn: &Connection) -> rusqlite::Result<()> {
         "repos",
         "remote_origin_probed_at",
         "ALTER TABLE repos ADD COLUMN remote_origin_probed_at INTEGER",
+    )
+}
+
+/// v16 — WHAT the server answered, when it did not hand over a url.
+///
+/// v15 kept two states ("never looked" / "looked, here is the url or the absence of
+/// one"), and the sweep threw away everything else: a folder that is not a repository
+/// over there, one whose directory is gone, a server with no `git` at all. Those are
+/// FIRM answers, and dropping them left `remote_origin_probed_at` NULL — the field that
+/// means "we could not ask". The card then blamed the server's reachability for a
+/// folder the server had answered about perfectly well, and offered "try again once the
+/// server is reachable", advice that could never work.
+///
+/// So this column carries the answer itself, verbatim and small: `no-remote`,
+/// `not-a-repository`, `gone`, `no-git`, or NULL when a url WAS read. `probed_at` is now
+/// stamped for every one of them — it means "we asked", which is true in all these
+/// cases — while `remote_origin_url` is left untouched by the non-url answers, so an
+/// unmounted folder does not lose the url it had.
+fn migrate_v16(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "repos",
+        "remote_origin_note",
+        "ALTER TABLE repos ADD COLUMN remote_origin_note TEXT",
     )
 }
 
@@ -1257,7 +1282,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT r.id, r.path, r.tosse_repository_id, r.machine_id, m.label,
-                    r.remote_origin_url, r.remote_origin_probed_at
+                    r.remote_origin_url, r.remote_origin_probed_at, r.remote_origin_note
              FROM repos r LEFT JOIN machines m ON m.id = r.machine_id
              ORDER BY r.added_at ASC",
         )?;
@@ -1271,6 +1296,7 @@ impl Store {
                     machine_label: row.get(4)?,
                     remote_origin_url: row.get(5)?,
                     remote_origin_probed_at: row.get(6)?,
+                    remote_origin_note: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1283,9 +1309,17 @@ impl Store {
     /// timestamp is written on both outcomes: it is the field that says we looked, and
     /// without it a repo with no origin would be re-probed on every single load.
     ///
-    /// Returns whether the stored url actually CHANGED, so the caller can skip telling
-    /// the UI to refetch when nothing moved — the common case, since a repo's origin is
-    /// set once and then never again.
+    /// `note` carries a firm answer that is not a url (`no-remote`, `not-a-repository`,
+    /// `gone`, `no-git`) so the UI can name the real situation instead of inferring one;
+    /// `None` alongside a `Some(url)` means the url IS the answer. See [`migrate_v16`].
+    ///
+    /// Returns whether the folder's VISIBLE state changed — a moved url, a different
+    /// answer, or the very first time this folder was ever probed. Not just "the url
+    /// moved": a first sweep that finds no origin leaves the url at `None` while flipping
+    /// `origin_read` from false to true, which is precisely the transition that takes
+    /// "the server could not be reached" off the card. Reporting that as "nothing
+    /// changed" left the wrong sentence on screen until something else happened to
+    /// refetch.
     ///
     /// ⚠️ Like [`Self::set_repo_tosse_link`], the only writer of these columns, and kept
     /// out of `RepoRecord`: `upsert_repo` rewrites that record wholesale from callers
@@ -1295,22 +1329,46 @@ impl Store {
         &self,
         repo_id: &str,
         url: Option<&str>,
+        note: Option<&str>,
         now_ms: i64,
     ) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let before: Option<String> = conn
+        let before: Option<(Option<String>, Option<i64>, Option<String>)> = conn
             .query_row(
-                "SELECT remote_origin_url FROM repos WHERE id = ?1",
+                "SELECT remote_origin_url, remote_origin_probed_at, remote_origin_note
+                   FROM repos WHERE id = ?1",
                 params![repo_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()?
-            .flatten();
-        conn.execute(
-            "UPDATE repos SET remote_origin_url = ?2, remote_origin_probed_at = ?3 WHERE id = ?1",
-            params![repo_id, url, now_ms],
-        )?;
-        Ok(before.as_deref() != url)
+            .optional()?;
+        let (before_url, before_probed, before_note) = before.unwrap_or((None, None, None));
+        // A non-url answer leaves the cached url ALONE: a folder that is unmounted right
+        // now still has the origin it had, and blanking it would un-match a repository
+        // for a reason that has nothing to do with its remote.
+        match url {
+            Some(_) => conn.execute(
+                "UPDATE repos SET remote_origin_url = ?2, remote_origin_probed_at = ?3,
+                                  remote_origin_note = ?4
+                   WHERE id = ?1",
+                params![repo_id, url, now_ms, note],
+            )?,
+            None if note.is_some() => conn.execute(
+                "UPDATE repos SET remote_origin_probed_at = ?2, remote_origin_note = ?3
+                   WHERE id = ?1",
+                params![repo_id, now_ms, note],
+            )?,
+            // "The server answered, and this folder genuinely has no origin" — the one
+            // case that clears a cached url, because it IS a statement about the remote.
+            None => conn.execute(
+                "UPDATE repos SET remote_origin_url = NULL, remote_origin_probed_at = ?2,
+                                  remote_origin_note = ?3
+                   WHERE id = ?1",
+                params![repo_id, now_ms, note],
+            )?,
+        };
+        let url_moved = url.is_some() && before_url.as_deref() != url;
+        let cleared = url.is_none() && note.is_none() && before_url.is_some();
+        Ok(url_moved || cleared || before_probed.is_none() || before_note.as_deref() != note)
     }
 
     /// Pin a repo to a TOSSE repository, or clear the pin with `None`.
@@ -2949,31 +3007,80 @@ mod tests {
         assert_eq!(never.remote_origin_probed_at, None);
 
         let url = "https://github.com/Alex375/FlightDeck.git";
-        assert!(store.set_repo_remote_origin("r1", Some(url), 1_000).unwrap(), "first read moved it");
+        assert!(
+            store.set_repo_remote_origin("r1", Some(url), None, 1_000).unwrap(),
+            "first read moved it"
+        );
         let got = &store.repo_tosse_links().unwrap()[0];
         assert_eq!(got.remote_origin_url.as_deref(), Some(url));
         assert_eq!(got.remote_origin_probed_at, Some(1_000));
 
         // The common case: the server confirms what we already knew. Reporting "changed"
         // here would make the UI refetch on every single sweep, forever.
-        assert!(!store.set_repo_remote_origin("r1", Some(url), 2_000).unwrap());
+        assert!(!store.set_repo_remote_origin("r1", Some(url), None, 2_000).unwrap());
 
         // Asked, and this repo has no origin: url null, timestamp SET. Reading only the
         // url would send us back to the server on every load for a settled answer.
-        assert!(store.set_repo_remote_origin("r1", None, 3_000).unwrap());
+        assert!(store.set_repo_remote_origin("r1", None, None, 3_000).unwrap());
         let cleared = &store.repo_tosse_links().unwrap()[0];
         assert_eq!(cleared.remote_origin_url, None);
         assert_eq!(cleared.remote_origin_probed_at, Some(3_000));
 
         // ⚠️ The regression the column shape is chosen to avoid: re-upserting the repo
         // (rename, undo, a path fix) knows nothing about origins and must not blank one.
-        store.set_repo_remote_origin("r1", Some(url), 4_000).unwrap();
+        store.set_repo_remote_origin("r1", Some(url), None, 4_000).unwrap();
         store.upsert_repo(&repo_at("r1", 1)).unwrap();
         assert_eq!(
             store.repo_tosse_links().unwrap()[0].remote_origin_url.as_deref(),
             Some(url),
             "upsert_repo must not clear a cache it knows nothing about"
         );
+    }
+
+    /// ⚠️ A first probe that finds no origin leaves the url at `None` on both sides —
+    /// but it flips `origin_read` false → true, which is exactly what takes "the server
+    /// could not be reached" off the card. Reporting "nothing changed" for it left that
+    /// wrong sentence on screen until something unrelated happened to refetch.
+    #[test]
+    fn a_first_probe_reports_a_change_even_when_it_finds_no_origin() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo_at("r1", 1)).unwrap();
+        assert!(
+            store.set_repo_remote_origin("r1", None, None, 1_000).unwrap(),
+            "the very first answer is always a change: the folder stops being 'never asked'"
+        );
+        // The second identical answer genuinely changes nothing.
+        assert!(!store.set_repo_remote_origin("r1", None, None, 2_000).unwrap());
+    }
+
+    /// The three firm answers that are NOT a url. They must stamp "we asked" — otherwise
+    /// the UI reads them as "we could not ask" and blames the server — while leaving the
+    /// cached url alone, so a folder that is merely unmounted keeps the origin it had.
+    #[test]
+    fn a_firm_non_url_answer_is_recorded_without_losing_the_cached_url() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo_at("r1", 1)).unwrap();
+        let url = "https://github.com/Alex375/FlightDeck.git";
+        store.set_repo_remote_origin("r1", Some(url), None, 1_000).unwrap();
+
+        assert!(store.set_repo_remote_origin("r1", None, Some("gone"), 2_000).unwrap());
+        let row = &store.repo_tosse_links().unwrap()[0];
+        assert_eq!(row.remote_origin_note.as_deref(), Some("gone"));
+        assert_eq!(row.remote_origin_probed_at, Some(2_000), "we DID ask, and got an answer");
+        assert_eq!(
+            row.remote_origin_url.as_deref(),
+            Some(url),
+            "an unmounted folder keeps the origin it had — it has not moved, it is absent"
+        );
+
+        // Same answer twice in a row is not a change.
+        assert!(!store.set_repo_remote_origin("r1", None, Some("gone"), 3_000).unwrap());
+        // A different answer is.
+        assert!(store.set_repo_remote_origin("r1", None, Some("not-a-repository"), 4_000).unwrap());
+
+        // Back to a url: the note clears, so nothing keeps saying the folder is gone.
+        assert!(store.set_repo_remote_origin("r1", Some(url), None, 5_000).unwrap());
+        assert_eq!(store.repo_tosse_links().unwrap()[0].remote_origin_note, None);
     }
 
     #[test]

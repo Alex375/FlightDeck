@@ -31,7 +31,9 @@ import { useAccountsLoggedOut } from "../../ipc/useAccounts";
 import { isUnreachable, useMachineHealth } from "../../store/machineHealth";
 import { useSettingsUi } from "../../store/settingsUi";
 import { Ico } from "../../ui/kit";
-import { ComposerStatusBand } from "./ComposerStatusBand";
+import { ComposerStatusBand, useMarkSeenShortcut } from "./ComposerStatusBand";
+import { useAgentStatus } from "../../agent/useAgentStatus";
+import { isDismissable } from "../../agent/status";
 
 /** One band: the shared shape every warning here renders as, so they cannot drift apart.
  *  Same grammar as `ComposerStatusBand` — icon · label · detail · action. */
@@ -105,6 +107,12 @@ export function ComposerBand({ session }: { session: string }) {
   const loggedOut = useAccountsLoggedOut(claudeAvailable, codexAvailable);
   const down = useUnreachableServer(session);
   const openSettings = useSettingsUi((s) => s.openSettings);
+  // ⚠️ Armed HERE, before the branches, so the acknowledge chord survives whichever band
+  // wins. It used to live inside `ComposerStatusBand`, which a warning band REPLACES — so
+  // with a red band on screen ⌘↵ fell through to the composer and SENT the draft, which
+  // then failed for the very reason the band was warning about. The status the chord acts
+  // on is the same one `ComposerStatusBand` reads; only the mounting point changed.
+  useMarkSeenShortcut(session, isDismissable(useAgentStatus(session)));
 
   const name = kind === "codex" ? "Codex" : "Claude";
   const toAccounts = () => openSettings("general", "accounts");

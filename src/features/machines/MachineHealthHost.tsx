@@ -70,6 +70,13 @@ export function MachineHealthHost() {
       // the window is handled by the visibility listener below, which probes at once
       // instead of making the user wait out the rest of the period.
       if (typeof document !== "undefined" && document.hidden) return;
+      // Drop the previous round's handles before queueing this one — otherwise `timers`
+      // grows by one entry per machine per sweep for the whole life of the effect (hours,
+      // every 60s), and the unmount cleanup walks thousands of long-dead ids. Cancelling
+      // any stragglers is the right call anyway: a staggered probe still pending when the
+      // next sweep starts is one this sweep is about to redo, and `probeMachine` dedupes.
+      for (const t of timers) clearTimeout(t);
+      timers.length = 0;
       ids.forEach((id, i) => {
         timers.push(
           setTimeout(() => {

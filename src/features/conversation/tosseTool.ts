@@ -28,6 +28,7 @@ import type { SessionEntry } from "../../store/types";
 import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
 import { parseMcpToolName } from "../../agent/toolNames";
+import { canonicalTosseTaskId } from "../tosse/taskId";
 
 /**
  * What a TOSSE call is ABOUT, which picks the card:
@@ -328,6 +329,15 @@ export interface TosseCardView {
   /** Where the task stands AFTER this call — from the CRM's answer, or (while that answer is
    *  still on its way) the status the agent asked for. Null when the call carries no status. */
   statusTo: string | null;
+  /** Did THIS call carry a status change?
+   *
+   *  ⚠️ `statusTo` alone does not say so: the CRM echoes the whole task back after ANY write,
+   *  so a title edit lands here with the status it already had. The card's arrow means "this
+   *  call moved the task", and `previousStatus` is merely the last status this thread SIGHTED
+   *  — a move made in Flight Deck's own TOSSE view, or by a sub-agent, leaves no MCP call in
+   *  the thread. Without this flag, the next unrelated write drew an arrow for a transition it
+   *  had nothing to do with. */
+  movedStatus: boolean;
   /** Present only for the task family, and only for what the payload actually carried. */
   task: TosseTaskInfo | null;
   /** The task the card links to, when we have an id to link with. */
@@ -357,11 +367,19 @@ const ID_KEYS = new Set([
   "release_note_id",
 ]);
 
-function changedFields(input: JsonValue): string[] {
+/** The identifiers of an `update_*` call: the row it names. Everything else it carries is a
+ *  FIELD being written — including `project_id`, which on `update_task` is what moves a task
+ *  from one project to another. Stripping it globally made that move invisible: the card
+ *  whose whole job is to say what changed showed nothing at all, indistinguishable from a
+ *  no-op. On a `create_*`, `project_id` names the destination and is not a change. */
+const UPDATE_ID_KEYS = new Set(["task_id", "parent_task_id", "entity_id", "entity_type"]);
+
+function changedFields(input: JsonValue, tool: string): string[] {
   const obj = asObject(input);
   if (!obj) return [];
+  const ids = tool.startsWith("update_") ? UPDATE_ID_KEYS : ID_KEYS;
   return Object.keys(obj)
-    .filter((k) => !ID_KEYS.has(k))
+    .filter((k) => !ids.has(k))
     .map((k) => k.replace(/_+/g, " "));
 }
 
@@ -399,8 +417,16 @@ export function tosseCardView(
 
   if (action.family === "task") {
     const task = parseTosseTaskResult(content);
-    const headline = task?.title ?? field(input, "title")?.trim() ?? toolPhrase(tool);
-    const taskId = task?.id ?? field(input, "task_id") ?? field(input, "parent_task_id") ?? null;
+    // ⚠️ `??` only catches null/undefined, so a title of "" or "   " fell straight through
+    // `.trim()` and became the headline — a card with no headline at all. The empty string
+    // must fall back like an absent one.
+    const headline = task?.title?.trim() || field(input, "title")?.trim() || toolPhrase(tool);
+    // An id that reaches a CRM URL. Anything but a canonical UUID is refused here: the id
+    // comes from the agent's own tool input, which a prompt injection can dictate, and the
+    // browser fallback builds `<origin>/tasks/<id>` — where `../admin/…` normalises out of
+    // the `/tasks/` path entirely. Not clickable beats clickable somewhere else.
+    const rawTaskId = task?.id ?? field(input, "task_id") ?? field(input, "parent_task_id") ?? null;
+    const taskId = canonicalTosseTaskId(rawTaskId);
     // Where the task stands now. The CRM's answer wins; while it is still on its way, the status
     // the agent ASKED for stands in, so a move in flight already reads as the move it is.
     const statusTo = task?.status ?? (tool === "update_task_status" ? field(input, "status") ?? null : null);
@@ -411,9 +437,11 @@ export function tosseCardView(
       tool === "update_task_status"
         ? null
         : tool === "update_task"
-          ? (changedFields(input).join(", ") || null)
+          ? (changedFields(input, tool).join(", ") || null)
           : (task?.project ?? null);
-    return { family: "task", action, tool, headline, detail, statusTo, task, taskId };
+    const movedStatus =
+      tool === "update_task_status" || (tool.startsWith("update_") && field(input, "status") != null);
+    return { family: "task", action, tool, headline, detail, statusTo, movedStatus, task, taskId };
   }
 
   if (action.family === "context") {
@@ -426,6 +454,7 @@ export function tosseCardView(
       headline: named ?? (level ? `${level} context` : toolPhrase(tool)),
       detail: level,
       statusTo: null,
+      movedStatus: false,
       task: null,
       taskId: null,
     };
@@ -438,6 +467,7 @@ export function tosseCardView(
     headline: entityName(input, content) ?? toolPhrase(tool),
     detail: null,
     statusTo: null,
+    movedStatus: false,
     task: null,
     taskId: null,
   };

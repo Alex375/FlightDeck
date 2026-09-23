@@ -378,6 +378,16 @@ pub struct RepoTosseLink {
     /// both `None` is "never asked". Collapsing the two re-probes a repo forever and
     /// lets the UI state a verdict it never obtained.
     pub remote_origin_probed_at: Option<i64>,
+    /// The server's answer when it was NOT a url — `no-remote`, `not-a-repository`,
+    /// `gone`, `no-git` — and `None` when a url was read (or nothing was ever asked).
+    ///
+    /// ⚠️ These four are a fact about the FOLDER, obtained from a server that answered
+    /// perfectly well. Dropping them (as the sweep first did) left `probed_at` NULL,
+    /// which means "we could not ask" — so the card blamed the server for something it
+    /// had just told us. A string, not an enum, because the front only ever shows it:
+    /// an answer this app does not know yet must reach the user, not be swallowed by a
+    /// deserializer.
+    pub remote_origin_note: Option<String>,
 }
 
 /// A TOSSE project pinned to one of the app's local folders.

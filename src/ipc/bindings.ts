@@ -613,13 +613,12 @@ async tosseRepoLinks() : Promise<Result<TosseRepoLinksPayload, string>> {
  * round trip per server does not belong there. It runs beside it and, when something
  * actually changed, the front refetches.
  * 
- * Returns whether any cached url MOVED, so a run that confirms what we already knew —
- * the overwhelmingly common one, since a repository's origin is set once — costs the UI
- * nothing. Never returns `Err` for an unreachable server: that is the server's state,
- * not a failure of this call, and turning it into one would resurrect exactly the false
- * alarm the machine-aware probe removed.
+ * Reports what the sweep did — see [`RemoteOriginSweep`]. Never returns `Err` for an
+ * unreachable server: that is the server's state, not a failure of this call, and
+ * turning it into one would resurrect exactly the false alarm the machine-aware probe
+ * removed.
  */
-async tosseProbeRemoteOrigins() : Promise<Result<boolean, string>> {
+async tosseProbeRemoteOrigins() : Promise<Result<RemoteOriginSweep, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("tosse_probe_remote_origins") };
 } catch (e) {
@@ -4794,6 +4793,18 @@ pairing_code: string | null }
  */
 export type RemoteListing = { path: string; dirs: string[] }
 /**
+ * What one run of [`tosse_probe_remote_origins`] did.
+ * 
+ * Three facts, deliberately not collapsed into the single `bool` this used to be:
+ * - `changed` — a folder's visible state moved (a url, an answer, or the first probe
+ * ever), so the UI should refetch;
+ * - `skipped` — the sweep never ran (another one held the lock). NOT the same as
+ * "nothing changed", and the caller must not treat it as a verdict;
+ * - `write_errors` — answers that were obtained and then LOST on the way to SQLite,
+ * verbatim. Silence here would turn a broken database into "Refresh does nothing".
+ */
+export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeErrors: string[] }
+/**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
@@ -5759,7 +5770,18 @@ label: string | null;
  * (never swept, or the server is off) from "we asked, and this folder has no
  * origin". Both show no url; only the second is a fact about the folder.
  */
-originRead: boolean }
+originRead: boolean; 
+/**
+ * What the server answered when it did not hand over a url — `no-remote`,
+ * `not-a-repository`, `gone`, `no-git` — and `None` when a url WAS read.
+ * 
+ * The third state `origin_read` alone cannot express. "We asked and got an answer"
+ * (`origin_read: true`) covers both "this folder has no origin" and "this folder is
+ * not a repository over there", which call for different sentences — and the UI was
+ * inferring the first from the absence of the second. Passed through verbatim, never
+ * matched on in Rust.
+ */
+originNote: string | null }
 /**
  * A repository as TOSSE knows it.
  * 

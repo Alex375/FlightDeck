@@ -249,9 +249,23 @@ export function normalize(raw: unknown): ModelPrefsData {
   const o = raw as Partial<ModelPrefsData>;
   const known = (v: unknown, fallback: string, backend: BackendKind): string =>
     typeof v === "string" && modelOption(v)?.backend === backend ? v : fallback;
+  // ⚠️ Codex's catalogue is what the INSTALLED BINARY offers (`model/list`), not the
+  // static list — that one is only a guess for a binary we have not asked yet. Validating
+  // a stored Codex default against it threw away every default the user picked from the
+  // live list: `gpt-6-luna` is unknown here, so each launch silently reset them to the
+  // factory model. So an id the static catalogue does not know is KEPT, and
+  // `effectiveDefaultModel` does the real arbitration once the binary has answered — it
+  // already falls back to the binary's own default for an id that is not offered.
+  // An id the catalogue knows as the OTHER backend's is still refused: that is a corrupt
+  // blob, not a newer model.
+  const codexish = (v: unknown, fallback: string): string => {
+    if (typeof v !== "string" || !v) return fallback;
+    const opt = modelOption(v);
+    return !opt || opt.backend === "codex" ? v : fallback;
+  };
   const model = {
     claude: known(o.claudeModel, base.claudeModel, "claude"),
-    codex: known(o.codexModel, base.codexModel, "codex"),
+    codex: codexish(o.codexModel, base.codexModel),
   };
   // `hidden` is only seeded when absent: an EMPTY stored array means the user showed
   // everything, which must not be re-seeded with the factory hiding on next launch.
@@ -331,7 +345,11 @@ export const useModelPrefs = create<ModelPrefsState>((set, get) => ({
 
   setDefaultEffort: (backend, effort) => {
     const key = backend === "codex" ? "codexEffort" : "claudeEffort";
-    const model = backend === "codex" ? get().codexModel : get().claudeModel;
+    // ⚠️ Clamped against the model the row OFFERED the ladder of — the effective one —
+    // not the stored id. The Settings picker lists `effectiveDefaultModel`'s rungs, so
+    // clamping against a stored id with a shorter ladder silently downgraded the pick:
+    // choose "Ultra", get `max` stored and displayed, with nothing saying why.
+    const model = effectiveDefaultModel(get(), backend);
     set({ [key]: clampEffort(effort, model) } as Partial<ModelPrefsState>);
     persist(get());
   },
@@ -377,7 +395,12 @@ function repairDefaults(
   const patch: Partial<ModelPrefsData> = {};
   for (const backend of ["claude", "codex"] as const) {
     const key = backend === "codex" ? "codexModel" : "claudeModel";
-    if (!s.hidden.includes(s[key])) continue;
+    // ⚠️ The EFFECTIVE default, not the stored id. For Codex they differ whenever the
+    // stored one is not in the installed binary's list: hiding the model the app actually
+    // resolves to left every new conversation seeded on the model the user had just
+    // removed from the picker, and the Defaults row showed it under its raw id.
+    const current = effectiveDefaultModel(s, backend);
+    if (!s.hidden.includes(current)) continue;
     const fallback = fallbackModel(backend, s.hidden);
     if (fallback) patch[key] = fallback;
   }

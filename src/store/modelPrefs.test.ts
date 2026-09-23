@@ -123,6 +123,28 @@ describe("the live Codex list", () => {
     offer(["gpt-5.5"], "gpt-5.5"); // tops out at xhigh
     expect(defaultEffortFor("codex")).toBe("xhigh");
   });
+
+  // ⚠️ The Settings row offers the EFFECTIVE model's ladder, so the pick must be clamped
+  // against that same model. Clamping against the STORED id silently downgraded it: the
+  // row showed "gpt-5.6-sol" and its Ultra rung, the user picked Ultra, and `max` was
+  // stored and displayed — an unselectable rung, with nothing saying why.
+  it("keeps an effort the offered model accepts, even when the stored id is older", () => {
+    useModelPrefs.setState({ codexModel: "gpt-6-luna" }); // unknown ladder → tops at xhigh
+    offer(V144, "gpt-5.6-sol"); // the effective model reaches `ultra`
+    useModelPrefs.getState().setDefaultEffort("codex", "ultra");
+    expect(defaultEffortFor("codex")).toBe("ultra");
+  });
+
+  // ⚠️ Hiding the model the app actually RESOLVES to used to go unrepaired: the guard
+  // tested the stored id, which was not the hidden one, so every new Codex conversation
+  // kept starting on the model the user had just removed from the picker.
+  it("moves the default off the offered model the user hides", () => {
+    useModelPrefs.setState({ codexModel: "gpt-6-astra" }); // not offered by this binary
+    offer(V144, "gpt-5.6-sol");
+    expect(defaultModelFor("codex")).toBe("gpt-5.6-sol");
+    useModelPrefs.getState().setHidden("gpt-5.6-sol", true);
+    expect(defaultModelFor("codex")).not.toBe("gpt-5.6-sol");
+  });
 });
 
 describe("models the user has never seen get the factory treatment", () => {
@@ -219,10 +241,28 @@ describe("normalize (what a stored blob is allowed to say)", () => {
     expect([...legacy].sort()).toEqual(["claude-fable-5", "claude-mythos-5-1", "claude-opus-5"]);
   });
 
-  it("falls back to the factory default when the stored model is unknown to this version", () => {
-    const p = normalize({ claudeModel: "claude-opus-9-9", codexModel: "gpt-nope" });
-    expect(p.claudeModel).toBe(FACTORY_DEFAULTS.claudeModel);
-    expect(p.codexModel).toBe(FACTORY_DEFAULTS.codexModel);
+  it("falls back to the factory default when the stored CLAUDE model is unknown", () => {
+    // Claude's catalogue is static and curated here, so an id it does not know is an
+    // outdated or hand-edited blob — seeding conversations with it would just be refused.
+    expect(normalize({ claudeModel: "claude-opus-9-9" }).claudeModel).toBe(
+      FACTORY_DEFAULTS.claudeModel,
+    );
+  });
+
+  // ⚠️ The opposite rule for Codex, and the bug it fixes: Codex's real catalogue is what
+  // the INSTALLED BINARY offers, and the static list is only a guess for a binary we have
+  // not asked yet. Validating against it discarded every default picked from the live
+  // list — a user on `gpt-6-luna` was silently put back on the factory model at each
+  // launch, with nothing saying so.
+  it("keeps a stored CODEX model the static catalogue does not know", () => {
+    expect(normalize({ codexModel: "gpt-6-luna" }).codexModel).toBe("gpt-6-luna");
+  });
+
+  it("still refuses a stored Codex model the catalogue knows as a CLAUDE one", () => {
+    // A corrupt blob, not a newer model — and it would be rejected by the binary.
+    expect(normalize({ codexModel: FACTORY_DEFAULTS.claudeModel }).codexModel).toBe(
+      FACTORY_DEFAULTS.codexModel,
+    );
   });
 
   it("refuses a default from the WRONG backend (a Claude alias would be rejected by Codex)", () => {

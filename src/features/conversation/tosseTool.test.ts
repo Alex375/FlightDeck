@@ -223,10 +223,74 @@ describe("the card view", () => {
 
     // A failed archive has no payload to name the task from. "Task archived" would assert
     // exactly the thing that did not happen, so the headline states the attempt instead.
-    const failed = tosseCardView("mcp__claude_ai_TOSSE__archive_task", { task_id: "x" }, undefined);
+    const id = "8d82cff2-0bc0-4cd4-a5a6-a789eff3f0e4";
+    const failed = tosseCardView("mcp__claude_ai_TOSSE__archive_task", { task_id: id }, undefined);
     expect(failed.headline).toBe("Archive task");
     // …and it still knows WHICH task, so the card can link to it.
-    expect(failed.taskId).toBe("x");
+    expect(failed.taskId).toBe(id);
+  });
+
+  // ⚠️ The id comes from the agent's own tool input, which a prompt injection can dictate,
+  // and the card's browser fallback concatenates it into `<origin>/tasks/<id>` — where
+  // `../admin/…` normalises straight out of the tasks path. Not clickable beats clickable
+  // somewhere else, so anything but a canonical UUID yields no link at all.
+  it("refuses a task id that is not a canonical UUID, so it can never become a URL", () => {
+    const traversal = tosseCardView(
+      "mcp__claude_ai_TOSSE__update_task_status",
+      { task_id: "../admin/users/deactivate?id=42", status: "En cours" },
+      undefined,
+    );
+    expect(traversal.taskId).toBeNull();
+    // The card still renders — it simply does not offer a link.
+    expect(traversal.headline).toBe("Update task status");
+    expect(tosseCardView("mcp__claude_ai_TOSSE__archive_task", { task_id: "x" }, undefined).taskId).toBeNull();
+    // Case is normalised, so the same task is the same id everywhere.
+    expect(
+      tosseCardView(
+        "mcp__claude_ai_TOSSE__archive_task",
+        { task_id: "8D82CFF2-0BC0-4CD4-A5A6-A789EFF3F0E4" },
+        undefined,
+      ).taskId,
+    ).toBe("8d82cff2-0bc0-4cd4-a5a6-a789eff3f0e4");
+  });
+
+  // ⚠️ `??` only catches null/undefined: an empty or blank title fell through `.trim()`
+  // and became the headline, leaving the card with no first line at all.
+  it("falls back to the action when the title is blank", () => {
+    const v = tosseCardView("mcp__claude_ai_TOSSE__create_task", { title: "   " }, undefined);
+    expect(v.headline).toBe("Create task");
+  });
+
+  // ⚠️ On an `update_task`, `project_id` is not an identifier — it is the field that moves
+  // the task to another project, and it was filtered out with the real ids, leaving the
+  // card blank on the only change the call made.
+  it("names a project move as the change it is", () => {
+    const v = tosseCardView(
+      "mcp__claude_ai_TOSSE__update_task",
+      { task_id: "8d82cff2-0bc0-4cd4-a5a6-a789eff3f0e4", project_id: "ef02be22-fe30-4463-9450-ec3b20746a35" },
+      undefined,
+    );
+    expect(v.detail).toBe("project id");
+    // A creation is the opposite: `project_id` names the destination, not a change.
+    expect(tosseCardView("mcp__claude_ai_TOSSE__create_task", { title: "T", project_id: "p" }, undefined).detail)
+      .not.toBe("project id");
+  });
+
+  // ⚠️ The CRM echoes the WHOLE task back after any write, so a title edit arrives carrying
+  // the status it already had. Only a call that actually carried a status may claim a move.
+  it("claims a status move only for the call that carried one", () => {
+    const moved = tosseCardView(
+      "mcp__claude_ai_TOSSE__update_task_status",
+      { task_id: "8d82cff2-0bc0-4cd4-a5a6-a789eff3f0e4", status: "En cours" },
+      undefined,
+    );
+    expect(moved.movedStatus).toBe(true);
+    const renamed = tosseCardView(
+      "mcp__claude_ai_TOSSE__update_task",
+      { task_id: "8d82cff2-0bc0-4cd4-a5a6-a789eff3f0e4", title: "New title" },
+      undefined,
+    );
+    expect(renamed.movedStatus).toBe(false);
   });
 });
 

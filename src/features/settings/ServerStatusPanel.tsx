@@ -143,6 +143,15 @@ export function ServerStatusPanel({
   const [diagnosis, setDiagnosis] = useState<ServerDiagnosis | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Orders the three producers of a diagnosis for THIS card — the mount effect, Refresh
+  // (which "Retry" drives through `recheckToken`) and a repair. They overlap routinely:
+  // the mount probe is bounded at 20s against a dead server, and Retry is clickable
+  // while it is still in flight. Whoever answered LAST used to win, so a slow
+  // "unreachable" landed on top of the fresh "ready" the user had just asked for. Each
+  // producer takes a ticket before its round trip and only writes if it still holds the
+  // latest one. Its `startedAtMs` twin does the same job inside the health store, for
+  // the surfaces outside this card.
+  const diagGen = useRef(0);
   // Set on a FAILED `machine_diagnose` (initial load or Refresh) — never silently
   // dropped: with no `diagnosis` yet this is the only thing standing between the
   // card and a blank space below the server's name/address row, and even once a
@@ -178,23 +187,34 @@ export function ServerStatusPanel({
   // stale local snapshot.
   useEffect(() => {
     let disposed = false;
+    const mine = ++diagGen.current;
+    const startedAtMs = Date.now();
     setLoading(true);
     setDiagError(null);
     void commands.machineDiagnose(machine.id).then(
       (res) => {
+        // Every diagnosis this panel pays for is also the freshest answer the remote
+        // MARK could have — file it, so opening Settings clears a stale "unreachable"
+        // badge (and sets one) without a second round trip. See `store/machineHealth`.
+        //
+        // Filed BEFORE the `disposed` gate on purpose: a verdict is a fact about the
+        // machine, not about this card, and closing Settings while the round trip is in
+        // flight used to throw away an answer the whole app was waiting for. The store
+        // applies its own staleness rule, so this cannot overwrite a fresher one.
+        if (res.status === "ok") useMachineHealthStore.getState().record(machine.id, res.data, startedAtMs);
         if (disposed) return;
+        // `loading` belongs to THIS request, so it clears even when a newer probe has
+        // since taken over the content — otherwise the card would read "Checking…" for
+        // ever behind an answer that already landed.
         setLoading(false);
-        if (res.status === "ok") {
-          setDiagnosis(res.data);
-          // Every diagnosis this panel pays for is also the freshest answer the remote
-          // MARK could have — file it, so opening Settings clears a stale "unreachable"
-          // badge (and sets one) without a second round trip. See `store/machineHealth`.
-          useMachineHealthStore.getState().record(machine.id, res.data);
-        } else setDiagError(res.error);
+        if (mine !== diagGen.current) return;
+        if (res.status === "ok") setDiagnosis(res.data);
+        else setDiagError(res.error);
       },
       (e: unknown) => {
         if (disposed) return;
         setLoading(false);
+        if (mine !== diagGen.current) return;
         setDiagError(e instanceof Error ? e.message : String(e));
       },
     );
@@ -204,17 +224,21 @@ export function ServerStatusPanel({
   }, [machine.id]);
 
   const refresh = useCallback(async () => {
+    const mine = ++diagGen.current;
+    const startedAtMs = Date.now();
     setRefreshing(true);
     try {
       const res = await commands.machineDiagnose(machine.id);
+      if (res.status === "ok") useMachineHealthStore.getState().record(machine.id, res.data, startedAtMs);
+      if (mine !== diagGen.current) return;
       if (res.status === "ok") {
         setDiagnosis(res.data);
-        useMachineHealthStore.getState().record(machine.id, res.data);
         setDiagError(null);
       } else {
         setDiagError(res.error);
       }
     } catch (e) {
+      if (mine !== diagGen.current) return;
       setDiagError(e instanceof Error ? e.message : String(e));
     } finally {
       setRefreshing(false);
@@ -234,15 +258,18 @@ export function ServerStatusPanel({
 
   const runRepair = useCallback(
     async (action: RepairAction, password: string | null) => {
+      const mine = ++diagGen.current;
+      const startedAtMs = Date.now();
       setRepairBusy(action);
       setRepairError(null);
       const res = await commands.machineRepair(machine.id, action, password);
       setRepairBusy(null);
+      if (mine !== diagGen.current) return;
       if (res.status === "ok") {
         setDiagnosis(res.data.diagnosis);
         // A repair carries its own FRESH diagnosis — the badge must follow it, or a
         // machine the user just fixed would stay red until the next poll.
-        useMachineHealthStore.getState().record(machine.id, res.data.diagnosis);
+        useMachineHealthStore.getState().record(machine.id, res.data.diagnosis, startedAtMs);
         setRepairSudoAction(null);
         setRepairSudoPassword("");
       } else if (isSudoPasswordError(res.error)) {
