@@ -99,6 +99,14 @@ pub struct CanUseToolReq {
     pub blocked_path: Option<String>,
     #[serde(default)]
     pub decision_reason: Value,
+    /// Why the CLI asks (`rule`, `mode`, `classifier`, `safetyCheck`, …) — `rule` = an
+    /// `ask` rule from a settings file matched. Decides whether Flight Deck may answer it
+    /// on the user's standing "Allow" (see the session's `auto_allow`).
+    #[serde(default)]
+    pub decision_reason_type: Option<String>,
+    /// The tool itself demands a human (an MCP consent step): never answered for them.
+    #[serde(default)]
+    pub requires_user_interaction: Option<bool>,
 }
 
 /// Parse an inbound `control_request` line (already deserialized to a [`Value`]

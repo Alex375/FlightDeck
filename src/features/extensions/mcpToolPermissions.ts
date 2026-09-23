@@ -16,9 +16,12 @@
 //     Claude Code's own `enabledPlugins` in ~/.claude/settings.json).
 // Within one level a tool's own setting beats its server's; across levels the narrowest wins.
 //
-// Claude Code's settings FILES keep applying underneath ("external" rules here): Claude
-// enforces them itself, deny > ask > allow, so an external deny/ask can't be loosened from
-// Flight Deck — the rows say so, and the global view offers to remove such a rule.
+// Claude Code's own settings FILES are the BASELINE — what "Default" means below Global.
+// Whatever Flight Deck sets overrides them wherever the CLI lets it: a file `ask` is
+// answered for the user when Flight Deck says Allow (the session's auto-allow), and a
+// Flight Deck deny/ask always wins natively. Only a file `deny` (the tool never reaches
+// the app) and the organization's policy can't be overridden — those choices are simply
+// not offered.
 import type { McpToolInfo, PermissionRule, SessionOverrides, ToolRuleKind } from "../../ipc/client";
 
 /** A level of the cascade — what the panel's scope picker selects. */
@@ -80,15 +83,21 @@ export type ToolChoice = "default" | ToolRuleKind;
 
 export const TOOL_CHOICES: readonly ToolChoice[] = ["default", "allow", "ask", "deny"];
 
-/** Where a value comes from: a level, and whether the tool's own setting or its server's. */
+/** Where a value comes from: a Flight Deck level — or "claude", Claude Code's own files
+ *  (the baseline) — and whether the tool's own setting or its server's. */
 export interface From {
-  level: PermissionScope;
+  level: PermissionScope | "claude";
   via: "tool" | "server";
 }
 
-/** What a tool gets at a scope, from the scope itself or a broader level (null: nothing —
- *  the conversation's permission mode decides). */
-export function toolAt(cascade: Cascade, scope: PermissionScope, toolRule: string): { kind: ToolRuleKind | null; from: From | null } {
+/** What a tool gets at a scope, from the scope itself, a broader level, or Claude Code's
+ *  files underneath (null: nothing anywhere — the conversation's permission mode decides). */
+export function toolAt(
+  cascade: Cascade,
+  scope: PermissionScope,
+  toolRule: string,
+  baseline: readonly PermissionRule[] = [],
+): { kind: ToolRuleKind | null; from: From | null } {
   const server = serverOfTool(toolRule);
   for (const level of LEVELS_FROM[scope]) {
     const p = cascade[level];
@@ -98,18 +107,32 @@ export function toolAt(cascade: Cascade, scope: PermissionScope, toolRule: strin
     const s = p.servers[server];
     if (s !== undefined) return { kind: s ? null : "deny", from: { level, via: "server" } };
   }
-  return { kind: null, from: null };
+  const file = nativeResolve(toolRule, baseline);
+  return file ? { kind: file.kind, from: { level: "claude", via: "tool" } } : { kind: null, from: null };
 }
 
-/** A server's on/off at a scope (on unless a level says off). */
-export function serverAt(cascade: Cascade, scope: PermissionScope, server: string): { on: boolean; own: boolean | null; from: PermissionScope | null } {
+/** A Claude Code `deny` covering EVERY tool of the server (the server rule, or a glob) —
+ *  the one thing that keeps a server off whatever Flight Deck says. */
+function fileServerDeny(server: string, baseline: readonly PermissionRule[]): boolean {
+  return nativeResolve(`${serverRuleName(server)}__\u0001`, baseline)?.kind === "deny";
+}
+
+/** A server's on/off at a scope (on unless a level — or Claude Code's files — says off). */
+export function serverAt(
+  cascade: Cascade,
+  scope: PermissionScope,
+  server: string,
+  baseline: readonly PermissionRule[] = [],
+): { on: boolean; own: boolean | null; from: PermissionScope | "claude" | null; locked: boolean } {
   const rule = serverRuleName(server);
   const own = cascade[scope]?.servers[rule];
+  const locked = fileServerDeny(server, baseline);
+  if (locked) return { on: false, own: own ?? null, from: "claude", locked };
   for (const level of LEVELS_FROM[scope]) {
     const v = cascade[level]?.servers[rule];
-    if (v !== undefined) return { on: v, own: own ?? null, from: level };
+    if (v !== undefined) return { on: v, own: own ?? null, from: level, locked };
   }
-  return { on: true, own: null, from: null };
+  return { on: true, own: null, from: null, locked };
 }
 
 /** What a server would be at a scope WITHOUT the scope's own say. */
@@ -147,50 +170,49 @@ export function nativeResolve(tool: string, rules: readonly PermissionRule[]): P
   );
 }
 
-/** An external rule that would override `kind` for `tool` (a stricter one), if any. */
-export function externalOverride(tool: string, kind: ToolRuleKind | null, external: readonly PermissionRule[]): PermissionRule | null {
-  const ext = nativeResolve(tool, external);
-  if (!ext) return null;
-  if (kind === null) return ext.kind === "allow" ? null : ext; // an external allow is only looser
-  return KIND_RANK[ext.kind] < KIND_RANK[kind] ? ext : null;
+/**
+ * The choices Claude Code makes impossible for a tool: its files `deny` it (the tool never
+ * reaches the app — nothing to answer), or the organization's policy asks for it (never
+ * answered on the user's behalf). A file `ask` is NOT among them: Flight Deck answers it
+ * when its own setting is Allow.
+ */
+export function impossibleChoices(tool: string, baseline: readonly PermissionRule[]): Set<ToolChoice> {
+  const file = nativeResolve(tool, baseline);
+  if (file?.kind === "deny") return new Set(["allow", "ask"]);
+  const managedAsk = nativeResolve(tool, baseline.filter((r) => r.source === "managed"));
+  return managedAsk?.kind === "ask" ? new Set(["allow"]) : new Set();
 }
 
 // ---- One tool row -------------------------------------------------------------------------
 
 export interface ToolRowState {
-  /** The scope's own setting for the tool, or "default" (follow the broader levels). */
+  /** The scope's own setting for the tool, or "default" (follow what's underneath). */
   choice: ToolChoice;
-  /** What the tool gets at this scope (own, else inherited); null = the mode decides. */
+  /** What the tool gets at this scope (own, else inherited — Claude Code's files last);
+   *  null = nothing anywhere, the permission mode decides. */
   shown: ToolRuleKind | null;
   /** Where `shown` comes from, when not the scope's own tool setting. */
   from: From | null;
-  /** Per choice: a stricter rule in Claude Code's files that would win over it. */
-  blockedBy: Record<ToolChoice, PermissionRule | null>;
-  /** The external rule that wins over what this scope shows right now, if any. */
-  overriddenBy: PermissionRule | null;
+  /** Choices Claude Code doesn't let anything override — not offered. */
+  impossible: Set<ToolChoice>;
 }
 
 export function toolRowState(
   cascade: Cascade,
   scope: PermissionScope,
   toolRule: string,
-  external: readonly PermissionRule[],
+  baseline: readonly PermissionRule[],
 ): ToolRowState {
   const own = cascade[scope]?.tools[toolRule];
-  const at = toolAt(cascade, scope, toolRule);
-  const inherited = toolAt({ ...cascade, [scope]: { ...(cascade[scope] ?? EMPTY_LEVEL), tools: {} } }, scope, toolRule);
-  const blockedBy = {
-    default: externalOverride(toolRule, inherited.kind, external),
-    allow: externalOverride(toolRule, "allow", external),
-    ask: externalOverride(toolRule, "ask", external),
-    deny: null,
-  };
+  const impossible = impossibleChoices(toolRule, baseline);
+  const at = toolAt(cascade, scope, toolRule, baseline);
+  // A file deny wins whatever is set — show what really applies.
+  const shown = impossible.has("allow") && impossible.has("ask") ? "deny" : at.kind;
   return {
-    choice: own ?? "default",
-    shown: at.kind,
-    from: own ? null : at.from,
-    blockedBy,
-    overriddenBy: externalOverride(toolRule, at.kind, external),
+    choice: own && !impossible.has(own) ? own : "default",
+    shown,
+    from: own && !impossible.has(own) ? null : at.from,
+    impossible,
   };
 }
 
@@ -392,10 +414,11 @@ export function serverSummary(
   scope: PermissionScope,
   server: string,
   tools: readonly Pick<McpToolInfo, "name">[],
+  baseline: readonly PermissionRule[] = [],
 ): { deny: number; ask: number; allow: number } {
   const out = { deny: 0, ask: 0, allow: 0 };
   for (const t of tools) {
-    const k = toolAt(cascade, scope, mcpToolRuleName(server, t.name)).kind;
+    const k = toolRowState(cascade, scope, mcpToolRuleName(server, t.name), baseline).shown;
     if (k) out[k]++;
   }
   return out;
@@ -409,20 +432,8 @@ export const LEVEL_LABEL: Record<PermissionScope, string> = {
   conversation: "this conversation",
 };
 
-const FILE_LABEL: Record<PermissionRule["source"], string> = {
-  managed: "your organization's policy",
-  local: "the repository's .claude/settings.local.json",
-  project: "the repository's .claude/settings.json",
-  user: "~/.claude/settings.json",
-};
-
-/** "`mcp__x` in ~/.claude/settings.json" — names a Claude Code rule for a tooltip. */
-export function describeRule(r: PermissionRule): string {
-  return `${r.rule} in ${FILE_LABEL[r.source]}`;
-}
-
-/** "Global" / "this repository (server off)" — names where a value comes from. */
+/** "Global" / "this repository (the whole server)" / "Claude Code" — where a value comes from. */
 export function describeFrom(f: From): string {
-  const where = f.level === "global" ? "Global" : LEVEL_LABEL[f.level];
+  const where = f.level === "claude" ? "Claude Code" : f.level === "global" ? "Global" : LEVEL_LABEL[f.level];
   return f.via === "server" ? `${where} (the whole server)` : where;
 }

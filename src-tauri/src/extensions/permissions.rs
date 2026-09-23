@@ -1,23 +1,16 @@
-//! Per-tool permission rules for MCP tools — Claude Code's own `permissions.allow` /
-//! `ask` / `deny` lists, read across every settings file that can hold one and written in
-//! the user's `~/.claude/settings.json`.
+//! Claude Code's own MCP permission rules and plugin on/off, READ from every settings file
+//! that can hold them — the baseline Flight Deck's own cascade (Global → repository →
+//! conversation, resolved front-side and delivered per session) starts from. Nothing here
+//! writes: Flight Deck never edits Claude Code's files for these.
 //!
-//! ## What a rule does (verified against the docs and binary 2.1.280)
+//! ## What a Claude Code rule does (verified against the docs and binary 2.1.280)
 //! - `deny` on a bare tool name (`mcp__claude_ai_Gmail__send_message` IS a bare name — an
 //!   `mcp__` rule never takes parentheses) removes the tool from Claude's context, in every
-//!   permission mode, `bypassPermissions` included.
-//! - `ask` prompts on every call, even in `auto` and `bypassPermissions` (`dontAsk` denies).
-//! - `allow` runs the tool without a prompt, and skips the auto-mode classifier.
-//! - No rule: the conversation's permission mode decides.
+//!   permission mode — nothing can override that.
+//! - `ask` prompts on every call, even in `auto` and `bypassPermissions` — Flight Deck
+//!   answers that prompt when its own setting says Allow (the session's auto-allow).
+//! - `allow` runs the tool without a prompt.
 //! - deny > ask > allow, whatever the rule's specificity or the file it sits in.
-//! - The CLI watches its settings files: an edit applies from the next tool call of a
-//!   RUNNING session, no restart.
-//!
-//! ## What the app writes
-//! Only exact MCP tool names, only in the USER file — the one file that is the user's own
-//! and applies everywhere (terminal and VS Code included). Rules from the other files are
-//! read so the UI can tell when one of them overrides a choice made here; they are never
-//! edited from the app.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 
-use super::{home_dir, write_settings_file};
+use super::home_dir;
 
 /// Which of Claude Code's three rule lists a rule sits in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -48,7 +41,7 @@ impl ToolRuleKind {
     }
 }
 
-/// The settings file a rule was read from. Only `User` is ever written by the app.
+/// The settings file a rule was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleSource {
@@ -62,7 +55,7 @@ pub enum RuleSource {
     User,
 }
 
-/// One permission rule that can concern an MCP tool.
+/// One Claude Code permission rule that can concern an MCP tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct PermissionRule {
     /// The rule verbatim (`mcp__claude_ai_Gmail__send_message`, `mcp__claude_ai_Gmail`,
@@ -70,35 +63,8 @@ pub struct PermissionRule {
     pub rule: String,
     pub kind: ToolRuleKind,
     pub source: RuleSource,
-    /// The file it was read from, for the UI to name.
+    /// The file it was read from.
     pub path: String,
-}
-
-/// Every MCP-relevant permission rule visible to a repository.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
-pub struct PermissionRulesView {
-    pub rules: Vec<PermissionRule>,
-    /// Files that exist but could not be read or parsed. Their rules are UNKNOWN, so the
-    /// view is incomplete — the UI says so rather than presenting a partial picture as whole.
-    pub warnings: Vec<String>,
-    /// Set when the USER file itself is unreadable: the app must not offer to write a file
-    /// it could not read (a rewrite would drop whatever it failed to parse).
-    pub user_error: Option<String>,
-    /// Same for the repository's local file (the Repository scope's target).
-    pub local_error: Option<String>,
-    /// Every `enabledPlugins` entry, per file.
-    pub plugins: Vec<PluginOverride>,
-    /// The project root the local/project files were read from (a worktree's own root).
-    pub repo_root: Option<String>,
-}
-
-/// One change to the user's rules: set `tool`'s rule to `kind`, or remove it (`None`,
-/// i.e. back to "no rule of mine").
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-pub struct McpToolPermissionChange {
-    /// The full MCP tool name (`mcp__<server>__<tool>`).
-    pub tool: String,
-    pub kind: Option<ToolRuleKind>,
 }
 
 /// One file's say on one plugin: `enabledPlugins[id]` in that settings file.
@@ -108,6 +74,18 @@ pub struct PluginOverride {
     pub enabled: bool,
     pub source: RuleSource,
     pub path: String,
+}
+
+/// Claude Code's MCP rules and plugin on/off visible to a repository.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct PermissionRulesView {
+    pub rules: Vec<PermissionRule>,
+    /// Every `enabledPlugins` entry, per file.
+    pub plugins: Vec<PluginOverride>,
+    /// Files that exist but could not be read or parsed (their say is unknown).
+    pub warnings: Vec<String>,
+    /// The project root the local/project files were read from (a worktree's own root).
+    pub repo_root: Option<String>,
 }
 
 /// macOS location of the organization policy file.
@@ -134,14 +112,14 @@ pub fn read_mcp_permission_rules(repo_path: Option<&str>) -> PermissionRulesView
     }
     match home_dir() {
         Some(home) => files.push((RuleSource::User, home.join(".claude/settings.json"))),
-        None => view.user_error = Some("home directory ($HOME) not found".to_string()),
+        None => view.warnings.push("home directory ($HOME) not found".to_string()),
     }
     for (source, path) in files {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                note_unreadable(&mut view, source, format!("{} unreadable: {e}", path.display()));
+                view.warnings.push(format!("{} unreadable: {e}", path.display()));
                 continue;
             }
         };
@@ -161,20 +139,10 @@ pub fn read_mcp_permission_rules(repo_path: Option<&str>) -> PermissionRulesView
                     path: shown.clone(),
                 }));
             }
-            Err(e) => note_unreadable(&mut view, source, format!("{shown}: {e}")),
+            Err(e) => view.warnings.push(format!("{shown}: {e}")),
         }
     }
     view
-}
-
-fn note_unreadable(view: &mut PermissionRulesView, source: RuleSource, msg: String) {
-    if source == RuleSource::User {
-        view.user_error = Some(msg.clone());
-    }
-    if source == RuleSource::Local {
-        view.local_error = Some(msg.clone());
-    }
-    view.warnings.push(msg);
 }
 
 /// Pure: the `enabledPlugins` entries of one settings document.
@@ -214,149 +182,9 @@ fn rules_in_document(text: &str) -> Result<Vec<(String, ToolRuleKind)>, String> 
     Ok(out)
 }
 
-/// Apply `changes` to the user's `~/.claude/settings.json`, then read the file back and
-/// check every change landed ("written" is not "in effect" — a concurrent writer, or a file
-/// the CLI rewrote, would otherwise go unnoticed). Flight Deck keeps its own permissions
-/// itself (applied per session); this only serves to CLEAN UP a rule found in that file.
-pub fn set_mcp_tool_permissions(changes: &[McpToolPermissionChange]) -> Result<(), String> {
-    for c in changes {
-        validate_tool_name(&c.tool)?;
-    }
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let path = home_dir().ok_or("home directory ($HOME) not found")?.join(".claude/settings.json");
-    write_settings_file(&path, |text| apply_mcp_tool_permissions(text, changes))?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("re-reading {}: {e}", path.display()))?;
-    let now = rules_in_document(&text)?;
-    for c in changes {
-        let have: Vec<ToolRuleKind> =
-            now.iter().filter(|(r, _)| r == &c.tool).map(|(_, k)| *k).collect();
-        let want: Vec<ToolRuleKind> = c.kind.into_iter().collect();
-        if have != want {
-            return Err(format!(
-                "settings.json does not hold the rule just written for {} — another program may have changed it",
-                c.tool
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Only an MCP rule may be written: one tool (`mcp__<server>__<tool>`) or one whole server
-/// (`mcp__<server>`, how a server is turned off), no glob, no parentheses, no whitespace.
-/// The app manages MCP rules and nothing else — this keeps a caller from slipping a broad
-/// rule (`*`, `Bash`) into a settings file.
-fn validate_tool_name(tool: &str) -> Result<(), String> {
-    if crate::supervisor::model::is_mcp_rule_name(tool) {
-        Ok(())
-    } else {
-        Err(format!("not an MCP rule: {tool:?}"))
-    }
-}
-
-/// Pure transform: for each change, remove the tool's exact rule from all three lists, then
-/// add it to the chosen one. Every other rule, key and its order is preserved; a list (or
-/// the whole `permissions` object) left empty by the edit is dropped, since absent == empty.
-/// A `permissions` value of the wrong type is an error, never overwritten.
-fn apply_mcp_tool_permissions(
-    text: &str,
-    changes: &[McpToolPermissionChange],
-) -> Result<String, String> {
-    let mut root: Value =
-        serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
-    let obj = root.as_object_mut().ok_or("settings.json is not a JSON object")?;
-    let perms = obj
-        .entry("permissions")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or("settings.json `permissions` is not an object")?;
-    for kind in ToolRuleKind::ALL {
-        if perms.get(kind.key()).is_some_and(|v| !v.is_array()) {
-            return Err(format!("settings.json `permissions.{}` is not a list", kind.key()));
-        }
-    }
-    for c in changes {
-        for kind in ToolRuleKind::ALL {
-            if let Some(list) = perms.get_mut(kind.key()).and_then(Value::as_array_mut) {
-                list.retain(|v| v.as_str().map(str::trim) != Some(c.tool.as_str()));
-            }
-        }
-        if let Some(kind) = c.kind {
-            perms
-                .entry(kind.key())
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .expect("checked above")
-                .push(Value::String(c.tool.clone()));
-        }
-    }
-    for kind in ToolRuleKind::ALL {
-        if perms.get(kind.key()).and_then(Value::as_array).is_some_and(Vec::is_empty) {
-            perms.remove(kind.key());
-        }
-    }
-    if perms.is_empty() {
-        obj.remove("permissions");
-    }
-    serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const GMAIL_SEND: &str = "mcp__claude_ai_Gmail__send_message";
-
-    fn change(tool: &str, kind: Option<ToolRuleKind>) -> McpToolPermissionChange {
-        McpToolPermissionChange { tool: tool.to_string(), kind }
-    }
-
-    #[test]
-    fn a_rule_moves_between_lists_and_nothing_else_changes() {
-        let text = r#"{"model":"opus","permissions":{"allow":["Bash(ls *)","mcp__claude_ai_Gmail__send_message"],"defaultMode":"auto"}}"#;
-        let out = apply_mcp_tool_permissions(text, &[change(GMAIL_SEND, Some(ToolRuleKind::Ask))]).unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["permissions"]["allow"], serde_json::json!(["Bash(ls *)"]));
-        assert_eq!(v["permissions"]["ask"], serde_json::json!([GMAIL_SEND]));
-        assert_eq!(v["permissions"]["defaultMode"], "auto");
-        assert_eq!(v["model"], "opus");
-        // Key order kept: `model` still first, `defaultMode` still after `allow`.
-        assert!(out.find("\"model\"").unwrap() < out.find("\"permissions\"").unwrap());
-        assert!(out.find("\"allow\"").unwrap() < out.find("\"defaultMode\"").unwrap());
-    }
-
-    #[test]
-    fn clearing_the_last_rule_leaves_no_empty_husk() {
-        let text = r#"{"permissions":{"deny":["mcp__claude_ai_Gmail__send_message"]}}"#;
-        let out = apply_mcp_tool_permissions(text, &[change(GMAIL_SEND, None)]).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), serde_json::json!({}));
-    }
-
-    #[test]
-    fn setting_twice_never_duplicates() {
-        let once = apply_mcp_tool_permissions("{}", &[change(GMAIL_SEND, Some(ToolRuleKind::Deny))]).unwrap();
-        let twice = apply_mcp_tool_permissions(&once, &[change(GMAIL_SEND, Some(ToolRuleKind::Deny))]).unwrap();
-        let v: Value = serde_json::from_str(&twice).unwrap();
-        assert_eq!(v["permissions"]["deny"], serde_json::json!([GMAIL_SEND]));
-    }
-
-    #[test]
-    fn a_malformed_permissions_value_is_an_error_not_overwritten() {
-        assert!(apply_mcp_tool_permissions(r#"{"permissions":"yes"}"#, &[change(GMAIL_SEND, None)]).is_err());
-        assert!(
-            apply_mcp_tool_permissions(r#"{"permissions":{"ask":"x"}}"#, &[change(GMAIL_SEND, None)]).is_err()
-        );
-    }
-
-    #[test]
-    fn only_mcp_tool_or_server_rules_may_be_written() {
-        assert!(validate_tool_name(GMAIL_SEND).is_ok());
-        assert!(validate_tool_name("mcp__claude_ai_Gmail").is_ok(), "a whole server (turning it off)");
-        for bad in ["*", "Bash", "mcp__", "mcp__claude_ai_Gmail__*", "mcp__x__y(z)", "mcp__x__a b", "mcp____y", "mcp__x__"] {
-            assert!(validate_tool_name(bad).is_err(), "{bad} must be refused");
-        }
-    }
 
     #[test]
     fn reads_every_plugin_say_of_a_file() {

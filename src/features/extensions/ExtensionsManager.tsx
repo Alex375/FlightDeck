@@ -46,7 +46,6 @@ import {
 import {
   McpPermissionSummary,
   McpToolPermissions,
-  ExternalRules,
   ScopeSwitcher,
   ServerScopeToggle,
   pluginAtScope,
@@ -774,7 +773,6 @@ function ConversationBody({
           <span className={styles.sectionT}>MCP servers</span>
           <span className={styles.sectionC}>{mcpTotal + sum(mcpContribs, (p) => p.mcp_count)}</span>
         </div>
-        <ExternalRules target={perms} />
         {handle == null ? (
           <div className={styles.sectionEmpty}>
             Start the conversation (send a message) to see the live MCP server status.
@@ -2473,7 +2471,6 @@ export function GlobalExtensions() {
             <Ico name="refresh" className={"sm" + (mcp.isFetching ? " " + styles.spin : "")} />
           </button>
         </div>
-        <ExternalRules target={perms} />
         {mcp.isLoading ? (
           <div className={styles.sectionEmpty}>Starting Claude to list your connectors — a few seconds…</div>
         ) : mcp.isError ? (

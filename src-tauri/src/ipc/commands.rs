@@ -3419,9 +3419,9 @@ pub async fn get_output_style() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Every permission rule that can concern an MCP tool, from the managed, local, project
-/// (`repo_path`) and user settings files — what the per-tool permission rows resolve their
-/// effective state from. Blocking file IO runs off the async runtime.
+/// Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+/// (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+/// ("Default"). Blocking file IO runs off the async runtime.
 #[tauri::command]
 #[specta::specta]
 pub async fn mcp_permission_rules(
@@ -3432,22 +3432,6 @@ pub async fn mcp_permission_rules(
     })
     .await
     .map_err(|e| e.to_string())
-}
-
-/// Set (or clear) MCP permission rules in the user's `~/.claude/settings.json`. Flight
-/// Deck applies its own permissions per session; this serves to clean up a rule found in
-/// that file (which Claude Code enforces on its own, above Flight Deck's). One atomic write
-/// for the batch, read back and verified.
-#[tauri::command]
-#[specta::specta]
-pub async fn set_mcp_tool_permissions(
-    changes: Vec<crate::extensions::permissions::McpToolPermissionChange>,
-) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        crate::extensions::permissions::set_mcp_tool_permissions(&changes)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;

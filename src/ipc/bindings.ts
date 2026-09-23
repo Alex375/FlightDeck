@@ -1590,27 +1590,13 @@ async setOutputStyle(style: string) : Promise<Result<null, string>> {
 }
 },
 /**
- * Every permission rule that can concern an MCP tool, from the managed, local, project
- * (`repo_path`) and user settings files — what the per-tool permission rows resolve their
- * effective state from. Blocking file IO runs off the async runtime.
+ * Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+ * (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+ * ("Default"). Blocking file IO runs off the async runtime.
  */
 async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRulesView, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("mcp_permission_rules", { repoPath }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Set (or clear) MCP permission rules in the user's `~/.claude/settings.json`. Flight
- * Deck applies its own permissions per session; this serves to clean up a rule found in
- * that file (which Claude Code enforces on its own, above Flight Deck's). One atomic write
- * for the batch, read back and verified.
- */
-async setMcpToolPermissions(changes: McpToolPermissionChange[]) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4554,15 +4540,6 @@ read_only: boolean | null;
  */
 destructive: boolean | null }
 /**
- * One change to the user's rules: set `tool`'s rule to `kind`, or remove it (`None`,
- * i.e. back to "no rule of mine").
- */
-export type McpToolPermissionChange = { 
-/**
- * The full MCP tool name (`mcp__<server>__<tool>`).
- */
-tool: string; kind: ToolRuleKind | null }
-/**
  * One authoritative content block of an assistant message.
  */
 export type NormalizedBlock = { type: "text"; text: string } | { type: "thinking"; text: string } | { type: "tool_use"; id: string; name: string; input: JsonValue } | 
@@ -4616,7 +4593,7 @@ decision_reason: JsonValue;
  */
 agent_id: string | null }
 /**
- * One permission rule that can concern an MCP tool.
+ * One Claude Code permission rule that can concern an MCP tool.
  */
 export type PermissionRule = { 
 /**
@@ -4625,31 +4602,21 @@ export type PermissionRule = {
  */
 rule: string; kind: ToolRuleKind; source: RuleSource; 
 /**
- * The file it was read from, for the UI to name.
+ * The file it was read from.
  */
 path: string }
 /**
- * Every MCP-relevant permission rule visible to a repository.
+ * Claude Code's MCP rules and plugin on/off visible to a repository.
  */
 export type PermissionRulesView = { rules: PermissionRule[]; 
-/**
- * Files that exist but could not be read or parsed. Their rules are UNKNOWN, so the
- * view is incomplete — the UI says so rather than presenting a partial picture as whole.
- */
-warnings: string[]; 
-/**
- * Set when the USER file itself is unreadable: the app must not offer to write a file
- * it could not read (a rewrite would drop whatever it failed to parse).
- */
-user_error: string | null; 
-/**
- * Same for the repository's local file (the Repository scope's target).
- */
-local_error: string | null; 
 /**
  * Every `enabledPlugins` entry, per file.
  */
 plugins: PluginOverride[]; 
+/**
+ * Files that exist but could not be read or parsed (their say is unknown).
+ */
+warnings: string[]; 
 /**
  * The project root the local/project files were read from (a worktree's own root).
  */
@@ -5000,7 +4967,7 @@ export type RoutingOrigin =
  */
 "built_in"
 /**
- * The settings file a rule was read from. Only `User` is ever written by the app.
+ * The settings file a rule was read from.
  */
 export type RuleSource = 
 /**

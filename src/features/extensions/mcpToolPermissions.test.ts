@@ -69,7 +69,7 @@ describe("the cascade: the narrowest level wins, both ways", () => {
   it("a server turned off globally can be turned back on for one conversation", () => {
     const c: Cascade = { global: lvl({ servers: { [SERVER]: false } }), conversation: lvl({ servers: { [SERVER]: true } }) };
     expect(serverAt(c, "global", GMAIL).on).toBe(false);
-    expect(serverAt(c, "conversation", GMAIL)).toEqual({ on: true, own: true, from: "conversation" });
+    expect(serverAt(c, "conversation", GMAIL)).toEqual({ on: true, own: true, from: "conversation", locked: false });
     expect(serverInherited(c, "conversation", GMAIL)).toBe(false);
     expect(toolAt(c, "conversation", SEND).kind).toBeNull();
   });
@@ -84,12 +84,33 @@ describe("a tool row", () => {
     expect(s.from).toEqual({ level: "global", via: "tool" });
   });
 
-  it("only Claude Code's own stricter files can block a choice — and it says which", () => {
-    const s = toolRowState({}, "conversation", SEND, [ext(SERVER, "ask", "project")]);
-    expect(s.blockedBy.allow?.rule).toBe(SERVER);
-    expect(s.blockedBy.ask).toBeNull();
-    expect(s.blockedBy.deny).toBeNull();
-    expect(s.overriddenBy?.kind).toBe("ask"); // nothing set here → the file's ask applies
+  it("Claude Code's files are the baseline 'Default' falls back to", () => {
+    const s = toolRowState({}, "global", SEND, [ext(SERVER, "ask", "project")]);
+    expect(s.choice).toBe("default");
+    expect(s.shown).toBe("ask");
+    expect(s.from).toEqual({ level: "claude", via: "tool" });
+  });
+
+  it("Flight Deck overrides a file's ask — every choice stays offered", () => {
+    const c: Cascade = { global: lvl({ tools: { [SEND]: "allow" } }) };
+    const s = toolRowState(c, "global", SEND, [ext(SEND, "ask")]);
+    expect(s.impossible.size).toBe(0);
+    expect(s.shown).toBe("allow");
+  });
+
+  it("only what Claude Code really enforces is not offered: a file deny, the org's ask", () => {
+    expect([...toolRowState({}, "conversation", SEND, [ext(SERVER, "deny", "user")]).impossible].sort()).toEqual(["allow", "ask"]);
+    expect([...toolRowState({}, "conversation", SEND, [ext(SEND, "ask", "managed")]).impossible]).toEqual(["allow"]);
+    // A choice set before the file denied it isn't shown as if it applied.
+    const s = toolRowState({ conversation: lvl({ tools: { [SEND]: "allow" } }) }, "conversation", SEND, [ext(SEND, "deny")]);
+    expect(s.choice).toBe("default");
+    expect(s.shown).toBe("deny");
+  });
+
+  it("a server Claude Code turns off entirely stays off, locked", () => {
+    const st = serverAt({ global: lvl({ servers: { [SERVER]: true } }) }, "global", GMAIL, [ext(SERVER, "deny")]);
+    expect(st).toMatchObject({ on: false, locked: true });
+    expect(serverAt({}, "global", GMAIL, [ext(SEND, "deny")]).locked).toBe(false); // one tool only
   });
 });
 

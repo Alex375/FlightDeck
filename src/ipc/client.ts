@@ -66,7 +66,6 @@ export type {
   McpServerInfo,
   McpServerLive,
   McpToolInfo,
-  McpToolPermissionChange,
   NormalizedBlock,
   PermissionDecision,
   PermissionMode,
