@@ -20,7 +20,7 @@ Le développement de Flight Deck accumule **beaucoup** de gras : chaque feature 
 1. **Jamais de source non committée.** Ce skill ne supprime que des chemins gitignorés (`target/`, bundles, overlays) et des dossiers de `~/Library`. Avant toute suppression dans un repo, `git status --porcelain` doit être vide — s'il ne l'est pas, **n'y touche pas** et dis-le : le travail en cours passe avant l'espace disque.
 2. **Jamais une identité protégée.** `com.tosse.desktop` est la **prod** (les vraies conversations d'Alexandre, ~17 Mo) et `com.tosse.desktop.dev` est l'identité fixe de `/build-dev`. Elles ne se purgent **jamais**, et on ne s'en approche pas avec un glob (`com.tosse.desktop*` les attraperait toutes les deux).
 3. **Jamais l'identité d'une feature vivante.** Une identité `com.tosse.desktop.<slug>` dont le worktree `<slug>` existe encore appartient à une feature en cours : ce sont ses données de test, ne les supprime pas.
-4. **Jamais pendant un build.** Le worktree principal est partagé avec les autres agents : supprimer `target` sous les pieds d'un `tauri build` en cours le casse. Vérifie d'abord, et si un build tourne, **saute la purge des `target`** (les autres étapes restent possibles).
+4. **Jamais pendant un build, ni sous une app qui tourne.** Le worktree principal est partagé avec les autres agents : supprimer `target` sous les pieds d'un `tauri build` en cours le casse. Et `target/release/bundle` contient le `.app` que `/build-dev` et `/build-app` lancent — une app en cours d'exécution vit DANS le dossier qu'on s'apprête à effacer. Vérifie les deux, et si l'un des deux est vrai, **saute la purge du `target` concerné** (les autres étapes restent possibles).
 5. **Jamais de réécriture d'historique, jamais un stash perdu.** Le `git gc` de l'étape 4 n'expire que les reflogs **de branches** : aucun commit d'aucune branche, et **aucun stash**, ne peut disparaître. Pas de `filter-branch`, pas de `--expire=now` global, **pas de `--all`** (il inclut `refs/stash`), pas de force-push.
 6. **Un chemin qu'on n'a pas trouvé n'a pas été purgé.** Toute racine est **dérivée**, jamais écrite en dur : un chemin en dur qui n'existe pas fait passer un garde-fou pour vert et fait annoncer un espace qu'on n'a jamais rendu. Si une racine est introuvable, **ne purge rien pour elle** et dis-le dans le rapport.
 
@@ -45,11 +45,15 @@ echo "ROOT=$ROOT"; echo "SERVER=${SERVER:-<introuvable, sera SAUTÉ>}"
 df -h / | tail -1
 du -sh "$ROOT" ${SERVER:+"$SERVER"} 2>/dev/null
 pgrep -x "cargo|rustc|cargo-tauri"      # vide (exit 1) = aucun build en cours (invariant 4)
+pgrep -fl "target/release/bundle"       # vide = aucune app lancée DEPUIS un target (invariant 4)
 ```
 
 ⚠️ Le test de build se fait sur le **nom** du process (`pgrep -x`), pas sur la ligne de commande complète (`pgrep -f "cargo|rustc|tauri"`) : cette dernière matche le PATH hérité de n'importe quel process (il contient `.cargo/bin`), le chemin du bundle `.app` de dev, et le `pgrep` lui-même — elle renvoyait 27 lignes **sans aucun build**, donc l'étape 2 était systématiquement sautée et les ~19 Go jamais rendus.
 
+⚠️ La seconde ligne est le garde-fou que l'ancienne version tenait par ACCIDENT : son `pgrep -f "cargo|…"` matchait tout process dont le PATH contient `.cargo/bin`, donc aussi l'app `Flight Deck dev build` — il bloquait tout, tout le temps, pour la mauvaise raison. Rendre le test du build précis a découvert le vrai trou : `/build-dev` laisse une app qui TOURNE depuis `target/release/bundle/macos/…`, et un `rm -rf target` l'efface sous ses pieds (macOS garde l'inode ouvert, mais le relaunch échoue et toute ressource chargée paresseusement disparaît). Constaté en conditions réelles le 23/09/2026.
+
 Si un build tourne : saute l'étape 2, fais le reste, et dis-le franchement dans le rapport.
+Si une app tourne depuis un `target` : purge `target/debug` (sans danger), **saute `target/release`**, et dis lequel et pourquoi. Proposer de quitter l'app pour récupérer le reste est un choix de l'utilisateur, pas une décision de ce skill.
 
 ## Étape 1 — Vérifier que rien n'est en jeu (invariant 1)
 
@@ -75,11 +79,15 @@ Quatre `target` peuvent exister, et on les oublie tous les quatre. Ordres de gra
 
 ```bash
 for T in "$ROOT/src-tauri/target" "$ROOT/flightdeckd/target" ${SERVER:+"$SERVER/flightdeckd/target"}; do
-  if [ -d "$T" ]; then
+  if [ ! -d "$T" ]; then
+    echo "absent, RIEN purgé : $T"
+  elif pgrep -f "$T/release/bundle" >/dev/null; then
+    # Une app tourne dedans : son `release` reste, son `debug` part quand même.
+    echo "app en cours depuis $T/release/bundle → SAUTÉ : $T/release"
+    [ -d "$T/debug" ] && { echo "purge $T/debug ($(du -sh "$T/debug" | cut -f1))"; rm -rf "$T/debug"; }
+  else
     echo "purge $T ($(du -sh "$T" | cut -f1))"
     rm -rf "$T"
-  else
-    echo "absent, RIEN purgé : $T"
   fi
 done
 ```
