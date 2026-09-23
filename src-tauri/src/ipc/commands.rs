@@ -188,6 +188,11 @@ pub struct SpawnFlags {
     /// an untitled conversation never stamps that placeholder as the daemon's
     /// authoritative title (see `spawn_session`'s wiring).
     pub conversation_title: Option<String>,
+    /// This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+    /// process right after `initialize` (they live in its flag settings layer, which dies
+    /// with the previous one). Claude only; `None`/empty = nothing of its own.
+    #[serde(default)]
+    pub session_overrides: Option<crate::supervisor::model::SessionOverrides>,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -229,7 +234,11 @@ pub async fn spawn_session(
         app_control,
         claude_account_id,
         conversation_title,
+        session_overrides,
     } = flags;
+    if let Some(o) = &session_overrides {
+        o.validate()?;
+    }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -385,6 +394,7 @@ pub async fn spawn_session(
         effort: cfg.effort.clone(),
         permission_mode: cfg.permission_mode.clone(),
         ultracode,
+        session_overrides,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -2646,6 +2656,81 @@ pub async fn mcp_status(
     handle.mcp_status().await.map_err(|e| e.to_string())
 }
 
+/// Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+/// flag settings layer (never a file, so no other conversation sees them). Rules bite from
+/// its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+/// returned, not swallowed.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_session_overrides(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    overrides: crate::supervisor::model::SessionOverrides,
+    reload_plugins: bool,
+) -> Result<(), String> {
+    overrides.validate()?;
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .apply_session_overrides(&overrides, reload_plugins)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
+/// less `claude` sees them — what the global Settings page lists. A throwaway process in
+/// the home directory, polled until the connectors settle (they connect asynchronously,
+/// a few seconds after start) or ~15 s pass; no model turn, no tokens.
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_global_mcp_status() -> Result<Vec<crate::supervisor::model::McpServerLive>, String> {
+    use crate::supervisor::control;
+    use crate::supervisor::protocol::CliMessage;
+    use crate::supervisor::transport::Transport;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("home directory ($HOME) not found")?;
+    let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(home)).map_err(|e| e.to_string())?;
+    transport
+        .send_line(control::initialize_request("tosse-mcp-init", &[]))
+        .map_err(|e| e.to_string())?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut latest: Option<Vec<crate::supervisor::model::McpServerLive>> = None;
+    let mut round = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        round += 1;
+        let rid = format!("tosse-mcp-status-{round}");
+        if transport.send_line(control::mcp_status_request(&rid)).is_err() {
+            break;
+        }
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = rx.recv().await {
+                if let CliMessage::ControlResponse(v) = msg {
+                    if v.get("response").and_then(|r| r.get("request_id")).and_then(|x| x.as_str())
+                        == Some(rid.as_str())
+                    {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(v) = answer else { break };
+        let servers = control::parse_mcp_status(&v);
+        let settled = !servers.is_empty() && servers.iter().all(|s| s.status != "pending");
+        latest = Some(servers);
+        if settled {
+            break;
+        }
+    }
+    transport.shutdown(false).await;
+    latest.ok_or_else(|| "the Claude CLI did not report its MCP servers".to_string())
+}
+
 /// Enable/disable a live MCP server in a running session (`mcp_toggle`). Optimistic
 /// — returns once sent; the UI re-polls `mcp_status` to reflect the new state, and a
 /// CLI rejection surfaces as a timeline control error.
@@ -3332,6 +3417,21 @@ pub async fn get_output_style() -> Result<String, String> {
     tokio::task::spawn_blocking(crate::extensions::read_output_style)
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+/// (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+/// ("Default"). Blocking file IO runs off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn mcp_permission_rules(
+    repo_path: Option<String>,
+) -> Result<crate::extensions::permissions::PermissionRulesView, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::permissions::read_mcp_permission_rules(repo_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;

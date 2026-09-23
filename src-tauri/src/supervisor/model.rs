@@ -143,12 +143,125 @@ pub struct McpServerLive {
     /// Names of the tools the server exposes (empty unless connected) — shown when
     /// the user expands a server row.
     pub tools: Vec<String>,
+    /// The same tools with what the server says about each one (description, read-only /
+    /// destructive hints) — what the per-tool permission rows are built from. Claude only
+    /// (`mcp_status` carries it); empty for Codex, whose rows show plain names.
+    #[serde(default)]
+    pub tool_info: Vec<McpToolInfo>,
     /// Why a Codex MCP server failed to start (e.g. `reauthenticationRequired`), captured
     /// from the `mcpServer/startupStatus/updated` push. Turns a mute "disconnected" into a
     /// named "failed" reason. `None` for Claude servers and for Codex servers that started
     /// fine.
     #[serde(default)]
     pub failure_reason: Option<String>,
+}
+
+/// What ONE conversation changes for itself from its extensions panel (scope
+/// "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
+/// flag settings layer (`apply_flag_settings`), never in a file, so they reach that
+/// conversation alone. Verified live (2.1.280):
+///   • `permissions` — a second apply REPLACES the key (a rule can be removed), `null`
+///     clears it, `list_permission_rules` reports the rules as `flagSettings`;
+///   • `enabledPlugins` — `{id:false}` then `reload_plugins` drops the plugin's commands,
+///     clearing it and reloading brings them back.
+/// The layer dies with the process, so the app keeps these per conversation and
+/// re-applies them after every `initialize` (with a plugin reload when there are any).
+///
+/// A rule can only ADD to what applies (deny > ask > allow across every source), so a
+/// conversation can tighten the repository or global rules, never loosen them. A plugin
+/// override, by contrast, wins over the files: the flag layer ranks above them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct SessionOverrides {
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+    /// Plugin id (`name@marketplace`) → on/off for this conversation.
+    #[serde(default)]
+    pub enabled_plugins: std::collections::BTreeMap<String, bool>,
+}
+
+impl SessionOverrides {
+    pub fn has_rules(&self) -> bool {
+        !(self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.has_rules() && self.enabled_plugins.is_empty()
+    }
+
+    /// Only MCP rule names (a whole server or one tool) and well-formed plugin ids — the
+    /// conversation panel manages nothing else, and this keeps a caller from slipping a
+    /// broad rule (`*`, `Bash`) into a live session.
+    pub fn validate(&self) -> Result<(), String> {
+        for rule in self.allow.iter().chain(&self.ask).chain(&self.deny) {
+            if !is_mcp_rule_name(rule) {
+                return Err(format!("not an MCP rule: {rule:?}"));
+            }
+        }
+        for id in self.enabled_plugins.keys() {
+            if !is_plugin_id(id) {
+                return Err(format!("not a plugin id: {id:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `settings` object for `apply_flag_settings`. Both keys are ALWAYS sent (`null`
+    /// when empty): the CLI merges at the top level, so this replaces exactly the two
+    /// keys the conversation owns and nothing else in the layer.
+    pub fn flag_settings(&self) -> Value {
+        let permissions = if self.has_rules() {
+            let mut map = serde_json::Map::new();
+            for (key, list) in [("allow", &self.allow), ("ask", &self.ask), ("deny", &self.deny)] {
+                if !list.is_empty() {
+                    map.insert(key.to_string(), serde_json::json!(list));
+                }
+            }
+            Value::Object(map)
+        } else {
+            Value::Null
+        };
+        let plugins = if self.enabled_plugins.is_empty() {
+            Value::Null
+        } else {
+            serde_json::json!(self.enabled_plugins)
+        };
+        serde_json::json!({ "permissions": permissions, "enabledPlugins": plugins })
+    }
+}
+
+/// `mcp__<server>` (the whole server) or `mcp__<server>__<tool>`: non-empty parts, no
+/// glob, no parentheses, no whitespace.
+pub fn is_mcp_rule_name(rule: &str) -> bool {
+    let Some(rest) = rule.strip_prefix("mcp__") else {
+        return false;
+    };
+    let parts_ok = match rest.split_once("__") {
+        Some((server, tool)) => !server.is_empty() && !tool.is_empty(),
+        None => !rest.is_empty(),
+    };
+    parts_ok && !rule.contains(['*', '(', ')']) && !rule.chars().any(char::is_whitespace)
+}
+
+/// `name@marketplace`, both non-empty, no whitespace.
+pub fn is_plugin_id(id: &str) -> bool {
+    id.split_once('@').is_some_and(|(n, m)| !n.is_empty() && !m.is_empty())
+        && !id.chars().any(char::is_whitespace)
+}
+
+/// One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
+/// SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
+/// get them wrong, so the UI treats them as a suggestion, never as a guarantee.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct McpToolInfo {
+    /// The tool's own name, as the server declares it (not the `mcp__…` rule name).
+    pub name: String,
+    /// The server's description of the tool, capped for display.
+    pub description: Option<String>,
+    /// `annotations.readOnly` — the tool claims not to change anything.
+    pub read_only: Option<bool>,
+    /// `annotations.destructive` — the tool claims it may change or delete data.
+    pub destructive: Option<bool>,
 }
 
 /// Result of an `mcp_authenticate` control request (OAuth start for an http/sse

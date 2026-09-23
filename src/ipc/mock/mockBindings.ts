@@ -55,6 +55,10 @@ import type {
   McpAuthResult,
   LiveModel,
   McpServerLive,
+  PermissionRule,
+  PermissionRulesView,
+  SessionOverrides,
+  PluginOverride,
   RewindFilesResult,
   PluginContents,
   PermissionDecision,
@@ -982,6 +986,8 @@ function mockSpendReport(): SpendReport {
 
 /** Mock-only: the current global output style, so a set is reflected by the next get. */
 let mockOutputStyle = "default";
+const mockPermissionRules: PermissionRule[] = [];
+const mockPluginOverrides: PluginOverride[] = [];
 
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
@@ -3132,6 +3138,20 @@ export const mockCommands = {
     return ok(null);
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {
+    return ok([]);
+  },
+  // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
+  async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {
+    return ok({ rules: mockPermissionRules, warnings: [], plugins: mockPluginOverrides, repo_root: _repoPath });
+  },
+  async applySessionOverrides(
+    _session: string,
+    _overrides: SessionOverrides,
+    _reloadPlugins: boolean,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async fetchGlobalMcpStatus(): Promise<Result<McpServerLive[], string>> {
     return ok([]);
   },
   async mcpToggle(_session: string, _serverName: string, _enabled: boolean): Promise<Result<null, string>> {

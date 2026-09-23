@@ -23,6 +23,7 @@ use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
     PermissionResolvedPayload, RemoteControlState, RewindFilesResult, SessionEmitter, SessionEvent,
+    SessionOverrides,
 };
 use super::protocol::CliMessage;
 use super::transport::{self, SpawnConfig, Transport, TransportError};
@@ -112,6 +113,10 @@ pub enum SessionCommand {
     /// enable / disable), so a running conversation applies it without a restart.
     /// Fire-and-correlate (bare-success ack; rejection surfaces as a control error).
     ReloadPlugins,
+    /// The tools Flight Deck's own settings ALLOW for this conversation (the `allow` list
+    /// of its [`SessionOverrides`]) — a prompt a settings-file `ask` rule raises for one of
+    /// them is answered "allow" on the user's behalf. Claude-only.
+    SetAutoAllow(Vec<String>),
     /// Compact the conversation's context. CODEX-ONLY: Claude compacts via the plain
     /// `/compact` text command (a slash-command turn), so its actor treats this as a
     /// no-op; the Codex actor issues the native `thread/compact/start` RPC (there is no
@@ -144,6 +149,10 @@ pub struct InitialControls {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub ultracode: bool,
+    /// The conversation's own overrides (MCP rules + plugin on/off). They live in the
+    /// process's flag settings layer, which dies with it — so they are re-applied after
+    /// every `initialize` (a resume, a rewind, an account switch all spawn afresh).
+    pub session_overrides: Option<SessionOverrides>,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -180,6 +189,9 @@ enum PendingControl {
     /// A `reload_plugins` request — its failure surfaces as a control error so the user
     /// knows the freshly-updated plugin was NOT hot-applied (a restart is still needed).
     ReloadPlugins,
+    /// The conversation's overrides re-applied after `initialize` — a failure surfaces,
+    /// since the conversation would otherwise run WITHOUT what the user set for it.
+    SessionOverrides,
 }
 
 impl PendingControl {
@@ -199,6 +211,7 @@ impl PendingControl {
             PendingControl::McpReconnect => "reconnecting an MCP server",
             PendingControl::McpClearAuth => "resetting MCP authentication",
             PendingControl::ReloadPlugins => "reloading plugins",
+            PendingControl::SessionOverrides => "applying this conversation's own settings",
         }
     }
 }
@@ -350,6 +363,28 @@ impl SessionHandle {
             Ok(Ok(Err(msg))) => Err(SessionError::Rejected(msg)),
             _ => Err(SessionError::Closed),
         }
+    }
+
+    /// Replace this conversation's own overrides in the RUNNING session
+    /// (`apply_flag_settings`), awaiting the CLI's answer so a rejection reaches the
+    /// caller. Rules bite from the next tool call; a plugin change needs the reload that
+    /// `reload_plugins` asks for (verified live against 2.1.280).
+    pub async fn apply_session_overrides(
+        &self,
+        overrides: &SessionOverrides,
+        reload_plugins: bool,
+    ) -> Result<(), SessionError> {
+        self.control_query(
+            "apply_flag_settings",
+            control::session_overrides_request("", overrides),
+            15,
+        )
+        .await?;
+        self.send(SessionCommand::SetAutoAllow(overrides.allow.clone())).await?;
+        if reload_plugins {
+            self.reload_plugins().await?;
+        }
+        Ok(())
     }
 
     /// The session's live model catalogue (`list_models`). Authoritative — it reflects
@@ -1336,6 +1371,13 @@ struct SessionCore {
     /// Whether to restore the ultracode flag after init (the `--effort` spawn flag
     /// sets the effort level but not the separate ultracode flag).
     restore_ultracode: bool,
+    /// The conversation's own overrides, to re-apply after `initialize` (see
+    /// [`InitialControls::session_overrides`]). `None` when it has none.
+    restore_session_overrides: Option<SessionOverrides>,
+    /// Tools Flight Deck's settings allow for this conversation: a prompt that only a
+    /// settings-file `ask` rule raised for one of them is answered for the user — Flight
+    /// Deck's choice overrides Claude Code's own files wherever the CLI lets it.
+    auto_allow: std::collections::HashSet<String>,
     /// In-flight `mcp_status` queries, keyed by their outbound `request_id`. The
     /// matching `control_response` fulfills (and removes) the reply channel.
     pending_mcp: HashMap<String, oneshot::Sender<Result<Vec<McpServerLive>, String>>>,
@@ -1386,6 +1428,12 @@ impl SessionCore {
             pending_control: HashMap::new(),
             init_request_id: None,
             restore_ultracode: initial.ultracode,
+            auto_allow: initial
+                .session_overrides
+                .as_ref()
+                .map(|o| o.allow.iter().cloned().collect())
+                .unwrap_or_default(),
+            restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1626,6 +1674,18 @@ impl SessionCore {
                 control::set_ultracode_request(rid, true)
             });
         }
+        // The conversation's own overrides live in the process's flag layer — gone with
+        // the previous process, so put them back before the first turn can run. Written
+        // right after `initialize` on the same stdin, ahead of any user message. Plugins
+        // were loaded at startup, so a plugin override also needs a reload to bite.
+        if let Some(overrides) = self.restore_session_overrides.clone() {
+            self.send_tracked(PendingControl::SessionOverrides, |rid| {
+                control::session_overrides_request(rid, &overrides)
+            });
+            if !overrides.enabled_plugins.is_empty() {
+                self.send_tracked(PendingControl::ReloadPlugins, control::reload_plugins_request);
+            }
+        }
         // Read the applied settings back so effort + ultracode (and the resolved
         // model id) reflect reality, not just the optimistic seed.
         self.refresh_settings();
@@ -1818,7 +1878,8 @@ impl SessionCore {
             | PendingControl::StopTask
             | PendingControl::McpToggle
             | PendingControl::McpReconnect
-            | PendingControl::McpClearAuth => {}
+            | PendingControl::McpClearAuth
+            | PendingControl::SessionOverrides => {}
             // A hot-reload's ack is NOT bare: it returns the same
             // `response.response.commands` catalogue as `initialize`, freshly rescanned
             // (a plugin's skills appear/disappear here). Harvesting it means the `/`
@@ -1862,6 +1923,17 @@ impl SessionCore {
             InboundControl::CanUseTool(req) => {
                 // Dedupe re-delivery of an in-flight prompt.
                 if self.pending.contains_key(&request_id) {
+                    return;
+                }
+                // Flight Deck's own "Allow" for this tool beats an `ask` rule from Claude
+                // Code's settings files: answer it for the user. Only that case — never a
+                // prompt the mode, the classifier or a safety check raised, and never a
+                // tool that itself demands a human.
+                if self.auto_allow.contains(&req.tool_name)
+                    && req.decision_reason_type.as_deref() == Some("rule")
+                    && !req.requires_user_interaction.unwrap_or(false)
+                {
+                    self.send(control::permission_allow_response(&request_id, &req.tool_use_id, req.input));
                     return;
                 }
                 let payload = PermissionRequestPayload {
@@ -2148,6 +2220,9 @@ impl SessionCore {
                 // control error so the user knows the update wasn't hot-applied.
                 self.send_tracked(PendingControl::ReloadPlugins, control::reload_plugins_request);
             }
+            SessionCommand::SetAutoAllow(tools) => {
+                self.auto_allow = tools.into_iter().collect();
+            }
             // Codex-only: Claude compacts via the `/compact` text command (a normal
             // slash-command turn the composer sends directly), so there's nothing to do
             // on the control channel here.
@@ -2352,6 +2427,44 @@ mod tests {
         assert_eq!(line["response"]["response"]["behavior"], json!("deny"));
         assert_eq!(line["response"]["response"]["message"], json!("no"));
         assert_eq!(line["response"]["response"]["toolUseID"], json!("toolu_1"));
+    }
+
+    /// Flight Deck's own "Allow" beats a settings-file `ask` rule: that prompt is answered
+    /// for the user (no card) — but never one the mode / classifier raised, a consent step
+    /// the tool itself demands, or a tool Flight Deck doesn't allow.
+    #[test]
+    fn a_settings_file_ask_is_answered_for_a_tool_flight_deck_allows() {
+        let tool = "mcp__claude_ai_Gmail__send_message";
+        let prompt = |rid: &str, reason: &str, needs_human: bool| -> CliMessage {
+            serde_json::from_value(json!({
+                "type": "control_request",
+                "request_id": rid,
+                "request": {
+                    "subtype": "can_use_tool", "tool_name": tool, "input": { "to": "x" },
+                    "tool_use_id": "toolu_1", "decision_reason_type": reason,
+                    "requires_user_interaction": needs_human
+                }
+            }))
+            .unwrap()
+        };
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetAutoAllow(vec![tool.to_string()]));
+
+        core.on_message(prompt("r1", "rule", false));
+        let answered = drain(&mut out);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0]["response"]["request_id"], json!("r1"));
+        assert_eq!(answered[0]["response"]["response"]["behavior"], json!("allow"));
+        assert!(!drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))));
+
+        for (rid, reason, human) in [("r2", "mode", false), ("r3", "rule", true)] {
+            core.on_message(prompt(rid, reason, human));
+            assert!(drain(&mut out).is_empty(), "{rid}: must reach the user");
+            assert!(drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))));
+        }
+        core.on_command(SessionCommand::SetAutoAllow(vec![]));
+        core.on_message(prompt("r4", "rule", false));
+        assert!(drain(&mut out).is_empty(), "no longer allowed: the user decides");
     }
 
     /// Build a `SessionCore` that HOSTS the app-control MCP server (a fresh hub).

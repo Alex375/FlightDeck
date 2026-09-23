@@ -287,6 +287,16 @@ pub fn path_is_ignored(repo_path: &str, relative_path: &str) -> Option<bool> {
     }
 }
 
+/// The root of the working tree `path` sits in (`git rev-parse --show-toplevel`) — a
+/// worktree's own root for a worktree. `None` outside a repository.
+pub fn toplevel(path: &str) -> Option<String> {
+    run_git(path, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+
 /// Reduce a git remote URL to a comparison key, so the SAME repository written in
 /// different notations compares equal. `None` for anything that carries no
 /// identity (empty, or a URL with no path part).

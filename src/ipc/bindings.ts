@@ -1590,6 +1590,47 @@ async setOutputStyle(style: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+ * (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+ * ("Default"). Blocking file IO runs off the async runtime.
+ */
+async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRulesView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("mcp_permission_rules", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+ * flag settings layer (never a file, so no other conversation sees them). Rules bite from
+ * its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+ * returned, not swallowed.
+ */
+async applySessionOverrides(session: string, overrides: SessionOverrides, reloadPlugins: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_session_overrides", { session, overrides, reloadPlugins }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
+ * less `claude` sees them — what the global Settings page lists. A throwaway process in
+ * the home directory, polled until the connectors settle (they connect asynchronously,
+ * a few seconds after start) or ~15 s pass; no model turn, no tokens.
+ */
+async fetchGlobalMcpStatus() : Promise<Result<McpServerLive[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_global_mcp_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Everything a single plugin provides (skills / sub-agents / MCP servers) for the
  * per-plugin explorer — scanned regardless of the plugin's enabled state so a
  * disabled plugin stays browsable. `repo_path` selects the install relevant to the
@@ -4464,12 +4505,40 @@ tool_count: number;
  */
 tools: string[]; 
 /**
+ * The same tools with what the server says about each one (description, read-only /
+ * destructive hints) — what the per-tool permission rows are built from. Claude only
+ * (`mcp_status` carries it); empty for Codex, whose rows show plain names.
+ */
+tool_info?: McpToolInfo[]; 
+/**
  * Why a Codex MCP server failed to start (e.g. `reauthenticationRequired`), captured
  * from the `mcpServer/startupStatus/updated` push. Turns a mute "disconnected" into a
  * named "failed" reason. `None` for Claude servers and for Codex servers that started
  * fine.
  */
 failure_reason?: string | null }
+/**
+ * One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
+ * SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
+ * get them wrong, so the UI treats them as a suggestion, never as a guarantee.
+ */
+export type McpToolInfo = { 
+/**
+ * The tool's own name, as the server declares it (not the `mcp__…` rule name).
+ */
+name: string; 
+/**
+ * The server's description of the tool, capped for display.
+ */
+description: string | null; 
+/**
+ * `annotations.readOnly` — the tool claims not to change anything.
+ */
+read_only: boolean | null; 
+/**
+ * `annotations.destructive` — the tool claims it may change or delete data.
+ */
+destructive: boolean | null }
 /**
  * One authoritative content block of an assistant message.
  */
@@ -4523,6 +4592,35 @@ decision_reason: JsonValue;
  * turn is blocked.
  */
 agent_id: string | null }
+/**
+ * One Claude Code permission rule that can concern an MCP tool.
+ */
+export type PermissionRule = { 
+/**
+ * The rule verbatim (`mcp__claude_ai_Gmail__send_message`, `mcp__claude_ai_Gmail`,
+ * `mcp__claude_ai_Gmail__*`, `mcp__*`, `*`…).
+ */
+rule: string; kind: ToolRuleKind; source: RuleSource; 
+/**
+ * The file it was read from.
+ */
+path: string }
+/**
+ * Claude Code's MCP rules and plugin on/off visible to a repository.
+ */
+export type PermissionRulesView = { rules: PermissionRule[]; 
+/**
+ * Every `enabledPlugins` entry, per file.
+ */
+plugins: PluginOverride[]; 
+/**
+ * Files that exist but could not be read or parsed (their say is unknown).
+ */
+warnings: string[]; 
+/**
+ * The project root the local/project files were read from (a worktree's own root).
+ */
+repo_root: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -4602,6 +4700,10 @@ latest_version: string | null;
  * enabled state — so the UI can show "5 skills" even when toggled off.
  */
 skill_count: number; agent_count: number; command_count: number; mcp_count: number }
+/**
+ * One file's say on one plugin: `enabledPlugins[id]` in that settings file.
+ */
+export type PluginOverride = { plugin_id: string; enabled: boolean; source: RuleSource; path: string }
 /**
  * Typed return value of `ping`. Proves React -> Rust (typed command).
  */
@@ -4865,6 +4967,26 @@ export type RoutingOrigin =
  */
 "built_in"
 /**
+ * The settings file a rule was read from.
+ */
+export type RuleSource = 
+/**
+ * Organization policy (`/Library/Application Support/ClaudeCode/managed-settings.json`).
+ */
+"managed" | 
+/**
+ * `<repo>/.claude/settings.local.json` — this project, this machine.
+ */
+"local" | 
+/**
+ * `<repo>/.claude/settings.json` — shared with everyone on the repository.
+ */
+"project" | 
+/**
+ * `~/.claude/settings.json` — the user's own, every project.
+ */
+"user"
+/**
  * A rate-limit window that applies to a NAMED subset of usage (today: a single model) rather
  * than the account as a whole. Kept separate from the two flat windows because its label is
  * data-driven — it comes from the payload, so a renamed or newly added scoped model shows up
@@ -5020,6 +5142,27 @@ export type SessionExtensionsChangedEvent = { session: string; area: string }
  * tool result, turn result, …).
  */
 export type SessionMessageEvent = { session: string; item: ConversationItem }
+/**
+ * What ONE conversation changes for itself from its extensions panel (scope
+ * "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
+ * flag settings layer (`apply_flag_settings`), never in a file, so they reach that
+ * conversation alone. Verified live (2.1.280):
+ * • `permissions` — a second apply REPLACES the key (a rule can be removed), `null`
+ * clears it, `list_permission_rules` reports the rules as `flagSettings`;
+ * • `enabledPlugins` — `{id:false}` then `reload_plugins` drops the plugin's commands,
+ * clearing it and reloading brings them back.
+ * The layer dies with the process, so the app keeps these per conversation and
+ * re-applies them after every `initialize` (with a plugin reload when there are any).
+ * 
+ * A rule can only ADD to what applies (deny > ask > allow across every source), so a
+ * conversation can tighten the repository or global rules, never loosen them. A plugin
+ * override, by contrast, wins over the files: the flag layer ranks above them.
+ */
+export type SessionOverrides = { allow: string[]; ask: string[]; deny: string[]; 
+/**
+ * Plugin id (`name@marketplace`) → on/off for this conversation.
+ */
+enabled_plugins?: Partial<{ [key in string]: boolean }> }
 /**
  * A `can_use_tool` permission prompt awaiting a decision.
  */
@@ -5222,7 +5365,13 @@ claudeAccountId: string | null;
  * an untitled conversation never stamps that placeholder as the daemon's
  * authoritative title (see `spawn_session`'s wiring).
  */
-conversationTitle: string | null }
+conversationTitle: string | null; 
+/**
+ * This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+ * process right after `initialize` (they live in its flag settings layer, which dies
+ * with the previous one). Claude only; `None`/empty = nothing of its own.
+ */
+sessionOverrides?: SessionOverrides | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -5363,6 +5512,10 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * Which of Claude Code's three rule lists a rule sits in.
+ */
+export type ToolRuleKind = "allow" | "ask" | "deny"
 /**
  * The TOSSE connection as the Settings tab shows it. `connected` false with a
  * `signed_out_reason` means we HELD a session and it stopped working (revoked/expired

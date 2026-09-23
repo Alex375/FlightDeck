@@ -1001,6 +1001,8 @@ describe("conversationsStore — controls applied at spawn", () => {
         // C9: the conversation's current title ("x", `baseConv`'s default name —
         // not the untitled placeholder, so it threads through).
         conversationTitle: "x",
+        // No extension settings of its own (its ⌘E panel was never used).
+        sessionOverrides: null,
       },
     );
   });

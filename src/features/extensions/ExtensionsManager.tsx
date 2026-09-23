@@ -41,7 +41,21 @@ import {
   useSetMarketplaceAutoUpdate,
   useSetPluginEnabled,
   useUpdatePlugin,
+  useGlobalMcpStatus,
 } from "../../ipc/useExtensions";
+import {
+  McpPermissionSummary,
+  McpToolPermissions,
+  ScopeSwitcher,
+  ServerScopeToggle,
+  pluginAtScope,
+  useExtensionScope,
+  type PermissionTarget,
+} from "./McpToolPermissionRows";
+import type { PermissionScope } from "./mcpToolPermissions";
+import { noteServerTools } from "../../store/mcpPolicy";
+import { homeDir } from "@tauri-apps/api/path";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useConversationsStore, type BackendKind, type Conversation } from "../../store/conversationsStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import type {
@@ -345,10 +359,12 @@ export function ExtensionsManager() {
   // reload can wait for them to land before the live sessions re-read disk — else a
   // fast click on the bar could race the toggle's own write.
   const pendingWrites = useRef<Promise<unknown>[]>([]);
-  const onPluginToggle = (pluginId: string, enabled: boolean) => {
-    pendingWrites.current.push(setPluginEnabled.mutateAsync({ pluginId, enabled }).catch(() => {}));
+  const onPluginWritten = (pluginId: string, write: Promise<unknown>) => {
+    pendingWrites.current.push(write.catch(() => {}));
     setTouched((prev) => (prev.has(pluginId) ? prev : new Set(prev).add(pluginId)));
   };
+  const onPluginToggle = (pluginId: string, enabled: boolean) =>
+    onPluginWritten(pluginId, setPluginEnabled.mutateAsync({ pluginId, enabled }));
   const applyReload = async (convs: Conversation[]) => {
     setReloading(true);
     try {
@@ -495,9 +511,10 @@ export function ExtensionsManager() {
             ext={ext}
             live={live}
             handle={handle}
+            convId={target.session ?? ""}
             path={target.path}
             setPluginEnabled={setPluginEnabled}
-            onPluginToggle={onPluginToggle}
+            onPluginWritten={onPluginWritten}
             onOpenDoc={setDoc}
             onOpenPlugin={openPlugin}
             onOpenMarketplaces={() => setMktOpen(true)}
@@ -621,15 +638,41 @@ function ProjectBody({
   );
 }
 
+// ---- What each scope lists -----------------------------------------------------
+//
+// A scope lists only what can be set at its level. Global: what is configured for the user
+// (their skills / sub-agents, user-scope servers, cloud connectors, user-installed plugins)
+// — a repository's own things don't exist there. Repository: its own skills / sub-agents,
+// and every server / plugin a conversation in it can use (a global connector can be tuned
+// per repository). Conversation: everything this conversation sees.
+
+/** A skill / sub-agent defined at `scope` (config scope `user` / `project` / `local`). */
+function definedAtScope(scope: PermissionScope, defined: ExtScope): boolean {
+  if (scope === "global") return defined === "user";
+  if (scope === "repository") return defined === "project" || defined === "local";
+  return true;
+}
+
+/** A plugin (by the scope it's installed in) that can be switched at `scope`. */
+function visibleAtScope(scope: PermissionScope, installed: ExtScope): boolean {
+  return scope !== "global" || installed === "user";
+}
+
+/** A live MCP server (by `mcp_status` scope) that can be tuned at `scope`. */
+function serverVisibleAtScope(scope: PermissionScope, serverScope: string | null): boolean {
+  return scope !== "global" || serverScope === "user" || serverScope === "claudeai";
+}
+
 // ---- Conversation view: this session's live picture ---------------------------
 
 function ConversationBody({
   ext,
   live,
   handle,
+  convId,
   path,
   setPluginEnabled,
-  onPluginToggle,
+  onPluginWritten,
   onOpenDoc,
   onOpenPlugin,
   onOpenMarketplaces,
@@ -638,33 +681,55 @@ function ConversationBody({
   ext: ReturnType<typeof useExtensions>;
   live: ReturnType<typeof useMcpStatus>;
   handle: string | null;
+  /** The conversation's stable id — what its own settings are kept under. */
+  convId: string;
   path: string;
   setPluginEnabled: ReturnType<typeof useSetPluginEnabled>;
-  onPluginToggle: (pluginId: string, enabled: boolean) => void;
+  /** A plugin change was written to a settings FILE (repository / global scope): the
+   *  manager tracks it to offer reloading the live conversations. */
+  onPluginWritten: (pluginId: string, write: Promise<unknown>) => void;
   onOpenDoc: (d: OpenDoc) => void;
   onOpenPlugin: (p: PluginInfo, section?: ExplorerSectionKey) => void;
   onOpenMarketplaces: () => void;
   resetToken: string;
 }) {
   const actions = useMcpActions(handle);
+  // WHERE the changes made below apply — picked at the top, "This conversation" by default.
+  // Each scope shows its own value (else the broader one it inherits — never a narrower
+  // one), and only what exists at that level; tool rules, servers and plugins follow it.
+  const [scope, setScope] = useState<PermissionScope>("conversation");
+  const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
+  const perms = useExtensionScope(scope, path, repoId, convId);
+  const togglePlugin = (p: PluginInfo, next: boolean) => {
+    const write = pluginAtScope(p, perms).write(next);
+    // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
+    // plugin reload). Global is Claude Code's own file: offered through the reload bar.
+    if (scope === "global") onPluginWritten(p.id, perms.setPlugin(p.id, write));
+    else void perms.setPlugin(p.id, write).catch(() => {});
+  };
+  // Remember each server's tools — how "server off, except these tools" reaches a spawn.
+  useEffect(() => {
+    for (const s of live.data ?? []) noteServerTools(s.name, s.tools);
+  }, [live.data]);
   // A live session lets an update hot-apply via reload_plugins (handle non-null);
   // otherwise it lands on the next spawn.
   const updatePlugin = useUpdatePlugin(path, handle);
   // Order FROZEN at window-open (enabled/connected first), then stable — toggling an
   // item must not make it jump under the cursor (see useStableOrder).
   const plugins = useStableOrder(
-    ext.data?.plugins ?? [],
+    (ext.data?.plugins ?? []).filter((p) => visibleAtScope(scope, p.scope)),
     (p) => p.id,
     (p) => (p.enabled ? 0 : 1),
     resetToken,
   );
   const allPlugins = ext.data?.plugins ?? [];
   // File-based only — plugin skills/agents are summarized as boxes below + live in
-  // the per-plugin explorer (never mixed in as if they were normal rows).
-  const skills = (ext.data?.skills ?? []).filter((s) => s.source == null);
-  const agents = (ext.data?.agents ?? []).filter((a) => a.source == null);
+  // the per-plugin explorer (never mixed in as if they were normal rows). Only what is
+  // defined at the picked level: Global lists the user's own, Repository the repo's.
+  const skills = (ext.data?.skills ?? []).filter((s) => s.source == null && definedAtScope(scope, s.scope));
+  const agents = (ext.data?.agents ?? []).filter((a) => a.source == null && definedAtScope(scope, a.scope));
   const orderedServers = useStableOrder(
-    live.data ?? [],
+    (live.data ?? []).filter((s) => serverVisibleAtScope(scope, s.scope)),
     // Two servers can share a name across scopes (e.g. a `local` and a `project`
     // `playwright`, both folded into the "repo" bucket) — key by scope+name so they
     // don't collide in the freeze order nor as React keys below.
@@ -682,6 +747,8 @@ function ConversationBody({
 
   return (
     <div className={styles.body}>
+      <ScopeSwitcher scope={scope} onChange={setScope} hint={perms.hint} />
+      {perms.error ? <div className={styles.error}>{perms.error}</div> : null}
       {actions.toggle.isError || actions.reconnect.isError || actions.authenticate.isError || actions.clearAuth.isError ? (
         <div className={styles.error}>
           {((actions.toggle.error || actions.reconnect.error || actions.authenticate.error || actions.clearAuth.error) as Error)?.message}
@@ -725,7 +792,12 @@ function ConversationBody({
               </div>
               <div className={styles.list}>
                 {g.items.map((m) => (
-                  <McpLiveRow key={`${m.scope ?? ""}:${m.name}`} mcp={m} actions={actions} />
+                  <McpLiveRow
+                    key={`${m.scope ?? ""}:${m.name}`}
+                    mcp={m}
+                    actions={actions}
+                    perms={perms}
+                  />
                 ))}
               </div>
             </div>
@@ -767,18 +839,24 @@ function ConversationBody({
         empty="No plugins."
         action={<MarketplacesButton updates={totalUpdates(allPlugins)} onOpen={onOpenMarketplaces} />}
       >
-        {plugins.map((p) => (
-          <PluginRow
-            key={p.id}
-            plugin={p}
-            busy={setPluginEnabled.isPending}
-            onToggle={(enabled) => onPluginToggle(p.id, enabled)}
-            onOpen={() => onOpenPlugin(p)}
-            onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
-            updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
-            anyUpdating={updatePlugin.isPending}
-          />
-        ))}
+        {plugins.map((p) => {
+          const at = pluginAtScope(p, perms);
+          return (
+            <PluginRow
+              key={p.id}
+              plugin={{ ...p, enabled: at.enabled }}
+              busy={perms.pending}
+              onToggle={(enabled) => togglePlugin(p, enabled)}
+              toggleTitle={at.title}
+              toggleLocked={at.locked}
+              note={at.note}
+              onOpen={() => onOpenPlugin(p)}
+              onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
+              updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
+              anyUpdating={updatePlugin.isPending}
+            />
+          );
+        })}
       </Section>
     </div>
   );
@@ -1652,7 +1730,16 @@ function WarningBanner({ warnings }: { warnings: string[] }) {
 
 // ---- MCP rows ------------------------------------------------------------------
 
-function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<typeof useMcpActions> }) {
+function McpLiveRow({
+  mcp,
+  actions,
+  perms,
+}: {
+  mcp: McpServerLive;
+  actions: ReturnType<typeof useMcpActions>;
+  /** The per-tool permission scope its tool rows edit (Claude only). */
+  perms: PermissionTarget;
+}) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
   const b = liveBadge(mcp.scope);
@@ -1676,12 +1763,13 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
         <span className={styles.rowName}>{mcp.name}</span>
         <Badge label={b.label} cls={b.cls} />
         <span className={styles.spacer} />
+        <McpPermissionSummary server={mcp} target={perms} />
         {mcp.tool_count > 0 ? <span className={styles.toolPill}>{mcp.tool_count} tools</span> : null}
         {canExpand ? (
           <button
             className={styles.chevBtn}
             onClick={() => setOpen((o) => !o)}
-            title={open ? "Hide tools" : "Show tools"}
+            title={open ? "Hide tools" : "Show tools and their permissions"}
             aria-label="Show tools"
           >
             <Ico name="chev" className={"sm " + styles.chev + (open ? " " + styles.chevOpen : "")} />
@@ -1713,6 +1801,7 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
             <button
               className={styles.actBtn + " " + styles.actPrimary}
               disabled={busy}
+              title="Signs in to this server for every conversation — whatever the scope picked above."
               onClick={() => actions.authenticate.mutate(mcp.name)}
             >
               Authenticate
@@ -1724,7 +1813,12 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
             </button>
           ) : null}
           {!isCloud && isNetwork && (mcp.status === "connected" || mcp.status === "needs-auth") ? (
-            <button className={styles.actBtn} disabled={busy} onClick={() => actions.clearAuth.mutate(mcp.name)}>
+            <button
+              className={styles.actBtn}
+              disabled={busy}
+              title="Signs out of this server for every conversation — whatever the scope picked above."
+              onClick={() => actions.clearAuth.mutate(mcp.name)}
+            >
               Reset auth
             </button>
           ) : null}
@@ -1736,21 +1830,23 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
               Managed by the Claude app
             </span>
           ) : null}
-          <Toggle
-            checked={enabled}
-            disabled={busy}
-            onChange={(v) => actions.toggle.mutate({ serverName: mcp.name, enabled: v })}
-            label={`${enabled ? "Disable" : "Enable"} ${mcp.name}`}
-          />
+          {enabled ? (
+            <ServerScopeToggle server={mcp} target={perms} busy={busy} />
+          ) : (
+            // Turned off in Claude Code itself (`/mcp`, saved for this FOLDER in
+            // ~/.claude.json) — not by any scope here. Offer the way back.
+            <button
+              className={styles.actBtn}
+              disabled={busy}
+              onClick={() => actions.toggle.mutate({ serverName: mcp.name, enabled: true })}
+              title="Turned off in Claude Code for this folder (~/.claude.json). Turns it back on for this folder."
+            >
+              Turn back on
+            </button>
+          )}
         </div>
       </div>
-      {open ? (
-        <div className={styles.toolList}>
-          {mcp.tools.map((t) => (
-            <span key={t} className={styles.toolChip}>{t}</span>
-          ))}
-        </div>
-      ) : null}
+      {open ? <McpToolPermissions server={mcp} target={perms} /> : null}
     </div>
   );
 }
@@ -1814,6 +1910,9 @@ function PluginRow({
   onUpdate,
   updating,
   anyUpdating,
+  toggleTitle,
+  toggleLocked,
+  note,
 }: {
   plugin: PluginInfo;
   busy?: boolean;
@@ -1828,6 +1927,12 @@ function PluginRow({
   /** Any plugin's update is in flight (disables every row's button to avoid one shared
    *  mutation hijacking another row's spinner/error). */
   anyUpdating?: boolean;
+  /** Where the toggle's change lands (the scoped panels say it). */
+  toggleTitle?: string;
+  /** Why the toggle can't be used here (e.g. an organization policy decides). */
+  toggleLocked?: string | null;
+  /** A line under the plugin's meta — who decides for this conversation, when not here. */
+  note?: string | null;
 }) {
   const parts = pluginParts(plugin);
   return (
@@ -1856,6 +1961,7 @@ function PluginRow({
             {plugin.marketplace}
             {parts ? ` · ${parts}` : ""}
           </span>
+          {note ? <span className={styles.scopeNote}>{note}</span> : null}
         </div>
         <Ico name="arrow" className={"sm " + styles.openArrow} />
       </button>
@@ -1879,10 +1985,10 @@ function PluginRow({
       {onToggle ? (
         <Toggle
           checked={plugin.enabled}
-          disabled={busy}
+          disabled={busy || toggleLocked != null}
           onChange={onToggle}
           label={`${plugin.enabled ? "Disable" : "Enable"} ${plugin.name}`}
-          title="Global setting (all repositories) · a bar offers to apply it to running conversations"
+          title={toggleLocked ?? toggleTitle ?? "Global setting (all repositories) · a bar offers to apply it to running conversations"}
         />
       ) : (
         <span className={styles.statusWord + " " + (plugin.enabled ? styles.sOk : styles.sOff)}>
@@ -2194,6 +2300,259 @@ function DocViewer({ doc, onClose }: { doc: OpenDoc; onClose: () => void }) {
         </div>
         <div className={styles.docFoot}>{doc.path}</div>
       </div>
+    </div>
+  );
+}
+
+// ---- Global view (Settings → Claude Code → Extensions) --------------------------
+
+/** The user's home directory — the "project" a conversation-less `claude` runs in. */
+function useHomeDir(): string | null {
+  const [home, setHome] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    homeDir()
+      .then((h) => alive && setHome(h))
+      // No Tauri runtime (browser mock): the configured scan still needs a path.
+      .catch(() => alive && setHome("~"));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return home;
+}
+
+/** A server as a conversation-less session sees it: status, tools, and the GLOBAL
+ *  per-tool permissions. No enable toggle — enabling a server is per session (⌘E). */
+function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTarget }) {
+  const [open, setOpen] = useState(false);
+  const tone = statusInfo(mcp.status);
+  const b = liveBadge(mcp.scope);
+  const conn = connType(mcp);
+  const canExpand = mcp.tools.length > 0;
+  return (
+    <div className={styles.mcpRow}>
+      <div className={styles.mcpHead}>
+        <span className={`${styles.dot} ${tone.cls}`} />
+        <span className={styles.rowName}>{mcp.name}</span>
+        <Badge label={b.label} cls={b.cls} />
+        <span className={styles.spacer} />
+        <McpPermissionSummary server={mcp} target={perms} />
+        {mcp.tool_count > 0 ? <span className={styles.toolPill}>{mcp.tool_count} tools</span> : null}
+        {canExpand ? (
+          <button
+            className={styles.chevBtn}
+            onClick={() => setOpen((o) => !o)}
+            title={open ? "Hide tools" : "Show tools and their permissions"}
+            aria-label="Show tools"
+          >
+            <Ico name="chev" className={"sm " + styles.chev + (open ? " " + styles.chevOpen : "")} />
+          </button>
+        ) : null}
+      </div>
+      <div className={styles.mcpSub}>
+        <span className={`${styles.statusWord} ${tone.cls}`}>{tone.label}</span>
+        {conn ? (
+          <>
+            <span className={styles.subSep}>·</span>
+            <Ico name={conn.icon} className="sm" />
+            <span>{conn.kind}</span>
+            {conn.detail ? <span className={styles.subDetail}>{conn.detail}</span> : null}
+          </>
+        ) : null}
+        <span className={styles.spacer} />
+        <div className={styles.mcpActions}>
+          {mcp.scope === "claudeai" && (mcp.status === "needs-auth" || mcp.status === "failed") ? (
+            <span className={styles.cloudHint} title="Authenticate it in the Claude app, then refresh.">
+              Managed by the Claude app
+            </span>
+          ) : null}
+          <ServerScopeToggle server={mcp} target={perms} />
+        </div>
+      </div>
+      {open ? <McpToolPermissions server={mcp} target={perms} /> : null}
+    </div>
+  );
+}
+
+const CLAUDE_CONNECTORS_URL = "https://claude.ai/settings/connectors";
+
+/**
+ * Settings → Claude Code → Extensions: the GLOBAL picture every Claude conversation starts from — cloud
+ * connectors and MCP servers with their global per-tool permissions, plugins (enabling one
+ * is user-global), and the user's own skills and sub-agents. A conversation's ⌘E panel
+ * shows the same things live and can add rules for that conversation alone.
+ */
+export function GlobalExtensions() {
+  const home = useHomeDir();
+  const ext = useExtensions(home);
+  const mcp = useGlobalMcpStatus(true);
+  const perms = useExtensionScope("global", null, null, null);
+  useEffect(() => {
+    for (const s of mcp.data ?? []) noteServerTools(s.name, s.tools);
+  }, [mcp.data]);
+  const updatePlugin = useUpdatePlugin(home ?? "~", null);
+  const [doc, setDoc] = useState<OpenDoc | null>(null);
+  const [pluginView, setPluginView] = useState<{ plugin: PluginInfo; section: ExplorerSectionKey } | null>(null);
+  const [mktOpen, setMktOpen] = useState(false);
+
+  // A plugin toggle only writes settings.json; offer to hot-apply it to the live Claude
+  // conversations, as the ⌘E panel does for its repository.
+  const [touched, setTouched] = useState<Set<string>>(new Set());
+  const [reloading, setReloading] = useState(false);
+  const pendingWrites = useRef<Promise<unknown>[]>([]);
+  const allConvs = useConversationsStore((s) => s.conversations);
+  const liveConvs = useMemo(() => allConvs.filter((c) => c.kind === "claude" && c.handle), [allConvs]);
+  const togglePlugin = (p: PluginInfo, next: boolean) => {
+    pendingWrites.current.push(perms.setPlugin(p.id, pluginAtScope(p, perms).write(next)).catch(() => {}));
+    setTouched((prev) => (prev.has(p.id) ? prev : new Set(prev).add(p.id)));
+  };
+  const reloadAll = async () => {
+    setReloading(true);
+    try {
+      await Promise.allSettled(pendingWrites.current);
+      pendingWrites.current = [];
+      await Promise.all(
+        liveConvs.map(async (c) => {
+          try {
+            await commands.reloadPlugins(c.handle!);
+          } catch {
+            /* applies on next spawn */
+          }
+        }),
+      );
+      await Promise.all(distinctCwds(liveConvs).map((cwd) => refetchSlashCommands(cwd)));
+    } finally {
+      setReloading(false);
+      setTouched(new Set());
+    }
+  };
+
+  // The home directory is not a project: only what is global shows here.
+  const servers = (mcp.data ?? []).filter((m) => m.scope === "claudeai" || m.scope === "user");
+  const groups = bucketizeLive(servers);
+  const plugins = (ext.data?.plugins ?? []).filter((p) => visibleAtScope("global", p.scope));
+  const skills = (ext.data?.skills ?? []).filter((s) => s.source == null && s.scope === "user");
+  const agents = (ext.data?.agents ?? []).filter((a) => a.source == null && a.scope === "user");
+
+  return (
+    <div className={styles.globalBody}>
+      {touched.size > 0 && liveConvs.length > 0 ? (
+        <PluginReloadBar
+          count={touched.size}
+          liveCount={liveConvs.length}
+          hasCurrent={false}
+          busy={reloading}
+          onReloadCurrent={() => {}}
+          onReloadAll={() => void reloadAll()}
+          onDismiss={() => setTouched(new Set())}
+        />
+      ) : null}
+      <div className={styles.section}>
+        <div className={styles.sectionH}>
+          <Ico name="globe" className="sm" />
+          <span className={styles.sectionT}>Connectors &amp; MCP servers</span>
+          <span className={styles.sectionC}>{servers.length}</span>
+          <span className={styles.spacer} />
+          <button
+            className={styles.actBtn}
+            onClick={() => void openUrl(CLAUDE_CONNECTORS_URL)}
+            title="Cloud connectors are added and signed in to on claude.ai; they then show up here."
+          >
+            Add connectors on claude.ai
+          </button>
+          <button
+            className={styles.iconBtn}
+            onClick={() => void mcp.refetch()}
+            disabled={mcp.isFetching}
+            title="Refresh"
+            aria-label="Refresh"
+          >
+            <Ico name="refresh" className={"sm" + (mcp.isFetching ? " " + styles.spin : "")} />
+          </button>
+        </div>
+        {mcp.isLoading ? (
+          <div className={styles.sectionEmpty}>Starting Claude to list your connectors — a few seconds…</div>
+        ) : mcp.isError ? (
+          <div className={styles.error}>Unable to list the MCP servers: {(mcp.error as Error).message}</div>
+        ) : servers.length === 0 ? (
+          <div className={styles.sectionEmpty}>No cloud connector or user-level MCP server.</div>
+        ) : (
+          groups.map((g) => (
+            <div key={g.bucket} className={styles.bucket}>
+              <div className={styles.bucketH}>
+                <span>{BUCKET_LABEL[g.bucket]}</span>
+                <span className={styles.bucketC}>{g.items.length}</span>
+              </div>
+              <div className={styles.list}>
+                {g.items.map((m) => (
+                  <GlobalMcpRow key={`${m.scope ?? ""}:${m.name}`} mcp={m} perms={perms} />
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+      {ext.isError ? (
+        <div className={styles.error}>Unable to read the extensions configuration: {(ext.error as Error).message}</div>
+      ) : null}
+      {perms.error ? <div className={styles.error}>{perms.error}</div> : null}
+      <PluginUpdateOutcome mutation={updatePlugin} />
+      <Section
+        icon="layers"
+        title="Plugins"
+        count={plugins.length}
+        empty={ext.isLoading ? "Loading…" : "No plugin installed."}
+        action={<MarketplacesButton updates={totalUpdates(plugins)} onOpen={() => setMktOpen(true)} />}
+      >
+        {plugins.map((p) => {
+          const at = pluginAtScope(p, perms);
+          return (
+            <PluginRow
+              key={p.id}
+              plugin={{ ...p, enabled: at.enabled }}
+              busy={perms.pending}
+              onToggle={(enabled) => togglePlugin(p, enabled)}
+              toggleTitle={at.title}
+              toggleLocked={at.locked}
+              note={at.note}
+              onOpen={() => setPluginView({ plugin: p, section: "skills" })}
+              onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
+              updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
+              anyUpdating={updatePlugin.isPending}
+            />
+          );
+        })}
+      </Section>
+      <Section icon="spark" title="Your skills" count={skills.length} empty="No skill in ~/.claude/skills.">
+        {skills.map((s) => (
+          <SkillRow
+            key={s.path}
+            skill={s}
+            onOpen={() => setDoc({ name: s.name, source: CONFIG_SCOPE_LABEL[s.scope], path: s.path, description: s.description })}
+          />
+        ))}
+      </Section>
+      <Section icon="grid" title="Your sub-agents" count={agents.length} empty="No sub-agent in ~/.claude/agents.">
+        {agents.map((a) => (
+          <AgentRow
+            key={a.path}
+            agent={a}
+            onOpen={() => setDoc({ name: a.name, source: CONFIG_SCOPE_LABEL[a.scope], path: a.path, description: a.description })}
+          />
+        ))}
+      </Section>
+      {pluginView ? (
+        <PluginExplorer
+          plugin={pluginView.plugin}
+          initialSection={pluginView.section}
+          repoPath={home ?? "~"}
+          codexMeta={null}
+          onClose={() => setPluginView(null)}
+        />
+      ) : null}
+      {doc ? <DocViewer doc={doc} onClose={() => setDoc(null)} /> : null}
+      {mktOpen ? <MarketplacesPage path={home ?? "~"} plugins={plugins} onClose={() => setMktOpen(false)} /> : null}
     </div>
   );
 }
