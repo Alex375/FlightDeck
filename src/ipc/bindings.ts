@@ -1590,6 +1590,32 @@ async setOutputStyle(style: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Every permission rule that can concern an MCP tool, from the managed, local, project
+ * (`repo_path`) and user settings files — what the per-tool permission rows resolve their
+ * effective state from. Blocking file IO runs off the async runtime.
+ */
+async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRulesView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("mcp_permission_rules", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set (or clear) the user's own permission rule for MCP tools, in `~/.claude/settings.json`
+ * — exact tool names only, one atomic write for the whole batch, read back and verified.
+ * A running session picks it up from its next tool call (the CLI watches the file).
+ */
+async setMcpToolPermissions(changes: McpToolPermissionChange[]) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Everything a single plugin provides (skills / sub-agents / MCP servers) for the
  * per-plugin explorer — scanned regardless of the plugin's enabled state so a
  * disabled plugin stays browsable. `repo_path` selects the install relevant to the
@@ -4464,12 +4490,49 @@ tool_count: number;
  */
 tools: string[]; 
 /**
+ * The same tools with what the server says about each one (description, read-only /
+ * destructive hints) — what the per-tool permission rows are built from. Claude only
+ * (`mcp_status` carries it); empty for Codex, whose rows show plain names.
+ */
+tool_info?: McpToolInfo[]; 
+/**
  * Why a Codex MCP server failed to start (e.g. `reauthenticationRequired`), captured
  * from the `mcpServer/startupStatus/updated` push. Turns a mute "disconnected" into a
  * named "failed" reason. `None` for Claude servers and for Codex servers that started
  * fine.
  */
 failure_reason?: string | null }
+/**
+ * One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
+ * SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
+ * get them wrong, so the UI treats them as a suggestion, never as a guarantee.
+ */
+export type McpToolInfo = { 
+/**
+ * The tool's own name, as the server declares it (not the `mcp__…` rule name).
+ */
+name: string; 
+/**
+ * The server's description of the tool, capped for display.
+ */
+description: string | null; 
+/**
+ * `annotations.readOnly` — the tool claims not to change anything.
+ */
+read_only: boolean | null; 
+/**
+ * `annotations.destructive` — the tool claims it may change or delete data.
+ */
+destructive: boolean | null }
+/**
+ * One change to the user's rules: set `tool`'s rule to `kind`, or remove it (`None`,
+ * i.e. back to "no rule of mine").
+ */
+export type McpToolPermissionChange = { 
+/**
+ * The full MCP tool name (`mcp__<server>__<tool>`).
+ */
+tool: string; kind: ToolRuleKind | null }
 /**
  * One authoritative content block of an assistant message.
  */
@@ -4523,6 +4586,33 @@ decision_reason: JsonValue;
  * turn is blocked.
  */
 agent_id: string | null }
+/**
+ * One permission rule that can concern an MCP tool.
+ */
+export type PermissionRule = { 
+/**
+ * The rule verbatim (`mcp__claude_ai_Gmail__send_message`, `mcp__claude_ai_Gmail`,
+ * `mcp__claude_ai_Gmail__*`, `mcp__*`, `*`…).
+ */
+rule: string; kind: ToolRuleKind; source: RuleSource; 
+/**
+ * The file it was read from, for the UI to name.
+ */
+path: string }
+/**
+ * Every MCP-relevant permission rule visible to a repository.
+ */
+export type PermissionRulesView = { rules: PermissionRule[]; 
+/**
+ * Files that exist but could not be read or parsed. Their rules are UNKNOWN, so the
+ * view is incomplete — the UI says so rather than presenting a partial picture as whole.
+ */
+warnings: string[]; 
+/**
+ * Set when the USER file itself is unreadable: the app must not offer to write a file
+ * it could not read (a rewrite would drop whatever it failed to parse).
+ */
+user_error: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -4864,6 +4954,26 @@ export type RoutingOrigin =
  * A built-in with no definition file: it follows the baseline, or the conversation.
  */
 "built_in"
+/**
+ * The settings file a rule was read from. Only `User` is ever written by the app.
+ */
+export type RuleSource = 
+/**
+ * Organization policy (`/Library/Application Support/ClaudeCode/managed-settings.json`).
+ */
+"managed" | 
+/**
+ * `<repo>/.claude/settings.local.json` — this project, this machine.
+ */
+"local" | 
+/**
+ * `<repo>/.claude/settings.json` — shared with everyone on the repository.
+ */
+"project" | 
+/**
+ * `~/.claude/settings.json` — the user's own, every project.
+ */
+"user"
 /**
  * A rate-limit window that applies to a NAMED subset of usage (today: a single model) rather
  * than the account as a whole. Kept separate from the two flat windows because its label is
@@ -5343,6 +5453,10 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * Which of Claude Code's three rule lists a rule sits in.
+ */
+export type ToolRuleKind = "allow" | "ask" | "deny"
 /**
  * The TOSSE connection as the Settings tab shows it. `connected` false with a
  * `signed_out_reason` means we HELD a session and it stopped working (revoked/expired

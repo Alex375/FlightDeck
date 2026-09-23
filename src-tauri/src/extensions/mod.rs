@@ -28,6 +28,7 @@
 //! the IPC layer or the UI.
 
 pub mod agent_edit;
+pub mod permissions;
 pub mod routing;
 
 use std::collections::BTreeMap;

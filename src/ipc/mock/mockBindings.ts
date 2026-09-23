@@ -55,6 +55,9 @@ import type {
   McpAuthResult,
   LiveModel,
   McpServerLive,
+  McpToolPermissionChange,
+  PermissionRule,
+  PermissionRulesView,
   RewindFilesResult,
   PluginContents,
   PermissionDecision,
@@ -981,6 +984,7 @@ function mockSpendReport(): SpendReport {
 
 /** Mock-only: the current global output style, so a set is reflected by the next get. */
 let mockOutputStyle = "default";
+let mockPermissionRules: PermissionRule[] = [];
 
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
@@ -3082,6 +3086,17 @@ export const mockCommands = {
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {
     return ok([]);
+  },
+  // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
+  async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {
+    return ok({ rules: mockPermissionRules, warnings: [], user_error: null });
+  },
+  async setMcpToolPermissions(changes: McpToolPermissionChange[]): Promise<Result<null, string>> {
+    for (const c of changes) {
+      mockPermissionRules = mockPermissionRules.filter((r) => !(r.source === "user" && r.rule === c.tool));
+      if (c.kind) mockPermissionRules.push({ rule: c.tool, kind: c.kind, source: "user", path: "~/.claude/settings.json" });
+    }
+    return ok(null);
   },
   async mcpToggle(_session: string, _serverName: string, _enabled: boolean): Promise<Result<null, string>> {
     return ok(null);

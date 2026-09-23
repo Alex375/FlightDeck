@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::model::{
-    LiveModel, McpAuthResult, McpServerLive, RemoteControlState, RewindFilesResult, SlashCommand,
+    LiveModel, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState, RewindFilesResult,
+    SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -655,15 +656,12 @@ pub fn parse_mcp_status(line: &Value) -> Vec<McpServerLive> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             };
-            let tools: Vec<String> = s
+            let tool_info: Vec<McpToolInfo> = s
                 .get("tools")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(mcp_tool_info).collect())
                 .unwrap_or_default();
+            let tools: Vec<String> = tool_info.iter().map(|t| t.name.clone()).collect();
             Some(McpServerLive {
                 name,
                 status,
@@ -676,11 +674,39 @@ pub fn parse_mcp_status(line: &Value) -> Vec<McpServerLive> {
                 url: field("url").as_deref().map(strip_url_query),
                 tool_count: tools.len() as u32,
                 tools,
+                tool_info,
                 // Claude's live MCP status has no structured startup-failure reason.
                 failure_reason: None,
             })
         })
         .collect()
+}
+
+/// Longest tool description carried across the IPC boundary — it is shown as a tooltip,
+/// and some servers ship pages of prompt text in it.
+const MCP_TOOL_DESCRIPTION_MAX: usize = 400;
+
+/// One `mcp_status` tool entry → [`McpToolInfo`]. Schema from the binary (2.1.280):
+/// `{name, description?, annotations?: {readOnly?, destructive?, openWorld?}}` — note the
+/// keys are `readOnly` / `destructive`, NOT the MCP spec's `readOnlyHint` spelling.
+fn mcp_tool_info(t: &Value) -> Option<McpToolInfo> {
+    let name = t.get("name").and_then(Value::as_str)?.to_string();
+    let description = t
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(|d| match d.char_indices().nth(MCP_TOOL_DESCRIPTION_MAX) {
+            Some((cut, _)) => format!("{}…", d[..cut].trim_end()),
+            None => d.to_string(),
+        });
+    let hint = |k: &str| t.get("annotations").and_then(|a| a.get(k)).and_then(Value::as_bool);
+    Some(McpToolInfo {
+        name,
+        description,
+        read_only: hint("readOnly"),
+        destructive: hint("destructive"),
+    })
 }
 
 /// `mcp_toggle` — enable/disable ONE MCP server live in the session (the binary
@@ -1374,6 +1400,33 @@ mod tests {
         assert_eq!(servers[0].url.as_deref(), Some("https://h/mcp"), "query + fragment stripped");
     }
 
+    /// Each tool carries its description and the server's read-only / destructive hints
+    /// (keys `readOnly` / `destructive` in `mcp_status`, not the MCP spec's `…Hint`), and
+    /// the plain name list stays in step with it.
+    #[test]
+    fn parse_mcp_status_reads_tool_hints() {
+        let long = "x".repeat(MCP_TOOL_DESCRIPTION_MAX + 50);
+        let line = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "x", "response": { "mcpServers": [
+                { "name": "claude.ai Gmail", "status": "connected", "scope": "claudeai", "tools": [
+                    { "name": "search_threads", "description": "Search mail",
+                      "annotations": { "readOnly": true } },
+                    { "name": "send_message", "description": long,
+                      "annotations": { "readOnly": false, "destructive": true } },
+                    { "name": "label_thread" }
+                ] }
+            ] } }
+        });
+        let s = &parse_mcp_status(&line)[0];
+        assert_eq!(s.tools, vec!["search_threads", "send_message", "label_thread"]);
+        assert_eq!(s.tool_info[0].read_only, Some(true));
+        assert_eq!(s.tool_info[0].description.as_deref(), Some("Search mail"));
+        assert_eq!(s.tool_info[1].destructive, Some(true));
+        assert!(s.tool_info[1].description.as_deref().unwrap().ends_with('…'), "capped");
+        assert_eq!(s.tool_info[2].read_only, None, "absent hint stays unknown");
+    }
+
     /// Live probe: confirm the `mcp_status` control request is answered by the real
     /// binary and DUMP the raw `control_response` so we can read the exact response
     /// shape (nesting + per-server fields) before building on it. Ignored by default
@@ -1433,6 +1486,15 @@ mod tests {
                         let scope = s.get("scope").and_then(Value::as_str).unwrap_or("-");
                         let ntools = s.get("tools").and_then(Value::as_array).map_or(0, |t| t.len());
                         eprintln!("  {name:42} status={status:14} scope={scope:10} tools={ntools}");
+                        // The first few tools verbatim: their `name` spelling (bare, or
+                        // already `mcp__…`?) and the `annotations` keys the rows rely on.
+                        for t in s.get("tools").and_then(Value::as_array).into_iter().flatten().take(3) {
+                            let mut t = t.clone();
+                            if let Some(o) = t.as_object_mut() {
+                                o.remove("description");
+                            }
+                            eprintln!("      {t}");
+                        }
                     }
                 }
                 None => eprintln!("  <no mcpServers in response>"),

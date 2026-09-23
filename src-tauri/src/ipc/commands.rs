@@ -3334,6 +3334,36 @@ pub async fn get_output_style() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Every permission rule that can concern an MCP tool, from the managed, local, project
+/// (`repo_path`) and user settings files — what the per-tool permission rows resolve their
+/// effective state from. Blocking file IO runs off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn mcp_permission_rules(
+    repo_path: Option<String>,
+) -> Result<crate::extensions::permissions::PermissionRulesView, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::permissions::read_mcp_permission_rules(repo_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Set (or clear) the user's own permission rule for MCP tools, in `~/.claude/settings.json`
+/// — exact tool names only, one atomic write for the whole batch, read back and verified.
+/// A running session picks it up from its next tool call (the CLI watches the file).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_mcp_tool_permissions(
+    changes: Vec<crate::extensions::permissions::McpToolPermissionChange>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::permissions::set_mcp_tool_permissions(&changes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;
 /// `"default"` removes the key). USER-GLOBAL, atomic, order-preserving write. A live
 /// session reflects the change on its next turn's `system/init`; otherwise it lands on

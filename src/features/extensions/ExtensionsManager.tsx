@@ -41,7 +41,10 @@ import {
   useSetMarketplaceAutoUpdate,
   useSetPluginEnabled,
   useUpdatePlugin,
+  useMcpPermissionRules,
+  useSetMcpToolPermissions,
 } from "../../ipc/useExtensions";
+import { McpPermissionSummary, McpToolPermissions } from "./McpToolPermissionRows";
 import { useConversationsStore, type BackendKind, type Conversation } from "../../store/conversationsStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import type {
@@ -647,6 +650,9 @@ function ConversationBody({
   resetToken: string;
 }) {
   const actions = useMcpActions(handle);
+  // Per-tool permission rules, resolved against this repository's settings files too.
+  const permRules = useMcpPermissionRules(path);
+  const setPerms = useSetMcpToolPermissions();
   // A live session lets an update hot-apply via reload_plugins (handle non-null);
   // otherwise it lands on the next spawn.
   const updatePlugin = useUpdatePlugin(path, handle);
@@ -725,7 +731,13 @@ function ConversationBody({
               </div>
               <div className={styles.list}>
                 {g.items.map((m) => (
-                  <McpLiveRow key={`${m.scope ?? ""}:${m.name}`} mcp={m} actions={actions} />
+                  <McpLiveRow
+                    key={`${m.scope ?? ""}:${m.name}`}
+                    mcp={m}
+                    actions={actions}
+                    rules={permRules}
+                    setPerms={setPerms}
+                  />
                 ))}
               </div>
             </div>
@@ -1652,7 +1664,18 @@ function WarningBanner({ warnings }: { warnings: string[] }) {
 
 // ---- MCP rows ------------------------------------------------------------------
 
-function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<typeof useMcpActions> }) {
+function McpLiveRow({
+  mcp,
+  actions,
+  rules,
+  setPerms,
+}: {
+  mcp: McpServerLive;
+  actions: ReturnType<typeof useMcpActions>;
+  /** The permission rules the per-tool rows resolve from (Claude only). */
+  rules: ReturnType<typeof useMcpPermissionRules>;
+  setPerms: ReturnType<typeof useSetMcpToolPermissions>;
+}) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
   const b = liveBadge(mcp.scope);
@@ -1676,12 +1699,13 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
         <span className={styles.rowName}>{mcp.name}</span>
         <Badge label={b.label} cls={b.cls} />
         <span className={styles.spacer} />
+        <McpPermissionSummary server={mcp} view={rules.data} />
         {mcp.tool_count > 0 ? <span className={styles.toolPill}>{mcp.tool_count} tools</span> : null}
         {canExpand ? (
           <button
             className={styles.chevBtn}
             onClick={() => setOpen((o) => !o)}
-            title={open ? "Hide tools" : "Show tools"}
+            title={open ? "Hide tools" : "Show tools and their permissions"}
             aria-label="Show tools"
           >
             <Ico name="chev" className={"sm " + styles.chev + (open ? " " + styles.chevOpen : "")} />
@@ -1744,13 +1768,7 @@ function McpLiveRow({ mcp, actions }: { mcp: McpServerLive; actions: ReturnType<
           />
         </div>
       </div>
-      {open ? (
-        <div className={styles.toolList}>
-          {mcp.tools.map((t) => (
-            <span key={t} className={styles.toolChip}>{t}</span>
-          ))}
-        </div>
-      ) : null}
+      {open ? <McpToolPermissions server={mcp} rules={rules} setPerms={setPerms} /> : null}
     </div>
   );
 }

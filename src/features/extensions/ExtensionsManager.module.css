@@ -1221,3 +1221,137 @@
   box-shadow: var(--shadow-overlay);
   overflow: hidden;
 }
+
+/* ---- Per-tool permissions (expanded live MCP row) ---- */
+.permSummary {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+}
+.permPanel {
+  padding: 2px 14px 13px 32px;
+}
+.permBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.permHint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--wf-tx-xlo);
+}
+.permMsg {
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  margin-bottom: 8px;
+}
+.permList {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--wf-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.permRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--wf-line);
+}
+.permRow:first-child {
+  border-top: none;
+}
+.permName {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.permTool {
+  font-family: var(--wf-mono);
+  font-size: 11px;
+  color: var(--wf-tx);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
+.permNature {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--wf-line-2);
+  color: var(--wf-tx-lo);
+  cursor: help;
+}
+/* Guessed from the name, not declared by the server — drawn dashed so it reads as a guess. */
+.permNatureGuess {
+  border-style: dashed;
+  color: var(--wf-tx-xlo);
+}
+.permSeg {
+  display: inline-flex;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.permOpt {
+  font: inherit;
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border: none;
+  border-left: 1px solid var(--wf-line-2);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+}
+.permOpt:first-child {
+  border-left: none;
+}
+.permOpt:hover:not(:disabled) {
+  color: var(--wf-tx-hi);
+  background: var(--wf-panel-3);
+}
+.permOpt:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.permOptOn {
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+  background: var(--wf-panel-3);
+}
+.permOptOn.permOpt_allow {
+  color: var(--wf-run);
+  background: var(--wf-run-bg);
+}
+.permOptOn.permOpt_ask {
+  color: #f0b15a;
+  background: rgba(240, 177, 90, 0.12);
+}
+.permOptOn.permOpt_deny {
+  color: var(--wf-err);
+  background: var(--wf-err-bg);
+}
+.permNote {
+  grid-column: 1 / -1;
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--wf-tx-xlo);
+  font-family: var(--wf-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.permNoteWarn {
+  color: #f0b15a;
+}

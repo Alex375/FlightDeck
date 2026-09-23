@@ -16,6 +16,8 @@ import type {
   ExtensionsSnapshot,
   MarketplaceInfo,
   McpServerLive,
+  McpToolPermissionChange,
+  PermissionRulesView,
   PluginContents,
   Result,
 } from "./client";
@@ -230,6 +232,37 @@ export function useMcpStatus(handle: string | null) {
     queryFn: () => unwrap(commands.mcpStatus(handle!)),
     staleTime: 2_000,
     refetchInterval: 4_000,
+  });
+}
+
+/** Query key for the MCP permission rules a repository sees. */
+export const mcpPermissionRulesKey = (repoPath: string | null) => ["mcp-permission-rules", repoPath] as const;
+
+/**
+ * Every permission rule that can reach an MCP tool (managed, local, project, user files),
+ * for the per-tool rows. Polled like the live status while the manager is open: the same
+ * rules can change under us from the CLI's own `/permissions` dialog or a hand edit.
+ */
+export function useMcpPermissionRules(repoPath: string | null) {
+  return useQuery<PermissionRulesView>({
+    queryKey: mcpPermissionRulesKey(repoPath),
+    queryFn: () => unwrap(commands.mcpPermissionRules(repoPath)),
+    staleTime: 2_000,
+    refetchInterval: 4_000,
+  });
+}
+
+/**
+ * Write the user's own per-tool rules (`~/.claude/settings.json`). Refetches the rules
+ * whatever the outcome — a write can fail AFTER landing (the read-back check), and the
+ * rows must show what the file really says.
+ */
+export function useSetMcpToolPermissions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (changes: McpToolPermissionChange[]): Promise<null> =>
+      unwrap(commands.setMcpToolPermissions(changes)),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["mcp-permission-rules"] }),
   });
 }
 

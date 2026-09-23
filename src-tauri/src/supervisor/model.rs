@@ -143,12 +143,32 @@ pub struct McpServerLive {
     /// Names of the tools the server exposes (empty unless connected) — shown when
     /// the user expands a server row.
     pub tools: Vec<String>,
+    /// The same tools with what the server says about each one (description, read-only /
+    /// destructive hints) — what the per-tool permission rows are built from. Claude only
+    /// (`mcp_status` carries it); empty for Codex, whose rows show plain names.
+    #[serde(default)]
+    pub tool_info: Vec<McpToolInfo>,
     /// Why a Codex MCP server failed to start (e.g. `reauthenticationRequired`), captured
     /// from the `mcpServer/startupStatus/updated` push. Turns a mute "disconnected" into a
     /// named "failed" reason. `None` for Claude servers and for Codex servers that started
     /// fine.
     #[serde(default)]
     pub failure_reason: Option<String>,
+}
+
+/// One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
+/// SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
+/// get them wrong, so the UI treats them as a suggestion, never as a guarantee.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct McpToolInfo {
+    /// The tool's own name, as the server declares it (not the `mcp__…` rule name).
+    pub name: String,
+    /// The server's description of the tool, capped for display.
+    pub description: Option<String>,
+    /// `annotations.readOnly` — the tool claims not to change anything.
+    pub read_only: Option<bool>,
+    /// `annotations.destructive` — the tool claims it may change or delete data.
+    pub destructive: Option<bool>,
 }
 
 /// Result of an `mcp_authenticate` control request (OAuth start for an http/sse
