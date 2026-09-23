@@ -259,7 +259,7 @@ pub async fn spawn_session(
     cfg.claude_account = claude_slot(&app, claude_account_id.as_deref()).map_err(|e| {
         format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
     })?;
-    // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
+    // Product defaults when unset: newest Opus + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
     // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
@@ -270,9 +270,9 @@ pub async fn spawn_session(
     let effort = effort
         .filter(|e| control::is_valid_effort_level(e))
         .unwrap_or_else(|| "xhigh".into());
-    // Full model name, not the `opus` alias — that alias tracks the LATEST Opus, so
-    // pinning 4.8 means naming it. Mirrors the front-end seed `DEFAULT_MODEL`.
-    cfg.model = Some(model.unwrap_or_else(|| "claude-opus-4-8".into()));
+    // The `opus` alias, which the binary resolves to the LATEST Opus — the default
+    // follows each release on its own. Mirrors the front-end seed `DEFAULT_MODEL`.
+    cfg.model = Some(model.unwrap_or_else(|| "opus".into()));
     cfg.effort = Some(effort);
     // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
     // off (e.g. the user turned the Settings toggle back off while a conversation still

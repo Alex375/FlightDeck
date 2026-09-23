@@ -51,7 +51,9 @@ const SLOT_ORDER = [
   "claude-opus-4-8",
   "sonnet",
   "haiku",
-  "claude-opus-4-7",
+  // Opus 5 took this slot from Opus 4.7 when the `opus` alias moved on to Opus 5.5: a
+  // month of Opus 5 history outweighs 4.7's, and swapping ONE slot shifts no other hue.
+  "claude-opus-5",
   "claude-sonnet-4-6",
 ];
 

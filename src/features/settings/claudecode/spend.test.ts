@@ -46,14 +46,24 @@ describe("matching a transcript model id to the catalogue", () => {
   // The six model ids that actually appear in the real corpus on this machine.
   it("resolves every model id observed in real transcripts", () => {
     expect(catalogueIdForTranscriptModel("claude-fable-5-1")).toBe("fable");
-    expect(catalogueIdForTranscriptModel("claude-opus-5")).toBe("opus");
+    expect(catalogueIdForTranscriptModel("claude-opus-5-5")).toBe("opus");
+    // Opus 5 ran under the `opus` alias until the alias moved on to Opus 5.5 — its
+    // history now lands on its own pinned row, never on the alias.
+    expect(catalogueIdForTranscriptModel("claude-opus-5")).toBe("claude-opus-5");
     expect(catalogueIdForTranscriptModel("claude-opus-4-8")).toBe("claude-opus-4-8");
     expect(catalogueIdForTranscriptModel("claude-sonnet-5")).toBe("sonnet");
     expect(catalogueIdForTranscriptModel("claude-haiku-4-5-20251001")).toBe("haiku");
-    // Fable 5 is NOT in the picker catalogue, yet it is ~30% of the real corpus. It has to
-    // survive as its own priced, labelled row anyway — see pricingKeyForTranscriptModel.
-    expect(catalogueIdForTranscriptModel("claude-fable-5")).toBeNull();
+    expect(catalogueIdForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
     expect(pricingKeyForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
+  });
+
+  it("keeps Opus 5 and Opus 5.5 apart (the same prefix trap as Fable)", () => {
+    expect(labelForTranscriptModel("claude-opus-5")).toBe("Opus 5");
+    expect(labelForTranscriptModel("claude-opus-5-5")).toBe("Opus 5.5");
+  });
+
+  it("returns null for a model the catalogue has never heard of", () => {
+    expect(catalogueIdForTranscriptModel("claude-opus-9")).toBeNull();
   });
 
   it("keeps Fable 5 and Fable 5.1 apart", () => {
@@ -139,7 +149,8 @@ describe("costing", () => {
   it("matches the published rate card for every priced model", () => {
     expect(DEFAULT_RATES["fable"]).toEqual({ input: 10, output: 50 });
     expect(DEFAULT_RATES["claude-fable-5"]).toEqual({ input: 10, output: 50 });
-    expect(DEFAULT_RATES["opus"]).toEqual({ input: 5, output: 25 });
+    expect(DEFAULT_RATES["opus"]).toEqual({ input: 4, output: 20 }); // Opus 5.5
+    expect(DEFAULT_RATES["claude-opus-5"]).toEqual({ input: 5, output: 25 });
     expect(DEFAULT_RATES["claude-opus-4-8"]).toEqual({ input: 5, output: 25 });
     expect(DEFAULT_RATES["claude-opus-4-7"]).toEqual({ input: 5, output: 25 });
     expect(DEFAULT_RATES["sonnet"]).toEqual({ input: 2, output: 10 });

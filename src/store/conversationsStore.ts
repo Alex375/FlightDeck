@@ -38,6 +38,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 // value. modelPrefs only imports `BackendKind` as a TYPE from here (erased at runtime),
 // so this value edge is acyclic.
 import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
+import { FACTORY_CLAUDE_MODEL } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
@@ -113,10 +114,10 @@ export function conversationTitleForSpawn(name: string): string | null {
 // `defaultEffortFor` (store/modelPrefs) instead of these constants — which stay as the
 // last-resort floor and as what "Reset" returns to.
 //
-// Opus 4.8 by its FULL name, not a family alias: `opus` always resolves to the LATEST
-// Opus, so pinning 4.8 requires naming it (see CLAUDE_MODELS). Keep in sync with the
-// Rust spawn fallback in `ipc/commands.rs`.
-export const DEFAULT_MODEL = "claude-opus-4-8";
+// The newest Opus, via its family alias (`opus`) — derived from the catalogue, so it
+// follows the next release on its own (see CLAUDE_MODELS). Keep in sync with the Rust
+// spawn fallback in `ipc/commands.rs`.
+export const DEFAULT_MODEL = FACTORY_CLAUDE_MODEL;
 export const DEFAULT_EFFORT = "xhigh";
 // "auto" is the binary's own native default and what the live session reports;
 // keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.

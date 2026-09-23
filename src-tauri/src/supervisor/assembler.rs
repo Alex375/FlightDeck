@@ -1248,25 +1248,57 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
     }
 }
 
-/// Friendly label for a model id (alias OR resolved id) — matches the composer's.
+/// Friendly label for a model id (alias OR resolved id) — matches the composer's
+/// catalogue (`CLAUDE_MODELS`, front).
+///
+/// A family alias names the NEWEST model of its family, so it must read exactly like the
+/// resolved id it stands for: the change notice compares labels, and a seed of `opus`
+/// read back as `claude-opus-5-5[1m]` is a confirmation, not a model switch.
+/// ⚠️ Keep the alias arms in step with the `modelId` of the front's alias rows — the CLI
+/// moves an alias on each release (`opus` went Opus 5 → Opus 5.5 in 2.1.280).
+///
+/// Every other id is read off its own name (`claude-<family>-<major>[-<minor>]`, or the
+/// older `claude-<major>-<minor>-<family>`), so a pinned version can never be mistaken
+/// for the family's newest — the bug a `contains("opus")` ladder kept reintroducing.
 fn model_label(id: &str) -> String {
     let s = id.to_lowercase();
-    // The full-name check comes FIRST: a resolved id carries both the full name and
-    // the family alias (`claude-opus-4-8[1m]` contains "opus"), so the generic branch
-    // would otherwise announce Opus 4.8 as "Opus 5".
-    if s.contains("opus-4-8") {
-        "Opus 4.8".to_string()
-    } else if s.contains("opus") {
-        "Opus 5".to_string()
-    } else if s.contains("sonnet") {
-        "Sonnet 5".to_string()
-    } else if s.contains("haiku") {
-        "Haiku 4.5".to_string()
-    } else if s.contains("fable") {
-        "Fable 5.1".to_string()
-    } else {
-        id.to_string()
+    match s.as_str() {
+        "opus" => return "Opus 5.5".to_string(),
+        "sonnet" => return "Sonnet 5".to_string(),
+        "haiku" => return "Haiku 4.5".to_string(),
+        "fable" => return "Fable 5.1".to_string(),
+        _ => {}
     }
+    parse_model_label(&s).unwrap_or_else(|| id.to_string())
+}
+
+/// `claude-opus-4-8[1m]` → "Opus 4.8", `claude-3-5-sonnet-20241022` → "Sonnet 3.5",
+/// `us.anthropic.claude-opus-4-6-v1` → "Opus 4.6". `None` for anything else.
+fn parse_model_label(s: &str) -> Option<String> {
+    const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
+    let from = s.find("claude-")?;
+    // Drop the context suffix (`[1m]`) and provider tails (`@20250805`, `:0`).
+    let name = s[from..].split(['[', '@', ':']).next()?;
+    let mut family = None;
+    let mut version: Vec<&str> = Vec::new();
+    for part in name.split('-').skip(1) {
+        if FAMILIES.contains(&part) {
+            family = Some(part);
+        } else if part.len() <= 2 && part.chars().all(|c| c.is_ascii_digit()) {
+            // Version digits only — an 8-digit date stamp or a `v1` tail is not one.
+            version.push(part);
+        }
+    }
+    let family = family?;
+    if version.last() == Some(&"0") && version.len() > 1 {
+        version.pop(); // `claude-opus-4-0` is "Opus 4"
+    }
+    if version.is_empty() {
+        return None;
+    }
+    let mut label = family[..1].to_uppercase();
+    label.push_str(&family[1..]);
+    Some(format!("{label} {}", version.join(".")))
 }
 
 /// Friendly effort label, folding the ultracode tier in. `None` when there is no
@@ -2178,9 +2210,9 @@ mod tests {
         let mut asm = seeded();
         // The initial get_settings confirms the seed → state only, no notice. The
         // resolved id has to be the one the `opus` alias actually names — the LATEST
-        // Opus, i.e. Opus 5 (`claude-opus-4-8` is now its own catalogue row, so reading
-        // it back against an `opus` seed is a genuine model change, not a confirmation).
-        let evs = asm.apply_settings(Some("claude-opus-5[1m]".into()), Some("xhigh".into()), Some(false));
+        // Opus, i.e. Opus 5.5 (Opus 5 and 4.8 are their own catalogue rows, so reading
+        // one back against an `opus` seed is a genuine model change, not a confirmation).
+        let evs = asm.apply_settings(Some("claude-opus-5-5[1m]".into()), Some("xhigh".into()), Some(false));
         assert!(first_notice(evs).is_none(), "confirming the seed must stay silent");
         // Now a genuine change xhigh → high.
         let (subtype, detail) = first_notice(asm.apply_settings(None, Some("high".into()), Some(false)))
@@ -2228,7 +2260,7 @@ mod tests {
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
         assert_eq!(detail["control"], serde_json::json!("Model"));
-        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
     }
 
@@ -2246,8 +2278,57 @@ mod tests {
         }))
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
-        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
         assert_eq!(detail["to"], serde_json::json!("Opus 4.8"));
+    }
+
+    /// Opus 5 became a pinned row when the `opus` alias moved on to Opus 5.5 — and its
+    /// id is a PREFIX of the new one, so neither may be read as the other.
+    #[test]
+    fn opus_5_and_opus_5_5_are_told_apart() {
+        let mut asm = seeded();
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "s", "uuid": "u", "cwd": "/x",
+            "model": "claude-opus-5[1m]", "permissionMode": "default",
+            "tools": ["Bash"], "slash_commands": []
+        }))
+        .unwrap();
+        let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
+        assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
+        assert_eq!(detail["to"], serde_json::json!("Opus 5"));
+    }
+
+    /// Each alias reads exactly like the id the CLI resolves it to (else a spawn on an
+    /// alias would announce a phantom model change at its first read-back), and every
+    /// other id is labelled off its own name — the front catalogue's labels, verbatim.
+    #[test]
+    fn model_labels_match_the_catalogue() {
+        for (alias, resolved) in [
+            ("opus", "claude-opus-5-5[1m]"),
+            ("sonnet", "claude-sonnet-5"),
+            ("haiku", "claude-haiku-4-5-20251001"),
+            ("fable", "claude-fable-5-1"),
+        ] {
+            assert_eq!(model_label(alias), model_label(resolved), "{alias} vs {resolved}");
+        }
+        for (id, label) in [
+            ("claude-opus-5-5", "Opus 5.5"),
+            ("claude-opus-5", "Opus 5"),
+            ("claude-opus-4-8[1m]", "Opus 4.8"),
+            ("claude-opus-4-0", "Opus 4"),
+            ("claude-opus-4-20250514", "Opus 4"),
+            ("claude-opus-4-1@20250805", "Opus 4.1"),
+            ("us.anthropic.claude-opus-4-6-v1", "Opus 4.6"),
+            ("claude-3-5-sonnet-20241022", "Sonnet 3.5"),
+            ("claude-3-7-sonnet", "Sonnet 3.7"),
+            ("claude-fable-5", "Fable 5"),
+            ("claude-mythos-5-1", "Mythos 5.1"),
+            ("gpt-5.5", "gpt-5.5"),
+            ("mystery", "mystery"),
+        ] {
+            assert_eq!(model_label(id), label, "{id}");
+        }
     }
 
     /// The `fable` family now resolves to Fable 5.1 (binary 2.1.260); the label must
@@ -2263,7 +2344,7 @@ mod tests {
         }))
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
-        assert_eq!(detail["from"], serde_json::json!("Opus 5"));
+        assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
         assert_eq!(detail["to"], serde_json::json!("Fable 5.1"));
     }
 

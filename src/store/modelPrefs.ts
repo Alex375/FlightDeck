@@ -10,6 +10,12 @@
 //     until someone thinks to look for it. The factory set (FACTORY_HIDDEN_MODELS) is
 //     just the seed for a user who has never touched the screen.
 //
+//   • A model the user has never SEEN gets the factory treatment. `seen` records which
+//     model each catalogue row ran when the prefs were last reconciled; a row that is new
+//     — or an alias that has since moved on to a newer model — is shown or hidden as on a
+//     fresh install (newest of its family: shown; older rows and Mythos: hidden). The
+//     user's earlier choices keep applying to the models they were actually made about.
+//
 //   • Defaults are PER BACKEND. Claude and Codex seed a new conversation from their own
 //     model + effort (a Claude alias would be rejected by the Codex binary and vice
 //     versa), which is exactly how createConversationInRepo already branches.
@@ -17,7 +23,9 @@ import { create } from "zustand";
 import {
   CLAUDE_MODELS,
   CODEX_MODELS,
+  FACTORY_CLAUDE_MODEL,
   FACTORY_HIDDEN_MODELS,
+  modelIdentity,
   modelOption,
   type ModelOption,
 } from "../features/conversation/models";
@@ -28,7 +36,8 @@ const STORAGE_KEY = "tosse:models";
 
 /** Factory defaults — the product's answer when the user has expressed no preference. */
 export const FACTORY_DEFAULTS = {
-  claudeModel: "claude-opus-4-8",
+  // The newest Opus — derived from the catalogue, so it follows the next release.
+  claudeModel: FACTORY_CLAUDE_MODEL,
   claudeEffort: "xhigh" as EffortLevel,
   // Kept in step with DEFAULT_CODEX_MODEL: this is the one a NEW Codex conversation is
   // seeded from, that one is the safety fallback when a conv's model isn't a Codex id.
@@ -45,6 +54,10 @@ export interface ModelPrefsData {
   claudeEffort: EffortLevel;
   codexModel: string;
   codexEffort: EffortLevel;
+  /** Catalogue value → the model it ran (its identity) when these prefs were last
+   *  reconciled. How a model the user has never seen is told apart from one they chose
+   *  to show or hide. */
+  seen: Record<string, string>;
 }
 
 interface ModelPrefsState extends ModelPrefsData {
@@ -59,6 +72,39 @@ interface ModelPrefsState extends ModelPrefsData {
   reset: () => void;
 }
 
+/** The static catalogue (both backends) — what `seen` tracks. The live Codex list is
+ *  left out on purpose: none of its models is factory-hidden, so none needs tracking. */
+const STATIC_CATALOGUE: readonly ModelOption[] = [...CLAUDE_MODELS, ...CODEX_MODELS];
+
+const currentSeen = (): Record<string, string> =>
+  Object.fromEntries(STATIC_CATALOGUE.map((m) => [m.value, modelIdentity(m)]));
+
+/**
+ * What a blob written BEFORE `seen` existed had seen: the Claude catalogue as it stood,
+ * each alias on the model its row was LABELLED as then (`opus` read "Opus 5"). Frozen —
+ * it describes the past and must not follow later catalogue edits. Codex rows are absent:
+ * none is factory-hidden, so an unseen one just stays shown, as it always did.
+ */
+const LEGACY_SEEN: Readonly<Record<string, string>> = {
+  fable: "claude-fable-5-1",
+  opus: "claude-opus-5",
+  "claude-opus-4-8": "claude-opus-4-8",
+  "claude-opus-4-7": "claude-opus-4-7",
+  "claude-opus-4-6": "claude-opus-4-6",
+  "claude-opus-4-5": "claude-opus-4-5",
+  "claude-opus-4-1": "claude-opus-4-1",
+  "claude-opus-4-0": "claude-opus-4-0",
+  sonnet: "claude-sonnet-5",
+  "claude-sonnet-4-6": "claude-sonnet-4-6",
+  "claude-sonnet-4-5": "claude-sonnet-4-5",
+  "claude-sonnet-4-0": "claude-sonnet-4-0",
+  "claude-3-7-sonnet": "claude-3-7-sonnet",
+  "claude-3-5-sonnet": "claude-3-5-sonnet",
+  haiku: "claude-haiku-4-5",
+  "claude-3-5-haiku": "claude-3-5-haiku",
+  "claude-mythos-5": "claude-mythos-5",
+};
+
 const factory = (): ModelPrefsData => ({
   hidden: [...FACTORY_HIDDEN_MODELS],
   order: [],
@@ -66,7 +112,47 @@ const factory = (): ModelPrefsData => ({
   claudeEffort: FACTORY_DEFAULTS.claudeEffort,
   codexModel: FACTORY_DEFAULTS.codexModel,
   codexEffort: FACTORY_DEFAULTS.codexEffort,
+  seen: currentSeen(),
 });
+
+/**
+ * Give every catalogue row the user has not seen the factory treatment, then mark the
+ * whole catalogue seen. A row is unseen when its value is new, or when it is an alias
+ * that now runs a different model than the one the user last saw under it.
+ *
+ *  - Factory-hidden (an older version, Mythos) → hidden, as on a fresh install.
+ *  - Factory-shown (the newest of its family) → shown. A brand-new value already is; a
+ *    MOVED alias has its old hide lifted — that hide was about the previous model, which
+ *    now has a pinned row of its own.
+ *
+ * Pure. A row the user hid while it ran the same model it runs now stays hidden.
+ */
+export function reconcileSeen(
+  hidden: readonly string[],
+  seen: Readonly<Record<string, string>>,
+): { hidden: string[]; seen: Record<string, string> } {
+  const next = new Set(hidden);
+  const factoryHidden = new Set(FACTORY_HIDDEN_MODELS);
+  for (const m of STATIC_CATALOGUE) {
+    const was = seen[m.value];
+    if (was === modelIdentity(m)) continue;
+    if (factoryHidden.has(m.value)) next.add(m.value);
+    else if (was !== undefined) next.delete(m.value);
+  }
+  // Already-hidden values keep their stored order; newly hidden ones follow.
+  const kept = hidden.filter((v) => next.has(v));
+  const added = [...next].filter((v) => !hidden.includes(v));
+  return { hidden: [...kept, ...added], seen: currentSeen() };
+}
+
+const seenMap = (v: unknown): Record<string, string> | null =>
+  v && typeof v === "object" && !Array.isArray(v)
+    ? Object.fromEntries(
+        Object.entries(v as Record<string, unknown>).filter(
+          (e): e is [string, string] => typeof e[1] === "string",
+        ),
+      )
+    : null;
 
 const strings = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
@@ -87,10 +173,15 @@ export function normalize(raw: unknown): ModelPrefsData {
     claude: known(o.claudeModel, base.claudeModel, "claude"),
     codex: known(o.codexModel, base.codexModel, "codex"),
   };
+  // `hidden` is only seeded when absent: an EMPTY stored array means the user showed
+  // everything, which must not be re-seeded with the factory hiding on next launch.
+  // A blob without `seen` predates it — it saw the catalogue LEGACY_SEEN describes.
+  const { hidden, seen } = Array.isArray(o.hidden)
+    ? reconcileSeen(strings(o.hidden), seenMap(o.seen) ?? LEGACY_SEEN)
+    : { hidden: base.hidden, seen: base.seen };
   return {
-    // `hidden` is only seeded when absent: an EMPTY stored array means the user showed
-    // everything, which must not be re-seeded with the factory hiding on next launch.
-    hidden: Array.isArray(o.hidden) ? strings(o.hidden) : base.hidden,
+    hidden,
+    seen,
     order: strings(o.order),
     claudeModel: model.claude,
     codexModel: model.codex,
@@ -108,7 +199,14 @@ const effortOr = (v: unknown, fallback: EffortLevel): EffortLevel =>
 function load(): ModelPrefsData {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return normalize(raw ? JSON.parse(raw) : null);
+    if (!raw) return factory();
+    const parsed = JSON.parse(raw);
+    const data = normalize(parsed);
+    // Write the reconciliation back, so the next catalogue change is measured from what
+    // this version showed — not from a snapshot several releases old.
+    const before = JSON.stringify([parsed?.hidden, parsed?.seen]);
+    if (JSON.stringify([data.hidden, data.seen]) !== before) save(data);
+    return data;
   } catch {
     return factory();
   }
@@ -169,6 +267,7 @@ function persist(s: ModelPrefsData) {
     claudeEffort: s.claudeEffort,
     codexModel: s.codexModel,
     codexEffort: s.codexEffort,
+    seen: s.seen,
   });
 }
 

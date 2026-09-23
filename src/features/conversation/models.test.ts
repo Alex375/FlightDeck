@@ -6,7 +6,9 @@ import {
   DEFAULT_CODEX_MODEL,
   RETIRED_CODEX_MODELS,
   backendOfModel,
+  latestClaudeModel,
   modelFamily,
+  modelIdentity,
   modelLabel,
   modelsForPicker,
 } from "./models";
@@ -43,7 +45,8 @@ describe("backendOfModel", () => {
 
 describe("modelLabel", () => {
   it("labels exact catalogue ids", () => {
-    expect(modelLabel("opus")).toBe("Opus 5");
+    // The `opus` alias resolves to Opus 5.5 as of CLI 2.1.280 (registry `aliases`).
+    expect(modelLabel("opus")).toBe("Opus 5.5");
     // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
     expect(modelLabel("fable")).toBe("Fable 5.1");
     expect(modelLabel("gpt-6-astra")).toBe("GPT-6 Astra");
@@ -61,8 +64,28 @@ describe("modelLabel", () => {
     // The resolved 1M-context id contains BOTH "claude-opus-4-8" and "opus" — the
     // longest catalogue value has to win.
     expect(modelLabel("claude-opus-4-8[1m]")).toBe("Opus 4.8");
-    // …and the generic Opus family still reads as Opus 5.
     expect(modelLabel("claude-opus-5[1m]")).toBe("Opus 5");
+  });
+
+  it("labels a point release by its own name, never by the id it extends", () => {
+    // `claude-opus-5-5` CONTAINS `claude-opus-5`: a plain substring match read every
+    // Opus 5.5 turn as "Opus 5". Same shape for Fable and Mythos.
+    expect(modelLabel("claude-opus-5-5")).toBe("Opus 5.5");
+    expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");
+    expect(modelLabel("claude-fable-5-1[1m]")).toBe("Fable 5.1");
+    expect(modelLabel("claude-fable-5")).toBe("Fable 5");
+    expect(modelLabel("claude-mythos-5-1")).toBe("Mythos 5.1");
+  });
+
+  it("reads provider-suffixed and dated ids", () => {
+    expect(modelLabel("claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
+    expect(modelLabel("us.anthropic.claude-opus-4-6-v1")).toBe("Opus 4.6");
+  });
+
+  it("never names a model the catalogue does not carry after its predecessor", () => {
+    // A release the catalogue has not caught up with yet reads as its raw id — honest —
+    // rather than as the nearest older model.
+    expect(modelLabel("claude-opus-5-7")).toBe("claude-opus-5-7");
   });
 
   it("falls back to the raw id / placeholder", () => {
@@ -73,7 +96,11 @@ describe("modelLabel", () => {
 
 describe("modelFamily (menu highlight)", () => {
   it("maps a resolved Claude id back to its picker value", () => {
-    expect(modelFamily("claude-opus-5[1m]")).toBe("opus");
+    // The alias row's identity is the model it resolves to…
+    expect(modelFamily("claude-opus-5-5[1m]")).toBe("opus");
+    expect(modelFamily("claude-fable-5-1")).toBe("fable");
+    // …and the model it used to name has a pinned row of its own.
+    expect(modelFamily("claude-opus-5[1m]")).toBe("claude-opus-5");
   });
   it("highlights Opus 4.8 (full name) rather than the Opus family row", () => {
     expect(modelFamily("claude-opus-4-8")).toBe("claude-opus-4-8");
@@ -187,11 +214,11 @@ describe("modelsForPicker (backend lock)", () => {
     const g = modelsForPicker("claude", {
       locked: true,
       codexAvailable: false,
-      hidden: ["opus", "haiku"],
+      hidden: ["claude-opus-5", "haiku"],
       current: "claude-opus-5[1m]",
     });
     const values = g[0].models.map((m) => m.value);
-    expect(values).toContain("opus");
+    expect(values).toContain("claude-opus-5");
     expect(values).not.toContain("haiku"); // the other hidden one stays hidden
   });
 
@@ -213,5 +240,27 @@ describe("modelsForPicker (backend lock)", () => {
 describe("catalogue integrity", () => {
   it("every model's value classifies to its own backend", () => {
     for (const m of ALL_MODELS) expect(backendOfModel(m.value)).toBe(m.backend);
+  });
+
+  it("every Claude row resolves back to itself, by value and by the id it runs", () => {
+    for (const m of CLAUDE_MODELS) {
+      expect(modelFamily(m.value)).toBe(m.value);
+      expect(modelFamily(modelIdentity(m))).toBe(m.value);
+      expect(modelFamily(`${modelIdentity(m)}[1m]`)).toBe(m.value);
+    }
+  });
+
+  it("identities are unique — two rows never claim the same model", () => {
+    const ids = CLAUDE_MODELS.map(modelIdentity);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("every Claude row names its family, and the family's first row is its newest", () => {
+    for (const m of CLAUDE_MODELS) expect(m.family).toBeTruthy();
+    expect(latestClaudeModel("opus")?.label).toBe("Opus 5.5");
+    expect(latestClaudeModel("fable")?.label).toBe("Fable 5.1");
+    expect(latestClaudeModel("sonnet")?.label).toBe("Sonnet 5");
+    expect(latestClaudeModel("haiku")?.label).toBe("Haiku 4.5");
+    expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.1");
   });
 });
