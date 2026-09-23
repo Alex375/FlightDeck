@@ -809,9 +809,18 @@ fn write_settings(
     home: &Path,
     transform: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
+    write_settings_file(&home.join(".claude/settings.json"), transform)
+}
+
+/// The same read-modify-write spine for ANY Claude settings file (a repository's
+/// `.claude/settings.local.json` too), under the same lock.
+fn write_settings_file(
+    path: &Path,
+    transform: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
     // Hold across the WHOLE read→transform→write so concurrent toggles serialize.
     let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = home.join(".claude/settings.json");
+    let path = path.to_path_buf();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),

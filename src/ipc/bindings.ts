@@ -1603,26 +1603,41 @@ async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRul
 }
 },
 /**
- * Set (or clear) the user's own permission rule for MCP tools, in `~/.claude/settings.json`
- * — exact tool names only, one atomic write for the whole batch, read back and verified.
- * A running session picks it up from its next tool call (the CLI watches the file).
+ * Set (or clear) MCP permission rules — per tool, or a whole server — in the global
+ * `~/.claude/settings.json` or in this repository's `.claude/settings.local.json`
+ * (`target`). One atomic write for the batch, read back and verified. Running sessions
+ * pick it up from their next tool call (the CLI watches both files).
  */
-async setMcpToolPermissions(changes: McpToolPermissionChange[]) : Promise<Result<null, string>> {
+async setMcpToolPermissions(changes: McpToolPermissionChange[], target: SettingsTarget, repoPath: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_mcp_tool_permissions", { changes, target, repoPath }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Replace a RUNNING conversation's own per-tool permission rules (its flag settings
- * layer — never a file, so no other conversation sees them). Effective from its next
- * tool call; a CLI rejection is returned, not swallowed.
+ * Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+ * flag settings layer (never a file, so no other conversation sees them). Rules bite from
+ * its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+ * returned, not swallowed.
  */
-async applySessionPermissions(session: string, rules: SessionToolRules) : Promise<Result<null, string>> {
+async applySessionOverrides(session: string, overrides: SessionOverrides, reloadPlugins: boolean) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("apply_session_permissions", { session, rules }) };
+    return { status: "ok", data: await TAURI_INVOKE("apply_session_overrides", { session, overrides, reloadPlugins }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Turn a plugin on/off in the global or this repository's local settings file, or remove
+ * that file's say (`enabled: null`) so the plugin follows the files below again. Read
+ * back and verified; a live session applies it on `reload_plugins`.
+ */
+async setPluginOverride(pluginId: string, enabled: boolean | null, target: SettingsTarget, repoPath: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_override", { pluginId, enabled, target, repoPath }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4639,7 +4654,19 @@ warnings: string[];
  * Set when the USER file itself is unreadable: the app must not offer to write a file
  * it could not read (a rewrite would drop whatever it failed to parse).
  */
-user_error: string | null }
+user_error: string | null; 
+/**
+ * Same for the repository's local file (the Repository scope's target).
+ */
+local_error: string | null; 
+/**
+ * Every `enabledPlugins` entry, per file.
+ */
+plugins: PluginOverride[]; 
+/**
+ * The project root the local/project files were read from (a worktree's own root).
+ */
+repo_root: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -4719,6 +4746,10 @@ latest_version: string | null;
  * enabled state — so the UI can show "5 skills" even when toggled off.
  */
 skill_count: number; agent_count: number; command_count: number; mcp_count: number }
+/**
+ * One file's say on one plugin: `enabledPlugins[id]` in that settings file.
+ */
+export type PluginOverride = { plugin_id: string; enabled: boolean; source: RuleSource; path: string }
 /**
  * Typed return value of `ping`. Proves React -> Rust (typed command).
  */
@@ -5138,6 +5169,27 @@ export type SessionExtensionsChangedEvent = { session: string; area: string }
  */
 export type SessionMessageEvent = { session: string; item: ConversationItem }
 /**
+ * What ONE conversation changes for itself from its extensions panel (scope
+ * "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
+ * flag settings layer (`apply_flag_settings`), never in a file, so they reach that
+ * conversation alone. Verified live (2.1.280):
+ * • `permissions` — a second apply REPLACES the key (a rule can be removed), `null`
+ * clears it, `list_permission_rules` reports the rules as `flagSettings`;
+ * • `enabledPlugins` — `{id:false}` then `reload_plugins` drops the plugin's commands,
+ * clearing it and reloading brings them back.
+ * The layer dies with the process, so the app keeps these per conversation and
+ * re-applies them after every `initialize` (with a plugin reload when there are any).
+ * 
+ * A rule can only ADD to what applies (deny > ask > allow across every source), so a
+ * conversation can tighten the repository or global rules, never loosen them. A plugin
+ * override, by contrast, wins over the files: the flag layer ranks above them.
+ */
+export type SessionOverrides = { allow: string[]; ask: string[]; deny: string[]; 
+/**
+ * Plugin id (`name@marketplace`) → on/off for this conversation.
+ */
+enabled_plugins?: Partial<{ [key in string]: boolean }> }
+/**
  * A `can_use_tool` permission prompt awaiting a decision.
  */
 export type SessionPermissionEvent = { session: string; request: PermissionRequestPayload }
@@ -5272,17 +5324,12 @@ export type SessionTaskEvent = { session: string; task: BackgroundTask }
  */
 export type SessionTitleEvent = { session: string; title: string; seq: number }
 /**
- * Per-tool permission rules scoped to ONE conversation: they live in the session's flag
- * settings layer (`apply_flag_settings{settings:{permissions}}`), never in a file, so they
- * reach that conversation alone. Verified live (2.1.280): a second apply REPLACES the
- * `permissions` key (a rule can be removed), `null` clears it, and `list_permission_rules`
- * then reports them with source `flagSettings`. The layer dies with the process, so the
- * app keeps them per conversation and re-applies them after every `initialize`.
- * 
- * Like a file rule, one can only ADD to what applies: deny > ask > allow across every
- * source, so a conversation can tighten a global rule but never loosen it.
+ * Which file a change is written to. Global = the user's `~/.claude/settings.json`;
+ * Repository = the project's `.claude/settings.local.json` — this repository, on this
+ * machine, never committed (the app makes git ignore it before writing it). The shared
+ * `.claude/settings.json` is never written: it would change the team's setup.
  */
-export type SessionToolRules = { allow: string[]; ask: string[]; deny: string[] }
+export type SettingsTarget = "global" | "repository"
 /**
  * One skill available to a repository (file-based or plugin-provided).
  */
@@ -5353,11 +5400,11 @@ claudeAccountId: string | null;
  */
 conversationTitle: string | null; 
 /**
- * This conversation's own per-tool permission rules, re-applied to the new process
- * right after `initialize` (they live in its flag settings layer, which dies with
- * the previous one). Claude only; `None`/empty = no rule of its own.
+ * This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+ * process right after `initialize` (they live in its flag settings layer, which dies
+ * with the previous one). Claude only; `None`/empty = nothing of its own.
  */
-sessionPermissions?: SessionToolRules | null }
+sessionOverrides?: SessionOverrides | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

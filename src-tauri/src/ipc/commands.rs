@@ -188,11 +188,11 @@ pub struct SpawnFlags {
     /// an untitled conversation never stamps that placeholder as the daemon's
     /// authoritative title (see `spawn_session`'s wiring).
     pub conversation_title: Option<String>,
-    /// This conversation's own per-tool permission rules, re-applied to the new process
-    /// right after `initialize` (they live in its flag settings layer, which dies with
-    /// the previous one). Claude only; `None`/empty = no rule of its own.
+    /// This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+    /// process right after `initialize` (they live in its flag settings layer, which dies
+    /// with the previous one). Claude only; `None`/empty = nothing of its own.
     #[serde(default)]
-    pub session_permissions: Option<crate::supervisor::model::SessionToolRules>,
+    pub session_overrides: Option<crate::supervisor::model::SessionOverrides>,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -234,10 +234,10 @@ pub async fn spawn_session(
         app_control,
         claude_account_id,
         conversation_title,
-        session_permissions,
+        session_overrides,
     } = flags;
-    if let Some(rules) = &session_permissions {
-        rules.validate()?;
+    if let Some(o) = &session_overrides {
+        o.validate()?;
     }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
@@ -394,7 +394,7 @@ pub async fn spawn_session(
         effort: cfg.effort.clone(),
         permission_mode: cfg.permission_mode.clone(),
         ultracode,
-        session_permissions,
+        session_overrides,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -2656,19 +2656,24 @@ pub async fn mcp_status(
     handle.mcp_status().await.map_err(|e| e.to_string())
 }
 
-/// Replace a RUNNING conversation's own per-tool permission rules (its flag settings
-/// layer — never a file, so no other conversation sees them). Effective from its next
-/// tool call; a CLI rejection is returned, not swallowed.
+/// Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+/// flag settings layer (never a file, so no other conversation sees them). Rules bite from
+/// its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+/// returned, not swallowed.
 #[tauri::command]
 #[specta::specta]
-pub async fn apply_session_permissions(
+pub async fn apply_session_overrides(
     sessions: tauri::State<'_, Sessions>,
     session: String,
-    rules: crate::supervisor::model::SessionToolRules,
+    overrides: crate::supervisor::model::SessionOverrides,
+    reload_plugins: bool,
 ) -> Result<(), String> {
-    rules.validate()?;
+    overrides.validate()?;
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
-    handle.apply_session_permissions(&rules).await.map_err(|e| e.to_string())
+    handle
+        .apply_session_overrides(&overrides, reload_plugins)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
@@ -3429,16 +3434,37 @@ pub async fn mcp_permission_rules(
     .map_err(|e| e.to_string())
 }
 
-/// Set (or clear) the user's own permission rule for MCP tools, in `~/.claude/settings.json`
-/// — exact tool names only, one atomic write for the whole batch, read back and verified.
-/// A running session picks it up from its next tool call (the CLI watches the file).
+/// Set (or clear) MCP permission rules — per tool, or a whole server — in the global
+/// `~/.claude/settings.json` or in this repository's `.claude/settings.local.json`
+/// (`target`). One atomic write for the batch, read back and verified. Running sessions
+/// pick it up from their next tool call (the CLI watches both files).
 #[tauri::command]
 #[specta::specta]
 pub async fn set_mcp_tool_permissions(
     changes: Vec<crate::extensions::permissions::McpToolPermissionChange>,
+    target: crate::extensions::permissions::SettingsTarget,
+    repo_path: Option<String>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        crate::extensions::permissions::set_mcp_tool_permissions(&changes)
+        crate::extensions::permissions::set_mcp_tool_permissions(&changes, target, repo_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Turn a plugin on/off in the global or this repository's local settings file, or remove
+/// that file's say (`enabled: null`) so the plugin follows the files below again. Read
+/// back and verified; a live session applies it on `reload_plugins`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_plugin_override(
+    plugin_id: String,
+    enabled: Option<bool>,
+    target: crate::extensions::permissions::SettingsTarget,
+    repo_path: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::permissions::set_plugin_override(&plugin_id, enabled, target, repo_path.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?

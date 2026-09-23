@@ -1,24 +1,39 @@
-// The expanded tool list of a Claude MCP server, with a permission per tool:
-// Default / Allow / Ask / Block — Claude Code's own permission rules. Two scopes share this
-// component (see mcpToolPermissions.ts):
-//   • global (Settings → Extensions): the user's ~/.claude/settings.json, every conversation;
-//   • conversation (its ⌘E panel): that conversation's session layer, it alone.
+// The scope model of the extensions panels, and the expanded tool list of a Claude MCP
+// server with a permission per tool (Default / Allow / Ask / Block — Claude Code's own
+// permission rules). Three scopes (see mcpToolPermissions.ts):
+//   • conversation — that conversation's session layer, it alone (the ⌘E default);
+//   • repository — the repository's .claude/settings.local.json, on this machine;
+//   • global — ~/.claude/settings.json, every conversation (Settings → Extensions).
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
-import type { McpServerLive, McpToolInfo, ToolRuleKind } from "../../ipc/client";
-import { useMcpPermissionRules, useSetMcpToolPermissions } from "../../ipc/useExtensions";
-import { applyConvToolPermissions, convToolRules, useConvToolPermissions } from "../../store/convToolPermissions";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { commands } from "../../ipc/client";
+import type { McpServerLive, McpToolInfo, PluginInfo, ToolRuleKind } from "../../ipc/client";
+import { Toggle } from "../../ui/Toggle";
+import { useMcpPermissionRules } from "../../ipc/useExtensions";
+import {
+  applyConvOverrides,
+  convPluginSay,
+  convToolRules,
+  useConvToolPermissions,
+  type PluginChange,
+} from "../../store/convToolPermissions";
 import {
   TOOL_CHOICES,
   describeRule,
+  describeSource,
   mcpToolRuleName,
+  pluginScopeState,
+  pluginWrite,
   readOnlyPreset,
   resetServer,
+  serverOffState,
+  serverRuleName,
   serverSummary,
   setAll,
   toolNature,
   toolPermissionState,
   type PermissionScope,
+  type PluginSay,
   type ToolChange,
   type ToolChoice,
   type ToolPermissionState,
@@ -29,7 +44,7 @@ import styles from "./ExtensionsManager.module.css";
 const CHOICE_LABEL: Record<ToolChoice, string> = { default: "Default", allow: "Allow", ask: "Ask", deny: "Block" };
 const KIND_LABEL: Record<ToolRuleKind, string> = { allow: "Allow", ask: "Ask", deny: "Block" };
 
-/** Everything a panel needs to show and change one scope's rules. */
+/** Everything a panel needs to show and change one scope's settings. */
 export interface PermissionTarget {
   scope: PermissionScope;
   /** Every rule that applies (files + the conversation's own); undefined while loading. */
@@ -39,54 +54,175 @@ export interface PermissionTarget {
   warnings: string[];
   /** Why this scope can't be changed right now (null: it can). */
   readOnlyReason: string | null;
+  /** Change MCP rules (per tool, or a whole server) at this scope. */
   apply: (changes: ToolChange[]) => void;
+  /** Every source's say on a plugin (files + the conversation's own). */
+  pluginSays: (pluginId: string) => PluginSay[];
+  /** Turn a plugin on/off at this scope (null: drop this scope's say). Resolves once
+   *  written — the caller may offer to reload the live conversations. */
+  setPlugin: (pluginId: string, enabled: boolean | null) => Promise<unknown>;
   pending: boolean;
   error: string | null;
-  /** Shown above the list: what this scope reaches. */
+  /** What this scope reaches, in one line. */
   hint: string;
 }
 
-/** The global scope: the user's settings file, evaluated with `repoPath`'s files too (null:
- *  only the files that don't depend on a project). */
-export function useGlobalPermissionTarget(repoPath: string | null): PermissionTarget {
-  const rules = useMcpPermissionRules(repoPath);
-  const set = useSetMcpToolPermissions();
+export const SCOPE_LABEL: Record<PermissionScope, string> = {
+  conversation: "This conversation",
+  repository: "This repository",
+  global: "Global",
+};
+
+const repoName = (root: string | null | undefined) => (root ? root.split("/").filter(Boolean).pop() : null);
+
+function scopeHint(scope: PermissionScope, repoRoot: string | null | undefined): string {
+  switch (scope) {
+    case "conversation":
+      return "Changes apply to this conversation only.";
+    case "repository":
+      return `Changes apply to every conversation in ${repoName(repoRoot) ?? "this repository"}, on this machine — saved in .claude/settings.local.json, never committed.`;
+    case "global":
+      return "Changes apply to every conversation, and to Claude Code in your terminal — saved in ~/.claude/settings.json.";
+  }
+}
+
+/**
+ * One scope's view and writer. `repoPath` = the repository the files are read for (null on
+ * the conversation-less Settings page); `convId`/`handle` = the conversation whose own
+ * settings apply (null outside one).
+ */
+export function useExtensionScope(
+  scope: PermissionScope,
+  repoPath: string | null,
+  convId: string | null,
+  handle: string | null,
+): PermissionTarget {
+  const qc = useQueryClient();
+  const files = useMcpPermissionRules(repoPath);
+  const byConv = useConvToolPermissions((s) => s.byConv);
+  const write = useMutation({
+    mutationFn: async ({ rules, plugins }: { rules: ToolChange[]; plugins: PluginChange[] }) => {
+      if (scope === "conversation") {
+        if (!convId) throw new Error("No conversation to apply this to.");
+        return applyConvOverrides(convId, handle, rules, plugins);
+      }
+      const target = scope === "repository" ? "repository" : "global";
+      const repo = scope === "repository" ? repoPath : null;
+      if (rules.length) {
+        const res = await commands.setMcpToolPermissions(rules, target, repo);
+        if (res.status === "error") throw new Error(res.error);
+      }
+      for (const p of plugins) {
+        const res = await commands.setPluginOverride(p.id, p.enabled, target, repo);
+        if (res.status === "error") throw new Error(res.error);
+      }
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["mcp-permission-rules"] });
+      void qc.invalidateQueries({ queryKey: ["extensions"] });
+    },
+  });
+  const view = files.data;
+  const fileError = scope === "global" ? view?.user_error : scope === "repository" ? view?.local_error : null;
   return {
-    scope: "global",
-    rules: rules.data?.rules,
-    loadError: rules.isError ? (rules.error as Error).message : null,
-    warnings: (rules.data?.warnings ?? []).filter((w) => w !== rules.data?.user_error),
-    readOnlyReason: rules.data?.user_error
-      ? `Your settings file can't be read, so it can't be changed from here: ${rules.data.user_error}`
-      : null,
-    apply: (changes) => set.mutate(changes),
-    pending: set.isPending,
-    error: set.isError ? (set.error as Error).message : null,
-    hint: "Global — every conversation, and Claude Code in the terminal. Saved in ~/.claude/settings.json; applies from the next tool call.",
+    scope,
+    rules: view ? [...view.rules, ...(convId ? convToolRules(byConv, convId) : [])] : undefined,
+    loadError: files.isError ? (files.error as Error).message : null,
+    warnings: (view?.warnings ?? []).filter((w) => w !== fileError),
+    readOnlyReason:
+      scope === "repository" && !repoPath
+        ? "No repository to save this in."
+        : fileError
+          ? `This scope's settings file can't be read, so it can't be changed from here: ${fileError}`
+          : null,
+    apply: (changes) => write.mutate({ rules: changes, plugins: [] }),
+    pluginSays: (pluginId) => [
+      ...(view?.plugins ?? [])
+        .filter((p) => p.plugin_id === pluginId)
+        .map((p) => ({ source: p.source, enabled: p.enabled })),
+      ...(convId ? convPluginSay(byConv, convId, pluginId) : []),
+    ],
+    setPlugin: (pluginId, enabled) => write.mutateAsync({ rules: [], plugins: [{ id: pluginId, enabled }] }),
+    pending: write.isPending,
+    error: write.isError ? (write.error as Error).message : null,
+    hint: scopeHint(scope, view?.repo_root ?? repoPath),
   };
 }
 
-/** The conversation scope: that conversation's own rules, on top of the files'. */
-export function useConversationPermissionTarget(
-  repoPath: string,
-  convId: string,
-  handle: string | null,
-): PermissionTarget {
-  const files = useMcpPermissionRules(repoPath);
-  const byConv = useConvToolPermissions((s) => s.byConv);
-  const apply = useMutation({
-    mutationFn: (changes: ToolChange[]) => applyConvToolPermissions(convId, handle, changes),
-  });
+const SCOPE_WHERE: Record<PermissionScope, string> = {
+  conversation: "this conversation",
+  repository: "every conversation in this repository",
+  global: "every conversation",
+};
+
+/** The scope picker at the top of a panel: where the changes below will apply. */
+export function ScopeSwitcher({
+  scope,
+  onChange,
+  hint,
+}: {
+  scope: PermissionScope;
+  onChange: (s: PermissionScope) => void;
+  hint: string;
+}) {
+  return (
+    <div className={styles.scopeBar}>
+      <div className={styles.scopeHead}>
+        <span className={styles.scopeLabel}>Apply changes to</span>
+        <div className={styles.scopeSeg} role="tablist" aria-label="Where changes apply">
+          {(["conversation", "repository", "global"] as const).map((s) => (
+            <button
+              key={s}
+              role="tab"
+              aria-selected={scope === s}
+              className={`${styles.scopeOpt} ${scope === s ? styles.scopeOptOn : ""}`}
+              onClick={() => onChange(s)}
+            >
+              {SCOPE_LABEL[s]}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className={styles.scopeHint}>{hint} Skills and sub-agents are listed as-is; their badge says where they come from.</div>
+    </div>
+  );
+}
+
+/** A server's on/off at a scope: a `deny` on the whole server in that scope's settings.
+ *  Off from a broader source (or the org) can't be turned back on here — it says why. */
+export function ServerScopeToggle({ server, perms, busy }: { server: McpServerLive; perms: PermissionTarget; busy?: boolean }) {
+  const st = perms.rules ? serverOffState(server.name, perms.rules, perms.scope) : null;
+  const on = !(st?.off ?? false);
+  const reason = st?.offBy
+    ? `Turned off by ${describeRule(st.offBy)} — it can't be turned back on from here.`
+    : perms.readOnlyReason;
+  return (
+    <Toggle
+      checked={on}
+      disabled={!st || !!busy || perms.pending || reason != null}
+      onChange={(next) => perms.apply([{ tool: serverRuleName(server.name), kind: next ? null : "deny" }])}
+      label={`${on ? "Turn off" : "Turn on"} ${server.name}`}
+      title={reason ?? `${on ? "Turn off" : "Turn on"} for ${SCOPE_WHERE[perms.scope]} — its tools leave (or rejoin) Claude's context`}
+    />
+  );
+}
+
+/** A plugin as one scope sees it: the toggle's state, what flipping it writes, and a note
+ *  when a level above decides differently for this conversation. */
+export function pluginAtScope(plugin: PluginInfo, perms: PermissionTarget) {
+  const st = pluginScopeState(perms.pluginSays(plugin.id), perms.scope, plugin.enabled);
+  const note = st.overriddenBy
+    ? `${st.effective ? "On" : "Off"} for this conversation — ${describeSource(st.overriddenBy)} decide${st.overriddenBy === "conversation" ? "" : "s"}`
+    : null;
   return {
-    scope: "conversation",
-    rules: files.data ? [...files.data.rules, ...convToolRules(byConv, convId)] : undefined,
-    loadError: files.isError ? (files.error as Error).message : null,
-    warnings: files.data?.warnings ?? [],
-    readOnlyReason: null,
-    apply: (changes) => apply.mutate(changes),
-    pending: apply.isPending,
-    error: apply.isError ? (apply.error as Error).message : null,
-    hint: "This conversation only — on top of your global rules (Settings → Extensions). It can tighten them, never loosen them.",
+    enabled: st.enabled,
+    note,
+    locked: st.lockedByPolicy
+      ? "Your organization's policy decides this plugin."
+      : perms.readOnlyReason,
+    title: `On/off for ${SCOPE_WHERE[perms.scope]}`,
+    /** What to write for `next` (null = drop this scope's say, follow the levels below). */
+    write: (next: boolean) => pluginWrite(st, next, perms.scope),
   };
 }
 
@@ -116,9 +252,9 @@ function choiceTitle(c: ToolChoice, s: ToolPermissionState, scope: PermissionSco
     case "default":
       if (s.inherited.kind && s.inherited.rule)
         return `No rule here — "${KIND_LABEL[s.inherited.kind]}" applies from ${describeRule(s.inherited.rule)}.`;
-      return scope === "conversation"
-        ? "No rule here — your global rules apply, and without one the permission mode decides."
-        : "No rule — the conversation's permission mode decides. In Auto mode the classifier may run it without asking.";
+      return scope === "global"
+        ? "No rule — the conversation's permission mode decides. In Auto mode the classifier may run it without asking."
+        : "No rule here — the broader settings apply, and without one the permission mode decides.";
     case "allow":
       return "Runs without asking, in every permission mode.";
     case "ask":

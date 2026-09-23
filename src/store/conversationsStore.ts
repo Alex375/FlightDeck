@@ -65,7 +65,7 @@ import { clearCodexControls, clearAllCodexControls } from "../features/conversat
 import {
   clearAllConvToolPermissions,
   clearConvToolPermissions,
-  sessionRulesFor,
+  sessionOverridesFor,
 } from "./convToolPermissions";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
 import {
@@ -1753,9 +1753,10 @@ export async function ensureConversationSession(
     // placeholder name, so an untitled conversation never stamps that placeholder
     // as the daemon's authoritative title (see `conversationTitleForSpawn`'s doc).
     const conversationTitle = conversationTitleForSpawn(atSpawn.name);
-    // This conversation's own tool rules (its ⌘E panel): they live in the process's flag
-    // layer, so every spawn carries them to be re-applied right after `initialize`.
-    const sessionPermissions = atSpawn.kind === "claude" ? sessionRulesFor(convId) : null;
+    // This conversation's own extension settings (its ⌘E panel, "This conversation"): they
+    // live in the process's flag layer, so every spawn carries them to be re-applied right
+    // after `initialize`.
+    const sessionOverrides = atSpawn.kind === "claude" ? sessionOverridesFor(convId) : null;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1770,7 +1771,7 @@ export async function ensureConversationSession(
         appControl,
         claudeAccountId,
         conversationTitle,
-        sessionPermissions,
+        sessionOverrides,
       },
     );
     if (res.status !== "ok") {
@@ -1812,7 +1813,7 @@ export async function ensureConversationSession(
             // Same account too: a lost worktree must not silently change identity.
             claudeAccountId,
             conversationTitle,
-            sessionPermissions,
+            sessionOverrides,
           },
         );
       }

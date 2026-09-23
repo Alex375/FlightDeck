@@ -17,7 +17,7 @@ use specta::Type;
 
 use super::model::{
     LiveModel, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState, RewindFilesResult,
-    SessionToolRules, SlashCommand,
+    SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -619,14 +619,14 @@ pub fn mcp_status_request(request_id: &str) -> Value {
     control_request(request_id, json!({ "subtype": "mcp_status" }))
 }
 
-/// `apply_flag_settings` carrying ONLY `permissions`: the conversation's own per-tool
-/// rules, in the session's flag layer (see [`SessionToolRules`]). The CLI merges at the
-/// top level, so this REPLACES the layer's `permissions` wholesale and touches no other
-/// key; `null` removes it.
-pub fn session_permissions_request(request_id: &str, rules: &SessionToolRules) -> Value {
+/// `apply_flag_settings` carrying the conversation's own overrides (`permissions` +
+/// `enabledPlugins`, see [`SessionOverrides`]). The CLI merges at the top level, so this
+/// REPLACES exactly those two keys of the session's flag layer; `null` removes one. A
+/// plugin change only bites after a `reload_plugins`, which the caller sends.
+pub fn session_overrides_request(request_id: &str, overrides: &SessionOverrides) -> Value {
     control_request(
         request_id,
-        json!({ "subtype": "apply_flag_settings", "settings": { "permissions": rules.flag_permissions() } }),
+        json!({ "subtype": "apply_flag_settings", "settings": overrides.flag_settings() }),
     )
 }
 
@@ -1411,28 +1411,36 @@ mod tests {
         assert_eq!(servers[0].url.as_deref(), Some("https://h/mcp"), "query + fragment stripped");
     }
 
-    /// The conversation's rules ride in `apply_flag_settings.settings.permissions`: empty
-    /// lists omitted, and no rule at all → `null` (which CLEARS the layer — verified live).
+    /// The conversation's overrides ride in `apply_flag_settings.settings`: both keys always
+    /// present (`null` CLEARS one — verified live), empty rule lists omitted.
     #[test]
-    fn session_permissions_request_shape() {
-        let rules = SessionToolRules {
+    fn session_overrides_request_shape() {
+        let o = SessionOverrides {
             allow: vec![],
             ask: vec!["mcp__claude_ai_Slack__slack_send_message".into()],
-            deny: vec!["mcp__claude_ai_Gmail__send_message".into()],
+            deny: vec!["mcp__claude_ai_Gmail".into()],
+            enabled_plugins: [("tosse-workflow@tosse-plugins".to_string(), false)].into(),
         };
-        let req = session_permissions_request("r1", &rules);
+        let req = session_overrides_request("r1", &o);
         assert_eq!(req["request"]["subtype"], "apply_flag_settings");
         assert_eq!(
             req["request"]["settings"],
-            json!({ "permissions": {
-                "ask": ["mcp__claude_ai_Slack__slack_send_message"],
-                "deny": ["mcp__claude_ai_Gmail__send_message"] } })
+            json!({
+                "permissions": {
+                    "ask": ["mcp__claude_ai_Slack__slack_send_message"],
+                    "deny": ["mcp__claude_ai_Gmail"] },
+                "enabledPlugins": { "tosse-workflow@tosse-plugins": false } })
         );
-        let cleared = session_permissions_request("r2", &SessionToolRules::default());
-        assert_eq!(cleared["request"]["settings"], json!({ "permissions": null }));
-        assert!(rules.validate().is_ok());
-        let sneaky = SessionToolRules { allow: vec!["Bash".into()], ..Default::default() };
-        assert!(sneaky.validate().is_err(), "only exact MCP tool names reach a session");
+        let cleared = session_overrides_request("r2", &SessionOverrides::default());
+        assert_eq!(cleared["request"]["settings"], json!({ "permissions": null, "enabledPlugins": null }));
+        assert!(o.validate().is_ok());
+        for bad in [
+            SessionOverrides { allow: vec!["Bash".into()], ..Default::default() },
+            SessionOverrides { deny: vec!["mcp__*".into()], ..Default::default() },
+            SessionOverrides { enabled_plugins: [("no-marketplace".to_string(), true)].into(), ..Default::default() },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} must be refused");
+        }
     }
 
     /// Each tool carries its description and the server's read-only / destructive hints
@@ -1525,6 +1533,54 @@ mod tests {
         eprintln!("apply #3 (null) → {:?}", wait(&mut rx, "f3").await.map(|v| v["response"]["subtype"].clone()));
         ask("l3", json!({"subtype":"list_permission_rules"}));
         eprintln!("flag rules after #3 (none): {:?}", flag_rules(&wait(&mut rx, "l3").await));
+        transport.shutdown(false).await;
+    }
+
+    /// Live probe: can ONE session turn a plugin off through its flag layer? Applies
+    /// `enabledPlugins:{id:false}`, then `reload_plugins`, and checks whether the plugin's
+    /// commands leave the reloaded catalogue (and come back once the override is cleared).
+    ///   cargo test --lib --ignored live_flag_plugins_probe -- --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary; toggles a plugin through the session flag layer"]
+    async fn live_flag_plugins_probe() {
+        use crate::supervisor::protocol::CliMessage;
+        use crate::supervisor::transport::{SpawnConfig, Transport};
+        use std::time::Duration;
+
+        const PLUGIN: &str = "tosse-workflow@tosse-plugins";
+        let cwd = std::env::current_dir().unwrap();
+        let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(cwd)).expect("claude should spawn");
+        let send = |rid: &str, body: Value| transport.send_line(control_request(rid, body)).expect("send");
+        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliMessage>, rid: &str) -> Option<Value> {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(msg) = rx.recv().await {
+                    if let CliMessage::ControlResponse(v) = msg {
+                        if v.get("response").and_then(|r| r.get("request_id")).and_then(Value::as_str) == Some(rid) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        let pickup = |v: &Option<Value>| {
+            v.as_ref()
+                .and_then(parse_initialize_commands)
+                .map(|cmds| cmds.iter().filter(|c| c.name.contains("pickup")).map(|c| c.name.clone()).collect::<Vec<_>>())
+        };
+        transport.send_line(initialize_request("init", &[])).expect("init");
+        eprintln!("at start: {:?}", pickup(&wait(&mut rx, "init").await));
+        send("f1", json!({"subtype":"apply_flag_settings","settings":{"enabledPlugins":{PLUGIN:false}}}));
+        eprintln!("apply off → {:?}", wait(&mut rx, "f1").await.map(|v| v["response"]["subtype"].clone()));
+        send("r1", json!({"subtype":"reload_plugins"}));
+        eprintln!("after reload (should be empty): {:?}", pickup(&wait(&mut rx, "r1").await));
+        send("f2", json!({"subtype":"apply_flag_settings","settings":{"enabledPlugins":null}}));
+        eprintln!("clear → {:?}", wait(&mut rx, "f2").await.map(|v| v["response"]["subtype"].clone()));
+        send("r2", json!({"subtype":"reload_plugins"}));
+        eprintln!("after reload (back): {:?}", pickup(&wait(&mut rx, "r2").await));
         transport.shutdown(false).await;
     }
 

@@ -16,7 +16,6 @@ import type {
   ExtensionsSnapshot,
   MarketplaceInfo,
   McpServerLive,
-  McpToolPermissionChange,
   PermissionRulesView,
   PluginContents,
   Result,
@@ -264,20 +263,6 @@ export function useMcpPermissionRules(repoPath: string | null) {
     queryFn: () => unwrap(commands.mcpPermissionRules(repoPath)),
     staleTime: 2_000,
     refetchInterval: 4_000,
-  });
-}
-
-/**
- * Write the user's own per-tool rules (`~/.claude/settings.json`). Refetches the rules
- * whatever the outcome — a write can fail AFTER landing (the read-back check), and the
- * rows must show what the file really says.
- */
-export function useSetMcpToolPermissions() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (changes: McpToolPermissionChange[]): Promise<null> =>
-      unwrap(commands.setMcpToolPermissions(changes)),
-    onSettled: () => qc.invalidateQueries({ queryKey: ["mcp-permission-rules"] }),
   });
 }
 

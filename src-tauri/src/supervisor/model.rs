@@ -156,61 +156,97 @@ pub struct McpServerLive {
     pub failure_reason: Option<String>,
 }
 
-/// Per-tool permission rules scoped to ONE conversation: they live in the session's flag
-/// settings layer (`apply_flag_settings{settings:{permissions}}`), never in a file, so they
-/// reach that conversation alone. Verified live (2.1.280): a second apply REPLACES the
-/// `permissions` key (a rule can be removed), `null` clears it, and `list_permission_rules`
-/// then reports them with source `flagSettings`. The layer dies with the process, so the
-/// app keeps them per conversation and re-applies them after every `initialize`.
+/// What ONE conversation changes for itself from its extensions panel (scope
+/// "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
+/// flag settings layer (`apply_flag_settings`), never in a file, so they reach that
+/// conversation alone. Verified live (2.1.280):
+///   • `permissions` — a second apply REPLACES the key (a rule can be removed), `null`
+///     clears it, `list_permission_rules` reports the rules as `flagSettings`;
+///   • `enabledPlugins` — `{id:false}` then `reload_plugins` drops the plugin's commands,
+///     clearing it and reloading brings them back.
+/// The layer dies with the process, so the app keeps these per conversation and
+/// re-applies them after every `initialize` (with a plugin reload when there are any).
 ///
-/// Like a file rule, one can only ADD to what applies: deny > ask > allow across every
-/// source, so a conversation can tighten a global rule but never loosen it.
+/// A rule can only ADD to what applies (deny > ask > allow across every source), so a
+/// conversation can tighten the repository or global rules, never loosen them. A plugin
+/// override, by contrast, wins over the files: the flag layer ranks above them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
-pub struct SessionToolRules {
+pub struct SessionOverrides {
     pub allow: Vec<String>,
     pub ask: Vec<String>,
     pub deny: Vec<String>,
+    /// Plugin id (`name@marketplace`) → on/off for this conversation.
+    #[serde(default)]
+    pub enabled_plugins: std::collections::BTreeMap<String, bool>,
 }
 
-impl SessionToolRules {
-    pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty()
+impl SessionOverrides {
+    pub fn has_rules(&self) -> bool {
+        !(self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty())
     }
 
-    /// Only exact MCP tool names — the conversation panel manages nothing else, and this
-    /// keeps a caller from slipping a broad rule (`*`, `Bash`) into a live session.
+    pub fn is_empty(&self) -> bool {
+        !self.has_rules() && self.enabled_plugins.is_empty()
+    }
+
+    /// Only MCP rule names (a whole server or one tool) and well-formed plugin ids — the
+    /// conversation panel manages nothing else, and this keeps a caller from slipping a
+    /// broad rule (`*`, `Bash`) into a live session.
     pub fn validate(&self) -> Result<(), String> {
-        for tool in self.allow.iter().chain(&self.ask).chain(&self.deny) {
-            if !is_mcp_tool_name(tool) {
-                return Err(format!("not an MCP tool name: {tool:?}"));
+        for rule in self.allow.iter().chain(&self.ask).chain(&self.deny) {
+            if !is_mcp_rule_name(rule) {
+                return Err(format!("not an MCP rule: {rule:?}"));
+            }
+        }
+        for id in self.enabled_plugins.keys() {
+            if !is_plugin_id(id) {
+                return Err(format!("not a plugin id: {id:?}"));
             }
         }
         Ok(())
     }
 
-    /// The `permissions` value for `apply_flag_settings`: the three lists (empty ones
-    /// omitted), or `null` to clear the conversation's rules altogether.
-    pub fn flag_permissions(&self) -> Value {
-        if self.is_empty() {
-            return Value::Null;
-        }
-        let mut map = serde_json::Map::new();
-        for (key, list) in [("allow", &self.allow), ("ask", &self.ask), ("deny", &self.deny)] {
-            if !list.is_empty() {
-                map.insert(key.to_string(), serde_json::json!(list));
+    /// The `settings` object for `apply_flag_settings`. Both keys are ALWAYS sent (`null`
+    /// when empty): the CLI merges at the top level, so this replaces exactly the two
+    /// keys the conversation owns and nothing else in the layer.
+    pub fn flag_settings(&self) -> Value {
+        let permissions = if self.has_rules() {
+            let mut map = serde_json::Map::new();
+            for (key, list) in [("allow", &self.allow), ("ask", &self.ask), ("deny", &self.deny)] {
+                if !list.is_empty() {
+                    map.insert(key.to_string(), serde_json::json!(list));
+                }
             }
-        }
-        Value::Object(map)
+            Value::Object(map)
+        } else {
+            Value::Null
+        };
+        let plugins = if self.enabled_plugins.is_empty() {
+            Value::Null
+        } else {
+            serde_json::json!(self.enabled_plugins)
+        };
+        serde_json::json!({ "permissions": permissions, "enabledPlugins": plugins })
     }
 }
 
-/// `mcp__<server>__<tool>`: both parts non-empty, no glob, no parentheses, no whitespace.
-pub fn is_mcp_tool_name(tool: &str) -> bool {
-    tool.strip_prefix("mcp__")
-        .and_then(|rest| rest.split_once("__"))
-        .is_some_and(|(server, name)| !server.is_empty() && !name.is_empty())
-        && !tool.contains(['*', '(', ')'])
-        && !tool.chars().any(char::is_whitespace)
+/// `mcp__<server>` (the whole server) or `mcp__<server>__<tool>`: non-empty parts, no
+/// glob, no parentheses, no whitespace.
+pub fn is_mcp_rule_name(rule: &str) -> bool {
+    let Some(rest) = rule.strip_prefix("mcp__") else {
+        return false;
+    };
+    let parts_ok = match rest.split_once("__") {
+        Some((server, tool)) => !server.is_empty() && !tool.is_empty(),
+        None => !rest.is_empty(),
+    };
+    parts_ok && !rule.contains(['*', '(', ')']) && !rule.chars().any(char::is_whitespace)
+}
+
+/// `name@marketplace`, both non-empty, no whitespace.
+pub fn is_plugin_id(id: &str) -> bool {
+    id.split_once('@').is_some_and(|(n, m)| !n.is_empty() && !m.is_empty())
+        && !id.chars().any(char::is_whitespace)
 }
 
 /// One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are

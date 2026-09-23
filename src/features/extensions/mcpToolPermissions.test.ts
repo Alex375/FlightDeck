@@ -3,10 +3,14 @@ import type { PermissionRule } from "../../ipc/client";
 import {
   mcpToolRuleName,
   normalizeServerName,
+  pluginScopeState,
+  pluginWrite,
   readOnlyPreset,
   resetServer,
   resolvePermission,
   ruleMatchesTool,
+  serverOffState,
+  serverRuleName,
   serverSummary,
   setAll,
   toolNature,
@@ -216,5 +220,67 @@ describe("the conversation scope", () => {
     expect(resetServer("claude.ai Gmail", tools, [rule(SEND, "deny"), conv(SEND, "ask")], "conversation")).toEqual([
       { tool: SEND, kind: null },
     ]);
+  });
+});
+
+describe("the repository scope", () => {
+  it("manages the repository's local file — not the shared one, not the user's", () => {
+    const rules = [rule(SEND, "ask", "local"), rule(SEARCH, "deny", "project"), rule(SEND, "allow", "user")];
+    expect(toolPermissionState(SEND, rules, "repository").choice).toBe("ask");
+    expect(toolPermissionState(SEARCH, rules, "repository").choice).toBe("default");
+    expect(toolPermissionState(SEND, rules, "global").choice).toBe("allow");
+  });
+});
+
+describe("a whole server on/off", () => {
+  const GMAIL = "claude.ai Gmail";
+
+  it("is a deny on the server's own rule name", () => {
+    expect(serverRuleName(GMAIL)).toBe("mcp__claude_ai_Gmail");
+  });
+
+  it("off at this scope: the toggle can turn it back on", () => {
+    const s = serverOffState(GMAIL, [{ rule: "mcp__claude_ai_Gmail", kind: "deny", source: "conversation", path: "" }], "conversation");
+    expect(s).toEqual({ off: true, ownOff: true, offBy: null });
+  });
+
+  it("off from a broader scope: this one can't turn it back on, and says who did it", () => {
+    const s = serverOffState(GMAIL, [rule("mcp__claude_ai_Gmail", "deny", "user")], "conversation");
+    expect(s.off).toBe(true);
+    expect(s.ownOff).toBe(false);
+    expect(s.offBy?.source).toBe("user");
+    // A glob covering every tool counts too; one tool's deny doesn't.
+    expect(serverOffState(GMAIL, [rule("mcp__*", "deny", "project")], "repository").off).toBe(true);
+    expect(serverOffState(GMAIL, [rule(SEND, "deny", "user")], "global").off).toBe(false);
+  });
+});
+
+describe("plugins per scope", () => {
+  const say = (source: ToolRule["source"], enabled: boolean) => ({ source, enabled });
+
+  it("each scope shows its own say, else what it inherits", () => {
+    const says = [say("user", true), say("local", false)];
+    expect(pluginScopeState(says, "global", false).enabled).toBe(true);
+    expect(pluginScopeState(says, "repository", false)).toMatchObject({ enabled: false, own: true, inherited: true });
+    expect(pluginScopeState(says, "conversation", false)).toMatchObject({ enabled: false, own: false, effective: false });
+  });
+
+  it("notes when a level above decides differently for this conversation", () => {
+    const says = [say("user", true), say("conversation", false)];
+    expect(pluginScopeState(says, "global", false).overriddenBy).toBe("conversation");
+    expect(pluginScopeState(says, "repository", false).overriddenBy).toBe("conversation");
+    expect(pluginScopeState(says, "conversation", false).overriddenBy).toBeNull();
+  });
+
+  it("the organization's policy locks it everywhere", () => {
+    expect(pluginScopeState([say("managed", false)], "conversation", true).lockedByPolicy).toBe(true);
+  });
+
+  it("writes nothing of its own when the choice matches what it would follow", () => {
+    const st = pluginScopeState([say("user", true)], "conversation", false);
+    expect(pluginWrite(st, true, "conversation")).toBeNull();
+    expect(pluginWrite(st, false, "conversation")).toBe(false);
+    // The global file always holds an explicit value.
+    expect(pluginWrite(pluginScopeState([say("user", true)], "global", false), true, "global")).toBe(true);
   });
 });

@@ -29,11 +29,16 @@ export interface ToolRule {
   path: string;
 }
 
-/** Which rules a panel manages: the user's settings file (every conversation), or one
- *  conversation's session layer. The other sources' rules still apply and are shown. */
-export type PermissionScope = "global" | "conversation";
+/** Which rules a panel manages: one conversation's session layer, this repository's local
+ *  file (`.claude/settings.local.json`, this machine only), or the user's settings file
+ *  (every conversation). The other sources' rules still apply and are shown. */
+export type PermissionScope = "conversation" | "repository" | "global";
 
-const OWN_SOURCE: Record<PermissionScope, ToolRuleSource> = { global: "user", conversation: "conversation" };
+const OWN_SOURCE: Record<PermissionScope, ToolRuleSource> = {
+  conversation: "conversation",
+  repository: "local",
+  global: "user",
+};
 
 /** What the user picks for one tool: one of the three rule lists, or no rule at all. */
 export type ToolChoice = "default" | ToolRuleKind;
@@ -257,13 +262,117 @@ export function serverSummary(
   return out;
 }
 
+// ---- A whole server on/off --------------------------------------------------------------
+
+/** The rule that names a whole server (`mcp__claude_ai_Gmail`) — a `deny` on it turns the
+ *  server off: every one of its tools leaves Claude's context. */
+export function serverRuleName(server: string): string {
+  return `mcp__${normalizeServerName(server)}`;
+}
+
+export interface ServerOffState {
+  /** The server is off for this conversation, every source considered. */
+  off: boolean;
+  /** The scope itself turned it off (its own `deny` on the server rule). */
+  ownOff: boolean;
+  /** Another source turned it off — the scope can't turn it back on. */
+  offBy: ToolRule | null;
+}
+
+/** Whether a server is off, and who turned it off. A server-wide deny is the server rule
+ *  itself, `mcp__<server>__*`, or a broader glob (`mcp__*`, `*`) — never one tool's deny. */
+export function serverOffState(server: string, rules: readonly ToolRule[], scope: PermissionScope): ServerOffState {
+  const name = serverRuleName(server);
+  // A tool name no real server uses: only a rule covering EVERY tool of the server matches it.
+  const anyTool = `${name}__\u0001`;
+  const wide = rules.filter((r) => r.kind === "deny" && ruleMatchesTool(r.rule, "deny", anyTool));
+  const ownOff = wide.some((r) => r.source === OWN_SOURCE[scope] && r.rule === name);
+  const offBy = wide.find((r) => !(r.source === OWN_SOURCE[scope] && r.rule === name)) ?? null;
+  return { off: ownOff || offBy != null, ownOff, offBy };
+}
+
+// ---- Plugins on/off per scope -------------------------------------------------------------
+
+/** One source's say on a plugin (`enabledPlugins[id]`): a settings file, or the
+ *  conversation's session layer. */
+export interface PluginSay {
+  source: ToolRuleSource;
+  enabled: boolean;
+}
+
+/** Highest precedence first — the flag layer (a conversation) ranks above every file but
+ *  the organization's. */
+const PLUGIN_ORDER: readonly ToolRuleSource[] = ["managed", "conversation", "local", "project", "user"];
+/** The sources each scope inherits from when it says nothing itself. */
+const PLUGIN_BELOW: Record<PermissionScope, readonly ToolRuleSource[]> = {
+  conversation: ["local", "project", "user"],
+  repository: ["project", "user"],
+  global: [],
+};
+
+export interface PluginScopeState {
+  /** On at this scope's level (its own say, else what it inherits). */
+  enabled: boolean;
+  /** The scope has a say of its own (else it follows the levels below). */
+  own: boolean;
+  /** What this scope would follow without a say of its own. */
+  inherited: boolean;
+  /** What this conversation actually gets, every level considered. */
+  effective: boolean;
+  /** The organization decides — nothing here can change it. */
+  lockedByPolicy: boolean;
+  /** A level ABOVE this scope decides differently for this conversation (e.g. the
+   *  conversation overrides the repository's choice). */
+  overriddenBy: ToolRuleSource | null;
+}
+
+/**
+ * A plugin seen from one scope. `fallback` is what applies when no source says anything
+ * (the plugin's installed state as the configuration scan reports it).
+ */
+export function pluginScopeState(
+  says: readonly PluginSay[],
+  scope: PermissionScope,
+  fallback: boolean,
+): PluginScopeState {
+  const at = (s: ToolRuleSource) => says.find((x) => x.source === s)?.enabled;
+  const firstOf = (order: readonly ToolRuleSource[]) => order.map(at).find((v) => v !== undefined);
+  const ownVal = at(OWN_SOURCE[scope]);
+  const inherited = firstOf(PLUGIN_BELOW[scope]) ?? fallback;
+  const enabled = ownVal ?? inherited;
+  const managed = at("managed");
+  const effective = firstOf(PLUGIN_ORDER) ?? fallback;
+  const above = PLUGIN_ORDER.slice(0, PLUGIN_ORDER.indexOf(OWN_SOURCE[scope]));
+  const overriddenBy = above.find((s) => at(s) !== undefined && at(s) !== enabled) ?? null;
+  return {
+    enabled,
+    own: ownVal !== undefined,
+    inherited,
+    effective,
+    lockedByPolicy: managed !== undefined,
+    overriddenBy,
+  };
+}
+
+/** What to write when the user flips a plugin to `enabled` at a scope: nothing of its own
+ *  (null) when that's what it would follow anyway — the files stay minimal — else the
+ *  value. The global file always holds an explicit value. */
+export function pluginWrite(state: PluginScopeState, enabled: boolean, scope: PermissionScope): boolean | null {
+  return scope !== "global" && enabled === state.inherited ? null : enabled;
+}
+
 const SOURCE_LABEL: Record<ToolRuleSource, string> = {
   managed: "organization policy",
-  conversation: "this conversation's rules",
-  local: "this project's local settings",
-  project: "this project's shared settings",
-  user: "your global rules (Settings → Extensions)",
+  conversation: "this conversation's settings",
+  local: "this repository's local settings",
+  project: "this repository's shared settings",
+  user: "your global settings",
 };
+
+/** "this conversation's settings" — who decides, for a note or tooltip. */
+export function describeSource(s: ToolRuleSource): string {
+  return SOURCE_LABEL[s];
+}
 
 /** "`mcp__claude_ai_Gmail` in this project's shared settings" — names a rule for a tooltip. */
 export function describeRule(r: ToolRule): string {

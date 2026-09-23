@@ -58,7 +58,9 @@ import type {
   McpToolPermissionChange,
   PermissionRule,
   PermissionRulesView,
-  SessionToolRules,
+  SessionOverrides,
+  SettingsTarget,
+  PluginOverride,
   RewindFilesResult,
   PluginContents,
   PermissionDecision,
@@ -986,6 +988,7 @@ function mockSpendReport(): SpendReport {
 /** Mock-only: the current global output style, so a set is reflected by the next get. */
 let mockOutputStyle = "default";
 let mockPermissionRules: PermissionRule[] = [];
+let mockPluginOverrides: PluginOverride[] = [];
 
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
@@ -3090,19 +3093,46 @@ export const mockCommands = {
   },
   // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
   async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {
-    return ok({ rules: mockPermissionRules, warnings: [], user_error: null });
+    return ok({
+      rules: mockPermissionRules,
+      warnings: [],
+      user_error: null,
+      local_error: null,
+      plugins: mockPluginOverrides,
+      repo_root: _repoPath,
+    });
   },
-  async applySessionPermissions(_session: string, _rules: SessionToolRules): Promise<Result<null, string>> {
+  async applySessionOverrides(
+    _session: string,
+    _overrides: SessionOverrides,
+    _reloadPlugins: boolean,
+  ): Promise<Result<null, string>> {
     return ok(null);
   },
   async fetchGlobalMcpStatus(): Promise<Result<McpServerLive[], string>> {
     return ok([]);
   },
-  async setMcpToolPermissions(changes: McpToolPermissionChange[]): Promise<Result<null, string>> {
+  async setMcpToolPermissions(
+    changes: McpToolPermissionChange[],
+    target: SettingsTarget,
+    _repoPath: string | null,
+  ): Promise<Result<null, string>> {
+    const source = target === "repository" ? "local" : "user";
     for (const c of changes) {
-      mockPermissionRules = mockPermissionRules.filter((r) => !(r.source === "user" && r.rule === c.tool));
-      if (c.kind) mockPermissionRules.push({ rule: c.tool, kind: c.kind, source: "user", path: "~/.claude/settings.json" });
+      mockPermissionRules = mockPermissionRules.filter((r) => !(r.source === source && r.rule === c.tool));
+      if (c.kind) mockPermissionRules.push({ rule: c.tool, kind: c.kind, source, path: "" });
     }
+    return ok(null);
+  },
+  async setPluginOverride(
+    pluginId: string,
+    enabled: boolean | null,
+    target: SettingsTarget,
+    _repoPath: string | null,
+  ): Promise<Result<null, string>> {
+    const source = target === "repository" ? "local" : "user";
+    mockPluginOverrides = mockPluginOverrides.filter((p) => !(p.source === source && p.plugin_id === pluginId));
+    if (enabled !== null) mockPluginOverrides.push({ plugin_id: pluginId, enabled, source, path: "" });
     return ok(null);
   },
   async mcpToggle(_session: string, _serverName: string, _enabled: boolean): Promise<Result<null, string>> {

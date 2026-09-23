@@ -246,6 +246,71 @@
   padding-top: 4px;
 }
 
+/* ---- Scope picker (top of the conversation panel): where changes apply ---- */
+.scopeBar {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 10px;
+  background: var(--wf-panel-2);
+}
+.scopeHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.scopeLabel {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--wf-tx-hi);
+}
+.scopeSeg {
+  display: inline-flex;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.scopeOpt {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 12px;
+  border: none;
+  border-left: 1px solid var(--wf-line-2);
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.scopeOpt:first-child {
+  border-left: none;
+}
+.scopeOpt:hover {
+  color: var(--wf-tx-hi);
+  background: var(--wf-panel-3);
+}
+.scopeOptOn {
+  font-weight: 600;
+  color: #1a0f0a;
+  background: var(--wf-accent);
+}
+.scopeOptOn:hover {
+  color: #1a0f0a;
+  background: var(--wf-accent);
+}
+.scopeHint {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+}
+/* Under a plugin's meta: who decides for this conversation when it isn't this scope. */
+.scopeNote {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: #f0b15a;
+}
+
 /* Muted footer note (e.g. the Codex read-only / deferred hint). */
 .codexHint {
   margin-top: 6px;

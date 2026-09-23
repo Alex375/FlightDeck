@@ -287,6 +287,38 @@ pub fn path_is_ignored(repo_path: &str, relative_path: &str) -> Option<bool> {
     }
 }
 
+/// The root of the working tree `path` sits in (`git rev-parse --show-toplevel`) — a
+/// worktree's own root for a worktree. `None` outside a repository.
+pub fn toplevel(path: &str) -> Option<String> {
+    run_git(path, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Make git ignore `relative_path` in this repository WITHOUT touching a tracked file:
+/// the pattern goes to the clone's own `info/exclude` (resolved with `--git-path`, so a
+/// worktree lands in the shared one). No-op when git already ignores it, or when
+/// `repo_path` is not a repository at all. Used before the app writes a file meant for
+/// this machine only (`.claude/settings.local.json`), so it can never be committed by
+/// accident.
+pub fn ignore_locally(repo_path: &str, relative_path: &str) -> Result<(), GitError> {
+    if path_is_ignored(repo_path, relative_path) != Some(false) {
+        return Ok(()); // already ignored, or not a repository: nothing to guard
+    }
+    let rel = run_git(repo_path, &["rev-parse", "--git-path", "info/exclude"])?;
+    let exclude = Path::new(repo_path).join(rel.trim());
+    if let Some(dir) = exclude.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| GitError::Parse(format!("info/exclude: {e}")))?;
+    }
+    let mut body = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("/{relative_path}\n"));
+    std::fs::write(&exclude, body).map_err(|e| GitError::Parse(format!("info/exclude: {e}")))
+}
+
 /// Reduce a git remote URL to a comparison key, so the SAME repository written in
 /// different notations compares equal. `None` for anything that carries no
 /// identity (empty, or a URL with no path part).
