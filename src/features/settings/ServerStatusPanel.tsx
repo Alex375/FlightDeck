@@ -11,6 +11,7 @@ import { useMachineActiveConversationIds } from "../../agent/fleet";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
+import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
@@ -175,8 +176,13 @@ export function ServerStatusPanel({
       (res) => {
         if (disposed) return;
         setLoading(false);
-        if (res.status === "ok") setDiagnosis(res.data);
-        else setDiagError(res.error);
+        if (res.status === "ok") {
+          setDiagnosis(res.data);
+          // Every diagnosis this panel pays for is also the freshest answer the remote
+          // MARK could have — file it, so opening Settings clears a stale "unreachable"
+          // badge (and sets one) without a second round trip. See `store/machineHealth`.
+          useMachineHealthStore.getState().record(machine.id, res.data);
+        } else setDiagError(res.error);
       },
       (e: unknown) => {
         if (disposed) return;
@@ -195,6 +201,7 @@ export function ServerStatusPanel({
       const res = await commands.machineDiagnose(machine.id);
       if (res.status === "ok") {
         setDiagnosis(res.data);
+        useMachineHealthStore.getState().record(machine.id, res.data);
         setDiagError(null);
       } else {
         setDiagError(res.error);
@@ -214,6 +221,9 @@ export function ServerStatusPanel({
       setRepairBusy(null);
       if (res.status === "ok") {
         setDiagnosis(res.data.diagnosis);
+        // A repair carries its own FRESH diagnosis — the badge must follow it, or a
+        // machine the user just fixed would stay red until the next poll.
+        useMachineHealthStore.getState().record(machine.id, res.data.diagnosis);
         setRepairSudoAction(null);
         setRepairSudoPassword("");
       } else if (isSudoPasswordError(res.error)) {

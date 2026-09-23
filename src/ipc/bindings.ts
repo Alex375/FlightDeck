@@ -4889,11 +4889,31 @@ group: string | null; window: UsageWindow }
 export type SearchHit = { session_id: string; score: number; snippet: string }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
- * [`Self::restart_pending`] is TRI-STATE (`Option<...>`): a missing/garbled marker in
- * [`diagnose`]'s own accumulating script degrades to `None` ("unknown"), never a
- * false `Some(false)` — see [`parse_diagnosis_fields`].
+ * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
+ * missing/garbled marker in [`diagnose`]'s own accumulating script degrades to `None`
+ * ("unknown"), never a false `Some(false)` — see [`parse_diagnosis_fields`].
  */
-export type ServerDiagnosis = { state: DiagnosisState; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+export type ServerDiagnosis = { state: DiagnosisState; 
+/**
+ * Did the ssh round trip reach the server AT ALL — the one fact that tells "this
+ * machine is off/unplugged/unroutable" apart from "it answered, and what it said
+ * is bad news".
+ * 
+ * ⚠️ It exists as its own field because [`Self::state`] CANNOT carry it:
+ * [`collapse_state`] returns [`DiagnosisState::Failed`] for a perfectly reachable
+ * server whose `flightdeckd` is merely stopped or missing, so `Failed` means
+ * "broken", not "out of reach". The only other way to tell the two apart would be
+ * to match on `Failed`'s `reason` STRING, which would silently turn a reworded
+ * message into a wrong verdict — the same trap the `tosse` module's
+ * `SESSION_GONE_MARKERS` contract exists to document.
+ * 
+ * `false` whenever [`diagnose`]'s ssh invocation failed, timed out, or was never
+ * attempted (unusable saved connection details) — see [`ServerDiagnosis::
+ * unreachable`], the ONE constructor of that case. Read by the front's ambient
+ * machine-health poll (`store/machineHealth.ts`), which paints the remote mark on
+ * every repository that lives on this machine.
+ */
+reachable: boolean; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.

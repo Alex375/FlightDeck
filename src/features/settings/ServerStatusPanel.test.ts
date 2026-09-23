@@ -77,6 +77,7 @@ let root: Root;
 function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
   return {
     state: { kind: "ready" },
+    reachable: true,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -170,6 +171,7 @@ describe("DiagnosisSummary — the 5 headline states", () => {
   it("Failed — red headline with the reason, tri-state facts render as Unknown (never a false No)", () => {
     mount({
       state: { kind: "failed", reason: "could not reach the server" },
+      reachable: false,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,

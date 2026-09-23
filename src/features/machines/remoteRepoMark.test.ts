@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { remoteMarkFor } from "./RemoteRepoMark";
+import { lastReachedPhrase, remoteMarkFor } from "./RemoteRepoMark";
+import type { MachineHealth } from "../../store/machineHealth";
 import type { Machine } from "../../store/conversationsStore";
 
 const machine = (over: Partial<Machine> = {}): Machine => ({
@@ -44,5 +45,35 @@ describe("remoteMarkFor", () => {
   it("still reads as remote when the machine id names no paired machine", () => {
     expect(remoteMarkFor("gone", [machine()])).toEqual({ kind: "unknown" });
     expect(remoteMarkFor("m1", [])).toEqual({ kind: "unknown" });
+  });
+});
+
+describe("lastReachedPhrase", () => {
+  const health = (lastReachedAtMs: number | null): MachineHealth => ({
+    reachable: false,
+    checkedAtMs: 1_000_000,
+    lastReachedAtMs,
+    reason: "could not reach the server",
+    probeError: null,
+  });
+
+  // A machine that has never answered since launch has no duration to state. Saying
+  // "0 min ago" there would be a fabricated fact about a server we have simply never
+  // spoken to — the caller writes its own sentence instead.
+  it("has nothing to say about a machine that never answered", () => {
+    expect(lastReachedPhrase(health(null), 1_000_000)).toBeNull();
+  });
+
+  it("reads a fresh outage as just now, then in minutes, hours and days", () => {
+    const now = 1_000_000;
+    expect(lastReachedPhrase(health(now - 5_000), now)).toBe("just now");
+    expect(lastReachedPhrase(health(now - 4 * 60_000), now)).toBe("4 min ago");
+    expect(lastReachedPhrase(health(now - 3 * 3_600_000), now)).toBe("3 h ago");
+    expect(lastReachedPhrase(health(now - 2 * 86_400_000), now)).toBe("2 d ago");
+  });
+
+  // Clocks move backwards (NTP, sleep/wake). "in -3 minutes" is worse than "just now".
+  it("never reports a negative age", () => {
+    expect(lastReachedPhrase(health(2_000_000), 1_000_000)).toBe("just now");
   });
 });

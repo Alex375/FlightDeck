@@ -1563,12 +1563,30 @@ pub enum DiagnosisState {
 }
 
 /// One `machine_diagnose` result — every field besides [`Self::state`]/
-/// [`Self::restart_pending`] is TRI-STATE (`Option<...>`): a missing/garbled marker in
-/// [`diagnose`]'s own accumulating script degrades to `None` ("unknown"), never a
-/// false `Some(false)` — see [`parse_diagnosis_fields`].
+/// [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
+/// missing/garbled marker in [`diagnose`]'s own accumulating script degrades to `None`
+/// ("unknown"), never a false `Some(false)` — see [`parse_diagnosis_fields`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct ServerDiagnosis {
     pub state: DiagnosisState,
+    /// Did the ssh round trip reach the server AT ALL — the one fact that tells "this
+    /// machine is off/unplugged/unroutable" apart from "it answered, and what it said
+    /// is bad news".
+    ///
+    /// ⚠️ It exists as its own field because [`Self::state`] CANNOT carry it:
+    /// [`collapse_state`] returns [`DiagnosisState::Failed`] for a perfectly reachable
+    /// server whose `flightdeckd` is merely stopped or missing, so `Failed` means
+    /// "broken", not "out of reach". The only other way to tell the two apart would be
+    /// to match on `Failed`'s `reason` STRING, which would silently turn a reworded
+    /// message into a wrong verdict — the same trap the `tosse` module's
+    /// `SESSION_GONE_MARKERS` contract exists to document.
+    ///
+    /// `false` whenever [`diagnose`]'s ssh invocation failed, timed out, or was never
+    /// attempted (unusable saved connection details) — see [`ServerDiagnosis::
+    /// unreachable`], the ONE constructor of that case. Read by the front's ambient
+    /// machine-health poll (`store/machineHealth.ts`), which paints the remote mark on
+    /// every repository that lives on this machine.
+    pub reachable: bool,
     pub installed_as: InstalledAs,
     pub daemon_running: Option<bool>,
     pub daemon_version_disk: Option<String>,
@@ -1628,6 +1646,7 @@ impl ServerDiagnosis {
     fn unreachable() -> Self {
         Self {
             state: DiagnosisState::Failed { reason: "could not reach the server".to_string() },
+            reachable: false,
             installed_as: InstalledAs::Unknown,
             daemon_running: None,
             daemon_version_disk: None,
@@ -1851,6 +1870,10 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
     ServerDiagnosis {
         // Overwritten by `collapse_state` right after this returns — see `parse_diagnosis`.
         state: DiagnosisState::Ready,
+        // This function only ever runs on stdout ssh actually brought back: the
+        // unreachable case returns `ServerDiagnosis::unreachable()` without ever
+        // reaching here (see `parse_diagnosis`).
+        reachable: true,
         installed_as,
         daemon_running,
         daemon_version_disk,
@@ -2625,6 +2648,7 @@ mod tests {
     fn base_diagnosis() -> ServerDiagnosis {
         ServerDiagnosis {
             state: DiagnosisState::Ready,
+            reachable: true,
             installed_as: InstalledAs::System,
             daemon_running: Some(true),
             daemon_version_disk: Some("0.2.0".into()),
@@ -2712,6 +2736,29 @@ mod tests {
         assert_eq!(d.installed_as, InstalledAs::Unknown);
         assert_eq!(d.daemon_running, None);
         assert_eq!(d.claude_logged_in, None);
+        assert!(!d.reachable);
+    }
+
+    /// The whole reason `reachable` is its OWN field and not something read off
+    /// [`DiagnosisState`]: a server that answers ssh perfectly well but whose
+    /// `flightdeckd` is stopped collapses to `Failed` too. Anything deriving "this
+    /// machine is out of reach" from `Failed` — or from `Failed`'s `reason` wording —
+    /// would paint the remote mark red on a machine that is up and one repair click
+    /// away. The front's badge reads THIS boolean; this test is what stops the two
+    /// meanings from silently merging again.
+    #[test]
+    fn a_reachable_server_with_a_stopped_daemon_stays_reachable_while_failing() {
+        let d = parse_diagnosis(
+            "FLIGHTDECK_UNIT_SYSTEM:yes\nFLIGHTDECK_STATUS_JSON:\n",
+            true,
+        );
+        assert!(d.reachable, "ssh came back — the machine is reachable");
+        assert_eq!(d.daemon_running, Some(false));
+        assert!(
+            matches!(d.state, DiagnosisState::Failed { .. }),
+            "a stopped daemon is still a Failed diagnosis: {:?}",
+            d.state,
+        );
     }
 
     // ---- daemon_is_outdated (B2/B3: bundled version vs. the server's running one) ----

@@ -27,6 +27,7 @@ function step(id: StepState["id"], status: StepState["status"], detail: string |
 function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
   return {
     state: { kind: "ready" },
+    reachable: true,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",

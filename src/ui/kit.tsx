@@ -86,6 +86,15 @@ const WF_PATHS: Record<string, string> = {
   // land under a pixel apart once scaled down, and merge into one smudge. Don't add a
   // third, and don't tighten the gap.
   server: "M11 9.6v8.9M8.5 18.5h5M7.9 7.6a4.4 4.4 0 0 1 6.2 0M5.4 5.2a8 8 0 0 1 11.2 0",
+  // The same mast, out of reach: base and pole kept so it is recognisably the SAME
+  // object, both arcs replaced by one stroke through where they were, carried on down
+  // across the pole so the whole glyph reads as crossed out. Shape carries the meaning
+  // here on purpose — the mark also turns red, but a red-only difference is invisible to
+  // anyone who doesn't separate those hues, and this is the one state in the sidebar you
+  // must not miss. ⚠️ The arcs are REPLACED, not struck through: at the 13px this
+  // renders at, a slash crossing two arcs and a pole is three strokes inside four pixels
+  // and resolves to a blob.
+  serverOff: "M11 9.6v8.9M8.5 18.5h5M5.4 5.2 16.6 16.4",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",
   // A document with a sparkle — a published `Artifact` (a generated, hosted deliverable).

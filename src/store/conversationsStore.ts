@@ -43,6 +43,7 @@ import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
+import { probeMachine } from "./machineHealth";
 import {
   defaultAccountForNewConversation,
   noteManualAccountPick,
@@ -951,8 +952,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // awaited — a failure here must never block or fail the LOCAL rename, which has
     // already landed above.
     if (!conv.handle && !isSpawning(id) && conv.sessionId) {
-      const repo = get().repos.find((r) => r.id === conv.repoId);
-      if (repo?.machineId) {
+      const machineId = get().repos.find((r) => r.id === conv.repoId)?.machineId;
+      if (machineId) {
         void commands
           .pushRemoteConversationTitle(id, trimmed)
           .then((ok) => {
@@ -965,6 +966,11 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
             // carries the title anyway (see the doc above).
             if (!ok) {
               console.warn("pushRemoteConversationTitle: push did not land (daemon unreachable or too old)", id);
+              // A round trip to this machine just failed. That is NOT a verdict —
+              // "daemon too old" fails here on a perfectly reachable server — so it
+              // triggers a real check rather than marking anything down itself. This is
+              // what makes the badge react in seconds instead of waiting out the poll.
+              void probeMachine(machineId);
             }
           })
           .catch((e) => console.error("pushRemoteConversationTitle failed:", e));
@@ -1806,7 +1812,18 @@ export async function ensureConversationSession(
         );
       }
     }
-    if (res.status !== "ok") throw new Error(res.error);
+    if (res.status !== "ok") {
+      // A spawn on a REMOTE repository failed — the strongest hint we ever get that a
+      // server has gone away, and the one moment the user is definitely watching.
+      // Deliberately a TRIGGER, not a verdict: this fails for plenty of reasons that
+      // have nothing to do with reachability (a missing `claude`, a bad cwd), so the
+      // real check decides, and the throw below is unaffected either way.
+      const spawnMachineId = useConversationsStore
+        .getState()
+        .repos.find((r) => r.id === before.repoId)?.machineId;
+      if (spawnMachineId) void probeMachine(spawnMachineId);
+      throw new Error(res.error);
+    }
     useConversationsStore
       .getState()
       .setHandle(convId, res.data, allowBypass, claudeAccountId);

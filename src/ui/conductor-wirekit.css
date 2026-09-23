@@ -580,3 +580,14 @@
 /* A `machineId` naming no paired machine: a real fault, not a state — the repo IS remote
    and we cannot say where. Tinted so it never reads as an ordinary server. */
 .wf-remote.unknown, .wf-remote.unknown:hover { color:var(--wf-att); }
+/* Checked, and out of reach. The error tone this mark has been reserving since it was
+   introduced — the only state on a repository row worth spending it on. Paired with the
+   `serverOff` glyph, so the difference survives without colour too. */
+.wf-remote.down, .wf-remote.down:hover { color:var(--wf-err); }
+/* The unreachable mark is a real button (→ the server panel). Stripped back to the glyph
+   so it looks identical to the non-interactive mark beside it: this is the SAME badge,
+   which happens to lead somewhere once there is somewhere to lead. */
+.wf-remote-btn { all:unset; display:inline-flex; align-items:center; cursor:pointer;
+  color:inherit; }
+.wf-remote-btn:focus-visible { outline:1px solid var(--wf-err); outline-offset:2px;
+  border-radius:3px; }

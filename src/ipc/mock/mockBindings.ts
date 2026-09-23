@@ -387,6 +387,7 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
 function readyDiagnosis(): ServerDiagnosis {
   return {
     state: { kind: "ready" },
+    reachable: true,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -1969,6 +1970,7 @@ export const mockCommands = {
           "unreachable.example.com",
           {
             state: { kind: "failed", reason: "could not reach the server" },
+            reachable: false,
             installed_as: "unknown",
             daemon_running: null,
             daemon_version_disk: null,
@@ -1998,14 +2000,37 @@ export const mockCommands = {
       return ok({ machines: [...mockMachines], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
     // `?demo=remote` — visual check for the remote-machine mark (sidebar row, Flight Deck
-    // lane header, stream card). Three folders that must read DIFFERENTLY at a glance:
-    // a local one (unmarked), one on a paired server (globe + its name), and one whose
-    // `machine_id` names nothing — the case that must NOT quietly look local.
-    // Deliberately pairs the server here rather than reusing `?demo=servers`: the point is
-    // a repo that CARRIES a machine, which that fixture has no repos for.
+    // lane header, stream card). Four folders that must read DIFFERENTLY at a glance: a
+    // local one (unmarked), one on a paired server that ANSWERS (quiet mast), one on a
+    // server that does NOT (red crossed-out mast, plus that conversation's own warning
+    // bar above the composer), and one whose `machine_id` names nothing — the case that
+    // must NOT quietly look local. Deliberately pairs the servers here rather than
+    // reusing `?demo=servers`: the point is a repo that CARRIES a machine, which that
+    // fixture has no repos for.
     const remoteDemo = demoParam === "remote";
     if (remoteDemo && mockMachines.length === 0) {
-      findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
+      const up = findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
+      const down = findOrCreateMockMachine("build-box", "10.0.0.5", 22, "ci");
+      // The ambient health poll runs `machineDiagnose` against both — seeding their
+      // diagnoses is what makes the mark's two states appear in the browser build.
+      mockDiagnoses.set(up.id, readyDiagnosis());
+      mockDiagnoses.set(down.id, {
+        ...readyDiagnosis(),
+        reachable: false,
+        state: { kind: "failed", reason: "could not reach the server" },
+        installed_as: "unknown",
+        daemon_running: null,
+        daemon_version_disk: null,
+        daemon_version_running: null,
+        reboot_safe: null,
+        sleep_masked: null,
+        claude_installed: null,
+        claude_logged_in: null,
+        claude_email: null,
+        tailscale_name: null,
+        last_boot: null,
+        busy_conversations: null,
+      });
     }
     const remoteRepos: RepoRecord[] = remoteDemo
       ? [
@@ -2017,7 +2042,13 @@ export const mockCommands = {
             added_at: now - 1,
             machine_id: mockMachines[0]?.id ?? null,
           },
-          { id: "repo-orphan", path: "/srv/app", added_at: now - 2, machine_id: "machine-deleted" },
+          {
+            id: "repo-down",
+            path: "/home/ci/build-box-repo",
+            added_at: now - 2,
+            machine_id: mockMachines[1]?.id ?? null,
+          },
+          { id: "repo-orphan", path: "/srv/app", added_at: now - 3, machine_id: "machine-deleted" },
         ]
       : [];
     return ok({
@@ -2036,6 +2067,26 @@ export const mockCommands = {
                 cwd: "/home/deploy/demo-repo",
                 created_at: now - 1,
                 last_activity_at: now - 1,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+              {
+                id: "conv-down",
+                name: "Agent on a dead server",
+                repo_id: "repo-down",
+                cwd: "/home/ci/build-box-repo",
+                created_at: now - 2,
+                last_activity_at: now - 2,
                 session_id: null,
                 model: "claude-opus-4-8",
                 effort: "xhigh",
