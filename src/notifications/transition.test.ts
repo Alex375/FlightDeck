@@ -15,6 +15,7 @@ const base: SessionStatePayload = {
   activity: null,
   awaiting_permission: false,
     retry: null,
+  link: null,
   ended: false,
   context_tokens: null,
   context_window: null,

@@ -269,13 +269,22 @@ async fn run_phone_reply(
         return Ok(reply);
     }
     if !out.success {
-        return Err(out
-            .stderr
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("ssh command failed")
-            .to_string());
+        // Classify ssh's own exit-255 failures (key refused / host key changed /
+        // unreachable) into a plain sentence first — the real incident that
+        // motivated this had ssh's raw stderr line
+        // (`josty@100.97.14.57: Permission denied (publickey,password).`) leaking
+        // straight into this string via the phone-provisioning status row.
+        let stderr_lines: Vec<String> = out.stderr.lines().map(str::to_string).collect();
+        return Err(crate::ssh_link::classify_transport_close(out.exit_code, &stderr_lines)
+            .map(crate::ssh_link::describe)
+            .unwrap_or_else(|| {
+                stderr_lines
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "ssh command failed".to_string())
+            }));
     }
     Err(format!("unexpected daemon response: {}", out.stdout.trim()))
 }
@@ -550,16 +559,17 @@ else
 fi
 case \"$cmd\" in
   *whoami*)
-    out=\"$FAKE_SSH_WHOAMI_OUT\"; ec=\"$FAKE_SSH_WHOAMI_EXIT\" ;;
+    out=\"$FAKE_SSH_WHOAMI_OUT\"; ec=\"$FAKE_SSH_WHOAMI_EXIT\"; err=\"$FAKE_SSH_WHOAMI_ERR\" ;;
   *add-phone*)
-    out=\"$FAKE_SSH_ADDPHONE_OUT\"; ec=\"$FAKE_SSH_ADDPHONE_EXIT\" ;;
+    out=\"$FAKE_SSH_ADDPHONE_OUT\"; ec=\"$FAKE_SSH_ADDPHONE_EXIT\"; err=\"$FAKE_SSH_ADDPHONE_ERR\" ;;
   *remove-phone*)
-    out=\"$FAKE_SSH_REMOVEPHONE_OUT\"; ec=\"$FAKE_SSH_REMOVEPHONE_EXIT\" ;;
+    out=\"$FAKE_SSH_REMOVEPHONE_OUT\"; ec=\"$FAKE_SSH_REMOVEPHONE_EXIT\"; err=\"$FAKE_SSH_REMOVEPHONE_ERR\" ;;
   *)
     exit 7 ;;
 esac
 [ -z \"$out\" ] && out='{}'
 [ -z \"$ec\" ] && ec=0
+[ -n \"$err\" ] && printf '%s' \"$err\" >&2
 printf '%s' \"$out\"
 exit \"$ec\"
 ";
@@ -590,10 +600,13 @@ exit \"$ec\"
         "FAKE_SSH_STDIN_LOG",
         "FAKE_SSH_WHOAMI_OUT",
         "FAKE_SSH_WHOAMI_EXIT",
+        "FAKE_SSH_WHOAMI_ERR",
         "FAKE_SSH_ADDPHONE_OUT",
         "FAKE_SSH_ADDPHONE_EXIT",
+        "FAKE_SSH_ADDPHONE_ERR",
         "FAKE_SSH_REMOVEPHONE_OUT",
         "FAKE_SSH_REMOVEPHONE_EXIT",
+        "FAKE_SSH_REMOVEPHONE_ERR",
     ];
 
     /// Holds [`PATH_LOCK`] and a live `TOSSE_TEST_SSH_BIN` override (pointed at a
@@ -832,6 +845,30 @@ mod tests {
         assert!(matches!(state, ProvisionState::Provisioned { .. }));
         let got = store.machine_by_id("m1").unwrap().unwrap();
         assert!(got.daemon_mac_id.is_none(), "whoami never answered, so no identity to attach");
+    }
+
+    /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real
+    /// server's `authorized_keys`, and ssh's raw stderr line
+    /// (`josty@100.97.14.57: Permission denied (publickey,password).`) used to leak
+    /// straight into this phone-provisioning status row. Must now come back as
+    /// `ssh_link::describe`'s classified sentence instead.
+    #[tokio::test]
+    async fn provision_classifies_a_key_refused_ssh_failure_instead_of_leaking_the_raw_line() {
+        let _guard = PathGuard::install("provision-key-refused");
+        std::env::set_var("FAKE_SSH_WHOAMI_EXIT", "255");
+        std::env::set_var("FAKE_SSH_WHOAMI_ERR", "josty@100.97.14.57: Permission denied (publickey,password).");
+        std::env::set_var("FAKE_SSH_ADDPHONE_EXIT", "255");
+        std::env::set_var("FAKE_SSH_ADDPHONE_ERR", "josty@100.97.14.57: Permission denied (publickey,password).");
+
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine("m1")).unwrap();
+        store.set_config("remote_phone_token", "tok").unwrap();
+
+        let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
+        assert_eq!(
+            state,
+            ProvisionState::Failed { reason: "this Mac's saved key was refused by this server".to_string() },
+        );
     }
 
     #[tokio::test]

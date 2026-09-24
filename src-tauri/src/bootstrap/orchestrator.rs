@@ -107,7 +107,9 @@ use crate::ipc::commands::{
     invalidate_daemon_version_cache, persist_paired_machine, probe_candidates, resolve_daemon_bin_expr,
     run_ssh_on_machine, run_ssh_on_machine_stdin, shq, RemoteProbeResult,
 };
+use crate::ssh_link::{self, SshLinkIssue};
 use crate::store::{MachineRecord, Store};
+use crate::tailscale;
 
 /// Bounded timeout for a single ssh round trip this module makes OUTSIDE the
 /// password/sudo flows (which already have their own, e.g. [`run_sudo`]'s 15s/30s) —
@@ -1587,6 +1589,19 @@ pub struct ServerDiagnosis {
     /// machine-health poll (`store/machineHealth.ts`), which paints the remote mark on
     /// every repository that lives on this machine.
     pub reachable: bool,
+    /// WHY the ssh round trip itself failed — `None` only when [`Self::reachable`] is
+    /// `true` (a reachable server has nothing to classify here; see
+    /// [`ServerDiagnosis::unreachable_with`], the one constructor of every
+    /// `reachable: false` diagnosis). Read by the front's `repairSuggestionsFor`
+    /// (`key_refused` is the only one that offers a repair, [`RepairAction::
+    /// ReconnectMac`]) and by its `headlineLabel` for the bucket-specific sentence —
+    /// see [`SshLinkIssue`]'s own doc for why there are only three buckets.
+    pub link_issue: Option<SshLinkIssue>,
+    /// This Mac's OWN local Tailscale state — `Some(true)` ONLY on positive local
+    /// evidence (`tailscale::local_status()` confirmed `NotRunning`), never inferred
+    /// or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
+    /// [`crate::tailscale`]'s own module doc.
+    pub tailscale_off_locally: Option<bool>,
     pub installed_as: InstalledAs,
     pub daemon_running: Option<bool>,
     pub daemon_version_disk: Option<String>,
@@ -1642,11 +1657,36 @@ pub struct ServerDiagnosis {
 
 impl ServerDiagnosis {
     /// The whole-fields-unknown shape [`diagnose`] returns when the ssh round trip
-    /// itself never even reached the server.
+    /// itself never even reached the server, with no more specific classification
+    /// available (used only where [`Self::unreachable_with`] cannot apply — the
+    /// destination-validation-failure early return in [`diagnose`], which never even
+    /// spawns ssh). Every OTHER unreachable path goes through
+    /// [`Self::unreachable_with`] instead, which this now delegates to.
     fn unreachable() -> Self {
+        Self::unreachable_with(SshLinkIssue::Unreachable, None)
+    }
+
+    /// The whole-fields-unknown shape for an unreachable diagnosis, classified by
+    /// `issue` (see [`SshLinkIssue`]) with `tailscale_off_locally` folded into the
+    /// reason when it applies. The ONE constructor of every `reachable: false`
+    /// [`ServerDiagnosis`] — see [`Self::link_issue`]'s own doc for why every such
+    /// diagnosis carries `Some(issue)`, never `None`.
+    fn unreachable_with(issue: SshLinkIssue, tailscale_off_locally: Option<bool>) -> Self {
+        let reason = match issue {
+            SshLinkIssue::KeyRefused => "this Mac's saved key was refused".to_string(),
+            SshLinkIssue::HostKeyChanged => {
+                "this server's identity has changed since this Mac last connected to it".to_string()
+            }
+            SshLinkIssue::Unreachable if tailscale_off_locally == Some(true) => {
+                "Tailscale looks off on this Mac".to_string()
+            }
+            SshLinkIssue::Unreachable => "could not reach the server".to_string(),
+        };
         Self {
-            state: DiagnosisState::Failed { reason: "could not reach the server".to_string() },
+            state: DiagnosisState::Failed { reason },
             reachable: false,
+            link_issue: Some(issue),
+            tailscale_off_locally,
             installed_as: InstalledAs::Unknown,
             daemon_running: None,
             daemon_version_disk: None,
@@ -1874,6 +1914,11 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         // unreachable case returns `ServerDiagnosis::unreachable()` without ever
         // reaching here (see `parse_diagnosis`).
         reachable: true,
+        // Nothing to classify — the ssh round trip itself succeeded. Both fields
+        // stay `None` for every reachable diagnosis by construction (see their own
+        // docs on `ServerDiagnosis`).
+        link_issue: None,
+        tailscale_off_locally: None,
         installed_as,
         daemon_running,
         daemon_version_disk,
@@ -1981,8 +2026,48 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
     // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
     match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) => parse_diagnosis(&String::from_utf8_lossy(&out.stdout), out.status.success()),
-        Ok(Err(_)) | Err(_) => parse_diagnosis("", false),
+        // The accumulating script (see its own doc) never `exit`s early, so a
+        // SUCCESSFUL exit status here means ssh itself connected and ran it —
+        // `parse_diagnosis`'s stdout-parsing path is untouched by anything below.
+        Ok(Ok(out)) if out.status.success() => {
+            parse_diagnosis(&String::from_utf8_lossy(&out.stdout), true)
+        }
+        // ssh itself failed (a non-zero exit — OpenSSH's own convention for exit 255,
+        // though anything non-zero here means the same thing for THIS script, which
+        // never returns non-zero on its own). Thread the stderr this used to discard
+        // entirely through the shared classifier, so the diagnosis names WHY instead
+        // of the single fixed "could not reach the server".
+        Ok(Ok(out)) => {
+            let stderr_lines: Vec<String> =
+                String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
+            let issue = ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
+                .unwrap_or(SshLinkIssue::Unreachable);
+            let tailscale_off = tailscale_off_locally_if_relevant(&machine.host).await;
+            ServerDiagnosis::unreachable_with(issue, tailscale_off)
+        }
+        // No `Output` at all: the round trip either couldn't even be spawned, or the
+        // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed — nothing to classify from
+        // stderr, but the host can still be checked against the local Tailscale
+        // state (a wedged/hung remote shell on a tailnet host is exactly the shape
+        // this clause exists for).
+        Ok(Err(_)) | Err(_) => {
+            let tailscale_off = tailscale_off_locally_if_relevant(&machine.host).await;
+            ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, tailscale_off)
+        }
+    }
+}
+
+/// [`tailscale::local_status`], gated on [`tailscale::host_looks_like_tailnet`] first
+/// so a LAN/public server's diagnosis never pays for the subprocess at all — folds
+/// into the one signal [`ServerDiagnosis::tailscale_off_locally`] ever carries:
+/// `Some(true)` on POSITIVE local evidence, `None` otherwise (never a guessed "on").
+async fn tailscale_off_locally_if_relevant(host: &str) -> Option<bool> {
+    if !tailscale::host_looks_like_tailnet(host) {
+        return None;
+    }
+    match tailscale::local_status().await {
+        tailscale::LocalTailscaleState::NotRunning => Some(true),
+        _ => None,
     }
 }
 
@@ -2042,6 +2127,13 @@ pub enum RepairAction {
     InstallClaude,
     SignInClaude,
     ProvisionPhone,
+    /// (CRM `c9bf1482`) Reinstalls this Mac's SAVED key on a server that refused it
+    /// (`ServerDiagnosis::link_issue == Some(SshLinkIssue::KeyRefused)`) — a normal,
+    /// exhaustively-dispatched `RepairAction`, unlike [`Self::SignInClaude`]: see the
+    /// module doc's own note on why the two are NOT the same shape (this is a
+    /// single, non-interactive, password-in/summary-out round trip; sign-in needs an
+    /// interactive [`server_setup::LoginSession`] handle this dispatch can't carry).
+    ReconnectMac,
 }
 
 /// Exhaustive, COMPILE-TIME-checked label for each [`RepairAction`] — no wildcard arm,
@@ -2060,6 +2152,7 @@ pub(crate) fn repair_action_label(action: RepairAction) -> &'static str {
         RepairAction::InstallClaude => "Install Claude Code",
         RepairAction::SignInClaude => "Start the Claude sign-in flow",
         RepairAction::ProvisionPhone => "Provision this Mac's phone token",
+        RepairAction::ReconnectMac => "Reconnect this Mac",
     }
 }
 
@@ -2097,9 +2190,49 @@ fn install_service_repair_needs_path_fix(d: &ServerDiagnosis) -> bool {
     d.installed_as == InstalledAs::User && d.user_unit_missing_path == Some(true)
 }
 
+/// [`RepairAction::ReconnectMac`]'s own wording for [`connect::install_key`]'s one
+/// password outcome it cannot recover from: a WRONG password and a server with
+/// password auth disabled both surface identically from ssh
+/// (`askpass::classify_output`'s `WrongPassword` — see that function's own doc for
+/// why there is no way to tell the two apart at that layer), so this is the ONE,
+/// honest message for both — never a bare "wrong password" that would send someone
+/// re-typing a password that can never work if the server's sshd itself refuses the
+/// auth method (supervisor decision, CRM `c9bf1482`: "degrade honestly … points to
+/// removing and re-adding the server with the 'use a command instead' method").
+/// Every OTHER `install_key` failure (unreachable, timed out, host key changed, key
+/// installed but not accepted) is forwarded UNCHANGED — those already explain
+/// themselves.
+fn reconnect_mac_password_error(e: BootstrapError) -> BootstrapError {
+    match e {
+        BootstrapError::WrongPassword => BootstrapError::Other(
+            "this server refused this Mac's saved login password — remove and re-add this \
+             server using the \"use a command instead\" method."
+                .to_string(),
+        ),
+        other => other,
+    }
+}
+
+/// [`RepairAction::ReconnectMac`]'s own precondition, pulled out of [`repair`]'s body
+/// so it is directly unit-testable — `repair` itself needs a `tauri::AppHandle` this
+/// crate has no unit-test harness for (see
+/// `resume_after_a_host_rotation_targets_the_rotated_host_not_the_frozen_one`'s own
+/// doc for the same constraint), but THIS precondition is a plain, synchronous
+/// `Option` check with no I/O at all.
+fn require_connection_password(
+    sudo_password: Option<&SecretString>,
+) -> Result<&SecretString, BootstrapError> {
+    sudo_password.ok_or(BootstrapError::NeedsConnectionPassword)
+}
+
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
 /// re-diagnose. `sudo_password` beyond the brief's own shorthand signature — see the
-/// module doc.
+/// module doc. `sudo_password` carries either a Linux `sudo` password (every action
+/// except one) OR — for [`RepairAction::ReconnectMac`] specifically — this server's
+/// own SSH LOGIN password, depending on `action`: no signature/rename change, the
+/// same parameter is just reused for the analogous "repair needs a password → show
+/// inline prompt" UI loop `ServerStatusPanel.tsx` already has, generalized with a
+/// second wording branch.
 async fn repair(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
@@ -2199,6 +2332,39 @@ async fn repair(
             let registry = app.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>();
             registry.record(&machine.id, state.clone());
             format!("{state:?}")
+        }
+        RepairAction::ReconnectMac => {
+            // `sudo_password` doubles for this action's own login password — see
+            // `repair`'s own doc comment on that parameter, and
+            // `BootstrapError::NeedsConnectionPassword`'s doc for the wizard-loop
+            // contract this leans on (the SAME "repair needs a password → show
+            // inline prompt" flow `EnableLinger`/`MaskSleep` already use).
+            let password = require_connection_password(sudo_password)?;
+            // Sibling-file convention this crate's own key-generation already uses
+            // (see the `ThrowawayKey` test fixtures elsewhere in `bootstrap::`).
+            let pub_key_path = format!("{identity_file}.pub");
+            let public_key = tokio::fs::read_to_string(&pub_key_path).await.map_err(|e| {
+                BootstrapError::Other(format!("could not read this Mac's saved public key ({pub_key_path}): {e}"))
+            })?;
+            let target =
+                connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
+            // `install_key`'s own `verify_key_accepted` step already classifies a
+            // mid-repair host-key mismatch as `BootstrapError::HostKeyMismatch`,
+            // surfaced generically like any other repair error — no special-casing
+            // needed here. Only its `WrongPassword` outcome gets reworded: a wrong
+            // password and a server with password auth disabled are INDISTINGUISHABLE
+            // from ssh's own wire (both are "Permission denied"), so this is the one,
+            // honest message for both — see `reconnect_mac_password_error`'s doc.
+            let outcome = connect::install_key(
+                &target,
+                password.expose(),
+                identity_file,
+                public_key.trim(),
+                known_hosts.unwrap_or_default(),
+            )
+            .await
+            .map_err(reconnect_mac_password_error)?;
+            format!("{outcome:?}")
         }
     };
 
@@ -2649,6 +2815,8 @@ mod tests {
         ServerDiagnosis {
             state: DiagnosisState::Ready,
             reachable: true,
+            link_issue: None,
+            tailscale_off_locally: None,
             installed_as: InstalledAs::System,
             daemon_running: Some(true),
             daemon_version_disk: Some("0.2.0".into()),
@@ -2761,6 +2929,87 @@ mod tests {
         );
     }
 
+    // ---- ServerDiagnosis::unreachable_with (link classification wording) ----
+
+    #[test]
+    fn unreachable_with_key_refused_and_host_key_changed_have_fixed_reasons() {
+        let key = ServerDiagnosis::unreachable_with(SshLinkIssue::KeyRefused, None);
+        assert_eq!(key.link_issue, Some(SshLinkIssue::KeyRefused));
+        assert!(!key.reachable);
+        assert_eq!(key.state, DiagnosisState::Failed { reason: "this Mac's saved key was refused".to_string() });
+        assert_eq!(key.tailscale_off_locally, None);
+
+        let host = ServerDiagnosis::unreachable_with(SshLinkIssue::HostKeyChanged, None);
+        assert_eq!(host.link_issue, Some(SshLinkIssue::HostKeyChanged));
+        assert_eq!(
+            host.state,
+            DiagnosisState::Failed {
+                reason: "this server's identity has changed since this Mac last connected to it".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn unreachable_with_unreachable_reason_depends_on_tailscale_signal() {
+        let no_signal = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, None);
+        assert_eq!(no_signal.link_issue, Some(SshLinkIssue::Unreachable));
+        assert_eq!(no_signal.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
+        assert_eq!(no_signal.tailscale_off_locally, None);
+
+        let tailscale_off = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, Some(true));
+        assert_eq!(tailscale_off.state, DiagnosisState::Failed { reason: "Tailscale looks off on this Mac".to_string() });
+        assert_eq!(tailscale_off.tailscale_off_locally, Some(true));
+
+        // A `Some(false)` signal (never actually produced by `tailscale_off_locally_
+        // if_relevant`, which only ever returns `Some(true)` or `None` — see its own
+        // doc) must not be mistaken for the positive case either.
+        let not_true = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, Some(false));
+        assert_eq!(not_true.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
+    }
+
+    #[test]
+    fn plain_unreachable_delegates_to_unreachable_with() {
+        let d = ServerDiagnosis::unreachable();
+        assert_eq!(d.link_issue, Some(SshLinkIssue::Unreachable));
+        assert_eq!(d.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
+    }
+
+    #[tokio::test]
+    async fn tailscale_off_locally_if_relevant_skips_a_non_tailnet_host() {
+        // Gated on `host_looks_like_tailnet` FIRST — an ordinary host must never pay
+        // for (or even attempt) the local `tailscale` subprocess.
+        assert_eq!(tailscale_off_locally_if_relevant("example.com").await, None);
+    }
+
+    // ---- RepairAction::ReconnectMac (CRM `c9bf1482`) ----
+
+    #[test]
+    fn require_connection_password_without_one_needs_one() {
+        assert!(matches!(require_connection_password(None), Err(BootstrapError::NeedsConnectionPassword)));
+    }
+
+    #[test]
+    fn require_connection_password_with_one_passes_it_through() {
+        let pw = SecretString::new("hunter2".to_string());
+        assert_eq!(require_connection_password(Some(&pw)).unwrap().expose(), "hunter2");
+    }
+
+    #[test]
+    fn reconnect_mac_password_error_rewords_only_a_wrong_password() {
+        match reconnect_mac_password_error(BootstrapError::WrongPassword) {
+            BootstrapError::Other(msg) => {
+                assert!(msg.contains("remove and re-add"), "{msg}");
+                assert!(msg.contains("use a command instead"), "{msg}");
+            }
+            other => panic!("expected BootstrapError::Other(..), got {other:?}"),
+        }
+        // Every other `install_key` outcome is forwarded UNCHANGED — it already
+        // explains itself.
+        assert_eq!(reconnect_mac_password_error(BootstrapError::HostKeyMismatch), BootstrapError::HostKeyMismatch);
+        assert_eq!(reconnect_mac_password_error(BootstrapError::HostUnreachable), BootstrapError::HostUnreachable);
+        assert_eq!(reconnect_mac_password_error(BootstrapError::Timeout), BootstrapError::Timeout);
+    }
+
     // ---- daemon_is_outdated (B2/B3: bundled version vs. the server's running one) ----
 
     #[test]
@@ -2796,6 +3045,7 @@ mod tests {
             RepairAction::InstallClaude,
             RepairAction::SignInClaude,
             RepairAction::ProvisionPhone,
+            RepairAction::ReconnectMac,
         ] {
             assert!(!repair_action_label(action).is_empty(), "{action:?} has no label");
         }
@@ -2820,6 +3070,7 @@ mod tests {
             RepairAction::InstallClaude,
             RepairAction::SignInClaude,
             RepairAction::ProvisionPhone,
+            RepairAction::ReconnectMac,
         ] {
             assert!(
                 !repair_action_invalidates_daemon_version_cache(action),
@@ -3446,6 +3697,83 @@ mod tests {
                 DiagnosisState::Failed { reason: "flightdeckd is not installed".to_string() },
                 "a fresh, never-bootstrapped server must never report Ready/NeedsClaudeSignIn: {d:?}"
             );
+        }
+
+        /// The real incident, end to end (CRM `c9bf1482`): this Mac's key removed
+        /// from a real server's `authorized_keys` mid-life. Proves `diagnose()`
+        /// classifies it as `KeyRefused` (never the old single fixed "could not
+        /// reach the server") against the REAL `keyed_ssh_options`/
+        /// `push_ssh_destination` transport a live conversation's own reconnect loop
+        /// uses — then that `repair(ReconnectMac)`'s underlying pure I/O call
+        /// (`connect::install_key`, exactly what that dispatch arm delegates to —
+        /// `repair()` itself needs a `tauri::AppHandle` this crate has no live-test
+        /// harness for, see this module's own doc above) recovers it, confirmed by
+        /// a fresh `diagnose()` reading `reachable: true` again.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start) + the in-repo flightdeckd/live/bootstrap-fixtures"]
+        async fn live_diagnose_classifies_key_refused_then_reconnect_mac_recovers_it() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let key = ThrowawayKey::generate("key-refused");
+            install_key_via_password(FIXTURE_A_PORT, FIXTURE_A_USER, FIXTURE_A_PASSWORD, &key).await;
+            let machine = fixture_machine(FIXTURE_A_PORT, FIXTURE_A_USER, &key);
+            let kh = ScratchKnownHosts::new("key-refused");
+
+            // Sanity: the freshly-installed key genuinely works before we ever touch it.
+            let before = diagnose(&machine, kh.path()).await;
+            assert!(before.reachable, "the freshly-installed key must work: {before:?}");
+            assert_eq!(before.link_issue, None);
+
+            // The real incident: an operator (or this same test, standing in for one)
+            // removes this Mac's key from the server's `authorized_keys` — no sudo
+            // needed over ssh, so `docker exec` (root inside the container) does it
+            // directly, exactly like an admin editing the file by hand would.
+            let wipe = std::process::Command::new("docker")
+                .args(["exec", "fd-fixture-a", "sh", "-c", "> /home/deploy/.ssh/authorized_keys"])
+                .output()
+                .expect("docker exec must be available");
+            assert!(
+                wipe.status.success(),
+                "wiping authorized_keys failed: {}",
+                String::from_utf8_lossy(&wipe.stderr)
+            );
+
+            let after = diagnose(&machine, kh.path()).await;
+            assert!(!after.reachable, "{after:?}");
+            assert_eq!(after.link_issue, Some(SshLinkIssue::KeyRefused), "{after:?}");
+            assert_eq!(
+                after.state,
+                DiagnosisState::Failed { reason: "this Mac's saved key was refused".to_string() },
+                "{after:?}",
+            );
+
+            // `RepairAction::ReconnectMac`'s own arm, exactly: re-install this Mac's
+            // OWN saved public key over the fixture's documented login password
+            // (the dispatch arm reads it off the sibling `.pub` file; this throwaway
+            // key already carries its own public half in memory).
+            let target = connect::BootstrapTarget {
+                host: machine.host.clone(),
+                port: machine.port,
+                user: machine.user.clone(),
+            };
+            let outcome = connect::install_key(
+                &target,
+                FIXTURE_A_PASSWORD,
+                key.private.to_string_lossy().as_ref(),
+                &key.public,
+                kh.path().unwrap_or_default(),
+            )
+            .await
+            .expect("reconnecting this Mac over the fixture's real login password must succeed");
+            assert_eq!(
+                outcome,
+                connect::KeyInstallOutcome::Installed,
+                "authorized_keys was wiped, so re-installing must genuinely APPEND the key again: {outcome:?}",
+            );
+
+            let recovered = diagnose(&machine, kh.path()).await;
+            assert!(recovered.reachable, "{recovered:?}");
+            assert_eq!(recovered.link_issue, None, "{recovered:?}");
         }
     }
 }

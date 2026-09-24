@@ -70,3 +70,28 @@ describe("NoticeBlock task_failed", () => {
     expect(NOTICE_ERROR_HEADINGS.task_failed).toBeUndefined();
   });
 });
+
+// CRM `c9bf1482`: a terminal ssh-level failure (key refused / host identity changed)
+// falls through the generic heading-lookup path, same as `process_exited`/`send_failed`.
+describe("NoticeBlock remote_link_blocked", () => {
+  it("renders via ErrorBlock with the 'Can't reach this server' heading", () => {
+    expect(NOTICE_ERROR_HEADINGS.remote_link_blocked).toBe("Can't reach this server");
+    const html = renderToStaticMarkup(
+      createElement(NoticeBlock, {
+        subtype: "remote_link_blocked",
+        detail: {
+          message:
+            "This Mac's saved key was refused by this server. Reconnect this Mac in Settings → Control → Remote, then reopen this conversation.",
+          reason: "ssh_key_refused",
+        },
+      }),
+    );
+    expect(html).toContain('role="alert"');
+    // React escapes the apostrophe as an HTML entity in the raw markup — match
+    // around it rather than the literal `'`.
+    expect(html).toContain("Can");
+    expect(html).toContain("reach this server");
+    expect(html).toContain("This Mac");
+    expect(html).toContain("saved key was refused");
+  });
+});

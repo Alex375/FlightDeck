@@ -79,6 +79,8 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
   return {
     state: { kind: "ready" },
     reachable: true,
+    link_issue: null,
+    tailscale_off_locally: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -169,10 +171,12 @@ describe("DiagnosisSummary — the 5 headline states", () => {
     expect(repairButtonTitles().some((t) => t.includes("Enable linger"))).toBe(true);
   });
 
-  it("Failed — red headline with the reason, tri-state facts render as Unknown (never a false No)", () => {
+  it("Failed (unreachable) — red headline, but NO fact-row grid at all (every field is unknown, not worth nine 'Unknown' rows)", () => {
     mount({
       state: { kind: "failed", reason: "could not reach the server" },
       reachable: false,
+      link_issue: "unreachable",
+      tailscale_off_locally: null,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,
@@ -193,9 +197,99 @@ describe("DiagnosisSummary — the 5 headline states", () => {
     });
     expect(container.textContent).toContain("Failed — could not reach the server");
     expect(container.querySelector('[data-tone="error"]')).not.toBeNull();
-    const unknownValues = container.querySelectorAll('[data-tri="unknown"]');
-    expect(unknownValues.length).toBeGreaterThan(0);
+    // (CRM `c9bf1482`) No fact-row grid at all for an unreachable server — see
+    // `DiagnosisSummary`'s own doc — never a false "No" and no longer nine rows of
+    // "Unknown" either.
+    expect(container.querySelectorAll('[data-tri="unknown"]')).toHaveLength(0);
     expect(container.querySelectorAll('[data-tri="no"]')).toHaveLength(0);
+  });
+
+  it("Failed (key refused) — offers ONLY 'Reconnect this Mac', no fact-row grid, no Tailscale row", () => {
+    mount({
+      state: { kind: "failed", reason: "this Mac's saved key was refused" },
+      reachable: false,
+      link_issue: "key_refused",
+      tailscale_off_locally: null,
+      installed_as: "unknown",
+      daemon_running: null,
+      daemon_version_disk: null,
+      daemon_version_running: null,
+      restart_pending: false,
+      reboot_safe: null,
+      linger: null,
+      sleep_masked: null,
+      user_unit_missing_path: null,
+      claude_installed: null,
+      claude_logged_in: null,
+      claude_email: null,
+      tailscale_name: null,
+      last_boot: null,
+      busy_conversations: null,
+      bundled_daemon_version: null,
+      daemon_outdated: false,
+    });
+    expect(container.textContent).toContain("Failed — this Mac's saved key was refused");
+    expect(container.querySelectorAll("button")).toHaveLength(1);
+    expect(repairButtonTitles().some((t) => t.includes("Reconnect this Mac"))).toBe(true);
+    expect(container.querySelectorAll('[data-tri]')).toHaveLength(0);
+  });
+
+  it("Failed (host key changed) — informational note, no repair button, no Tailscale row", () => {
+    mount({
+      state: { kind: "failed", reason: "this server's identity has changed since this Mac last connected to it" },
+      reachable: false,
+      link_issue: "host_key_changed",
+      tailscale_off_locally: null,
+      installed_as: "unknown",
+      daemon_running: null,
+      daemon_version_disk: null,
+      daemon_version_running: null,
+      restart_pending: false,
+      reboot_safe: null,
+      linger: null,
+      sleep_masked: null,
+      user_unit_missing_path: null,
+      claude_installed: null,
+      claude_logged_in: null,
+      claude_email: null,
+      tailscale_name: null,
+      last_boot: null,
+      busy_conversations: null,
+      bundled_daemon_version: null,
+      daemon_outdated: false,
+    });
+    expect(container.textContent).toContain("identity has changed since this Mac last connected to it");
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("Failed (unreachable, Tailscale confirmed off) — shows the Tailscale fact row, nothing else", () => {
+    mount({
+      state: { kind: "failed", reason: "Tailscale looks off on this Mac" },
+      reachable: false,
+      link_issue: "unreachable",
+      tailscale_off_locally: true,
+      installed_as: "unknown",
+      daemon_running: null,
+      daemon_version_disk: null,
+      daemon_version_running: null,
+      restart_pending: false,
+      reboot_safe: null,
+      linger: null,
+      sleep_masked: null,
+      user_unit_missing_path: null,
+      claude_installed: null,
+      claude_logged_in: null,
+      claude_email: null,
+      tailscale_name: null,
+      last_boot: null,
+      busy_conversations: null,
+      bundled_daemon_version: null,
+      daemon_outdated: false,
+    });
+    expect(container.textContent).toContain("Failed — Tailscale looks off on this Mac");
+    const row = Array.from(container.querySelectorAll("span")).find((s) => s.textContent === "Tailscale (this Mac)");
+    expect(row).toBeTruthy();
+    expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 });
 
@@ -255,6 +349,15 @@ function mountPanel(
 function clickButtonWithText(text: string) {
   const btn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === text);
   if (!btn) throw new Error(`no button with text "${text}" — saw: ${Array.from(container.querySelectorAll("button")).map((b) => b.textContent)}`);
+  act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+/** A repair-suggestion button's own text is its title glued to its reason (two spans,
+ *  no separator) — never an exact match. Mirrors the "Mask sleep / suspend" click
+ *  pattern already used above for the same reason. */
+function clickButtonContaining(text: string) {
+  const btn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes(text));
+  if (!btn) throw new Error(`no button containing "${text}" — saw: ${Array.from(container.querySelectorAll("button")).map((b) => b.textContent)}`);
   act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 }
 
@@ -370,6 +473,145 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
     expect(busyBox).toBeTruthy();
     expect(busyBox?.className).toBe(sharedStyles.hintWarn);
     expect(busyBox?.className).not.toBe(sharedStyles.errorMsg);
+  });
+});
+
+// CRM `c9bf1482`: `RepairAction::ReconnectMac` reuses the same sudo-password prompt
+// loop as every other repair, but with its OWN wording (never "Sudo password" — this is
+// the server's own SSH login password) and its own honest failure mode when ssh itself
+// rejects it (a wrong password and password auth disabled are indistinguishable — see
+// `reconnect_mac_password_error`'s own doc on the Rust side).
+function keyRefusedDiagnosis(): ServerDiagnosis {
+  return {
+    state: { kind: "failed", reason: "this Mac's saved key was refused" },
+    reachable: false,
+    link_issue: "key_refused",
+    tailscale_off_locally: null,
+    installed_as: "unknown",
+    daemon_running: null,
+    daemon_version_disk: null,
+    daemon_version_running: null,
+    restart_pending: false,
+    reboot_safe: null,
+    linger: null,
+    sleep_masked: null,
+    user_unit_missing_path: null,
+    claude_installed: null,
+    claude_logged_in: null,
+    claude_email: null,
+    tailscale_name: null,
+    last_boot: null,
+    busy_conversations: null,
+    bundled_daemon_version: null,
+    daemon_outdated: false,
+  };
+}
+
+describe("ServerStatusPanel — Reconnect this Mac (CRM c9bf1482)", () => {
+  it("prompts for the SERVER's login password (never 'Sudo password') on NeedsConnectionPassword", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: keyRefusedDiagnosis() });
+    mountPanel();
+    await settle();
+
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error: "this server needs its login password to reconnect",
+    });
+    clickButtonContaining("Reconnect this Mac");
+    await settle();
+
+    expect(machineRepair).toHaveBeenCalledWith("m1", "reconnect_mac", null);
+    expect(container.querySelector('input[placeholder="Sudo password"]')).toBeNull();
+    const pwInput = container.querySelector('input[placeholder="Server login password"]') as HTMLInputElement;
+    expect(pwInput).not.toBeNull();
+    expect(pwInput.getAttribute("aria-label")).toBe("Login password for reconnecting this Mac");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Reconnect")).toBe(true);
+  });
+
+  it("clears the typed password from React state the instant it's handed off, and submits it with reconnect_mac", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: keyRefusedDiagnosis() });
+    mountPanel();
+    await settle();
+
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error: "this server needs its login password to reconnect",
+    });
+    clickButtonContaining("Reconnect this Mac");
+    await settle();
+
+    const pwInput = container.querySelector('input[placeholder="Server login password"]') as HTMLInputElement;
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+    act(() => {
+      nativeSetter.call(pwInput, "hunter2");
+      pwInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    let resolveRepair: (v: { status: "ok"; data: { action: "reconnect_mac"; label: string; summary: string; diagnosis: ServerDiagnosis } }) => void;
+    machineRepair.mockReturnValueOnce(
+      new Promise((res) => {
+        resolveRepair = res;
+      }),
+    );
+    clickButtonWithText("Reconnect");
+    // Cleared SYNCHRONOUSLY on submit — before the round trip even resolves — same
+    // discipline as every other password prompt in this component.
+    expect((container.querySelector('input[placeholder="Server login password"]') as HTMLInputElement).value).toBe("");
+    expect(machineRepair).toHaveBeenNthCalledWith(2, "m1", "reconnect_mac", "hunter2");
+
+    await act(async () => {
+      resolveRepair({
+        status: "ok",
+        data: { action: "reconnect_mac", label: "Reconnect this Mac", summary: "KeyInstalled", diagnosis: baseDiagnosis() },
+      });
+      await Promise.resolve();
+    });
+    await settle();
+    expect(container.querySelector('input[placeholder="Server login password"]')).toBeNull();
+    expect(container.textContent).toContain("Ready");
+  });
+
+  it("a refused/disabled password shows the honest error (never a bare 'wrong password') and points to 'use a command instead'", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: keyRefusedDiagnosis() });
+    mountPanel();
+    await settle();
+
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error: "this server needs its login password to reconnect",
+    });
+    clickButtonContaining("Reconnect this Mac");
+    await settle();
+
+    const pwInput = container.querySelector('input[placeholder="Server login password"]') as HTMLInputElement;
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+    act(() => {
+      nativeSetter.call(pwInput, "wrong");
+      pwInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    // The backend cannot tell a WRONG password apart from password-login disabled
+    // entirely (`reconnect_mac_password_error`'s own doc) — this is the ONE, honest
+    // message for both, never a bare "wrong password".
+    machineRepair.mockResolvedValueOnce({
+      status: "error",
+      error:
+        'this server refused this Mac\'s saved login password — remove and re-add this server using the "use a command instead" method.',
+    });
+    clickButtonWithText("Reconnect");
+    await settle();
+
+    // It's genuinely ambiguous whether that was a typo or the server has password
+    // login disabled outright — the prompt stays up so a corrected retry is still
+    // possible, cleared back to empty rather than left holding the wrong one.
+    const pwInputAfter = container.querySelector('input[placeholder="Server login password"]') as HTMLInputElement;
+    expect(pwInputAfter).not.toBeNull();
+    expect(pwInputAfter.value).toBe("");
+    const errBox = mostSpecificDivWithText("use a command instead");
+    expect(errBox).toBeTruthy();
+    expect(errBox?.className).toBe(sharedStyles.errorMsg);
+    // Never confused with the "needs a password"/server-busy soft treatments.
+    expect(errBox?.className).not.toBe(sharedStyles.hintWarn);
   });
 });
 
@@ -511,6 +753,7 @@ describe("ServerStatusPanel — recheckToken", () => {
   const unreachable = () =>
     baseDiagnosis({
       reachable: false,
+      link_issue: "unreachable",
       state: { kind: "failed", reason: "could not reach the server" },
       installed_as: "unknown",
       daemon_running: null,

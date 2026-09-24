@@ -55,6 +55,15 @@ pub struct SessionStatePayload {
     /// own, but nothing on screen explains the pause. Carries `attempt`/`max` so the UI
     /// can say how far along the recovery is.
     pub retry: Option<RetryState>,
+    /// The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
+    /// every local conversation, by construction (nothing ever sets it there). Set the
+    /// instant a remote actor spawns (`Connecting`), cleared to `None` the instant
+    /// `fd_attach` lands, and set again to `Reconnecting` on every later drop —
+    /// mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
+    /// per-turn API retry, this is ssh itself never having reached the daemon yet.
+    /// Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
+    /// priority, above `retry`) — see `ConductorThread.tsx`.
+    pub link: Option<RemoteLinkState>,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
@@ -455,6 +464,22 @@ pub struct RetryState {
     pub max: Option<u32>,
     /// Short human reason ("Connection error."), when one is available.
     pub reason: Option<String>,
+}
+
+/// A remote (SSH) conversation's live link lifecycle — see
+/// [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
+/// cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
+/// itself only ever describes "not attached yet".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteLinkState {
+    /// This actor has never yet received `fd_attach` this session.
+    Connecting,
+    /// Has attached before (or is on a later retry of the same outage). `attempt`
+    /// is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
+    /// attempts THIS outage has made, 1 at the very first drop, reset to 0 only
+    /// on a genuine return to attached (never by an address rotation).
+    Reconnecting { attempt: u32 },
 }
 
 /// A `can_use_tool` permission prompt surfaced to the UI. The UI answers it via

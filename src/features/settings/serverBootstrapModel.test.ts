@@ -7,6 +7,7 @@ import {
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
+  isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
   isTrustedSignInUrl,
@@ -28,6 +29,8 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
   return {
     state: { kind: "ready" },
     reachable: true,
+    link_issue: null,
+    tailscale_off_locally: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -155,6 +158,23 @@ describe("isSudoPasswordError", () => {
   });
 });
 
+// CRM `c9bf1482`: wording-contract test with the Rust `BootstrapError::
+// NeedsConnectionPassword` — keep the two in sync (mirrors `isSudoPasswordError`'s
+// own discipline above).
+describe("isNeedsConnectionPasswordError", () => {
+  it("recognizes BootstrapError::NeedsConnectionPassword's exact Display text", () => {
+    expect(isNeedsConnectionPasswordError("this server needs its login password to reconnect")).toBe(true);
+  });
+  it("never matches isSudoPasswordError's wording, and vice versa", () => {
+    expect(isNeedsConnectionPasswordError("this server needs a sudo password to continue")).toBe(false);
+    expect(isSudoPasswordError("this server needs its login password to reconnect")).toBe(false);
+  });
+  it("rejects an unrelated error and null", () => {
+    expect(isNeedsConnectionPasswordError("could not reach the server")).toBe(false);
+    expect(isNeedsConnectionPasswordError(null)).toBe(false);
+  });
+});
+
 // B_lifecycle-#7: wording-contract test with the Rust `server_busy_error` in
 // orchestrator.rs — keep the two in sync (see that function's own doc).
 describe("isServerBusyError", () => {
@@ -231,6 +251,59 @@ describe("STEP_ORDER (B14)", () => {
     const uploadIdx = STEP_ORDER.indexOf("upload_daemon");
     expect(installClaudeIdx).toBe(probeIdx + 1);
     expect(uploadIdx).toBe(installClaudeIdx + 1);
+  });
+});
+
+// CRM `c9bf1482`: an UNREACHABLE diagnosis carries every OTHER tri-state fact as
+// `null` ("unknown") — before this gate, that null fell through to the body below and
+// misread `claude_installed !== true` as "not installed", offering a bogus "Install
+// Claude Code" for a server that was simply out of reach (the real incident).
+describe("repairSuggestionsFor — unreachable (early gate)", () => {
+  function unreachableDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
+    return baseDiagnosis({
+      state: { kind: "failed", reason: "could not reach the server" },
+      reachable: false,
+      installed_as: "unknown",
+      daemon_running: null,
+      daemon_version_disk: null,
+      daemon_version_running: null,
+      restart_pending: false,
+      reboot_safe: null,
+      sleep_masked: null,
+      claude_installed: null,
+      claude_logged_in: null,
+      claude_email: null,
+      bundled_daemon_version: null,
+      ...over,
+    });
+  }
+
+  it("offers ONLY Reconnect this Mac when the server refused this Mac's key", () => {
+    expect(repairSuggestionsFor(unreachableDiagnosis({ link_issue: "key_refused" }))).toEqual([
+      { action: "reconnect_mac", title: "Reconnect this Mac", reason: "this server refused this Mac's saved key" },
+    ]);
+  });
+
+  it("offers nothing for a changed host identity — informational only, no repair button", () => {
+    expect(repairSuggestionsFor(unreachableDiagnosis({ link_issue: "host_key_changed" }))).toEqual([]);
+  });
+
+  it("offers nothing for a plain unreachable — never 'Install Claude Code' (the real incident's bogus suggestion)", () => {
+    expect(repairSuggestionsFor(unreachableDiagnosis({ link_issue: "unreachable" }))).toEqual([]);
+  });
+
+  it("never falls through to the reachable-only body below, even with stale-looking tri-state fields", () => {
+    // A defensive case: even if some field looked like "false" rather than "null",
+    // the early `!d.reachable` return must still win — nothing below it runs.
+    const actions = repairSuggestionsFor(
+      unreachableDiagnosis({ link_issue: "unreachable", sleep_masked: false, restart_pending: true }),
+    ).map((s) => s.action);
+    expect(actions).toEqual([]);
+  });
+
+  it("a REACHABLE diagnosis is unaffected by the gate (regression guard)", () => {
+    expect(repairSuggestionsFor(baseDiagnosis())).toEqual([]);
+    expect(repairSuggestionsFor(baseDiagnosis({ sleep_masked: false })).map((s) => s.action)).toContain("mask_sleep");
   });
 });
 

@@ -5058,12 +5058,23 @@ pub(crate) async fn run_ssh_on_machine(
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("ssh command failed")
-            .to_string())
+        // Classify ssh's own exit-255 failures (key refused / host key changed /
+        // unreachable — `crate::ssh_link`, shared with the live session's reconnect
+        // loop) into a plain sentence BEFORE falling back to the raw last stderr
+        // line — the same real incident that motivated this (`josty@…: Permission
+        // denied (publickey,password).`) used to leak straight into this string.
+        let stderr_lines: Vec<String> =
+            String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
+        Err(crate::ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
+            .map(crate::ssh_link::describe)
+            .unwrap_or_else(|| {
+                stderr_lines
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "ssh command failed".to_string())
+            }))
     }
 }
 
@@ -5082,6 +5093,12 @@ pub(crate) struct SshStdinOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    /// The raw exit code (`None` only if ssh was killed by a signal) — kept
+    /// alongside `success` so a caller that needs to tell "ssh itself failed" (exit
+    /// 255, OpenSSH's own convention) apart from "the remote command's own non-zero
+    /// exit" can, via `crate::ssh_link::classify_transport_close`. `success` alone
+    /// cannot make that distinction (CRM `c9bf1482`).
+    pub exit_code: Option<i32>,
 }
 
 /// [`run_ssh_on_machine`]'s sibling for a remote command that reads bytes off its OWN
@@ -5175,6 +5192,7 @@ pub(crate) async fn run_ssh_on_machine_stdin(
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         success: out.status.success(),
+        exit_code: out.status.code(),
     })
 }
 
@@ -6694,6 +6712,35 @@ mod tests {
         assert!(result.is_err(), "an exploit host must be refused");
         assert!(!marker.exists(), "ssh must NEVER have been spawned");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real incident (CRM `c9bf1482`): this Mac's key was removed from a real
+    /// server's `authorized_keys`, and ssh's raw stderr line
+    /// (`josty@100.97.14.57: Permission denied (publickey,password).`) used to leak
+    /// straight into this error string. Must now come back as `ssh_link::describe`'s
+    /// classified sentence instead.
+    #[tokio::test]
+    async fn run_ssh_on_machine_classifies_a_key_refused_failure_instead_of_leaking_the_raw_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "tosse-keyrefused-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'josty@100.97.14.57: Permission denied (publickey,password).' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(script.to_string_lossy().into_owned()));
+        let machine = machine_with_user_and_host("josty", "example.com");
+        let result = run_ssh_on_machine(&machine, None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
     }
 
     #[tokio::test]

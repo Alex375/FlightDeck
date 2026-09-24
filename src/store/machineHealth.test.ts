@@ -11,6 +11,8 @@ import {
 const diagnosis = (over: Partial<ServerDiagnosis> = {}): ServerDiagnosis => ({
   state: { kind: "ready" },
   reachable: true,
+  link_issue: null,
+  tailscale_off_locally: null,
   installed_as: "system",
   daemon_running: true,
   daemon_version_disk: "0.4.2",

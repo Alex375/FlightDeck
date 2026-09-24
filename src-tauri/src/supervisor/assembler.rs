@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::control;
 use super::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, NormalizedBlock,
-    RateLimitSnapshot, RemoteControlState, RetryState, SessionEvent, SessionStatePayload,
+    RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent, SessionStatePayload,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
@@ -131,6 +131,15 @@ impl Assembler {
     /// so the composer flips to "working" immediately.
     pub fn set_busy(&mut self, busy: bool) -> SessionEvent {
         self.state.busy = busy;
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// Reflect the live remote SSH link's lifecycle — see
+    /// [`RemoteLinkState`]/[`SessionStatePayload::link`]'s own docs. Mirrors
+    /// [`Self::set_busy`] in shape; called only by `supervisor::session::run_actor` for
+    /// a REMOTE conversation (never set for a local one).
+    pub fn set_link(&mut self, link: Option<RemoteLinkState>) -> SessionEvent {
+        self.state.link = link;
         SessionEvent::State(self.state.clone())
     }
 
@@ -272,6 +281,7 @@ impl Assembler {
         self.state.busy = false;
         self.state.awaiting_permission = false;
         self.state.activity = None;
+        self.state.link = None;
         self.state.ended = true;
         SessionEvent::State(self.state.clone())
     }

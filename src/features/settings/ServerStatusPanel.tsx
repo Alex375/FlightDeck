@@ -17,6 +17,7 @@ import {
   claudeNeedsSignIn,
   headlineLabel,
   headlineTone,
+  isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
   repairSuggestionsFor,
@@ -69,24 +70,48 @@ export function DiagnosisSummary({
           {headlineLabel(diagnosis.state)}
         </span>
       )}
-      <div className={styles.rows}>
-        <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
-        <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
-        <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
-        <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
-        <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
-        <FactRow
-          label="Claude signed in"
-          value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
-          toneTri={tri(diagnosis.claude_logged_in)}
-        />
-        <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
-        <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
-        <FactRow
-          label="Busy conversations"
-          value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
-        />
-      </div>
+      {diagnosis.reachable ? (
+        <div className={styles.rows}>
+          <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
+          <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
+          <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
+          <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
+          <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
+          <FactRow
+            label="Claude signed in"
+            value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
+            toneTri={tri(diagnosis.claude_logged_in)}
+          />
+          <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
+          <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
+          <FactRow
+            label="Busy conversations"
+            value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
+          />
+        </div>
+      ) : (
+        // (CRM `c9bf1482`) An unreachable server has NOTHING confirmed to show in
+        // the fact-row grid above (every field is `null`, not `false` — see
+        // `ServerDiagnosis::unreachable_with`'s own doc) — rendering it here would
+        // be nine rows of "Unknown". Instead: an informational note ONLY for a
+        // changed host identity (no repair button — see `repairSuggestionsFor`'s
+        // own doc for why), and a Tailscale fact row ONLY on positive local
+        // evidence that it is off.
+        <>
+          {diagnosis.link_issue === "host_key_changed" && (
+            <p className={styles.hostKeyNote}>
+              This server&apos;s identity has changed since this Mac last connected to it. If
+              that&apos;s expected — a reinstall, a new host — remove this server and add it
+              again.
+            </p>
+          )}
+          {diagnosis.tailscale_off_locally === true && (
+            <div className={styles.rows}>
+              <FactRow label="Tailscale (this Mac)" value="Off" toneTri="no" />
+            </div>
+          )}
+        </>
+      )}
       {suggestions.length > 0 && (
         <div className={styles.repairs}>
           {suggestions.map((s) => (
@@ -272,7 +297,7 @@ export function ServerStatusPanel({
         useMachineHealthStore.getState().record(machine.id, res.data.diagnosis, startedAtMs);
         setRepairSudoAction(null);
         setRepairSudoPassword("");
-      } else if (isSudoPasswordError(res.error)) {
+      } else if (isSudoPasswordError(res.error) || isNeedsConnectionPasswordError(res.error)) {
         setRepairSudoAction(action);
       } else {
         setRepairError(res.error);
@@ -396,13 +421,17 @@ export function ServerStatusPanel({
                 className={sharedStyles.field}
                 style={{ flex: "0 0 220px" }}
                 type="password"
-                placeholder="Sudo password"
+                placeholder={repairSudoAction === "reconnect_mac" ? "Server login password" : "Sudo password"}
                 value={repairSudoPassword}
                 onChange={(e) => setRepairSudoPassword(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") submitRepairSudo();
                 }}
-                aria-label="Sudo password for the repair"
+                aria-label={
+                  repairSudoAction === "reconnect_mac"
+                    ? "Login password for reconnecting this Mac"
+                    : "Sudo password for the repair"
+                }
                 autoComplete="new-password"
               />
               <button
@@ -411,7 +440,7 @@ export function ServerStatusPanel({
                 disabled={!repairSudoPassword || repairBusy !== null}
                 onClick={submitRepairSudo}
               >
-                Retry with sudo password
+                {repairSudoAction === "reconnect_mac" ? "Reconnect" : "Retry with sudo password"}
               </button>
               <button
                 type="button"
