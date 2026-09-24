@@ -300,6 +300,7 @@ const baseState: SessionStatePayload = {
   activity: null,
   awaiting_permission: false,
     retry: null,
+  link: null,
   ended: false,
   context_tokens: CTX_DEMO === "none" ? null : 29756,
   context_window: CTX_DEMO === "none" || CTX_DEMO === "nowindow" ? null : 1000000,
@@ -1384,6 +1385,88 @@ export class ScenarioDriver {
           summary: 'Workflow "review-changes" completed',
         }),
       );
+    });
+  }
+
+  /**
+   * `?demo=remotelink` (CRM `c9bf1482`) — a remote conversation whose SSH link has not
+   * attached yet when the message is sent: `WorkingIndicator` must read the link
+   * wording, not the usual "thinking" activity line (see `remoteLinkText.ts`). Walks
+   * both `RemoteLinkState` variants — `Connecting` (never attached), then
+   * `Reconnecting` (attached once, dropped) — before the link finally attaches and
+   * the turn proceeds normally, so the transition back to the ordinary activity line
+   * is visible too. Mirrors the real actor's own sequencing (`session.rs::run_actor`):
+   * `link` is set alongside `busy`, cleared the instant `FdAttach` would land.
+   */
+  startRemoteLink() {
+    this.reset();
+    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
+    this.step(2200, () => {
+      this.emit.state({ ...baseState, busy: true, link: { kind: "reconnecting", attempt: 1 } });
+    });
+    this.step(2200, () => {
+      // Attached: `link` clears and the turn proceeds like any other.
+      this.emit.state({ ...baseState, busy: true, activity: "thinking", link: null });
+      this.step(260, () =>
+        this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+      );
+      const text = "Connected — continuing with the turn.\n\n";
+      this.streamText("m1", text);
+      this.step(180, () =>
+        this.emit.item({
+          kind: "assistant_message",
+          id: "m1",
+          parent_tool_use_id: null,
+          blocks: [{ type: "text", text }],
+        }),
+      );
+      this.step(200, () => {
+        this.emit.item({
+          kind: "turn_result",
+          subtype: "success",
+          is_error: false,
+          result: null,
+          api_error_status: null,
+          total_cost_usd: 0.01,
+          num_turns: 1,
+          duration_ms: 1200,
+          duration_api_ms: 900,
+          ttft_ms: 200,
+        });
+        this.emit.state(idleState());
+      });
+    });
+  }
+
+  /**
+   * `?demo=remotelinkblocked` / `?demo=remotelinkblockedhost` (CRM `c9bf1482`, review
+   * finding): the real incident this whole feature exists to fix — a HARD ssh-level
+   * precondition failure (key refused, or the server's host identity changed) drives
+   * the link straight to the TERMINAL `remote_link_blocked` thread notice instead of
+   * retrying forever, mirroring `run_actor`'s own two terminal branches
+   * (`ssh_link::SshLinkIssue::KeyRefused`/`HostKeyChanged` in `session.rs`): `busy`
+   * clears and the state ends (`ended: true`, `link: null`), same as the real actor's
+   * `flag_undelivered_if_busy` + `set_ended`. Unlike `startRemoteLink` above (the
+   * happy-path recovery), this never attaches — so it is the one demo path that
+   * exercises the thread notice's heading ("Can't reach this server",
+   * `NOTICE_ERROR_HEADINGS`) and message text live, in a real conversation, the way
+   * the incident actually looked (busy spinner → terminal notice), not just in
+   * component-level unit tests.
+   */
+  startRemoteLinkBlocked(reason: "ssh_key_refused" | "ssh_host_key_changed") {
+    this.reset();
+    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
+    this.step(1200, () => {
+      const message =
+        reason === "ssh_key_refused"
+          ? "This Mac's saved key was refused by this server. Reconnect this Mac in Settings → Control → Remote, then reopen this conversation."
+          : "This server's identity has changed since this Mac last connected to it. Review it in Settings → Control → Remote before reconnecting.";
+      this.emit.item({
+        kind: "notice",
+        subtype: "remote_link_blocked",
+        detail: { message, reason, machine_id: "mock-machine-1", detail: null },
+      });
+      this.emit.state({ ...baseState, busy: false, link: null, ended: true });
     });
   }
 

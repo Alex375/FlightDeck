@@ -4788,6 +4788,24 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * A remote (SSH) conversation's live link lifecycle — see
+ * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
+ * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
+ * itself only ever describes "not attached yet".
+ */
+export type RemoteLinkState = 
+/**
+ * This actor has never yet received `fd_attach` this session.
+ */
+{ kind: "connecting" } | 
+/**
+ * Has attached before (or is on a later retry of the same outage). `attempt`
+ * is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
+ * attempts THIS outage has made, 1 at the very first drop, reset to 0 only
+ * on a genuine return to attached (never by an address rotation).
+ */
+{ kind: "reconnecting"; attempt: number }
+/**
  * One level of a remote server's filesystem: the resolved absolute `path` and its
  * immediate SUB-directories (names only). Powers the remote folder browser.
  */
@@ -4824,7 +4842,16 @@ export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_servi
  * this fixes [`DiagnosisState::NeedsClaudeInstall`], that one fixes
  * [`DiagnosisState::NeedsClaudeSignIn`].
  */
-"install_claude" | "sign_in_claude" | "provision_phone"
+"install_claude" | "sign_in_claude" | "provision_phone" | 
+/**
+ * (CRM `c9bf1482`) Reinstalls this Mac's SAVED key on a server that refused it
+ * (`ServerDiagnosis::link_issue == Some(SshLinkIssue::KeyRefused)`) — a normal,
+ * exhaustively-dispatched `RepairAction`, unlike [`Self::SignInClaude`]: see the
+ * module doc's own note on why the two are NOT the same shape (this is a
+ * single, non-interactive, password-in/summary-out round trip; sign-in needs an
+ * interactive [`server_setup::LoginSession`] handle this dispatch can't carry).
+ */
+"reconnect_mac"
 /**
  * One `machine_repair` outcome: what changed, plus a FRESH [`diagnose`] (never a stale
  * one from before the fix).
@@ -5046,7 +5073,24 @@ export type ServerDiagnosis = { state: DiagnosisState;
  * machine-health poll (`store/machineHealth.ts`), which paints the remote mark on
  * every repository that lives on this machine.
  */
-reachable: boolean; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+reachable: boolean; 
+/**
+ * WHY the ssh round trip itself failed — `None` only when [`Self::reachable`] is
+ * `true` (a reachable server has nothing to classify here; see
+ * [`ServerDiagnosis::unreachable_with`], the one constructor of every
+ * `reachable: false` diagnosis). Read by the front's `repairSuggestionsFor`
+ * (`key_refused` is the only one that offers a repair, [`RepairAction::
+ * ReconnectMac`]) and by its `headlineLabel` for the bucket-specific sentence —
+ * see [`SshLinkIssue`]'s own doc for why there are only three buckets.
+ */
+link_issue: SshLinkIssue | null; 
+/**
+ * This Mac's OWN local Tailscale state — `Some(true)` ONLY on positive local
+ * evidence (`tailscale::local_status()` confirmed `NotRunning`), never inferred
+ * or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
+ * [`crate::tailscale`]'s own module doc.
+ */
+tailscale_off_locally: boolean | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
@@ -5261,6 +5305,17 @@ awaiting_permission: boolean;
  */
 retry: RetryState | null; 
 /**
+ * The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
+ * every local conversation, by construction (nothing ever sets it there). Set the
+ * instant a remote actor spawns (`Connecting`), cleared to `None` the instant
+ * `fd_attach` lands, and set again to `Reconnecting` on every later drop —
+ * mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
+ * per-turn API retry, this is ssh itself never having reached the daemon yet.
+ * Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
+ * priority, above `retry`) — see `ConductorThread.tsx`.
+ */
+link: RemoteLinkState | null; 
+/**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session
  * dead instead of showing it as live forever.
@@ -5443,6 +5498,34 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * What kind of hard ssh-level failure just closed a transport before (or
+ * instead of) ever reaching the daemon. `Unreachable` is the catch-all — see
+ * the module doc for why it is not split further.
+ */
+export type SshLinkIssue = 
+/**
+ * The server rejected every key/password this Mac offered
+ * (`Permission denied (publickey…)`/`(publickey,password)`) — the
+ * saved key is no longer authorized (the real incident this module was
+ * built for: an operator removed it from `authorized_keys`).
+ */
+"key_refused" | 
+/**
+ * The server's host key does not match what this Mac last saw (or, under
+ * strict checking, refused a brand-new one) — see
+ * [`crate::bootstrap::askpass::is_host_key_mismatch`], reused here so
+ * both this live-session path and the bootstrap flow recognize the SAME
+ * two OpenSSH wordings.
+ */
+"host_key_changed" | 
+/**
+ * Everything else that keeps ssh from ever connecting: DNS failure,
+ * connection refused, no route to host, network unreachable, a timed-out
+ * handshake, or any other unrecognized ssh-level (exit 255) failure.
+ * Deliberately ONE bucket — see the module doc.
+ */
+"unreachable"
 /**
  * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
  * see the module doc's overview.

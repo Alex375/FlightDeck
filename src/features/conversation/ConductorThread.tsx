@@ -78,6 +78,7 @@ import { parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
+import { remoteLinkText } from "./remoteLinkText";
 import { useShallow } from "zustand/react/shallow";
 import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
@@ -1605,10 +1606,25 @@ function WorkingIndicator({ session }: { session: string }) {
   // terminal-style ("$ command…") rather than the generic "Running …" phrase — the
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
+  const sessionState = useSessionState(session);
+  // A remote conversation's SSH link has not even reached the daemon yet — highest
+  // priority, above `retry` below: there is nothing else true to say about the turn
+  // while ssh itself is still trying to connect/reconnect. See `SessionStatePayload.
+  // link`'s own doc (Rust) and `remoteLinkText`'s own doc.
+  const linkText = remoteLinkText(sessionState?.link ?? null);
+  if (linkText) {
+    return (
+      <div className={styles.activity}>
+        <Ico name="refresh" className={"sm " + styles.retrySpin} />
+        <RollText text={linkText} />
+        <LiveElapsed session={session} />
+      </div>
+    );
+  }
   // The connection dropped and Claude Code is retrying on its own. It takes over the
   // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
   // usual "Running …" phrase would be a lie while nothing is actually running.
-  const retry = useSessionState(session)?.retry ?? null;
+  const retry = sessionState?.retry ?? null;
   if (retry) {
     const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
     return (

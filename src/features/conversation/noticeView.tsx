@@ -58,6 +58,11 @@ export const NOTICE_ERROR_HEADINGS: Record<string, string> = {
   session_budget_exceeded: "Codex session budget exceeded",
   permission_error: "Unreadable permission request",
   history_error: "Problem restoring history",
+  // A terminal ssh-level failure (key refused / host identity changed) — see
+  // `ssh_link::classify_transport_close` (Rust). Falls through to the generic
+  // heading-lookup path below; `detail.message` already carries the specific
+  // wording (which of the two, and what to do about it).
+  remote_link_blocked: "Can't reach this server",
 };
 
 /** The `detail` payload of a `task_failed` notice, built from the failed background task's

@@ -125,6 +125,17 @@ pub enum BootstrapError {
     /// this is what stands between `repair(RestartDaemon)` — reachable directly from a
     /// future wizard UI — and killing a live Claude Code session on that server.
     DaemonBusy(Option<u32>),
+    /// (CRM `c9bf1482`) [`crate::bootstrap::orchestrator::repair`]'s
+    /// [`RepairAction::ReconnectMac`](crate::bootstrap::orchestrator::RepairAction::ReconnectMac)
+    /// arm was called with no password to offer this server's login — the caller (a
+    /// Settings UI) should prompt for the server's SSH login password and retry with
+    /// it, the SAME "repair needs a password → show inline prompt" loop
+    /// [`Self::NeedsSudoPassword`] already drives, distinguished by wording so the
+    /// front never confuses a `sudo` password with an SSH login password
+    /// (`isNeedsConnectionPasswordError` vs `isSudoPasswordError` in
+    /// `serverBootstrapModel.ts` — a wording contract, same discipline as
+    /// `SESSION_GONE_MARKERS`).
+    NeedsConnectionPassword,
     /// Anything else — the ssh/askpass plumbing itself failing, not the login
     /// outcome. Carries a short, already-scrubbed-of-secrets diagnostic.
     Other(String),
@@ -164,6 +175,9 @@ impl std::fmt::Display for BootstrapError {
             }
             Self::DaemonBusy(None) => {
                 write!(f, "won't restart flightdeckd — could not confirm no conversations are busy")
+            }
+            Self::NeedsConnectionPassword => {
+                write!(f, "this server needs its login password to reconnect")
             }
             Self::Other(d) => write!(f, "{d}"),
         }
@@ -602,6 +616,12 @@ pub(crate) fn classify_output(
         || stderr.contains("connection refused")
         || stderr.contains("no route to host")
         || stderr.contains("connection timed out")
+        // macOS's own `ETIMEDOUT` wording for a handshake that never got a SYN-ACK
+        // (e.g. a TEST-NET address, `203.0.113.0/24`) — distinct from "connection
+        // timed out" above, which is Linux's wording for the same failure. Both are
+        // live-verified (this session) real OpenSSH strings for the identical
+        // underlying condition, so both must classify the same way.
+        || stderr.contains("operation timed out")
         || stderr.contains("network is unreachable")
     {
         return Err(BootstrapError::HostUnreachable);
@@ -830,6 +850,22 @@ mod tests {
         };
         let err = classify_output(out, "").expect_err("must classify as an error, not success");
         assert_eq!(err, BootstrapError::HostKeyMismatch);
+    }
+
+    /// macOS's own `ETIMEDOUT` wording ("Operation timed out") for a handshake that
+    /// never got a SYN-ACK — live-verified this session against a TEST-NET address
+    /// (`203.0.113.0/24`) — must classify the same as the pre-existing "Connection
+    /// timed out" (Linux's wording for the same failure): both are a `HostUnreachable`,
+    /// not left to fall through to the raw-line `Other` branch.
+    #[test]
+    fn classify_output_reports_host_unreachable_for_macos_operation_timed_out() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: b"ssh: connect to host 203.0.113.1 port 22: Operation timed out\n".to_vec(),
+        };
+        let err = classify_output(out, "").expect_err("must classify as an error, not success");
+        assert_eq!(err, BootstrapError::HostUnreachable);
     }
 
     /// `run_with_password` is the one that owns `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE`
