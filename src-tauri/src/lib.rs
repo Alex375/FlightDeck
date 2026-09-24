@@ -16,8 +16,10 @@ mod ipc;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
+pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
+pub mod tailscale;
 pub mod terminal;
 pub mod tosse;
 pub mod usage;
@@ -34,7 +36,8 @@ use ipc::commands::{
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
     interrupt_session, list_disk_conversations, list_extensions, list_marketplaces,
-    list_plugin_contents, get_output_style, set_output_style,
+    list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
+    apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, load_session_context, load_session_goal,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
@@ -69,7 +72,7 @@ use ipc::commands::{
     tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
     tosse_link_project_repo, tosse_live_start, tosse_live_stop,
     tosse_login_start, tosse_logout, tosse_project_repos,
-    tosse_repo_links, tosse_set_project_status,
+    tosse_probe_remote_origins, tosse_repo_links, tosse_set_project_status,
     tosse_set_task_assignee, tosse_set_task_status, tosse_status, tosse_task_detail, tosse_web_url,
     tosse_tasks_by_status,
     set_voice_bridge, voice_bridge_status,
@@ -233,6 +236,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             tosse_live_start,
             tosse_live_stop,
             tosse_repo_links,
+            tosse_probe_remote_origins,
             tosse_link_repository,
             tosse_project_repos,
             tosse_link_project_repo,
@@ -301,6 +305,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_plugin_enabled,
             get_output_style,
             set_output_style,
+            mcp_permission_rules,
+            apply_session_overrides,
+            fetch_global_mcp_status,
             list_plugin_contents,
             list_marketplaces,
             set_marketplace_auto_update,

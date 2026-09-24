@@ -188,6 +188,11 @@ pub struct SpawnFlags {
     /// an untitled conversation never stamps that placeholder as the daemon's
     /// authoritative title (see `spawn_session`'s wiring).
     pub conversation_title: Option<String>,
+    /// This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+    /// process right after `initialize` (they live in its flag settings layer, which dies
+    /// with the previous one). Claude only; `None`/empty = nothing of its own.
+    #[serde(default)]
+    pub session_overrides: Option<crate::supervisor::model::SessionOverrides>,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -229,7 +234,11 @@ pub async fn spawn_session(
         app_control,
         claude_account_id,
         conversation_title,
+        session_overrides,
     } = flags;
+    if let Some(o) = &session_overrides {
+        o.validate()?;
+    }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -259,7 +268,7 @@ pub async fn spawn_session(
     cfg.claude_account = claude_slot(&app, claude_account_id.as_deref()).map_err(|e| {
         format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
     })?;
-    // Product defaults when unset: Opus 4.8 + Extra (xhigh) effort + Auto (`auto`)
+    // Product defaults when unset: newest Opus + Extra (xhigh) effort + Auto (`auto`)
     // permission mode. `auto` is the binary's OWN native default (verified: spawning
     // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
     // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
@@ -270,9 +279,9 @@ pub async fn spawn_session(
     let effort = effort
         .filter(|e| control::is_valid_effort_level(e))
         .unwrap_or_else(|| "xhigh".into());
-    // Full model name, not the `opus` alias — that alias tracks the LATEST Opus, so
-    // pinning 4.8 means naming it. Mirrors the front-end seed `DEFAULT_MODEL`.
-    cfg.model = Some(model.unwrap_or_else(|| "claude-opus-4-8".into()));
+    // The `opus` alias, which the binary resolves to the LATEST Opus — the default
+    // follows each release on its own. Mirrors the front-end seed `DEFAULT_MODEL`.
+    cfg.model = Some(model.unwrap_or_else(|| "opus".into()));
     cfg.effort = Some(effort);
     // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
     // off (e.g. the user turned the Settings toggle back off while a conversation still
@@ -385,6 +394,7 @@ pub async fn spawn_session(
         effort: cfg.effort.clone(),
         permission_mode: cfg.permission_mode.clone(),
         ultracode,
+        session_overrides,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -1239,22 +1249,41 @@ pub async fn tosse_repo_links(
         rows.into_iter()
             .map(|row| {
                 use crate::git::RemoteLookup;
-                // Three ordinary answers, one fault. A folder that is not a repository is
-                // COMMON here (Flight Deck opens folders, not only clones) and must not be
-                // dressed up as a failure; a folder that vanished, or that git cannot read,
-                // must SAY so rather than pass for "simply un-associated".
-                let (remote_url, not_a_repository, remote_error) =
-                    match crate::git::remote_url(&row.path) {
-                        Ok(RemoteLookup::Url(url)) => (Some(url), false, None),
-                        Ok(RemoteLookup::NoRemote) => (None, false, None),
-                        Ok(RemoteLookup::NotARepository) => (None, true, None),
-                        Err(e) => (None, false, Some(e.to_string())),
+                use crate::tosse::RemoteProbe;
+                // Three ordinary answers, one fault — and, before any of them, the question
+                // of whether this Mac is even the right machine to ask. A folder that is not
+                // a repository is COMMON here (Flight Deck opens folders, not only clones)
+                // and must not be dressed up as a failure; a folder that vanished, or that
+                // git cannot read, must SAY so rather than pass for "simply un-associated".
+                let (remote_url, not_a_repository, remote_error, machine) =
+                    match crate::tosse::remote_probe(
+                        row.machine_id.as_deref(),
+                        row.machine_label.as_deref(),
+                        row.remote_origin_probed_at.is_some(),
+                        row.remote_origin_note.as_deref(),
+                    ) {
+                        // Not a fault, and not a spawn either: the folder lives on a
+                        // server, so the url comes from what that server last told us
+                        // (`tosse_probe_remote_origins`, out of band) instead of from a
+                        // `git` here. Cached rather than fetched on this path because
+                        // the sidebar calls it at load — and because a cached answer
+                        // still matches with the server switched off.
+                        RemoteProbe::Skip(machine) => {
+                            (row.remote_origin_url.clone(), false, None, Some(machine))
+                        }
+                        RemoteProbe::Locally => match crate::git::remote_url(&row.path) {
+                            Ok(RemoteLookup::Url(url)) => (Some(url), false, None, None),
+                            Ok(RemoteLookup::NoRemote) => (None, false, None, None),
+                            Ok(RemoteLookup::NotARepository) => (None, true, None, None),
+                            Err(e) => (None, false, Some(e.to_string()), None),
+                        },
                     };
                 (
                     crate::tosse::LocalRepo {
                         repo_id: row.repo_id,
                         remote_url,
                         manual_repository_id: row.tosse_repository_id,
+                        machine,
                     },
                     (not_a_repository, remote_error),
                 )
@@ -1282,6 +1311,196 @@ pub async fn tosse_repo_links(
         repositories,
         error: listed.err(),
     })
+}
+
+/// What one run of [`tosse_probe_remote_origins`] did.
+///
+/// Three facts, deliberately not collapsed into the single `bool` this used to be:
+///  - `changed` — a folder's visible state moved (a url, an answer, or the first probe
+///    ever), so the UI should refetch;
+///  - `skipped` — the sweep never ran (another one held the lock). NOT the same as
+///    "nothing changed", and the caller must not treat it as a verdict;
+///  - `write_errors` — answers that were obtained and then LOST on the way to SQLite,
+///    verbatim. Silence here would turn a broken database into "Refresh does nothing".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOriginSweep {
+    pub changed: bool,
+    pub skipped: bool,
+    pub write_errors: Vec<String>,
+}
+
+impl RemoteOriginSweep {
+    fn skipped() -> Self {
+        Self { changed: false, skipped: true, write_errors: Vec::new() }
+    }
+    fn ran(changed: bool, write_errors: Vec<String>) -> Self {
+        Self { changed, skipped: false, write_errors }
+    }
+}
+
+/// Refresh, over SSH, the `origin` of every folder that lives on a paired server, and
+/// cache each answer in SQLite.
+///
+/// This is what makes the automatic TOSSE match work on a remote repository at all: a
+/// folder over there has a perfectly good `origin`, it simply cannot be read by this
+/// Mac's `git` (see [`crate::tosse::remote_probe`]). The read is deliberately NOT on
+/// [`tosse_repo_links`]'s path — that one is called when the sidebar loads, and an SSH
+/// round trip per server does not belong there. It runs beside it and, when something
+/// actually changed, the front refetches.
+///
+/// Reports what the sweep did — see [`RemoteOriginSweep`]. Never returns `Err` for an
+/// unreachable server: that is the server's state, not a failure of this call, and
+/// turning it into one would resurrect exactly the false alarm the machine-aware probe
+/// removed.
+#[tauri::command]
+#[specta::specta]
+pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<RemoteOriginSweep, String> {
+    // One sweep at a time. A second caller is told it was SKIPPED and made to wait for
+    // nothing: the in-flight sweep will report its own result, and React Query already
+    // de-duplicates concurrent fetches of the same key.
+    //
+    // ⚠️ Skipped is not "nothing moved". This used to answer `false`, which reads as a
+    // verdict — "we looked, everything is where it was" — for a call that never looked
+    // at all. A folder added while a sweep was in flight is not in that sweep, so it
+    // would have waited for an unrelated trigger to ever be asked about.
+    static SWEEPING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    {
+        let mut busy = SWEEPING.lock().unwrap();
+        if *busy {
+            return Ok(RemoteOriginSweep::skipped());
+        }
+        *busy = true;
+    }
+    let done = ProbeGuard(&SWEEPING);
+
+    let store = app.state::<Store>();
+    let rows = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    // Group by server: the SSH handshake dwarfs the `git` calls, so ten folders on one
+    // machine are one connection, not ten.
+    let mut by_machine: std::collections::HashMap<
+        String,
+        Vec<crate::store::model::RepoTosseLink>,
+    > = std::collections::HashMap::new();
+    for row in rows {
+        if let Some(id) = row.machine_id.clone() {
+            by_machine.entry(id).or_default().push(row);
+        }
+    }
+    if by_machine.is_empty() {
+        return Ok(RemoteOriginSweep::ran(false, Vec::new()));
+    }
+    let known_hosts = remote_known_hosts_path(&app);
+    let machines: Vec<_> = by_machine
+        .into_iter()
+        .filter_map(|(id, rows)| {
+            // A row whose server was un-paired keeps its cached url (it was true when it
+            // was read); there is simply nothing left to ask.
+            match store.machine_by_id(&id) {
+                Ok(Some(m)) => Some((m, rows)),
+                _ => None,
+            }
+        })
+        .collect();
+    drop(store);
+
+    let sweeps = machines.into_iter().map(|(machine, rows)| {
+        let known_hosts = known_hosts.clone();
+        async move {
+            let paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
+            let script = crate::git::remote_origin_script(&paths, |p| shq(p));
+            // `ConnectTimeout` only bounds the handshake. A server that answers and then
+            // stalls (a hung filesystem under one of the folders) would leave this future
+            // pending forever, and with it the query the sidebar's refresh waits on.
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                run_ssh_on_machine(&machine, known_hosts.as_deref(), &script),
+            )
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string()));
+            let out = match probe {
+                Ok(out) => out,
+                Err(e) => {
+                    // Said out loud in the log, but NOT to the user as a fault: a server
+                    // that is off is not a broken repository. The card keeps saying the
+                    // folder lives over there and offers the manual pin.
+                    eprintln!("[tosse] could not read origins on {}: {e}", machine.label);
+                    return Vec::new();
+                }
+            };
+            let answers = crate::git::parse_remote_origin_script(&out);
+            // `nogit` answers for the whole machine (empty path), so it cannot be paired
+            // with a folder — but it IS an answer about every folder on it: the server
+            // was reached and told us it has no git. Filed as such on each row, rather
+            // than dropped, which used to leave them all looking like "we never managed
+            // to ask" and had the card blame the server's reachability.
+            if answers.iter().any(|(_, a)| *a == crate::git::RemoteOriginAnswer::NoGit) {
+                eprintln!("[tosse] {} has no git, so no origin could be read", machine.label);
+                return rows
+                    .into_iter()
+                    .map(|row| (row.repo_id, None, Some("no-git")))
+                    .collect::<Vec<_>>();
+            }
+            rows.into_iter()
+                .filter_map(|row| {
+                    let answer = answers.iter().find(|(p, _)| *p == row.path).map(|(_, a)| a)?;
+                    match answer {
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::Url(u)) => {
+                            // Redacted at the point of capture: this string is about to be
+                            // persisted and shown, and a clone's remote can carry a token.
+                            Some((row.repo_id, Some(crate::git::redact_remote_url(u)), None))
+                        }
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::NoRemote) => {
+                            Some((row.repo_id, None, Some("no-remote")))
+                        }
+                        // ⚠️ These are FIRM answers, not silence. Dropping them left
+                        // `remote_origin_probed_at` NULL — the field that means "we could
+                        // not ask" — so the card told the user to "try again once the
+                        // server is reachable" about a server that had just answered. The
+                        // note is carried through to the UI instead; the cached url is
+                        // left alone, so an unmounted folder keeps the origin it had.
+                        crate::git::RemoteOriginAnswer::Local(crate::git::RemoteLookup::NotARepository) => {
+                            Some((row.repo_id, None, Some("not-a-repository")))
+                        }
+                        crate::git::RemoteOriginAnswer::Gone => Some((row.repo_id, None, Some("gone"))),
+                        crate::git::RemoteOriginAnswer::NoGit => Some((row.repo_id, None, Some("no-git"))),
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+    });
+    let results = futures_util::future::join_all(sweeps).await;
+
+    let store = app.state::<Store>();
+    let now = now_ms();
+    let mut changed = false;
+    let mut write_errors = Vec::new();
+    for (repo_id, url, note) in results.into_iter().flatten() {
+        match store.set_repo_remote_origin(&repo_id, url.as_deref(), note, now) {
+            Ok(moved) => changed |= moved,
+            // ⚠️ Carried back, not just logged. A failed write means the answer we paid
+            // an SSH round trip for was LOST: the folder keeps reading as never-probed,
+            // the next sweep asks again, and "Refresh" looks like it does nothing. A
+            // line in a log nobody reads is how that becomes a permanent mystery.
+            Err(e) => {
+                eprintln!("[tosse] could not cache the origin of {repo_id}: {e}");
+                write_errors.push(format!("{repo_id}: {e}"));
+            }
+        }
+    }
+    drop(done);
+    Ok(RemoteOriginSweep::ran(changed, write_errors))
+}
+
+/// Releases [`tosse_probe_remote_origins`]'s one-sweep-at-a-time flag however the sweep
+/// ends — an early `?` included. A bare `*busy = false` at the bottom would leave the
+/// flag stuck on after the first error, and no origin would ever refresh again.
+struct ProbeGuard(&'static std::sync::Mutex<bool>);
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = false;
+    }
 }
 
 /// Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
@@ -1374,7 +1593,17 @@ pub async fn scan_local_git_repos(
     // Where to look: the home directory covers the usual cases, plus the PARENT of every
     // folder already in Flight Deck — that is where this user demonstrably keeps clones,
     // including outside home (an external volume, /Volumes/…).
-    let known = store.repo_tosse_links().map_err(|e| e.to_string())?;
+    // ⚠️ LOCAL folders only. A folder on a paired server has a path that means nothing
+    // here (`/home/agent/projects/FlightDeck`): taken as a scan root it makes this Mac
+    // look for clones in a directory that belongs to another machine, tells the user
+    // macOS is blocking access to it, and — since `/home` is an autofs mount point —
+    // can stall the scan's whole time budget waiting on a lookup that will never resolve.
+    let known: Vec<_> = store
+        .repo_tosse_links()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.machine_id.is_none())
+        .collect();
     let scan = tauri::async_runtime::spawn_blocking(move || {
         let mut roots: Vec<PathBuf> = Vec::new();
         // `$HOME` directly, as every other module here resolves it — no new dependency
@@ -2490,6 +2719,81 @@ pub async fn mcp_status(
     handle.mcp_status().await.map_err(|e| e.to_string())
 }
 
+/// Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+/// flag settings layer (never a file, so no other conversation sees them). Rules bite from
+/// its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+/// returned, not swallowed.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_session_overrides(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    overrides: crate::supervisor::model::SessionOverrides,
+    reload_plugins: bool,
+) -> Result<(), String> {
+    overrides.validate()?;
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .apply_session_overrides(&overrides, reload_plugins)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
+/// less `claude` sees them — what the global Settings page lists. A throwaway process in
+/// the home directory, polled until the connectors settle (they connect asynchronously,
+/// a few seconds after start) or ~15 s pass; no model turn, no tokens.
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_global_mcp_status() -> Result<Vec<crate::supervisor::model::McpServerLive>, String> {
+    use crate::supervisor::control;
+    use crate::supervisor::protocol::CliMessage;
+    use crate::supervisor::transport::Transport;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("home directory ($HOME) not found")?;
+    let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(home)).map_err(|e| e.to_string())?;
+    transport
+        .send_line(control::initialize_request("tosse-mcp-init", &[]))
+        .map_err(|e| e.to_string())?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut latest: Option<Vec<crate::supervisor::model::McpServerLive>> = None;
+    let mut round = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        round += 1;
+        let rid = format!("tosse-mcp-status-{round}");
+        if transport.send_line(control::mcp_status_request(&rid)).is_err() {
+            break;
+        }
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = rx.recv().await {
+                if let CliMessage::ControlResponse(v) = msg {
+                    if v.get("response").and_then(|r| r.get("request_id")).and_then(|x| x.as_str())
+                        == Some(rid.as_str())
+                    {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(v) = answer else { break };
+        let servers = control::parse_mcp_status(&v);
+        let settled = !servers.is_empty() && servers.iter().all(|s| s.status != "pending");
+        latest = Some(servers);
+        if settled {
+            break;
+        }
+    }
+    transport.shutdown(false).await;
+    latest.ok_or_else(|| "the Claude CLI did not report its MCP servers".to_string())
+}
+
 /// Enable/disable a live MCP server in a running session (`mcp_toggle`). Optimistic
 /// — returns once sent; the UI re-polls `mcp_status` to reflect the new state, and a
 /// CLI rejection surfaces as a timeline control error.
@@ -3176,6 +3480,21 @@ pub async fn get_output_style() -> Result<String, String> {
     tokio::task::spawn_blocking(crate::extensions::read_output_style)
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+/// (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+/// ("Default"). Blocking file IO runs off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn mcp_permission_rules(
+    repo_path: Option<String>,
+) -> Result<crate::extensions::permissions::PermissionRulesView, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::extensions::permissions::read_mcp_permission_rules(repo_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Set the user's global output style (writes `~/.claude/settings.json` `outputStyle`;
@@ -4725,6 +5044,11 @@ pub(crate) async fn run_ssh_on_machine(
 ) -> Result<String, String> {
     let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
     cmd.arg("-T");
+    // A caller may bound this call with `tokio::time::timeout` (the remote-origin sweep
+    // does, at 30s). Dropping the future does NOT stop the child on its own: `ssh` and
+    // the remote command behind it would keep running, holding the connection, with
+    // nobody left to read them. Same reaping `cli_update` and `accounts` already do.
+    cmd.kill_on_drop(true);
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
     let out = cmd
@@ -4734,12 +5058,23 @@ pub(crate) async fn run_ssh_on_machine(
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("ssh command failed")
-            .to_string())
+        // Classify ssh's own exit-255 failures (key refused / host key changed /
+        // unreachable — `crate::ssh_link`, shared with the live session's reconnect
+        // loop) into a plain sentence BEFORE falling back to the raw last stderr
+        // line — the same real incident that motivated this (`josty@…: Permission
+        // denied (publickey,password).`) used to leak straight into this string.
+        let stderr_lines: Vec<String> =
+            String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
+        Err(crate::ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
+            .map(crate::ssh_link::describe)
+            .unwrap_or_else(|| {
+                stderr_lines
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "ssh command failed".to_string())
+            }))
     }
 }
 
@@ -4758,6 +5093,12 @@ pub(crate) struct SshStdinOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    /// The raw exit code (`None` only if ssh was killed by a signal) — kept
+    /// alongside `success` so a caller that needs to tell "ssh itself failed" (exit
+    /// 255, OpenSSH's own convention) apart from "the remote command's own non-zero
+    /// exit" can, via `crate::ssh_link::classify_transport_close`. `success` alone
+    /// cannot make that distinction (CRM `c9bf1482`).
+    pub exit_code: Option<i32>,
 }
 
 /// [`run_ssh_on_machine`]'s sibling for a remote command that reads bytes off its OWN
@@ -4851,6 +5192,7 @@ pub(crate) async fn run_ssh_on_machine_stdin(
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         success: out.status.success(),
+        exit_code: out.status.code(),
     })
 }
 
@@ -6370,6 +6712,35 @@ mod tests {
         assert!(result.is_err(), "an exploit host must be refused");
         assert!(!marker.exists(), "ssh must NEVER have been spawned");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real incident (CRM `c9bf1482`): this Mac's key was removed from a real
+    /// server's `authorized_keys`, and ssh's raw stderr line
+    /// (`josty@100.97.14.57: Permission denied (publickey,password).`) used to leak
+    /// straight into this error string. Must now come back as `ssh_link::describe`'s
+    /// classified sentence instead.
+    #[tokio::test]
+    async fn run_ssh_on_machine_classifies_a_key_refused_failure_instead_of_leaking_the_raw_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "tosse-keyrefused-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'josty@100.97.14.57: Permission denied (publickey,password).' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(script.to_string_lossy().into_owned()));
+        let machine = machine_with_user_and_host("josty", "example.com");
+        let result = run_ssh_on_machine(&machine, None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
     }
 
     #[tokio::test]

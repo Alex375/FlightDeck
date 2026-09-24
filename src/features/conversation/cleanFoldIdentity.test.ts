@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConductorThread } from "./ConductorThread";
 import { useConversationStore } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
@@ -80,11 +81,20 @@ function seed(busy: boolean) {
 function render() {
   act(() => {
     root.render(
-      createElement(ConductorThread, {
-        session: SESSION,
-        scrollRef: () => {},
-        onRender: () => {},
-      }),
+      // The thread asks whether TOSSE calls get their CRM rendering, which reads the CRM
+      // session through react-query — so the real app's provider has to be here too. Retries
+      // off and a fresh client per render keep the question instant and answer-free (the mock
+      // IPC is not wired in this test), which is all this test needs: it is about DOM identity
+      // across the live → settled flip, not about TOSSE.
+      createElement(
+        QueryClientProvider,
+        { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
+        createElement(ConductorThread, {
+          session: SESSION,
+          scrollRef: () => {},
+          onRender: () => {},
+        }),
+      ),
     );
   });
 }

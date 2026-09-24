@@ -305,6 +305,9 @@ export function RemoteServersGroup() {
   // OLD token from the last "regenerate pairing" was actually forgotten here. ----
   const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
   const [retrying, setRetrying] = useState<Set<string>>(new Set());
+  // Per-machine counter handed to its card as `recheckToken`: bumped when an action the
+  // GROUP owns has just talked to that server, so the card re-diagnoses.
+  const [rechecks, setRechecks] = useState<Record<string, number>>({});
   const now = useNow(30_000);
 
   // Poll both registries so a background provisioning/revocation attempt
@@ -347,6 +350,14 @@ export function RemoteServersGroup() {
           next.delete(machineId);
           return next;
         });
+        // Whatever the outcome, this just finished a real round trip to that server —
+        // the freshest evidence anyone has about whether it is there. Ask the card to
+        // re-diagnose rather than concluding anything here: a retry can fail for reasons
+        // that say nothing about reachability (a daemon too old, a refusal), and one
+        // verdict source keeps the card's headline, the sidebar mark and the composer
+        // band from contradicting each other. Without this, a Retry that visibly WORKED
+        // left "could not reach the server" on screen — see `recheckToken`.
+        setRechecks((cur) => ({ ...cur, [machineId]: (cur[machineId] ?? 0) + 1 }));
       });
   }, []);
 
@@ -371,7 +382,7 @@ export function RemoteServersGroup() {
   }, []);
 
   return (
-    <SettingsGroup title="Remote servers (SSH)" icon="globe">
+    <SettingsGroup title="Remote servers (SSH)" icon="server">
       {machines.length === 0 && !wizardOpen && (
         <div className={styles.remoteEmpty}>
           No remote server yet. Pair a Linux box and run conversations on it, over SSH.
@@ -385,6 +396,7 @@ export function RemoteServersGroup() {
           provisionLabel={describeProvisionStatus(provisionStatuses.get(m.id), now)}
           revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
           isRetrying={retrying.has(m.id)}
+          recheckToken={rechecks[m.id] ?? 0}
           onRetryProvisioning={() => retryProvisioning(m.id)}
           onNewConversation={() => toggleConv(m.id)}
           onRemove={() => useConversationsStore.getState().removeMachine(m.id)}

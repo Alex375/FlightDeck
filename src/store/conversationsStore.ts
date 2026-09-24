@@ -38,10 +38,12 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 // value. modelPrefs only imports `BackendKind` as a TYPE from here (erased at runtime),
 // so this value edge is acyclic.
 import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
+import { FACTORY_CLAUDE_MODEL } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
+import { probeMachine } from "./machineHealth";
 import {
   defaultAccountForNewConversation,
   noteManualAccountPick,
@@ -61,6 +63,7 @@ import {
   clearAllArtifactsCache,
 } from "../features/conversation/artifacts";
 import { clearCodexControls, clearAllCodexControls } from "../features/conversation/codexControls";
+import { clearAllPolicy, clearConvPolicy, sessionOverridesForConv } from "./mcpPolicy";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
 import {
   clearPlanAnnotations,
@@ -113,10 +116,10 @@ export function conversationTitleForSpawn(name: string): string | null {
 // `defaultEffortFor` (store/modelPrefs) instead of these constants — which stay as the
 // last-resort floor and as what "Reset" returns to.
 //
-// Opus 4.8 by its FULL name, not a family alias: `opus` always resolves to the LATEST
-// Opus, so pinning 4.8 requires naming it (see CLAUDE_MODELS). Keep in sync with the
-// Rust spawn fallback in `ipc/commands.rs`.
-export const DEFAULT_MODEL = "claude-opus-4-8";
+// The newest Opus, via its family alias (`opus`) — derived from the catalogue, so it
+// follows the next release on its own (see CLAUDE_MODELS). Keep in sync with the Rust
+// spawn fallback in `ipc/commands.rs`.
+export const DEFAULT_MODEL = FACTORY_CLAUDE_MODEL;
 export const DEFAULT_EFFORT = "xhigh";
 // "auto" is the binary's own native default and what the live session reports;
 // keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.
@@ -686,6 +689,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   clearComposerDraft(id);
   clearComposerAttachments(id);
   clearCodexControls(id);
+  clearConvPolicy(id);
   clearWorkFold(id);
   clearPlanAnnotations(id);
   useGitViewStore.getState().clear(id);
@@ -835,6 +839,23 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   addConversation: (c) => {
+    // A conversation entering the store with NO session id has no on-disk transcript
+    // yet: everything it will ever show arrives LIVE. Mark it hydrated right away so
+    // the select-time loader never replays a transcript ON TOP of turns already
+    // streamed — `loadConversationHistory` is ADDITIVE (see its own doc), so a late
+    // first open would append the whole past again: the same user prompt a second
+    // time at the tail, and every assistant block duplicated inside its turn.
+    //
+    // ⚠️ Load-bearing for any conversation that runs BEFORE it is ever opened — the
+    // TOSSE tasks view's "Start" is the everyday case (it stays on the tasks page by
+    // default, so the thread is only opened once the agent has worked for a while).
+    // It is the same order-of-operations the app-control `send_message` /
+    // `read_conversation` paths get by pre-hydrating.
+    //
+    // NOT for a conversation that arrives WITH a session id (undo of a delete,
+    // `reactivateDiskConversation`, a Codex fork): those have real history on disk
+    // that the loader must still read.
+    if (!c.sessionId) historyLoaded.add(c.id);
     set((s) => ({ conversations: [...s.conversations, c], activeId: c.id }));
     syncToCore("upsertConversation", () => commands.upsertConversation(convToRecord(c)));
     syncToCore("setActive", () => commands.setActiveConversation(c.id));
@@ -933,8 +954,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // awaited — a failure here must never block or fail the LOCAL rename, which has
     // already landed above.
     if (!conv.handle && !isSpawning(id) && conv.sessionId) {
-      const repo = get().repos.find((r) => r.id === conv.repoId);
-      if (repo?.machineId) {
+      const machineId = get().repos.find((r) => r.id === conv.repoId)?.machineId;
+      if (machineId) {
         void commands
           .pushRemoteConversationTitle(id, trimmed)
           .then((ok) => {
@@ -947,6 +968,11 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
             // carries the title anyway (see the doc above).
             if (!ok) {
               console.warn("pushRemoteConversationTitle: push did not land (daemon unreachable or too old)", id);
+              // A round trip to this machine just failed. That is NOT a verdict —
+              // "daemon too old" fails here on a perfectly reachable server — so it
+              // triggers a real check rather than marking anything down itself. This is
+              // what makes the badge react in seconds instead of waiting out the poll.
+              void probeMachine(machineId);
             }
           })
           .catch((e) => console.error("pushRemoteConversationTitle failed:", e));
@@ -1729,6 +1755,11 @@ export async function ensureConversationSession(
     // placeholder name, so an untitled conversation never stamps that placeholder
     // as the daemon's authoritative title (see `conversationTitleForSpawn`'s doc).
     const conversationTitle = conversationTitleForSpawn(atSpawn.name);
+    // Flight Deck's MCP permission / plugin cascade (Global → repository → this
+    // conversation), resolved for this conversation: it lives in the process's flag layer,
+    // so every spawn carries it to be re-applied right after `initialize`.
+    const sessionOverrides =
+      atSpawn.kind === "claude" ? sessionOverridesForConv(convId, atSpawn.repoId ?? null) : null;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1743,6 +1774,7 @@ export async function ensureConversationSession(
         appControl,
         claudeAccountId,
         conversationTitle,
+        sessionOverrides,
       },
     );
     if (res.status !== "ok") {
@@ -1784,11 +1816,23 @@ export async function ensureConversationSession(
             // Same account too: a lost worktree must not silently change identity.
             claudeAccountId,
             conversationTitle,
+            sessionOverrides,
           },
         );
       }
     }
-    if (res.status !== "ok") throw new Error(res.error);
+    if (res.status !== "ok") {
+      // A spawn on a REMOTE repository failed — the strongest hint we ever get that a
+      // server has gone away, and the one moment the user is definitely watching.
+      // Deliberately a TRIGGER, not a verdict: this fails for plenty of reasons that
+      // have nothing to do with reachability (a missing `claude`, a bad cwd), so the
+      // real check decides, and the throw below is unaffected either way.
+      const spawnMachineId = useConversationsStore
+        .getState()
+        .repos.find((r) => r.id === before.repoId)?.machineId;
+      if (spawnMachineId) void probeMachine(spawnMachineId);
+      throw new Error(res.error);
+    }
     useConversationsStore
       .getState()
       .setHandle(convId, res.data, allowBypass, claudeAccountId);
@@ -1874,7 +1918,9 @@ export function demoteBypassConversations(): void {
   }
 }
 
-// Conversations whose on-disk transcript has already been replayed this run.
+// Conversations whose on-disk transcript has already been replayed this run — plus
+// those BORN in this run (seeded by `addConversation` when the row has no session id),
+// which never had a transcript to replay in the first place.
 const historyLoaded = new Set<string>();
 
 /**
@@ -2190,6 +2236,7 @@ export async function wipeAllData(): Promise<void> {
   clearAllComposerDrafts();
   clearAllComposerAttachments();
   clearAllCodexControls();
+  clearAllPolicy();
   clearAllWorkFold();
   clearAllPlanAnnotations();
   clearAllSidebarFold();

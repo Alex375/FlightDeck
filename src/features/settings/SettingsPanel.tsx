@@ -24,6 +24,7 @@ import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
 import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
+import { GlobalExtensions } from "../extensions/ExtensionsManager";
 import { useClaudeAccount } from "../../ipc/useAccounts";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
@@ -67,7 +68,8 @@ const TABS: Array<{
   // page is Claude model names, Claude file layout and Claude-only CLI flags end to end,
   // so an abstraction over both backends would have to speak in euphemisms. A Codex twin
   // would be its own tab. Holds what used to be the top-level "Behavior" tab (output
-  // style, bypass permissions) — both are Claude-only and do nothing for Codex.
+  // style, bypass permissions) — both are Claude-only and do nothing for Codex — and the
+  // global extensions page (its "Extensions" sub-tab).
   { id: "claudeCode", label: "Claude Code", icon: "code", needsClaude: true },
   { id: "shortcuts", label: "Shortcuts", icon: "key" },
   // Agents piloting the app: the in-process MCP server, the voice agent, the bridge.
@@ -101,11 +103,14 @@ const DISPLAY_SUBS = [
 ] as const;
 
 /** Claude Code, widest scope first: the instructions every conversation starts from, then
- *  how Claude itself behaves, then the helpers it delegates to and what they cost. */
+ *  how Claude itself behaves, then the helpers it delegates to and what they cost, then
+ *  the extensions (connectors, plugins, skills, sub-agents) every conversation starts with.
+ *  Extensions lives here because it is Claude's — Codex's own stay in its ⌘E panel. */
 const CLAUDE_CODE_SUBS = [
   { id: "instructions", label: "Instructions", icon: "file" },
   { id: "behavior", label: "Behavior", icon: "shield" },
   { id: "helpers", label: "Helpers", icon: "bot" },
+  { id: "extensions", label: "Extensions", icon: "layers" },
 ] as const;
 
 const CONTROL_SUBS = [
@@ -436,7 +441,11 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               <div>
                 <PageHead
                   title="Claude Code"
-                  subtitle="The instructions Claude works from, how it behaves, and which model each of its helpers runs on."
+                  subtitle={
+                    claudeCodeSub === "extensions"
+                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
+                      : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
+                  }
                 />
                 {/* Claude-only, all of it: the output style and the bypass-permissions
                     unlock came from the old top-level "Behavior" tab — one writes
@@ -457,6 +466,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   </>
                 )}
                 {claudeCodeSub === "helpers" && <ClaudeCodeHelpers />}
+                {claudeCodeSub === "extensions" && <GlobalExtensions />}
               </div>
             )}
 
@@ -601,8 +611,6 @@ function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
-  const sidebarStatePills = useDisplay((s) => s.sidebarStatePills);
-  const composerStatusBand = useDisplay((s) => s.composerStatusBand);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -618,37 +626,6 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
-        />
-        <ToggleRow
-          title="Tinted conversation rows"
-          hint={
-            <>
-              In the sidebar, a conversation's state is <strong>the colour of its row</strong>:
-              green while it runs — with the working dots and the{" "}
-              <strong>time since your last message</strong> under its name — green-violet for
-              background work, amber when it needs you, blue to review, red on an error. Idle
-              and stopped conversations stay plain. Off → the classic status dot in front of
-              the name. <strong>On by default.</strong>
-            </>
-          }
-          checked={sidebarStatePills}
-          onChange={(v) => set({ sidebarStatePills: v })}
-          label="Show each conversation's state as its row colour"
-        />
-        <ToggleRow
-          title="Status inside the composer"
-          hint={
-            <>
-              “Conversation ended”, a question waiting for you, an error, background work: the
-              conversation's status shows as a <strong>band at the top of the composer</strong>,
-              whose border takes the state's colour, with <strong>Mark as seen</strong> (⌘↵)
-              and <strong>Continue</strong> right there. Off → the classic full-width bar
-              above the composer. <strong>On by default.</strong>
-            </>
-          }
-          checked={composerStatusBand}
-          onChange={(v) => set({ composerStatusBand: v })}
-          label="Show the conversation's status inside the composer"
         />
         <ToggleRow
           title="Live workflow on the Flight Deck card"
@@ -1165,8 +1142,8 @@ function TimingPrefs() {
             On a conversation's row in the sidebar, next to the working dots: a{" "}
             <strong>live counter</strong> while the agent works, then the time{" "}
             <strong>frozen</strong> on how long the turn took once it stops on a state
-            (ready to review, a question, an error). Off → the dots alone. Needs{" "}
-            “Tinted conversation rows” (Appearance). <strong>On by default.</strong>
+            (ready to review, a question, an error). Off → the dots alone.{" "}
+            <strong>On by default.</strong>
           </>
         }
         checked={sidebarRowTimer}

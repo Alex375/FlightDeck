@@ -3,7 +3,7 @@
 // per actionable diagnosis (`machine_repair`). Replaces the old plain `.remoteRow` —
 // everything that row already did (phone-provisioning status, New conversation…,
 // Remove) is folded in here so there is one card per server, not two.
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Ico } from "../../ui/kit";
 import { commands, type RepairAction, type ServerDiagnosis } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
@@ -11,11 +11,13 @@ import { useMachineActiveConversationIds } from "../../agent/fleet";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
+import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
   headlineLabel,
   headlineTone,
+  isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
   repairSuggestionsFor,
@@ -68,24 +70,48 @@ export function DiagnosisSummary({
           {headlineLabel(diagnosis.state)}
         </span>
       )}
-      <div className={styles.rows}>
-        <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
-        <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
-        <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
-        <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
-        <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
-        <FactRow
-          label="Claude signed in"
-          value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
-          toneTri={tri(diagnosis.claude_logged_in)}
-        />
-        <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
-        <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
-        <FactRow
-          label="Busy conversations"
-          value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
-        />
-      </div>
+      {diagnosis.reachable ? (
+        <div className={styles.rows}>
+          <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
+          <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
+          <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
+          <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
+          <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
+          <FactRow
+            label="Claude signed in"
+            value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
+            toneTri={tri(diagnosis.claude_logged_in)}
+          />
+          <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
+          <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
+          <FactRow
+            label="Busy conversations"
+            value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
+          />
+        </div>
+      ) : (
+        // (CRM `c9bf1482`) An unreachable server has NOTHING confirmed to show in
+        // the fact-row grid above (every field is `null`, not `false` — see
+        // `ServerDiagnosis::unreachable_with`'s own doc) — rendering it here would
+        // be nine rows of "Unknown". Instead: an informational note ONLY for a
+        // changed host identity (no repair button — see `repairSuggestionsFor`'s
+        // own doc for why), and a Tailscale fact row ONLY on positive local
+        // evidence that it is off.
+        <>
+          {diagnosis.link_issue === "host_key_changed" && (
+            <p className={styles.hostKeyNote}>
+              This server&apos;s identity has changed since this Mac last connected to it. If
+              that&apos;s expected — a reinstall, a new host — remove this server and add it
+              again.
+            </p>
+          )}
+          {diagnosis.tailscale_off_locally === true && (
+            <div className={styles.rows}>
+              <FactRow label="Tailscale (this Mac)" value="Off" toneTri="no" />
+            </div>
+          )}
+        </>
+      )}
       {suggestions.length > 0 && (
         <div className={styles.repairs}>
           {suggestions.map((s) => (
@@ -118,6 +144,7 @@ export function ServerStatusPanel({
   onRetryProvisioning,
   onNewConversation,
   onRemove,
+  recheckToken = 0,
   children,
 }: {
   machine: Machine;
@@ -127,6 +154,13 @@ export function ServerStatusPanel({
   onRetryProvisioning: () => void;
   onNewConversation: () => void;
   onRemove: () => void;
+  /** Bumped by the parent whenever something IT owns finished a round trip to this
+   *  server — today only "Retry" (phone access), which lives in the parent's state. A
+   *  change re-runs this card's own `refresh`, so the headline stops contradicting what
+   *  just visibly worked AND the machine-health store (hence the sidebar mark and the
+   *  composer band) learns the server answered. Everything this card owns already
+   *  refreshes itself (Refresh, a repair, a server sign-in). */
+  recheckToken?: number;
   /** The inline "New conversation…" folder picker, rendered by the parent when open —
    *  kept out of this component (unrelated to B12, pre-existing feature). */
   children?: ReactNode;
@@ -134,6 +168,15 @@ export function ServerStatusPanel({
   const [diagnosis, setDiagnosis] = useState<ServerDiagnosis | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Orders the three producers of a diagnosis for THIS card — the mount effect, Refresh
+  // (which "Retry" drives through `recheckToken`) and a repair. They overlap routinely:
+  // the mount probe is bounded at 20s against a dead server, and Retry is clickable
+  // while it is still in flight. Whoever answered LAST used to win, so a slow
+  // "unreachable" landed on top of the fresh "ready" the user had just asked for. Each
+  // producer takes a ticket before its round trip and only writes if it still holds the
+  // latest one. Its `startedAtMs` twin does the same job inside the health store, for
+  // the surfaces outside this card.
+  const diagGen = useRef(0);
   // Set on a FAILED `machine_diagnose` (initial load or Refresh) — never silently
   // dropped: with no `diagnosis` yet this is the only thing standing between the
   // card and a blank space below the server's name/address row, and even once a
@@ -169,18 +212,34 @@ export function ServerStatusPanel({
   // stale local snapshot.
   useEffect(() => {
     let disposed = false;
+    const mine = ++diagGen.current;
+    const startedAtMs = Date.now();
     setLoading(true);
     setDiagError(null);
     void commands.machineDiagnose(machine.id).then(
       (res) => {
+        // Every diagnosis this panel pays for is also the freshest answer the remote
+        // MARK could have — file it, so opening Settings clears a stale "unreachable"
+        // badge (and sets one) without a second round trip. See `store/machineHealth`.
+        //
+        // Filed BEFORE the `disposed` gate on purpose: a verdict is a fact about the
+        // machine, not about this card, and closing Settings while the round trip is in
+        // flight used to throw away an answer the whole app was waiting for. The store
+        // applies its own staleness rule, so this cannot overwrite a fresher one.
+        if (res.status === "ok") useMachineHealthStore.getState().record(machine.id, res.data, startedAtMs);
         if (disposed) return;
+        // `loading` belongs to THIS request, so it clears even when a newer probe has
+        // since taken over the content — otherwise the card would read "Checking…" for
+        // ever behind an answer that already landed.
         setLoading(false);
+        if (mine !== diagGen.current) return;
         if (res.status === "ok") setDiagnosis(res.data);
         else setDiagError(res.error);
       },
       (e: unknown) => {
         if (disposed) return;
         setLoading(false);
+        if (mine !== diagGen.current) return;
         setDiagError(e instanceof Error ? e.message : String(e));
       },
     );
@@ -190,9 +249,13 @@ export function ServerStatusPanel({
   }, [machine.id]);
 
   const refresh = useCallback(async () => {
+    const mine = ++diagGen.current;
+    const startedAtMs = Date.now();
     setRefreshing(true);
     try {
       const res = await commands.machineDiagnose(machine.id);
+      if (res.status === "ok") useMachineHealthStore.getState().record(machine.id, res.data, startedAtMs);
+      if (mine !== diagGen.current) return;
       if (res.status === "ok") {
         setDiagnosis(res.data);
         setDiagError(null);
@@ -200,23 +263,41 @@ export function ServerStatusPanel({
         setDiagError(res.error);
       }
     } catch (e) {
+      if (mine !== diagGen.current) return;
       setDiagError(e instanceof Error ? e.message : String(e));
     } finally {
       setRefreshing(false);
     }
   }, [machine.id]);
 
+  // Re-check when the parent says one of ITS actions finished a round trip to this server
+  // (see `recheckToken`). Goes through `refresh`, not the mount effect: this is a
+  // re-check of a card already on screen, so it must not blank the facts back to
+  // "Checking…" — the user is looking straight at them.
+  const seenRecheck = useRef(recheckToken);
+  useEffect(() => {
+    if (recheckToken === seenRecheck.current) return;
+    seenRecheck.current = recheckToken;
+    void refresh();
+  }, [recheckToken, refresh]);
+
   const runRepair = useCallback(
     async (action: RepairAction, password: string | null) => {
+      const mine = ++diagGen.current;
+      const startedAtMs = Date.now();
       setRepairBusy(action);
       setRepairError(null);
       const res = await commands.machineRepair(machine.id, action, password);
       setRepairBusy(null);
+      if (mine !== diagGen.current) return;
       if (res.status === "ok") {
         setDiagnosis(res.data.diagnosis);
+        // A repair carries its own FRESH diagnosis — the badge must follow it, or a
+        // machine the user just fixed would stay red until the next poll.
+        useMachineHealthStore.getState().record(machine.id, res.data.diagnosis, startedAtMs);
         setRepairSudoAction(null);
         setRepairSudoPassword("");
-      } else if (isSudoPasswordError(res.error)) {
+      } else if (isSudoPasswordError(res.error) || isNeedsConnectionPasswordError(res.error)) {
         setRepairSudoAction(action);
       } else {
         setRepairError(res.error);
@@ -340,13 +421,17 @@ export function ServerStatusPanel({
                 className={sharedStyles.field}
                 style={{ flex: "0 0 220px" }}
                 type="password"
-                placeholder="Sudo password"
+                placeholder={repairSudoAction === "reconnect_mac" ? "Server login password" : "Sudo password"}
                 value={repairSudoPassword}
                 onChange={(e) => setRepairSudoPassword(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") submitRepairSudo();
                 }}
-                aria-label="Sudo password for the repair"
+                aria-label={
+                  repairSudoAction === "reconnect_mac"
+                    ? "Login password for reconnecting this Mac"
+                    : "Sudo password for the repair"
+                }
                 autoComplete="new-password"
               />
               <button
@@ -355,7 +440,7 @@ export function ServerStatusPanel({
                 disabled={!repairSudoPassword || repairBusy !== null}
                 onClick={submitRepairSudo}
               >
-                Retry with sudo password
+                {repairSudoAction === "reconnect_mac" ? "Reconnect" : "Retry with sudo password"}
               </button>
               <button
                 type="button"

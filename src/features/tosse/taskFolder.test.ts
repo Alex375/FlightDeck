@@ -38,6 +38,7 @@ function link(repoId: string, repository: TosseRepository | null): TosseRepoLink
     ambiguous: [],
     notARepository: false,
     remoteError: null,
+    machine: null,
   };
 }
 

@@ -122,6 +122,17 @@ export function isSudoPasswordError(message: string | null): boolean {
   return !!message && message.includes("needs a sudo password");
 }
 
+/** Whether a `machine_repair` error string is the backend's
+ *  `BootstrapError::NeedsConnectionPassword` wording ("this server needs its login
+ *  password to reconnect") — the front's cue to prompt for THIS server's SSH login
+ *  password (never a `sudo` password) for {@link RepairAction} `"reconnect_mac"`.
+ *  Mirrors {@link isSudoPasswordError}'s own wording-contract pattern; deliberately
+ *  worded so the two never match each other's message (a repair dispatch must show
+ *  the right password prompt, not either one guessed from the other). */
+export function isNeedsConnectionPasswordError(message: string | null): boolean {
+  return !!message && message.includes("needs its login password to reconnect");
+}
+
 /** Whether a `bootstrap_server`/`bootstrap_resume`/`machine_repair` error string is
  *  the backend's per-server lock rejection (`server_busy_error`, `orchestrator.rs`) —
  *  another one of the three is already running against this same server. Wording
@@ -228,6 +239,21 @@ export interface RepairSuggestion {
  * plain summary string is all this needs — so it DOES appear here.
  */
 export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
+  // (CRM `c9bf1482`) Nothing below this point is CONFIRMED about an unreachable
+  // server — every one of `claude_installed`/`installed_as`/`daemon_running`/…
+  // is `null` ("unknown"), never `false`, for a diagnosis that never even got an
+  // ssh answer (see `ServerDiagnosis::unreachable_with`, Rust). Falling through to
+  // the body below used to read `claude_installed !== true` as "not installed" and
+  // offer "Install Claude Code" for a server that was simply unreachable — the
+  // real incident's bogus suggestion. `key_refused` is the one classification with
+  // an actual fix this Mac can apply on its own; every other unreachable case has
+  // nothing to suggest here (the Settings card's own informational text/fact row
+  // covers `host_key_changed`/Tailscale instead — see `ServerStatusPanel.tsx`).
+  if (!d.reachable) {
+    return d.link_issue === "key_refused"
+      ? [{ action: "reconnect_mac", title: "Reconnect this Mac", reason: "this server refused this Mac's saved key" }]
+      : [];
+  }
   const out: RepairSuggestion[] = [];
   if (d.claude_installed !== true) {
     out.push({

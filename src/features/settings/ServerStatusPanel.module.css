@@ -121,3 +121,12 @@
   font-size: 12px;
   color: var(--text-muted);
 }
+
+/* Informational note for an unreachable server whose host identity changed — no
+   repair button next to it (see `repairSuggestionsFor`'s own doc for why). */
+.hostKeyNote {
+  margin: 4px 15px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}

@@ -25,7 +25,20 @@ export interface ModelOption {
   caps?: readonly ModelCap[];
   /** Who serves the model — shown as a column in Settings → Models. */
   provider?: ModelProvider;
+  /** Claude model family, as the CLI registry names it. Drives the factory picker (the
+   *  newest row of each family is shown out of the box — see FACTORY_HIDDEN_MODELS). */
+  family?: ClaudeFamily;
+  /**
+   * The full model id this row runs, when `value` is a family ALIAS (`opus`) rather than
+   * the id itself — i.e. what the binary resolved that alias to when the row was written.
+   * It is the row's IDENTITY: the resolvers match a live resolved id against it, and the
+   * picker preferences notice when an alias has moved on to a newer model (see
+   * store/modelPrefs `seen`). Pinned rows omit it: their `value` already is the id.
+   */
+  modelId?: string;
 }
+
+export type ClaudeFamily = "fable" | "opus" | "sonnet" | "haiku" | "mythos";
 
 /** Effort capability tokens, verbatim from the CLI registry's `capabilities` array. */
 export type ModelCap = "effort" | "max_effort" | "xhigh_effort";
@@ -40,7 +53,7 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
 
 /**
  * Every Claude model the CLI knows, transcribed from the model registry BAKED INTO the
- * binary (2.1.233 — a plain `{id,family,display_name,capabilities,default_effort,…}`
+ * binary (2.1.280 — a plain `{id,family,display_name,capabilities,default_effort,…}`
  * array). That registry is the authority for two things we used to guess at:
  *   • the effort ladder (`caps`) — which is how we learn that Opus 4.6 and Sonnet 4.6
  *     take `max` but NOT `xhigh`, and that everything at 4.5 and below has no effort
@@ -48,55 +61,76 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
  *   • the exact display names, so a row here reads like the CLI's own `/model` picker.
  *
  * Wire value = the CLI alias for the LATEST of a family (`opus`, `sonnet`, `haiku`,
- * `fable`, resolved by the registry's `aliases` table), and the FULL model name for
- * every pinned older version — an alias always follows the newest release, so it can't
- * name a specific one. `--model` accepts both.
+ * `fable`, resolved by the registry's `aliases` table — `latest_per_family` in the same
+ * registry), and the FULL model name for every pinned older version — an alias always
+ * follows the newest release, so it can't name a specific one. `--model` accepts both.
+ * An alias row carries the id it resolves to in `modelId`, so its label stays honest.
  *
- * Only the first few are shown out of the box; the rest are opt-in from
+ * ⚠️ When the binary ships a new model, the alias silently moves on: the alias row then
+ * RUNS the new model under the old label (Opus 5.5 ran as "Opus 5" for a CLI release).
+ * The update is: relabel the alias row + bump its `modelId`, add a pinned row for the
+ * model it used to name, and move the alias arm of the Rust `assembler.rs::model_label`.
+ * Picker preferences reconcile on their own (store/modelPrefs).
+ *
+ * Only the newest model of each family is shown out of the box; the rest are opt-in from
  * Settings → Models (see FACTORY_HIDDEN_MODELS). Ordered newest-family-first, and
- * newest-version-first inside a family — that IS the default picker order.
+ * newest-version-first inside a family — that IS the default picker order, and "first row
+ * of a family" is how the newest one is found.
  */
 export const CLAUDE_MODELS: ModelOption[] = [
   // Fable 5.1: preview model with its own rate-limit window (surfaced by the usage ring
-  // as a model-scoped cap). Same effort tier as Opus. Alias "fable" is sent verbatim and
-  // the binary resolves it to the latest of the family (claude-fable-5-1 as of 2.1.260).
-  { label: "Fable 5.1", value: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
-  { label: "Opus 5", value: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
-  // Opus 4.8: the app's default (see DEFAULT_MODEL). Named in full because `opus` now
-  // resolves to Opus 5. Verified live: a turn spawned with `--model claude-opus-4-8`
-  // reports `claude-opus-4-8` in its modelUsage.
-  { label: "Opus 4.8", value: "claude-opus-4-8", backend: "claude", caps: FULL, provider: "Anthropic" },
-  { label: "Opus 4.7", value: "claude-opus-4-7", backend: "claude", caps: FULL, provider: "Anthropic" },
-  { label: "Opus 4.6", value: "claude-opus-4-6", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
-  { label: "Opus 4.5", value: "claude-opus-4-5", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Opus 4.1", value: "claude-opus-4-1", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Opus 4", value: "claude-opus-4-0", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 5", value: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
-  { label: "Sonnet 4.6", value: "claude-sonnet-4-6", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
-  { label: "Sonnet 4.5", value: "claude-sonnet-4-5", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 4", value: "claude-sonnet-4-0", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 3.7", value: "claude-3-7-sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 3.5", value: "claude-3-5-sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Haiku 4.5", value: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Haiku 3.5", value: "claude-3-5-haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  // Mythos 5: in the registry with NO provider ids beyond first-party and no
-  // capabilities — listed for completeness, hidden by default like the rest.
-  { label: "Mythos 5", value: "claude-mythos-5", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  // as a model-scoped cap). Same effort tier as Opus.
+  { label: "Fable 5.1", value: "fable", modelId: "claude-fable-5-1", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Fable 5", value: "claude-fable-5", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Opus 5.5", value: "opus", modelId: "claude-opus-5-5", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Opus 5", value: "claude-opus-5", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
+  // Verified live: a turn spawned with `--model claude-opus-4-8` reports
+  // `claude-opus-4-8` in its modelUsage — a pinned full name is honoured as such.
+  { label: "Opus 4.8", value: "claude-opus-4-8", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Opus 4.7", value: "claude-opus-4-7", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Opus 4.6", value: "claude-opus-4-6", family: "opus", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
+  { label: "Opus 4.5", value: "claude-opus-4-5", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Opus 4.1", value: "claude-opus-4-1", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Opus 4", value: "claude-opus-4-0", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Sonnet 5", value: "sonnet", modelId: "claude-sonnet-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Sonnet 4.6", value: "claude-sonnet-4-6", family: "sonnet", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
+  { label: "Sonnet 4.5", value: "claude-sonnet-4-5", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Sonnet 4", value: "claude-sonnet-4-0", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Sonnet 3.7", value: "claude-3-7-sonnet", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Sonnet 3.5", value: "claude-3-5-sonnet", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Haiku 4.5", value: "haiku", modelId: "claude-haiku-4-5", family: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Haiku 3.5", value: "claude-3-5-haiku", family: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  // Mythos: first-party only (no Bedrock/Vertex ids in the registry), and NEVER offered
+  // out of the box — see FACTORY_EXCLUDED_FAMILIES. No alias exists for the family, so
+  // both rows are pinned.
+  { label: "Mythos 5.1", value: "claude-mythos-5-1", family: "mythos", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Mythos 5", value: "claude-mythos-5", family: "mythos", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
 ];
 
-/**
- * What the picker shows on a fresh install: Fable 5.1, Opus 4.8, Sonnet 5, Haiku 4.5 —
- * one current model per family, with Opus 4.8 as the default. Everything else (Opus 5
- * included, by explicit product decision) starts in Settings → Models' "Available"
- * list, one click away.
- *
- * Stored as the HIDDEN set rather than the shown one, on purpose: a model added to the
- * catalogue later then appears on its own instead of staying invisible until someone
- * notices. The user's own choices are persisted the same way (see store/modelPrefs).
- */
-export const FACTORY_HIDDEN_MODELS: readonly string[] = CLAUDE_MODELS.map((m) => m.value).filter(
-  (v) => !["fable", "claude-opus-4-8", "sonnet", "haiku"].includes(v),
-);
+/** A catalogue row's identity: the model it actually runs (see `ModelOption.modelId`). */
+export function modelIdentity(m: ModelOption): string {
+  return m.modelId ?? m.value;
+}
+
+/** Families never shown by default, however new — the user opts in from Settings. */
+const FACTORY_EXCLUDED_FAMILIES: readonly ClaudeFamily[] = ["mythos"];
+
+/** The newest Claude model of `family` — the first row of that family in CLAUDE_MODELS. */
+export function latestClaudeModel(family: ClaudeFamily): ModelOption | undefined {
+  return CLAUDE_MODELS.find((m) => m.family === family);
+}
+
+/** The Claude half of FACTORY_HIDDEN_MODELS: everything but each family's newest row,
+ *  and Mythos whatever its age. */
+const FACTORY_HIDDEN_CLAUDE: readonly string[] = CLAUDE_MODELS.filter(
+  (m) =>
+    !m.family ||
+    FACTORY_EXCLUDED_FAMILIES.includes(m.family) ||
+    latestClaudeModel(m.family) !== m,
+).map((m) => m.value);
+
+/** The model a new Claude conversation starts on out of the box: the newest Opus. */
+export const FACTORY_CLAUDE_MODEL: string = latestClaudeModel("opus")!.value;
 
 // The real Codex models, as reported by `codex app-server`'s `model/list`. STATIC
 // fallback used while the dynamic list loads or on error — the live `model/list` (see
@@ -105,28 +139,92 @@ export const FACTORY_HIDDEN_MODELS: readonly string[] = CLAUDE_MODELS.map((m) =>
 // `model/list` response; they are per MODEL, not per family. The ids are the true wire ids,
 // so a pick takes effect at `thread/start` (see the Rust `codex_model` plumbing).
 //
-// Transcribed verbatim from codex-cli 0.144.4, newest-first — which is also the order
-// `model/list` itself returns. `gpt-5.4` is deliberately ABSENT: the binary no longer
-// offers it, and listing a model it would reject is how a pick during the dynamic list's
-// loading window turns into a failed turn. It lives on in RETIRED_CODEX_MODELS below,
-// which the resolvers read but the picker never does — so a conversation still pinned to
-// it keeps its real name instead of showing the raw wire id.
+// Transcribed verbatim from codex-cli 0.156.1, newest-first — which is also the order
+// `model/list` itself returns. `gpt-5.4` and `gpt-5.4-mini` are deliberately ABSENT: the
+// binary no longer offers them, and listing a model it would reject is how a pick during
+// the dynamic list's loading window turns into a failed turn. They live on in
+// RETIRED_CODEX_MODELS below, which the resolvers read but the picker never does — so a
+// conversation still pinned to one keeps its real name instead of showing the raw wire id.
 export const CODEX_MODELS: ModelOption[] = [
   // GPT-6 Astra: the binary's own `isDefault` model, and the first to declare a 2× "Fast"
   // service tier (the gpt-5.6 family is 1.5×). Effort ladder runs the full low→ultra.
   { label: "GPT-6 Astra", value: "gpt-6-astra", backend: "codex", provider: "OpenAI" },
+  { label: "GPT-6 Sol", value: "gpt-6-sol", backend: "codex", provider: "OpenAI" },
+  { label: "GPT-6 Luna", value: "gpt-6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.6 Luna", value: "gpt-5.6-luna", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.5", value: "gpt-5.5", backend: "codex", provider: "OpenAI" },
-  { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
+];
+
+/** `gpt-5.6-sol` → version [5, 6], line "sol"; `gpt-5.5` → [5, 5], no line. `null` for an
+ *  id that doesn't follow the `gpt-<version>[-<line>]` shape. */
+function codexLineOf(id: string): { version: number[]; line: string | null } | null {
+  const m = /^gpt-(\d+(?:\.\d+)*)(?:-([a-z][a-z0-9]*))?$/.exec(id.toLowerCase());
+  if (!m) return null;
+  return { version: m[1].split(".").map(Number), line: m[2] ?? null };
+}
+
+const compareVersions = (a: number[], b: number[]): number => {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+
+/**
+ * The Codex models a fresh install keeps out of the picker: the newest model of each
+ * LINE is shown — Astra, Sol, Terra, Luna, Mini read like Opus / Sonnet / Haiku — and a
+ * line-less model (`gpt-5.5`) only while it is the newest generation of all, since a
+ * later generation replaces it outright. An id of any other shape stays shown: nothing
+ * is known about what supersedes it.
+ *
+ * Takes the list as an argument because the live one (`model/list`) is the authority —
+ * the static CODEX_MODELS only stands in for it until it loads.
+ */
+export function codexFactoryHidden(models: readonly Pick<ModelOption, "value">[]): string[] {
+  const parsed = models
+    .map((m) => ({ value: m.value, id: codexLineOf(m.value) }))
+    .filter((x): x is { value: string; id: { version: number[]; line: string | null } } => !!x.id);
+  const newest = (xs: typeof parsed) =>
+    xs.reduce<number[] | null>(
+      (best, x) => (best === null || compareVersions(x.id.version, best) > 0 ? x.id.version : best),
+      null,
+    );
+  const newestOverall = newest(parsed);
+  return parsed
+    .filter(({ id }) => {
+      const peers = id.line === null ? parsed : parsed.filter((x) => x.id.line === id.line);
+      const top = id.line === null ? newestOverall : newest(peers);
+      return top !== null && compareVersions(id.version, top) < 0;
+    })
+    .map((x) => x.value);
+}
+
+/**
+ * What the picker hides on a fresh install. Claude: all but the NEWEST model of each
+ * family — today Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 are shown — and never Mythos.
+ * Codex: all but the newest of each line (codexFactoryHidden), re-applied to the live list
+ * when it loads. Derived, not listed, so a model added at the top of its family replaces
+ * its predecessor in the factory picker with no other edit. Everything else starts in
+ * Settings → Models' "Available" list, one click away.
+ *
+ * Stored as the HIDDEN set rather than the shown one, on purpose: a model added to the
+ * catalogue later then appears on its own instead of staying invisible until someone
+ * notices. The user's own choices are persisted the same way (see store/modelPrefs).
+ */
+export const FACTORY_HIDDEN_MODELS: readonly string[] = [
+  ...FACTORY_HIDDEN_CLAUDE,
+  ...codexFactoryHidden(CODEX_MODELS),
 ];
 
 /** The Codex backend's default model — seeds a Codex conversation so its persisted
  *  `model` is always a real Codex id (never a Claude alias the binary would reject).
- *  gpt-6-astra: the model `model/list` itself flags `isDefault`, and the top of the
- *  ladder (full low→ultra effort range). Only NEW conversations are seeded from here;
- *  an existing one keeps the model persisted on its record. */
+ *  gpt-6-astra: the model `model/list` itself flags `isDefault` (codex 0.153+), and the
+ *  top of the ladder (full low→ultra effort range). Only NEW conversations are seeded
+ *  from here; an existing one keeps the model persisted on its record. An older binary
+ *  that doesn't offer it gets ITS OWN default instead (store/modelPrefs `codexOffered`). */
 export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
 
 /**
@@ -137,6 +235,7 @@ export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
  * composer highlighted no row. A retired row costs nothing and keeps those readable.
  */
 export const RETIRED_CODEX_MODELS: ModelOption[] = [
+  { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", backend: "codex", provider: "OpenAI" },
   { label: "GPT-5.4", value: "gpt-5.4", backend: "codex", provider: "OpenAI" },
 ];
 
@@ -151,12 +250,36 @@ const CODEX_BY_LEN = [...CODEX_MODELS, ...RETIRED_CODEX_MODELS].sort(
   (a, b) => b.value.length - a.value.length,
 );
 
-/** Same, for Claude: a resolved id contains BOTH a full model name and the family
- *  alias (`claude-opus-4-8[1m]` contains "claude-opus-4-8" AND "opus"), so the longest
- *  value has to win — otherwise Opus 4.8 would read as "Opus 5". Driving the label /
- *  family lookups off the catalogue (rather than a hand-written ladder) also means
- *  adding a model stays a one-line edit above. */
-const CLAUDE_BY_LEN = [...CLAUDE_MODELS].sort((a, b) => b.value.length - a.value.length);
+/** Same, for Claude — but keyed on each row's IDENTITY (the model it runs), never on a
+ *  family alias: every resolved Opus id contains "opus", so an alias used as a substring
+ *  labelled Opus 4.8 as "Opus 5" once, and Opus 5.5 as "Opus 5" after that. Driving the
+ *  label / family lookups off the catalogue (rather than a hand-written ladder) also
+ *  means adding a model stays a one-line edit above. */
+const CLAUDE_BY_LEN = [...CLAUDE_MODELS].sort(
+  (a, b) => modelIdentity(b).length - modelIdentity(a).length,
+);
+
+/**
+ * Whether resolved id `s` names model `id` — `id` followed by nothing, a context suffix
+ * (`[1m]`), a date stamp (`-20251001`), or a provider tail (`-v1`, `@…`, `:0`). The
+ * boundary is what keeps `claude-opus-5` from claiming `claude-opus-5-5`: a newer point
+ * release always EXTENDS its predecessor's id.
+ */
+function namesModel(s: string, id: string): boolean {
+  const at = s.indexOf(id);
+  if (at < 0) return false;
+  const rest = s.slice(at + id.length);
+  return rest === "" || /^(\[|@|:|-\d{8}(?!\d)|-v\d)/.test(rest);
+}
+
+/** The Claude row a live id names: an exact value (an alias like `opus`, or a pinned
+ *  id), else the row whose identity the resolved id carries (`claude-opus-5-5[1m]`). */
+function claudeRowFor(s: string): ModelOption | undefined {
+  return (
+    CLAUDE_MODELS.find((m) => m.value === s) ??
+    CLAUDE_BY_LEN.find((m) => namesModel(s, modelIdentity(m)))
+  );
+}
 
 /**
  * Which backend a model id belongs to. Matches an exact catalogue value first, then
@@ -180,7 +303,7 @@ export function modelLabel(id?: string | null): string {
   const s = id.toLowerCase();
   const exact = RESOLVABLE_MODELS.find((m) => m.value === s);
   if (exact) return exact.label;
-  const claude = CLAUDE_BY_LEN.find((m) => s.includes(m.value));
+  const claude = claudeRowFor(s);
   if (claude) return claude.label;
   const codex = CODEX_BY_LEN.find((m) => s.includes(m.value));
   if (codex) return codex.label;
@@ -196,7 +319,7 @@ export function modelFamily(id?: string | null): string | null {
   if (exact) return exact.value;
   const codex = CODEX_BY_LEN.find((m) => s.includes(m.value));
   if (codex) return codex.value;
-  const claude = CLAUDE_BY_LEN.find((m) => s.includes(m.value));
+  const claude = claudeRowFor(s);
   if (claude) return claude.value;
   return null;
 }

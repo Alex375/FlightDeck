@@ -603,6 +603,30 @@ async tosseRepoLinks() : Promise<Result<TosseRepoLinksPayload, string>> {
 }
 },
 /**
+ * Refresh, over SSH, the `origin` of every folder that lives on a paired server, and
+ * cache each answer in SQLite.
+ * 
+ * This is what makes the automatic TOSSE match work on a remote repository at all: a
+ * folder over there has a perfectly good `origin`, it simply cannot be read by this
+ * Mac's `git` (see [`crate::tosse::remote_probe`]). The read is deliberately NOT on
+ * [`tosse_repo_links`]'s path — that one is called when the sidebar loads, and an SSH
+ * round trip per server does not belong there. It runs beside it and, when something
+ * actually changed, the front refetches.
+ * 
+ * Reports what the sweep did — see [`RemoteOriginSweep`]. Never returns `Err` for an
+ * unreachable server: that is the server's state, not a failure of this call, and
+ * turning it into one would resurrect exactly the false alarm the machine-aware probe
+ * removed.
+ */
+async tosseProbeRemoteOrigins() : Promise<Result<RemoteOriginSweep, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tosse_probe_remote_origins") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pin a folder to a TOSSE repository by hand, or clear the pin with `None`.
  * 
  * Local only — the CRM has no field for a machine path, and this is never written back.
@@ -1559,6 +1583,47 @@ async getOutputStyle() : Promise<Result<string, string>> {
 async setOutputStyle(style: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_output_style", { style }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Claude Code's own MCP rules and plugin on/off, from the managed, local, project
+ * (`repo_path`) and user settings files — the baseline Flight Deck's cascade starts from
+ * ("Default"). Blocking file IO runs off the async runtime.
+ */
+async mcpPermissionRules(repoPath: string | null) : Promise<Result<PermissionRulesView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("mcp_permission_rules", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace a RUNNING conversation's own overrides — MCP rules and plugin on/off, in its
+ * flag settings layer (never a file, so no other conversation sees them). Rules bite from
+ * its next tool call; `reload_plugins` hot-applies a plugin change. A CLI rejection is
+ * returned, not swallowed.
+ */
+async applySessionOverrides(session: string, overrides: SessionOverrides, reloadPlugins: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_session_overrides", { session, overrides, reloadPlugins }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The MCP servers (cloud connectors included) and their tools as a FRESH, conversation-
+ * less `claude` sees them — what the global Settings page lists. A throwaway process in
+ * the home directory, polled until the connectors settle (they connect asynchronously,
+ * a few seconds after start) or ~15 s pass; no model turn, no tokens.
+ */
+async fetchGlobalMcpStatus() : Promise<Result<McpServerLive[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_global_mcp_status") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4439,12 +4504,40 @@ tool_count: number;
  */
 tools: string[]; 
 /**
+ * The same tools with what the server says about each one (description, read-only /
+ * destructive hints) — what the per-tool permission rows are built from. Claude only
+ * (`mcp_status` carries it); empty for Codex, whose rows show plain names.
+ */
+tool_info?: McpToolInfo[]; 
+/**
  * Why a Codex MCP server failed to start (e.g. `reauthenticationRequired`), captured
  * from the `mcpServer/startupStatus/updated` push. Turns a mute "disconnected" into a
  * named "failed" reason. `None` for Claude servers and for Codex servers that started
  * fine.
  */
 failure_reason?: string | null }
+/**
+ * One tool of a live MCP server, as the session's `mcp_status` reports it. The hints are
+ * SERVER-SUPPLIED (`annotations.readOnly` / `.destructive`): a connector can omit them or
+ * get them wrong, so the UI treats them as a suggestion, never as a guarantee.
+ */
+export type McpToolInfo = { 
+/**
+ * The tool's own name, as the server declares it (not the `mcp__…` rule name).
+ */
+name: string; 
+/**
+ * The server's description of the tool, capped for display.
+ */
+description: string | null; 
+/**
+ * `annotations.readOnly` — the tool claims not to change anything.
+ */
+read_only: boolean | null; 
+/**
+ * `annotations.destructive` — the tool claims it may change or delete data.
+ */
+destructive: boolean | null }
 /**
  * One authoritative content block of an assistant message.
  */
@@ -4498,6 +4591,35 @@ decision_reason: JsonValue;
  * turn is blocked.
  */
 agent_id: string | null }
+/**
+ * One Claude Code permission rule that can concern an MCP tool.
+ */
+export type PermissionRule = { 
+/**
+ * The rule verbatim (`mcp__claude_ai_Gmail__send_message`, `mcp__claude_ai_Gmail`,
+ * `mcp__claude_ai_Gmail__*`, `mcp__*`, `*`…).
+ */
+rule: string; kind: ToolRuleKind; source: RuleSource; 
+/**
+ * The file it was read from.
+ */
+path: string }
+/**
+ * Claude Code's MCP rules and plugin on/off visible to a repository.
+ */
+export type PermissionRulesView = { rules: PermissionRule[]; 
+/**
+ * Every `enabledPlugins` entry, per file.
+ */
+plugins: PluginOverride[]; 
+/**
+ * Files that exist but could not be read or parsed (their say is unknown).
+ */
+warnings: string[]; 
+/**
+ * The project root the local/project files were read from (a worktree's own root).
+ */
+repo_root: string | null }
 /**
  * The full persisted snapshot the UI hydrates from at boot.
  */
@@ -4577,6 +4699,10 @@ latest_version: string | null;
  * enabled state — so the UI can show "5 skills" even when toggled off.
  */
 skill_count: number; agent_count: number; command_count: number; mcp_count: number }
+/**
+ * One file's say on one plugin: `enabledPlugins[id]` in that settings file.
+ */
+export type PluginOverride = { plugin_id: string; enabled: boolean; source: RuleSource; path: string }
 /**
  * Typed return value of `ping`. Proves React -> Rust (typed command).
  */
@@ -4662,10 +4788,40 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * A remote (SSH) conversation's live link lifecycle — see
+ * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
+ * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
+ * itself only ever describes "not attached yet".
+ */
+export type RemoteLinkState = 
+/**
+ * This actor has never yet received `fd_attach` this session.
+ */
+{ kind: "connecting" } | 
+/**
+ * Has attached before (or is on a later retry of the same outage). `attempt`
+ * is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
+ * attempts THIS outage has made, 1 at the very first drop, reset to 0 only
+ * on a genuine return to attached (never by an address rotation).
+ */
+{ kind: "reconnecting"; attempt: number }
+/**
  * One level of a remote server's filesystem: the resolved absolute `path` and its
  * immediate SUB-directories (names only). Powers the remote folder browser.
  */
 export type RemoteListing = { path: string; dirs: string[] }
+/**
+ * What one run of [`tosse_probe_remote_origins`] did.
+ * 
+ * Three facts, deliberately not collapsed into the single `bool` this used to be:
+ * - `changed` — a folder's visible state moved (a url, an answer, or the first probe
+ * ever), so the UI should refetch;
+ * - `skipped` — the sweep never ran (another one held the lock). NOT the same as
+ * "nothing changed", and the caller must not treat it as a verdict;
+ * - `write_errors` — answers that were obtained and then LOST on the way to SQLite,
+ * verbatim. Silence here would turn a broken database into "Refresh does nothing".
+ */
+export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeErrors: string[] }
 /**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
@@ -4686,7 +4842,16 @@ export type RepairAction = "reupload_daemon" | "restart_daemon" | "install_servi
  * this fixes [`DiagnosisState::NeedsClaudeInstall`], that one fixes
  * [`DiagnosisState::NeedsClaudeSignIn`].
  */
-"install_claude" | "sign_in_claude" | "provision_phone"
+"install_claude" | "sign_in_claude" | "provision_phone" | 
+/**
+ * (CRM `c9bf1482`) Reinstalls this Mac's SAVED key on a server that refused it
+ * (`ServerDiagnosis::link_issue == Some(SshLinkIssue::KeyRefused)`) — a normal,
+ * exhaustively-dispatched `RepairAction`, unlike [`Self::SignInClaude`]: see the
+ * module doc's own note on why the two are NOT the same shape (this is a
+ * single, non-interactive, password-in/summary-out round trip; sign-in needs an
+ * interactive [`server_setup::LoginSession`] handle this dispatch can't carry).
+ */
+"reconnect_mac"
 /**
  * One `machine_repair` outcome: what changed, plus a FRESH [`diagnose`] (never a stale
  * one from before the fix).
@@ -4840,6 +5005,26 @@ export type RoutingOrigin =
  */
 "built_in"
 /**
+ * The settings file a rule was read from.
+ */
+export type RuleSource = 
+/**
+ * Organization policy (`/Library/Application Support/ClaudeCode/managed-settings.json`).
+ */
+"managed" | 
+/**
+ * `<repo>/.claude/settings.local.json` — this project, this machine.
+ */
+"local" | 
+/**
+ * `<repo>/.claude/settings.json` — shared with everyone on the repository.
+ */
+"project" | 
+/**
+ * `~/.claude/settings.json` — the user's own, every project.
+ */
+"user"
+/**
  * A rate-limit window that applies to a NAMED subset of usage (today: a single model) rather
  * than the account as a whole. Kept separate from the two flat windows because its label is
  * data-driven — it comes from the payload, so a renamed or newly added scoped model shows up
@@ -4864,11 +5049,48 @@ group: string | null; window: UsageWindow }
 export type SearchHit = { session_id: string; score: number; snippet: string }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
- * [`Self::restart_pending`] is TRI-STATE (`Option<...>`): a missing/garbled marker in
- * [`diagnose`]'s own accumulating script degrades to `None` ("unknown"), never a
- * false `Some(false)` — see [`parse_diagnosis_fields`].
+ * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
+ * missing/garbled marker in [`diagnose`]'s own accumulating script degrades to `None`
+ * ("unknown"), never a false `Some(false)` — see [`parse_diagnosis_fields`].
  */
-export type ServerDiagnosis = { state: DiagnosisState; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+export type ServerDiagnosis = { state: DiagnosisState; 
+/**
+ * Did the ssh round trip reach the server AT ALL — the one fact that tells "this
+ * machine is off/unplugged/unroutable" apart from "it answered, and what it said
+ * is bad news".
+ * 
+ * ⚠️ It exists as its own field because [`Self::state`] CANNOT carry it:
+ * [`collapse_state`] returns [`DiagnosisState::Failed`] for a perfectly reachable
+ * server whose `flightdeckd` is merely stopped or missing, so `Failed` means
+ * "broken", not "out of reach". The only other way to tell the two apart would be
+ * to match on `Failed`'s `reason` STRING, which would silently turn a reworded
+ * message into a wrong verdict — the same trap the `tosse` module's
+ * `SESSION_GONE_MARKERS` contract exists to document.
+ * 
+ * `false` whenever [`diagnose`]'s ssh invocation failed, timed out, or was never
+ * attempted (unusable saved connection details) — see [`ServerDiagnosis::
+ * unreachable`], the ONE constructor of that case. Read by the front's ambient
+ * machine-health poll (`store/machineHealth.ts`), which paints the remote mark on
+ * every repository that lives on this machine.
+ */
+reachable: boolean; 
+/**
+ * WHY the ssh round trip itself failed — `None` only when [`Self::reachable`] is
+ * `true` (a reachable server has nothing to classify here; see
+ * [`ServerDiagnosis::unreachable_with`], the one constructor of every
+ * `reachable: false` diagnosis). Read by the front's `repairSuggestionsFor`
+ * (`key_refused` is the only one that offers a repair, [`RepairAction::
+ * ReconnectMac`]) and by its `headlineLabel` for the bucket-specific sentence —
+ * see [`SshLinkIssue`]'s own doc for why there are only three buckets.
+ */
+link_issue: SshLinkIssue | null; 
+/**
+ * This Mac's OWN local Tailscale state — `Some(true)` ONLY on positive local
+ * evidence (`tailscale::local_status()` confirmed `NotRunning`), never inferred
+ * or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
+ * [`crate::tailscale`]'s own module doc.
+ */
+tailscale_off_locally: boolean | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
@@ -4976,6 +5198,27 @@ export type SessionExtensionsChangedEvent = { session: string; area: string }
  */
 export type SessionMessageEvent = { session: string; item: ConversationItem }
 /**
+ * What ONE conversation changes for itself from its extensions panel (scope
+ * "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
+ * flag settings layer (`apply_flag_settings`), never in a file, so they reach that
+ * conversation alone. Verified live (2.1.280):
+ * • `permissions` — a second apply REPLACES the key (a rule can be removed), `null`
+ * clears it, `list_permission_rules` reports the rules as `flagSettings`;
+ * • `enabledPlugins` — `{id:false}` then `reload_plugins` drops the plugin's commands,
+ * clearing it and reloading brings them back.
+ * The layer dies with the process, so the app keeps these per conversation and
+ * re-applies them after every `initialize` (with a plugin reload when there are any).
+ * 
+ * A rule can only ADD to what applies (deny > ask > allow across every source), so a
+ * conversation can tighten the repository or global rules, never loosen them. A plugin
+ * override, by contrast, wins over the files: the flag layer ranks above them.
+ */
+export type SessionOverrides = { allow: string[]; ask: string[]; deny: string[]; 
+/**
+ * Plugin id (`name@marketplace`) → on/off for this conversation.
+ */
+enabled_plugins?: Partial<{ [key in string]: boolean }> }
+/**
  * A `can_use_tool` permission prompt awaiting a decision.
  */
 export type SessionPermissionEvent = { session: string; request: PermissionRequestPayload }
@@ -5061,6 +5304,17 @@ awaiting_permission: boolean;
  * can say how far along the recovery is.
  */
 retry: RetryState | null; 
+/**
+ * The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
+ * every local conversation, by construction (nothing ever sets it there). Set the
+ * instant a remote actor spawns (`Connecting`), cleared to `None` the instant
+ * `fd_attach` lands, and set again to `Reconnecting` on every later drop —
+ * mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
+ * per-turn API retry, this is ssh itself never having reached the daemon yet.
+ * Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
+ * priority, above `retry`) — see `ConductorThread.tsx`.
+ */
+link: RemoteLinkState | null; 
 /**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session
@@ -5177,7 +5431,13 @@ claudeAccountId: string | null;
  * an untitled conversation never stamps that placeholder as the daemon's
  * authoritative title (see `spawn_session`'s wiring).
  */
-conversationTitle: string | null }
+conversationTitle: string | null; 
+/**
+ * This conversation's own overrides (MCP rules + plugin on/off), re-applied to the new
+ * process right after `initialize` (they live in its flag settings layer, which dies
+ * with the previous one). Claude only; `None`/empty = nothing of its own.
+ */
+sessionOverrides?: SessionOverrides | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -5238,6 +5498,34 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * What kind of hard ssh-level failure just closed a transport before (or
+ * instead of) ever reaching the daemon. `Unreachable` is the catch-all — see
+ * the module doc for why it is not split further.
+ */
+export type SshLinkIssue = 
+/**
+ * The server rejected every key/password this Mac offered
+ * (`Permission denied (publickey…)`/`(publickey,password)`) — the
+ * saved key is no longer authorized (the real incident this module was
+ * built for: an operator removed it from `authorized_keys`).
+ */
+"key_refused" | 
+/**
+ * The server's host key does not match what this Mac last saw (or, under
+ * strict checking, refused a brand-new one) — see
+ * [`crate::bootstrap::askpass::is_host_key_mismatch`], reused here so
+ * both this live-session path and the bootstrap flow recognize the SAME
+ * two OpenSSH wordings.
+ */
+"host_key_changed" | 
+/**
+ * Everything else that keeps ssh from ever connecting: DNS failure,
+ * connection refused, no route to host, network unreachable, a timed-out
+ * handshake, or any other unrecognized ssh-level (exit 255) failure.
+ * Deliberately ONE bucket — see the module doc.
+ */
+"unreachable"
 /**
  * One pipeline step, in the FIXED order [`build_pipeline`] always builds them —
  * see the module doc's overview.
@@ -5318,6 +5606,10 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * Which of Claude Code's three rule lists a rule sits in.
+ */
+export type ToolRuleKind = "allow" | "ask" | "deny"
 /**
  * The TOSSE connection as the Settings tab shows it. `connected` false with a
  * `signed_out_reason` means we HELD a session and it stopped working (revoked/expired
@@ -5502,8 +5794,21 @@ notARepository: boolean;
  * Why the folder's remote could not be read — a genuine FAULT only (the folder has
  * vanished, permissions, git missing). `None` on the happy path, when the repository
  * simply has no remote, AND when the folder is not a repository: those are answers.
+ * 
+ * ⚠️ Never set for a folder on a paired server (see `machine`). This Mac's `git`
+ * fails on a remote path with the same "cannot change to …" as a deleted folder, and
+ * reporting that verbatim put a red flag on every remote repository — a fault that
+ * was ours, blamed on the user's folder.
  */
-remoteError: string | null }
+remoteError: string | null; 
+/**
+ * The paired server this folder lives on, `None` for a folder on this Mac.
+ * 
+ * Set means the automatic match cannot RUN from here (we read git remotes on this
+ * Mac only) — an ordinary limit like `not_a_repository`, not a failure: the manual
+ * pin still works, and it is pure SQLite so it works on a remote folder too.
+ */
+machine: TosseRepoMachine | null }
 /**
  * How each of Flight Deck's folders relates to TOSSE, in one call.
  * 
@@ -5531,6 +5836,35 @@ repositories: TosseRepository[];
  * as un-associated — which would look like the association was lost.
  */
 error: string | null }
+/**
+ * The paired server a folder lives on — everything the UI needs to say "not on this Mac".
+ */
+export type TosseRepoMachine = { id: string; 
+/**
+ * The server's label as the user named it, or `None` when the id names no paired
+ * machine any more. Unnamed is NOT local: a folder whose server was unpaired still
+ * sits over there, and reading it as local is exactly the confusion this type ends.
+ */
+label: string | null; 
+/**
+ * Whether that server has ever ANSWERED about this folder's `origin`.
+ * 
+ * Splits the two silences the UI must not blur: "we have not managed to ask yet"
+ * (never swept, or the server is off) from "we asked, and this folder has no
+ * origin". Both show no url; only the second is a fact about the folder.
+ */
+originRead: boolean; 
+/**
+ * What the server answered when it did not hand over a url — `no-remote`,
+ * `not-a-repository`, `gone`, `no-git` — and `None` when a url WAS read.
+ * 
+ * The third state `origin_read` alone cannot express. "We asked and got an answer"
+ * (`origin_read: true`) covers both "this folder has no origin" and "this folder is
+ * not a repository over there", which call for different sentences — and the UI was
+ * inferring the first from the absence of the second. Passed through verbatim, never
+ * matched on in Rust.
+ */
+originNote: string | null }
 /**
  * A repository as TOSSE knows it.
  * 

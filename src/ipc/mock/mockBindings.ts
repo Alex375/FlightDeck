@@ -55,6 +55,10 @@ import type {
   McpAuthResult,
   LiveModel,
   McpServerLive,
+  PermissionRule,
+  PermissionRulesView,
+  SessionOverrides,
+  PluginOverride,
   RewindFilesResult,
   PluginContents,
   PermissionDecision,
@@ -387,6 +391,9 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
 function readyDiagnosis(): ServerDiagnosis {
   return {
     state: { kind: "ready" },
+    reachable: true,
+    link_issue: null,
+    tailscale_off_locally: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -402,6 +409,40 @@ function readyDiagnosis(): ServerDiagnosis {
     tailscale_name: "mock-server.tail1234.ts.net",
     last_boot: "2026-09-15 08:12:03",
     busy_conversations: 0,
+    bundled_daemon_version: null,
+    daemon_outdated: false,
+  };
+}
+
+/** An unreachable `ServerDiagnosis` classified by `linkIssue` (CRM `c9bf1482`) — every
+ *  OTHER tri-state fact stays `null` ("unknown"), mirroring `ServerDiagnosis::
+ *  unreachable_with`'s own shape on the Rust side. Used by the `?demo=servers` fixture
+ *  below to preview all three states in the browser build. */
+function unreachableDiagnosis(
+  linkIssue: NonNullable<ServerDiagnosis["link_issue"]>,
+  reason: string,
+  tailscaleOffLocally: boolean | null = null,
+): ServerDiagnosis {
+  return {
+    state: { kind: "failed", reason },
+    reachable: false,
+    link_issue: linkIssue,
+    tailscale_off_locally: tailscaleOffLocally,
+    installed_as: "unknown",
+    daemon_running: null,
+    daemon_version_disk: null,
+    daemon_version_running: null,
+    restart_pending: false,
+    reboot_safe: null,
+    linger: null,
+    sleep_masked: null,
+    user_unit_missing_path: null,
+    claude_installed: null,
+    claude_logged_in: null,
+    claude_email: null,
+    tailscale_name: null,
+    last_boot: null,
+    busy_conversations: null,
     bundled_daemon_version: null,
     daemon_outdated: false,
   };
@@ -981,6 +1022,8 @@ function mockSpendReport(): SpendReport {
 
 /** Mock-only: the current global output style, so a set is reflected by the next get. */
 let mockOutputStyle = "default";
+const mockPermissionRules: PermissionRule[] = [];
+const mockPluginOverrides: PluginOverride[] = [];
 
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
@@ -1006,7 +1049,7 @@ export const mockCommands = {
   // so the composer's backend-aware controls render without a real `claude`/`codex`
   // binary. Both twins MUST exist: `binaryAvailable.probe()` calls `commands.xxx()`
   // synchronously, so a missing method throws a TypeError before its `.catch` is attached
-  // → the always-mounted AuthWarningBar / Settings → Accounts crash the mock UI.
+  // → the always-mounted composer band / Settings → Accounts crash the mock UI.
   async claudeAvailable(): Promise<boolean> {
     return true;
   },
@@ -1339,9 +1382,20 @@ export const mockCommands = {
         manualRepositoryId: null,
         ambiguous: [],
         remoteError: null,
+        // The demo folder is on this Mac. A folder on a paired server carries its machine
+        // here instead, and its url is whatever that server last reported — read over SSH
+        // by `tosseProbeRemoteOrigins`, never by a `git` run against a path that does not
+        // exist locally.
+        machine: null,
       },
     ];
     return ok({ connected: true, links, repositories, error: null });
+  },
+  // No server to ask in the browser, and nothing moved — which is the answer that keeps
+  // the front from refetching. Returning `true` here would loop the demo: sweep →
+  // invalidate → refetch → sweep.
+  async tosseProbeRemoteOrigins(): Promise<Result<boolean, string>> {
+    return ok(false);
   },
   async tosseLinkRepository(): Promise<Result<null, string>> {
     return ok(null);
@@ -1588,7 +1642,11 @@ export const mockCommands = {
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
+    else if (demo === "tosse") driver.startTosse();
     else if (demo === "design") driver.startTypedArtifact();
+    else if (demo === "remotelink") driver.startRemoteLink();
+    else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
+    else if (demo === "remotelinkblockedhost") driver.startRemoteLinkBlocked("ssh_host_key_changed");
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).
@@ -1955,26 +2013,30 @@ export const mockCommands = {
         [
           "unreachable-vps",
           "unreachable.example.com",
-          {
-            state: { kind: "failed", reason: "could not reach the server" },
-            installed_as: "unknown",
-            daemon_running: null,
-            daemon_version_disk: null,
-            daemon_version_running: null,
-            restart_pending: false,
-            reboot_safe: null,
-            linger: null,
-            sleep_masked: null,
-            user_unit_missing_path: null,
-            claude_installed: null,
-            claude_logged_in: null,
-            claude_email: null,
-            tailscale_name: null,
-            last_boot: null,
-            busy_conversations: null,
-            bundled_daemon_version: null,
-            daemon_outdated: false,
-          },
+          unreachableDiagnosis("unreachable", "could not reach the server"),
+        ],
+        // (CRM `c9bf1482`) The three new remote-connection-state visual checks, all
+        // previewable through this same fixture: the server refused this Mac's saved
+        // key (offers "Reconnect this Mac"), its host identity changed (informational
+        // note, no repair button), and it's unreachable with Tailscale confirmed off
+        // on this Mac (extra fact row).
+        [
+          "key-refused-vps",
+          "key-refused.example.com",
+          unreachableDiagnosis("key_refused", "this Mac's saved key was refused"),
+        ],
+        [
+          "host-key-changed-vps",
+          "host-key-changed.example.com",
+          unreachableDiagnosis(
+            "host_key_changed",
+            "this server's identity has changed since this Mac last connected to it",
+          ),
+        ],
+        [
+          "tailscale-off-vps",
+          "tailscale-off.example.com",
+          unreachableDiagnosis("unreachable", "Tailscale looks off on this Mac", true),
         ],
       ];
       for (const [label, host, diagnosis] of seed) {
@@ -1985,10 +2047,130 @@ export const mockCommands = {
     if (demoParam === null)
       return ok({ machines: [...mockMachines], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
+    // `?demo=remote` — visual check for the remote-machine mark (sidebar row, Flight Deck
+    // lane header, stream card). Four folders that must read DIFFERENTLY at a glance: a
+    // local one (unmarked), one on a paired server that ANSWERS (quiet mast), one on a
+    // server that does NOT (red crossed-out mast, plus that conversation's own warning
+    // bar above the composer), and one whose `machine_id` names nothing — the case that
+    // must NOT quietly look local. Deliberately pairs the servers here rather than
+    // reusing `?demo=servers`: the point is a repo that CARRIES a machine, which that
+    // fixture has no repos for.
+    const remoteDemo = demoParam === "remote";
+    if (remoteDemo && mockMachines.length === 0) {
+      const up = findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
+      const down = findOrCreateMockMachine("build-box", "10.0.0.5", 22, "ci");
+      // The ambient health poll runs `machineDiagnose` against both — seeding their
+      // diagnoses is what makes the mark's two states appear in the browser build.
+      mockDiagnoses.set(up.id, readyDiagnosis());
+      mockDiagnoses.set(down.id, {
+        ...readyDiagnosis(),
+        reachable: false,
+        link_issue: "unreachable",
+        state: { kind: "failed", reason: "could not reach the server" },
+        installed_as: "unknown",
+        daemon_running: null,
+        daemon_version_disk: null,
+        daemon_version_running: null,
+        reboot_safe: null,
+        sleep_masked: null,
+        claude_installed: null,
+        claude_logged_in: null,
+        claude_email: null,
+        tailscale_name: null,
+        last_boot: null,
+        busy_conversations: null,
+      });
+    }
+    const remoteRepos: RepoRecord[] = remoteDemo
+      ? [
+          {
+            id: "repo-remote",
+            // A path that looks just like a local one once truncated — the confusion the
+            // mark exists to end.
+            path: "/home/deploy/demo-repo",
+            added_at: now - 1,
+            machine_id: mockMachines[0]?.id ?? null,
+          },
+          {
+            id: "repo-down",
+            path: "/home/ci/build-box-repo",
+            added_at: now - 2,
+            machine_id: mockMachines[1]?.id ?? null,
+          },
+          { id: "repo-orphan", path: "/srv/app", added_at: now - 3, machine_id: "machine-deleted" },
+        ]
+      : [];
     return ok({
       machines: [...mockMachines],
-      repos: [{ id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }],
+      repos: [
+        { id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null },
+        ...remoteRepos,
+      ],
       conversations: [
+        ...(remoteDemo
+          ? ([
+              {
+                id: "conv-remote",
+                name: "Deploy on the server",
+                repo_id: "repo-remote",
+                cwd: "/home/deploy/demo-repo",
+                created_at: now - 1,
+                last_activity_at: now - 1,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+              {
+                id: "conv-down",
+                name: "Agent on a dead server",
+                repo_id: "repo-down",
+                cwd: "/home/ci/build-box-repo",
+                created_at: now - 2,
+                last_activity_at: now - 2,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+              {
+                id: "conv-orphan",
+                name: "Paired server gone",
+                repo_id: "repo-orphan",
+                cwd: "/srv/app",
+                created_at: now - 2,
+                last_activity_at: now - 2,
+                session_id: null,
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                ultracode: false,
+                permission_mode: "auto",
+                pending_reminder: null,
+                clean_output: null,
+                tosse_task_id: null,
+                tosse_task_title: null,
+                tosse_task_status: null,
+                backend: "claude",
+                claude_account_id: null,
+              },
+            ] as ConversationRecord[])
+          : []),
         {
           id: "conv-demo",
           name: "Background tasks demo",
@@ -2232,7 +2414,7 @@ export const mockCommands = {
     return ok({ ...d });
   },
 
-  async machineRepair(machineId: string, action: RepairAction, _sudoPassword: string | null): Promise<Result<RepairOutcome, string>> {
+  async machineRepair(machineId: string, action: RepairAction, sudoPassword: string | null): Promise<Result<RepairOutcome, string>> {
     const machine = mockMachines.find((m) => m.id === machineId);
     if (!machine) return err("unknown server");
     const d = { ...(mockDiagnoses.get(machineId) ?? readyDiagnosis()) };
@@ -2287,6 +2469,23 @@ export const mockCommands = {
         label = "Provision this Mac's phone token";
         summary = "Provisioned";
         mockProvisionStatuses.set(machineId, { machine_id: machineId, state: { kind: "provisioned", at_ms: Date.now() }, checked_at_ms: Date.now() });
+        break;
+      case "reconnect_mac":
+        // Mirrors `BootstrapError::NeedsConnectionPassword` (no password offered)
+        // and the "degrade honestly" wrong-password wording (CRM `c9bf1482`) — the
+        // dev-console-only `"wrong"` sentinel previews the second path without a
+        // real server to reject a real password against.
+        if (!sudoPassword) return err("this server needs its login password to reconnect");
+        if (sudoPassword === "wrong") {
+          return err(
+            'this server refused this Mac\'s saved login password — remove and re-add this server using the "use a command instead" method.',
+          );
+        }
+        label = "Reconnect this Mac";
+        summary = "KeyInstalled";
+        // The key is accepted — this machine is fully reachable again, same as any
+        // other freshly-paired server (a real `repair()` re-diagnoses fresh too).
+        Object.assign(d, readyDiagnosis());
         break;
     }
     d.state = collapseMockState(d);
@@ -2999,6 +3198,20 @@ export const mockCommands = {
     return ok(null);
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {
+    return ok([]);
+  },
+  // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
+  async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {
+    return ok({ rules: mockPermissionRules, warnings: [], plugins: mockPluginOverrides, repo_root: _repoPath });
+  },
+  async applySessionOverrides(
+    _session: string,
+    _overrides: SessionOverrides,
+    _reloadPlugins: boolean,
+  ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async fetchGlobalMcpStatus(): Promise<Result<McpServerLive[], string>> {
     return ok([]);
   },
   async mcpToggle(_session: string, _serverName: string, _enabled: boolean): Promise<Result<null, string>> {

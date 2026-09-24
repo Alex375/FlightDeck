@@ -30,6 +30,7 @@ import type {
   WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
+import { probeMachine } from "../store/machineHealth";
 import { isGenericThinking } from "../store/activity";
 import {
   useBackgroundTasksStore,
@@ -78,6 +79,14 @@ function repoPathForConv(convId: string): string | null {
   const s = useConversationsStore.getState();
   const conv = s.conversations.find((c) => c.id === convId);
   return conv ? (s.repos.find((r) => r.id === conv.repoId)?.path ?? null) : null;
+}
+
+/** The paired server a conversation's repo lives on (`null` for a local repo) — for
+ *  triggering an ambient `probeMachine` from a live link-state edge. */
+function machineIdForConv(convId: string): string | null {
+  const s = useConversationsStore.getState();
+  const conv = s.conversations.find((c) => c.id === convId);
+  return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
 }
 
 interface DeltaBuf {
@@ -446,6 +455,21 @@ export function useGlobalSessionEvents(): void {
 
       useConversationStore.getState().applyItem(session, item);
 
+      // A terminal ssh-level failure (key refused / host identity changed, CRM
+      // `c9bf1482`) just told us this MACHINE is out of reach — piggyback on the
+      // ambient machine-health poll's own dedup/rate-limit (unforced: this is a
+      // live trigger, not an explicit human "Diagnose" click) so the sidebar mark /
+      // Flight Deck lane header / composer band pick it up promptly instead of
+      // waiting for the next scheduled poll.
+      if (item.kind === "notice" && item.subtype === "remote_link_blocked") {
+        const detail = item.detail;
+        const machineId =
+          detail && typeof detail === "object" && !Array.isArray(detail)
+            ? (detail as Record<string, unknown>).machine_id
+            : null;
+        if (typeof machineId === "string") void probeMachine(machineId);
+      }
+
       // A finished turn settles the conversation into review / error / open-question
       // (or stays idle if interrupted). Persist that the moment the result lands so
       // the reminder survives the process dying — paired with the busy-edge in
@@ -460,6 +484,17 @@ export function useGlobalSessionEvents(): void {
       // Read the prior state BEFORE applying the new one, to detect the edge.
       const prev = useConversationStore.getState().sessions[session]?.state;
       useConversationStore.getState().applyState(session, payload.state);
+      // A remote conversation's link just entered a non-attached state (Connecting on
+      // first spawn, or Reconnecting after a drop) — piggyback the ambient
+      // machine-health probe's own dedup/rate-limit (unforced), same as the
+      // `remote_link_blocked` trigger below, so ComposerBand/RemoteRepoMark/Flight
+      // Deck react promptly to a PLAIN outage (Tailscale off, ordinary network blip)
+      // too — not only to a refused key, which is the only thing `remote_link_blocked`
+      // itself ever fires for.
+      if (payload.state.link && (!prev || !prev.link)) {
+        const machineId = machineIdForConv(session);
+        if (machineId) void probeMachine(machineId);
+      }
       // Remember the AUTHORITATIVE context window (from the live result's modelUsage)
       // so the ring is seeded correctly next time this conversation is opened — the
       // on-disk transcript can't distinguish a 200k model from a 1M one.

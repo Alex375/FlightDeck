@@ -317,7 +317,7 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
 /// module's own ssh calls never trigger that path in practice, and why the stripping is
 /// kept anyway). Any escape sequence this doesn't recognize has its lone ESC byte
 /// dropped rather than left dangling in the output.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

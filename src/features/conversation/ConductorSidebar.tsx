@@ -21,12 +21,9 @@ import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useBackgroundWorkSince, useRunningTaskCount } from "../../store/backgroundTasksStore";
 import {
-  agentStatusToDot,
-  backgroundCount,
   isActivelyRunning,
   isDismissable,
   railState,
-  rowAttention,
   type AgentStatus,
 } from "../../agent/status";
 import { useConversationStore } from "../../store/conversationStore";
@@ -35,10 +32,11 @@ import { fmtFrozenElapsed, useLiveElapsed } from "../../ui/liveElapsed";
 import { useShallow } from "zustand/react/shallow";
 import { useSettingsUi } from "../../store/settingsUi";
 import { TosseRepoBadge } from "../tosse/TosseRepoBadge";
+import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
-import { Dot, Ico, Menu, MenuItem, MenuLabel, RunDots, RunPulse } from "../../ui/kit";
+import { Ico, Menu, MenuItem, MenuLabel, RunDots } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
 import { deleteReasonFor } from "./deleteGuard";
@@ -51,13 +49,6 @@ import { SortableContext, verticalListSortingStrategy, useSortable } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { useSurfaceOrderDnd, orderCollisionDetection, guardReorderClick, type DragData } from "../../ui/orderDnd";
-
-/** The conversation's status glyph: the "sonar" running indicator while a turn is in
- *  flight, otherwise the plain coloured status dot (review / attention / error / idle…). */
-function StatusDot({ status }: { status: AgentStatus }) {
-  if (status.kind === "running") return <RunPulse />;
-  return <Dot s={agentStatusToDot(status)} pulse ring={backgroundCount(status) > 0} />;
-}
 
 /** The live counter on a working row (tinted-pill style). Its own leaf: the shared clock
  *  re-renders this <span>, never the row. A frozen counter is plain text, so it needs no
@@ -153,17 +144,13 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   // background work is live (see status.ts + status.test.ts). Reading the count avoids
   // the friction-free × silently killing that live work.
   const runningBgTasks = useRunningTaskCount(conv.id);
-  const attn = rowAttention(status);
-  // Tinted-pill rows (Settings → Display → Appearance): the state IS the row's colour —
-  // no leading dot, no attention tint. `pill` reuses the importance classifier (the same
-  // five loud states); the two calm ones stay plain, `off` a touch dimmer than `idle`.
-  const pills = useDisplay((d) => d.sidebarStatePills);
-  const pill = pills ? railState(status) : null;
-  const calm = pills && !pill ? (status.kind === "off" ? "off" : "idle") : undefined;
+  // The state IS the row's colour — no leading dot. `pill` reuses the importance
+  // classifier (the same five loud states); the two calm ones stay plain, `off` a
+  // touch dimmer than `idle`.
+  const pill = railState(status);
   const rowState = {
-    "data-attn": pills ? undefined : (attn ?? undefined),
     "data-pill": pill ?? undefined,
-    "data-calm": calm,
+    "data-calm": pill ? undefined : status.kind === "off" ? "off" : "idle",
   };
   const select = useConversationsStore((s) => s.selectConversation);
   const rename = useConversationsStore((s) => s.renameConversation);
@@ -232,7 +219,6 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         {...rowState}
       >
         <span className="cv-sess" style={{ cursor: "default" }}>
-          {pills ? null : <StatusDot status={status} />}
           <input
             className="cv-sess-edit"
             value={draft}
@@ -264,31 +250,26 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         className="cv-sess"
         onClick={() => select(conv.id)}
         onDoubleClick={startEdit}
-        aria-label={pills ? `${conv.name} — ${statusWords(status)}` : undefined}
+        aria-label={`${conv.name} — ${statusWords(status)}`}
       >
-        {pills ? null : <StatusDot status={status} />}
-        {/* Keyed by the name so an incoming auto-title (applyAutoTitle) REMOUNTS this
-            node instead of mutating its text in place. WebKit fails to repaint a
-            text-overflow:ellipsis box when only its text content changes at an identical
-            box size — old and new glyphs superimpose (the "ghost title" that only a
-            sidebar resize cleared). A fresh node gets a clean paint region. Repo titles
-            never change, which is why they never ghosted. */}
-        {pills ? (
-          <span className="cv-sess-main">
-            <span key={conv.name} className="cv-sess-n">{conv.name}</span>
-            {/* The thread's "Claude is working" dots + the time: ticking while it works,
-                frozen once it stopped on a state, gone when it is calm again. Nothing
-                else — the state itself is the pill colour. */}
-            <RowLive convId={conv.id} status={status} />
-          </span>
-        ) : (
+        <span className="cv-sess-main">
+          {/* Keyed by the name so an incoming auto-title (applyAutoTitle) REMOUNTS this
+              node instead of mutating its text in place. WebKit fails to repaint a
+              text-overflow:ellipsis box when only its text content changes at an identical
+              box size — old and new glyphs superimpose (the "ghost title" that only a
+              sidebar resize cleared). A fresh node gets a clean paint region. Repo titles
+              never change, which is why they never ghosted. */}
           <span key={conv.name} className="cv-sess-n">{conv.name}</span>
-        )}
+          {/* The thread's "Claude is working" dots + the time: ticking while it works,
+              frozen once it stopped on a state, gone when it is calm again. Nothing
+              else — the state itself is the pill colour. */}
+          <RowLive convId={conv.id} status={status} />
+        </span>
       </button>
       <WorktreeBadge conv={conv} />
       {/* Where ✓ cannot apply (a questionnaire / a permission is answered in the thread,
           not dismissed), the row still says so — with a glyph, not a button. */}
-      {pills ? <RowAskGlyph status={status} /> : null}
+      <RowAskGlyph status={status} />
       {isDismissable(status) ? (
         <button
           type="button"
@@ -401,6 +382,11 @@ function RepoGroup({
           <Ico name="chev" className="sm cv-repo-fold-chev" />
           <span className="cv-repo-n">{repoName(repo.path)}</span>
         </button>
+        {/* Which machine this folder lives on — globe + server name, always visible, and
+            nothing at all for a local folder. Sits OUTSIDE the title button (no button
+            inside a button) and right after the name, so "where does this run?" is read
+            with the name rather than hunted for. */}
+        <RemoteRepoMark machineId={repo.machineId} />
         {/* TOSSE — renders nothing unless the CRM is connected. Solid and always visible
             when this folder maps to a repository there; otherwise it behaves like the
             secondary tools below (revealed on hover) and offers to associate it by hand. */}
@@ -524,7 +510,6 @@ export function ConductorSidebar() {
   const openHistory = useHistoryUi((s) => s.openPanel);
   const openSettings = useSettingsUi((s) => s.openSettings);
   const showFleet = useDisplay((s) => s.fleetBannerConversation);
-  const statePills = useDisplay((s) => s.sidebarStatePills);
   // Paired remote servers → the "+ new conversation" flow can start a folder on one of
   // them, not just on this Mac.
   const machines = useMachines();
@@ -546,7 +531,6 @@ export function ConductorSidebar() {
     <div
       ref={rootRef}
       className="wf-col cv-side"
-      data-rows={statePills ? "pills" : undefined}
       style={{
         width,
         flex: `0 0 ${width}px`,
@@ -587,7 +571,7 @@ export function ConductorSidebar() {
                 This Mac…
               </MenuItem>
               {machines.map((m) => (
-                <MenuItem key={m.id} icon="globe" onClick={() => setRemoteDialogMachine(m)}>
+                <MenuItem key={m.id} icon="server" onClick={() => setRemoteDialogMachine(m)}>
                   {m.label}…
                 </MenuItem>
               ))}

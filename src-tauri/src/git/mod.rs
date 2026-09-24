@@ -287,6 +287,48 @@ pub fn path_is_ignored(repo_path: &str, relative_path: &str) -> Option<bool> {
     }
 }
 
+/// The root of the working tree `path` sits in (`git rev-parse --show-toplevel`) — a
+/// worktree's own root for a worktree. `None` outside a repository.
+pub fn toplevel(path: &str) -> Option<String> {
+    run_git(path, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+
+/// Strip the credentials out of a remote URL, keeping it a usable, showable URL.
+///
+/// A clone can perfectly well carry a token in its remote — `https://user:ghp_xxx@github
+/// .com/o/r.git` is what `gh` writes for a PAT clone, and `git remote get-url` hands it
+/// back verbatim. Everything downstream of a probe either PERSISTS the url (SQLite, kept
+/// indefinitely, copied into every backup of the database) or SHOWS it (the TOSSE card
+/// prints the remote when no CRM repository carries it), so the secret must not get past
+/// the point of capture.
+///
+/// Matching is unaffected: [`normalize_remote_url`] already drops the userinfo segment
+/// before comparing, so a redacted url and its original produce the same key.
+///
+/// Only the `scheme://` form is touched. The scp form's `git@host:path` is an SSH USER
+/// NAME, not a secret — SSH authenticates by key there, no password can appear — and
+/// amputating it would mangle the canonical way these remotes are written.
+pub fn redact_remote_url(url: &str) -> String {
+    let s = url.trim();
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    // The userinfo lives in the AUTHORITY only: an `@` later in the path is part of the
+    // path (`https://host/a@b`) and must survive untouched.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    // `rsplit_once`: a password may itself contain an `@`, and the host is what follows
+    // the LAST one.
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
+        None => s.to_string(),
+    }
+}
+
 /// Reduce a git remote URL to a comparison key, so the SAME repository written in
 /// different notations compares equal. `None` for anything that carries no
 /// identity (empty, or a URL with no path part).
@@ -793,6 +835,76 @@ pub(crate) fn parse_origin_url(config: &str) -> Option<String> {
     None
 }
 
+// ── Reading a repository's `origin` on ANOTHER machine ──────────────────────────────
+
+/// What one folder on a server answered. [`RemoteLookup`]'s three ordinary outcomes,
+/// plus the ones only a remote can have: we asked a machine, and the machine may not be
+/// in a position to answer at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOriginAnswer {
+    /// The three answers a local probe also gives.
+    Local(RemoteLookup),
+    /// The path is not there any more. Distinct from `NotARepository`: nothing was read,
+    /// and a folder that is absent today may be back tomorrow (an unmounted disk).
+    Gone,
+    /// The server has no `git`. Without this, `git -C … rev-parse` failing would read as
+    /// "not a repository" — blaming the folder for the server's missing tool.
+    NoGit,
+}
+
+/// The shell script that asks a server for several repositories' `origin` in ONE round
+/// trip. One SSH connection per machine, not per folder: the handshake dwarfs the work.
+///
+/// `quote` escapes a path for the remote shell (the caller passes the crate's POSIX
+/// quoter). Output is one line per path, `<status>\t<url>\t<path>` — the path LAST so a
+/// path containing a tab cannot shift the fields that matter.
+pub fn remote_origin_script(paths: &[String], quote: impl Fn(&str) -> String) -> String {
+    // Asked once, up front: a server without git must not make every folder on it look
+    // like "not a repository".
+    let mut s = String::from("command -v git >/dev/null 2>&1 || { printf 'nogit\\t\\t\\n'; exit 0; }\n");
+    for path in paths {
+        let p = quote(path);
+        s.push_str(&format!(
+            "if [ ! -d {p} ]; then printf 'gone\\t\\t%s\\n' {p}; \
+             elif ! git -C {p} rev-parse --git-dir >/dev/null 2>&1; then printf 'norepo\\t\\t%s\\n' {p}; \
+             elif U=$(git -C {p} remote get-url origin 2>/dev/null); then printf 'ok\\t%s\\t%s\\n' \"$U\" {p}; \
+             else printf 'noremote\\t\\t%s\\n' {p}; fi\n"
+        ));
+    }
+    s
+}
+
+/// Read back what [`remote_origin_script`] printed.
+///
+/// Pure, so the wire format has one definition and a test rather than being re-derived
+/// from whatever a live server happened to print. A `nogit` line answers for the WHOLE
+/// machine, so it comes back as the single entry with an empty path — the caller pairs
+/// it with every folder it asked about. An unrecognised line is DROPPED, never guessed
+/// into a verdict: a folder we cannot read an answer for is one we did not look at.
+pub fn parse_remote_origin_script(stdout: &str) -> Vec<(String, RemoteOriginAnswer)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut parts = line.splitn(3, '\t');
+        let (Some(status), Some(url), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let answer = match status {
+            "ok" if !url.is_empty() => RemoteOriginAnswer::Local(RemoteLookup::Url(url.to_string())),
+            // `ok` with nothing in the url field is a malformed line, not an empty remote.
+            "ok" => continue,
+            "noremote" => RemoteOriginAnswer::Local(RemoteLookup::NoRemote),
+            "norepo" => RemoteOriginAnswer::Local(RemoteLookup::NotARepository),
+            "gone" => RemoteOriginAnswer::Gone,
+            "nogit" => RemoteOriginAnswer::NoGit,
+            _ => continue,
+        };
+        out.push((path.to_string(), answer));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1175,96 @@ mod tests {
         // the port must not manufacture a key that other portless hosts match.
         assert_eq!(normalize_remote_url("ssh://git@github.com:22"), None);
         assert_eq!(normalize_remote_url("ssh://git@github.com:22/"), None);
+    }
+
+    /// One connection asks about every folder on that server, and each line says which
+    /// folder it is about — the pairing is by path, so the script must quote each one and
+    /// print it back verbatim.
+    #[test]
+    fn the_remote_origin_script_asks_about_every_path_it_is_given() {
+        let script = remote_origin_script(
+            &["/home/a/one".to_string(), "/home/a/two".to_string()],
+            |p| format!("'{p}'"),
+        );
+        assert!(script.contains("'/home/a/one'"));
+        assert!(script.contains("'/home/a/two'"));
+        // Asked ONCE for the machine: without it, `git -C … rev-parse` failing on a
+        // server with no git would read as "none of your folders are repositories".
+        assert!(script.starts_with("command -v git"));
+    }
+
+    /// The wire format between the script and the app. Parsed here rather than inferred
+    /// from whatever a live server printed, so a change to either side breaks a test
+    /// instead of silently un-matching every remote repository.
+    #[test]
+    fn the_remote_origin_script_reads_back_every_outcome() {
+        let out = "ok\thttps://github.com/Alex375/FlightDeck.git\t/home/a/fd\n\
+                   noremote\t\t/home/a/scratch\n\
+                   norepo\t\t/home/a/notes\n\
+                   gone\t\t/mnt/unplugged/work\n";
+        assert_eq!(
+            parse_remote_origin_script(out),
+            vec![
+                (
+                    "/home/a/fd".to_string(),
+                    RemoteOriginAnswer::Local(RemoteLookup::Url(
+                        "https://github.com/Alex375/FlightDeck.git".to_string()
+                    ))
+                ),
+                ("/home/a/scratch".to_string(), RemoteOriginAnswer::Local(RemoteLookup::NoRemote)),
+                ("/home/a/notes".to_string(), RemoteOriginAnswer::Local(RemoteLookup::NotARepository)),
+                ("/mnt/unplugged/work".to_string(), RemoteOriginAnswer::Gone),
+            ]
+        );
+        // The real pair this whole feature exists for: the server's origin and the CRM's
+        // url normalise to the same key, so the match succeeds once the url crosses over.
+        let (_, answer) = &parse_remote_origin_script(out)[0];
+        let RemoteOriginAnswer::Local(RemoteLookup::Url(url)) = answer else { panic!() };
+        assert_eq!(
+            normalize_remote_url(url),
+            normalize_remote_url("https://github.com/Alex375/FlightDeck")
+        );
+    }
+
+    /// A remote read off a server is PERSISTED and SHOWN, so a token in it would outlive
+    /// the probe in SQLite and appear on the TOSSE card. It goes at the point of capture.
+    #[test]
+    fn a_remote_url_loses_its_credentials_but_stays_the_same_repository() {
+        let secret = "https://Alex375:ghp_0123456789@github.com/Alex375/FlightDeck.git";
+        let clean = "https://github.com/Alex375/FlightDeck.git";
+        assert_eq!(redact_remote_url(secret), clean);
+        // Matching is untouched: `normalize_remote_url` already drops the userinfo.
+        assert_eq!(normalize_remote_url(secret), normalize_remote_url(clean));
+
+        // A bare username carries no secret but nothing needs it either.
+        assert_eq!(
+            redact_remote_url("https://Alex375@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        // An `@` in the PATH is part of the path. Cutting at it would mangle the url.
+        assert_eq!(redact_remote_url("https://host/a@b/r.git"), "https://host/a@b/r.git");
+        // The scp form's `git@` is an ssh USER, not a credential — left alone, or the
+        // canonical way half these remotes are written would come back amputated.
+        assert_eq!(
+            redact_remote_url("git@github.com:Alex375/FlightDeck.git"),
+            "git@github.com:Alex375/FlightDeck.git"
+        );
+        // Nothing to redact, nothing changed.
+        assert_eq!(redact_remote_url(clean), clean);
+        assert_eq!(redact_remote_url(""), "");
+    }
+
+    /// Nothing is ever guessed from a line we do not recognise: a folder with no readable
+    /// answer is one we did not look at, and inventing "no origin" for it would un-match a
+    /// repository that is perfectly fine.
+    #[test]
+    fn unreadable_lines_yield_no_verdict() {
+        assert!(parse_remote_origin_script("garbage\nok\n\nok\t\t/p\n").is_empty());
+        // A whole-machine answer carries no path, and is not an answer about any folder.
+        assert_eq!(
+            parse_remote_origin_script("nogit\t\t\n"),
+            vec![(String::new(), RemoteOriginAnswer::NoGit)]
+        );
     }
 
     /// The three outcomes, against real `git` — the classification depends on exit codes

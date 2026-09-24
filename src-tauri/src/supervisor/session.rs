@@ -22,10 +22,12 @@ use super::assembler::Assembler;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
-    PermissionResolvedPayload, RemoteControlState, RewindFilesResult, SessionEmitter, SessionEvent,
+    PermissionResolvedPayload, RemoteControlState, RemoteLinkState, RewindFilesResult, SessionEmitter,
+    SessionEvent, SessionOverrides,
 };
 use super::protocol::CliMessage;
 use super::transport::{self, SpawnConfig, Transport, TransportError};
+use crate::{ssh_link, tailscale};
 
 /// A command sent from the UI to a running session.
 pub enum SessionCommand {
@@ -112,6 +114,10 @@ pub enum SessionCommand {
     /// enable / disable), so a running conversation applies it without a restart.
     /// Fire-and-correlate (bare-success ack; rejection surfaces as a control error).
     ReloadPlugins,
+    /// The tools Flight Deck's own settings ALLOW for this conversation (the `allow` list
+    /// of its [`SessionOverrides`]) — a prompt a settings-file `ask` rule raises for one of
+    /// them is answered "allow" on the user's behalf. Claude-only.
+    SetAutoAllow(Vec<String>),
     /// Compact the conversation's context. CODEX-ONLY: Claude compacts via the plain
     /// `/compact` text command (a slash-command turn), so its actor treats this as a
     /// no-op; the Codex actor issues the native `thread/compact/start` RPC (there is no
@@ -144,6 +150,10 @@ pub struct InitialControls {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub ultracode: bool,
+    /// The conversation's own overrides (MCP rules + plugin on/off). They live in the
+    /// process's flag settings layer, which dies with it — so they are re-applied after
+    /// every `initialize` (a resume, a rewind, an account switch all spawn afresh).
+    pub session_overrides: Option<SessionOverrides>,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -180,6 +190,9 @@ enum PendingControl {
     /// A `reload_plugins` request — its failure surfaces as a control error so the user
     /// knows the freshly-updated plugin was NOT hot-applied (a restart is still needed).
     ReloadPlugins,
+    /// The conversation's overrides re-applied after `initialize` — a failure surfaces,
+    /// since the conversation would otherwise run WITHOUT what the user set for it.
+    SessionOverrides,
 }
 
 impl PendingControl {
@@ -199,6 +212,7 @@ impl PendingControl {
             PendingControl::McpReconnect => "reconnecting an MCP server",
             PendingControl::McpClearAuth => "resetting MCP authentication",
             PendingControl::ReloadPlugins => "reloading plugins",
+            PendingControl::SessionOverrides => "applying this conversation's own settings",
         }
     }
 }
@@ -350,6 +364,28 @@ impl SessionHandle {
             Ok(Ok(Err(msg))) => Err(SessionError::Rejected(msg)),
             _ => Err(SessionError::Closed),
         }
+    }
+
+    /// Replace this conversation's own overrides in the RUNNING session
+    /// (`apply_flag_settings`), awaiting the CLI's answer so a rejection reaches the
+    /// caller. Rules bite from the next tool call; a plugin change needs the reload that
+    /// `reload_plugins` asks for (verified live against 2.1.280).
+    pub async fn apply_session_overrides(
+        &self,
+        overrides: &SessionOverrides,
+        reload_plugins: bool,
+    ) -> Result<(), SessionError> {
+        self.control_query(
+            "apply_flag_settings",
+            control::session_overrides_request("", overrides),
+            15,
+        )
+        .await?;
+        self.send(SessionCommand::SetAutoAllow(overrides.allow.clone())).await?;
+        if reload_plugins {
+            self.reload_plugins().await?;
+        }
+        Ok(())
     }
 
     /// The session's live model catalogue (`list_models`). Authoritative — it reflects
@@ -560,6 +596,12 @@ async fn run_actor(
     mut cfg: SpawnConfig,
 ) {
     core.initialize();
+    // A REMOTE conversation's link starts "not attached yet" the instant this actor
+    // exists — before this, a local conversation never touches `link` at all (stays
+    // `None` by construction). See `RemoteLinkState::Connecting`'s own doc.
+    if cfg.remote.is_some() {
+        core.set_link_connecting();
+    }
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
@@ -585,6 +627,14 @@ async fn run_actor(
         .and_then(|r| r.addresses.iter().position(|a| a == &r.host))
         .unwrap_or(0);
     let mut candidate_failures: u32 = 0;
+    // link: how many failed reconnect attempts THIS outage has made — distinct
+    // from `candidate_failures` (which is scoped to the CURRENT address
+    // candidate and resets on every rotation, or on any attach even if the
+    // link then drops again). `outage_attempts` only resets on a genuine
+    // `FdAttach` (a real return to attached), so it climbs monotonically
+    // across rotations and stays the true count shown as `Reconnecting
+    // { attempt }` — see that variant's own doc.
+    let mut outage_attempts: u32 = 0;
     // A6: the host already persisted as this machine's preferred address THIS
     // session — `None` until the first successful persist, after which it (not
     // `original_host`) becomes the baseline `host_to_persist` compares against.
@@ -602,6 +652,11 @@ async fn run_actor(
     let mut attach_base: u64 = attach.cursor;
     let mut cursor: u64 = attach.cursor;
     let mut attach_seen = false;
+    // A6/link: has THIS actor EVER received `fd_attach`, across its whole lifetime
+    // (never reset by a later drop) — distinct from `attach_seen`, which is per
+    // ATTEMPT. Decides `Connecting` (never yet attached) vs `Reconnecting` (attached
+    // before, now trying again) for `RemoteLinkState` — see its own doc.
+    let mut ever_attached = false;
     // True from link-loss until the next fd_attach: gates the one "lost" notice
     // per outage, the "Reconnected" notice, and the backoff escalation.
     let mut reconnect_pending = false;
@@ -649,7 +704,12 @@ async fn run_actor(
                             attach.epoch = Some(a.epoch);
                             attach_base = a.replay_from;
                             attach_seen = true;
+                            ever_attached = true;
+                            core.clear_link();
                             delay = std::time::Duration::from_secs(1);
+                            // A genuine return to attached ends the outage: the next
+                            // one (if any) starts counting from zero again.
+                            outage_attempts = 0;
                             if reconnect_pending {
                                 reconnect_pending = false;
                                 core.emit_error_notice("remote_link", json!({
@@ -729,6 +789,13 @@ async fn run_actor(
         // fire for it — this is the only case `looks_like_missing_daemon`
         // needs to look at.
         let had_attach = attach_seen;
+        // Set inside the new `ssh_link` classifier arm below when THIS close was an
+        // `Unreachable` ssh-level failure (never attached, exit 255, no key/host-key
+        // wording) — read a few lines down, at the point the outage's "Connection
+        // lost — reconnecting…" notice is built, to decide whether to append the
+        // Tailscale clause. Fresh every outer-loop iteration (never carried across a
+        // later, differently-classified close).
+        let mut just_classified_unreachable = false;
         if !had_attach {
             // Safe to call before `shutdown` (see their doc comments in
             // transport.rs) — the process already exited on its own; this
@@ -830,6 +897,57 @@ async fn run_actor(
                 }
                 // else: fall through to the normal reconnect path below, now
                 // downgraded — exactly one retry without the flags, per the table.
+            } else if let Some(issue) = ssh_link::classify_transport_close(exit_code, &stderr) {
+                // A hard ssh-level failure (exit 255) — never attached this attempt.
+                // `KeyRefused`/`HostKeyChanged` are terminal precondition failures,
+                // exactly like `daemon_missing`/`flag_rejected` above: retrying
+                // forever against a server that has already said "no" is the bug
+                // this whole module exists to fix (the real incident: an infinite
+                // "reconnecting…" spinner after the key was removed server-side).
+                // `Unreachable` is the ordinary case — no dedicated notice, just a
+                // flag read below to decide the Tailscale clause on the outage's
+                // FIRST "Connection lost" notice.
+                match issue {
+                    ssh_link::SshLinkIssue::Unreachable => {
+                        just_classified_unreachable = true;
+                    }
+                    ssh_link::SshLinkIssue::KeyRefused | ssh_link::SshLinkIssue::HostKeyChanged => {
+                        let reason = match issue {
+                            ssh_link::SshLinkIssue::KeyRefused => "ssh_key_refused",
+                            ssh_link::SshLinkIssue::HostKeyChanged => "ssh_host_key_changed",
+                            ssh_link::SshLinkIssue::Unreachable => unreachable!(),
+                        };
+                        let (message, terminal, narrated) =
+                            reconnect_policy_for_reason(reason, exit_code.map(i64::from), None);
+                        if let Some(message) = &message {
+                            core.emit_error_notice(
+                                "remote_link_blocked",
+                                json!({
+                                    "message": message,
+                                    "reason": reason,
+                                    "machine_id": cfg.remote.as_ref().and_then(|r| r.machine_id.clone()),
+                                    // Server-controlled text (ssh's own stderr) — sanitized
+                                    // (ANSI/control stripped) and capped before it reaches the
+                                    // UI's collapsed "Technical details" disclosure; see
+                                    // `sanitize_stderr_detail`'s own doc for why (mirrors
+                                    // `appmcp::provision`/`ipc::commands::run_ssh_on_machine`'s
+                                    // discipline for the SAME stderr).
+                                    "detail": ssh_link::sanitize_stderr_detail(&stderr)
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Null),
+                                }),
+                            );
+                        }
+                        if terminal {
+                            // The message that started this turn (if any) never
+                            // reached the daemon and never will — say so instead of
+                            // leaving the composer optimistically "busy" forever.
+                            core.flag_undelivered_if_busy();
+                            deliberate_exit = narrated;
+                            break 'outer true;
+                        }
+                    }
+                }
             }
         }
         // Remote link lost while the server-side session lives on: reconnect.
@@ -867,12 +985,40 @@ async fn run_actor(
             // count it toward that candidate's consecutive-failure streak.
             candidate_failures += 1;
         }
+        // link: this transport just closed without leaving the outage attached
+        // (whether or not it had attached earlier in its own life) — that is
+        // one more failed reconnect attempt for THIS outage, independent of
+        // `candidate_failures`'s per-address bookkeeping above.
+        outage_attempts += 1;
         transport.shutdown(false).await; // reap the dead ssh client quietly
         if !reconnect_pending {
             reconnect_pending = true;
-            core.emit_error_notice("remote_link", json!({
-                "message": "Connection to the server lost — reconnecting…",
+            // The field must be set for the WHOLE outage (not only once a respawn
+            // attempt is under way) — the backoff wait below can run up to 30s with
+            // nothing else explaining the pause. `ever_attached` decides the wording
+            // (`Connecting` vs `Reconnecting`); `outage_attempts` — already
+            // incremented above for this failed attempt — is shown as `attempt`,
+            // per `RemoteLinkState::Reconnecting`'s own doc.
+            core.set_link(Some(if ever_attached {
+                RemoteLinkState::Reconnecting { attempt: outage_attempts }
+            } else {
+                RemoteLinkState::Connecting
             }));
+            let mut message = "Connection to the server lost — reconnecting…".to_string();
+            // One bounded, local, on-demand check per OUTAGE (never per backoff
+            // retry) — only when THIS close was classified `Unreachable` (see the
+            // `ssh_link` classifier above) and the host even looks like a tailnet
+            // address, so a LAN/public server's outage never pays for this at all.
+            if just_classified_unreachable {
+                if let Some(remote) = cfg.remote.as_ref() {
+                    if tailscale::host_looks_like_tailnet(&remote.host)
+                        && matches!(tailscale::local_status().await, tailscale::LocalTailscaleState::NotRunning)
+                    {
+                        message.push_str(" Tailscale looks off on this Mac.");
+                    }
+                }
+            }
+            core.emit_error_notice("remote_link", json!({ "message": message }));
         } else {
             // Still in the same outage (the previous attempt spawned ssh but
             // never got an fd_attach): escalate the backoff.
@@ -929,6 +1075,16 @@ async fn run_actor(
                     transport = t;
                     msg_rx = rx;
                     core.set_outbound(transport.outbound());
+                    // Re-set (not just left over from the "lost" notice above): a
+                    // rotation just above this match, or an escalated backoff loop
+                    // that came back here without ever re-entering the
+                    // `!reconnect_pending` branch, can move `outage_attempts`
+                    // between the two — keep the shown `attempt` current.
+                    core.set_link(Some(if ever_attached {
+                        RemoteLinkState::Reconnecting { attempt: outage_attempts }
+                    } else {
+                        RemoteLinkState::Connecting
+                    }));
                     // NOT success yet — that's the daemon's fd_attach. Go drive
                     // the new transport; an instant EOF loops back here with the
                     // escalated backoff still in force.
@@ -942,6 +1098,9 @@ async fn run_actor(
                     // above, against whichever candidate `cfg2.remote.host` (== the
                     // CURRENT `cfg.remote.host`, `cfg2` is just its clone) just named.
                     candidate_failures += 1;
+                    // link: another failed reconnect attempt for this outage,
+                    // even though it never even got an ssh process running.
+                    outage_attempts += 1;
                     if let Some(new_host) = rotate_remote_address(&mut cfg, &mut addr_idx, candidate_failures) {
                         candidate_failures = 0;
                         core.emit_error_notice("remote_link", json!({
@@ -1058,6 +1217,36 @@ fn reconnect_policy_for_reason(
                 true,
             )
         }
+        // Synthesized locally by `ssh_link::classify_transport_close` — the server
+        // has refused every key/password this Mac offered. A hard precondition
+        // failure (the saved key is no longer authorized), never a retryable blip:
+        // retrying forever here is exactly the real incident this reason exists to
+        // fix (an infinite "Reasoning… Meditating…" spinner after the key was
+        // removed server-side, with no explanation). See `NOTICE_ERROR_HEADINGS`
+        // (front) for the matching "Can't reach this server" heading.
+        "ssh_key_refused" => (
+            Some(
+                "This Mac's saved key was refused by this server. Reconnect this Mac in \
+                 Settings → Control → Remote, then reopen this conversation."
+                    .to_string(),
+            ),
+            true,
+            true,
+        ),
+        // Synthesized locally by `ssh_link::classify_transport_close` — the server's
+        // host key does not match what this Mac last saw. Also a hard precondition
+        // failure: auto-trusting a changed identity would defeat the whole point of
+        // pinning it, so this stops the loop and asks the human to look, same as
+        // `"ssh_key_refused"` above.
+        "ssh_host_key_changed" => (
+            Some(
+                "This server's identity has changed since this Mac last connected to it. \
+                 Review it in Settings → Control → Remote before reconnecting."
+                    .to_string(),
+            ),
+            true,
+            true,
+        ),
         // Synthesized locally by `looks_like_clap_flag_rejection`, never sent by the
         // daemon. Non-terminal: `run_actor` has ALREADY invalidated the machine's
         // cached daemon version and dropped the optional flags for the rest of this
@@ -1336,6 +1525,13 @@ struct SessionCore {
     /// Whether to restore the ultracode flag after init (the `--effort` spawn flag
     /// sets the effort level but not the separate ultracode flag).
     restore_ultracode: bool,
+    /// The conversation's own overrides, to re-apply after `initialize` (see
+    /// [`InitialControls::session_overrides`]). `None` when it has none.
+    restore_session_overrides: Option<SessionOverrides>,
+    /// Tools Flight Deck's settings allow for this conversation: a prompt that only a
+    /// settings-file `ask` rule raised for one of them is answered for the user — Flight
+    /// Deck's choice overrides Claude Code's own files wherever the CLI lets it.
+    auto_allow: std::collections::HashSet<String>,
     /// In-flight `mcp_status` queries, keyed by their outbound `request_id`. The
     /// matching `control_response` fulfills (and removes) the reply channel.
     pending_mcp: HashMap<String, oneshot::Sender<Result<Vec<McpServerLive>, String>>>,
@@ -1386,6 +1582,12 @@ impl SessionCore {
             pending_control: HashMap::new(),
             init_request_id: None,
             restore_ultracode: initial.ultracode,
+            auto_allow: initial
+                .session_overrides
+                .as_ref()
+                .map(|o| o.allow.iter().cloned().collect())
+                .unwrap_or_default(),
+            restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1403,6 +1605,46 @@ impl SessionCore {
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
         self.sent_on_current_link = false;
+    }
+
+    /// Reflect the live remote SSH link's lifecycle (see
+    /// [`super::model::RemoteLinkState`]'s own doc) and emit the resulting state.
+    /// `run_actor`'s single entry point for every `link` mutation — never writes
+    /// `self.assembler`'s state directly.
+    fn set_link(&mut self, link: Option<RemoteLinkState>) {
+        let ev = self.assembler.set_link(link);
+        self.emit(ev);
+    }
+
+    /// This actor's very first spawn for a remote conversation — not attached yet.
+    fn set_link_connecting(&mut self) {
+        self.set_link(Some(RemoteLinkState::Connecting));
+    }
+
+    /// `fd_attach` landed — the link is up, nothing left to explain.
+    fn clear_link(&mut self) {
+        self.set_link(None);
+    }
+
+    /// A remote link just closed TERMINALLY (see `ssh_link::classify_transport_close`)
+    /// — if a turn was in flight, the message that started it never reached the
+    /// daemon and never will (the reconnect loop is about to stop for good, unlike an
+    /// ordinary drop). Surface it via the EXISTING `send_failed` notice/wording
+    /// (`session.rs`'s own `sync_remote_busy` uses the same message for the
+    /// non-terminal case) rather than leaving the composer optimistically "busy"
+    /// forever — the real incident this fixes: "Reasoning… Meditating…" spinning with
+    /// no explanation once the key was refused.
+    fn flag_undelivered_if_busy(&mut self) {
+        if self.assembler.state().busy {
+            self.emit_error_notice(
+                "send_failed",
+                json!({
+                    "message": "Your message couldn't be delivered to Claude Code: the session closed. Send it again to restart it.",
+                }),
+            );
+            let ev = self.assembler.set_busy(false);
+            self.emit(ev);
+        }
     }
 
     /// The claude session id the assembler learned from `system/init`, if any.
@@ -1626,6 +1868,18 @@ impl SessionCore {
                 control::set_ultracode_request(rid, true)
             });
         }
+        // The conversation's own overrides live in the process's flag layer — gone with
+        // the previous process, so put them back before the first turn can run. Written
+        // right after `initialize` on the same stdin, ahead of any user message. Plugins
+        // were loaded at startup, so a plugin override also needs a reload to bite.
+        if let Some(overrides) = self.restore_session_overrides.clone() {
+            self.send_tracked(PendingControl::SessionOverrides, |rid| {
+                control::session_overrides_request(rid, &overrides)
+            });
+            if !overrides.enabled_plugins.is_empty() {
+                self.send_tracked(PendingControl::ReloadPlugins, control::reload_plugins_request);
+            }
+        }
         // Read the applied settings back so effort + ultracode (and the resolved
         // model id) reflect reality, not just the optimistic seed.
         self.refresh_settings();
@@ -1818,7 +2072,8 @@ impl SessionCore {
             | PendingControl::StopTask
             | PendingControl::McpToggle
             | PendingControl::McpReconnect
-            | PendingControl::McpClearAuth => {}
+            | PendingControl::McpClearAuth
+            | PendingControl::SessionOverrides => {}
             // A hot-reload's ack is NOT bare: it returns the same
             // `response.response.commands` catalogue as `initialize`, freshly rescanned
             // (a plugin's skills appear/disappear here). Harvesting it means the `/`
@@ -1862,6 +2117,17 @@ impl SessionCore {
             InboundControl::CanUseTool(req) => {
                 // Dedupe re-delivery of an in-flight prompt.
                 if self.pending.contains_key(&request_id) {
+                    return;
+                }
+                // Flight Deck's own "Allow" for this tool beats an `ask` rule from Claude
+                // Code's settings files: answer it for the user. Only that case — never a
+                // prompt the mode, the classifier or a safety check raised, and never a
+                // tool that itself demands a human.
+                if self.auto_allow.contains(&req.tool_name)
+                    && req.decision_reason_type.as_deref() == Some("rule")
+                    && !req.requires_user_interaction.unwrap_or(false)
+                {
+                    self.send(control::permission_allow_response(&request_id, &req.tool_use_id, req.input));
                     return;
                 }
                 let payload = PermissionRequestPayload {
@@ -2148,6 +2414,9 @@ impl SessionCore {
                 // control error so the user knows the update wasn't hot-applied.
                 self.send_tracked(PendingControl::ReloadPlugins, control::reload_plugins_request);
             }
+            SessionCommand::SetAutoAllow(tools) => {
+                self.auto_allow = tools.into_iter().collect();
+            }
             // Codex-only: Claude compacts via the `/compact` text command (a normal
             // slash-command turn the composer sends directly), so there's nothing to do
             // on the control channel here.
@@ -2292,6 +2561,40 @@ mod tests {
         assert!(!core.assembler.state().busy);
     }
 
+    // ---- flag_undelivered_if_busy (CRM `c9bf1482`) ----
+
+    fn notice_detail<'a>(events: &'a [SessionEvent], subtype: &str) -> Option<&'a Value> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Item(ConversationItem::Notice { subtype: s, detail }) if s == subtype => Some(detail),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn flag_undelivered_if_busy_emits_send_failed_and_clears_busy_when_busy() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        drain(&mut events);
+        assert!(core.assembler.state().busy, "a send optimistically marks the turn in flight");
+
+        core.flag_undelivered_if_busy();
+        let evs = drain(&mut events);
+        let detail = notice_detail(&evs, "send_failed").expect("expected a send_failed notice");
+        assert_eq!(
+            detail["message"].as_str(),
+            Some("Your message couldn't be delivered to Claude Code: the session closed. Send it again to restart it."),
+        );
+        assert!(!core.assembler.state().busy, "busy must be force-cleared, not left stuck");
+    }
+
+    #[test]
+    fn flag_undelivered_if_busy_is_a_no_op_when_nothing_was_in_flight() {
+        let (mut core, mut events, _out) = test_core();
+        core.flag_undelivered_if_busy();
+        let evs = drain(&mut events);
+        assert!(evs.is_empty(), "no notice/state event when nothing was ever sent: {evs:?}");
+    }
+
     /// Find the first outbound control_request with the given subtype.
     fn find_req<'a>(lines: &'a [Value], subtype: &str) -> Option<&'a Value> {
         lines.iter().find(|l| l["request"]["subtype"] == json!(subtype))
@@ -2352,6 +2655,44 @@ mod tests {
         assert_eq!(line["response"]["response"]["behavior"], json!("deny"));
         assert_eq!(line["response"]["response"]["message"], json!("no"));
         assert_eq!(line["response"]["response"]["toolUseID"], json!("toolu_1"));
+    }
+
+    /// Flight Deck's own "Allow" beats a settings-file `ask` rule: that prompt is answered
+    /// for the user (no card) — but never one the mode / classifier raised, a consent step
+    /// the tool itself demands, or a tool Flight Deck doesn't allow.
+    #[test]
+    fn a_settings_file_ask_is_answered_for_a_tool_flight_deck_allows() {
+        let tool = "mcp__claude_ai_Gmail__send_message";
+        let prompt = |rid: &str, reason: &str, needs_human: bool| -> CliMessage {
+            serde_json::from_value(json!({
+                "type": "control_request",
+                "request_id": rid,
+                "request": {
+                    "subtype": "can_use_tool", "tool_name": tool, "input": { "to": "x" },
+                    "tool_use_id": "toolu_1", "decision_reason_type": reason,
+                    "requires_user_interaction": needs_human
+                }
+            }))
+            .unwrap()
+        };
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetAutoAllow(vec![tool.to_string()]));
+
+        core.on_message(prompt("r1", "rule", false));
+        let answered = drain(&mut out);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0]["response"]["request_id"], json!("r1"));
+        assert_eq!(answered[0]["response"]["response"]["behavior"], json!("allow"));
+        assert!(!drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))));
+
+        for (rid, reason, human) in [("r2", "mode", false), ("r3", "rule", true)] {
+            core.on_message(prompt(rid, reason, human));
+            assert!(drain(&mut out).is_empty(), "{rid}: must reach the user");
+            assert!(drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))));
+        }
+        core.on_command(SessionCommand::SetAutoAllow(vec![]));
+        core.on_message(prompt("r4", "rule", false));
+        assert!(drain(&mut out).is_empty(), "no longer allowed: the user decides");
     }
 
     /// Build a `SessionCore` that HOSTS the app-control MCP server (a fresh hub).
@@ -3627,6 +3968,36 @@ mod tests {
                 false,
             ),
         );
+        // The dedicated entries `ssh_link::classify_transport_close` routes into
+        // (CRM `c9bf1482`): both terminal AND already-narrated, exact wording —
+        // same wording-contract discipline as `tosse/mod.rs`'s
+        // `session_gone_errors_keep_the_wording_the_front_matches_on` (the front's
+        // `NOTICE_ERROR_HEADINGS["remote_link_blocked"]` renders whatever this
+        // returns verbatim).
+        assert_eq!(
+            reconnect_policy_for_reason("ssh_key_refused", None, None),
+            (
+                Some(
+                    "This Mac's saved key was refused by this server. Reconnect this Mac in \
+                     Settings → Control → Remote, then reopen this conversation."
+                        .to_string()
+                ),
+                true,
+                true,
+            ),
+        );
+        assert_eq!(
+            reconnect_policy_for_reason("ssh_host_key_changed", None, None),
+            (
+                Some(
+                    "This server's identity has changed since this Mac last connected to it. \
+                     Review it in Settings → Control → Remote before reconnecting."
+                        .to_string()
+                ),
+                true,
+                true,
+            ),
+        );
     }
 
     /// [`looks_like_clap_flag_rejection`] unit coverage: exit code 2 alone is not
@@ -4091,6 +4462,522 @@ mod tests {
             Some("daemon_missing"),
             "the notice must carry a stable, structured reason alongside the free-text \
              message, so a future UI can match on it instead of parsing English prose",
+        );
+    }
+
+    /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real
+    /// server's `authorized_keys` — ssh fails with `Permission denied
+    /// (publickey,password).` before `fd_attach` EVER lands. The actor must STOP
+    /// for good (never retry a key the server has already refused) and surface
+    /// exactly one `remote_link_blocked` notice, with `link` cleared and `busy`
+    /// force-cleared by `set_ended` — the real incident's "Reasoning… Meditating…"
+    /// forever-spinner, now explained instead of silent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_stops_cleanly_on_a_refused_key_before_ever_attaching() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-key-refused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+printf '\033[31mjosty@100.97.14.57: Permission denied (publickey,password).\033[0m\n' 1>&2
+exit 255
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: Some("m-key-refused".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "key-refused-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        let mut remote_link_blocked: Option<Value> = None;
+        let mut ended_state: Option<SessionStatePayload> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { subtype, detail }) if subtype == "remote_link_blocked" => {
+                        remote_link_blocked = Some(detail);
+                    }
+                    SessionEvent::State(s) if s.ended => {
+                        ended_state = Some(s);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect(
+            "the actor must stop on its own instead of reconnecting forever against a \
+             server that has already refused this Mac's key",
+        );
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(calls, 1, "a refused key must stop the loop after exactly ONE attempt, never retry");
+
+        let notice = remote_link_blocked.expect("expected a remote_link_blocked notice");
+        assert!(
+            notice["message"].as_str().unwrap_or_default().contains("saved key was refused"),
+            "{notice:?}",
+        );
+        assert_eq!(notice["reason"].as_str(), Some("ssh_key_refused"));
+        assert_eq!(notice["machine_id"].as_str(), Some("m-key-refused"));
+        // Security regression guard: ssh's own stderr is SERVER-controlled text —
+        // the raw ANSI-wrapped line the fake ssh script wrote must never reach the
+        // notice verbatim; `sanitize_stderr_detail` must have stripped it.
+        let detail = notice["detail"].as_str().expect("expected a sanitized detail string");
+        assert!(!detail.contains('\u{1b}'), "detail must have its ANSI escape stripped: {detail:?}");
+        assert_eq!(detail, "josty@100.97.14.57: Permission denied (publickey,password).");
+
+        let ended = ended_state.expect("expected a terminal state event (ended == true)");
+        assert!(!ended.busy);
+        assert_eq!(ended.link, None, "link must be cleared by set_ended");
+    }
+
+    /// Mirror of the key-refused test above, for the other terminal `ssh_link`
+    /// classification: the server's host key does not match what this Mac last
+    /// saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_stops_cleanly_on_a_changed_host_key_before_ever_attaching() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-hostkey-changed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" 1>&2
+echo "REMOTE HOST IDENTIFICATION HAS CHANGED!" 1>&2
+echo "Host key verification failed." 1>&2
+exit 255
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: Some("m-hostkey-changed".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "hostkey-changed-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        let mut remote_link_blocked: Option<Value> = None;
+        let mut ended_state: Option<SessionStatePayload> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { subtype, detail }) if subtype == "remote_link_blocked" => {
+                        remote_link_blocked = Some(detail);
+                    }
+                    SessionEvent::State(s) if s.ended => {
+                        ended_state = Some(s);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the actor must stop on its own instead of reconnecting forever against a changed host key");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(calls, 1, "a changed host key must stop the loop after exactly ONE attempt, never retry");
+
+        let notice = remote_link_blocked.expect("expected a remote_link_blocked notice");
+        assert!(
+            notice["message"].as_str().unwrap_or_default().contains("identity has changed"),
+            "{notice:?}",
+        );
+        assert_eq!(notice["reason"].as_str(), Some("ssh_host_key_changed"));
+
+        let ended = ended_state.expect("expected a terminal state event (ended == true)");
+        assert!(!ended.busy);
+        assert_eq!(ended.link, None);
+    }
+
+    /// Mirror of `run_actor_stops_cleanly_on_a_refused_key_before_ever_attaching`,
+    /// but with a message genuinely QUEUED (`busy == true`) at the exact moment the
+    /// key is refused — the real incident's sharper edge: a message sent right as
+    /// the key stops being trusted must never leave the composer optimistically
+    /// "busy" forever. `flag_undelivered_if_busy` must fire the EXISTING
+    /// `send_failed` notice exactly once, alongside (not instead of) the terminal
+    /// `remote_link_blocked` notice, `busy` must end up `false`, the session must
+    /// still end, and the loop must still never retry (`calls == 1`). The fake ssh
+    /// sleeps briefly before failing so the test has a real window to queue the
+    /// message on the still-alive transport before it closes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_flags_an_undelivered_message_when_a_refused_key_closes_the_link() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-key-refused-busy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+# A real window for the test to queue a message on this still-alive transport
+# before ssh reports the key was refused and exits.
+sleep 0.3
+echo "josty@100.97.14.57: Permission denied (publickey,password)." 1>&2
+exit 255
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: Some("m-key-refused-busy".into()),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "key-refused-busy-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        // Queue a message on the still-alive transport, well inside the script's
+        // 0.3s grace window, so `busy` is genuinely `true` when the key is refused.
+        handle
+            .send_user_text("hello while the key is about to be refused")
+            .await
+            .expect("the outbound channel is alive at this point, so the send itself must succeed");
+
+        let mut remote_link_blocked_count = 0u32;
+        let mut send_failed_count = 0u32;
+        let mut ended_state: Option<SessionStatePayload> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "remote_link_blocked" => {
+                        remote_link_blocked_count += 1;
+                    }
+                    SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "send_failed" => {
+                        send_failed_count += 1;
+                    }
+                    SessionEvent::State(s) if s.ended => {
+                        ended_state = Some(s);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect(
+            "the actor must stop on its own instead of reconnecting forever against a \
+             server that has already refused this Mac's key",
+        );
+
+        handle.shutdown_and_wait_stopping().await.ok();
+
+        let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(calls, 1, "a refused key must stop the loop after exactly ONE attempt, never retry");
+
+        assert_eq!(remote_link_blocked_count, 1, "expected exactly one remote_link_blocked notice");
+        assert_eq!(
+            send_failed_count, 1,
+            "a message genuinely in flight when the key is refused must be flagged undelivered exactly once",
+        );
+
+        let ended = ended_state.expect("expected a terminal state event (ended == true)");
+        assert!(!ended.busy, "busy must be force-cleared by flag_undelivered_if_busy, not left stuck");
+        assert_eq!(ended.link, None, "link must be cleared by set_ended");
+    }
+
+    /// The ordinary case, unchanged by this task: an `Unreachable` classification
+    /// (DNS/refused/timeout/…) is NON-terminal — the actor keeps retrying forever,
+    /// never emits the terminal `remote_link_blocked` notice, and `link` stays
+    /// `Connecting` throughout (this actor has never once attached, so there is
+    /// nothing to "re"-connect to yet — see `RemoteLinkState::Connecting`'s own
+    /// doc; `Reconnecting` is reserved for an outage that follows a REAL earlier
+    /// attach, exercised by the next test).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_keeps_retrying_forever_on_an_unreachable_classification() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-unreachable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+echo "ssh: connect to host 127.0.0.1 port 1: Connection refused" 1>&2
+exit 255
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "unreachable-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        let handle = handle.expect("fake ssh should spawn");
+
+        let mut link_states: Vec<Option<RemoteLinkState>> = Vec::new();
+        let mut remote_link_blocked_seen = false;
+        // Drive until the fake ssh has been invoked at least 3 times (proof the
+        // loop genuinely retries), bounded so a regression that stops retrying
+        // (or one that loops so fast it never yields) can't hang the suite.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap_or_default().trim().parse().unwrap_or(0);
+                if calls >= 3 {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                    Ok(Some(SessionEvent::State(s))) => link_states.push(s.link),
+                    Ok(Some(SessionEvent::Item(ConversationItem::Notice { subtype, .. })))
+                        if subtype == "remote_link_blocked" =>
+                    {
+                        remote_link_blocked_seen = true;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {} // no event within this slice — keep polling the call count
+                }
+            }
+        })
+        .await
+        .expect("expected at least 3 retries within the deadline — the loop must never give up");
+
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            !remote_link_blocked_seen,
+            "an Unreachable classification must NEVER emit the terminal notice",
+        );
+        assert!(
+            link_states.iter().flatten().all(|l| matches!(l, RemoteLinkState::Connecting)),
+            "never having attached, every link state must stay Connecting: {link_states:?}",
+        );
+        assert!(
+            link_states.iter().any(|l| l.is_some()),
+            "expected at least one Connecting state event: {link_states:?}",
+        );
+    }
+
+    /// After a REAL earlier attach, a later drop must show `Reconnecting` (not
+    /// `Connecting`) while the actor tries to get back — the FIRST reconnect
+    /// after an attach shows `attempt: 1` (`outage_attempts`, a counter separate
+    /// from `candidate_failures` — see `RemoteLinkState::Reconnecting`'s own
+    /// doc): the drop itself is this outage's first failed attempt, even though
+    /// the just-lost candidate's own per-address streak (`candidate_failures`)
+    /// was reset to 0 by that same attach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_shows_reconnecting_after_a_link_drop_once_attached() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-reconnecting-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+if [ "$N" -eq 1 ]; then
+    printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+    exit 0
+fi
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "reconnecting-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        let handle = handle.expect("fake ssh should spawn");
+
+        let mut saw_connecting_first = false;
+        let mut saw_reconnecting = false;
+        let mut reconnecting_attempt: Option<u32> = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::State(s) = ev {
+                    match s.link {
+                        Some(RemoteLinkState::Connecting) => saw_connecting_first = true,
+                        Some(RemoteLinkState::Reconnecting { attempt }) => {
+                            saw_reconnecting = true;
+                            reconnecting_attempt = Some(attempt);
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected a Reconnecting state event once the (attached-then-dropped) link retries");
+
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(saw_connecting_first, "the very first state (before the first attach) must be Connecting");
+        assert!(saw_reconnecting, "expected a Reconnecting state after the attached link dropped");
+        assert_eq!(
+            reconnecting_attempt,
+            Some(1),
+            "the outage's first failed reconnect attempt must show attempt: 1, not 0 \
+             (candidate_failures resets to 0 on this same attach — outage_attempts must not)",
         );
     }
 
@@ -5341,5 +6228,480 @@ esac
             "expected exactly 8 tool results (4 Bash + 4 Read), none missing/duplicated: \
              {tool_use_ids:?}",
         );
+    }
+
+    // ========================================================================
+    // Live remote-link tests (CRM `c9bf1482`) — the real ssh binary, against
+    // either a genuinely unreachable address (no Docker needed) or a throwaway
+    // local Docker fixture (`flightdeckd/live/bootstrap-fixtures/fixture.sh`).
+    // NEVER a real paired server. `cargo test --lib -- --ignored --nocapture`.
+    //
+    // These deliberately do NOT set `$TOSSE_SSH_BIN` — the whole point is
+    // exercising the REAL `ssh` client's real stderr wording end to end, not a
+    // fake-ssh script (see the deterministic `run_actor_*` tests above for that).
+    // ========================================================================
+    mod live_remote {
+        use super::*;
+        use std::path::PathBuf;
+
+        /// A SEPARATE lock from `bootstrap::{connect,orchestrator}`'s own
+        /// same-named statics — neither module has a place to put shared
+        /// test-only fixture infra today (see their own docs for the same
+        /// reasoning), so each keeps its own copy of the handful of helpers
+        /// below.
+        static LIVE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// Same helper as `bootstrap::{connect,orchestrator}`'s own copies.
+        fn flightdeckd_crate_dir() -> PathBuf {
+            if let Ok(p) = std::env::var("FLIGHTDECKD_CRATE_DIR") {
+                return PathBuf::from(p);
+            }
+            let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            loop {
+                let candidate = dir.join("flightdeckd");
+                if candidate.join("live/bootstrap-fixtures").is_dir() {
+                    return candidate;
+                }
+                if !dir.pop() {
+                    panic!(
+                        "could not locate the flightdeckd crate as an ancestor of {} \
+                         — it should live at <repo root>/flightdeckd, or set FLIGHTDECKD_CRATE_DIR",
+                        env!("CARGO_MANIFEST_DIR")
+                    );
+                }
+            }
+        }
+
+        fn fixture_up(letter: &str) {
+            let script = flightdeckd_crate_dir().join("live/bootstrap-fixtures/fixture.sh");
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .args(["up", letter])
+                .output()
+                .unwrap_or_else(|e| panic!("could not run {}: {e}", script.display()));
+            assert!(
+                out.status.success(),
+                "fixture.sh up {letter} failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        const FIXTURE_A_PORT: u16 = 2231;
+        const FIXTURE_A_USER: &str = "deploy";
+        const FIXTURE_B_PORT: u16 = 2232;
+        const FIXTURE_B_USER: &str = "root";
+        const FIXTURE_B_PASSWORD: &str = "root-pw";
+
+        struct ThrowawayKey {
+            dir: PathBuf,
+            private: PathBuf,
+            public: String,
+        }
+        impl ThrowawayKey {
+            fn generate(tag: &str) -> Self {
+                let dir = std::env::temp_dir().join(format!("tosse-c9bf1482-live-{tag}-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir(&dir).expect("scratch dir for the throwaway key");
+                let private = dir.join("id_ed25519");
+                let out = std::process::Command::new("ssh-keygen")
+                    .args(["-t", "ed25519", "-f"])
+                    .arg(&private)
+                    .args(["-N", "", "-C", "tosse-c9bf1482-live-test"])
+                    .output()
+                    .expect("ssh-keygen must be available");
+                assert!(out.status.success(), "ssh-keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+                let public = std::fs::read_to_string(dir.join("id_ed25519.pub")).expect("read the generated pubkey");
+                Self { dir, private, public: public.trim().to_string() }
+            }
+            fn path(&self) -> &str {
+                self.private.to_str().expect("throwaway key path must be UTF-8")
+            }
+        }
+        impl Drop for ThrowawayKey {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        struct ScratchKnownHosts(PathBuf);
+        impl ScratchKnownHosts {
+            fn new(tag: &str) -> Self {
+                let path =
+                    std::env::temp_dir().join(format!("tosse-c9bf1482-known-hosts-{tag}-{}", uuid::Uuid::new_v4()));
+                std::fs::write(&path, "").expect("scratch known_hosts");
+                Self(path)
+            }
+            fn path(&self) -> &str {
+                self.0.to_str().expect("scratch known_hosts path must be UTF-8")
+            }
+        }
+        impl Drop for ScratchKnownHosts {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        fn fixture_machine(id: &str, port: u16, user: &str, key: &ThrowawayKey) -> crate::store::MachineRecord {
+            crate::store::MachineRecord {
+                id: id.to_string(),
+                label: format!("live-test-{id}"),
+                host: "127.0.0.1".to_string(),
+                port,
+                user: user.to_string(),
+                identity_file: Some(key.path().to_string()),
+                added_at: 0,
+                addresses: Vec::new(),
+                daemon_mac_id: None,
+                daemon_relay_url: None,
+                daemon_label: None,
+                phone_provisioned_at: None,
+            }
+        }
+
+        /// THE INCIDENT (CRM `c9bf1482`), through the app's REAL remote
+        /// transport/`run_actor`: a genuinely wrong throwaway keypair (NEVER
+        /// installed on the fixture) against a REAL `sshd` — the spec's own
+        /// accepted variant of "install then remove the key", since ssh itself
+        /// refuses the connection before the remote command is ever exec'd, so
+        /// whether `flightdeckd` is even installed on the target fixture makes
+        /// no difference to this path. Proves the REAL OpenSSH client's exact
+        /// stderr wording (`Permission denied (publickey,password).`)
+        /// classifies through `ssh_link::classify_transport_close` exactly like
+        /// the fake-ssh unit tests above assume, that `push_ssh_destination`/
+        /// `LC_ALL=C` do not somehow change that wording, and — checked against
+        /// the fixture's OWN sshd log, not just this process's own bookkeeping —
+        /// that the loop genuinely never retries against the real server.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start) + the in-repo flightdeckd/live/bootstrap-fixtures"]
+        async fn live_key_refused_via_real_sshd_blocks_the_link_and_never_retries() {
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("a");
+            let key = ThrowawayKey::generate("key-refused"); // deliberately NEVER installed
+            let kh = ScratchKnownHosts::new("key-refused");
+
+            let mut cfg = SpawnConfig::new(std::env::temp_dir());
+            cfg.remote = Some(transport::RemoteTarget {
+                host: "127.0.0.1".into(),
+                port: FIXTURE_A_PORT,
+                user: FIXTURE_A_USER.into(),
+                identity_file: Some(key.path().to_string()),
+                known_hosts_file: Some(kh.path().to_string()),
+                daemon_bin: "flightdeckd".into(),
+                addresses: vec!["127.0.0.1".into()],
+                machine_id: Some("live-key-refused".into()),
+            });
+
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let handle = spawn_session(
+                "live-key-refused-test".to_string(),
+                cfg,
+                InitialControls::default(),
+                Arc::new(ChannelEmitter { tx: event_tx }),
+                Box::new(|| {}),
+                None,
+            )
+            .expect("spawning the real ssh client must succeed even though auth will fail");
+
+            // Queue a message right away: the outbound channel accepts it
+            // regardless of whether the real ssh handshake has completed yet —
+            // same reasoning as the fake-ssh
+            // `run_actor_flags_an_undelivered_message_...` test above.
+            handle
+                .send_user_text("hello while the real handshake is in flight")
+                .await
+                .expect("the outbound channel is alive at this point");
+
+            let mut remote_link_blocked_count = 0u32;
+            let mut send_failed_count = 0u32;
+            let mut ended_state: Option<SessionStatePayload> = None;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while let Some(ev) = event_rx.recv().await {
+                    match ev {
+                        SessionEvent::Item(ConversationItem::Notice { subtype, .. })
+                            if subtype == "remote_link_blocked" =>
+                        {
+                            remote_link_blocked_count += 1;
+                        }
+                        SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "send_failed" => {
+                            send_failed_count += 1;
+                        }
+                        SessionEvent::State(s) if s.ended => {
+                            ended_state = Some(s);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the actor must stop on its own against a real sshd that refuses this key");
+
+            handle.shutdown_and_wait_stopping().await.ok();
+
+            assert_eq!(remote_link_blocked_count, 1, "expected exactly one remote_link_blocked notice");
+            assert_eq!(
+                send_failed_count, 1,
+                "the message genuinely in flight must be flagged undelivered exactly once",
+            );
+            let ended = ended_state.expect("expected a terminal state event (ended == true)");
+            assert!(!ended.busy, "busy must be force-cleared");
+            assert_eq!(ended.link, None, "link must be cleared by set_ended");
+
+            // Bounded wait, then check the fixture's OWN sshd log: exactly one
+            // failed auth attempt for this user — proof the loop genuinely never
+            // retried against the real server, not just that this process
+            // stopped emitting events.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let log = std::process::Command::new("docker")
+                .args(["exec", "fd-fixture-a", "journalctl", "-u", "ssh", "--no-pager", "-o", "cat"])
+                .output()
+                .expect("docker exec must be available");
+            let attempts = String::from_utf8_lossy(&log.stdout)
+                .lines()
+                .filter(|l| l.contains("authenticating user") && l.contains(FIXTURE_A_USER))
+                .count();
+            assert_eq!(
+                attempts, 1,
+                "the fixture's sshd log must show exactly one connection attempt, never a retry loop: {}",
+                String::from_utf8_lossy(&log.stdout),
+            );
+        }
+
+        /// The `Unreachable` bucket via REAL network conditions (no Docker
+        /// needed) — a closed local port ("Connection refused") and an
+        /// unresolvable hostname ("Could not resolve hostname"), both
+        /// live-verified in the spec this implements. Both must stay
+        /// non-terminal — `link` reflects `Connecting`/`Reconnecting`, never
+        /// `remote_link_blocked` — while the loop keeps retrying (driven for a
+        /// bounded window here and then shut down; the fake-ssh
+        /// `run_actor_keeps_retrying_forever_...` unit test above already
+        /// proves the "forever" part deterministically).
+        #[tokio::test]
+        #[ignore = "spawns the real ssh binary against local/DNS addresses"]
+        async fn live_unreachable_classification_via_real_network() {
+            for (label, host, port) in [
+                ("closed local port", "127.0.0.1", 1u16),
+                ("unresolvable host", "does-not-exist.invalid", 22u16),
+            ] {
+                let mut cfg = SpawnConfig::new(std::env::temp_dir());
+                cfg.remote = Some(transport::RemoteTarget {
+                    host: host.into(),
+                    port,
+                    user: "nobody".into(),
+                    identity_file: None,
+                    known_hosts_file: None,
+                    daemon_bin: "flightdeckd".into(),
+                    addresses: vec![host.into()],
+                    machine_id: None,
+                });
+
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let handle = spawn_session(
+                    format!("live-unreachable-{label}"),
+                    cfg,
+                    InitialControls::default(),
+                    Arc::new(ChannelEmitter { tx: event_tx }),
+                    Box::new(|| {}),
+                    None,
+                )
+                .expect("spawning ssh itself must succeed even though the connection will fail");
+
+                let mut saw_non_terminal_link = false;
+                // Blocker (review finding): `run_actor` emits its FIRST `Connecting`
+                // state synchronously at actor startup (`set_link_connecting()`),
+                // BEFORE `ssh` has even been spawned — that event proves nothing
+                // about classification. A real classified attempt only produces the
+                // NEXT non-terminal link event, emitted after the spawned `ssh`
+                // process has actually closed and `ssh_link::classify_transport_close`
+                // has run on its exit code/stderr (see the ordering in `run_actor`:
+                // the classify call precedes every `core.set_link` in the reconnect
+                // path). So this must wait for a SECOND such event — breaking on the
+                // first one (the old bug) would pass this test vacuously even with
+                // classification completely broken, which is exactly what it is here
+                // to catch.
+                let mut non_terminal_link_events = 0u32;
+                let mut remote_link_blocked = false;
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    while let Some(ev) = event_rx.recv().await {
+                        match ev {
+                            SessionEvent::State(s) => {
+                                if matches!(
+                                    s.link,
+                                    Some(RemoteLinkState::Connecting) | Some(RemoteLinkState::Reconnecting { .. })
+                                ) {
+                                    saw_non_terminal_link = true;
+                                    non_terminal_link_events += 1;
+                                }
+                            }
+                            SessionEvent::Item(ConversationItem::Notice { subtype, .. })
+                                if subtype == "remote_link_blocked" =>
+                            {
+                                remote_link_blocked = true;
+                            }
+                            _ => {}
+                        }
+                        // Stop as soon as either outcome has REAL evidence: a second
+                        // non-terminal link event (proof a classified attempt
+                        // happened and stayed non-terminal), or the regression this
+                        // test guards against actually firing.
+                        if non_terminal_link_events >= 2 || remote_link_blocked {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "[{label}] expected a SECOND Connecting/Reconnecting link state \
+                         (proof a real classified ssh attempt happened, not just the actor's \
+                         pre-connection startup state)"
+                    )
+                });
+
+                handle.shutdown_and_wait_stopping().await.ok();
+                assert!(saw_non_terminal_link, "[{label}] expected the link to reflect a non-terminal retry state");
+                assert!(
+                    non_terminal_link_events >= 2,
+                    "[{label}] expected at least two non-terminal link events (the startup one, then one \
+                     following a real classified ssh failure) — got {non_terminal_link_events}",
+                );
+                assert!(
+                    !remote_link_blocked,
+                    "[{label}] an Unreachable classification must NEVER emit the terminal notice",
+                );
+            }
+        }
+
+        /// Host-key-changed via a REAL fixture whose host key genuinely
+        /// regenerates — same fixture-mutation technique as
+        /// `bootstrap::connect`'s own
+        /// `live_host_key_change_is_detected_then_recoverable_via_forget_host_key`
+        /// — but driving BOTH `diagnose()` (the Settings-panel path) and
+        /// `run_actor` (the live-session path) against the SAME stale,
+        /// app-dedicated known_hosts file, proving neither one silently
+        /// auto-trusts the new identity (the whole point of pinning it at all):
+        /// `StrictHostKeyChecking=accept-new` only auto-trusts a host NEVER
+        /// seen before, never one that changed.
+        #[tokio::test]
+        #[ignore = "needs Docker (colima start) + the in-repo flightdeckd/live/bootstrap-fixtures"]
+        async fn live_host_key_changed_blocks_diagnose_and_run_actor_without_ever_auto_trusting() {
+            use crate::bootstrap::connect;
+            use crate::bootstrap::orchestrator::{self, DiagnosisState};
+
+            let _guard = LIVE_FIXTURE_LOCK.lock().await;
+            fixture_up("b");
+            let key = ThrowawayKey::generate("host-key-changed");
+            let kh = ScratchKnownHosts::new("host-key-changed");
+            let target =
+                connect::BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_B_PORT, user: FIXTURE_B_USER.to_string() };
+
+            // Pin the fixture's REAL host key into this Mac's own dedicated
+            // known_hosts, exactly like a real pairing.
+            let first = connect::install_key(&target, FIXTURE_B_PASSWORD, key.path(), &key.public, kh.path())
+                .await
+                .expect("the first connection must pin the fixture's real host key");
+            assert_eq!(first, connect::KeyInstallOutcome::Installed);
+            let fingerprint_before = connect::read_pinned_fingerprint(kh.path(), &target.host, target.port)
+                .await
+                .expect("a fingerprint must be pinned after a successful connection");
+
+            let machine = fixture_machine("live-hostkey-changed", FIXTURE_B_PORT, FIXTURE_B_USER, &key);
+            let before = orchestrator::diagnose(&machine, Some(kh.path())).await;
+            assert!(before.reachable, "{before:?}");
+            assert_eq!(before.link_issue, None, "{before:?}");
+
+            // Genuinely regenerate the container's host key from the outside —
+            // same technique as `connect.rs`'s own live test.
+            let regen = std::process::Command::new("docker")
+                .args([
+                    "exec",
+                    "fd-fixture-b",
+                    "sh",
+                    "-c",
+                    "rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null 2>&1 && systemctl restart ssh",
+                ])
+                .output()
+                .expect("docker exec must be available");
+            assert!(
+                regen.status.success(),
+                "regenerating the host key failed: {}",
+                String::from_utf8_lossy(&regen.stderr)
+            );
+
+            // (1) `diagnose()` — the Settings-panel path.
+            let after = orchestrator::diagnose(&machine, Some(kh.path())).await;
+            assert!(!after.reachable, "{after:?}");
+            assert_eq!(after.link_issue, Some(ssh_link::SshLinkIssue::HostKeyChanged), "{after:?}");
+            assert_eq!(
+                after.state,
+                DiagnosisState::Failed {
+                    reason: "this server's identity has changed since this Mac last connected to it".to_string()
+                },
+                "{after:?}",
+            );
+
+            // (2) `run_actor` — the live-session path, same stale known_hosts.
+            let mut cfg = SpawnConfig::new(std::env::temp_dir());
+            cfg.remote = Some(transport::RemoteTarget {
+                host: "127.0.0.1".into(),
+                port: FIXTURE_B_PORT,
+                user: FIXTURE_B_USER.into(),
+                identity_file: Some(key.path().to_string()),
+                known_hosts_file: Some(kh.path().to_string()),
+                daemon_bin: "flightdeckd".into(),
+                addresses: vec!["127.0.0.1".into()],
+                machine_id: Some("live-hostkey-changed".into()),
+            });
+
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let handle = spawn_session(
+                "live-hostkey-changed-test".to_string(),
+                cfg,
+                InitialControls::default(),
+                Arc::new(ChannelEmitter { tx: event_tx }),
+                Box::new(|| {}),
+                None,
+            )
+            .expect("spawning the real ssh client must succeed even though the host key check will fail");
+
+            let mut remote_link_blocked_count = 0u32;
+            let mut ended_state: Option<SessionStatePayload> = None;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while let Some(ev) = event_rx.recv().await {
+                    match ev {
+                        SessionEvent::Item(ConversationItem::Notice { subtype, detail })
+                            if subtype == "remote_link_blocked" =>
+                        {
+                            remote_link_blocked_count += 1;
+                            assert_eq!(detail["reason"].as_str(), Some("ssh_host_key_changed"), "{detail:?}");
+                        }
+                        SessionEvent::State(s) if s.ended => {
+                            ended_state = Some(s);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the actor must stop on its own against a genuinely changed host key");
+
+            handle.shutdown_and_wait_stopping().await.ok();
+
+            assert_eq!(remote_link_blocked_count, 1);
+            let ended = ended_state.expect("expected a terminal state event (ended == true)");
+            assert!(!ended.busy);
+            assert_eq!(ended.link, None);
+
+            // Never auto-trusted: the OLD fingerprint must still be the one
+            // pinned — `run_actor`'s own ssh invocation must never silently
+            // re-pin a changed identity, exactly like `install_key`'s own
+            // reconnect above never did.
+            let fingerprint_after = connect::read_pinned_fingerprint(kh.path(), &target.host, target.port)
+                .await
+                .expect("the stale fingerprint must still be pinned — never silently overwritten");
+            assert_eq!(
+                fingerprint_after, fingerprint_before,
+                "run_actor must NEVER auto-trust a changed host identity",
+            );
+        }
     }
 }

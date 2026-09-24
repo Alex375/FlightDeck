@@ -357,6 +357,37 @@ pub struct RepoTosseLink {
     pub path: String,
     /// The CRM repository id, or `None` when the user never pinned one.
     pub tosse_repository_id: Option<String>,
+    /// The paired server this folder lives on, or `None` for a folder on this Mac.
+    ///
+    /// ⚠️ Carried here because `path` alone is MACHINE-BLIND: a remote folder's path
+    /// exists only on that server, so running this Mac's `git` on it fails exactly like
+    /// a folder that was deleted. Without this field the association check reports a
+    /// fault on every remote repository.
+    pub machine_id: Option<String>,
+    /// That server's label, when it is still paired. `None` while `machine_id` is set
+    /// means the id names no machine any more — the folder is STILL remote (degrading it
+    /// to "local" would bring back the very misreading this field exists to end), we
+    /// just cannot name the server.
+    pub machine_label: Option<String>,
+    /// For a remote folder: the `origin` a SERVER last reported, cached so matching is
+    /// instant at load and survives the server being switched off. Always `None` for a
+    /// local folder, whose remote is read live.
+    pub remote_origin_url: Option<String>,
+    /// When that probe last ran (unix ms). ⚠️ This — not the url — is what says we ever
+    /// LOOKED: `probed_at: Some, url: None` is "asked, this repo has no origin", while
+    /// both `None` is "never asked". Collapsing the two re-probes a repo forever and
+    /// lets the UI state a verdict it never obtained.
+    pub remote_origin_probed_at: Option<i64>,
+    /// The server's answer when it was NOT a url — `no-remote`, `not-a-repository`,
+    /// `gone`, `no-git` — and `None` when a url was read (or nothing was ever asked).
+    ///
+    /// ⚠️ These four are a fact about the FOLDER, obtained from a server that answered
+    /// perfectly well. Dropping them (as the sweep first did) left `probed_at` NULL,
+    /// which means "we could not ask" — so the card blamed the server for something it
+    /// had just told us. A string, not an enum, because the front only ever shows it:
+    /// an answer this app does not know yet must reach the user, not be swallowed by a
+    /// deserializer.
+    pub remote_origin_note: Option<String>,
 }
 
 /// A TOSSE project pinned to one of the app's local folders.

@@ -36,7 +36,7 @@ export interface SettingEntry {
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
   general: ["accounts", "system"],
   display: ["appearance", "thread", "timing", "composer", "models", "ide", "order"],
-  claudeCode: ["instructions", "behavior", "helpers"],
+  claudeCode: ["instructions", "behavior", "helpers", "extensions"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
@@ -44,8 +44,6 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
-  { title: "Tinted conversation rows", section: "display", sub: "appearance", group: "Appearance", keywords: "sidebar state colour color pill running timer chrono dot status couleur etat pastille ligne conversation display affichage" },
-  { title: "Status inside the composer", section: "display", sub: "appearance", group: "Appearance", keywords: "review bar mark as seen question error banner encadre statut composeur vu display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
@@ -80,6 +78,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Auto-switch account near usage limit", section: "general", sub: "accounts", group: "Switching", keywords: "auto switch rotate failover quota limit bascule automatique changement compte limite" },
   { title: "Switch at", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "threshold trigger percent seuil declenchement pourcentage auto-switch" },
   { title: "Target below", flash: "Switching", section: "general", sub: "accounts", group: "Switching", keywords: "ceiling hysteresis target oscillation plafond cible auto-switch" },
+  { title: "TOSSE actions in the conversation", section: "tosse", group: "In the app", keywords: "mcp thread fil carte card task tache statut status contexte context lecture read logo rose crm" },
   { title: "TOSSE mark on repositories", section: "tosse", group: "In the app", keywords: "badge repo crm" },
   { title: "TOSSE tasks view", section: "tosse", group: "In the app", keywords: "tasks board kanban taches" },
   { title: "Stay on the tasks view when you press Start", section: "tosse", group: "In the app", keywords: "pickup start navigation" },
@@ -149,6 +148,8 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Show in the Flight Deck", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout counters banner alerts alertes" },
   { title: "Show in the Conversation", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout sidebar counters alerts alertes" },
   { title: "Alert for background shell commands", section: "notifications", sub: "background", group: "Background tasks", keywords: "bash monitor background notification alerts alertes" },
+  { title: "Connectors & MCP servers", section: "claudeCode", sub: "extensions", group: "Extensions", keywords: "cloud connectors mcp tools outils permissions allow ask block autoriser bloquer gmail slack claude.ai" },
+  { title: "Plugins", section: "claudeCode", sub: "extensions", group: "Extensions", keywords: "plugins marketplaces extensions enable" },
   { title: "Flight Deck", section: "updates", group: "Flight Deck", keywords: "app update version mise a jour" },
   { title: "Claude Code CLI", section: "updates", group: "Claude Code CLI", keywords: "binary update version cli" },
   { title: "Automatic updates", section: "updates", group: "Claude Code CLI", keywords: "auto update cli" },

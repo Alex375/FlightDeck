@@ -2323,6 +2323,8 @@ fn mcp_server_live(v: &Value, startup: &HashMap<String, McpStartupStatus>) -> Mc
         url: None,
         tool_count: tools.len() as u32,
         tools,
+        // Codex has no per-tool permission rules for the app to write: plain names only.
+        tool_info: Vec::new(),
         failure_reason,
     }
 }

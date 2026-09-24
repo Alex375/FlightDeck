@@ -13,6 +13,7 @@ import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { SoundToggle } from "./features/notifications/SoundToggle";
 import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { MachineHealthHost } from "./features/machines/MachineHealthHost";
 import { AutoAccountSwitchHost } from "./features/settings/AutoAccountSwitchHost";
 import { ClaudeAccountApplyHost } from "./features/settings/ClaudeAccountApplyHost";
 import { ZoomHost } from "./ui/ZoomHost";
@@ -407,6 +408,8 @@ export default function App() {
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Ambient "is each server we actually use still there?" — see the component. */}
+      <MachineHealthHost />
       {/* Idem (render-null): watches each Claude account's usage and, when the opt-in is
           on, moves a conversation off an account nearing its limit — at a turn boundary
           only. Renders (and fetches) nothing until a second account exists. */}

@@ -22,6 +22,7 @@ import {
   type Conversation,
   type Repo,
 } from "../../store/conversationsStore";
+import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { useFleetLanes } from "../../agent/fleet";
 import { useDisplay } from "../../store/display";
 import {
@@ -75,6 +76,10 @@ function RepoLane({
         <span className="wf-hi" style={{ fontWeight: 600, fontSize: 12.5 }}>
           {repoName(repo.path)}
         </span>
+        {/* Which machine this lane's folder lives on. Sits between the name and the path
+            on purpose: the path right next to it is the one that misleads (a server path
+            and a Mac path look alike once truncated), so the answer arrives first. */}
+        <RemoteRepoMark machineId={repo.machineId} />
         <span className="wf-mono wf-xmuted" style={{ fontSize: 11 }}>
           {repo.path}
         </span>
@@ -97,7 +102,16 @@ function RepoLane({
         <div className="ag-grid">
           <SortableContext items={conversations.map((c) => c.id)} strategy={rectSortingStrategy}>
             {conversations.map((c) => (
-              <StreamCard key={c.id} conv={c} repoPath={repo.path} now={now} onOpen={onOpen} />
+              <StreamCard
+                key={c.id}
+                conv={c}
+                repoPath={repo.path}
+                // Handed down rather than looked up per card: the lane already holds the
+                // repo, so a card costs no extra store subscription for it.
+                machineId={repo.machineId}
+                now={now}
+                onOpen={onOpen}
+              />
             ))}
           </SortableContext>
         </div>

@@ -78,11 +78,13 @@ import { parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
+import { remoteLinkText } from "./remoteLinkText";
 import { useShallow } from "zustand/react/shallow";
 import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
 import { ArtifactCard } from "./ArtifactCard";
 import { AgentMessageSentCard } from "./AgentMessageCards";
+import { TosseToolCard, useTosseToolCards } from "./TosseToolCard";
 import { resolveTranscriptSource } from "./transcriptSource";
 import type { StickToBottom } from "./useStickToBottom";
 import styles from "./ConductorThread.module.css";
@@ -586,8 +588,9 @@ function LiveRunSection({
     session,
     steps.map((s) => s.id),
   );
+  const tosseCards = useTosseToolCards();
   return (
-    <ToolSection title={runHeader(steps)} errored={errored} live={live}>
+    <ToolSection title={runHeader(steps, tosseCards)} errored={errored} live={live}>
       {steps.map((step) =>
         motion ? (
           <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>
@@ -782,6 +785,19 @@ function renderSegment(
     // delivery state), the recipient jumping to where the message arrived.
     return (
       <AgentMessageSentCard
+        key={seg.key}
+        session={session}
+        name={seg.step.name}
+        toolUseId={seg.step.id}
+        input={seg.step.input}
+        active={active}
+      />
+    );
+  if (seg.kind === "tosse")
+    // A write to the TOSSE CRM renders as its own action card (what changed, on which task,
+    // with the CRM's own status pill), clicking through to the task.
+    return (
+      <TosseToolCard
         key={seg.key}
         session={session}
         name={seg.step.name}
@@ -1046,7 +1062,10 @@ function AssistantBlocks({
   // background agent into the thread. Shallow-compared → stable ref unless a new one appears.
   const bgAgentIds = useBackgroundAgentIds(session);
   const bgSet = useMemo(() => new Set(bgAgentIds), [bgAgentIds]);
-  const segments = groupBlocks(blocks, false, bgSet);
+  // Off → a TOSSE write stays an ordinary MCP step inside its run, exactly as before the
+  // dedicated CRM rendering existed.
+  const tosseCards = useTosseToolCards();
+  const segments = groupBlocks(blocks, false, bgSet, tosseCards);
 
   if (!cleanOutput) {
     const lastIdx = segments.length - 1;
@@ -1587,10 +1606,25 @@ function WorkingIndicator({ session }: { session: string }) {
   // terminal-style ("$ command…") rather than the generic "Running …" phrase — the
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
+  const sessionState = useSessionState(session);
+  // A remote conversation's SSH link has not even reached the daemon yet — highest
+  // priority, above `retry` below: there is nothing else true to say about the turn
+  // while ssh itself is still trying to connect/reconnect. See `SessionStatePayload.
+  // link`'s own doc (Rust) and `remoteLinkText`'s own doc.
+  const linkText = remoteLinkText(sessionState?.link ?? null);
+  if (linkText) {
+    return (
+      <div className={styles.activity}>
+        <Ico name="refresh" className={"sm " + styles.retrySpin} />
+        <RollText text={linkText} />
+        <LiveElapsed session={session} />
+      </div>
+    );
+  }
   // The connection dropped and Claude Code is retrying on its own. It takes over the
   // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
   // usual "Running …" phrase would be a lie while nothing is actually running.
-  const retry = useSessionState(session)?.retry ?? null;
+  const retry = sessionState?.retry ?? null;
   if (retry) {
     const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
     return (

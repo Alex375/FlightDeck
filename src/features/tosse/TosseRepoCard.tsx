@@ -18,7 +18,13 @@ import { Ico, TosseCrmMark } from "../../ui/kit";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TosseRepoLink, TosseRepository } from "../../ipc/client";
-import { repoLinkFor, useLinkTosseRepository, useTosseRepoLinks } from "../../ipc/useTosse";
+import {
+  repoLinkFor,
+  useLinkTosseRepository,
+  useRefreshRemoteOrigins,
+  useRemoteOriginWriteErrors,
+  useTosseRepoLinks,
+} from "../../ipc/useTosse";
 import { repoName, useConversationsStore } from "../../store/conversationsStore";
 import { useTosseRepoUi } from "./tosseRepoUiStore";
 import styles from "./TosseRepoCard.module.css";
@@ -52,12 +58,81 @@ export function orderForPicker(
   });
 }
 
+/** Name a paired server for a sentence: its label, or an honest stand-in when the server
+ *  was un-paired and only its id survives on the folder. */
+function machineName(machine: { label: string | null }): string {
+  return machine.label ?? "a server that is no longer paired";
+}
+
+/** Why this folder could not be matched automatically, in one sentence.
+ *
+ *  Pure and exported so the reason has ONE definition and a test. Each branch names a
+ *  different situation, and the order is load-bearing: a folder that lives on a server was
+ *  never probed at all, so nothing may be said about its remote — reading it as "this
+ *  folder has no git remote" is what the card did, and it was simply untrue. */
+export function whyUnmatched(link: TosseRepoLink | undefined): string {
+  // ⚠️ Before anything about reach: what the server actually ANSWERED, when that answer
+  // was not a url. These are facts about the folder, obtained from a server that replied
+  // perfectly well — and they used to be thrown away, which left `originRead` false and
+  // sent the branch below to blame the server's reachability and advise "try again once
+  // the server is reachable", advice that could never work. See `remote_origin_note`.
+  const note = link?.machine?.originNote;
+  if (link?.machine && note) {
+    const where = machineName(link.machine);
+    switch (note) {
+      case "not-a-repository":
+        return `This folder is not a git repository on ${where}, so there is no remote to match on. You can still pick a TOSSE repository by hand.`;
+      case "gone":
+        return `This folder is no longer there on ${where}, so its git remote cannot be read. Pick a TOSSE repository by hand, or check the folder on that server.`;
+      case "no-git":
+        return `${where} has no git installed, so Flight Deck cannot read this folder's remote there. Pick a TOSSE repository by hand, or install git on that server.`;
+      case "no-remote":
+        return `This folder has no git remote on ${where}, so it cannot be matched automatically.`;
+      // An answer a newer backend knows and this build does not: say it rather than
+      // dress it up as one of the cases above.
+      default:
+        return `${where} answered "${note}" for this folder, so its git remote could not be read. Pick a TOSSE repository by hand.`;
+    }
+  }
+  // Only while the server has not answered at all: nothing was read, so every claim below
+  // would be about a probe that never ran. Once it HAS answered, a folder over there is an
+  // ordinary candidate and falls through to the same sentences as a local one.
+  if (link?.machine && !link.machine.originRead) {
+    return `This folder lives on ${machineName(link.machine)}, and Flight Deck has not been able to read its git remote there yet — so it cannot be matched automatically. Pick a TOSSE repository by hand, or try again once the server is reachable.`;
+  }
+  if (link?.machine && !link.remoteUrl && !link.remoteError) {
+    // The server DID answer, and this folder has no origin. A fact about the folder, not
+    // about our reach — the previous branch would have blamed the server for it.
+    return `This folder has no git remote on ${machineName(link.machine)}, so it cannot be matched automatically.`;
+  }
+  if (link?.remoteError) {
+    return "This folder's git remote could not be read, so it cannot be matched automatically.";
+  }
+  if (link?.notARepository) {
+    return "This folder is not a git repository, so there is no remote to match on. You can still pick a TOSSE repository by hand.";
+  }
+  if (link?.remoteUrl) {
+    return `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`;
+  }
+  return "This folder has no git remote, so it cannot be matched automatically.";
+}
+
 export function TosseRepoCard() {
   const repoId = useTosseRepoUi((s) => s.repoId);
   const close = useTosseRepoUi((s) => s.closeCard);
   const repoPath = useConversationsStore((s) => s.repos.find((r) => r.id === repoId)?.path ?? null);
   const { data, isFetching, refetch, error: queryError } = useTosseRepoLinks(repoId != null);
   const linkRepository = useLinkTosseRepository();
+  // Refresh re-ASKS the servers as well as re-running the match: for a remote folder the
+  // url is cached, so a plain refetch would re-read the same answer and the button would
+  // be a no-op exactly where someone presses it (an origin that moved, a server that was
+  // off when the app started).
+  const refreshRemoteOrigins = useRefreshRemoteOrigins();
+  const originWriteErrors = useRemoteOriginWriteErrors();
+  const refresh = () => {
+    refreshRemoteOrigins();
+    void refetch();
+  };
   const [picking, setPicking] = useState(false);
   const [query, setQuery] = useState("");
 
@@ -141,7 +216,7 @@ export function TosseRepoCard() {
             className={styles.iconBtn}
             title="Refresh"
             disabled={isFetching}
-            onClick={() => void refetch()}
+            onClick={refresh}
           >
             <Ico name="refresh" className="sm" />
           </button>
@@ -174,6 +249,26 @@ export function TosseRepoCard() {
                 </div>
                 <div className={styles.problemBody}>
                   {String(queryError)} — what is shown below may be out of date.
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* An answer the sweep paid an SSH round trip for and then failed to cache. It
+              is invisible everywhere else: the folder simply keeps reading as
+              never-probed, and Refresh looks inert for a reason nobody can see. */}
+          {originWriteErrors.length > 0 ? (
+            <div className={styles.problem}>
+              <Ico name="alert" className="sm" />
+              <div>
+                <div className={styles.problemTitle}>
+                  {originWriteErrors.length === 1
+                    ? "A server's answer could not be saved"
+                    : `${originWriteErrors.length} server answers could not be saved`}
+                </div>
+                <div className={styles.problemBody}>
+                  {originWriteErrors.join(" · ")} — those folders will keep asking their
+                  server on every refresh until this is fixed.
                 </div>
               </div>
             </div>
@@ -275,8 +370,14 @@ export function TosseRepoCard() {
                     <span className={styles.muted}>no url in TOSSE</span>
                   )}
                 </Fact>
-                <Fact label="Local folder">
+                {/* "Local folder" is a lie for a path that only exists on a server — and a
+                    dangerous one, since a remote path can look exactly like one of yours.
+                    The label follows the folder, and the server is named next to it. */}
+                <Fact label={link?.machine ? "Folder" : "Local folder"}>
                   <span className={styles.mono}>{repoPath}</span>
+                  {link?.machine ? (
+                    <span className={styles.muted}> · on {machineName(link.machine)}</span>
+                  ) : null}
                 </Fact>
                 <Fact label="Association">
                   <span className={styles.muted}>
@@ -316,15 +417,7 @@ export function TosseRepoCard() {
               <div className={styles.empty}>
                 <Ico name="link" className={styles.emptyIco} />
                 <div className={styles.emptyTitle}>This folder is not associated with TOSSE</div>
-                <div className={styles.emptyBody}>
-                  {link?.remoteError
-                    ? `This folder's git remote could not be read, so it cannot be matched automatically.`
-                    : link?.notARepository
-                      ? "This folder is not a git repository, so there is no remote to match on. You can still pick a TOSSE repository by hand."
-                      : link?.remoteUrl
-                        ? `No TOSSE repository carries this folder's remote (${link.remoteUrl}).`
-                        : "This folder has no git remote, so it cannot be matched automatically."}
-                </div>
+                <div className={styles.emptyBody}>{whyUnmatched(link)}</div>
               </div>
             ) : (
               // Not checked: say exactly that, and nothing about the folder's remote or
@@ -338,11 +431,20 @@ export function TosseRepoCard() {
                     ? "TOSSE could not be read, so this folder's association could not be verified. Nothing has changed — retry once TOSSE is reachable."
                     : "This folder has not been matched against TOSSE yet. Refresh to check it."}
                 </div>
+                {/* WHERE the folder lives is a local fact — it stays true through an
+                    outage. Only said while the server has yet to answer: once it has,
+                    this folder matches like any other and the note would be misleading. */}
+                {link?.machine && !link.machine.originRead && !link.machine.originNote ? (
+                  <div className={styles.emptyBody}>
+                    It lives on {machineName(link.machine)}, whose git remotes could not be
+                    read yet.
+                  </div>
+                ) : null}
                 <button
                   type="button"
                   className={styles.ghostBtn}
                   disabled={isFetching}
-                  onClick={() => void refetch()}
+                  onClick={refresh}
                 >
                   {isFetching ? "Checking…" : "Refresh"}
                 </button>

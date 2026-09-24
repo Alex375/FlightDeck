@@ -40,6 +40,10 @@ vi.mock("../../ipc/useTosse", () => ({
     isError: false,
     error: null,
   }),
+  // Refresh also re-asks the paired servers for their folders' origins. Stubbed here for
+  // the same reason as the hook above: the card must render without a QueryClient.
+  useRefreshRemoteOrigins: () => vi.fn(),
+  useRemoteOriginWriteErrors: () => [],
 }));
 
 // The opener plugin has no Tauri host under vitest.
@@ -72,6 +76,7 @@ function link(over: Partial<TosseRepoLink> = {}): TosseRepoLink {
     ambiguous: [],
     notARepository: false,
     remoteError: null,
+    machine: null,
     ...over,
   };
 }

@@ -15,7 +15,9 @@ export type SettingsSection =
    *  top-level tabs (conversation, reordering). */
   | "display"
   /** Claude-specific settings: the instructions file, how Claude behaves (output style,
-   *  what it may do without asking), and sub-agent routing + spend.
+   *  what it may do without asking), sub-agent routing + spend, and the global extensions
+   *  picture (connectors + global per-tool permissions, plugins, skills, sub-agents — the
+   *  counterpart of a conversation's ⌘E panel; was a top-level "Extensions" tab).
    *  Backend-specific ON PURPOSE — its whole content is Claude model names, Claude file
    *  layout and Claude-only CLI flags, so it is shown only while a Claude account is
    *  connected, and a Codex twin would be its own tab rather than an abstraction over both.

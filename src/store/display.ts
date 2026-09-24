@@ -162,6 +162,20 @@ export interface DisplayPrefs {
    *  {@link FileMentionProvider} (surfaced as its `stepRowInert`). */
   clickableFileMentions: boolean;
 
+  /** Render the TOSSE (CRM) MCP calls as CRM actions instead of anonymous MCP steps: a write
+   *  (task filed, status moved, context updated) becomes its own card carrying the CRM's rose,
+   *  the exact tool, the status it moved from → to and the assignee mark, and a lookup keeps
+   *  its step row but reads "Read tasks · 12 tasks" with the rose instead of "claude ai TOSSE :
+   *  get_tasks" with a plug. ON by default. Off → every TOSSE call renders exactly as it did
+   *  before the feature, grouped in its run.
+   *
+   *  ⚠️ Only ever MATTERS while signed in to TOSSE: the effective value ANDs this with the CRM
+   *  session ({@link useTosseToolCards}), because the toggle lives in Settings → TOSSE, a tab
+   *  that does not exist while signed out — leaving the rendering on there would hand someone
+   *  cards with no switch to turn them off. Signed out, TOSSE calls render as plain MCP steps.
+   *  Read by the conversation thread and the off-thread transcript. */
+  tosseToolCards: boolean;
+
   /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
    *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
    *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
@@ -296,22 +310,10 @@ export interface DisplayPrefs {
    *  default. OFF → the swimlanes keep a MANUAL, drag-and-drop order. Read by {@link useFleetLanes}. */
   autoOrderFleetRepos: boolean;
 
-  /** Sidebar conversation rows show their state as a TINTED PILL (green running with a live
-   *  "time since your last message" counter under the name, green→violet background work,
-   *  amber needs you, blue to review, red error; idle/off stay plain) instead of the classic
-   *  leading status dot + attention tint. ON by default. Read by {@link ConductorSidebar}. */
-  sidebarStatePills: boolean;
-
   /** Show the TIME on a sidebar conversation row's second line — ticking while the agent
    *  works, frozen on how long the turn took once it stopped on a state. ON by default.
-   *  Off → the working dots alone. Only applies to {@link sidebarStatePills} rows. */
+   *  Off → the working dots alone. */
   sidebarRowTimer: boolean;
-
-  /** The review / question / error / background status lives INSIDE the composer — a header
-   *  band on the composer card, whose border takes the state colour — instead of the classic
-   *  full-width bar above it. ON by default. Read by {@link ComposerStatusBand} and
-   *  {@link ReviewBar} (exactly one of the two renders). */
-  composerStatusBand: boolean;
 
   /** Whether the sidebar and the Flight Deck SHARE one manual order (drag in one reorders both)
    *  or keep independent arrangements. ON by default (one canonical order). Only affects levels
@@ -347,6 +349,7 @@ const DEFAULTS: DisplayPrefs = {
   conversationAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
+  tosseToolCards: true,
   artifactsInApp: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
@@ -370,9 +373,7 @@ const DEFAULTS: DisplayPrefs = {
   autoOrderFleetConvs: true,
   autoOrderFleetRepos: true,
   sharedManualOrder: true,
-  sidebarStatePills: true,
   sidebarRowTimer: true,
-  composerStatusBand: true,
 };
 
 function load(): DisplayPrefs {
@@ -427,6 +428,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
+        tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
         artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
@@ -445,9 +447,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         autoOrderFleetConvs: patch.autoOrderFleetConvs ?? s.autoOrderFleetConvs,
         autoOrderFleetRepos: patch.autoOrderFleetRepos ?? s.autoOrderFleetRepos,
         sharedManualOrder: patch.sharedManualOrder ?? s.sharedManualOrder,
-        sidebarStatePills: patch.sidebarStatePills ?? s.sidebarStatePills,
         sidebarRowTimer: patch.sidebarRowTimer ?? s.sidebarRowTimer,
-        composerStatusBand: patch.composerStatusBand ?? s.composerStatusBand,
       };
       save(next);
       return next;

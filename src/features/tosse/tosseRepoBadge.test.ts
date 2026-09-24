@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { badgeStateFor } from "./TosseRepoBadge";
-import { orderForPicker } from "./TosseRepoCard";
-import type { TosseRepository } from "../../ipc/client";
+import { orderForPicker, whyUnmatched } from "./TosseRepoCard";
+import type { TosseRepoLink, TosseRepository } from "../../ipc/client";
 
 const link = (over: Partial<Parameters<typeof badgeStateFor>[0]> = {}) => ({
   resolved: true,
@@ -9,6 +9,7 @@ const link = (over: Partial<Parameters<typeof badgeStateFor>[0]> = {}) => ({
   ambiguous: [],
   manualRepositoryId: null,
   remoteError: null,
+  machine: null,
   ...over,
 });
 
@@ -54,10 +55,123 @@ describe("badgeStateFor", () => {
     expect(badgeStateFor(link({ resolved: false }))).toBe("unlinked");
   });
 
+  it("does not flag a folder that lives on a paired server", () => {
+    // The bug: this Mac's git was run on a path that only exists on the server, failed with
+    // "cannot change to …" — indistinguishable from a deleted folder — and the badge showed
+    // a warning on a repository whose remote matches the CRM perfectly. No automatic match
+    // is possible from here, which is an ordinary limit, not a fault.
+    expect(badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true, originNote: null } }))).toBe("unlinked");
+  });
+
+  it("still shows a repository pinned by hand on a remote folder", () => {
+    // The manual pin is pure local SQLite, so it works over there exactly as it does here.
+    expect(
+      badgeStateFor(link({ machine: { id: "m1", label: "tower", originRead: true, originNote: null }, repository: { id: "r" } })),
+    ).toBe("linked");
+  });
+
   it("is unknown for a folder with no entry at all", () => {
     // A repo added since the last fetch: we have not looked at it, so we say nothing
     // about it — least of all that it has no git remote.
     expect(badgeStateFor(undefined)).toBe("unknown");
+  });
+});
+
+describe("whyUnmatched", () => {
+  const cardLink = (over: Partial<TosseRepoLink> = {}): TosseRepoLink =>
+    ({
+      repoId: "r",
+      resolved: true,
+      remoteUrl: null,
+      repository: null,
+      source: null,
+      manualRepositoryId: null,
+      ambiguous: [],
+      notARepository: false,
+      remoteError: null,
+      machine: null,
+      ...over,
+    }) as TosseRepoLink;
+
+  it("names the server, instead of claiming the folder has no git remote", () => {
+    // It has one — we simply have not read it yet, because the path lives on that machine.
+    // Saying "no git remote" sent the user hunting for a remote that is right there.
+    const said = whyUnmatched(
+      cardLink({ machine: { id: "m1", label: "tower", originRead: false, originNote: null } }),
+    );
+    expect(said).toContain("tower");
+    expect(said).toContain("Pick a TOSSE repository by hand");
+    expect(said).not.toContain("has no git remote");
+  });
+
+  it("does not pass an un-paired server off as this Mac", () => {
+    // Only the id survives on the folder. The folder is still over there, and the sentence
+    // must not quietly become the local one.
+    expect(
+      whyUnmatched(cardLink({ machine: { id: "m1", label: null, originRead: false, originNote: null } })),
+    ).toContain("no longer paired");
+  });
+
+  it("stops blaming the server once it has answered", () => {
+    // The sweep read this folder's origin and nothing in the CRM carries it. That is a
+    // fact about the CRM, not about our reach — keeping the "could not read it there yet"
+    // sentence would send the user to fix a server that is working fine.
+    const said = whyUnmatched(
+      cardLink({
+        machine: { id: "m1", label: "tower", originRead: true, originNote: null },
+        remoteUrl: "https://github.com/Alex375/FlightDeck.git",
+      }),
+    );
+    expect(said).toContain("No TOSSE repository carries");
+    expect(said).not.toContain("tower");
+  });
+
+  it("tells a server that has no origin for the folder from one it could not reach", () => {
+    // Same empty url, two different truths. Answered: the folder genuinely has no origin.
+    const answered = whyUnmatched(
+      cardLink({ machine: { id: "m1", label: "tower", originRead: true, originNote: null } }),
+    );
+    expect(answered).toContain("has no git remote on tower");
+    expect(answered).not.toContain("not been able to read");
+  });
+
+  // ⚠️ The sweep used to THROW these answers away, which left `originRead` false — the
+  // flag that means "we could not ask" — so the card blamed the server's reachability for
+  // something the server had just told us, and advised "try again once the server is
+  // reachable": a fix that could never work.
+  it("says what the server actually answered, instead of blaming its reachability", () => {
+    const on = (originNote: string) =>
+      whyUnmatched(
+        cardLink({ machine: { id: "m1", label: "tower", originRead: true, originNote } }),
+      );
+
+    expect(on("not-a-repository")).toContain("not a git repository on tower");
+    expect(on("gone")).toContain("no longer there on tower");
+    expect(on("no-git")).toContain("has no git installed");
+    expect(on("no-remote")).toContain("has no git remote on tower");
+    for (const note of ["not-a-repository", "gone", "no-git", "no-remote"]) {
+      expect(on(note)).not.toContain("try again once the server is reachable");
+    }
+  });
+
+  // An answer a newer backend knows and this build does not must still reach the user.
+  it("passes an unknown answer through rather than dressing it up", () => {
+    const said = whyUnmatched(
+      cardLink({
+        machine: { id: "m1", label: "tower", originRead: true, originNote: "permission-denied" },
+      }),
+    );
+    expect(said).toContain("permission-denied");
+    expect(said).toContain("tower");
+  });
+
+  it("keeps the local answers it already gave", () => {
+    expect(whyUnmatched(cardLink({ notARepository: true }))).toContain("not a git repository");
+    expect(whyUnmatched(cardLink({ remoteError: "fatal: …" }))).toContain("could not be read");
+    expect(whyUnmatched(cardLink({ remoteUrl: "git@github.com:a/b.git" }))).toContain(
+      "git@github.com:a/b.git",
+    );
+    expect(whyUnmatched(cardLink())).toContain("has no git remote");
   });
 });
 

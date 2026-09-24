@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::model::{
-    LiveModel, McpAuthResult, McpServerLive, RemoteControlState, RewindFilesResult, SlashCommand,
+    LiveModel, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState, RewindFilesResult,
+    SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -98,6 +99,14 @@ pub struct CanUseToolReq {
     pub blocked_path: Option<String>,
     #[serde(default)]
     pub decision_reason: Value,
+    /// Why the CLI asks (`rule`, `mode`, `classifier`, `safetyCheck`, …) — `rule` = an
+    /// `ask` rule from a settings file matched. Decides whether Flight Deck may answer it
+    /// on the user's standing "Allow" (see the session's `auto_allow`).
+    #[serde(default)]
+    pub decision_reason_type: Option<String>,
+    /// The tool itself demands a human (an MCP consent step): never answered for them.
+    #[serde(default)]
+    pub requires_user_interaction: Option<bool>,
 }
 
 /// Parse an inbound `control_request` line (already deserialized to a [`Value`]
@@ -618,6 +627,17 @@ pub fn mcp_status_request(request_id: &str) -> Value {
     control_request(request_id, json!({ "subtype": "mcp_status" }))
 }
 
+/// `apply_flag_settings` carrying the conversation's own overrides (`permissions` +
+/// `enabledPlugins`, see [`SessionOverrides`]). The CLI merges at the top level, so this
+/// REPLACES exactly those two keys of the session's flag layer; `null` removes one. A
+/// plugin change only bites after a `reload_plugins`, which the caller sends.
+pub fn session_overrides_request(request_id: &str, overrides: &SessionOverrides) -> Value {
+    control_request(
+        request_id,
+        json!({ "subtype": "apply_flag_settings", "settings": overrides.flag_settings() }),
+    )
+}
+
 /// Drop a URL's query string and fragment — they can carry an auth token. Mirrors
 /// the on-disk scanner's redaction (`extensions::strip_url_query`); duplicated here
 /// (2 lines) to keep `supervisor` independent of `extensions`.
@@ -655,15 +675,12 @@ pub fn parse_mcp_status(line: &Value) -> Vec<McpServerLive> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             };
-            let tools: Vec<String> = s
+            let tool_info: Vec<McpToolInfo> = s
                 .get("tools")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(mcp_tool_info).collect())
                 .unwrap_or_default();
+            let tools: Vec<String> = tool_info.iter().map(|t| t.name.clone()).collect();
             Some(McpServerLive {
                 name,
                 status,
@@ -676,11 +693,39 @@ pub fn parse_mcp_status(line: &Value) -> Vec<McpServerLive> {
                 url: field("url").as_deref().map(strip_url_query),
                 tool_count: tools.len() as u32,
                 tools,
+                tool_info,
                 // Claude's live MCP status has no structured startup-failure reason.
                 failure_reason: None,
             })
         })
         .collect()
+}
+
+/// Longest tool description carried across the IPC boundary — it is shown as a tooltip,
+/// and some servers ship pages of prompt text in it.
+const MCP_TOOL_DESCRIPTION_MAX: usize = 400;
+
+/// One `mcp_status` tool entry → [`McpToolInfo`]. Schema from the binary (2.1.280):
+/// `{name, description?, annotations?: {readOnly?, destructive?, openWorld?}}` — note the
+/// keys are `readOnly` / `destructive`, NOT the MCP spec's `readOnlyHint` spelling.
+fn mcp_tool_info(t: &Value) -> Option<McpToolInfo> {
+    let name = t.get("name").and_then(Value::as_str)?.to_string();
+    let description = t
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(|d| match d.char_indices().nth(MCP_TOOL_DESCRIPTION_MAX) {
+            Some((cut, _)) => format!("{}…", d[..cut].trim_end()),
+            None => d.to_string(),
+        });
+    let hint = |k: &str| t.get("annotations").and_then(|a| a.get(k)).and_then(Value::as_bool);
+    Some(McpToolInfo {
+        name,
+        description,
+        read_only: hint("readOnly"),
+        destructive: hint("destructive"),
+    })
 }
 
 /// `mcp_toggle` — enable/disable ONE MCP server live in the session (the binary
@@ -1374,6 +1419,179 @@ mod tests {
         assert_eq!(servers[0].url.as_deref(), Some("https://h/mcp"), "query + fragment stripped");
     }
 
+    /// The conversation's overrides ride in `apply_flag_settings.settings`: both keys always
+    /// present (`null` CLEARS one — verified live), empty rule lists omitted.
+    #[test]
+    fn session_overrides_request_shape() {
+        let o = SessionOverrides {
+            allow: vec![],
+            ask: vec!["mcp__claude_ai_Slack__slack_send_message".into()],
+            deny: vec!["mcp__claude_ai_Gmail".into()],
+            enabled_plugins: [("tosse-workflow@tosse-plugins".to_string(), false)].into(),
+        };
+        let req = session_overrides_request("r1", &o);
+        assert_eq!(req["request"]["subtype"], "apply_flag_settings");
+        assert_eq!(
+            req["request"]["settings"],
+            json!({
+                "permissions": {
+                    "ask": ["mcp__claude_ai_Slack__slack_send_message"],
+                    "deny": ["mcp__claude_ai_Gmail"] },
+                "enabledPlugins": { "tosse-workflow@tosse-plugins": false } })
+        );
+        let cleared = session_overrides_request("r2", &SessionOverrides::default());
+        assert_eq!(cleared["request"]["settings"], json!({ "permissions": null, "enabledPlugins": null }));
+        assert!(o.validate().is_ok());
+        for bad in [
+            SessionOverrides { allow: vec!["Bash".into()], ..Default::default() },
+            SessionOverrides { deny: vec!["mcp__*".into()], ..Default::default() },
+            SessionOverrides { enabled_plugins: [("no-marketplace".to_string(), true)].into(), ..Default::default() },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// Each tool carries its description and the server's read-only / destructive hints
+    /// (keys `readOnly` / `destructive` in `mcp_status`, not the MCP spec's `…Hint`), and
+    /// the plain name list stays in step with it.
+    #[test]
+    fn parse_mcp_status_reads_tool_hints() {
+        let long = "x".repeat(MCP_TOOL_DESCRIPTION_MAX + 50);
+        let line = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "x", "response": { "mcpServers": [
+                { "name": "claude.ai Gmail", "status": "connected", "scope": "claudeai", "tools": [
+                    { "name": "search_threads", "description": "Search mail",
+                      "annotations": { "readOnly": true } },
+                    { "name": "send_message", "description": long,
+                      "annotations": { "readOnly": false, "destructive": true } },
+                    { "name": "label_thread" }
+                ] }
+            ] } }
+        });
+        let s = &parse_mcp_status(&line)[0];
+        assert_eq!(s.tools, vec!["search_threads", "send_message", "label_thread"]);
+        assert_eq!(s.tool_info[0].read_only, Some(true));
+        assert_eq!(s.tool_info[0].description.as_deref(), Some("Search mail"));
+        assert_eq!(s.tool_info[1].destructive, Some(true));
+        assert!(s.tool_info[1].description.as_deref().unwrap().ends_with('…'), "capped");
+        assert_eq!(s.tool_info[2].read_only, None, "absent hint stays unknown");
+    }
+
+    /// Live probe: do session-scoped permission rules sent with `apply_flag_settings`
+    /// land in the running session, and does a second call REPLACE the `permissions`
+    /// key (so a rule can be removed)? Reads the session's live rules back with
+    /// `list_permission_rules`. No model turn. Run with:
+    ///   cargo test --lib --ignored live_flag_permissions_probe -- --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary; applies session permission rules and lists them back"]
+    async fn live_flag_permissions_probe() {
+        use crate::supervisor::protocol::CliMessage;
+        use crate::supervisor::transport::{SpawnConfig, Transport};
+        use std::time::Duration;
+
+        let cwd = std::env::current_dir().unwrap();
+        let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(cwd)).expect("claude should spawn");
+        transport.send_line(initialize_request("probe-init", &[])).expect("send initialize");
+        let ask = |rid: &str, body: Value| {
+            transport.send_line(control_request(rid, body)).expect("send");
+        };
+        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliMessage>, rid: &str) -> Option<Value> {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(msg) = rx.recv().await {
+                    if let CliMessage::ControlResponse(v) = msg {
+                        if v.get("response").and_then(|r| r.get("request_id")).and_then(Value::as_str) == Some(rid) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        let flag_rules = |v: &Option<Value>| -> Vec<String> {
+            // Shape (2.1.280): response.response.state.rules = [{behavior, source, rule, …}].
+            let rules = v.as_ref().and_then(|v| v.pointer("/response/response/state/rules"));
+            rules
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|r| r.get("source").and_then(Value::as_str) == Some("flagSettings"))
+                .map(|r| format!("{}:{}", r["behavior"].as_str().unwrap_or("?"), r["rule"].as_str().unwrap_or("?")))
+                .collect()
+        };
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let a = "mcp__claude_ai_Gmail__send_message";
+        let b = "mcp__claude_ai_Slack__slack_send_message";
+        ask("f1", json!({"subtype":"apply_flag_settings","settings":{"permissions":{"deny":[a],"ask":[b]}}}));
+        eprintln!("apply #1 → {:?}", wait(&mut rx, "f1").await.map(|v| v["response"]["subtype"].clone()));
+        ask("l1", json!({"subtype":"list_permission_rules"}));
+        let l1 = wait(&mut rx, "l1").await;
+        eprintln!("flag rules after #1: {:?}", flag_rules(&l1));
+        if flag_rules(&l1).is_empty() {
+            eprintln!("raw list_permission_rules: {}", l1.map(|v| v.to_string()).unwrap_or_default().chars().take(1500).collect::<String>());
+        }
+        ask("f2", json!({"subtype":"apply_flag_settings","settings":{"permissions":{"ask":[b]}}}));
+        eprintln!("apply #2 → {:?}", wait(&mut rx, "f2").await.map(|v| v["response"]["subtype"].clone()));
+        ask("l2", json!({"subtype":"list_permission_rules"}));
+        eprintln!("flag rules after #2 (deny should be gone): {:?}", flag_rules(&wait(&mut rx, "l2").await));
+        ask("f3", json!({"subtype":"apply_flag_settings","settings":{"permissions":null}}));
+        eprintln!("apply #3 (null) → {:?}", wait(&mut rx, "f3").await.map(|v| v["response"]["subtype"].clone()));
+        ask("l3", json!({"subtype":"list_permission_rules"}));
+        eprintln!("flag rules after #3 (none): {:?}", flag_rules(&wait(&mut rx, "l3").await));
+        transport.shutdown(false).await;
+    }
+
+    /// Live probe: can ONE session turn a plugin off through its flag layer? Applies
+    /// `enabledPlugins:{id:false}`, then `reload_plugins`, and checks whether the plugin's
+    /// commands leave the reloaded catalogue (and come back once the override is cleared).
+    ///   cargo test --lib --ignored live_flag_plugins_probe -- --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary; toggles a plugin through the session flag layer"]
+    async fn live_flag_plugins_probe() {
+        use crate::supervisor::protocol::CliMessage;
+        use crate::supervisor::transport::{SpawnConfig, Transport};
+        use std::time::Duration;
+
+        const PLUGIN: &str = "tosse-workflow@tosse-plugins";
+        let cwd = std::env::current_dir().unwrap();
+        let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(cwd)).expect("claude should spawn");
+        let send = |rid: &str, body: Value| transport.send_line(control_request(rid, body)).expect("send");
+        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliMessage>, rid: &str) -> Option<Value> {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(msg) = rx.recv().await {
+                    if let CliMessage::ControlResponse(v) = msg {
+                        if v.get("response").and_then(|r| r.get("request_id")).and_then(Value::as_str) == Some(rid) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        let pickup = |v: &Option<Value>| {
+            v.as_ref()
+                .and_then(parse_initialize_commands)
+                .map(|cmds| cmds.iter().filter(|c| c.name.contains("pickup")).map(|c| c.name.clone()).collect::<Vec<_>>())
+        };
+        transport.send_line(initialize_request("init", &[])).expect("init");
+        eprintln!("at start: {:?}", pickup(&wait(&mut rx, "init").await));
+        send("f1", json!({"subtype":"apply_flag_settings","settings":{"enabledPlugins":{PLUGIN:false}}}));
+        eprintln!("apply off → {:?}", wait(&mut rx, "f1").await.map(|v| v["response"]["subtype"].clone()));
+        send("r1", json!({"subtype":"reload_plugins"}));
+        eprintln!("after reload (should be empty): {:?}", pickup(&wait(&mut rx, "r1").await));
+        send("f2", json!({"subtype":"apply_flag_settings","settings":{"enabledPlugins":null}}));
+        eprintln!("clear → {:?}", wait(&mut rx, "f2").await.map(|v| v["response"]["subtype"].clone()));
+        send("r2", json!({"subtype":"reload_plugins"}));
+        eprintln!("after reload (back): {:?}", pickup(&wait(&mut rx, "r2").await));
+        transport.shutdown(false).await;
+    }
+
     /// Live probe: confirm the `mcp_status` control request is answered by the real
     /// binary and DUMP the raw `control_response` so we can read the exact response
     /// shape (nesting + per-server fields) before building on it. Ignored by default
@@ -1433,6 +1651,15 @@ mod tests {
                         let scope = s.get("scope").and_then(Value::as_str).unwrap_or("-");
                         let ntools = s.get("tools").and_then(Value::as_array).map_or(0, |t| t.len());
                         eprintln!("  {name:42} status={status:14} scope={scope:10} tools={ntools}");
+                        // The first few tools verbatim: their `name` spelling (bare, or
+                        // already `mcp__…`?) and the `annotations` keys the rows rely on.
+                        for t in s.get("tools").and_then(Value::as_array).into_iter().flatten().take(3) {
+                            let mut t = t.clone();
+                            if let Some(o) = t.as_object_mut() {
+                                o.remove("description");
+                            }
+                            eprintln!("      {t}");
+                        }
                     }
                 }
                 None => eprintln!("  <no mcpServers in response>"),

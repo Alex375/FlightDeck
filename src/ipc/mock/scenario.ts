@@ -300,6 +300,7 @@ const baseState: SessionStatePayload = {
   activity: null,
   awaiting_permission: false,
     retry: null,
+  link: null,
   ended: false,
   context_tokens: CTX_DEMO === "none" ? null : 29756,
   context_window: CTX_DEMO === "none" || CTX_DEMO === "nowindow" ? null : 1000000,
@@ -819,6 +820,179 @@ export class ScenarioDriver {
    * arrives (the received card), then the agent answers through `send_message` — one send
    * delivered, one refused (the failed card). Exercises both cards and their jump chips.
    */
+  /**
+   * `?demo=tosse` — the TOSSE action cards, in one pass: the LOOKUPS grouped in a run (rose
+   * glyph, "Read tasks · 12 tasks"), then a card per write — a task filed, a status moved, a
+   * context updated — plus the two states that must never pass for a success: a write the CRM
+   * REFUSED, and one still in flight. Mirrors what a real `/pickup` does to the CRM.
+   */
+  startTosse() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+
+    const TASK = {
+      id: "6edf5907-048b-4b61-a6fc-b85bc14253c9",
+      title: "Style the TOSSE MCP calls in the thread",
+      projectId: "ef02be22-fe30-4463-9450-ec3b20746a35",
+      type: "Code",
+      status: "En cours",
+      priority: "Moyenne",
+      assignedTo: "Alexandre",
+      project: { id: "ef02be22-fe30-4463-9450-ec3b20746a35", name: "Tosse Code" },
+    };
+    const json = (v: unknown) => [{ type: "text" as const, text: JSON.stringify(v, null, 2) }];
+    const tosse = (tool: string) => `mcp__claude_ai_TOSSE__${tool}`;
+
+    this.step(240, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "Picking the task up — let me read the board and the context first.\n\n";
+    this.streamText("m1", t1);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          { type: "tool_use", id: "ts_read1", name: tosse("get_tasks"), input: { project_id: "ef02be22" } },
+          { type: "tool_use", id: "ts_read2", name: tosse("get_context_chain"), input: { repository_id: "8c509e62" } },
+          { type: "tool_use", id: "ts_read3", name: tosse("list_subtasks"), input: { parent_task_id: TASK.id } },
+        ],
+      }),
+    );
+    this.step(420, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read1",
+        // The board as it stood BEFORE the move — including the target task in « À faire ».
+        // This sighting is what lets the status card render the arrow: the CRM never sends a
+        // previous status back, so the card reads it out of the thread (see priorTaskStatus).
+        content: json([
+          { id: TASK.id, title: TASK.title, status: "À faire", priority: "Moyenne" },
+          ...Array.from({ length: 11 }, (_, i) => ({ id: `t${i}`, title: `Task ${i}`, status: "Backlog" })),
+        ]),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read2",
+        content: json({ repository: { name: "tosse-code" }, project: { name: "Tosse Code" } }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_read3",
+        content: json([]),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t2 = "No blockers. Moving it to **En cours**, filing the follow-up and recording the decision.\n\n";
+    this.streamText("m2", t2, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t2 },
+          {
+            type: "tool_use",
+            id: "ts_status",
+            name: tosse("update_task_status"),
+            input: { task_id: TASK.id, status: "En cours" },
+          },
+          {
+            type: "tool_use",
+            id: "ts_create",
+            name: tosse("create_task"),
+            input: {
+              title: "Write an English README",
+              project_id: "ef02be22",
+              type: "Rédaction",
+              priority: "Basse",
+            },
+          },
+          {
+            type: "tool_use",
+            id: "ts_ctx",
+            name: tosse("update_context"),
+            input: { entity_type: "project", entity_id: "ef02be22", context: "…" },
+          },
+          // Refused by the CRM — must read as a failure, never as a quiet success.
+          {
+            type: "tool_use",
+            id: "ts_fail",
+            name: tosse("archive_task"),
+            input: { task_id: "00000000-0000-0000-0000-000000000000" },
+          },
+          // Never answered: the card stays pending while the turn runs.
+          {
+            type: "tool_use",
+            id: "ts_pending",
+            name: tosse("update_task"),
+            input: { task_id: TASK.id, priority: "Haute", due_date: "2026-10-01" },
+          },
+        ],
+      }),
+    );
+    this.step(420, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_status",
+        content: json(TASK),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_create",
+        content: json({
+          id: "b1d0c0de-1111-2222-3333-444455556666",
+          title: "Write an English README",
+          type: "Rédaction",
+          status: "À faire",
+          priority: "Basse",
+          assignedTo: "Armand",
+          project: { id: "ef02be22", name: "Tosse Code" },
+        }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_ctx",
+        content: json({ ok: true, entity_type: "project", name: "Tosse Code" }),
+        is_error: false,
+        parent_tool_use_id: null,
+      }),
+    );
+    this.step(220, () =>
+      this.emit.item({
+        kind: "tool_result",
+        tool_use_id: "ts_fail",
+        content: [{ type: "text", text: "Error: no task with id 00000000-0000-0000-0000-000000000000" }],
+        is_error: true,
+        parent_tool_use_id: null,
+      }),
+    );
+  }
+
   startAgentMessage() {
     this.reset();
     this.emit.state({ ...this.busyState });
@@ -1211,6 +1385,88 @@ export class ScenarioDriver {
           summary: 'Workflow "review-changes" completed',
         }),
       );
+    });
+  }
+
+  /**
+   * `?demo=remotelink` (CRM `c9bf1482`) — a remote conversation whose SSH link has not
+   * attached yet when the message is sent: `WorkingIndicator` must read the link
+   * wording, not the usual "thinking" activity line (see `remoteLinkText.ts`). Walks
+   * both `RemoteLinkState` variants — `Connecting` (never attached), then
+   * `Reconnecting` (attached once, dropped) — before the link finally attaches and
+   * the turn proceeds normally, so the transition back to the ordinary activity line
+   * is visible too. Mirrors the real actor's own sequencing (`session.rs::run_actor`):
+   * `link` is set alongside `busy`, cleared the instant `FdAttach` would land.
+   */
+  startRemoteLink() {
+    this.reset();
+    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
+    this.step(2200, () => {
+      this.emit.state({ ...baseState, busy: true, link: { kind: "reconnecting", attempt: 1 } });
+    });
+    this.step(2200, () => {
+      // Attached: `link` clears and the turn proceeds like any other.
+      this.emit.state({ ...baseState, busy: true, activity: "thinking", link: null });
+      this.step(260, () =>
+        this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+      );
+      const text = "Connected — continuing with the turn.\n\n";
+      this.streamText("m1", text);
+      this.step(180, () =>
+        this.emit.item({
+          kind: "assistant_message",
+          id: "m1",
+          parent_tool_use_id: null,
+          blocks: [{ type: "text", text }],
+        }),
+      );
+      this.step(200, () => {
+        this.emit.item({
+          kind: "turn_result",
+          subtype: "success",
+          is_error: false,
+          result: null,
+          api_error_status: null,
+          total_cost_usd: 0.01,
+          num_turns: 1,
+          duration_ms: 1200,
+          duration_api_ms: 900,
+          ttft_ms: 200,
+        });
+        this.emit.state(idleState());
+      });
+    });
+  }
+
+  /**
+   * `?demo=remotelinkblocked` / `?demo=remotelinkblockedhost` (CRM `c9bf1482`, review
+   * finding): the real incident this whole feature exists to fix — a HARD ssh-level
+   * precondition failure (key refused, or the server's host identity changed) drives
+   * the link straight to the TERMINAL `remote_link_blocked` thread notice instead of
+   * retrying forever, mirroring `run_actor`'s own two terminal branches
+   * (`ssh_link::SshLinkIssue::KeyRefused`/`HostKeyChanged` in `session.rs`): `busy`
+   * clears and the state ends (`ended: true`, `link: null`), same as the real actor's
+   * `flag_undelivered_if_busy` + `set_ended`. Unlike `startRemoteLink` above (the
+   * happy-path recovery), this never attaches — so it is the one demo path that
+   * exercises the thread notice's heading ("Can't reach this server",
+   * `NOTICE_ERROR_HEADINGS`) and message text live, in a real conversation, the way
+   * the incident actually looked (busy spinner → terminal notice), not just in
+   * component-level unit tests.
+   */
+  startRemoteLinkBlocked(reason: "ssh_key_refused" | "ssh_host_key_changed") {
+    this.reset();
+    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
+    this.step(1200, () => {
+      const message =
+        reason === "ssh_key_refused"
+          ? "This Mac's saved key was refused by this server. Reconnect this Mac in Settings → Control → Remote, then reopen this conversation."
+          : "This server's identity has changed since this Mac last connected to it. Review it in Settings → Control → Remote before reconnecting.";
+      this.emit.item({
+        kind: "notice",
+        subtype: "remote_link_blocked",
+        detail: { message, reason, machine_id: "mock-machine-1", detail: null },
+      });
+      this.emit.state({ ...baseState, busy: false, link: null, ended: true });
     });
   }
 

@@ -16,6 +16,7 @@ import type {
   ExtensionsSnapshot,
   MarketplaceInfo,
   McpServerLive,
+  PermissionRulesView,
   PluginContents,
   Result,
 } from "./client";
@@ -228,6 +229,38 @@ export function useMcpStatus(handle: string | null) {
     queryKey: mcpStatusKey(handle),
     enabled: !!handle,
     queryFn: () => unwrap(commands.mcpStatus(handle!)),
+    staleTime: 2_000,
+    refetchInterval: 4_000,
+  });
+}
+
+/**
+ * The MCP servers + tools a conversation-less `claude` sees — the global Settings page's
+ * list. Costs a short-lived process (a few seconds while the connectors connect), so it is
+ * kept for a while and refreshed on demand, never polled.
+ */
+export function useGlobalMcpStatus(enabled: boolean) {
+  return useQuery<McpServerLive[]>({
+    queryKey: ["global-mcp-status"],
+    enabled,
+    queryFn: () => unwrap(commands.fetchGlobalMcpStatus()),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+/** Query key for the MCP permission rules a repository sees. */
+export const mcpPermissionRulesKey = (repoPath: string | null) => ["mcp-permission-rules", repoPath] as const;
+
+/**
+ * Every permission rule that can reach an MCP tool (managed, local, project, user files),
+ * for the per-tool rows. Polled like the live status while the manager is open: the same
+ * rules can change under us from the CLI's own `/permissions` dialog or a hand edit.
+ */
+export function useMcpPermissionRules(repoPath: string | null) {
+  return useQuery<PermissionRulesView>({
+    queryKey: mcpPermissionRulesKey(repoPath),
+    queryFn: () => unwrap(commands.mcpPermissionRules(repoPath)),
     staleTime: 2_000,
     refetchInterval: 4_000,
   });

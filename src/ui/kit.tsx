@@ -77,6 +77,24 @@ const WF_PATHS: Record<string, string> = {
   sidebarR: "M4 5h14v12H4zM13 5v12",
   power: "M11 4v7M7.3 6.8a6 6 0 1 0 7.4 0",
   globe: "M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM3 11h16M11 3c2.4 2.2 2.4 13.8 0 16M11 3c-2.4 2.2-2.4 13.8 0 16",
+  // A paired SERVER — a mast on a base, broadcasting. Distinct from `globe`, which stays
+  // for the NETWORK sense (the claude.ai bridge, a phone relay, an MCP server reached over
+  // http): a VPS of your own is a machine you reach, not the internet. Alexandre picked
+  // this one over a rack unit: what matters at a glance is that the thing is REACHING you
+  // from somewhere, and a transmitting mast says that where a stack of bars says "list".
+  // ⚠️ The two arcs are spaced for the 13px this renders at — arcs any closer than these
+  // land under a pixel apart once scaled down, and merge into one smudge. Don't add a
+  // third, and don't tighten the gap.
+  server: "M11 9.6v8.9M8.5 18.5h5M7.9 7.6a4.4 4.4 0 0 1 6.2 0M5.4 5.2a8 8 0 0 1 11.2 0",
+  // The same mast, out of reach: base and pole kept so it is recognisably the SAME
+  // object, both arcs replaced by one stroke through where they were, carried on down
+  // across the pole so the whole glyph reads as crossed out. Shape carries the meaning
+  // here on purpose — the mark also turns red, but a red-only difference is invisible to
+  // anyone who doesn't separate those hues, and this is the one state in the sidebar you
+  // must not miss. ⚠️ The arcs are REPLACED, not struck through: at the 13px this
+  // renders at, a slash crossing two arcs and a pole is three strokes inside four pixels
+  // and resolves to a blob.
+  serverOff: "M11 9.6v8.9M8.5 18.5h5M5.4 5.2 16.6 16.4",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",
   // A document with a sparkle — a published `Artifact` (a generated, hosted deliverable).
@@ -114,6 +132,11 @@ const WF_PATHS: Record<string, string> = {
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
 export function Ico({ name, className }: { name: string; className?: string }) {
+  // `tosse` is not a path in the glyph table: the CRM's rose is a multi-shape brand mark, and
+  // routing it through <Ico> is what lets the shared, table-driven surfaces (a tool step row,
+  // a card tile) ask for it by name like any other icon. Its own class carries the sizing and
+  // the bichrome accent — see `.wf-tosse-mark`.
+  if (name === "tosse") return <TosseCrmMark className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">
