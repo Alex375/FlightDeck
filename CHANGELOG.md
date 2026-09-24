@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.6.0
+
+- New: **per-tool permissions for MCP tools** — Allow / Ask / Block each tool, and choose where it applies (this conversation, the repository, or everywhere). Extensions now live under Settings → Claude Code.
+- New: the **newest model of each family is offered by default** (Opus 5.5, and the newest Codex model of each line); a default the installed CLI can't run is never picked.
+- New: the sidebar **shows which machine a repository lives on**, and says clearly when a server can't be reached, and why.
+- New: a repository on a server is **matched to its TOSSE repository** just like a local one.
+- New: **TOSSE CRM calls show up as readable actions** in the conversation instead of anonymous MCP steps.
+- Fix: a conversation no longer **replays its history over the turns running live**.
+
 ## v2.5.0
 
 - New: **run your agents on a remote server** — a Settings wizard sets up a Linux machine end to end (install, service, Claude sign-in), and conversations keep running there even when the Mac is closed. Your phone can be paired to each server.
