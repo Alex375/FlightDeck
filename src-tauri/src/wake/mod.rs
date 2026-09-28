@@ -8,16 +8,21 @@
 //! Everything is on-device — no network, no cloud, the audio never leaves the Mac.
 //!
 //! Optional and OFF by default (like the voice agent it serves): with the toggle
-//! off nothing captures the microphone and this module costs nothing. The status
-//! is HONEST — `running`/`error` are the real post-apply state of the detector,
-//! not a switch that lies (mirroring the voice-bridge honest-toggle rule).
+//! off nothing captures the microphone and this module costs nothing. It also
+//! stays off without an OpenAI key (`require_voice_key`): the wake word only ever
+//! opens the voice agent, so without one every detection would be thrown away. The
+//! status is HONEST — `running`/`error` are the real post-apply state of the
+//! detector, not a switch that lies (mirroring the voice-bridge honest-toggle rule).
+//!
+//! Cost while on: the worker wakes once per 80 ms step (the capture batches), runs
+//! at UTILITY QoS (efficiency cores), sleeps when no audio comes, and the engine's
+//! silence gate skips the expensive stages while nobody is talking (`engine.rs`).
 
 mod capture;
 mod debug;
 mod engine;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -49,6 +54,11 @@ pub struct WakeConfig {
     /// data dir) so this module stays free of Tauri types, exactly like
     /// `on_detect`. `None` while debug capture is off.
     pub debug_dir: Option<PathBuf>,
+    /// Why the detector must stay OFF even though the user enabled it — today only
+    /// "no OpenAI key" (see `require_voice_key`). The choice itself is kept: the
+    /// status reads enabled-but-not-running with this as the reason, and the
+    /// detector comes back by itself once the reason is gone.
+    pub paused: Option<String>,
 }
 
 impl Default for WakeConfig {
@@ -59,8 +69,26 @@ impl Default for WakeConfig {
             sensitivity: 0.5,
             debug_capture: false,
             debug_dir: None,
+            paused: None,
         }
     }
+}
+
+/// The reason a detector enabled without an OpenAI key stays off.
+pub const PAUSED_NO_VOICE_KEY: &str =
+    "paused — no OpenAI key. The wake word only opens the voice agent, so the microphone \
+     stays off until a key is added.";
+
+/// Hold an enabled detector off while no OpenAI key is stored. The wake word only
+/// ever opens the voice agent, and without a key the front drops every detection
+/// (`shouldFireWake`) — so an always-on microphone would buy nothing but battery
+/// drain and a lit mic indicator. `key_configured` comes from the caller (reading
+/// the Keychain spawns `/usr/bin/security`; this module stays free of it).
+pub fn require_voice_key(mut config: WakeConfig, key_configured: bool) -> WakeConfig {
+    if config.enabled && !key_configured {
+        config.paused = Some(PAUSED_NO_VOICE_KEY.to_string());
+    }
+    config
 }
 
 /// One selectable wake phrase for the Settings picker.
@@ -123,7 +151,12 @@ struct Inner {
     /// Shared with the worker thread, which is where captures are actually
     /// written — `status()` reads whatever the last attempt left here.
     debug_error: Arc<Mutex<Option<String>>>,
-    stop: Option<Arc<AtomicBool>>,
+    /// Why a detector that started has since died (the microphone went away) —
+    /// written by the worker, read by `status()`, so the status stops claiming a
+    /// dead detector runs.
+    fault: Arc<Mutex<Option<String>>>,
+    /// The controller's line to the worker: a `Stop` here ends it.
+    stop: Option<mpsc::Sender<WorkerMsg>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -152,6 +185,7 @@ impl WakeController {
                 running: false,
                 error: None,
                 debug_error: Arc::new(Mutex::new(None)),
+                fault: Arc::new(Mutex::new(None)),
                 stop: None,
                 handle: None,
             }),
@@ -191,6 +225,7 @@ impl WakeController {
                 },
             };
         let debug_error = Arc::new(Mutex::new(debug_reason));
+        let fault = Arc::new(Mutex::new(None));
         {
             let mut inner = self.inner.lock().unwrap();
             inner.phrase = phrase.clone();
@@ -198,18 +233,23 @@ impl WakeController {
             inner.enabled = config.enabled;
             inner.debug_capture = debug_capture;
             inner.debug_dir = config.debug_dir.clone();
-            inner.error = None;
+            // Paused = enabled, deliberately not running, and saying why.
+            inner.error = config.paused.clone().filter(|_| config.enabled);
             inner.debug_error = debug_error.clone();
+            inner.fault = fault.clone();
             inner.running = false;
         }
-        if !config.enabled {
+        if !config.enabled || config.paused.is_some() {
             return self.status();
         }
 
         let on_detect = self.on_detect.lock().unwrap().clone();
-        let stop = Arc::new(AtomicBool::new(false));
+        // ONE channel carries the audio (from the capture), a fault (from the
+        // capture) and the stop request (from here), so the worker can simply
+        // block on it — see `run_worker`.
+        let (tx, inbox) = mpsc::channel::<WorkerMsg>();
         let (report_tx, report_rx) = mpsc::channel::<Result<(), String>>();
-        let stop_worker = stop.clone();
+        let link = WorkerLink { capture_tx: tx.clone(), inbox, fault, report: report_tx };
         let phrase_worker = phrase.clone();
         let debug = DebugSink {
             enabled: debug_capture,
@@ -218,14 +258,12 @@ impl WakeController {
         };
         let handle = std::thread::Builder::new()
             .name("wake-detector".into())
-            .spawn(move || {
-                run_worker(phrase_worker, sensitivity, on_detect, debug, stop_worker, report_tx)
-            })
+            .spawn(move || run_worker(phrase_worker, sensitivity, on_detect, debug, link))
             .ok();
 
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.stop = Some(stop);
+            inner.stop = Some(tx);
             inner.handle = handle;
         }
 
@@ -257,7 +295,9 @@ impl WakeController {
             (inner.stop.take(), inner.handle.take())
         };
         if let Some(stop) = stop {
-            stop.store(true, Ordering::SeqCst);
+            // A worker that already exited (failed start, dead mic) has dropped its
+            // end; nothing to tell it then.
+            let _ = stop.send(WorkerMsg::Stop);
         }
         if let Some(handle) = handle {
             let _ = handle.join();
@@ -267,15 +307,18 @@ impl WakeController {
 
     pub fn status(&self) -> WakeStatus {
         let inner = self.inner.lock().unwrap();
-        // Read the shared capture error into a local FIRST: its guard is a
-        // temporary that would otherwise outlive `inner` at the end of the block.
+        // Read the shared errors into locals FIRST: their guards are temporaries
+        // that would otherwise outlive `inner` at the end of the block.
         let debug_error = inner.debug_error.lock().unwrap().clone();
+        let fault = inner.fault.lock().unwrap().clone();
         WakeStatus {
             enabled: inner.enabled,
             phrase: inner.phrase.clone(),
             sensitivity: inner.sensitivity,
-            running: inner.running,
-            error: inner.error.clone(),
+            // A detector whose microphone went away is not running, whatever it
+            // was when it started.
+            running: inner.running && fault.is_none(),
+            error: fault.or_else(|| inner.error.clone()),
             phrases: phrase_catalogue(),
             debug_capture: inner.debug_capture,
             debug_dir: inner.debug_dir.as_ref().map(|p| p.display().to_string()),
@@ -314,6 +357,46 @@ impl DebugSink {
     }
 }
 
+/// What reaches the worker thread, all on one channel so the worker can BLOCK on
+/// it: it wakes for audio (once per detection step), a dead stream or a stop
+/// request, and otherwise sleeps — no timeout, no polling, even when the
+/// microphone goes quiet.
+enum WorkerMsg {
+    /// A batch of 16 kHz mono audio — about one detection step (`capture.rs`).
+    Audio(Vec<f32>),
+    /// The capture died (the device went away): stop, and record why.
+    Fault(String),
+    /// The controller wants the worker gone (disable, reconfigure, quit).
+    Stop,
+}
+
+/// The worker's end of the plumbing, kept together so `run_worker`'s signature
+/// stays readable.
+struct WorkerLink {
+    /// Handed to the capture, which sends audio and faults on it.
+    capture_tx: mpsc::Sender<WorkerMsg>,
+    inbox: mpsc::Receiver<WorkerMsg>,
+    /// Where a mid-run failure is recorded for `status()`.
+    fault: Arc<Mutex<Option<String>>>,
+    /// The start-up outcome, which `apply` waits on.
+    report: mpsc::Sender<Result<(), String>>,
+}
+
+/// Move the calling thread to the UTILITY QoS class, which macOS schedules on the
+/// efficiency cores. Every ONNX session runs one intra-op thread, so the inference
+/// happens ON this thread and inherits the class. A step's work takes a few ms even
+/// there, against an 80 ms budget.
+#[cfg(target_os = "macos")]
+fn lower_thread_qos() {
+    // SAFETY: only changes the calling thread's own QoS class; no pointers.
+    let rc = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
+    };
+    if rc != 0 {
+        eprintln!("[wake] could not lower the detector's QoS class (error {rc}) — it runs at the default class");
+    }
+}
+
 /// The detector worker: build the engine + open the mic, report the outcome, then
 /// pump audio through the engine until asked to stop. Owns the `!Send` capture
 /// stream and the `&mut`-driven ONNX sessions, so neither ever crosses a thread.
@@ -322,13 +405,15 @@ fn run_worker(
     sensitivity: f32,
     on_detect: Option<Arc<DetectFn>>,
     debug: DebugSink,
-    stop: Arc<AtomicBool>,
-    report: mpsc::Sender<Result<(), String>>,
+    link: WorkerLink,
 ) {
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
+    #[cfg(target_os = "macos")]
+    lower_thread_qos();
+
+    let WorkerLink { capture_tx, inbox, fault, report } = link;
     let setup = (|| {
         let engine = Engine::new(&phrase, sensitivity, debug.enabled)?;
-        let capture = Capture::start(tx)?;
+        let capture = Capture::start(capture_tx)?;
         Ok::<_, String>((engine, capture))
     })();
     let (mut engine, _capture) = match setup {
@@ -344,37 +429,41 @@ fn run_worker(
         }
     };
 
-    while !stop.load(Ordering::SeqCst) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => {
-                if let Some(detection) = engine.feed(&chunk) {
-                    match detection.suppressed_by {
-                        None => eprintln!(
-                            "[wake] DETECTED phrase={} score={:.3} → firing event",
-                            engine.phrase(),
-                            detection.score
-                        ),
-                        // Only reachable while debug capture is on, and only ever
-                        // dumped — a suppressed candidate must never reach the app.
-                        Some(gate) => eprintln!(
-                            "[wake] suppressed phrase={} score={:.3} by {gate}",
-                            engine.phrase(),
-                            detection.score
-                        ),
-                    }
-                    // Dump BEFORE firing: the callback hops into the webview and
-                    // opens a microphone, and the evidence for a false positive is
-                    // worth more than a few ms of trigger latency.
-                    debug.record(engine.phrase(), sensitivity, &detection);
-                    if detection.fired() {
-                        if let Some(cb) = &on_detect {
-                            cb(engine.phrase(), detection.score);
-                        }
-                    }
-                }
+    loop {
+        // Blocks until something arrives: audio (~12×/s), a fault, or a stop.
+        let chunk = match inbox.recv() {
+            Ok(WorkerMsg::Audio(chunk)) => chunk,
+            Ok(WorkerMsg::Fault(reason)) => {
+                eprintln!("[wake] detector STOPPED: {reason}");
+                *fault.lock().unwrap() = Some(reason);
+                break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break, // capture died
+            // `Err` = the controller's sender is gone too: nobody left to serve.
+            Ok(WorkerMsg::Stop) | Err(_) => break,
+        };
+        let Some(detection) = engine.feed(&chunk) else { continue };
+        match detection.suppressed_by {
+            None => eprintln!(
+                "[wake] DETECTED phrase={} score={:.3} → firing event",
+                engine.phrase(),
+                detection.score
+            ),
+            // Only reachable while debug capture is on, and only ever dumped — a
+            // suppressed candidate must never reach the app.
+            Some(gate) => eprintln!(
+                "[wake] suppressed phrase={} score={:.3} by {gate}",
+                engine.phrase(),
+                detection.score
+            ),
+        }
+        // Dump BEFORE firing: the callback hops into the webview and opens a
+        // microphone, and the evidence for a false positive is worth more than a
+        // few ms of trigger latency.
+        debug.record(engine.phrase(), sensitivity, &detection);
+        if detection.fired() {
+            if let Some(cb) = &on_detect {
+                cb(engine.phrase(), detection.score);
+            }
         }
     }
     // `_capture` drops here → mic released (orange indicator off).
@@ -392,6 +481,40 @@ mod tests {
         let (p, s) = sanitize("hey_jarvis", -3.0);
         assert_eq!(p, "hey_jarvis");
         assert_eq!(s, 0.0);
+    }
+
+    /// Without an OpenAI key the wake word is useless (the front drops every
+    /// detection), so an enabled detector must not hold the microphone — but it
+    /// must not forget the user's choice either, and must say why it is off.
+    #[test]
+    fn an_enabled_detector_without_a_voice_key_is_paused_not_started() {
+        let enabled = WakeConfig { enabled: true, ..WakeConfig::default() };
+        assert!(require_voice_key(enabled.clone(), true).paused.is_none(), "a key: runs");
+        let disabled = WakeConfig::default();
+        assert!(require_voice_key(disabled, false).paused.is_none(), "off stays plain off");
+
+        let ctrl = WakeController::new();
+        let st = ctrl.apply(require_voice_key(enabled, false));
+        assert!(st.enabled, "the user's choice is kept");
+        assert!(!st.running, "no worker, no microphone");
+        assert_eq!(st.error.as_deref(), Some(PAUSED_NO_VOICE_KEY), "and the reason is legible");
+        assert!(ctrl.inner.lock().unwrap().handle.is_none(), "no thread was spawned");
+    }
+
+    /// A detector that started and then lost its microphone must stop claiming to
+    /// run — the fault the worker records wins over the start-up state.
+    #[test]
+    fn a_fault_after_start_reads_as_not_running_with_the_reason() {
+        let ctrl = WakeController::new();
+        {
+            let mut inner = ctrl.inner.lock().unwrap();
+            inner.enabled = true;
+            inner.running = true;
+            *inner.fault.lock().unwrap() = Some("the microphone went away".into());
+        }
+        let st = ctrl.status();
+        assert!(!st.running);
+        assert_eq!(st.error.as_deref(), Some("the microphone went away"));
     }
 
     #[test]

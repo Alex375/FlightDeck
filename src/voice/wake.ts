@@ -1,8 +1,10 @@
 // Wake-word trigger — the hands-free equivalent of the push-to-talk key.
 //
 // A wake-word detector (native; see the Rust `wake/` module — cpal capture +
-// Silero VAD gate + openWakeWord inference, all local) fires when it hears the
-// configured phrase. The front then reacts EXACTLY like a spoken push-to-talk:
+// openWakeWord inference, vetoed by Silero VAD and skipped while nobody is
+// talking, all local) fires when it hears the configured phrase. The core keeps
+// it off while no OpenAI key is stored, since every detection would be dropped
+// by the gate below anyway. The front then reacts EXACTLY like a spoken push-to-talk:
 // arm the voice session if it isn't up, then OPEN the microphone so the user can
 // speak. A wake word means "start listening" — it NEVER closes the mic (that is
 // what the silence guard and `end_call` are for), so re-firing while already

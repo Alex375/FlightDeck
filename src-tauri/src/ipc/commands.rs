@@ -5647,19 +5647,48 @@ pub async fn voice_agent_status() -> Result<crate::voice::VoiceAgentStatus, Stri
 /// read-back). Returns the fresh status.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
-    tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
+pub async fn set_voice_agent_key(
+    app: tauri::AppHandle,
+    key: String,
+) -> Result<crate::voice::VoiceAgentStatus, String> {
+    let status = tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
         .await
-        .map_err(|e| format!("keychain task failed: {e}"))?
+        .map_err(|e| format!("keychain task failed: {e}"))??;
+    reapply_wake_after_key_change(&app, status.configured).await;
+    Ok(status)
 }
 
 /// Forget the stored OpenAI key (absent item = success).
 #[tauri::command]
 #[specta::specta]
-pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
-    tokio::task::spawn_blocking(crate::voice::clear_key)
+pub async fn clear_voice_agent_key(
+    app: tauri::AppHandle,
+) -> Result<crate::voice::VoiceAgentStatus, String> {
+    let status = tokio::task::spawn_blocking(crate::voice::clear_key)
         .await
-        .map_err(|e| format!("keychain task failed: {e}"))?
+        .map_err(|e| format!("keychain task failed: {e}"))??;
+    reapply_wake_after_key_change(&app, status.configured).await;
+    Ok(status)
+}
+
+/// The wake word is held off while no OpenAI key is stored
+/// (`crate::wake::require_voice_key`), so a key change re-applies it: removing
+/// the key stops an always-on microphone whose every detection would now be
+/// dropped, adding one resumes a wake word the user left enabled. Best-effort —
+/// the key change itself already succeeded, and the wake status carries its own
+/// outcome for Settings to show.
+async fn reapply_wake_after_key_change(app: &tauri::AppHandle, key_configured: bool) {
+    let cfg = load_wake_config(app, &app.state::<Store>());
+    let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
+    // Nothing to pause or resume for a wake word the user never enabled, and a
+    // detector already running with a key stored needs no restart.
+    if !cfg.enabled || (key_configured && wake.status().running) {
+        return;
+    }
+    let apply = move || wake.apply(crate::wake::require_voice_key(cfg, key_configured));
+    if let Err(e) = tokio::task::spawn_blocking(apply).await {
+        eprintln!("[wake] re-applying the wake word after a key change failed: {e}");
+    }
 }
 
 /// Mint a short-lived Realtime client secret for ONE voice session — the only
@@ -5708,6 +5737,7 @@ pub fn load_wake_config(app: &tauri::AppHandle, store: &Store) -> crate::wake::W
         sensitivity,
         debug_capture: read(WAKE_DEBUG_CAPTURE_KEY).as_deref() == Some("1"),
         debug_dir: wake_debug_dir(app),
+        paused: None, // decided at apply time (`crate::wake::require_voice_key`)
     }
 }
 
@@ -5767,9 +5797,14 @@ pub async fn set_wake_word_config(
         cfg
     };
     let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
-    tokio::task::spawn_blocking(move || wake.apply(cfg))
-        .await
-        .map_err(|e| format!("wake apply task failed: {e}"))
+    tokio::task::spawn_blocking(move || {
+        // No OpenAI key → held off, choice kept (`require_voice_key`). The Keychain
+        // is only read when it can matter.
+        let has_key = cfg.enabled && crate::voice::status().configured;
+        wake.apply(crate::wake::require_voice_key(cfg, has_key))
+    })
+    .await
+    .map_err(|e| format!("wake apply task failed: {e}"))
 }
 
 /// A compact, bounded directory tree for AGENT orientation (the `browse_folders`

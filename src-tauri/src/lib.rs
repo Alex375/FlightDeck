@@ -842,7 +842,10 @@ pub fn run() {
                 if cfg.enabled {
                     let wake = wake.clone();
                     std::thread::spawn(move || {
-                        let _ = wake.apply(cfg);
+                        // Without an OpenAI key every detection is dropped, so the
+                        // mic stays off — paused, choice kept (`require_voice_key`).
+                        let has_key = voice::status().configured;
+                        let _ = wake.apply(wake::require_voice_key(cfg, has_key));
                     });
                 }
             }
