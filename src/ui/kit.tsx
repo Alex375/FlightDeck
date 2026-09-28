@@ -10,6 +10,7 @@ import {
   type CSSProperties,
   type ReactElement,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
 
@@ -242,11 +243,56 @@ export function UserMark({ className }: { className?: string }) {
   );
 }
 
+/**
+ * Keeps the title bar's ONE underline under the current tab (the nav child carrying
+ * `data-on`). A single element that moves — rather than an underline per tab — is what lets it
+ * SLIDE from the old tab to the new one; the transition itself is CSS, gated on the bar's
+ * `data-motion`. Driven by observers rather than by React renders: the App re-renders the bar
+ * on many unrelated store changes, and measuring on each would force a layout every time. The
+ * MutationObserver catches a tab switch (`data-on` moving) and a tab appearing (TOSSE once
+ * signed in); the ResizeObserver catches widths changing (fonts landing). The line only gets
+ * `data-ready` — and with it the transition — after its first placement, so it does not sweep
+ * in from the left edge on launch.
+ */
+function useTabUnderline(
+  navRef: RefObject<HTMLDivElement>,
+  lineRef: RefObject<HTMLSpanElement>,
+  enabled: boolean,
+) {
+  useLayoutEffect(() => {
+    const nav = navRef.current;
+    const line = lineRef.current;
+    if (!enabled || !nav || !line) return;
+    const place = () => {
+      const tab = nav.querySelector<HTMLElement>(":scope > [data-on]");
+      if (!tab) {
+        line.style.opacity = "0";
+        return;
+      }
+      line.style.opacity = "1";
+      line.style.width = `${tab.offsetWidth}px`;
+      line.style.transform = `translateX(${tab.offsetLeft}px)`;
+    };
+    place();
+    const raf = requestAnimationFrame(() => line.setAttribute("data-ready", ""));
+    const mo = new MutationObserver(place);
+    mo.observe(nav, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-on"] });
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
+    ro?.observe(nav);
+    return () => {
+      cancelAnimationFrame(raf);
+      mo.disconnect();
+      ro?.disconnect();
+    };
+  }, [navRef, lineRef, enabled]);
+}
+
 export function Win({
   title,
   nav,
   right,
   banner,
+  motion = false,
   children,
 }: {
   title?: ReactNode;
@@ -254,12 +300,23 @@ export function Win({
   right?: ReactNode;
   /** Full-width strip between the title bar and the body (e.g. update banner). */
   banner?: ReactNode;
+  /** Animate the title bar (the tab underline slides, button states ease) — the
+   *  `titleBarAnimations` display pref. The OS "reduce motion" setting still wins, in CSS. */
+  motion?: boolean;
   children: ReactNode;
 }) {
+  const navRef = useRef<HTMLDivElement>(null);
+  const underlineRef = useRef<HTMLSpanElement>(null);
+  useTabUnderline(navRef, underlineRef, !!nav);
   return (
     <div className="wf-win">
-      <div className="wf-titlebar">
-        {nav ? <div className="wf-tbnav">{nav}</div> : null}
+      <div className="wf-titlebar" data-motion={motion ? "" : undefined}>
+        {nav ? (
+          <div className="wf-tbnav" ref={navRef}>
+            {nav}
+            <span className="wf-tbnav-line" ref={underlineRef} aria-hidden="true" />
+          </div>
+        ) : null}
         {/* `title` attribute when the caption is a plain string: it is truncated with an
             ellipsis, so the full name has to stay readable somewhere. */}
         {title ? (
@@ -275,19 +332,14 @@ export function Win({
   );
 }
 
+/** A title-bar view tab: plain text, underlined while current (see `.wf-tbnav`). */
 export function NavBtn({
-  icon,
-  glyph,
   label,
   on,
   badge,
   title,
   onClick,
 }: {
-  icon?: string;
-  /** A ready-made mark, for a tab whose identity isn't one of the `WF_PATHS` glyphs — the
-   *  TOSSE tab wears the CRM's own brand mark. Takes precedence over `icon`. */
-  glyph?: React.ReactNode;
   label: string;
   on?: boolean;
   badge?: number | null;
@@ -295,8 +347,7 @@ export function NavBtn({
   onClick?: () => void;
 }) {
   return (
-    <button {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
-      {glyph ?? (icon ? <Ico name={icon} className="sm" /> : null)}
+    <button type="button" {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
       {label}
       {badge != null ? <span className="wf-badge att">{badge}</span> : null}
     </button>

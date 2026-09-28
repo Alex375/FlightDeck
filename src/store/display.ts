@@ -148,6 +148,13 @@ export interface DisplayPrefs {
    *  necessarily the person who wants panels to stop sliding. */
   conversationAnimations: boolean;
 
+  /** Animate the title bar: the current view's underline SLIDES to the tab you pick instead
+   *  of jumping there, a panel button's "open" dot grows in and out, and the system switches
+   *  give under the click. ON by default (~0.18 s for the slide, ~0.14 s for the rest). Off →
+   *  the bar changes state in one frame. The OS "reduce motion" setting overrides this
+   *  whichever way it is set (CSS media query). Read by App → {@link Win}'s `motion` flag. */
+  titleBarAnimations: boolean;
+
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
    *  offered on both the user's and Claude's messages. ON by default. Off → messages have no
@@ -350,6 +357,7 @@ const DEFAULTS: DisplayPrefs = {
   flightdeckModalZoom: true,
   panelAnimations: true,
   conversationAnimations: true,
+  titleBarAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseToolCards: true,
@@ -429,6 +437,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
         panelAnimations: patch.panelAnimations ?? s.panelAnimations,
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
+        titleBarAnimations: patch.titleBarAnimations ?? s.titleBarAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
