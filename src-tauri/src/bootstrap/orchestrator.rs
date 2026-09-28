@@ -2015,12 +2015,7 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
         // The `Err` is deliberately discarded — it embeds the raw offending value (see
         // `validate_ssh_user`/`validate_address_value`'s own docs) and this reason
         // string is user-facing. Same discipline as `TransportError::InvalidRemoteTarget`.
-        return ServerDiagnosis {
-            state: DiagnosisState::Failed {
-                reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
-            },
-            ..ServerDiagnosis::unreachable()
-        };
+        return invalid_connection_details();
     }
     cmd.arg(diagnose_script());
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
@@ -2032,6 +2027,29 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
         Ok(Ok(out)) if out.status.success() => {
             parse_diagnosis(&String::from_utf8_lossy(&out.stdout), true)
         }
+        failed => unreachable_after(&machine.host, failed).await,
+    }
+}
+
+/// The diagnosis of a machine whose saved `user`/`host` no longer pass validation —
+/// shared by [`diagnose`] and [`probe_reachability`], so both name it in the same words.
+fn invalid_connection_details() -> ServerDiagnosis {
+    ServerDiagnosis {
+        state: DiagnosisState::Failed {
+            reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
+        },
+        ..ServerDiagnosis::unreachable()
+    }
+}
+
+/// Classify an ssh round trip that did NOT succeed — shared by [`diagnose`] and
+/// [`probe_reachability`], so the ambient probe says WHY in exactly the words the full
+/// diagnosis in the server panel uses.
+async fn unreachable_after(
+    host: &str,
+    failed: Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+) -> ServerDiagnosis {
+    match failed {
         // ssh itself failed (a non-zero exit — OpenSSH's own convention for exit 255,
         // though anything non-zero here means the same thing for THIS script, which
         // never returns non-zero on its own). Thread the stderr this used to discard
@@ -2042,7 +2060,7 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
                 String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
             let issue = ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
                 .unwrap_or(SshLinkIssue::Unreachable);
-            let tailscale_off = tailscale_off_locally_if_relevant(&machine.host).await;
+            let tailscale_off = tailscale_off_locally_if_relevant(host).await;
             ServerDiagnosis::unreachable_with(issue, tailscale_off)
         }
         // No `Output` at all: the round trip either couldn't even be spawned, or the
@@ -2051,9 +2069,62 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
         // state (a wedged/hung remote shell on a tailnet host is exactly the shape
         // this clause exists for).
         Ok(Err(_)) | Err(_) => {
-            let tailscale_off = tailscale_off_locally_if_relevant(&machine.host).await;
+            let tailscale_off = tailscale_off_locally_if_relevant(host).await;
             ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, tailscale_off)
         }
+    }
+}
+
+/// The one fact the AMBIENT machine-health probe needs: can this Mac reach the server
+/// right now, and if not, why. See [`probe_reachability`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MachineReachability {
+    pub reachable: bool,
+    /// The diagnosis's own wording for why, when unreachable — the SAME string a full
+    /// [`diagnose`] would put in [`DiagnosisState::Failed`]. `None` when reachable.
+    pub reason: Option<String>,
+}
+
+impl MachineReachability {
+    fn reached() -> Self {
+        Self { reachable: true, reason: None }
+    }
+}
+
+impl From<&ServerDiagnosis> for MachineReachability {
+    fn from(d: &ServerDiagnosis) -> Self {
+        let reason = match &d.state {
+            DiagnosisState::Failed { reason } if !d.reachable => Some(reason.clone()),
+            _ => None,
+        };
+        Self { reachable: d.reachable, reason }
+    }
+}
+
+/// "Can I talk to this machine?" — the question the sidebar mark, the Flight Deck lane
+/// header and the composer band answer, and NOTHING more.
+///
+/// ⚠️ Why not [`diagnose`]: the ambient loop used to run the full diagnosis every 90 s
+/// per server, i.e. a fresh ssh handshake PLUS a dozen server-side commands — `systemctl`,
+/// `loginctl`, `flightdeckd --version`/`status`, and `claude --version` + `claude auth
+/// status`, two Node.js start-ups on the server — to paint a glyph that reads
+/// `reachable` and nothing else (see `store/machineHealth.ts`). The server panel still
+/// runs [`diagnose`]: it is the one surface that shows the rest.
+///
+/// Same ssh options, same timeout, same failure classification as [`diagnose`] (shared
+/// through [`unreachable_after`]), so a verdict never depends on which probe produced it.
+pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Option<&str>) -> MachineReachability {
+    let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    cmd.arg("-T");
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
+        return MachineReachability::from(&invalid_connection_details());
+    }
+    // `true`, not an empty command: ssh with no command opens an interactive login
+    // shell and waits on it. Exit 0 means ssh connected, authenticated and ran it.
+    cmd.arg("true");
+    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => MachineReachability::reached(),
+        failed => MachineReachability::from(&unreachable_after(&machine.host, failed).await),
     }
 }
 
@@ -2104,6 +2175,16 @@ pub async fn machine_diagnose(app: tauri::AppHandle, machine_id: String) -> Resu
     let machine = machine_by_id(&app, &machine_id)?;
     let known_hosts = known_hosts_path(&app);
     Ok(with_bundled_version(&app, diagnose(&machine, known_hosts.as_deref()).await))
+}
+
+/// The ambient health probe — see [`probe_reachability`] for why it is not
+/// [`machine_diagnose`].
+#[tauri::command]
+#[specta::specta]
+pub async fn machine_reachability(app: tauri::AppHandle, machine_id: String) -> Result<MachineReachability, String> {
+    let machine = machine_by_id(&app, &machine_id)?;
+    let known_hosts = known_hosts_path(&app);
+    Ok(probe_reachability(&machine, known_hosts.as_deref()).await)
 }
 
 // ============================================================================
@@ -2965,6 +3046,43 @@ mod tests {
         // doc) must not be mistaken for the positive case either.
         let not_true = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, Some(false));
         assert_eq!(not_true.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
+    }
+
+    /// The ambient probe must say WHY in the full diagnosis's own words — the mark's
+    /// tooltip and the server panel can never disagree on the reason.
+    #[test]
+    fn reachability_carries_the_diagnosis_reason_verbatim() {
+        for (issue, tailscale_off) in [
+            (SshLinkIssue::KeyRefused, None),
+            (SshLinkIssue::HostKeyChanged, None),
+            (SshLinkIssue::Unreachable, None),
+            (SshLinkIssue::Unreachable, Some(true)),
+        ] {
+            let d = ServerDiagnosis::unreachable_with(issue, tailscale_off);
+            let DiagnosisState::Failed { reason } = &d.state else { panic!("unreachable is Failed") };
+            assert_eq!(
+                MachineReachability::from(&d),
+                MachineReachability { reachable: false, reason: Some(reason.clone()) },
+            );
+        }
+        let invalid = MachineReachability::from(&invalid_connection_details());
+        assert!(!invalid.reachable);
+        assert_eq!(
+            invalid.reason.as_deref(),
+            Some("this server's saved connection details are not valid — remove and re-add it"),
+        );
+        assert_eq!(MachineReachability::reached(), MachineReachability { reachable: true, reason: None });
+    }
+
+    /// A REACHABLE server whose daemon is stopped is `Failed` too — but it must never
+    /// read as unreachable through the ambient probe's shape (same prudence as
+    /// `store/machineHealth.ts`, which only ever looks at `reachable`).
+    #[test]
+    fn reachability_of_a_reachable_failed_diagnosis_has_no_reason() {
+        let mut d = ServerDiagnosis::unreachable();
+        d.reachable = true;
+        d.state = DiagnosisState::Failed { reason: "flightdeckd is not running".to_string() };
+        assert_eq!(MachineReachability::from(&d), MachineReachability { reachable: true, reason: None });
     }
 
     #[test]

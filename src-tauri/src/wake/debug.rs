@@ -94,8 +94,8 @@ pub fn write_capture(
         "audio_samples": audio.len(),
         "audio_file": wav_path.file_name().map(|n| n.to_string_lossy().to_string()),
         // Oldest step first, ending with the one that fired. `vad` is Silero's
-        // speech probability (diagnostic only today — it gates nothing) and `rms`
-        // the level of the window that step scored.
+        // speech probability — the fire-time veto reads its peak over the last 16
+        // steps — and `rms` the level of the window that step scored.
         "trace": detection
             .trace
             .iter()

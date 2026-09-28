@@ -18,12 +18,7 @@ import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { commands, events } from "../../ipc/client";
 import type { TosseLiveStatus } from "../../ipc/client";
-import {
-  allTosseQueryKeys,
-  connectionRefetch,
-  mergeInvalidationKeys,
-  recycleRefetchKeys,
-} from "../../ipc/tosseLiveEvents";
+import { allTosseQueryKeys, connectionRefetch, mergeInvalidationKeys } from "../../ipc/tosseLiveEvents";
 import { useTosseConnection } from "../../ipc/useTosse";
 import { useTosseLive } from "../../store/tosseLive";
 import { useAppErrors } from "../../store/appErrors";
@@ -37,24 +32,6 @@ import { useAppErrors } from "../../store/appErrors";
  */
 const BURST_MS = 400;
 
-/**
- * Shortest interval between two refetches caused by the server RECYCLING an idle stream.
- *
- * ⚠️ This exists because of a MEASURED server behaviour: an idle stream is ended by the
- * proxy roughly every 12 s (see `tosse/sse.rs`), so the core reopens one about that often.
- * Each connection owes a refetch — there is no replay, so the gap could have hidden a
- * change — and honouring every one of them literally would be a refetch every 12 s: the
- * polling this feature exists to remove, wearing a different hat.
- *
- * Set to the briefing's own `staleTime`, so at its very worst this costs no more than the
- * query would have refetched by itself. Two further guards keep it from becoming a permanent
- * poll (which is exactly what it was): the sweep is narrowed to what a ~200 ms gap can
- * plausibly have hidden ({@link recycleRefetchKeys}, which excludes the expensive repo-link
- * matching), and it does not run at all while the window is hidden — it is held, then flushed
- * when the user comes back. Fixing the keepalive on the CRM side would make both the recycles
- * and this throttle unnecessary.
- */
-const RECYCLE_REFETCH_MS = 60_000;
 
 export function TosseLiveHost() {
   const queryClient = useQueryClient();
@@ -75,17 +52,13 @@ export function TosseLiveHost() {
   // the core keeps a recycled stream on `live` (no indicator flicker), so `live → live` with
   // a bumped counter is precisely the case a transition test would miss.
   const refetchedFor = useRef(0);
-  // Throttle bookkeeping for those refetches: when the last one ran, and the timer that will
-  // run the one we held back. Held back, never dropped — see RECYCLE_REFETCH_MS.
-  const lastRefetchAt = useRef(0);
-  const pendingRefetch = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Was the channel ever NOT live since the connection we last refetched for? That is what
   // separates the server's ~200 ms recycle from a real outage (a lid closed, a redeploy),
-  // whose gap can be minutes long. The two owe very different refetches — see onState.
+  // whose gap can be minutes long. Only the outage owes a refetch — see onState.
   const sawOutage = useRef(false);
-  // What the last (re)connection still owes, if anything. "full" outranks "recycle": once an
-  // outage is in the mix, the narrow sweep is no longer enough to cover the gap.
-  const owed = useRef<null | "recycle" | "full">(null);
+  // Whether the last real (re)connection still owes its refetch — held while the window is
+  // hidden, paid on the way back.
+  const owed = useRef(false);
 
   // Listeners are attached ONCE, independently of whether the channel is currently open:
   // re-attaching them on every sign-in would race the events themselves (a state event
@@ -119,22 +92,11 @@ export function TosseLiveHost() {
      * that was the polling this feature exists to remove.
      */
     const runOwed = () => {
-      pendingRefetch.current = null;
-      const what = owed.current;
-      if (what == null || document.hidden) return;
-      owed.current = null;
-      lastRefetchAt.current = Date.now();
-      for (const key of what === "full" ? allTosseQueryKeys() : recycleRefetchKeys()) {
+      if (!owed.current || document.hidden) return;
+      owed.current = false;
+      for (const key of allTosseQueryKeys()) {
         void queryClient.invalidateQueries({ queryKey: key });
       }
-    };
-
-    /** Owe it now if the throttle allows, else park it on a timer. */
-    const scheduleOwed = () => {
-      if (pendingRefetch.current != null || document.hidden) return;
-      const since = Date.now() - lastRefetchAt.current;
-      if (since >= RECYCLE_REFETCH_MS) runOwed();
-      else pendingRefetch.current = setTimeout(runOwed, RECYCLE_REFETCH_MS - since);
     };
 
     const onState = (status: TosseLiveStatus) => {
@@ -142,36 +104,34 @@ export function TosseLiveHost() {
       // Sign-out clears the slate: there is no gap to cover for a channel nobody asked for.
       if (status.state === "off") {
         sawOutage.current = false;
-        owed.current = null;
+        owed.current = false;
       } else if (status.state !== "live") {
         sawOutage.current = true;
       }
-      // ⚠️ Every connection owes a refetch: the server implements no replay, so whatever it
-      // emitted while the socket was down is gone. Without it, a reconnection leaves the view
+      // ⚠️ A reconnection after a gap owes a refetch: the server implements no replay, so
+      // whatever it emitted while the socket was down is gone. Without it, the view is left
       // showing — confidently, under a green indicator — a board that changed in the
-      // meantime. The rule itself is pure and tested.
+      // meantime. Which connection is NEW is pure and tested (`connectionRefetch`).
       const { refetch, nextHandled } = connectionRefetch(status, refetchedFor.current);
       refetchedFor.current = nextHandled;
       if (!refetch) return;
-      // How MUCH is owed depends on what the gap was. A real outage (the channel dropped to
-      // connecting/error first) can have hidden minutes of changes and is rare → the full
-      // sweep, right now, no throttle. The server's idle recycle hides ~200 ms and happens
-      // five times a minute → the narrow sweep, on the throttle. Treating both as "refetch
-      // everything" is what turned this into a permanent 30-second poll of the whole board.
+      // …but only a REAL outage owes one: the channel dropped to connecting/error first, a
+      // gap that can have hidden minutes of changes (a lid closed, a redeploy) → the full
+      // sweep, once. A server-side RECYCLE of an idle stream (the core keeps the state on
+      // `live`, only the counter moves) hides ~200 ms and owes nothing: refetching for it was
+      // a sweep every 60 s for as long as the window stayed visible — a poll wearing the live
+      // channel's clothes. And the recycles themselves are gone: they came from the CRM's
+      // `Bun.serve` idle timeout, which its SSE route now opts out of (see `tosse/sse.rs`).
       const outage = sawOutage.current;
       sawOutage.current = false;
-      owed.current = outage || owed.current === "full" ? "full" : "recycle"; // "full" wins
-      if (!outage) {
-        scheduleOwed();
-        return;
-      }
-      if (pendingRefetch.current != null) clearTimeout(pendingRefetch.current);
+      if (!outage) return;
+      owed.current = true;
       runOwed();
     };
 
     // Coming back to the window is when a held-back refetch is finally worth paying for.
     const onVisibility = () => {
-      if (!document.hidden && owed.current != null) scheduleOwed();
+      if (!document.hidden) runOwed();
     };
     document.addEventListener("visibilitychange", onVisibility);
 
@@ -202,8 +162,6 @@ export function TosseLiveHost() {
       disposed = true;
       if (timer.current != null) clearTimeout(timer.current);
       timer.current = null;
-      if (pendingRefetch.current != null) clearTimeout(pendingRefetch.current);
-      pendingRefetch.current = null;
       document.removeEventListener("visibilitychange", onVisibility);
       unlisteners.forEach((un) => un());
     };

@@ -3,10 +3,12 @@
 //! Two stacked models, both bundled into the binary (`include_bytes!`), so the
 //! feature works offline on first launch:
 //!
-//!  1. **Silero VAD** gates everything: the neural nets below run ONLY while it
-//!     hears speech (the battery guard — silence costs ~one tiny VAD inference
-//!     per 512 samples, not the full stack). VAD failures degrade to "always
-//!     active" rather than killing the feature.
+//!  1. **Silero VAD**, on every 512 samples. It does not decide what runs: it
+//!     VETOES a fire unless it heard speech somewhere in the trailing ~1.3 s
+//!     (`VAD_VETO_MIN`). There is no silence-based battery guard — the whole
+//!     neural pipeline below runs on every step, speech or silence, for as long
+//!     as the wake word is on. A VAD failure fails OPEN (reported as certain
+//!     speech, so the veto never blocks) rather than killing the feature.
 //!
 //!  2. **openWakeWord** proper, a three-stage pipeline on 16 kHz mono audio:
 //!       audio → melspectrogram (32-bin) → shared speech embedding (96-dim) →
@@ -22,6 +24,14 @@
 //! classifier scores them. This is a faithful streaming approximation — the exact
 //! recall is tuned by the sensitivity threshold and validated with a real mic
 //! (the /build-app spike), not asserted headlessly.
+//!
+//! ⚠️ The melspectrogram is recomputed over the whole trailing window on purpose,
+//! not incrementally over the new audio the way openWakeWord's own streaming code
+//! does: the model floors every value at 80 dB below the loudest value of ITS
+//! input, so a quiet frame's value depends on everything computed with it. An
+//! incremental version would feed the classifier features this pipeline was never
+//! tuned on, to save ~13 µs a step (the model's cost is almost all fixed per-call
+//! overhead). `the_melspectrogram_depends_on_its_whole_window` pins the reason.
 
 use ort::session::Session;
 use ort::value::Tensor;
@@ -30,8 +40,10 @@ use ort::value::Tensor;
 /// input down to this before anything here runs.
 pub const SAMPLE_RATE: u32 = 16_000;
 
-/// One detection step per 80 ms of new audio (openWakeWord's step).
-const CHUNK: usize = 1280;
+/// One detection step per 80 ms of new audio (openWakeWord's step). `capture.rs`
+/// batches the microphone into whole steps, so the worker thread wakes once per
+/// step instead of once per audio callback.
+pub const CHUNK: usize = 1280;
 /// Mel frames per embedding window, and the embedding stride.
 const EMB_FRAMES: usize = 76;
 /// Number of consecutive embeddings the classifier scores.
@@ -95,8 +107,8 @@ const DEBUG_AUDIO_SAMPLES: usize = SAMPLE_RATE as usize * 4;
 pub struct StepTrace {
     /// The classifier's probability for this step.
     pub score: f32,
-    /// Silero's PEAK speech probability over the audio that fed this step.
-    /// DIAGNOSTIC ONLY — the VAD gates nothing today (see `feed`).
+    /// Silero's PEAK speech probability over the audio that fed this step — what
+    /// the fire-time veto reads over the trailing window (see `VAD_VETO_MIN`).
     pub vad: f32,
     /// RMS of the trailing mel window, in [0, 1]. Near zero means the step scored
     /// (near-)silence — which no spoken phrase can do, so a fire there points at
@@ -196,7 +208,9 @@ fn run_single(session: &mut Session, shape: Vec<i64>, data: Vec<f32>) -> Result<
 fn build_session(bytes: &[u8]) -> Result<Session, String> {
     Session::builder()
         .map_err(|e| e.to_string())?
-        // A background listener has no business grabbing every core.
+        // A background listener has no business grabbing every core. One intra-op
+        // thread also means inference runs ON the worker thread, so the worker's
+        // QoS class (see `run_worker`) is what schedules it.
         .with_intra_threads(1)
         .map_err(|e| e.to_string())?
         .commit_from_memory(bytes)
@@ -205,7 +219,7 @@ fn build_session(bytes: &[u8]) -> Result<Session, String> {
 
 /// The Silero VAD, kept separate so its failures never take the wake pipeline
 /// down: if the model errors even once, `disabled` latches and the caller treats
-/// every frame as speech (higher CPU, still functional).
+/// every frame as speech (the veto then never blocks; detection still works).
 struct Vad {
     session: Session,
     state: Vec<f32>,
@@ -230,7 +244,7 @@ impl Vad {
     /// Feed new audio; return the PEAK speech probability across the frames this
     /// call completed (0.0 when it completed none — callers accumulate with `max`,
     /// for which that is a no-op). Returning the probability rather than a boolean
-    /// is what lets it ride in the trace and, later, veto a fire. On any model
+    /// is what lets it ride in the trace and veto a fire. On any model
     /// error the VAD latches off and reports certain speech (fail-open — never
     /// silence the feature over a VAD glitch).
     fn speech_prob(&mut self, samples: &[f32]) -> f32 {
@@ -363,21 +377,19 @@ impl Engine {
     /// moment the configured phrase is detected (at most once per spoken phrase,
     /// thanks to the cooldown). `None` otherwise.
     pub fn feed(&mut self, samples: &[f32]) -> Option<Detection> {
-        // VAD is computed for diagnostics only — it does NOT gate the pipeline.
+        // The VAD feeds the fire-time veto only — it does NOT gate the pipeline.
         // openWakeWord needs a CONTINUOUS rolling window of embeddings (~2 s); a
         // hard VAD gate that ran the stack only during speech (and cleared the
         // embedding buffer on silence) mis-anchored that window and starved the
         // classifier of the 16 consecutive embeddings it needs — so a short
         // utterance never fired. Run the stack every step.
         //
-        // Reading this probability as a FIRE-TIME VETO would not touch the rolling
-        // window, and is the next move against false positives. ⚠️ When that lands,
-        // veto on the peak across the TRAILING WINDOW, never on the firing step's
-        // own 80 ms: the classifier scores ~2 s of context, so it typically fires
-        // one or two steps AFTER the phrase ends, on new audio that is already
+        // The veto reads the peak across the TRAILING WINDOW, never the firing
+        // step's own 80 ms: the classifier scores ~2 s of context, so it typically
+        // fires one or two steps AFTER the phrase ends, on new audio that is already
         // silent. Measured on a `say "Alexa"` clip: the step that scores 1.000
         // carries vad=0.01, while the steps holding the phrase itself read ~1.0.
-        // A naive per-step veto would therefore reject every real detection.
+        // A per-step veto would therefore reject every real detection.
         self.vad_peak = self.vad_peak.max(self.vad.speech_prob(samples));
 
         self.audio.extend_from_slice(samples);
@@ -637,9 +649,9 @@ mod tests {
 
     /// Push a synthetic tone through mel → embedding → classifier directly,
     /// asserting every ONNX run succeeds and the shapes line up end-to-end. The
-    /// streaming path logs-and-swallows inference errors (and VAD gates the stack
-    /// out of the silence test), so a shape bug could hide until a live mic — this
-    /// catches it headlessly. Detection ACCURACY still needs a real mic.
+    /// streaming path logs-and-swallows inference errors, so a shape bug could
+    /// hide until a live mic — this catches it headlessly. Detection ACCURACY
+    /// still needs a real mic.
     #[test]
     fn pipeline_shapes_line_up_end_to_end() {
         let mut mel = build_session(MEL_MODEL).unwrap();
@@ -790,6 +802,70 @@ mod tests {
         );
     }
 
+    /// The capture now hands the engine one batch per 80 ms step instead of every
+    /// ~10 ms callback. Batching must change no DECISION: the same fires and the
+    /// same suppressed candidates (debug on, so the gates' rejections show too),
+    /// with bit-identical scores. The batches are cut exactly the way `capture.rs`
+    /// cuts them — flushed in the callback that completes a step — so each one
+    /// completes at most ONE step. That matters: `feed` returns only the last
+    /// candidate of a call, so a call spanning several steps could swallow a
+    /// debug-only suppressed candidate (fires are safe — the cooldown follows them).
+    #[test]
+    fn batching_the_microphone_changes_no_decision() {
+        let alexa = parse_wav_i16(SPEECH_WAV);
+        let tone = |n: usize| pseudo_noise(n, 0.002);
+        let second = SAMPLE_RATE as usize;
+        let audio: Vec<f32> = [tone(second), alexa.clone(), tone(second * 2), alexa, tone(second)]
+            .concat();
+        let callback = 171; // one 512-frame 48 kHz CoreAudio callback, resampled
+        let run = |batched: bool| {
+            let mut engine = Engine::new(DEFAULT_PHRASE, 0.5, true).expect("engine builds");
+            let mut out = Vec::new();
+            let (mut pending, mut into_step) = (Vec::new(), 0usize);
+            for c in audio.chunks(callback) {
+                pending.extend_from_slice(c);
+                into_step += c.len();
+                if batched && into_step < CHUNK {
+                    continue; // the batcher holds it until a step completes
+                }
+                into_step %= CHUNK;
+                out.extend(engine.feed(&std::mem::take(&mut pending)));
+            }
+            out.into_iter().map(|d| (d.suppressed_by, d.score.to_bits())).collect::<Vec<_>>()
+        };
+        let per_callback = run(false);
+        assert!(
+            per_callback.iter().any(|(gate, _)| gate.is_none()),
+            "the fixture must fire, or this proves nothing: {per_callback:?}"
+        );
+        assert_eq!(run(true), per_callback, "batching per step changed a decision");
+    }
+
+    /// Why the melspectrogram is recomputed over the whole trailing window every
+    /// step instead of incrementally over the new audio (openWakeWord's own
+    /// streaming — and the "obvious" optimisation): the model floors every value at
+    /// 80 dB below the loudest value of ITS INPUT, so a quiet frame computed next to
+    /// speech is not the frame computed next to silence. Pinned so the change is not
+    /// made by accident: it would feed the classifier features the pipeline was
+    /// never tuned on (measured: scores moved by up to 5e-3).
+    #[test]
+    fn the_melspectrogram_depends_on_its_whole_window() {
+        let mut mel = build_session(MEL_MODEL).unwrap();
+        // Digital silence, then speech: far more than 80 dB inside one window.
+        let mut audio = vec![0.0f32; 1760];
+        audio.extend(parse_wav_i16(SPEECH_WAV));
+        audio.resize(MEL_WINDOW_SAMPLES, 0.0);
+        let scaled: Vec<f32> = audio.iter().map(|s| s * 32768.0).collect();
+        let (_, full) =
+            run_single(&mut mel, vec![1, MEL_WINDOW_SAMPLES as i64], scaled.clone()).unwrap();
+        // The same first 8 frames (all silence), computed on their own.
+        let (_, alone) = run_single(&mut mel, vec![1, 1632], scaled[..1632].to_vec()).unwrap();
+        let floor = full.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 80.0;
+        assert!(full.iter().all(|&v| v >= floor), "nothing sits below the window's floor");
+        assert!(full.iter().any(|&v| v == floor), "the silence was lifted exactly TO it");
+        assert_ne!(alone[..], full[..alone.len()], "the same frames computed alone differ");
+    }
+
     /// A muted or dead input device delivers values the mel stage turns non-finite.
     /// Those steps must be DROPPED, never scored: a NaN through the classifier can
     /// come back as a confident hit.
@@ -917,6 +993,106 @@ mod tests {
         }
         eprintln!();
         eprintln!("[corpus] {} files: {fired} FIRED, suppressed {suppressed:?}", paths.len());
+    }
+
+    /// CPU time consumed by the CALLING thread, in seconds. Every session is built
+    /// with one intra-op thread, so the ONNX work runs on the thread that calls
+    /// `run` — this is the engine's real cost, without the rest of the test binary.
+    fn thread_cpu_secs() -> f64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+    }
+
+    /// Diagnostic (ignored) micro-benchmark: CPU per second of audio through the
+    /// whole engine, in silence (room tone) and in continuous speech (the fixture
+    /// looped), fed per ~10 ms callback (171) and per 80 ms step (what the capture
+    /// now sends). `WAKE_BENCH_QOS=utility` runs it at the worker's QoS class.
+    ///   cargo test --release --lib wake::engine::tests::bench_engine_cpu -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_engine_cpu() {
+        #[cfg(target_os = "macos")]
+        if std::env::var("WAKE_BENCH_QOS").as_deref() == Ok("utility") {
+            super::super::lower_thread_qos();
+            eprintln!("[bench] running at UTILITY QoS");
+        }
+        let seconds = 30usize;
+        let n = SAMPLE_RATE as usize * seconds;
+        let clip = parse_wav_i16(SPEECH_WAV);
+        let speech: Vec<f32> = clip.iter().copied().cycle().take(n).collect();
+        let cases = [("silence (room tone)", pseudo_noise(n, 0.002)), ("speech (fixture looped)", speech)];
+        for (label, audio) in &cases {
+            for chunk in [171usize, CHUNK] {
+                let mut engine = Engine::new(DEFAULT_PHRASE, 0.5, false).expect("engine builds");
+                for c in pseudo_noise(SAMPLE_RATE as usize * 3, 0.002).chunks(chunk) {
+                    engine.feed(c); // warm-up: prime the buffers and sessions, not measured
+                }
+                let t0 = thread_cpu_secs();
+                let mut slowest = std::time::Duration::ZERO;
+                for c in audio.chunks(chunk) {
+                    let w0 = std::time::Instant::now();
+                    engine.feed(c);
+                    slowest = slowest.max(w0.elapsed());
+                }
+                let cpu = thread_cpu_secs() - t0;
+                eprintln!(
+                    "[bench] {label:<24} chunk={chunk:>4}: {:.2} ms CPU per audio second \
+                     ({:.2}% of one core), slowest call {:.1} ms",
+                    cpu * 1000.0 / seconds as f64,
+                    cpu * 100.0 / seconds as f64,
+                    slowest.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+    }
+
+    /// Diagnostic (ignored): the cost of each stage on its own, per call and per
+    /// second of audio at the rate the engine calls it. Tells where the time goes.
+    ///   cargo test --release --lib wake::engine::tests::bench_stage_costs -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_stage_costs() {
+        let reps = 300usize;
+        let scaled: Vec<f32> =
+            pseudo_noise(MEL_WINDOW_SAMPLES, 0.05).iter().map(|s| s * 32768.0).collect();
+        let mut mel = build_session(MEL_MODEL).unwrap();
+        let mut embedding = build_session(EMBEDDING_MODEL).unwrap();
+        let mut classifier = build_session(classifier_bytes(DEFAULT_PHRASE)).unwrap();
+        let mut vad = Vad::new().unwrap();
+        let steps_per_s = SAMPLE_RATE as f64 / CHUNK as f64;
+        let vad_per_s = SAMPLE_RATE as f64 / VAD_FRAME as f64;
+        let time = |label: &str, per_s: f64, f: &mut dyn FnMut()| {
+            f(); // warm-up
+            let t0 = thread_cpu_secs();
+            for _ in 0..reps {
+                f();
+            }
+            let per_call = (thread_cpu_secs() - t0) / reps as f64;
+            eprintln!(
+                "[stage] {label:<34} {:>8.1} µs/call × {per_s:>5.2}/s = {:>6.2} ms per audio second",
+                per_call * 1e6,
+                per_call * per_s * 1000.0
+            );
+        };
+        time("mel over the trailing window", steps_per_s, &mut || {
+            run_single(&mut mel, vec![1, scaled.len() as i64], scaled.clone()).unwrap();
+        });
+        let emb_in = vec![1.0f32; EMB_FRAMES * MEL_BINS];
+        time("embedding (76 frames)", steps_per_s, &mut || {
+            run_single(&mut embedding, vec![1, EMB_FRAMES as i64, MEL_BINS as i64, 1], emb_in.clone())
+                .unwrap();
+        });
+        let cls_in = vec![0.1f32; CLASSIFIER_EMBEDDINGS * 96];
+        time("classifier (16 embeddings)", steps_per_s, &mut || {
+            run_single(&mut classifier, vec![1, CLASSIFIER_EMBEDDINGS as i64, 96], cls_in.clone())
+                .unwrap();
+        });
+        let frame = vec![0.01f32; VAD_FRAME + VAD_CONTEXT];
+        time("silero VAD (576 samples)", vad_per_s, &mut || {
+            vad.run_frame(&frame).unwrap();
+        });
     }
 
     /// Minimal PCM-16 WAV reader: locate the `data` subchunk, decode i16 LE → f32.

@@ -35,7 +35,7 @@ use ipc::commands::{
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
-    interrupt_session, list_disk_conversations, list_extensions, list_marketplaces,
+    interrupt_session, reconnect_remote_sessions, list_disk_conversations, list_extensions, list_marketplaces,
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, load_session_context, load_session_goal,
@@ -89,7 +89,8 @@ use ipc::commands::{
 };
 use bootstrap::connect::bootstrap_forget_host_key;
 use bootstrap::orchestrator::{
-    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
+    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
+    BootstrapSessions,
     ServerLocks,
 };
 use bootstrap::server_setup::{cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
@@ -99,7 +100,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
-    TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -285,6 +286,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             generate_conversation_title,
             generate_message_summary,
             interrupt_session,
+            reconnect_remote_sessions,
             mcp_status,
             mcp_toggle,
             mcp_reconnect,
@@ -388,6 +390,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             bootstrap_resume,
             bootstrap_cancel,
             machine_diagnose,
+            machine_reachability,
             machine_repair,
             artifact_host_show,
             artifact_host_set_bounds,
@@ -397,7 +400,6 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             artifact_host_open_claude_url,
         ])
         .events(collect_events![
-            TickEvent,
             SessionStateEvent,
             SessionMessageEvent,
             SessionPermissionEvent,
@@ -840,7 +842,10 @@ pub fn run() {
                 if cfg.enabled {
                     let wake = wake.clone();
                     std::thread::spawn(move || {
-                        let _ = wake.apply(cfg);
+                        // Without an OpenAI key every detection is dropped, so the
+                        // mic stays off — paused, choice kept (`require_voice_key`).
+                        let has_key = voice::status().configured;
+                        let _ = wake.apply(wake::require_voice_key(cfg, has_key));
                     });
                 }
             }
@@ -854,24 +859,6 @@ pub fn run() {
                 let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
                 tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
-
-            // Rust timer: emit a TickEvent every second (Rust -> React) — kept as
-            // a heartbeat / proof of the outbound event leg.
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let mut seq = 0u32;
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    seq += 1;
-                    let ev = TickEvent {
-                        seq,
-                        message: format!("tick #{seq}"),
-                    };
-                    if TickEvent::emit(&ev, &handle).is_err() {
-                        break; // window closed
-                    }
-                }
-            });
             Ok(())
         })
         .build(tauri::generate_context!())

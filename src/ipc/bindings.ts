@@ -1301,6 +1301,20 @@ async interruptSession(session: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Retry every REMOTE session's lost link NOW rather than at the end of its backoff —
+ * fired by the front when the Mac's network comes back or the user returns to the app
+ * (see `SessionCommand::ReconnectNow`). Cheap and idempotent: an attached session, which
+ * is not waiting out a backoff, ignores it. A session that closed meanwhile is skipped.
+ */
+async reconnectRemoteSessions() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_remote_sessions") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Query a running session's LIVE MCP server status (real connection state +
  * tools per server) via the `mcp_status` control request — the authoritative
  * source the conversation view uses (NOT the stale `system/init` snapshot).
@@ -2745,6 +2759,18 @@ async machineDiagnose(machineId: string) : Promise<Result<ServerDiagnosis, strin
 }
 },
 /**
+ * The ambient health probe — see [`probe_reachability`] for why it is not
+ * [`machine_diagnose`].
+ */
+async machineReachability(machineId: string) : Promise<Result<MachineReachability, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_reachability", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
  * running anything — `Err` with [`server_busy_error`] when a `bootstrap_server`/
  * `bootstrap_resume`/another `machine_repair` is already in flight against it (the
@@ -2859,7 +2885,6 @@ sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
-tickEvent: TickEvent,
 tosseCrmEvent: TosseCrmEvent,
 tosseLiveStateEvent: TosseLiveStateEvent,
 wakeWordEvent: WakeWordEvent,
@@ -2887,7 +2912,6 @@ sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
-tickEvent: "tick-event",
 tosseCrmEvent: "tosse-crm-event",
 tosseLiveStateEvent: "tosse-live-state-event",
 wakeWordEvent: "wake-word-event",
@@ -4292,6 +4316,16 @@ owned: boolean }
  */
 export type MachineProvisionStatus = { machine_id: string; state: ProvisionState; checked_at_ms: number }
 /**
+ * The one fact the AMBIENT machine-health probe needs: can this Mac reach the server
+ * right now, and if not, why. See [`probe_reachability`].
+ */
+export type MachineReachability = { reachable: boolean; 
+/**
+ * The diagnosis's own wording for why, when unreachable — the SAME string a full
+ * [`diagnose`] would put in [`DiagnosisState::Failed`]. `None` when reachable.
+ */
+reason: string | null }
+/**
  * A remote host (a "server") reached over SSH, on which repos can live and their
  * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
  * the connection coordinates so a user adds a server from the UI without editing any
@@ -5615,10 +5649,6 @@ export type TerminalExitEvent = { id: string }
  * Keyed by the terminal `id` so the front routes it to the right xterm instance.
  */
 export type TerminalOutputEvent = { id: string; data: string }
-/**
- * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
- */
-export type TickEvent = { seq: number; message: string }
 /**
  * The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
  * the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),

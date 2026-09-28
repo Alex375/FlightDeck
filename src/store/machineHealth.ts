@@ -27,7 +27,9 @@
 //    fixes. Same reasoning the remote mark itself already carries.
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
-import { commands, type ServerDiagnosis } from "../ipc/client";
+import { commands, type MachineReachability, type ServerDiagnosis } from "../ipc/client";
+import type { Conversation, Repo } from "./conversationsStore";
+import type { SessionEntry } from "./types";
 
 /** What we know about one machine's reachability. Absent from the store = UNKNOWN. */
 export interface MachineHealth {
@@ -61,11 +63,22 @@ export function healthFromDiagnosis(
   d: ServerDiagnosis,
   nowMs: number,
 ): MachineHealth {
+  return healthFromReachability(prev, { reachable: d.reachable, reason: d.reachable ? null : reasonOf(d) }, nowMs);
+}
+
+/** Fold a reachability-only verdict (the ambient probe, `machine_reachability`) into what
+ *  we already knew. Same fold as {@link healthFromDiagnosis} — the backend builds
+ *  `reason` from the very same classifier, in the very same words. Pure. */
+export function healthFromReachability(
+  prev: MachineHealth | undefined,
+  r: MachineReachability,
+  nowMs: number,
+): MachineHealth {
   return {
-    reachable: d.reachable,
+    reachable: r.reachable,
     checkedAtMs: nowMs,
-    lastReachedAtMs: d.reachable ? nowMs : (prev?.lastReachedAtMs ?? null),
-    reason: d.reachable ? null : reasonOf(d),
+    lastReachedAtMs: r.reachable ? nowMs : (prev?.lastReachedAtMs ?? null),
+    reason: r.reachable ? null : r.reason,
     probeError: null,
   };
 }
@@ -87,6 +100,9 @@ interface MachineHealthState {
    *  are in flight at once (see `isStaleProbe`). Omit it only where no newer probe can
    *  possibly exist. */
   record: (machineId: string, diagnosis: ServerDiagnosis, startedAtMs?: number) => void;
+  /** Record a reachability-only verdict — the ambient probe's, or the evidence of a live
+   *  session that is attached to the machine right now. Same ordering rule as `record`. */
+  recordReachability: (machineId: string, verdict: MachineReachability, startedAtMs?: number) => void;
   /** A probe that never produced a verdict. Keeps whatever we already knew. */
   recordProbeError: (machineId: string, error: string, startedAtMs?: number) => void;
   /** Drop a machine's row — it was unpaired. */
@@ -127,6 +143,17 @@ export const useMachineHealthStore = create<MachineHealthState>((set) => ({
       byMachine: {
         ...s.byMachine,
         [machineId]: healthFromDiagnosis(s.byMachine[machineId], diagnosis, Date.now()),
+      },
+    }));
+  },
+  recordReachability: (machineId, verdict, startedAtMs) => {
+    if (isStaleProbe(machineId, startedAtMs)) return;
+    appliedProbeStartMs.set(machineId, startedAtMs ?? Date.now());
+    lastProbeAtMs.set(machineId, Date.now());
+    set((s) => ({
+      byMachine: {
+        ...s.byMachine,
+        [machineId]: healthFromReachability(s.byMachine[machineId], verdict, Date.now()),
       },
     }));
   },
@@ -182,6 +209,50 @@ export const useUnreachableMachineIds = (): string[] =>
 export const isUnreachable = (h: MachineHealth | undefined): boolean =>
   h !== undefined && h.checkedAtMs > 0 && !h.reachable;
 
+/** The verdict a live, attached session is evidence of. */
+export const REACHED: MachineReachability = { reachable: true, reason: null };
+
+/**
+ * Machines that a live session is ATTACHED to right now — i.e. whose ssh link is up and
+ * answering its keepalives this very moment (`link === null` once `fd_attach` landed;
+ * `connecting`/`reconnecting` otherwise). For those, a probe would only re-prove what the
+ * session already proves, at the price of a fresh ssh handshake: the ambient poll skips
+ * them and files the attached link as the evidence instead. The moment the link drops,
+ * its state flips to `reconnecting`, which probes at once (`useGlobalSessionEvents`).
+ *
+ * Pure (types only, no store import — `conversationsStore` imports this module).
+ * `session_id` must be known too: a freshly spawned entry starts from the neutral
+ * connecting state (`link: null`) before its first real state event, and must not read
+ * as attached.
+ */
+export function attachedMachineIds(
+  conversations: ReadonlyArray<Pick<Conversation, "id" | "repoId" | "handle">>,
+  repos: ReadonlyArray<Pick<Repo, "id" | "machineId">>,
+  sessions: Readonly<Record<string, Pick<SessionEntry, "state"> | undefined>>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const c of conversations) {
+    if (!c.handle) continue;
+    const st = sessions[c.id]?.state;
+    if (!st || st.ended || st.link != null || st.session_id == null) continue;
+    const machineId = repos.find((r) => r.id === c.repoId)?.machineId;
+    if (machineId) out.add(machineId);
+  }
+  return out;
+}
+
+/** Whether any live remote session has LOST its link (connecting / reconnecting) — the
+ *  only case a reconnect nudge can do anything for. Pure. */
+export function anyRemoteLinkDown(
+  sessions: Readonly<Record<string, Pick<SessionEntry, "state"> | undefined>>,
+): boolean {
+  for (const id in sessions) {
+    const st = sessions[id]?.state;
+    if (st && !st.ended && st.link != null) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Probing
 // ---------------------------------------------------------------------------
@@ -217,8 +288,11 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
   const startedAtMs = Date.now();
   lastProbeAtMs.set(machineId, startedAtMs);
   try {
-    const res = await commands.machineDiagnose(machineId);
-    if (res.status === "ok") useMachineHealthStore.getState().record(machineId, res.data, startedAtMs);
+    // Reachability only — see `machine_reachability`'s doc in Rust: the full diagnosis is a
+    // dozen server-side commands (two of them Node.js start-ups) for a glyph that reads one
+    // boolean. The server panel still runs `machine_diagnose` and files it through `record`.
+    const res = await commands.machineReachability(machineId);
+    if (res.status === "ok") useMachineHealthStore.getState().recordReachability(machineId, res.data, startedAtMs);
     else useMachineHealthStore.getState().recordProbeError(machineId, res.error, startedAtMs);
   } catch (e) {
     useMachineHealthStore

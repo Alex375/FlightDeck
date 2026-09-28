@@ -30,7 +30,7 @@ import type {
   WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
-import { probeMachine } from "../store/machineHealth";
+import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHealth";
 import { isGenericThinking } from "../store/activity";
 import {
   useBackgroundTasksStore,
@@ -301,16 +301,45 @@ export function useGlobalSessionEvents(): void {
   // The `state.busy` gate is essential — without it an idle empty session reads as "thinking".
   // 1 s (not 500 ms) is deliberate: the word only escalates on 40 s tier/rotation boundaries, so
   // second-resolution is ample and it halves the store churn during otherwise-quiet thinking.
+  // The ticker only RUNS while at least one session is busy: an idle app has nothing to accrue,
+  // and a once-a-second wakeup forever is a battery cost for nothing. It is driven by a plain
+  // store subscription (not a selector) so a busy flip never re-renders the host. When the last
+  // session goes idle, one final sweep seals every open spell — the seal is the ticker's job
+  // (`accrueThinking(…, false)`), so stopping without it would leave a spell open.
   useEffect(() => {
-    const id = setInterval(() => {
+    let id: ReturnType<typeof setInterval> | null = null;
+    const sweep = () => {
       const now = Date.now();
       const store = useConversationStore.getState();
       for (const session in store.sessions) {
         const entry = store.sessions[session];
         store.accrueThinking(session, entry.state.busy && isGenericThinking(entry), now);
       }
-    }, 1000);
-    return () => clearInterval(id);
+    };
+    const sync = (sessions: ReturnType<typeof useConversationStore.getState>["sessions"]) => {
+      let busy = false;
+      for (const session in sessions) {
+        if (sessions[session].state.busy) {
+          busy = true;
+          break;
+        }
+      }
+      if (busy && id === null) {
+        id = setInterval(sweep, 1000);
+      } else if (!busy && id !== null) {
+        clearInterval(id);
+        id = null;
+        sweep();
+      }
+    };
+    sync(useConversationStore.getState().sessions);
+    const unsubscribe = useConversationStore.subscribe((state, prev) => {
+      if (state.sessions !== prev.sessions) sync(state.sessions);
+    });
+    return () => {
+      unsubscribe();
+      if (id !== null) clearInterval(id);
+    };
   }, []);
 
   useEffect(() => {
@@ -494,6 +523,13 @@ export function useGlobalSessionEvents(): void {
       if (payload.state.link && (!prev || !prev.link)) {
         const machineId = machineIdForConv(session);
         if (machineId) void probeMachine(machineId);
+      } else if (prev?.link && !payload.state.link && !payload.state.ended) {
+        // …and the opposite edge: the link just ATTACHED (`fd_attach` landed) — an ssh
+        // round trip that worked. File it, so a mark still red from the outage turns
+        // back at once: the ambient poll no longer probes a machine a session is attached
+        // to (see `attachedMachineIds`), so nothing else would.
+        const machineId = machineIdForConv(session);
+        if (machineId) useMachineHealthStore.getState().recordReachability(machineId, REACHED);
       }
       // Remember the AUTHORITATIVE context window (from the live result's modelUsage)
       // so the ring is seeded correctly next time this conversation is opened — the
