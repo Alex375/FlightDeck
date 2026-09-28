@@ -10,7 +10,7 @@
 // Only mounted while the `conversationSidePanel` display pref is on — see ConductorConversation.
 
 import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { ContextUsageBody, Dot, Ico, Menu, TosseCrmMark } from "../../ui/kit";
+import { Dot, Ico, TosseCrmMark } from "../../ui/kit";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
 import {
   useSetTosseTaskAssignee,
@@ -37,7 +37,9 @@ import { TaskStatusActions, TaskStatusChip, TaskSubtaskRows } from "../tosse/Tos
 import { AssigneePicker } from "../tosse/AssigneePicker";
 import { TodoList } from "../todos/TodoList";
 import { useArtifacts, type Artifact } from "./artifacts";
-import { useBackendUsage } from "./backendUsage";
+import { ContextUsageMenu } from "./ContextUsageMenu";
+import { TelemetryDeck } from "./TelemetryDeck";
+import { useDisplay } from "../../store/display";
 import { ArtifactFace } from "./artifactIcon";
 import { artifactKind, openArtifactView } from "./artifactOpen";
 import { openConversationAt } from "../../store/threadJump";
@@ -54,20 +56,26 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
   // The context section appears once there IS a token count to show — an untouched
   // conversation has nothing to report, and "— / —" is not a reading.
   const contextKnown = useContextData(conv.id).ctx.usedKnown;
+  // The opt-in telemetry deck (OFF by default): when on, its gauge IS the context reading, so
+  // the plain Context section steps aside rather than showing the same number twice.
+  const telemetry = useDisplay((d) => d.conversationTelemetry);
 
   // Same gate as the header chip it replaces: a linked task only shows while TOSSE exists.
   const showTask = tosseAvailable && !!conv.tosseTaskId && !!conv.tosseTaskTitle;
-  const empty = !showTask && !goal && todos.length === 0 && artifacts.length === 0 && !contextKnown;
+  const empty =
+    !telemetry && !showTask && !goal && todos.length === 0 && artifacts.length === 0 && !contextKnown;
 
   return (
     <aside className={s.panel} aria-label="Conversation panel">
       <div className={s.head}>
-        <span className={s.headTab}>Conversation</span>
-        {/* A standing reminder, not a tooltip: the panel is opened and closed all the time,
-            and the chord is only worth having if it is known. */}
-        <kbd className={s.kbd} title="Open / close this panel">
-          {CONVERSATION_PANEL_CHORD}
-        </kbd>
+        <span className={s.headTab}>
+          Conversation
+          {/* A standing reminder, not a tooltip: the panel is opened and closed all the time,
+              and the chord is only worth having if it is known. */}
+          <kbd className={s.kbd} title="Open / close this panel">
+            {CONVERSATION_PANEL_CHORD}
+          </kbd>
+        </span>
         <button
           type="button"
           className={s.iconBtn}
@@ -80,6 +88,8 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
       </div>
 
       <div className={s.body}>
+        {/* First when on: it is the whole point of turning it on. */}
+        {telemetry ? <TelemetryDeck convId={conv.id} /> : null}
         {showTask ? <TaskSection conv={conv} /> : null}
         {goal ? (
           <GoalSection convId={conv.id} condition={goal.condition} reason={goal.reason} />
@@ -88,7 +98,7 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
         {artifacts.length > 0 ? <ArtifactsSection convId={conv.id} artifacts={artifacts} /> : null}
         {/* Last of the scrolling sections: what the conversation IS (its task, goal, work and
             output) comes before how much room it has left. */}
-        {contextKnown ? <ContextSection convId={conv.id} /> : null}
+        {contextKnown && !telemetry ? <ContextSection convId={conv.id} /> : null}
         {empty ? (
           <p className={s.empty}>
             Nothing to track yet. This conversation's TOSSE task, goal, todo list, artifacts
@@ -286,9 +296,7 @@ function GoalSection({
  * answering the same question must not be a third implementation of it.
  */
 function ContextSection({ convId }: { convId: string }) {
-  const { ctx, ready, plan } = useContextData(convId);
-  const usage = useBackendUsage(convId, { enabled: ready });
-  const warn = ctx.windowKnown && ctx.pct >= 70;
+  const { ctx } = useContextData(convId);
   return (
     <section className={s.section}>
       <div className={s.label}>
@@ -296,13 +304,9 @@ function ContextSection({ convId }: { convId: string }) {
         Context
         <span className={`${s.meta} wf-mono`}>{ctx.windowKnown ? `${ctx.pct}%` : "—"}</span>
       </div>
-      {/* Portalled: the sections scroll (`.body` is an `overflow-y:auto` box), so an in-flow
-          popover would be clipped by it — the same reason the Flight Deck's meter portals. */}
-      <Menu
-        portal
-        align="right"
-        onOpen={usage.onOpenUsage}
-        trigger={
+      <ContextUsageMenu
+        convId={convId}
+        trigger={(ctx, warn) => (
           <button
             className={s.ctxBtn}
             data-warn={warn || undefined}
@@ -333,20 +337,8 @@ function ContextSection({ convId }: { convId: string }) {
               </span>
             </span>
           </button>
-        }
-      >
-        <ContextUsageBody
-          ctx={ctx}
-          plan={usage.isCodex ? null : plan}
-          onCompact={usage.onCompact}
-          usage={usage.usage}
-          usageLoading={usage.usageLoading}
-          usageError={usage.usageError}
-          usageUpdatedAt={usage.usageUpdatedAt}
-          usageBackend={usage.usageBackend}
-          onRefreshUsage={usage.onRefreshUsage}
-        />
-      </Menu>
+        )}
+      />
     </section>
   );
 }

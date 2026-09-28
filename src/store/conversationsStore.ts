@@ -62,6 +62,7 @@ import {
   clearArtifactsCache,
   clearAllArtifactsCache,
 } from "../features/conversation/artifacts";
+import { clearAllTelemetryCache, clearTelemetryCache } from "../features/conversation/telemetry";
 import { clearCodexControls, clearAllCodexControls } from "../features/conversation/codexControls";
 import { clearAllPolicy, clearConvPolicy, sessionOverridesForConv } from "./mcpPolicy";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
@@ -695,8 +696,10 @@ function teardownConversationSession(id: string, handle: string | null): void {
   useGitViewStore.getState().clear(id);
   useRemoteControlStore.getState().clear(id);
   useGoalStore.getState().clear(id);
-  // Drop the derived artifacts memo: it pins this conversation's timeline + tool results.
+  // Drop the derived artifacts and telemetry memos: each pins this conversation's timeline +
+  // tool results.
   clearArtifactsCache(id);
+  clearTelemetryCache(id);
   useLastMessageSummaryStore.getState().clear(id);
   autoTitlePending.delete(id);
   titleContext.delete(id);
@@ -2257,6 +2260,7 @@ export async function wipeAllData(): Promise<void> {
   useRemoteControlStore.getState().clearAll();
   useGoalStore.getState().clearAll();
   clearAllArtifactsCache();
+  clearAllTelemetryCache();
   useCodexPlanUsageStore.getState().clear();
   useLastMessageSummaryStore.getState().clearAll();
 }

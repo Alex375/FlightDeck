@@ -1,0 +1,259 @@
+import { describe, expect, it } from "vitest";
+import type { JsonValue, NormalizedBlock } from "../../ipc/client";
+import type { SessionEntry } from "../../store/types";
+import {
+  clearAllTelemetryCache,
+  closeBucket,
+  deckStatus,
+  fmtClock,
+  fmtSpan,
+  HISTOGRAM_BUCKETS,
+  histogramArrivals,
+  memoizedTelemetry,
+  selectTelemetry,
+  TELEMETRY_FEED_SIZE,
+  toolFamily,
+} from "./telemetry";
+
+function tuse(id: string, name: string, input: Record<string, unknown> = {}): NormalizedBlock {
+  return { type: "tool_use", id, name, input } as unknown as NormalizedBlock;
+}
+
+/** A minimal SessionEntry: assistant turns (optionally a sub-agent's), tool results (ids in
+ *  `errored` come back is_error) and turn results. */
+function entryOf(
+  turns: Array<{ id: string; parent?: string | null; blocks: NormalizedBlock[] }>,
+  results: Record<string, JsonValue> = {},
+  errored: string[] = [],
+  turnResults: Array<{ cost?: number | null; apiMs?: number | null }> = [],
+): SessionEntry {
+  const turnMap: Record<string, unknown> = {};
+  const timeline: Array<{ kind: "turn"; id: string }> = [];
+  for (const t of turns) {
+    turnMap[t.id] = {
+      id: t.id,
+      role: "assistant",
+      status: "final",
+      streamingText: "",
+      streamingThinking: "",
+      blocks: t.blocks,
+      parentToolUseId: t.parent ?? null,
+      hasThinking: false,
+    };
+    if (!t.parent) timeline.push({ kind: "turn", id: t.id });
+  }
+  const toolResults: Record<string, unknown> = {};
+  for (const [id, content] of Object.entries(results)) {
+    toolResults[id] = { toolUseId: id, content, isError: errored.includes(id), parentToolUseId: null };
+  }
+  const tr: Record<string, unknown> = {};
+  turnResults.forEach((r, i) => {
+    tr[`r${i}`] = {
+      subtype: "success",
+      isError: false,
+      result: null,
+      apiErrorStatus: null,
+      totalCostUsd: r.cost ?? null,
+      numTurns: 1,
+      durationMs: null,
+      durationApiMs: r.apiMs ?? null,
+      ttftMs: null,
+    };
+  });
+  return { timeline, turns: turnMap, toolResults, subThreads: {}, turnResults: tr } as unknown as SessionEntry;
+}
+
+describe("toolFamily", () => {
+  it("sorts the agent's tools onto the six dials", () => {
+    expect(toolFamily("Read")).toBe("read");
+    expect(toolFamily("Edit")).toBe("edit");
+    expect(toolFamily("MultiEdit")).toBe("edit");
+    expect(toolFamily("Write")).toBe("edit");
+    expect(toolFamily("ApplyPatch")).toBe("edit"); // Codex
+    expect(toolFamily("Bash")).toBe("shell");
+    expect(toolFamily("Monitor")).toBe("shell");
+    expect(toolFamily("Grep")).toBe("search");
+    expect(toolFamily("Glob")).toBe("search");
+    expect(toolFamily("Agent")).toBe("agent");
+    expect(toolFamily("Task")).toBe("agent"); // older transcripts
+    expect(toolFamily("WebFetch")).toBe("web");
+    expect(toolFamily("WebSearch")).toBe("web");
+  });
+
+  it("keeps everything else countable without inventing a dial for it", () => {
+    expect(toolFamily("Skill")).toBe("other");
+    expect(toolFamily("TodoWrite")).toBe("other");
+    expect(toolFamily("mcp__tosse__get_tasks")).toBe("other");
+    expect(toolFamily("Artifact")).toBe("other");
+  });
+});
+
+describe("selectTelemetry", () => {
+  it("reads as not known on an empty conversation, never as fake zeros of cost", () => {
+    const t = selectTelemetry(entryOf([]));
+    expect(t.totalCalls).toBe(0);
+    expect(t.costUsd).toBeNull();
+    expect(t.modelMs).toBeNull();
+    expect(t.events).toEqual([]);
+  });
+
+  it("counts calls per family, failures separately, and the total", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Read", { file_path: "/repo/src/a.ts" }),
+            tuse("b", "Read", { file_path: "/repo/src/b.ts" }),
+            tuse("c", "Bash", { command: "pnpm test" }),
+            tuse("d", "Skill", { skill: "land" }),
+          ],
+        },
+      ],
+      { a: "ok", b: "ok", c: "1 failed", d: "ok" },
+      ["c"],
+    );
+    const t = selectTelemetry(e);
+    expect(t.counts.read).toBe(2);
+    expect(t.counts.shell).toBe(1);
+    expect(t.counts.other).toBe(1);
+    expect(t.errors.shell).toBe(1);
+    expect(t.errors.read).toBe(0);
+    expect(t.totalCalls).toBe(4);
+  });
+
+  it("counts DISTINCT files touched by the edit family, a Codex patch's files included", () => {
+    const e = entryOf([
+      {
+        id: "t1",
+        blocks: [
+          tuse("a", "Edit", { file_path: "/r/a.ts" }),
+          tuse("b", "Edit", { file_path: "/r/a.ts" }), // same file twice
+          tuse("c", "Write", { file_path: "/r/b.ts" }),
+          tuse("d", "ApplyPatch", { changes: [{ path: "/r/c.ts" }, { path: "/r/a.ts" }] }),
+          tuse("e", "Read", { file_path: "/r/z.ts" }), // a read touches nothing
+        ],
+      },
+    ]);
+    expect(selectTelemetry(e).filesTouched).toBe(3);
+  });
+
+  it("includes the work a SUB-AGENT did, flagged as such", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("ag", "Agent", { description: "explore" })] },
+        { id: "s1", parent: "ag", blocks: [tuse("r1", "Read", { file_path: "/r/x.ts" })] },
+      ],
+      { ag: "done", r1: "ok" },
+    );
+    const t = selectTelemetry(e);
+    expect(t.subAgents).toBe(1);
+    expect(t.counts.read).toBe(1);
+    expect(t.events.find((ev) => ev.id === "r1")?.sub).toBe(true);
+    expect(t.events.find((ev) => ev.id === "ag")?.sub).toBe(false);
+  });
+
+  it("keeps a call RUNNING until its result lands", () => {
+    const e = entryOf([{ id: "t1", blocks: [tuse("a", "Bash", { command: "sleep 30" })] }]);
+    expect(selectTelemetry(e).events[0].status).toBe("running");
+  });
+
+  it("feeds the newest calls first, capped, with a readable one-line target", () => {
+    const blocks = Array.from({ length: 10 }, (_, i) =>
+      tuse(`c${i}`, i === 9 ? "Bash" : "Read", i === 9 ? { command: "pnpm build\n--mode x" } : { file_path: `/r/f${i}.ts` }),
+    );
+    const t = selectTelemetry(entryOf([{ id: "t1", blocks }]));
+    expect(t.events).toHaveLength(TELEMETRY_FEED_SIZE);
+    expect(t.events[0]).toMatchObject({ id: "c9", family: "shell", target: "pnpm build" });
+    expect(t.events[1]).toMatchObject({ id: "c8", target: "f8.ts" });
+  });
+
+  it("sums cost and model time only over the turns that reported them", () => {
+    const e = entryOf([], {}, [], [{ cost: 0.12, apiMs: 4000 }, { cost: null, apiMs: null }, { cost: 0.03, apiMs: 1500 }]);
+    const t = selectTelemetry(e);
+    expect(t.turns).toBe(3);
+    expect(t.costUsd).toBeCloseTo(0.15);
+    expect(t.modelMs).toBe(5500);
+  });
+});
+
+describe("memoizedTelemetry", () => {
+  it("returns the SAME object when nothing it reads has changed", () => {
+    clearAllTelemetryCache();
+    const e = entryOf([{ id: "t1", blocks: [tuse("a", "Read", { file_path: "/r/a.ts" })] }], { a: "ok" });
+    const first = memoizedTelemetry("s", e);
+    // A new entry object with the same content (e.g. a streamed token replaced `turns`).
+    const again = memoizedTelemetry("s", { ...e, toolResults: { ...e.toolResults } });
+    expect(again).toBe(first);
+  });
+
+  it("re-derives when a result lands and flips a call's status", () => {
+    clearAllTelemetryCache();
+    const turns = [{ id: "t1", blocks: [tuse("a", "Bash", { command: "ls" })] }];
+    expect(memoizedTelemetry("s", entryOf(turns)).events[0].status).toBe("running");
+    expect(memoizedTelemetry("s", entryOf(turns, { a: "x" })).events[0].status).toBe("ok");
+  });
+});
+
+describe("deckStatus (the lamp)", () => {
+  const idle = { busy: false, awaitingPermission: false, retrying: false, runningTool: null, streaming: false, backgroundOps: 0 };
+
+  it("puts a question waiting on the USER above everything — the agent is stopped", () => {
+    expect(deckStatus({ ...idle, busy: true, runningTool: "Bash", awaitingPermission: true }).key).toBe("permission");
+  });
+
+  it("names the tool running, then streaming, then the silence in between", () => {
+    expect(deckStatus({ ...idle, busy: true, runningTool: "Bash", streaming: true }).label).toBe("Running Bash");
+    expect(deckStatus({ ...idle, busy: true, streaming: true }).key).toBe("streaming");
+    expect(deckStatus({ ...idle, busy: true }).key).toBe("thinking");
+  });
+
+  it("names an MCP tool by its own name, not its server's", () => {
+    expect(deckStatus({ ...idle, busy: true, runningTool: "mcp__claude_ai_TOSSE__get_tasks" }).label).toBe(
+      "Running get tasks",
+    );
+  });
+
+  it("never claims work on a call left without result once the turn is over", () => {
+    expect(deckStatus({ ...idle, runningTool: "Bash" }).key).toBe("standby");
+  });
+
+  it("tells background work apart from real standby", () => {
+    expect(deckStatus({ ...idle, backgroundOps: 2 }).key).toBe("background");
+    expect(deckStatus(idle).key).toBe("standby");
+  });
+});
+
+describe("clock formats", () => {
+  it("reads a run as m:ss, then h:mm:ss", () => {
+    expect(fmtClock(0)).toBe("0:00");
+    expect(fmtClock(65_400)).toBe("1:05");
+    expect(fmtClock(3_725_000)).toBe("1:02:05");
+  });
+
+  it("reads model time as a span", () => {
+    expect(fmtSpan(42_000)).toBe("42s");
+    expect(fmtSpan(192_000)).toBe("3m 12s");
+    expect(fmtSpan(3_840_000)).toBe("1h 04m");
+  });
+});
+
+describe("the activity histogram", () => {
+  it("counts only calls that ARRIVE while the deck is open — never the history it opened on", () => {
+    // A transcript replayed from disk lands all at once: counting it would draw one giant
+    // spike at the moment the conversation was loaded, which is not activity.
+    expect(histogramArrivals(null, 240)).toBe(0);
+    expect(histogramArrivals(240, 243)).toBe(3);
+    expect(histogramArrivals(243, 243)).toBe(0);
+    // A rewind cuts the transcript: the total shrinks, and that is no arrival either.
+    expect(histogramArrivals(243, 180)).toBe(0);
+  });
+
+  it("slides a fixed two-minute window", () => {
+    let done: number[] = [];
+    for (let i = 0; i < 40; i++) done = closeBucket(done, i);
+    expect(done).toHaveLength(HISTOGRAM_BUCKETS - 1);
+    expect(done[done.length - 1]).toBe(39);
+    expect(done[0]).toBe(40 - (HISTOGRAM_BUCKETS - 1));
+  });
+});

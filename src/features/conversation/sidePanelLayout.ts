@@ -20,12 +20,13 @@ export const SIDE_PANEL_PX = 340;
 /**
  * Narrowest the panel may be dragged to.
  *
- * 280px of content + the 6px splitter. The floor is set by the panel's own rows, not by taste:
- * at 280 the header still holds its title, its chord badge and the close button; the session
- * footer's rows still fit an icon, a two-line label and their two 26px buttons; and the TOSSE
- * card's status chip and assignee picker still share one line before wrapping.
+ * 280px of sheet + the 6px splitter + the sheet's floating insets (2px left, 8px right — see
+ * `.panel` in ConversationSidePanel.module.css; change one, change the other). The floor is set
+ * by the panel's own rows, not by taste: at 280 the header still holds its title pill and the
+ * close button; the session footer's rows still fit an icon, a two-line label and their two
+ * 26px buttons; and the TOSSE card's status chip and assignee picker still share one line.
  */
-export const SIDE_PANEL_MIN_PX = 286;
+export const SIDE_PANEL_MIN_PX = 296;
 
 /** Widest the panel may be dragged to. Past this it stops being a column of status and starts
  *  eating the thread, which is the surface the window is for. */

@@ -48,6 +48,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
   { title: "Conversation side panel", section: "display", sub: "thread", group: "Thread", keywords: "sidebar panneau lateral droite todo goal artifacts artefacts tosse task tache worktree stream header display affichage" },
+  { title: "Telemetry deck", section: "display", sub: "thread", group: "Thread", keywords: "telemetry télémétrie gauge jauge dashboard tableau de bord instruments counters compteurs histogram activity activité palantir cockpit stats live panneau" },
   { title: "Message minimap", section: "display", sub: "thread", group: "Thread", keywords: "scrollbar map jump navigation display affichage" },
   { title: "Live workflow on the Flight Deck card", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow card phases display affichage" },
   { title: "Per-agent detail in the workflow view", section: "display", sub: "appearance", group: "Appearance", keywords: "workflow agents phase live detail agents display affichage" },

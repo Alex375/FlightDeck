@@ -212,9 +212,11 @@ function ConversationArea({
     const rect = areaRef.current?.getBoundingClientRect();
     if (rect) setConvPanelWidth(rect.right - clientX);
   };
+  // Quiet: the panel is a floating sheet with its own edge, so a standing rule in the gap beside
+  // it would be a third line between two framed surfaces. It lights up where the pointer finds it.
   const panel = (
     <>
-      <Splitter axis="x" onMove={onPanelDrag} />
+      <Splitter axis="x" onMove={onPanelDrag} quiet />
       <ConversationSidePanel conv={conv} />
     </>
   );
@@ -244,7 +246,7 @@ function ConversationArea({
             width,
             zIndex: 20,
             display: "flex",
-            boxShadow: "-18px 0 36px -20px #000",
+            // No shadow of its own: the sheet inside already floats with one, docked or not.
           }}
         >
           {panel}

@@ -774,6 +774,7 @@ function ThreadPrefs() {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
+  const conversationTelemetry = useDisplay((s) => s.conversationTelemetry);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
@@ -841,6 +842,26 @@ function ThreadPrefs() {
           checked={conversationSidePanel}
           onChange={(v) => set({ conversationSidePanel: v })}
           label="Show the conversation side panel"
+        />
+        <ToggleRow
+          title="Telemetry deck"
+          hint={
+            <>
+              Turns the top of the conversation panel into a <strong>live instrument deck</strong>:
+              a context gauge, the run's clock and status lamp, a counter per kind of tool call,
+              a two-minute activity histogram, totals (files touched, turns, cost, model time)
+              and a feed of the latest calls — all of it moving as the agent works. Every
+              reading is real; nothing moves on its own. <strong>Off by default.</strong>
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {conversationSidePanel ? null : (
+                <> It lives in the conversation panel, so turn that on first.</>
+              )}
+            </>
+          }
+          checked={conversationTelemetry}
+          onChange={(v) => set({ conversationTelemetry: v })}
+          label="Show the telemetry deck in the conversation panel"
+          disabled={!conversationSidePanel}
         />
         <ToggleRow
           title="Message minimap"
