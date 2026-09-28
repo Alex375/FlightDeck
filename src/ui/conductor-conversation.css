@@ -224,6 +224,22 @@
   --pill-glow:0 0 0 2px color-mix(in srgb, #a78bfa 20%, transparent);
 }
 .cv-sess-row:is([data-pill="att"], [data-pill="review"], [data-pill="err"]):hover:not(.on) { --pill-t:19%; --pill-r:58%; }
+/* Review with background work still running: the blue row keeps its colour, halo and ring,
+   with the bg row's violet washing in on its right end. Blue and violet are close hues, so
+   the violet end is pushed a notch above the blue to stay readable. Each rung restates both
+   gradients (they don't read --pill-t / --pill-r). */
+.cv-sess-row[data-pill="review"][data-bgrun] {
+  --pill-tint-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 16%, transparent) 0 62%, color-mix(in srgb, #a78bfa 22%, transparent) 100%);
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 50%, transparent) 0 48%, color-mix(in srgb, #a78bfa 85%, transparent) 100%);
+}
+.cv-sess-row[data-pill="review"][data-bgrun]:hover:not(.on) {
+  --pill-tint-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 19%, transparent) 0 62%, color-mix(in srgb, #a78bfa 26%, transparent) 100%);
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 58%, transparent) 0 48%, color-mix(in srgb, #a78bfa 92%, transparent) 100%);
+}
+.cv-sess-row.on[data-pill="review"][data-bgrun] {
+  --pill-tint-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 32%, transparent) 0 62%, color-mix(in srgb, #a78bfa 36%, transparent) 100%);
+  --pill-ring-img:linear-gradient(90deg, color-mix(in srgb, var(--wf-wait) 95%, transparent) 0 48%, color-mix(in srgb, #a78bfa 100%, transparent) 100%);
+}
 /* Stopped recedes a touch more than idle — the only whisper between the two calm states. */
 .cv-sess-row[data-calm="off"]:not(:hover):not(.on) .cv-sess-n { color:color-mix(in srgb, var(--wf-tx) 78%, var(--wf-bg-2)); }
 @media (prefers-reduced-motion: reduce) {
