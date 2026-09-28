@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { ServerDiagnosis } from "../ipc/client";
+import type { ServerDiagnosis, SessionStatePayload } from "../ipc/client";
 import {
+  attachedMachineIds,
   healthFromDiagnosis,
+  healthFromReachability,
   isUnreachable,
+  REACHED,
   resetProbeStateForTests,
   useMachineHealthStore,
   type MachineHealth,
@@ -180,3 +183,83 @@ describe("the store", () => {
     expect(useMachineHealthStore.getState().byMachine.m1.probeError).toBeNull();
   });
 });
+
+describe("healthFromReachability", () => {
+  it("folds a reachability verdict exactly like the full diagnosis it replaces", () => {
+    const d = unreachable();
+    const reason = d.state.kind === "failed" ? d.state.reason : null;
+    expect(healthFromReachability(undefined, { reachable: false, reason }, 9_000)).toEqual(
+      healthFromDiagnosis(undefined, d, 9_000),
+    );
+    expect(healthFromReachability(undefined, REACHED, 9_000)).toEqual(
+      healthFromDiagnosis(undefined, diagnosis(), 9_000),
+    );
+  });
+
+  it("carries the last time the machine answered across an unreachable verdict", () => {
+    const up = healthFromReachability(undefined, REACHED, 1_000);
+    const down = healthFromReachability(up, { reachable: false, reason: "could not reach the server" }, 2_000);
+    expect(down.lastReachedAtMs).toBe(1_000);
+    expect(down.reason).toBe("could not reach the server");
+  });
+
+  it("orders reachability verdicts by when the probe was fired, like diagnoses", () => {
+    resetProbeStateForTests();
+    useMachineHealthStore.setState({ byMachine: {} });
+    useMachineHealthStore.getState().recordReachability("m1", REACHED, 5_000);
+    useMachineHealthStore.getState().recordReachability("m1", { reachable: false, reason: "x" }, 1_000);
+    expect(isUnreachable(useMachineHealthStore.getState().byMachine.m1)).toBe(false);
+  });
+});
+
+describe("attachedMachineIds", () => {
+  const repos = [
+    { id: "r-remote", machineId: "m1" },
+    { id: "r-local", machineId: null },
+  ];
+  const attachedState: SessionStatePayload = { ...neutralState(), session_id: "s", link: null, ended: false };
+
+  it("lists a machine whose live session is attached", () => {
+    const ids = attachedMachineIds(
+      [{ id: "c1", repoId: "r-remote", handle: "session-1" }],
+      repos,
+      { c1: { state: attachedState } },
+    );
+    expect([...ids]).toEqual(["m1"]);
+  });
+
+  it("ignores a session that is connecting, reconnecting, ended, not spawned, or local", () => {
+    const conv = { id: "c1", repoId: "r-remote", handle: "session-1" };
+    const none = (state: typeof attachedState, c = conv) =>
+      attachedMachineIds([c], repos, { c1: { state } }).size;
+    expect(none({ ...attachedState, link: { kind: "connecting" } })).toBe(0);
+    expect(none({ ...attachedState, link: { kind: "reconnecting", attempt: 2 } })).toBe(0);
+    expect(none({ ...attachedState, ended: true })).toBe(0);
+    // The neutral entry a fresh spawn starts from: `link: null` but no session yet.
+    expect(none({ ...attachedState, session_id: null })).toBe(0);
+    expect(none(attachedState, { ...conv, handle: null as unknown as string })).toBe(0);
+    expect(none(attachedState, { ...conv, repoId: "r-local" })).toBe(0);
+  });
+});
+
+/** A session state with every field neutral — the attached/connecting fields are set by each test. */
+function neutralState(): SessionStatePayload {
+  return {
+    busy: false,
+    session_id: null,
+    cwd: null,
+    model: null,
+    permission_mode: null,
+    output_style: null,
+    effort: null,
+    ultracode: false,
+    activity: null,
+    awaiting_permission: false,
+    retry: null,
+    link: null,
+    ended: false,
+    context_tokens: null,
+    context_window: null,
+    rate_limit: null,
+  };
+}

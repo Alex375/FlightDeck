@@ -9,13 +9,6 @@ use crate::supervisor::model::{
 };
 use crate::usage::PlanUsage;
 
-/// Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
-pub struct TickEvent {
-    pub seq: u32,
-    pub message: String,
-}
-
 /// A session's lifecycle / identity changed.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct SessionStateEvent {

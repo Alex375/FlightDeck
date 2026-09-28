@@ -89,7 +89,8 @@ use ipc::commands::{
 };
 use bootstrap::connect::bootstrap_forget_host_key;
 use bootstrap::orchestrator::{
-    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_repair, BootstrapSessions,
+    bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
+    BootstrapSessions,
     ServerLocks,
 };
 use bootstrap::server_setup::{cancel_claude_login, restart_claude_login, start_claude_login, submit_claude_login_code};
@@ -99,7 +100,7 @@ use ipc::events::{
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
-    TerminalExitEvent, TerminalOutputEvent, TickEvent,
+    TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
@@ -388,6 +389,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             bootstrap_resume,
             bootstrap_cancel,
             machine_diagnose,
+            machine_reachability,
             machine_repair,
             artifact_host_show,
             artifact_host_set_bounds,
@@ -397,7 +399,6 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             artifact_host_open_claude_url,
         ])
         .events(collect_events![
-            TickEvent,
             SessionStateEvent,
             SessionMessageEvent,
             SessionPermissionEvent,
@@ -854,24 +855,6 @@ pub fn run() {
                 let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
                 tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
-
-            // Rust timer: emit a TickEvent every second (Rust -> React) — kept as
-            // a heartbeat / proof of the outbound event leg.
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let mut seq = 0u32;
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    seq += 1;
-                    let ev = TickEvent {
-                        seq,
-                        message: format!("tick #{seq}"),
-                    };
-                    if TickEvent::emit(&ev, &handle).is_err() {
-                        break; // window closed
-                    }
-                }
-            });
             Ok(())
         })
         .build(tauri::generate_context!())
