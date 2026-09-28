@@ -326,7 +326,7 @@ function tokensTile({ kind, usage, source, backgroundRunning }: StatsInput): Sta
               "No spend on record",
               codex
                 ? "This thread's log holds no token count yet."
-                : "The session's last process closed without recording its spend (it was killed, or an older Claude Code). The count restarts at the next turn end, from the reopen.",
+                : "The transcript holds no spend record (the last process was killed, the conversation was rewound or forked early, or an older Claude Code wrote it). The count restarts at the next turn end, from the reopen.",
             ]
           : [
               "Not known yet",
@@ -358,7 +358,7 @@ function tokensTile({ kind, usage, source, backgroundRunning }: StatsInput): Sta
     tip.push(
       codex
         ? "Since the thread was reopened: its earlier count was not carried over."
-        : "Since the session was reopened: Claude Code kept no record of the earlier spend (a killed process, or a /clear).",
+        : "Since the session was reopened: the earlier spend was not carried over (a killed process, a rewind, or a /clear).",
     );
   } else if (!codex) {
     tip.push(

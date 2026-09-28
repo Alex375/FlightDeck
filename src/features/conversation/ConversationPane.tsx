@@ -87,7 +87,9 @@ export function ConversationPane({
   // The todo list lives in the panel only while its widget is shown there; switched off, the
   // bar above the composer comes back.
   const todosWidget = useWidgetOn("todos");
+  const goalWidget = useWidgetOn("goal");
   const todosInPanel = inPanel && todosWidget;
+  const goalInPanel = inPanel && goalWidget;
   return (
     <div
       ref={paneRef}
@@ -123,10 +125,12 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
-      {!todosInPanel ? (
-        <TodoBar session={session} />
-      ) : !panelOpen ? (
-        <ConversationSummaryLine session={session} />
+      {/* The todo bar whenever the todo list is NOT in the panel; the one-line stand-in for
+          what IS in the panel while the panel is closed — each decided on its own, so switching
+          one widget off never hides (or doubles) the other's state. */}
+      {!todosInPanel ? <TodoBar session={session} /> : null}
+      {!panelOpen && (todosInPanel || goalInPanel) ? (
+        <ConversationSummaryLine session={session} showGoal={goalInPanel} showTodos={todosInPanel} />
       ) : null}
       <ConductorComposer
           ref={composerRef}

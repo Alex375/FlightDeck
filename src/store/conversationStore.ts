@@ -280,6 +280,11 @@ interface ConversationState {
    *  would otherwise record a bogus ~0ms for every replayed tool. Live calls omit
    *  it (default false). */
   applyItem: (session: string, item: ConversationItem, hydrating?: boolean) => void;
+  /** Apply a whole replayed history in ONE store commit — the same reducer as {@link applyItem},
+   *  folded over the items. ⚠️ One `set` per item made every subscriber re-derive once per item
+   *  (the side panel's stats and links walk the whole thread each time): opening a long
+   *  conversation was quadratic. Subscribers now see the history land once. */
+  applyItems: (session: string, items: ConversationItem[], hydrating?: boolean) => void;
   appendText: (session: string, messageId: string, text: string) => void;
   appendThinking: (session: string, messageId: string, text: string) => void;
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
@@ -396,6 +401,308 @@ export const useConversationStore = create<ConversationState>((set) => {
         turns: { ...base.turns, [messageId]: nextTurn },
       };
     });
+
+  /** One ConversationItem applied to one session entry — pure on the entry (a new entry, or the
+   *  same one to skip). Shared by {@link applyItem} (live, one at a time) and {@link applyItems}
+   *  (a replayed history, all at once). */
+  function reduceItem(entry: SessionEntry, item: ConversationItem, hydrating: boolean): SessionEntry {
+    switch (item.kind) {
+      case "message_started": {
+        const opened = openTurn(entry, item.id, item.parent_tool_use_id);
+        // A new ROOT assistant message = the agent's next model call, which is
+        // past the boundary where the CLI injects queued messages. So a message
+        // that was waiting "en attente" has now been delivered to the agent —
+        // clear its badge here (not only at turn_result, the end of the whole
+        // loop). Sub-agent (Task) messages don't count: the queued message is
+        // injected into the ROOT loop, not the sub-thread.
+        return item.parent_tool_use_id === null ? clearQueuedBadges(opened) : opened;
+      }
+
+      case "text_delta":
+      case "thinking_delta": {
+        // Normally deltas come via appendText/appendThinking (rAF-coalesced);
+        // handle here too for completeness / out-of-band delivery.
+        const field =
+          item.kind === "text_delta" ? "streamingText" : "streamingThinking";
+        const key = rootKey(null);
+        const messageId = item.message_id ?? entry.openBubble[key];
+        if (!messageId) return entry;
+        const turn = entry.turns[messageId];
+        if (!turn || turn.status !== "streaming") return entry;
+        // Same thinking-start stamp as appendBuffer (this is the out-of-band path).
+        const thinkStart =
+          field === "streamingThinking" && turn.streamingThinking === "";
+        const nextTurn: Turn = {
+          ...turn,
+          [field]: turn[field] + item.text,
+          hasThinking:
+            field === "streamingThinking" ? true : turn.hasThinking,
+        };
+        return {
+          ...entry,
+          thinkingStartedAt: thinkStart ? Date.now() : entry.thinkingStartedAt,
+          turns: { ...entry.turns, [messageId]: nextTurn },
+        };
+      }
+
+      case "user_message": {
+        // A user turn from the stream. Our OWN turns are suppressed in the core (by
+        // the uuid we stamped), so only REMOTE (phone/web) turns and history replays
+        // reach here; both are keyed by their transcript uuid, so a re-delivery
+        // dedupes. Mirrors addUserTurn (role "user", text in streamingText).
+        if (entry.turns[item.id]) return entry;
+        const turn: Turn = {
+          id: item.id,
+          role: "user",
+          status: "final",
+          streamingText: item.text,
+          streamingThinking: "",
+          blocks: [],
+          parentToolUseId: item.parent_tool_use_id,
+          hasThinking: false,
+          // A message restored from a mid-turn injection (a transcript's queued_command)
+          // carries the same durable flag a live mid-turn send sets, so clean output
+          // groups the restored round as it did live.
+          injectedMidTurn: item.mid_turn === true,
+        };
+        const line = { kind: "turn", id: item.id } as const;
+        // A HISTORY restore (`replay:false`) is already chronological → APPEND. It
+        // must NOT go through the splice: the anchor isn't re-armed during a resume
+        // (the transcript carries no `turn_result`), so splicing would bunch every
+        // user turn above the replies. Only a LIVE remote echo (`replay:true`) —
+        // which can arrive out-of-order, after its own answer already streamed — is
+        // spliced at the frozen anchor (the current turn boundary), landing right
+        // before this turn's whole response; the anchor advances so several queued
+        // replays keep their order. See `SessionEntry.replayAnchor`.
+        if (!item.replay) {
+          return {
+            ...entry,
+            turns: { ...entry.turns, [item.id]: turn },
+            timeline: hasTimelineId(entry.timeline, item.id)
+              ? entry.timeline
+              : [...entry.timeline, line],
+          };
+        }
+        const at = Math.min(entry.replayAnchor, entry.timeline.length);
+        return {
+          ...entry,
+          turns: { ...entry.turns, [item.id]: turn },
+          timeline: [...entry.timeline.slice(0, at), line, ...entry.timeline.slice(at)],
+          replayAnchor: at + 1,
+        };
+      }
+
+      case "assistant_message": {
+        // Claude delivers one logical message (same id) as SEPARATE events,
+        // one per finalized content block (thinking, then text, then tool_use).
+        // APPEND the new block(s) to whatever the turn already shows — never
+        // replace — otherwise the text rendered between two tools would be
+        // overwritten by the following tool_use block and vanish. The live
+        // buffers are cleared because the block they were typing is now
+        // authoritative in `blocks`. The turn stays "streaming"; turn_result
+        // finalizes it. (Resume takes a faster path: history.rs has already
+        // merged the same-id lines, so this just appends the one merged event.)
+        const base = openTurn(entry, item.id, item.parent_tool_use_id);
+        const existing = base.turns[item.id];
+        const blocks = [...existing.blocks, ...item.blocks];
+        const turn: Turn = {
+          ...existing,
+          blocks,
+          streamingText: "",
+          streamingThinking: "",
+          hasThinking: blocks.some((b) => b.type === "thinking"),
+          // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
+          // Null on Claude; keep any prior value if a later block omits it.
+          codexTurnId: item.turn_id ?? existing.codexTurnId,
+        };
+        // Freeze the elapsed of any thinking block finalized here, keyed by its text
+        // (what the renderer receives). Clear the live start so the next block re-stamps.
+        // Skipped during hydration: a replayed assistant_message carries no live delta,
+        // so `thinkingStartedAt` is already null there — the guard is belt-and-suspenders.
+        let thinkingStartedAt = base.thinkingStartedAt;
+        let thinkingDurations = base.thinkingDurations;
+        if (!hydrating && thinkingStartedAt != null) {
+          const finalized = item.blocks.filter(
+            (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
+              b.type === "thinking" && !!b.text,
+          );
+          if (finalized.length > 0) {
+            const dur = Date.now() - thinkingStartedAt;
+            thinkingDurations = { ...thinkingDurations };
+            for (const b of finalized) thinkingDurations[b.text] = dur;
+            thinkingStartedAt = null;
+          }
+        }
+        // Stamp the start of each tool call appearing here (keyed by tool_use_id), so a
+        // running tool row can show a live counter and its tool_result can freeze the
+        // duration. Only the first sighting stamps (an assistant_message can't re-open a
+        // tool). Sub-agent (Task) tool_uses are included — they get durations too.
+        // NEVER stamp during hydration: replayed history has no wall-clock meaning, and
+        // its tool_result lands in the SAME synchronous loop, freezing ~0ms → every tool
+        // of a reloaded conversation would show a bogus "0ms" chip. Live only.
+        let toolStartedAt = base.toolStartedAt;
+        const toolUses = item.blocks.filter(
+          (b): b is Extract<NormalizedBlock, { type: "tool_use" }> => b.type === "tool_use",
+        );
+        if (!hydrating && toolUses.length > 0) {
+          const t = Date.now();
+          toolStartedAt = { ...toolStartedAt };
+          for (const b of toolUses) if (toolStartedAt[b.id] == null) toolStartedAt[b.id] = t;
+        }
+        let next = {
+          ...base,
+          turns: { ...base.turns, [item.id]: turn },
+          thinkingStartedAt,
+          thinkingDurations,
+          toolStartedAt,
+        };
+        // Record any detached sub-agent (`Agent` with run_in_background) launched in
+        // this message, so the pinned AgentBar can list it WITHOUT re-scanning every
+        // block on each streamed token. Done once per assistant_message.
+        //
+        // MAIN THREAD ONLY (same scoping as the TodoWrite capture below). A sub-agent
+        // can spawn its own agents — the CLI nests them up to depth 3 by default, and
+        // we pass `--forward-subagent-text`, so those messages reach us. Collecting
+        // them here would list a GRANDCHILD in the conversation-level AgentBar as if
+        // the user had launched it, and hide its block from the parent sub-agent's own
+        // drill-in transcript (bgAgentIds also drives that fold).
+        const newBg = (item.parent_tool_use_id === null
+          ? backgroundAgentIdsIn(item.blocks)
+          : []
+        ).filter((id) => !next.bgAgentIds.includes(id));
+        if (newBg.length > 0) {
+          next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
+        }
+        // Capture the agent's to-do list from a TodoWrite tool_use (last
+        // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
+        // its own todos and must not overwrite the conversation-level list.
+        if (item.parent_tool_use_id === null) {
+          const todos = latestTodosInBlocks(item.blocks);
+          if (todos) return { ...next, todos };
+        }
+        return next;
+      }
+
+      case "tool_result": {
+        const result: ToolResult = {
+          toolUseId: item.tool_use_id,
+          content: item.content,
+          isError: item.is_error,
+          parentToolUseId: item.parent_tool_use_id,
+        };
+        // Freeze the tool's duration (tool_use → tool_result) if we stamped its start.
+        // Skipped during hydration (belt-and-suspenders: a replayed tool_use never gets a
+        // stamp, so `startedAt` is already null here — but make the intent explicit).
+        let toolDurations = entry.toolDurations;
+        const startedAt = entry.toolStartedAt[item.tool_use_id];
+        if (!hydrating && startedAt != null && toolDurations[item.tool_use_id] == null) {
+          toolDurations = { ...toolDurations, [item.tool_use_id]: Date.now() - startedAt };
+        }
+        const next: SessionEntry = {
+          ...entry,
+          toolResults: { ...entry.toolResults, [item.tool_use_id]: result },
+          toolDurations,
+        };
+        // Robustness: a DETACHED sub-agent whose live `Agent` block arrived WITHOUT
+        // `run_in_background` (a transient wire drop) would otherwise render inline as a
+        // foreground card and never reach the AgentBar. Its launch ack is an independent,
+        // reliable "detached" signal — fold the id into bgAgentIds so the AgentBar lists
+        // it AND the inline hiding drops it, exactly as if the input flag had been present.
+        if (
+          isDetachedAgentByAck(entry, item.tool_use_id, item.content) &&
+          !next.bgAgentIds.includes(item.tool_use_id)
+        ) {
+          next.bgAgentIds = [...next.bgAgentIds, item.tool_use_id];
+        }
+        return next;
+      }
+
+      case "turn_result": {
+        const id = `tr_${entry.seq}`;
+        const meta: TurnResultMeta = {
+          subtype: item.subtype,
+          isError: item.is_error,
+          result: item.result,
+          apiErrorStatus: item.api_error_status ?? null,
+          totalCostUsd: item.total_cost_usd,
+          numTurns: item.num_turns,
+          durationMs: item.duration_ms,
+          durationApiMs: item.duration_api_ms,
+          ttftMs: item.ttft_ms,
+          usage: item.usage ?? null,
+        };
+        // finalize any still-streaming turns
+        const turns = { ...entry.turns };
+        let touched = false;
+        for (const [tid, t] of Object.entries(turns)) {
+          if (t.status === "streaming") {
+            turns[tid] = {
+              ...t,
+              status: item.subtype === "interrupted" ? "interrupted" : "final",
+            };
+            touched = true;
+          }
+        }
+        // Safety net for the "en attente" badge: normally cleared at the next
+        // message_started, but a loop can end (e.g. interrupted) without one, so
+        // clear any still-queued user turn now that the loop is over.
+        return clearQueuedBadges({
+          ...entry,
+          seq: entry.seq + 1,
+          turns: touched ? turns : entry.turns,
+          turnResults: { ...entry.turnResults, [id]: meta },
+          timeline: [...entry.timeline, { kind: "turn_result", id }],
+          // Attach it to its run (a history replay carries no results; guarded anyway).
+          runClock: hydrating
+            ? entry.runClock
+            : runResult(entry.runClock, id, Date.now(), item.duration_api_ms),
+          openBubble: {},
+          pendingPermissions: [],
+          // Re-anchor the replay insert point to the (new) end of the timeline at
+          // this turn boundary, so the NEXT remote turn's echo splices right after
+          // this turn — never inside the response that just finished. (+1 = the
+          // turn_result footer we just appended.) See `SessionEntry.replayAnchor`.
+          replayAnchor: entry.timeline.length + 1,
+          // A turn just finished → it's now "to review", UNLESS it was
+          // interrupted (the user did that, so they're already aware).
+          turnSeen: item.subtype === "interrupted",
+        });
+      }
+
+      case "notice": {
+        const id = `nt_${entry.seq}`;
+        const notice: NoticeItem = {
+          id,
+          subtype: item.subtype,
+          detail: item.detail,
+        };
+        const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
+        // A notice landing AT the anchor (nothing of the current turn sits above it) is
+        // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
+        // the anchor past it so a LATER remote echo splices below it, not above — else a
+        // "Background task failed" would read as happening after a message the user only
+        // sent afterwards. A notice arriving MID-response (anchor already behind the
+        // streaming reply) leaves the anchor alone: the late echo of the prompt that
+        // caused that reply still belongs before the whole response.
+        // See `SessionEntry.replayAnchor`.
+        const atBoundary = entry.replayAnchor >= entry.timeline.length;
+        return {
+          ...entry,
+          seq: entry.seq + 1,
+          notices: { ...entry.notices, [id]: notice },
+          timeline,
+          replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
+        };
+      }
+
+      default:
+        // A ConversationItem kind we don't handle (a new core/protocol variant
+        // landing before the front catches up). TS has no exhaustiveness guard on
+        // this switch, so it would be dropped without a trace — log it instead.
+        console.warn("[conversationStore] unhandled ConversationItem kind:", (item as { kind?: string }).kind);
+        return entry;
+    }
+  }
 
   return {
     sessions: {},
@@ -701,305 +1008,12 @@ export const useConversationStore = create<ConversationState>((set) => {
       }),
 
     applyItem: (session, item, hydrating = false) =>
-      withEntry(session, (entry) => {
-        switch (item.kind) {
-          case "message_started": {
-            const opened = openTurn(entry, item.id, item.parent_tool_use_id);
-            // A new ROOT assistant message = the agent's next model call, which is
-            // past the boundary where the CLI injects queued messages. So a message
-            // that was waiting "en attente" has now been delivered to the agent —
-            // clear its badge here (not only at turn_result, the end of the whole
-            // loop). Sub-agent (Task) messages don't count: the queued message is
-            // injected into the ROOT loop, not the sub-thread.
-            return item.parent_tool_use_id === null ? clearQueuedBadges(opened) : opened;
-          }
+      withEntry(session, (entry) => reduceItem(entry, item, hydrating)),
 
-          case "text_delta":
-          case "thinking_delta": {
-            // Normally deltas come via appendText/appendThinking (rAF-coalesced);
-            // handle here too for completeness / out-of-band delivery.
-            const field =
-              item.kind === "text_delta" ? "streamingText" : "streamingThinking";
-            const key = rootKey(null);
-            const messageId = item.message_id ?? entry.openBubble[key];
-            if (!messageId) return entry;
-            const turn = entry.turns[messageId];
-            if (!turn || turn.status !== "streaming") return entry;
-            // Same thinking-start stamp as appendBuffer (this is the out-of-band path).
-            const thinkStart =
-              field === "streamingThinking" && turn.streamingThinking === "";
-            const nextTurn: Turn = {
-              ...turn,
-              [field]: turn[field] + item.text,
-              hasThinking:
-                field === "streamingThinking" ? true : turn.hasThinking,
-            };
-            return {
-              ...entry,
-              thinkingStartedAt: thinkStart ? Date.now() : entry.thinkingStartedAt,
-              turns: { ...entry.turns, [messageId]: nextTurn },
-            };
-          }
-
-          case "user_message": {
-            // A user turn from the stream. Our OWN turns are suppressed in the core (by
-            // the uuid we stamped), so only REMOTE (phone/web) turns and history replays
-            // reach here; both are keyed by their transcript uuid, so a re-delivery
-            // dedupes. Mirrors addUserTurn (role "user", text in streamingText).
-            if (entry.turns[item.id]) return entry;
-            const turn: Turn = {
-              id: item.id,
-              role: "user",
-              status: "final",
-              streamingText: item.text,
-              streamingThinking: "",
-              blocks: [],
-              parentToolUseId: item.parent_tool_use_id,
-              hasThinking: false,
-              // A message restored from a mid-turn injection (a transcript's queued_command)
-              // carries the same durable flag a live mid-turn send sets, so clean output
-              // groups the restored round as it did live.
-              injectedMidTurn: item.mid_turn === true,
-            };
-            const line = { kind: "turn", id: item.id } as const;
-            // A HISTORY restore (`replay:false`) is already chronological → APPEND. It
-            // must NOT go through the splice: the anchor isn't re-armed during a resume
-            // (the transcript carries no `turn_result`), so splicing would bunch every
-            // user turn above the replies. Only a LIVE remote echo (`replay:true`) —
-            // which can arrive out-of-order, after its own answer already streamed — is
-            // spliced at the frozen anchor (the current turn boundary), landing right
-            // before this turn's whole response; the anchor advances so several queued
-            // replays keep their order. See `SessionEntry.replayAnchor`.
-            if (!item.replay) {
-              return {
-                ...entry,
-                turns: { ...entry.turns, [item.id]: turn },
-                timeline: hasTimelineId(entry.timeline, item.id)
-                  ? entry.timeline
-                  : [...entry.timeline, line],
-              };
-            }
-            const at = Math.min(entry.replayAnchor, entry.timeline.length);
-            return {
-              ...entry,
-              turns: { ...entry.turns, [item.id]: turn },
-              timeline: [...entry.timeline.slice(0, at), line, ...entry.timeline.slice(at)],
-              replayAnchor: at + 1,
-            };
-          }
-
-          case "assistant_message": {
-            // Claude delivers one logical message (same id) as SEPARATE events,
-            // one per finalized content block (thinking, then text, then tool_use).
-            // APPEND the new block(s) to whatever the turn already shows — never
-            // replace — otherwise the text rendered between two tools would be
-            // overwritten by the following tool_use block and vanish. The live
-            // buffers are cleared because the block they were typing is now
-            // authoritative in `blocks`. The turn stays "streaming"; turn_result
-            // finalizes it. (Resume takes a faster path: history.rs has already
-            // merged the same-id lines, so this just appends the one merged event.)
-            const base = openTurn(entry, item.id, item.parent_tool_use_id);
-            const existing = base.turns[item.id];
-            const blocks = [...existing.blocks, ...item.blocks];
-            const turn: Turn = {
-              ...existing,
-              blocks,
-              streamingText: "",
-              streamingThinking: "",
-              hasThinking: blocks.some((b) => b.type === "thinking"),
-              // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
-              // Null on Claude; keep any prior value if a later block omits it.
-              codexTurnId: item.turn_id ?? existing.codexTurnId,
-            };
-            // Freeze the elapsed of any thinking block finalized here, keyed by its text
-            // (what the renderer receives). Clear the live start so the next block re-stamps.
-            // Skipped during hydration: a replayed assistant_message carries no live delta,
-            // so `thinkingStartedAt` is already null there — the guard is belt-and-suspenders.
-            let thinkingStartedAt = base.thinkingStartedAt;
-            let thinkingDurations = base.thinkingDurations;
-            if (!hydrating && thinkingStartedAt != null) {
-              const finalized = item.blocks.filter(
-                (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
-                  b.type === "thinking" && !!b.text,
-              );
-              if (finalized.length > 0) {
-                const dur = Date.now() - thinkingStartedAt;
-                thinkingDurations = { ...thinkingDurations };
-                for (const b of finalized) thinkingDurations[b.text] = dur;
-                thinkingStartedAt = null;
-              }
-            }
-            // Stamp the start of each tool call appearing here (keyed by tool_use_id), so a
-            // running tool row can show a live counter and its tool_result can freeze the
-            // duration. Only the first sighting stamps (an assistant_message can't re-open a
-            // tool). Sub-agent (Task) tool_uses are included — they get durations too.
-            // NEVER stamp during hydration: replayed history has no wall-clock meaning, and
-            // its tool_result lands in the SAME synchronous loop, freezing ~0ms → every tool
-            // of a reloaded conversation would show a bogus "0ms" chip. Live only.
-            let toolStartedAt = base.toolStartedAt;
-            const toolUses = item.blocks.filter(
-              (b): b is Extract<NormalizedBlock, { type: "tool_use" }> => b.type === "tool_use",
-            );
-            if (!hydrating && toolUses.length > 0) {
-              const t = Date.now();
-              toolStartedAt = { ...toolStartedAt };
-              for (const b of toolUses) if (toolStartedAt[b.id] == null) toolStartedAt[b.id] = t;
-            }
-            let next = {
-              ...base,
-              turns: { ...base.turns, [item.id]: turn },
-              thinkingStartedAt,
-              thinkingDurations,
-              toolStartedAt,
-            };
-            // Record any detached sub-agent (`Agent` with run_in_background) launched in
-            // this message, so the pinned AgentBar can list it WITHOUT re-scanning every
-            // block on each streamed token. Done once per assistant_message.
-            //
-            // MAIN THREAD ONLY (same scoping as the TodoWrite capture below). A sub-agent
-            // can spawn its own agents — the CLI nests them up to depth 3 by default, and
-            // we pass `--forward-subagent-text`, so those messages reach us. Collecting
-            // them here would list a GRANDCHILD in the conversation-level AgentBar as if
-            // the user had launched it, and hide its block from the parent sub-agent's own
-            // drill-in transcript (bgAgentIds also drives that fold).
-            const newBg = (item.parent_tool_use_id === null
-              ? backgroundAgentIdsIn(item.blocks)
-              : []
-            ).filter((id) => !next.bgAgentIds.includes(id));
-            if (newBg.length > 0) {
-              next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
-            }
-            // Capture the agent's to-do list from a TodoWrite tool_use (last
-            // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
-            // its own todos and must not overwrite the conversation-level list.
-            if (item.parent_tool_use_id === null) {
-              const todos = latestTodosInBlocks(item.blocks);
-              if (todos) return { ...next, todos };
-            }
-            return next;
-          }
-
-          case "tool_result": {
-            const result: ToolResult = {
-              toolUseId: item.tool_use_id,
-              content: item.content,
-              isError: item.is_error,
-              parentToolUseId: item.parent_tool_use_id,
-            };
-            // Freeze the tool's duration (tool_use → tool_result) if we stamped its start.
-            // Skipped during hydration (belt-and-suspenders: a replayed tool_use never gets a
-            // stamp, so `startedAt` is already null here — but make the intent explicit).
-            let toolDurations = entry.toolDurations;
-            const startedAt = entry.toolStartedAt[item.tool_use_id];
-            if (!hydrating && startedAt != null && toolDurations[item.tool_use_id] == null) {
-              toolDurations = { ...toolDurations, [item.tool_use_id]: Date.now() - startedAt };
-            }
-            const next: SessionEntry = {
-              ...entry,
-              toolResults: { ...entry.toolResults, [item.tool_use_id]: result },
-              toolDurations,
-            };
-            // Robustness: a DETACHED sub-agent whose live `Agent` block arrived WITHOUT
-            // `run_in_background` (a transient wire drop) would otherwise render inline as a
-            // foreground card and never reach the AgentBar. Its launch ack is an independent,
-            // reliable "detached" signal — fold the id into bgAgentIds so the AgentBar lists
-            // it AND the inline hiding drops it, exactly as if the input flag had been present.
-            if (
-              isDetachedAgentByAck(entry, item.tool_use_id, item.content) &&
-              !next.bgAgentIds.includes(item.tool_use_id)
-            ) {
-              next.bgAgentIds = [...next.bgAgentIds, item.tool_use_id];
-            }
-            return next;
-          }
-
-          case "turn_result": {
-            const id = `tr_${entry.seq}`;
-            const meta: TurnResultMeta = {
-              subtype: item.subtype,
-              isError: item.is_error,
-              result: item.result,
-              apiErrorStatus: item.api_error_status ?? null,
-              totalCostUsd: item.total_cost_usd,
-              numTurns: item.num_turns,
-              durationMs: item.duration_ms,
-              durationApiMs: item.duration_api_ms,
-              ttftMs: item.ttft_ms,
-              usage: item.usage ?? null,
-            };
-            // finalize any still-streaming turns
-            const turns = { ...entry.turns };
-            let touched = false;
-            for (const [tid, t] of Object.entries(turns)) {
-              if (t.status === "streaming") {
-                turns[tid] = {
-                  ...t,
-                  status: item.subtype === "interrupted" ? "interrupted" : "final",
-                };
-                touched = true;
-              }
-            }
-            // Safety net for the "en attente" badge: normally cleared at the next
-            // message_started, but a loop can end (e.g. interrupted) without one, so
-            // clear any still-queued user turn now that the loop is over.
-            return clearQueuedBadges({
-              ...entry,
-              seq: entry.seq + 1,
-              turns: touched ? turns : entry.turns,
-              turnResults: { ...entry.turnResults, [id]: meta },
-              timeline: [...entry.timeline, { kind: "turn_result", id }],
-              // Attach it to its run (a history replay carries no results; guarded anyway).
-              runClock: hydrating
-                ? entry.runClock
-                : runResult(entry.runClock, id, Date.now(), item.duration_api_ms),
-              openBubble: {},
-              pendingPermissions: [],
-              // Re-anchor the replay insert point to the (new) end of the timeline at
-              // this turn boundary, so the NEXT remote turn's echo splices right after
-              // this turn — never inside the response that just finished. (+1 = the
-              // turn_result footer we just appended.) See `SessionEntry.replayAnchor`.
-              replayAnchor: entry.timeline.length + 1,
-              // A turn just finished → it's now "to review", UNLESS it was
-              // interrupted (the user did that, so they're already aware).
-              turnSeen: item.subtype === "interrupted",
-            });
-          }
-
-          case "notice": {
-            const id = `nt_${entry.seq}`;
-            const notice: NoticeItem = {
-              id,
-              subtype: item.subtype,
-              detail: item.detail,
-            };
-            const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
-            // A notice landing AT the anchor (nothing of the current turn sits above it) is
-            // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
-            // the anchor past it so a LATER remote echo splices below it, not above — else a
-            // "Background task failed" would read as happening after a message the user only
-            // sent afterwards. A notice arriving MID-response (anchor already behind the
-            // streaming reply) leaves the anchor alone: the late echo of the prompt that
-            // caused that reply still belongs before the whole response.
-            // See `SessionEntry.replayAnchor`.
-            const atBoundary = entry.replayAnchor >= entry.timeline.length;
-            return {
-              ...entry,
-              seq: entry.seq + 1,
-              notices: { ...entry.notices, [id]: notice },
-              timeline,
-              replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
-            };
-          }
-
-          default:
-            // A ConversationItem kind we don't handle (a new core/protocol variant
-            // landing before the front catches up). TS has no exhaustiveness guard on
-            // this switch, so it would be dropped without a trace — log it instead.
-            console.warn("[conversationStore] unhandled ConversationItem kind:", (item as { kind?: string }).kind);
-            return entry;
-        }
-      }),
+    applyItems: (session, items, hydrating = false) =>
+      withEntry(session, (entry) => items.reduce((acc, item) => reduceItem(acc, item, hydrating), entry)),
   };
+
 });
 
 // ---- Fine-grained selector hooks -------------------------------------------

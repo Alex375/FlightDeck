@@ -2,6 +2,9 @@
    and a coverage hint where the value needs one. Quiet at rest: no fill, no colour but the
    caveat's; a tile lights on hover because hovering it is how its full wording is read. */
 
+.wrap {
+  container: stats / inline-size;
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -110,4 +113,13 @@
   line-height: 1.4;
   color: var(--wf-tx-lo);
   font-variant-numeric: tabular-nums;
+}
+
+/* At the panel's narrowest a quarter of the island cannot hold "AVG TURN" or a "12m 30s": the
+   four readings go two by two rather than be cut. (Queried on .wrap's width.) */
+@container stats (max-width: 250px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 4px;
+  }
 }

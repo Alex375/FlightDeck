@@ -228,8 +228,23 @@ export function createGitFsRefresh({
 export function pathsTouchCwd(paths: readonly string[], cwd: string): boolean {
   if (paths.length === 0) return false;
   if (!cwd.startsWith("/")) return true;
-  const root = cwd.replace(/\/+$/, "");
+  const root = comparablePath(cwd.replace(/\/+$/, ""));
   if (!root) return true; // the filesystem root
   const prefix = `${root}/`;
-  return paths.some((p) => p === root || p.startsWith(prefix));
+  return paths.some((raw) => {
+    const p = comparablePath(raw);
+    return p === root || p.startsWith(prefix);
+  });
+}
+
+/**
+ * A path in the form the file watcher reports it. ⚠️ FSEvents canonicalizes the watched root, so
+ * its events carry the REAL path — a folder opened as `/tmp/x` reports `/private/tmp/x` — and the
+ * default APFS volume ignores case. Comparing raw strings dropped every event for such a folder,
+ * and its git counts went stale until the next focus. (A folder under a user-made symlink still
+ * needs the turn-end and focus refreshes: resolving those would take a round trip to the disk.)
+ */
+function comparablePath(path: string): string {
+  const real = /^\/(tmp|var|etc)(\/|$)/.test(path) ? `/private${path}` : path;
+  return real.toLowerCase();
 }

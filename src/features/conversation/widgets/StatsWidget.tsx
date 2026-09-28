@@ -96,10 +96,14 @@ function StatsBody({ convId, kind, usage }: { convId: string; kind: Kind; usage:
   const motion = motionAllowed(useDisplay((d) => d.panelAnimations));
   const view = statsView({ kind, t, usage, source, workflows, backgroundRunning });
   return (
-    <div className={w.grid} data-motion={motion || undefined}>
-      {view.tiles.map((tile) => (
-        <Tile key={tile.key} tile={tile} />
-      ))}
+    // The wrapper is the size container the grid's narrow layout queries (a container cannot
+    // query itself).
+    <div className={w.wrap}>
+      <div className={w.grid} data-motion={motion || undefined}>
+        {view.tiles.map((tile) => (
+          <Tile key={tile.key} tile={tile} />
+        ))}
+      </div>
     </div>
   );
 }

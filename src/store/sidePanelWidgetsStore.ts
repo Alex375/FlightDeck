@@ -8,6 +8,7 @@
 // `customizing`, never persisted: whether the panel is showing its customize view — so Settings
 // can open it too.
 import { create } from "zustand";
+import { useEditorStore } from "../features/editor/editorStore";
 import {
   applyPreset,
   defaultLayout,
@@ -109,3 +110,12 @@ export function useWidgetOn(id: WidgetId): boolean {
     [...s.layout.main, ...s.layout.foot].some((e) => e.id === id && e.on),
   );
 }
+
+// Closing the panel ends the customize view: it is a moment of setting up, not a mode to come
+// back to days later — the panel must reopen on its widgets (whichever way it was closed: its ×,
+// the chord, an artifact taking its place).
+useEditorStore.subscribe((st, prev) => {
+  if (prev.convPanelOpen && !st.convPanelOpen && useSidePanelLayout.getState().customizing) {
+    useSidePanelLayout.getState().setCustomizing(false);
+  }
+});

@@ -147,6 +147,12 @@
   gap: 8px;
   padding: 2px 10px 10px;
 }
+/* The telemetry deck's host: a plain box, so the deck stays a direct island of the stack. */
+.deckHost {
+  display: flex;
+  flex-direction: column;
+}
+
 /* The widget stack. Coming back from the customize view it rises in, like the view did. */
 .stack {
   display: flex;
@@ -897,6 +903,11 @@
 
 /* ---- Session footer: the last island, pinned ------------------------------------------ */
 
+/* Rows render nothing when they have nothing to say (a worktree row outside a repository): an
+   island with no row must not be drawn. */
+.foot:empty {
+  display: none;
+}
 .foot {
   flex: 0 0 auto;
   display: flex;

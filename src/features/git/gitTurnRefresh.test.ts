@@ -114,6 +114,16 @@ describe("pathsTouchCwd", () => {
   it("the filesystem root holds every absolute path", () => {
     expect(pathsTouchCwd(["/anywhere/a.ts"], "/")).toBe(true);
   });
+
+  it("matches the REAL paths the watcher reports for a folder opened another way", () => {
+    // FSEvents canonicalizes the watched root: /tmp/x is reported as /private/tmp/x.
+    expect(pathsTouchCwd(["/private/tmp/proj/a.ts"], "/tmp/proj")).toBe(true);
+    expect(pathsTouchCwd(["/private/var/folders/x/a"], "/var/folders/x")).toBe(true);
+    // The default APFS volume ignores case.
+    expect(pathsTouchCwd(["/Users/me/Repos/App/a.ts"], "/Users/me/repos/app")).toBe(true);
+    // …without widening the match to a sibling.
+    expect(pathsTouchCwd(["/private/tmp/proj-2/a.ts"], "/tmp/proj")).toBe(false);
+  });
 });
 
 describe("invalidateGitQueries", () => {

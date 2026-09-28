@@ -157,8 +157,8 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
               </div>
               {/* Shown by CSS only while the stack above rendered nothing (`.stack:empty`). */}
               <p className={s.empty}>
-                {main.length === 0 && foot.length === 0 ? (
-                  <>Every widget is switched off. </>
+                {main.length === 0 ? (
+                  <>Every section is switched off. </>
                 ) : (
                   <>
                     Nothing to track yet. This conversation's task, goal, todo list, artifacts and
@@ -234,12 +234,27 @@ function TelemetryWidget({ convId }: { convId: string }) {
   const collapsible = useSidePanelLayout((st) => st.layout.collapsible);
   const collapsed = useSidePanelLayout((st) => isCollapsed(st.layout, "telemetry"));
   const setCollapsed = useSidePanelLayout((st) => st.setCollapsed);
-  if (collapsed) return <TelemetryDeckFolded convId={convId} onUnfold={() => setCollapsed("telemetry", false)} />;
+  // The folded and the open deck are different elements: a fold toggled from the keyboard would
+  // drop focus to <body>. Remember that the toggle had focus, and give it back to the new one.
+  const hostRef = useRef<HTMLDivElement>(null);
+  const refocus = useRef(false);
+  const toggle = (fold: boolean) => {
+    refocus.current = hostRef.current?.contains(document.activeElement) ?? false;
+    setCollapsed("telemetry", fold);
+  };
+  useLayoutEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    hostRef.current?.querySelector<HTMLButtonElement>("button[aria-expanded]")?.focus();
+  }, [collapsed]);
   return (
-    <TelemetryDeck
-      convId={convId}
-      onFold={collapsible ? () => setCollapsed("telemetry", true) : undefined}
-    />
+    <div ref={hostRef} className={s.deckHost}>
+      {collapsed ? (
+        <TelemetryDeckFolded convId={convId} onUnfold={() => toggle(false)} />
+      ) : (
+        <TelemetryDeck convId={convId} onFold={collapsible ? () => toggle(true) : undefined} />
+      )}
+    </div>
   );
 }
 

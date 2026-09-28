@@ -182,7 +182,11 @@
     0 2px 6px rgba(0, 0, 0, 0.4);
   transform: scale(1.02);
   cursor: grabbing;
-  animation: lift 0.16s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+/* It rises into its lifted pose only when motion is allowed (it lives in a portal, outside the
+   view's own motion scope, so it carries the flag itself). */
+.card[data-lifted][data-motion] {
+  animation: lift 0.16s var(--wf-ease-enter) both;
 }
 
 .tile {

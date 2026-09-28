@@ -65,7 +65,9 @@ export function PanelCustomize() {
         Choose what this panel shows. Drag a card to reorder it — changes apply right away.
       </p>
 
-      <div className={c.presets} role="radiogroup" aria-label="Presets">
+      {/* Plain toggle buttons (aria-pressed), not a radiogroup: a radiogroup promises arrow-key
+          navigation, and these are four independent one-shot actions anyway. */}
+      <div className={c.presets} role="group" aria-label="Presets">
         {/* One highlight that SLIDES to the preset the layout matches (and fades when it
             matches none): the movement says "this is where you are now". */}
         <span
@@ -78,8 +80,7 @@ export function PanelCustomize() {
           <button
             key={p.id}
             type="button"
-            role="radio"
-            aria-checked={active?.id === p.id}
+            aria-pressed={active?.id === p.id}
             className={c.preset}
             data-active={active?.id === p.id || undefined}
             onClick={() => applyPreset(p)}
@@ -95,12 +96,14 @@ export function PanelCustomize() {
         title="Sections"
         hint={`${layout.main.filter((e) => e.on).length} of ${layout.main.length} shown`}
         entries={layout.main}
+        motion={motion}
       />
       <WidgetList
         zone="foot"
         title="Pinned at the bottom"
         hint={`${layout.foot.filter((e) => e.on).length} of ${layout.foot.length} shown`}
         entries={layout.foot}
+        motion={motion}
       />
 
       <div className={c.options}>
@@ -135,11 +138,14 @@ function WidgetList({
   title,
   hint,
   entries,
+  motion,
 }: {
   zone: "main" | "foot";
   title: string;
   hint: string;
   entries: LayoutEntry[];
+  /** Whether anything may move (the panel's animation switch and the OS "reduce motion"). */
+  motion: boolean;
 }) {
   const move = useSidePanelLayout((st) => st.move);
   const [dragging, setDragging] = useState<WidgetId | null>(null);
@@ -183,14 +189,16 @@ function WidgetList({
         <SortableContext items={entries.map((e) => e.id)} strategy={verticalListSortingStrategy}>
           <div className={c.list}>
             {entries.map((e) => (
-              <SortableCard key={e.id} entry={e} />
+              <SortableCard key={e.id} entry={e} motion={motion} />
             ))}
           </div>
         </SortableContext>
         {/* The lifted copy follows the pointer above everything (portalled: the panel clips). */}
         {createPortal(
-          <DragOverlay dropAnimation={{ duration: 180, easing: "cubic-bezier(0.32, 0.72, 0, 1)" }}>
-            {activeEntry ? <CardFace entry={activeEntry} lifted /> : null}
+          <DragOverlay
+            dropAnimation={motion ? { duration: 180, easing: "cubic-bezier(0.32, 0.72, 0, 1)" } : null}
+          >
+            {activeEntry ? <CardFace entry={activeEntry} lifted motion={motion} /> : null}
           </DragOverlay>,
           document.body,
         )}
@@ -199,14 +207,23 @@ function WidgetList({
   );
 }
 
-function SortableCard({ entry }: { entry: LayoutEntry }) {
+function SortableCard({ entry, motion }: { entry: LayoutEntry; motion: boolean }) {
   const setOn = useSidePanelLayout((st) => st.setOn);
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: entry.id,
-  });
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({
+      id: entry.id,
+      // No glide while motion is off: the cards swap places at once.
+      transition: motion ? undefined : null,
+    });
   return (
     <div
-      ref={setNodeRef}
+      // The card is its own ACTIVATOR, named explicitly: ⚠️ without it the keyboard sensor takes
+      // any Space / Enter that bubbles up from inside — the switch's too — as "start a drag", and
+      // no widget could be switched from the keyboard.
+      ref={(node) => {
+        setNodeRef(node);
+        setActivatorNodeRef(node);
+      }}
       className={c.slot}
       data-dragging={isDragging || undefined}
       style={{ transform: CSS.Translate.toString(transform), transition }}
@@ -229,14 +246,23 @@ function CardFace({
   entry,
   onToggle,
   lifted,
+  motion,
 }: {
   entry: LayoutEntry;
   onToggle?: (on: boolean) => void;
   lifted?: boolean;
+  /** Only for the lifted copy, which lives in a portal outside the view's motion scope. */
+  motion?: boolean;
 }) {
   const def = widgetDef(entry.id);
   return (
-    <div className={c.card} data-on={entry.on || undefined} data-lifted={lifted || undefined} data-widget={def.id}>
+    <div
+      className={c.card}
+      data-on={entry.on || undefined}
+      data-lifted={lifted || undefined}
+      data-motion={(lifted && motion) || undefined}
+      data-widget={def.id}
+    >
       <span className={c.tile} aria-hidden="true">
         <Ico name={def.icon} className="sm" />
       </span>
