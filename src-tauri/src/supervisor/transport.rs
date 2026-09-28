@@ -924,9 +924,9 @@ impl Transport {
                 //
                 // ⚠️ Every live remote conversation holds its OWN ssh, and each probe is
                 // an encrypted round trip that wakes the Wi-Fi radio (and Tailscale's
-                // tunnel) even when nothing else is happening. 5s was three times the
-                // traffic at rest for 15s of detection nobody needed (decided 28/09:
-                // ~30s is the accepted time to notice a cut).
+                // tunnel) even when nothing else is happening. 5s was twice the traffic
+                // at rest for 15s of detection nobody needed (decided 28/09: ~30s is the
+                // accepted time to notice a cut).
                 .arg("-o")
                 .arg("ServerAliveInterval=10")
                 .arg("-o")
