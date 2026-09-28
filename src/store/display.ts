@@ -55,9 +55,10 @@ export interface DisplayPrefs {
   uiZoom: number;
 
   /** The widest the conversation's reading column may get, px — the thread's text and the
-   *  composer, which share it. 760 by default; stepped by 40 between 560 and 1080 and
-   *  {@link sanitizeReadingWidth}d on load and on write. It is a CAP: a narrower pane keeps a
-   *  side margin of its own on top (`--cv-gutter`). Read by {@link ConversationPane}. */
+   *  composer, which share it. 840 by default — the column's historical width, so nothing
+   *  changes until someone narrows it; stepped by 40 between 560 and 1080 and
+   *  {@link sanitizeReadingWidth}d on load and on write. A CAP: a pane narrower than it keeps
+   *  its usual 26px either side. Read by {@link ConversationPane}. */
   conversationWidth: number;
 
   /** Show the "Fleet readout" banner (the adaptive "N Running · N Review · …" stage
@@ -111,7 +112,7 @@ export interface DisplayPrefs {
   /** Shape the conversation side panel to what it holds: a sheet at the top right, only as
    *  tall as its sections, that grows (animated) when a TOSSE task, a goal, todos or an
    *  artifact arrive and shrinks when they go — scrolling inside once it reaches the bottom of
-   *  the window. ON by default. Off → the previous full-height column. Read by
+   *  the window. OFF by default (the full-height column); opt-in. Read by
    *  {@link ConversationSidePanel} (see useFitHeight). */
   sidePanelFitContent: boolean;
 
@@ -378,7 +379,7 @@ const DEFAULTS: DisplayPrefs = {
   showLastMessagePreview: true,
   conversationSidePanel: true,
   conversationTelemetry: false,
-  sidePanelFitContent: true,
+  sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in

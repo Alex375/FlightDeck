@@ -149,10 +149,9 @@ export function isCompactable(id: string): boolean {
 // (max-width:500px)` has already put every chip in icon-only mode. One number in the
 // system instead of two that must be kept consistent.
 export const MIN_COMPOSER_PX = 500;
-/** The conversation pane's floor: the composer's floor plus the 2 × 26px its card leaves on
- *  either side AT this width (`.cv-composer { width: calc(100% - 2 * var(--cv-gutter)) }` —
- *  the gutter is responsive and bottoms out at 26px exactly here; see `.cv-pane`). The
- *  side-panel splitter stops here, and the window's own minimum is derived from it. */
+/** The conversation pane's floor: the composer's floor plus the 52px its card leaves on
+ *  either side (`.cv-composer { width: calc(100% - 52px) }`). The side-panel splitter
+ *  stops here, and the window's own minimum is derived from it. */
 export const MIN_CONVERSATION_PANE_PX = MIN_COMPOSER_PX + 52;
 export const COMPACT_CHIP_PX = 25;
 export const CHIP_GAP_PX = 3;

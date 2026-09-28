@@ -798,9 +798,9 @@ function ThreadPrefs() {
           hint={
             <>
               The widest the conversation's <strong>text column</strong> gets — the thread and
-              the composer share it. Narrower leaves more margin on both sides; when the window
-              is too tight for the width you pick (both side bars open), the column still keeps
-              a margin of its own. <strong>{DEFAULT_READING_WIDTH} px by default.</strong>
+              the composer share it. Narrower leaves more margin on both sides — handy with both
+              side bars open, where the default runs almost edge to edge.{" "}
+              <strong>{DEFAULT_READING_WIDTH} px by default.</strong>
             </>
           }
           control={
@@ -872,7 +872,7 @@ function ThreadPrefs() {
               The conversation panel sits at the <strong>top right</strong>, only as tall as what
               it holds, and <strong>grows</strong> — animated — when a TOSSE task, a goal, todos
               or an artifact show up (and shrinks when they go). Past the bottom of the window it
-              scrolls. Off → a full-height column. <strong>On by default.</strong>
+              scrolls. Off → a full-height column. <strong>Off by default.</strong>
               {conversationSidePanel ? null : (
                 <> It shapes the conversation panel, so turn that on first.</>
               )}
