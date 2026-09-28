@@ -930,6 +930,7 @@ function MotionPrefs() {
   const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
   const panelAnimations = useDisplay((s) => s.panelAnimations);
   const conversationAnimations = useDisplay((s) => s.conversationAnimations);
+  const titleBarAnimations = useDisplay((s) => s.titleBarAnimations);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -983,6 +984,21 @@ function MotionPrefs() {
           checked={conversationAnimations}
           onChange={(v) => set({ conversationAnimations: v })}
           label="Animate work folding and unfolding"
+        />
+        <ToggleRow
+          title="Animate the title bar"
+          hint={
+            <>
+              The underline under the current view <strong>slides to the tab you pick</strong>,
+              a panel button's <strong>open dot grows in and out</strong>, and the system
+              switches give under the click. <strong>On by default</strong> (under a fifth of a
+              second). Off → the bar changes state in one frame. Your system's{" "}
+              <strong>"reduce motion"</strong> setting always wins over this.
+            </>
+          }
+          checked={titleBarAnimations}
+          onChange={(v) => set({ titleBarAnimations: v })}
+          label="Animate the title bar"
         />
       </SettingsGroup>
     </>

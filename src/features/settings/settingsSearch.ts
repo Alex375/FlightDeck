@@ -54,6 +54,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Zoom when opening a card", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion modal flight deck display affichage mouvement" },
   { title: "Slide side panels open", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion panel editor terminal display affichage mouvement" },
   { title: "Animate the conversation", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion thread display affichage mouvement" },
+  { title: "Animate the title bar", section: "display", sub: "appearance", group: "Motion", keywords: "animation motion tabs onglets underline header titlebar barre buttons boutons display affichage mouvement" },
   { title: "Message controls", section: "display", sub: "thread", group: "Thread", keywords: "rewind fork hover controls rembobiner display affichage" },
   { title: "Clickable filename on Read/Write rows", section: "display", sub: "thread", group: "Thread", keywords: "file mention path link chemin cliquable display affichage" },
   { title: "Show hosted artifacts in Flight Deck", section: "display", sub: "thread", group: "Thread", keywords: "artifact artefact claude design canvas claude.ai webview browser navigateur panel panneau" },

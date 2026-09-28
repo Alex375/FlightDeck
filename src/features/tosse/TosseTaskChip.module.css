@@ -29,6 +29,17 @@
   border-color: var(--wf-tx-xlo);
   color: var(--wf-tx-hi);
 }
+/* In the title bar the chip drops its frame like the controls around it (a surface only on
+   hover); the Flight Deck card keeps the outlined version. */
+:global(.wf-titlebar) .chip {
+  height: 26px;
+  border-color: transparent;
+  border-radius: 8px;
+}
+:global(.wf-titlebar) .clickable:hover {
+  background: var(--wf-panel);
+  border-color: transparent;
+}
 /* On a Flight Deck card the chip sits among the other marks: the title would not fit and
    the mark + status dot already answer "which task". */
 .compact {
