@@ -8,6 +8,7 @@ import type {
   NormalizedBlock,
   PermissionRequestPayload,
   SessionStatePayload,
+  TokenUsage,
 } from "../ipc/client";
 import type { RunClock } from "../agent/runClock";
 
@@ -148,6 +149,9 @@ export interface TurnResultMeta {
   durationApiMs: number | null;
   /** Time-to-first-token this turn. Captured but not surfaced in the UI yet. */
   ttftMs: number | null;
+  /** What this turn consumed, summed over its model calls (`result.usage`). Claude only —
+   *  `null` for Codex and for a turn the CLI reported without usage. */
+  usage: TokenUsage | null;
 }
 
 /** A surfaced system notice (compact boundary, sub-agent lifecycle, …). */

@@ -100,6 +100,7 @@ export type {
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionStatePayload,
+  TokenUsage,
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,

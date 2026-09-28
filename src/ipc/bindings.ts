@@ -3603,7 +3603,12 @@ refs: string[] }
  * provisional window (the transcript carries no authoritative `modelUsage`); the
  * first live `result` later refines it.
  */
-export type ContextFill = { context_tokens: number | null; context_window: number | null }
+export type ContextFill = { context_tokens: number | null; context_window: number | null; 
+/**
+ * The breakdown of `context_tokens` (see `SessionState::context_usage`), from the same
+ * transcript line.
+ */
+context_usage: TokenUsage | null }
 /**
  * A normalized conversation event the UI applies incrementally. Tagged on
  * `kind` so the TS side is a simple discriminated union.
@@ -3639,7 +3644,7 @@ export type ConversationItem =
 /**
  * End of a turn (`result`).
  */
-{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null } | 
+{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null } | 
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
@@ -5328,6 +5333,14 @@ ended: boolean;
  */
 context_tokens: number | null; 
 /**
+ * The same last model call, broken down: what `context_tokens` is made of (fresh input,
+ * cache written, cache read) plus the tokens it generated. `None` until a call reports
+ * usage. Set wherever `context_tokens` is, from the same `usage` object — the two never
+ * disagree — and its `output` completed by the call's `message_delta`. Drives the
+ * telemetry deck's token breakdown.
+ */
+context_usage: TokenUsage | null; 
+/**
  * Size of the active model's context window (from `result.modelUsage[…].contextWindow`,
  * e.g. 200k or 1M for Opus in 1M mode). `None` until a `result` reports it; once
  * known it is kept across turns that omit it. The ring's denominator.
@@ -5606,6 +5619,13 @@ export type TerminalOutputEvent = { id: string; data: string }
  * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
  */
 export type TickEvent = { seq: number; message: string }
+/**
+ * The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
+ * the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),
+ * `cache_read` (prompt served from it) — and the `output` generated. Their prompt part sums
+ * to the context occupancy: `input + cache_creation + cache_read`.
+ */
+export type TokenUsage = { input: number; cache_creation: number; cache_read: number; output: number }
 /**
  * Which of Claude Code's three rule lists a rule sits in.
  */

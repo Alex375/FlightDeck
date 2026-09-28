@@ -13,7 +13,7 @@
 // for the same reason — on the timeline/tool-result/sub-thread/turn-result references, which
 // move when a turn settles or a result lands, NOT on every streamed token.
 
-import type { JsonValue } from "../../ipc/client";
+import type { JsonValue, TokenUsage } from "../../ipc/client";
 import type { SessionEntry } from "../../store/types";
 import { useConversationStore } from "../../store/conversationStore";
 import { basename, toolMeta } from "./toolMeta";
@@ -121,6 +121,10 @@ export interface Telemetry {
   familyMeanMs: Record<ToolFamily, number | null>;
   /** The average measured duration over every call, or null until one finished live. */
   meanCallMs: number | null;
+  /** Tokens the turns consumed, summed over those that reported usage (`result.usage` — every
+   *  model call of the turn, cache re-reads included); null when none did (Codex, or no turn
+   *  finished live yet). Like `costUsd`, it covers the turns this app watched finish. */
+  tokens: TokenUsage | null;
 }
 
 /** How many calls the feed keeps — four, so the whole deck fits a 13-inch laptop's height. */
@@ -157,6 +161,7 @@ const EMPTY: Telemetry = {
   medianTurnMs: null,
   familyMeanMs: { read: null, edit: null, shell: null, search: null, agent: null, web: null, other: null },
   meanCallMs: null,
+  tokens: null,
 };
 
 /** The mean of a list, or null when it is empty. */
@@ -250,8 +255,10 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
   let cost: number | null = null;
   let modelMs: number | null = null;
   const turnMs: number[] = [];
+  let tokens: TokenUsage | null = null;
   for (const r of Object.values(entry.turnResults)) {
     turns += 1;
+    if (r.usage) tokens = addUsage(tokens, r.usage);
     if (r.totalCostUsd != null) cost = (cost ?? 0) + r.totalCostUsd;
     if (r.durationApiMs != null) modelMs = (modelMs ?? 0) + r.durationApiMs;
     if (r.durationMs != null) turnMs.push(r.durationMs);
@@ -289,6 +296,17 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
       other: mean(durationsByFamily.other),
     },
     meanCallMs: mean(FAMILIES.flatMap((f) => durationsByFamily[f])),
+    tokens,
+  };
+}
+
+function addUsage(acc: TokenUsage | null, u: TokenUsage): TokenUsage {
+  if (!acc) return { ...u };
+  return {
+    input: acc.input + u.input,
+    cache_creation: acc.cache_creation + u.cache_creation,
+    cache_read: acc.cache_read + u.cache_read,
+    output: acc.output + u.output,
   };
 }
 
@@ -301,7 +319,8 @@ function telemetrySig(t: Telemetry): string {
     t.events.map((e) => `${e.id}:${e.status}:${e.durationMs ?? ""}`).join(",") +
     `|${t.inFlight.map((e) => `${e.id}@${e.startedAt}`).join(",")}` +
     `|${FAMILIES.map((f) => t.familyMedianMs[f] ?? "").join(",")}|${t.medianTurnMs ?? ""}` +
-    `|${FAMILIES.map((f) => t.familyMeanMs[f] ?? "").join(",")}|${t.meanCallMs ?? ""}`
+    `|${FAMILIES.map((f) => t.familyMeanMs[f] ?? "").join(",")}|${t.meanCallMs ?? ""}` +
+    `|${t.tokens ? `${t.tokens.input}.${t.tokens.cache_creation}.${t.tokens.cache_read}.${t.tokens.output}` : ""}`
   );
 }
 
@@ -493,6 +512,37 @@ export function deckStatus(s: {
   if (s.busy) return { key: "thinking", label: "Thinking" };
   if (s.backgroundOps > 0) return { key: "background", label: "Background ops" };
   return { key: "standby", label: "Standby" };
+}
+
+// ---- Tokens -----------------------------------------------------------------------------------
+
+/** The four kinds of token a model call reports, in the order the deck's bars stack them: the
+ *  prompt (cached, being cached, fresh), then what the model wrote. */
+export type TokenPart = "cache_read" | "cache_creation" | "input" | "output";
+
+export const TOKEN_PARTS: ReadonlyArray<{ key: TokenPart; label: string; title: string }> = [
+  { key: "cache_read", label: "Cached", title: "Prompt tokens read back from the prompt cache" },
+  { key: "cache_creation", label: "Caching", title: "Prompt tokens written to the prompt cache" },
+  { key: "input", label: "Input", title: "Prompt tokens sent fresh — neither read from nor written to the cache" },
+  { key: "output", label: "Output", title: "Tokens the model wrote" },
+];
+
+/** Every token a usage counts — its prompt and its reply. */
+export function tokenTotal(u: TokenUsage): number {
+  return u.input + u.cache_creation + u.cache_read + u.output;
+}
+
+/** Each part's share of the whole, for the stacked bar; all zero on an empty usage (an empty
+ *  bar, never a division by zero). */
+export function tokenShares(u: TokenUsage): Record<TokenPart, number> {
+  const total = tokenTotal(u);
+  const share = (n: number) => (total > 0 ? n / total : 0);
+  return {
+    cache_read: share(u.cache_read),
+    cache_creation: share(u.cache_creation),
+    input: share(u.input),
+    output: share(u.output),
+  };
 }
 
 /** A run's elapsed time on the deck's clock: `m:ss` under an hour, `h:mm:ss` beyond. */

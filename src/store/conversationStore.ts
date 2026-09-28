@@ -24,6 +24,7 @@ import type {
   JsonValue,
   PermissionRequestPayload,
   SessionStatePayload,
+  TokenUsage,
 } from "../ipc/client";
 import type {
   ErrorItem,
@@ -71,6 +72,7 @@ const connectingState: SessionStatePayload = {
   ended: false,
   context_tokens: null,
   context_window: null,
+  context_usage: null,
   rate_limit: null,
 };
 
@@ -167,7 +169,11 @@ interface ConversationState {
    *  Only fills a field that's still null — never clobbers a fresher live value. */
   applyContextFill: (
     session: string,
-    fill: { context_tokens: number | null; context_window: number | null },
+    fill: {
+      context_tokens: number | null;
+      context_window: number | null;
+      context_usage: TokenUsage | null;
+    },
   ) => void;
   /** Reset a session's live state to neutral (idle, not busy/ended) WITHOUT
    *  touching its timeline. Used when the stream is turned off: the terminal
@@ -385,8 +391,15 @@ export const useConversationStore = create<ConversationState>((set) => {
         const s = entry.state;
         const tokens = s.context_tokens ?? fill.context_tokens;
         const window = s.context_window ?? fill.context_window;
-        if (tokens === s.context_tokens && window === s.context_window) return entry;
-        return { ...entry, state: { ...s, context_tokens: tokens, context_window: window } };
+        // The breakdown travels WITH the tokens: take the transcript's only when its total
+        // is the one being seeded, so the bar never splits a fill it didn't sum to.
+        const usage = s.context_tokens === null ? fill.context_usage : s.context_usage;
+        if (tokens === s.context_tokens && window === s.context_window && usage === s.context_usage)
+          return entry;
+        return {
+          ...entry,
+          state: { ...s, context_tokens: tokens, context_window: window, context_usage: usage },
+        };
       }),
 
     clearState: (session) =>
@@ -790,6 +803,7 @@ export const useConversationStore = create<ConversationState>((set) => {
               durationMs: item.duration_ms,
               durationApiMs: item.duration_api_ms,
               ttftMs: item.ttft_ms,
+              usage: item.usage ?? null,
             };
             // finalize any still-streaming turns
             const turns = { ...entry.turns };

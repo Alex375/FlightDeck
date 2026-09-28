@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
 
-use super::assembler::{context_used_from_usage, normalize_blocks};
+use super::assembler::{context_used_from_usage, normalize_blocks, token_usage_from};
 use super::model::{ContextFill, ConversationItem, GoalState};
 
 /// Claude's config dir: `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`. Shared
@@ -154,8 +154,14 @@ fn load_context_fill_in(config_dir: &Path, session_id: &str) -> ContextFill {
         }
         // The freshest main-thread usage wins (largest accumulated context); keep
         // scanning so the LAST one sticks.
-        if let Some(used) = message.get("usage").and_then(context_used_from_usage) {
+        let usage = message.get("usage");
+        if let Some(used) = usage.and_then(context_used_from_usage) {
             fill.context_tokens = Some(used);
+        }
+        // Its breakdown, from the same line — so a reopened conversation shows what its fill
+        // is made of before a single new turn runs.
+        if let Some(breakdown) = usage.and_then(token_usage_from) {
+            fill.context_usage = Some(breakdown);
         }
     }
     fill

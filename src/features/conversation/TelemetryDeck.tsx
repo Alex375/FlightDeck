@@ -1,6 +1,7 @@
 // The TELEMETRY deck: the side panel's opt-in instrument cluster (`conversationTelemetry`,
 // OFF by default) — millisecond clocks, needles, key figures, a streaming oscilloscope, a
-// per-second call histogram, a counter per tool family, a board for the LONG calls and a feed.
+// per-second call histogram, the token mix, a counter per tool family, a board for the LONG calls
+// and a feed.
 //
 // It is meant to be loud, and it is allowed to be only because NOTHING on it moves on its own:
 // every figure is a real signal at its current value (telemetry.ts derives the counts,
@@ -24,6 +25,8 @@ import { liveRunStart, settledRunMs } from "../../agent/runClock";
 import { motionAllowed } from "../../ui/motion";
 import { Ico } from "../../ui/kit";
 import type { SessionEntry } from "../../store/types";
+import type { TokenUsage } from "../../ipc/client";
+import { fmtTokens } from "../../store/contextData";
 import { ContextUsageMenu } from "./ContextUsageMenu";
 import {
   closeBucket,
@@ -36,6 +39,9 @@ import {
   liveInFlight,
   LONG_CALL_MS,
   TELEMETRY_DIALS,
+  TOKEN_PARTS,
+  tokenShares,
+  tokenTotal,
   useTelemetry,
   type DeckStatusKey,
   type Telemetry,
@@ -146,6 +152,8 @@ export function TelemetryDeck({ convId }: { convId: string }) {
           </span>
         </div>
       </div>
+
+      <Tokens call={state?.context_usage ?? null} session={t.tokens} />
 
       {/* The figures worth reading first, set larger than the rest. */}
       <dl className={d.kpis}>
@@ -635,6 +643,59 @@ function ContextGauge({ convId, working }: { convId: string; working: boolean })
         );
       }}
     />
+  );
+}
+
+/**
+ * The token mix, as two stacked bars sharing one legend: the LAST model call (its prompt — the
+ * context fill the gauge shows, split into cached / being cached / fresh — then its reply) and
+ * the SESSION (every turn that finished while the app watched, as the CLI totals them; Claude
+ * only, so a Codex conversation reads "—" there rather than a made-up zero).
+ */
+function Tokens({ call, session }: { call: TokenUsage | null; session: TokenUsage | null }) {
+  return (
+    <div className={d.tokens}>
+      <span className={d.kicker}>Tokens</span>
+      {TOKEN_PARTS.map((p) => (
+        <span key={p.key} className={d.tokHead} data-part={p.key} title={p.title}>
+          {p.label}
+        </span>
+      ))}
+      <TokenRow label="Call" title="The last model call: its prompt, then its reply" usage={call} />
+      <TokenRow label="Session" title="Every turn that finished while this conversation was open" usage={session} />
+    </div>
+  );
+}
+
+function TokenRow({ label, title, usage }: { label: string; title: string; usage: TokenUsage | null }) {
+  const shares = usage ? tokenShares(usage) : null;
+  return (
+    <>
+      <span className={d.tokLabel} title={title}>
+        {label}
+      </span>
+      <span className={d.tokBar} role="img" aria-label={`${label} tokens`} data-empty={!usage || undefined}>
+        {shares
+          ? TOKEN_PARTS.map((p) =>
+              usage![p.key] > 0 ? (
+                <span
+                  key={p.key}
+                  className={d.tokSeg}
+                  data-part={p.key}
+                  style={{ flexGrow: shares[p.key] }}
+                  title={`${p.label}: ${usage![p.key].toLocaleString("en-US")} tokens (${Math.round(shares[p.key] * 100)}%)`}
+                />
+              ) : null,
+            )
+          : null}
+      </span>
+      <span className={d.tokTotal}>{usage ? fmtTokens(tokenTotal(usage)) : "—"}</span>
+      {TOKEN_PARTS.map((p) => (
+        <span key={p.key} className={d.tokVal} data-zero={!usage || usage[p.key] === 0 || undefined}>
+          {usage ? fmtTokens(usage[p.key]) : "—"}
+        </span>
+      ))}
+    </>
   );
 }
 

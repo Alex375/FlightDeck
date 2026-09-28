@@ -72,6 +72,12 @@ pub struct SessionStatePayload {
     /// `input + cache_creation + cache_read` (from `message_start` live, then the
     /// `result`). `None` until the first turn reports usage. Drives the context ring.
     pub context_tokens: Option<u64>,
+    /// The same last model call, broken down: what `context_tokens` is made of (fresh input,
+    /// cache written, cache read) plus the tokens it generated. `None` until a call reports
+    /// usage. Set wherever `context_tokens` is, from the same `usage` object — the two never
+    /// disagree — and its `output` completed by the call's `message_delta`. Drives the
+    /// telemetry deck's token breakdown.
+    pub context_usage: Option<TokenUsage>,
     /// Size of the active model's context window (from `result.modelUsage[…].contextWindow`,
     /// e.g. 200k or 1M for Opus in 1M mode). `None` until a `result` reports it; once
     /// known it is kept across turns that omit it. The ring's denominator.
@@ -319,6 +325,21 @@ pub struct RemoteControlState {
 pub struct ContextFill {
     pub context_tokens: Option<u64>,
     pub context_window: Option<u64>,
+    /// The breakdown of `context_tokens` (see `SessionState::context_usage`), from the same
+    /// transcript line.
+    pub context_usage: Option<TokenUsage>,
+}
+
+/// The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
+/// the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),
+/// `cache_read` (prompt served from it) — and the `output` generated. Their prompt part sums
+/// to the context occupancy: `input + cache_creation + cache_read`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+    pub output: u64,
 }
 
 /// The active `/goal` of a conversation (Claude Code's native goal feature: Claude keeps
@@ -443,6 +464,10 @@ pub enum ConversationItem {
         duration_api_ms: Option<u64>,
         /// Time-to-first-token this turn; captured but not yet surfaced in the UI.
         ttft_ms: Option<u64>,
+        /// What the turn consumed: `result.usage`, the aggregate over every model call the
+        /// turn made (not its last call — that is `SessionState::context_usage`). `None` when
+        /// the result carries none (Codex reports usage per thread, not per turn).
+        usage: Option<TokenUsage>,
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),

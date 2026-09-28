@@ -2004,6 +2004,7 @@ export async function loadConversationHistory(convId: string): Promise<void> {
       applyContextFill(convId, {
         context_tokens: ctx.data.context_tokens,
         context_window: getCachedWindow(convId),
+        context_usage: ctx.data.context_usage ?? null,
       });
     else console.error("loadSessionContext failed:", ctx.error);
   }
@@ -2064,6 +2065,7 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
       applyContextFill(convId, {
         context_tokens: ctx.data.context_tokens,
         context_window: getCachedWindow(convId),
+        context_usage: ctx.data.context_usage ?? null,
       });
     else console.error("loadSessionContext failed:", ctx.error);
   }

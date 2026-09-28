@@ -232,6 +232,102 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- Token mix: two stacked bars (last call, session) under one legend ------------------------ */
+
+/* One grid, so the legend heads, the bars and the figures line up column for column:
+     TOKENS  | Cached | Caching | Input | Output
+     CALL    | [============ bar ============]
+     30.6k   | 15.6k  | 9.1k    | 5.1k  | 812      (and the same two rows for SESSION) */
+.tokens {
+  display: grid;
+  grid-template-columns: 44px repeat(4, minmax(0, 1fr));
+  align-items: center;
+  column-gap: 4px;
+  row-gap: 3px;
+}
+.tokHead {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  font-size: 7.5px;
+  /* Tighter than the other labels: four heads share the width the panel's narrowest size
+     leaves them, and "Caching" must still read whole there. */
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tokHead::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
+  background: var(--part);
+}
+.tokLabel {
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+}
+.tokBar {
+  grid-column: span 4;
+  display: flex;
+  gap: 1px;
+  height: 7px;
+  margin-top: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--wf-panel-3);
+}
+.tokSeg {
+  flex: 1 1 0;
+  min-width: 2px;
+  background: var(--part);
+}
+/* The reply is set a notch apart from the prompt it answers. */
+.tokSeg[data-part="output"] {
+  margin-left: 2px;
+}
+.deck[data-motion] .tokSeg {
+  transition: flex-grow 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tokTotal,
+.tokVal {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tokTotal {
+  color: var(--wf-tx-hi);
+}
+.tokVal {
+  color: var(--wf-tx);
+}
+.tokVal[data-zero] {
+  color: var(--wf-tx-xlo);
+}
+/* One colour per part, shared by the legend and both bars — scoped to the deck, like the
+   families below (a bare attribute selector would leak app-wide). */
+.deck [data-part="cache_read"] {
+  --part: var(--wf-wait);
+}
+.deck [data-part="cache_creation"] {
+  --part: var(--wf-ultra);
+}
+.deck [data-part="input"] {
+  --part: var(--wf-accent);
+}
+.deck [data-part="output"] {
+  --part: var(--wf-run);
+}
+
 /* ---- Key figures ---------------------------------------------------------------------------- */
 
 .kpis,

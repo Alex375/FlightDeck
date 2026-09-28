@@ -14,6 +14,8 @@ import {
   memoizedTelemetry,
   selectTelemetry,
   TELEMETRY_FEED_SIZE,
+  tokenShares,
+  tokenTotal,
   toolFamily,
 } from "./telemetry";
 
@@ -27,7 +29,12 @@ function entryOf(
   turns: Array<{ id: string; parent?: string | null; blocks: NormalizedBlock[] }>,
   results: Record<string, JsonValue> = {},
   errored: string[] = [],
-  turnResults: Array<{ cost?: number | null; apiMs?: number | null; ms?: number | null }> = [],
+  turnResults: Array<{
+    cost?: number | null;
+    apiMs?: number | null;
+    ms?: number | null;
+    usage?: { input: number; cache_creation: number; cache_read: number; output: number } | null;
+  }> = [],
   stamps: { startedAt?: Record<string, number>; durations?: Record<string, number> } = {},
 ): SessionEntry {
   const turnMap: Record<string, unknown> = {};
@@ -61,6 +68,7 @@ function entryOf(
       durationMs: r.ms ?? null,
       durationApiMs: r.apiMs ?? null,
       ttftMs: null,
+      usage: r.usage ?? null,
     };
   });
   return {
@@ -185,6 +193,40 @@ describe("selectTelemetry", () => {
     expect(t.turns).toBe(3);
     expect(t.costUsd).toBeCloseTo(0.15);
     expect(t.modelMs).toBe(5500);
+  });
+
+  it("sums tokens only over the turns that reported usage, and knows nothing without one", () => {
+    expect(selectTelemetry(entryOf([], {}, [], [{ cost: 0.1 }])).tokens).toBeNull();
+    const e = entryOf([], {}, [], [
+      { usage: { input: 10, cache_creation: 200, cache_read: 3000, output: 40 } },
+      { usage: null }, // a turn the CLI reported without usage (or a Codex one)
+      { usage: { input: 5, cache_creation: 0, cache_read: 3200, output: 60 } },
+    ]);
+    expect(selectTelemetry(e).tokens).toEqual({ input: 15, cache_creation: 200, cache_read: 6200, output: 100 });
+  });
+
+  it("re-renders when only the token totals moved", () => {
+    const a = entryOf([], {}, [], [{ usage: { input: 1, cache_creation: 0, cache_read: 0, output: 1 } }]);
+    const b = entryOf([], {}, [], [{ usage: { input: 1, cache_creation: 0, cache_read: 0, output: 2 } }]);
+    clearAllTelemetryCache();
+    const first = memoizedTelemetry("s", a);
+    expect(memoizedTelemetry("s", b)).not.toBe(first);
+    expect(memoizedTelemetry("s", b).tokens?.output).toBe(2);
+  });
+});
+
+describe("token shares (the stacked bar)", () => {
+  it("splits a call into its parts, summing to the whole", () => {
+    const u = { input: 5069, cache_creation: 9061, cache_read: 15626, output: 812 };
+    expect(tokenTotal(u)).toBe(30568);
+    const s = tokenShares(u);
+    expect(s.cache_read + s.cache_creation + s.input + s.output).toBeCloseTo(1);
+    expect(s.cache_read).toBeCloseTo(15626 / 30568);
+  });
+
+  it("draws an empty usage as an empty bar, not NaN", () => {
+    const s = tokenShares({ input: 0, cache_creation: 0, cache_read: 0, output: 0 });
+    expect(Object.values(s)).toEqual([0, 0, 0, 0]);
   });
 });
 

@@ -16,6 +16,7 @@ import type {
   PermissionDecision,
   PermissionRequestPayload,
   SessionStatePayload,
+  TokenUsage,
   WorkflowJournal,
   WorkflowRun,
 } from "../client";
@@ -288,6 +289,19 @@ export const MOCK_SESSION_ID = "01HVMOCK-S3SSION-ID";
 const CTX_DEMO =
   typeof location !== "undefined" ? new URLSearchParams(location.search).get("ctx") : null;
 
+/** The capture fixture's last root call, broken down (see `context_usage`). */
+const DEMO_CONTEXT_USAGE: TokenUsage = { input: 5069, cache_creation: 9061, cache_read: 15626, output: 812 };
+
+/** What a demo turn consumed — scaled from the fixture, so totals across turns stay plausible. */
+function demoTurnUsage(scale: number): TokenUsage {
+  return {
+    input: Math.round(5069 * scale),
+    cache_creation: Math.round(9061 * scale * 0.4),
+    cache_read: Math.round(15626 * scale * 2.2),
+    output: Math.round(812 * scale),
+  };
+}
+
 const baseState: SessionStatePayload = {
   busy: false,
   session_id: MOCK_SESSION_ID,
@@ -303,6 +317,9 @@ const baseState: SessionStatePayload = {
   link: null,
   ended: false,
   context_tokens: CTX_DEMO === "none" ? null : 29756,
+  // The same fill, broken down as the real CLI reports it (the capture fixture's numbers:
+  // 5069 + 9061 + 15626 = 29756) — so the telemetry deck's token bar has something real-shaped.
+  context_usage: CTX_DEMO === "none" ? null : DEMO_CONTEXT_USAGE,
   context_window: CTX_DEMO === "none" || CTX_DEMO === "nowindow" ? null : 1000000,
   rate_limit: {
     status: "allowed",
@@ -318,9 +335,14 @@ export const idleState = (): SessionStatePayload => ({ ...baseState });
  *  transcript). `?ctx=nowindow` reproduces a RELOADED conversation — the transcript
  *  carries the token count but never the window, so the ring must stay openable with no
  *  percentage until the next turn ends. */
-export const demoContextFill = (): { context_tokens: number | null; context_window: number | null } => ({
+export const demoContextFill = (): {
+  context_tokens: number | null;
+  context_window: number | null;
+  context_usage: TokenUsage | null;
+} => ({
   context_tokens: CTX_DEMO === "nowindow" ? 29756 : null,
   context_window: null,
+  context_usage: CTX_DEMO === "nowindow" ? DEMO_CONTEXT_USAGE : null,
 });
 
 // ---- Fixture content -------------------------------------------------------
@@ -676,7 +698,7 @@ export class ScenarioDriver {
       ),
     );
     this.step(220, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.021, num_turns: 2, duration_ms: 26000, duration_api_ms: 18600, ttft_ms: 900 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.021, num_turns: 2, duration_ms: 26000, duration_api_ms: 18600, ttft_ms: 900, usage: demoTurnUsage(2) }),
     );
     // Idle main loop, but tk_bg keeps running → conversation goes "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
@@ -793,7 +815,7 @@ export class ScenarioDriver {
     );
 
     this.step(220, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.014, num_turns: 2, duration_ms: 8200, duration_api_ms: 6100, ttft_ms: 700 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.014, num_turns: 2, duration_ms: 8200, duration_api_ms: 6100, ttft_ms: 700, usage: demoTurnUsage(2) }),
     );
     // Idle main loop, but the two bg commands keep running → conversation "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
@@ -1109,7 +1131,7 @@ export class ScenarioDriver {
       }),
     );
     this.step(200, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 2, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 2, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500, usage: demoTurnUsage(2) }),
     );
     this.step(40, () => this.emit.state(idleState()));
   }
@@ -1223,7 +1245,7 @@ export class ScenarioDriver {
       this.emit.item({ kind: "assistant_message", id: "m3", parent_tool_use_id: null, blocks: [{ type: "text", text: t3 }] }),
     );
     this.step(200, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 3, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.004, num_turns: 3, duration_ms: 3100, duration_api_ms: 2400, ttft_ms: 500, usage: demoTurnUsage(3) }),
     );
     this.step(40, () => this.emit.state(idleState()));
   }
@@ -1314,7 +1336,7 @@ export class ScenarioDriver {
     );
     this.step(320, () => ack("toolu_r3", "audit-report.html", reportUrl, 3));
     this.step(200, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.006, num_turns: 3, duration_ms: 4200, duration_api_ms: 3300, ttft_ms: 460 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.006, num_turns: 3, duration_ms: 4200, duration_api_ms: 3300, ttft_ms: 460, usage: demoTurnUsage(3) }),
     );
     this.step(40, () => this.emit.state(idleState()));
   }
@@ -1386,7 +1408,7 @@ export class ScenarioDriver {
     );
 
     this.step(220, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.009, num_turns: 1, duration_ms: 5200, duration_api_ms: 3800, ttft_ms: 600 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.009, num_turns: 1, duration_ms: 5200, duration_api_ms: 3800, ttft_ms: 600, usage: demoTurnUsage(1) }),
     );
     // Idle main loop, but the watches keep running → conversation "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
@@ -1456,7 +1478,7 @@ export class ScenarioDriver {
     );
 
     this.step(220, () =>
-      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.052, num_turns: 1, duration_ms: 6200, duration_api_ms: 4500, ttft_ms: 650 }),
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.052, num_turns: 1, duration_ms: 6200, duration_api_ms: 4500, ttft_ms: 650, usage: demoTurnUsage(1) }),
     );
     // Idle main loop, but the workflow keeps running → conversation "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
@@ -1523,6 +1545,7 @@ export class ScenarioDriver {
           duration_ms: 1200,
           duration_api_ms: 900,
           ttft_ms: 200,
+          usage: demoTurnUsage(1),
         });
         this.emit.state(idleState());
       });
@@ -1651,6 +1674,7 @@ export class ScenarioDriver {
           duration_ms: 4200,
           duration_api_ms: 3100,
           ttft_ms: 550,
+          usage: demoTurnUsage(1),
         }),
       );
       this.step(40, () => this.emit.state(idleState()));
@@ -1695,6 +1719,7 @@ export class ScenarioDriver {
         duration_ms: 9300,
         duration_api_ms: 6800,
         ttft_ms: 800,
+        usage: demoTurnUsage(1),
       }),
     );
     this.step(40, () => this.emit.state(idleState()));
@@ -1715,6 +1740,7 @@ export class ScenarioDriver {
       duration_ms: null,
       duration_api_ms: null,
       ttft_ms: null,
+      usage: null,
     });
     this.emit.state(idleState());
   }
