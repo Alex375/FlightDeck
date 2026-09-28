@@ -76,6 +76,14 @@ pub struct Assembler {
     /// end-of-turn (`ingest_result`) so it can never swallow a real user turn (those only
     /// arrive AFTER a `result`, never mid-turn).
     skill_invocation_pending: bool,
+    /// The CLI's CUMULATIVE `result.duration_api_ms` as of the previous `result` — the
+    /// baseline a turn's own model time is measured from. The wire value is a running
+    /// per-SESSION total (verified live, claude 2.1.283: 2.1s → 6.0s → 7.1s over three
+    /// plain prompts) that is even restored across `--resume` (7.1s → 7.9s after a
+    /// re-spawn), NOT a per-turn figure. `Some(0)` for a brand-new session (the counter
+    /// starts at zero — see [`Assembler::mark_fresh_session`]); `None` while unknown (a
+    /// resumed or re-attached process, until its first `result` sets it).
+    api_ms_baseline: Option<u64>,
 }
 
 /// The last-announced friendly labels for the three controls (see [`Assembler`]).
@@ -106,6 +114,27 @@ struct ToolUse {
 impl Assembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This process started a brand-new session (no `--resume`, no re-attach), so the
+    /// CLI's cumulative model-time counter starts at zero and the FIRST turn's model time
+    /// is known too. Left unset otherwise: a resumed session's restored total cannot be
+    /// known before its first `result`, whose model time is then reported as unknown.
+    pub fn mark_fresh_session(&mut self) {
+        self.api_ms_baseline = Some(0);
+    }
+
+    /// The model time spent since the previous `result` — this turn's share of the CLI's
+    /// cumulative `duration_api_ms` (see [`Self::api_ms_baseline`]). `None` when the
+    /// baseline is unknown, or when the counter went BACKWARDS (a re-spawned process that
+    /// restored an older total): the delta would be meaningless, so the turn reports none
+    /// and the new total becomes the baseline. A `result` without the field leaves the
+    /// baseline untouched.
+    fn turn_api_ms(&mut self, cumulative: Option<u64>) -> Option<u64> {
+        let total = cumulative?;
+        let turn = self.api_ms_baseline.and_then(|base| total.checked_sub(base));
+        self.api_ms_baseline = Some(total);
+        turn
     }
 
     /// Read-only view of the current session state.
@@ -1098,7 +1127,7 @@ impl Assembler {
             total_cost_usd: r.total_cost_usd,
             num_turns: r.num_turns,
             duration_ms: r.duration_ms,
-            duration_api_ms: r.duration_api_ms,
+            duration_api_ms: self.turn_api_ms(r.duration_api_ms),
             ttft_ms: r.ttft_ms,
         }));
         out.push(SessionEvent::State(self.state.clone()));
@@ -1443,6 +1472,9 @@ mod tests {
     #[test]
     fn assembles_fixture_into_normalized_events() {
         let mut asm = Assembler::new();
+        // The capture is a brand-new session's first turn: its cumulative model time IS
+        // this turn's.
+        asm.mark_fresh_session();
         let mut streamed_text = String::new();
         let mut saw_model = false;
         let mut saw_session_id = false;
@@ -1838,6 +1870,69 @@ mod tests {
         // last iteration: 2000 + 18000 + 0 = 20000 (NOT the top-level 1).
         assert_eq!(asm.state().context_tokens, Some(20_000));
         assert_eq!(asm.state().context_window, Some(1_000_000));
+    }
+
+    /// A `result` line carrying only the timing fields under test.
+    fn timed_result(duration_ms: u64, cumulative_api_ms: u64) -> CliMessage {
+        serde_json::from_value(serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "ok",
+            "session_id": "s",
+            "uuid": "u",
+            "duration_ms": duration_ms,
+            "duration_api_ms": cumulative_api_ms,
+        }))
+        .unwrap()
+    }
+
+    /// The (duration_ms, duration_api_ms) of the TurnResult a `result` normalizes to.
+    fn turn_timing(asm: &mut Assembler, msg: &CliMessage) -> (Option<u64>, Option<u64>) {
+        asm.ingest(msg)
+            .into_iter()
+            .find_map(|ev| match ev {
+                SessionEvent::Item(ConversationItem::TurnResult {
+                    duration_ms,
+                    duration_api_ms,
+                    ..
+                }) => Some((duration_ms, duration_api_ms)),
+                _ => None,
+            })
+            .expect("a result normalizes to a TurnResult")
+    }
+
+    /// `result.duration_api_ms` is a running per-session TOTAL on the wire (values from a
+    /// live probe of claude 2.1.283, three prompts in one process). Each turn must report
+    /// its OWN share, or every footer after the first shows the whole session's model time.
+    #[test]
+    fn turn_model_time_is_the_delta_of_the_cumulative_counter() {
+        let mut asm = Assembler::new();
+        asm.mark_fresh_session();
+        assert_eq!(turn_timing(&mut asm, &timed_result(1265, 2128)), (Some(1265), Some(2128)));
+        assert_eq!(turn_timing(&mut asm, &timed_result(3907, 6016)), (Some(3907), Some(3888)));
+        assert_eq!(turn_timing(&mut asm, &timed_result(1115, 7086)), (Some(1115), Some(1070)));
+    }
+
+    /// A resumed process restores the session's earlier total, which we cannot know
+    /// before its first `result`: that turn's model time is unknown (never the whole
+    /// restored total), the next ones are exact again.
+    #[test]
+    fn turn_model_time_is_unknown_on_the_first_result_of_a_resumed_process() {
+        let mut asm = Assembler::new(); // not marked fresh: a --resume spawn
+        assert_eq!(turn_timing(&mut asm, &timed_result(863, 7894)), (Some(863), None));
+        assert_eq!(turn_timing(&mut asm, &timed_result(900, 8800)), (Some(900), Some(906)));
+    }
+
+    /// A counter that went BACKWARDS (a re-spawned process restored an older total) yields
+    /// no model time for that turn instead of an underflow, and re-bases on the new total.
+    #[test]
+    fn turn_model_time_survives_a_counter_that_went_backwards() {
+        let mut asm = Assembler::new();
+        asm.mark_fresh_session();
+        assert_eq!(turn_timing(&mut asm, &timed_result(1000, 5000)).1, Some(5000));
+        assert_eq!(turn_timing(&mut asm, &timed_result(1000, 3000)).1, None);
+        assert_eq!(turn_timing(&mut asm, &timed_result(1000, 3500)).1, Some(500));
     }
 
     const TASKS_CAPTURE: &str = include_str!("fixtures/capture_tasks.jsonl");

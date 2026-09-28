@@ -44,8 +44,11 @@ export function fmtDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   const s = ms / 1000;
   if (s < 60) return `${s % 1 === 0 ? s.toFixed(0) : s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s % 60);
+  // Round the WHOLE duration to seconds before splitting it: rounding only the remainder
+  // printed an impossible "1m 60s" for 119.6s.
+  const total = Math.round(s);
+  const m = Math.floor(total / 60);
+  const rem = total % 60;
   return `${m}m ${rem.toString().padStart(2, "0")}s`;
 }
 

@@ -26,6 +26,13 @@ export interface RowClock {
   /** When the background work still running started (earliest running task), `null` when
    *  none is. Outlives the turn that launched it — and any turn run meanwhile. */
   backgroundSince: number | null;
+  /** The RUN clock (`runClock.rowRunClock`): the same times counted from the user's Enter
+   *  across the follow-up turns a run's background work triggers. Preferred over the turn
+   *  fields above, which a follow-up turn restamps; absent/`null` when no run is known. */
+  runLiveSince?: number | null;
+  runStartedAt?: number | null;
+  runSettledAt?: number | null;
+  backgroundRunSince?: number | null;
 }
 
 export type RowTiming =
@@ -55,29 +62,37 @@ function frozen(from: number | null, to: number | null): RowTiming {
  */
 export function rowTiming(status: AgentStatus, clock: RowClock | undefined): RowTiming {
   if (!clock) return status.kind === "idle" || status.kind === "off" ? NONE : PAUSED_UNKNOWN;
+  // Everything counts from the RUN when one is known (the user's Enter): a follow-up turn
+  // the CLI runs on its own to report on background work would otherwise restart the
+  // count. The turn fields are the fallback.
+  const liveSince = clock.runLiveSince ?? clock.turnStartedAt;
+  const settled =
+    clock.runStartedAt != null
+      ? frozen(clock.runStartedAt, clock.runSettledAt ?? null)
+      : frozen(clock.lastTurnStartedAt, clock.lastTurnEndedAt);
   switch (status.kind) {
-    // Working: the turn itself, or the background work that outlived it — which counts from
-    // the WORK's own start, not from a turn (a follow-up turn would restart that clock while
-    // the same work keeps running); the turn's start is only a fallback.
+    // Working: the run in flight, or the background work that outlived its turn — counted
+    // from the Enter of the earliest run still running some, else from the WORK's own
+    // start; the last turn's start is only a fallback.
     case "running":
-      return clock.turnStartedAt == null ? NONE : { mode: "live", startedAt: clock.turnStartedAt };
+      return liveSince == null ? NONE : { mode: "live", startedAt: liveSince };
     case "backgrounding": {
-      const since = clock.backgroundSince ?? clock.lastTurnStartedAt;
+      const since = clock.backgroundRunSince ?? clock.backgroundSince ?? clock.lastTurnStartedAt;
       return since == null ? NONE : { mode: "live", startedAt: since };
     }
     // Blocked ON the user: nothing is happening, so freeze at the moment the agent asked.
     // The turn is usually still in flight — but a DETACHED sub-agent can ask after its turn
     // ended (`turnStartedAt` cleared), hence the fallback to that turn's start.
     case "needIntervention":
-      return frozen(clock.turnStartedAt ?? clock.lastTurnStartedAt, clock.awaitingSince);
+      return frozen(liveSince ?? clock.lastTurnStartedAt, clock.awaitingSince);
     case "needInput":
       return status.via === "questionnaire"
-        ? frozen(clock.turnStartedAt ?? clock.lastTurnStartedAt, clock.awaitingSince)
-        : frozen(clock.lastTurnStartedAt, clock.lastTurnEndedAt);
-    // Settled on a state the user has yet to clear: how long the turn took.
+        ? frozen(liveSince ?? clock.lastTurnStartedAt, clock.awaitingSince)
+        : settled;
+    // Settled on a state the user has yet to clear: how long the run took.
     case "error":
     case "review":
-      return frozen(clock.lastTurnStartedAt, clock.lastTurnEndedAt);
+      return settled;
     // Calm: no second line. Listed explicitly so a new status kind is a compile error
     // here until it is classified — same discipline as the other classifiers.
     case "idle":

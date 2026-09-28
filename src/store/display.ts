@@ -256,15 +256,18 @@ export interface DisplayPrefs {
    *  Read by {@link ClientAvatar}. */
   tosseClientFavicons: boolean;
 
-  /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
-   *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
-   *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
-   *  ON by default. Off → neither is rendered. */
+  /** Show a prompt's RUN timing in the conversation thread, counted from the user's Enter
+   *  (see `agent/runClock.ts`). Gates two surfaces: the timing line under a run's latest
+   *  result — main-answer time, then a live "background task running" counter or the total
+   *  once its background work is done — {@link TurnResultRow}; AND the LIVE elapsed counter
+   *  while the agent works past the threshold — {@link LiveElapsed}. ON by default. Off →
+   *  neither is rendered. */
   showTurnDuration: boolean;
 
-  /** Show the "· N s of model" breakdown (`result.duration_api_ms`) next to the turn's
-   *  total in the footer. Rides the footer, so only visible when {@link showTurnDuration} is
-   *  also on. ON by default. Read by {@link TurnResultRow}. */
+  /** Show the "· N s of model" breakdown (the per-turn share of the CLI's cumulative
+   *  `result.duration_api_ms`, summed over the run) next to the run's time in the footer.
+   *  Rides the footer, so only visible when {@link showTurnDuration} is also on. ON by
+   *  default. Read by {@link TurnResultRow}. */
   showModelTime: boolean;
 
   /** Show the reflection time on each thinking block — a live counter while thinking, frozen

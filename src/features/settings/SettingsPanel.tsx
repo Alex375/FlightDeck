@@ -1154,9 +1154,10 @@ function TimingPrefs() {
         title="Turn duration"
         hint={
           <>
-            Under each finished turn, the <strong>total time</strong> it took; and a{" "}
-            <strong>live counter</strong> when a turn runs past 40&nbsp;s.{" "}
-            <strong>On by default.</strong>
+            Under each answer, the <strong>time since your message</strong> — and, when
+            background tasks outlive the answer, a live counter until they finish, then the{" "}
+            <strong>total</strong>. Plus a <strong>live counter</strong> while the agent works
+            past 40&nbsp;s. <strong>On by default.</strong>
           </>
         }
         checked={showTurnDuration}

@@ -436,7 +436,10 @@ pub enum ConversationItem {
         total_cost_usd: Option<f64>,
         num_turns: Option<u64>,
         duration_ms: Option<u64>,
-        /// Cumulative model/API time this turn (the "N s of model" breakdown).
+        /// Model/API time spent during THIS turn (the "N s of model" breakdown), derived
+        /// from the CLI's cumulative per-session counter by the assembler. `None` when
+        /// unknown — the first turn of a resumed process (see
+        /// `Assembler::api_ms_baseline`) — or on a backend without the breakdown (Codex).
         duration_api_ms: Option<u64>,
         /// Time-to-first-token this turn; captured but not yet surfaced in the UI.
         ttft_ms: Option<u64>,

@@ -9,6 +9,7 @@ import type {
   PermissionRequestPayload,
   SessionStatePayload,
 } from "../ipc/client";
+import type { RunClock } from "../agent/runClock";
 
 export type {
   ConversationItem,
@@ -257,11 +258,18 @@ export interface SessionEntry {
   /**
    * Wall-clock start (`Date.now()`) of the turn currently in flight, or `null` when no
    * turn is running. Stamped when `state.busy` goes false→true and cleared on true→false
-   * (and on `clearState`). Drives the LIVE elapsed counter in the working indicator (shown
-   * once a turn runs past a threshold, like the CLI). NOT the finished turn's duration — that
-   * is `TurnResultMeta.durationMs`, measured by the binary and delivered in `turn_result`.
+   * (and on `clearState`). A TURN clock: a follow-up turn the CLI starts on its own
+   * restamps it, so the counters the user reads come from {@link runClock} instead; this
+   * is their fallback when no run is known.
    */
   turnStartedAt: number | null;
+  /**
+   * The RUN clock (see `agent/runClock.ts`): one run per prompt, from the user's Enter to
+   * the end of the last background work it launched, spanning the follow-up turns that
+   * work triggers. Drives the working indicator's live counter, the single footer under a
+   * run and the sidebar row's time. Front-measured, live-only (resets with the entry).
+   */
+  runClock: RunClock;
   /**
    * Start of the LAST turn, kept after that turn ends (unlike {@link turnStartedAt}, which
    * is cleared). With {@link lastTurnEndedAt} it gives the duration a settled sidebar row

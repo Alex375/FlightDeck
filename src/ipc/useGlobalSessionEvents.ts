@@ -686,6 +686,8 @@ export function useGlobalSessionEvents(): void {
         useBackgroundTasksStore.getState().sessions[session]?.[task.task_id]?.status;
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task);
+      // (1a) run clock: a run lasts until the last background task it launched is done.
+      useConversationStore.getState().noteTask(session, task.task_id, task.status === "running");
       if (prevStatus === "running" && task.status !== "running") {
         const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
         void commands.publishControlEvent("task_finished", session, conv?.name ?? "", {

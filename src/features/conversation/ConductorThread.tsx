@@ -33,11 +33,13 @@ import {
   useToolResult,
   useTurn,
   useTurnResult,
-  useTurnStartedAt,
+  useRunFooter,
+  useRunStartedAt,
   useThinkingStartedAt,
   useThinkingDuration,
 } from "../../store/conversationStore";
 import type { RoundMarker, UserTurnImage } from "../../store/types";
+import type { RunFooter } from "../../agent/runClock";
 import { imageDataUrl } from "./composerAttachments";
 import { useConversationsStore, rewindConversation, forkConversation } from "../../store/conversationsStore";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
@@ -352,25 +354,94 @@ function resultToText(result: JsonValue | null): string | null {
 
 function TurnResultRow({ session, resultId }: { session: string; resultId: string }) {
   const meta = useTurnResult(session, resultId);
+  const run = useRunFooter(session, resultId);
   const showTurnDuration = useDisplay((s) => s.showTurnDuration);
   const showModelTime = useDisplay((s) => s.showModelTime);
   if (!meta) return null;
   const isError = meta.isError || meta.subtype.startsWith("error");
+  // A run renders ONE timing line, under its latest result ("hidden" on the earlier ones):
+  // one line per turn is what made the duration look like it kept resetting, since each
+  // follow-up turn the CLI runs on its own to report on a background task got its own
+  // short number. No run known (a turn already in flight when this app saw it start):
+  // fall back to the turn's own duration (duration_ms) and model time. No cost/TTFT shown.
+  let timing: ReactNode = null;
+  if (showTurnDuration && run !== "hidden") {
+    if (run) {
+      timing = <RunTiming footer={run} showModel={showModelTime} />;
+    } else if (meta.durationMs != null) {
+      timing = (
+        <div className={styles.turnMeta + " wf-mono"} title="This turn's duration · including model time">
+          <Ico name="clock" className="sm" />
+          <span>{fmtDuration(meta.durationMs)}</span>
+          {showModelTime && meta.durationApiMs != null && meta.durationApiMs > 0 && (
+            <span className={styles.turnMetaModel}>{fmtDuration(meta.durationApiMs)} model</span>
+          )}
+        </div>
+      );
+    }
+  }
   if (isError) {
     const text = resultToText(meta.result);
-    return <ErrorBlock heading={turnErrorHeading(meta)}>{text}</ErrorBlock>;
+    return (
+      <>
+        <ErrorBlock heading={turnErrorHeading(meta)}>{text}</ErrorBlock>
+        {/* An errored turn shows no duration of its own — but when it closes a run that
+            outlived its main answer, that run's timing must not vanish with it. */}
+        {run && run !== "hidden" && run.extended ? timing : null}
+      </>
+    );
   }
-  // Success / interrupted: optionally surface the wall-clock time the turn took
-  // (duration_ms) plus the model-time breakdown (duration_api_ms). No cost/TTFT shown.
-  if (!showTurnDuration || meta.durationMs == null) return null;
+  return timing;
+}
+
+/** Whole seconds, for a counter that ticks once a second ("0s" before the first one). */
+function fmtWholeSeconds(ms: number): string {
+  return ms < 1000 ? "0s" : fmtDuration(Math.floor(ms / 1000) * 1000);
+}
+
+/**
+ * A run's timing line, everything counted from the user's Enter:
+ *  - the MAIN time — until the main agent answered — frozen as soon as it did;
+ *  - while background work it launched still runs: "— Background task running · 1m 12s",
+ *    a live counter since the Enter, in the green of the calm "backgrounding" state;
+ *  - once all of it is done, if the run outlived its answer: "— 3m 40s total", until the
+ *    last background task (and the follow-up turns it triggered) finished;
+ *  - the model time over the whole run, once it is done.
+ */
+function RunTiming({ footer, showModel }: { footer: RunFooter; showModel: boolean }) {
+  const done = footer.totalMs != null;
+  const total = footer.extended && done ? footer.totalMs : null;
+  const title =
+    footer.backgroundSince != null
+      ? "Time until the main answer · background work still running (counted from your message)"
+      : total != null
+        ? `${fmtDuration(footer.mainMs)} until the main answer · ${fmtDuration(total)} until the last background task finished`
+        : "Time from your message until the answer · including model time";
   return (
-    <div className={styles.turnMeta + " wf-mono"} title="This turn's duration · including model time">
+    <div className={styles.turnMeta + " wf-mono"} title={title}>
       <Ico name="clock" className="sm" />
-      <span>{fmtDuration(meta.durationMs)}</span>
-      {showModelTime && meta.durationApiMs != null && meta.durationApiMs > 0 && (
-        <span className={styles.turnMetaModel}>{fmtDuration(meta.durationApiMs)} model</span>
+      <span>{fmtDuration(footer.mainMs)}</span>
+      {footer.backgroundSince != null ? (
+        <BackgroundElapsed since={footer.backgroundSince} count={footer.backgroundCount} />
+      ) : null}
+      {total != null ? <span className={styles.turnMetaTotal}>{fmtDuration(total)} total</span> : null}
+      {showModel && done && footer.modelMs != null && footer.modelMs > 0 && (
+        <span className={styles.turnMetaModel}>{fmtDuration(footer.modelMs)} model</span>
       )}
     </div>
+  );
+}
+
+/** The live part of a run's timing line while its background work runs. Its own leaf, so
+ *  the 1 Hz tick re-renders this span only. */
+function BackgroundElapsed({ since, count }: { since: number; count: number }) {
+  const now = useNow(1000);
+  return (
+    <span className={styles.turnMetaBg}>
+      <span className={styles.turnMetaBgDot} aria-hidden="true" />
+      <span>{count > 1 ? `${count} background tasks running` : "Background task running"}</span>
+      <span className={styles.turnMetaBgTime}>{fmtWholeSeconds(now - since)}</span>
+    </span>
   );
 }
 
@@ -1579,13 +1650,15 @@ const TURN_ELAPSED_MIN_MS = 40_000;
  *  activity text. Whole seconds only (floored) so the number climbs smoothly. */
 function LiveElapsed({ session }: { session: string }) {
   const show = useDisplay((s) => s.showTurnDuration);
-  const startedAt = useTurnStartedAt(session);
+  // The RUN's start (the user's Enter), not the turn's: a follow-up turn the CLI starts on
+  // its own to report on background work continues the same count instead of restarting it.
+  const startedAt = useRunStartedAt(session);
   const now = useNow(1000);
   if (!show || startedAt == null) return null;
   const elapsed = now - startedAt;
   if (elapsed < TURN_ELAPSED_MIN_MS) return null;
   return (
-    <span className={styles.elapsed + " wf-mono"} title="Current turn duration">
+    <span className={styles.elapsed + " wf-mono"} title="Time since your message">
       <Ico name="clock" className="sm" />
       {fmtDuration(Math.floor(elapsed / 1000) * 1000)}
     </span>

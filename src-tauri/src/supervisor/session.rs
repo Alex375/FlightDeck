@@ -561,7 +561,13 @@ pub fn spawn_session(
     appmcp: Option<Arc<crate::appmcp::ControlHub>>,
 ) -> Result<SessionHandle, SessionError> {
     let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
-    let core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
+    let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
+    // A brand-new session's cumulative model-time counter starts at zero, so even its
+    // first turn's model time is exact. A resumed / re-attached one restores an unknown
+    // total first (see `Assembler::api_ms_baseline`).
+    if cfg.resume.is_none() && cfg.attach.is_none() {
+        core.assembler.mark_fresh_session();
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit, cfg));
     Ok(SessionHandle { id, cmd_tx })

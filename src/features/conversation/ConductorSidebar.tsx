@@ -28,6 +28,7 @@ import {
 } from "../../agent/status";
 import { useConversationStore } from "../../store/conversationStore";
 import { rowTiming } from "../../agent/rowTiming";
+import { rowRunClock } from "../../agent/runClock";
 import { fmtFrozenElapsed, useLiveElapsed } from "../../ui/liveElapsed";
 import { useShallow } from "zustand/react/shallow";
 import { useSettingsUi } from "../../store/settingsUi";
@@ -74,6 +75,7 @@ function RowLive({ convId, status }: { convId: string; status: AgentStatus }) {
             lastTurnStartedAt: e.lastTurnStartedAt,
             lastTurnEndedAt: e.lastTurnEndedAt,
             awaitingSince: e.awaitingSince,
+            ...rowRunClock(e.runClock),
           }
         : undefined;
     }),

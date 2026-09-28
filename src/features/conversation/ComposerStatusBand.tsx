@@ -16,6 +16,7 @@ import { acknowledgeConversation } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useSendMessage } from "../../ipc/useCommands";
 import { fmtDuration } from "../../agent/subagentMeta";
+import { settledRunMs } from "../../agent/runClock";
 import { Ico } from "../../ui/kit";
 
 /**
@@ -46,16 +47,19 @@ export function useMarkSeenShortcut(session: string, active: boolean) {
   }, [active, session]);
 }
 
-/** The finished turn's wall-clock, next to "Conversation ended". Its own leaf, mounted only
- *  in the review state. Live-only: a conversation restored from disk has no `turn_result`
- *  (and is already marked seen), so it shows nothing — and the timeline scan is gated on
- *  the same "settled and unseen" condition as `gather` in useAgentStatus, so it never walks
- *  a restored timeline on every store update. */
+/** How long the finished RUN took (Enter → the last of the background work it launched),
+ *  next to "Conversation ended" — not the last turn alone, which after background work is
+ *  just the short follow-up the CLI ran to report on it. Falls back to that last turn's
+ *  duration when no run is known. Its own leaf, mounted only in the review state.
+ *  Live-only: a conversation restored from disk has no `turn_result` (and is already marked
+ *  seen), so it shows nothing — and the timeline scan is gated on the same "settled and
+ *  unseen" condition as `gather` in useAgentStatus, so it never walks a restored timeline on
+ *  every store update. */
 function EndedAfter({ session }: { session: string }) {
   const ms = useConversationStore((s) => {
     const entry = s.sessions[session];
     if (!entry || entry.turnSeen || entry.state.busy) return null;
-    return lastTurnResultMeta(entry)?.durationMs ?? null;
+    return settledRunMs(entry.runClock) ?? lastTurnResultMeta(entry)?.durationMs ?? null;
   });
   if (ms == null) return null;
   return (

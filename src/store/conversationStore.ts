@@ -43,6 +43,17 @@ import { isBackgroundAgentInput, isDetachedAgentAck } from "../agent/subagentMet
 import { latestTodosInBlocks, todoSummary } from "./todos";
 import { THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
 import { parseSpecialMessage } from "../features/conversation/specialMessage";
+import {
+  EMPTY_RUN_CLOCK,
+  liveRunStart,
+  runBusy,
+  runEndAll,
+  runFooterFor,
+  runResult,
+  runSend,
+  runTask,
+  type RunFooter,
+} from "../agent/runClock";
 
 const connectingState: SessionStatePayload = {
   busy: false,
@@ -84,6 +95,7 @@ function emptyEntry(session: string): SessionEntry {
     seq: 0,
     replayAnchor: 0,
     turnStartedAt: null,
+    runClock: EMPTY_RUN_CLOCK,
     lastTurnStartedAt: null,
     lastTurnEndedAt: null,
     awaitingSince: null,
@@ -210,6 +222,10 @@ interface ConversationState {
   reanchorReplay: (session: string) => void;
   /** Forget a session's timeline entirely (e.g. its conversation was deleted). */
   dropSession: (session: string) => void;
+  /** A background task snapshot, for the run clock: `taskId` is (still) running or not.
+   *  No-op for a session the store does not hold, and when the task's state is unchanged
+   *  (snapshots arrive on every progress tick). */
+  noteTask: (session: string, taskId: string, running: boolean) => void;
 }
 
 export const useConversationStore = create<ConversationState>((set) => {
@@ -342,9 +358,14 @@ export const useConversationStore = create<ConversationState>((set) => {
         } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
           awaitingSince = null;
         }
+        // The run clock follows the same busy edges (a no-op on a mid-turn re-emit), and a
+        // process that ENDED can leave nothing of any run running.
+        let runClock = runBusy(entry.runClock, state.busy, Date.now());
+        if (state.ended && !entry.state.ended) runClock = runEndAll(runClock, Date.now());
         return {
           ...entry,
           turnStartedAt,
+          runClock,
           lastTurnStartedAt,
           lastTurnEndedAt,
           awaitingSince,
@@ -378,6 +399,8 @@ export const useConversationStore = create<ConversationState>((set) => {
           ...entry,
           state: { ...connectingState },
           turnStartedAt: null,
+          // The process is going away with everything it was running.
+          runClock: runEndAll(entry.runClock, Date.now()),
           awaitingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
@@ -443,6 +466,8 @@ export const useConversationStore = create<ConversationState>((set) => {
           // Sending the next message consumes any pending review/question: the
           // user has clearly moved on from the previous result.
           turnSeen: true,
+          // The Enter a run is timed from. A message sent mid-turn joins the run in flight.
+          runClock: runSend(entry.runClock, Date.now(), !!queued),
         };
       });
       return createdId;
@@ -529,6 +554,15 @@ export const useConversationStore = create<ConversationState>((set) => {
         const next = { ...s.sessions };
         delete next[session];
         return { sessions: next };
+      }),
+
+    noteTask: (session, taskId, running) =>
+      set((s) => {
+        const entry = s.sessions[session];
+        if (!entry) return s;
+        const runClock = runTask(entry.runClock, taskId, running, Date.now());
+        if (runClock === entry.runClock) return s;
+        return { sessions: { ...s.sessions, [session]: { ...entry, runClock } } };
       }),
 
     applyItem: (session, item, hydrating = false) =>
@@ -778,6 +812,10 @@ export const useConversationStore = create<ConversationState>((set) => {
               turns: touched ? turns : entry.turns,
               turnResults: { ...entry.turnResults, [id]: meta },
               timeline: [...entry.timeline, { kind: "turn_result", id }],
+              // Attach it to its run (a history replay carries no results; guarded anyway).
+              runClock: hydrating
+                ? entry.runClock
+                : runResult(entry.runClock, id, Date.now(), item.duration_api_ms),
               openBubble: {},
               pendingPermissions: [],
               // Re-anchor the replay insert point to the (new) end of the timeline at
@@ -839,10 +877,21 @@ const EMPTY_STRINGS: string[] = [];
 export const useSessionState = (session: string): SessionStatePayload | undefined =>
   useConversationStore((s) => s.sessions[session]?.state);
 
-/** Wall-clock start of the in-flight turn (`Date.now()`), or `null` when idle. Drives
- *  the live elapsed counter in the working indicator. See {@link SessionEntry.turnStartedAt}. */
-export const useTurnStartedAt = (session: string): number | null =>
-  useConversationStore((s) => s.sessions[session]?.turnStartedAt ?? null);
+/** Start of the run in flight — the user's Enter, NOT the current turn's start, so a
+ *  follow-up turn the CLI runs on its own never restarts the count — falling back to the
+ *  turn's start when no run is known; `null` when idle. Drives the live elapsed counter
+ *  in the working indicator. See {@link SessionEntry.runClock}. */
+export const useRunStartedAt = (session: string): number | null =>
+  useConversationStore((s) => {
+    const e = s.sessions[session];
+    return e ? (liveRunStart(e.runClock) ?? e.turnStartedAt) : null;
+  });
+
+/** What the footer of `turn_result` `resultId` shows for its run (see `runFooterFor`):
+ *  `null` = no run known (show the turn's own duration), `"hidden"` = not its run's latest
+ *  result. Shallow-compared, so the footer re-renders only when a figure moves. */
+export const useRunFooter = (session: string, resultId: string): RunFooter | "hidden" | null =>
+  useConversationStore(useShallow((s) => runFooterFor(s.sessions[session]?.runClock, resultId)));
 
 /** Wall-clock start of the thinking block currently streaming, or `null`. Drives the live
  *  counter on a streaming ThinkingBlock. See {@link SessionEntry.thinkingStartedAt}. */
