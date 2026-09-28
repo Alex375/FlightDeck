@@ -120,8 +120,8 @@ export function TosseLiveHost() {
       // sweep, once. A server-side RECYCLE of an idle stream (the core keeps the state on
       // `live`, only the counter moves) hides ~200 ms and owes nothing: refetching for it was
       // a sweep every 60 s for as long as the window stayed visible — a poll wearing the live
-      // channel's clothes. The CRM's keepalive (10 s, under the edge's 12 s idle timeout) is
-      // what keeps the stream from being recycled in the first place.
+      // channel's clothes. And the recycles themselves are gone: they came from the CRM's
+      // `Bun.serve` idle timeout, which its SSE route now opts out of (see `tosse/sse.rs`).
       const outage = sawOutage.current;
       sawOutage.current = false;
       if (!outage) return;
