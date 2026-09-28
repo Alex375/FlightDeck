@@ -9,6 +9,7 @@ import {
   fmtSpan,
   HISTOGRAM_BUCKETS,
   histogramArrivals,
+  histogramBars,
   liveInFlight,
   memoizedTelemetry,
   selectTelemetry,
@@ -326,6 +327,25 @@ describe("the activity histogram", () => {
     expect(histogramArrivals(243, 243)).toBe(0);
     // A rewind cuts the transcript: the total shrinks, and that is no arrival either.
     expect(histogramArrivals(243, 180)).toBe(0);
+  });
+
+  it("keys every bar by the SECOND it counts, so a tick moves bars instead of re-animating them", () => {
+    // Second 10 is live with 2 calls; a tick closes it and second 11 opens.
+    const before = histogramBars([3, 0, 1], 2, 10);
+    const after = histogramBars(closeBucket([3, 0, 1], 2), 0, 11);
+    const keyOf = (bars: typeof before, value: number, live: boolean) =>
+      bars.find((b) => b.value === value && b.live === live)?.key;
+    // The bucket that just closed keeps its key — same DOM bar, same height, nothing to animate.
+    expect(keyOf(before, 2, true)).toBe("b10");
+    expect(after.find((b) => b.key === "b10")).toMatchObject({ value: 2, live: false });
+    // So does every older bucket; only the new live bar is new.
+    expect(after.find((b) => b.key === "b7")?.value).toBe(3);
+    expect(after[after.length - 1]).toMatchObject({ key: "b11", value: 0, live: true });
+  });
+
+  it("always draws the full window", () => {
+    expect(histogramBars([], 0, 0)).toHaveLength(HISTOGRAM_BUCKETS);
+    expect(histogramBars(Array(HISTOGRAM_BUCKETS - 1).fill(1), 1, 500)).toHaveLength(HISTOGRAM_BUCKETS);
   });
 
   it("slides a fixed window, whatever its size", () => {

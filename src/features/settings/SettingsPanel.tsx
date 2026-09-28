@@ -848,10 +848,12 @@ function ThreadPrefs() {
           hint={
             <>
               Turns the top of the conversation panel into a <strong>live instrument deck</strong>:
-              a context gauge, the run's clock and status lamp, a counter per kind of tool call,
-              a two-minute activity histogram, totals (files touched, turns, cost, model time)
-              and a feed of the latest calls — all of it moving as the agent works. Every
-              reading is real; nothing moves on its own. <strong>Off by default.</strong>
+              millisecond clocks, a context gauge, cost and average call time, live gauges, a
+              streaming oscilloscope, calls per second over the last minute, a counter per kind
+              of tool call, a board timing the calls that run long, and a feed of the latest
+              calls — all of it moving as the agent works. Every reading is real; nothing moves
+              on its own. <strong>Off by default</strong> — and off, it costs nothing: it is not
+              even loaded.
               {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
               {conversationSidePanel ? null : (
                 <> It lives in the conversation panel, so turn that on first.</>

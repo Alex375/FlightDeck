@@ -116,10 +116,25 @@ export interface Telemetry {
   familyMedianMs: Record<ToolFamily, number | null>;
   /** The median length of this conversation's completed turns, or null before the first. */
   medianTurnMs: number | null;
+  /** The AVERAGE measured duration of each family's calls, or null until one finished live —
+   *  what the dials show under their counts. */
+  familyMeanMs: Record<ToolFamily, number | null>;
+  /** The average measured duration over every call, or null until one finished live. */
+  meanCallMs: number | null;
 }
 
-/** How many calls the feed keeps. */
-export const TELEMETRY_FEED_SIZE = 7;
+/** How many calls the feed keeps — four, so the whole deck fits a 13-inch laptop's height. */
+export const TELEMETRY_FEED_SIZE = 4;
+
+/**
+ * How long a call must have been running before the in-flight board shows it.
+ *
+ * ⚠️ Not zero, on purpose. Most calls finish in well under a second, and a board listing every
+ * one of them flickered rows in and out faster than anyone could read — the "sometimes fast,
+ * sometimes slow, you can't tell what's happening" Alexandre saw. The board is for the calls
+ * worth watching: the long ones. (Every call still counts on the dials, the gauges and the feed.)
+ */
+export const LONG_CALL_MS = 40_000;
 
 const FAMILIES: ToolFamily[] = ["read", "edit", "shell", "search", "agent", "web", "other"];
 
@@ -140,7 +155,17 @@ const EMPTY: Telemetry = {
   inFlight: [],
   familyMedianMs: { read: null, edit: null, shell: null, search: null, agent: null, web: null, other: null },
   medianTurnMs: null,
+  familyMeanMs: { read: null, edit: null, shell: null, search: null, agent: null, web: null, other: null },
+  meanCallMs: null,
 };
+
+/** The mean of a list, or null when it is empty. */
+export function mean(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
 
 /** The median of a list, or null when it is empty. */
 export function median(values: readonly number[]): number | null {
@@ -254,6 +279,16 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
       other: median(durationsByFamily.other),
     },
     medianTurnMs: median(turnMs),
+    familyMeanMs: {
+      read: mean(durationsByFamily.read),
+      edit: mean(durationsByFamily.edit),
+      shell: mean(durationsByFamily.shell),
+      search: mean(durationsByFamily.search),
+      agent: mean(durationsByFamily.agent),
+      web: mean(durationsByFamily.web),
+      other: mean(durationsByFamily.other),
+    },
+    meanCallMs: mean(FAMILIES.flatMap((f) => durationsByFamily[f])),
   };
 }
 
@@ -265,7 +300,8 @@ function telemetrySig(t: Telemetry): string {
     `|${t.filesTouched}|${t.turns}|${t.costUsd ?? ""}|${t.modelMs ?? ""}|${t.subAgents}|` +
     t.events.map((e) => `${e.id}:${e.status}:${e.durationMs ?? ""}`).join(",") +
     `|${t.inFlight.map((e) => `${e.id}@${e.startedAt}`).join(",")}` +
-    `|${FAMILIES.map((f) => t.familyMedianMs[f] ?? "").join(",")}|${t.medianTurnMs ?? ""}`
+    `|${FAMILIES.map((f) => t.familyMedianMs[f] ?? "").join(",")}|${t.medianTurnMs ?? ""}` +
+    `|${FAMILIES.map((f) => t.familyMeanMs[f] ?? "").join(",")}|${t.meanCallMs ?? ""}`
   );
 }
 
@@ -352,6 +388,34 @@ export const HISTOGRAM_BUCKETS = 60;
 export function closeBucket(done: readonly number[], live: number): number[] {
   const next = [...done, live];
   return next.length > HISTOGRAM_BUCKETS - 1 ? next.slice(next.length - (HISTOGRAM_BUCKETS - 1)) : next;
+}
+
+/** One bar of the activity histogram, keyed by the SECOND it counts. */
+export interface HistogramBar {
+  key: string;
+  value: number;
+  /** The bucket still filling (the rightmost one). */
+  live: boolean;
+}
+
+/**
+ * The bars to draw: `done` (closed buckets, oldest first) then the live one, left-padded with
+ * empty bars to the full window. `seq` is the live bucket's absolute index.
+ *
+ * ⚠️ Each bar is keyed by its ABSOLUTE bucket — the second it counts — never by its position.
+ * Keyed by position, every tick handed each DOM bar its neighbour's value, so every bar's height
+ * changed at once and every peak animated down and back up on each second. Keyed by bucket, a
+ * tick only MOVES the bars one step left (a layout shift, no height change, nothing animates);
+ * the only bar whose height changes is the live one, as calls land in it.
+ */
+export function histogramBars(done: readonly number[], live: number, seq: number): HistogramBar[] {
+  const bars: HistogramBar[] = [];
+  const pad = Math.max(0, HISTOGRAM_BUCKETS - 1 - done.length);
+  for (let i = 0; i < pad; i++) bars.push({ key: `pad${i}`, value: 0, live: false });
+  const first = seq - done.length;
+  for (let i = 0; i < done.length; i++) bars.push({ key: `b${first + i}`, value: done[i], live: false });
+  bars.push({ key: `b${seq}`, value: live, live: true });
+  return bars;
 }
 
 /**

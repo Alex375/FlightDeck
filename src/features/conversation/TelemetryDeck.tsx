@@ -1,20 +1,21 @@
 // The TELEMETRY deck: the side panel's opt-in instrument cluster (`conversationTelemetry`,
-// OFF by default) — millisecond clocks, needles, an oscilloscope, a board timing every call in
-// flight, counters, a histogram and a feed.
+// OFF by default) — millisecond clocks, needles, key figures, a streaming oscilloscope, a
+// per-second call histogram, a counter per tool family, a board for the LONG calls and a feed.
 //
 // It is meant to be loud, and it is allowed to be only because NOTHING on it moves on its own:
 // every figure is a real signal at its current value (telemetry.ts derives the counts,
-// telemetryLive.ts the per-frame arithmetic). Idle, the deck settles and stops; the agent
-// working is what animates it.
+// telemetryLive.ts the per-frame arithmetic). Idle, the deck settles and stops.
 //
-// ⚠️ How it stays cheap at 60 fps. React renders the deck only when its FACTS change (a call
-// lands or settles, a turn ends, the status changes) — the memoised telemetry and a few
-// scalar store selectors. Everything that moves every frame (the ms clocks, the needles, the
-// in-flight timers and latency bars, the oscilloscope) is written straight into DOM nodes by
-// ONE requestAnimationFrame loop reading the store with getState(): no React render per frame.
-// The loop runs while there is something live (a turn, a call in flight, text streaming) and
-// until the needles have settled after it, then stops itself. Under the OS "reduce motion"
-// setting it ticks once a second instead, with no easing.
+// It is also a JOKE feature, and a joke must cost nothing:
+//   - OFF (the default), it is not mounted at all — no hook, no timer, no frame loop, nothing
+//     derived. The panel only reads the pref.
+//   - ON, React renders it only when its FACTS change (a call lands or settles, a turn ends, the
+//     status changes). Everything that moves (clocks, needles, timers, the oscilloscope) is
+//     written straight into DOM nodes by ONE frame loop reading the store with getState() — no
+//     React render per frame — capped at 30 fps, paused while the window is hidden, running only
+//     while the run is live and until the needles have settled. The histogram's one-second tick
+//     stops once its minute has emptied. Under the OS "reduce motion" setting: 1 Hz, no easing.
+// Compact by design: the whole deck fits a 13-inch laptop's height with room to spare.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useConversationStore, useRunStartedAt, useSessionState } from "../../store/conversationStore";
@@ -31,7 +32,9 @@ import {
   HISTOGRAM_BUCKET_MS,
   HISTOGRAM_BUCKETS,
   histogramArrivals,
+  histogramBars,
   liveInFlight,
+  LONG_CALL_MS,
   TELEMETRY_DIALS,
   useTelemetry,
   type DeckStatusKey,
@@ -74,6 +77,8 @@ type GaugeKey = (typeof GAUGES)[number]["key"];
 /** Oscilloscope: one sample every 80 ms, fifteen seconds of history. */
 const SCOPE_SAMPLE_MS = 80;
 const SCOPE_SAMPLES = Math.round(15_000 / SCOPE_SAMPLE_MS);
+/** The frame loop's cap: plenty for a millisecond clock to read as running, half the work. */
+const FRAME_MS = 33;
 
 export function TelemetryDeck({ convId }: { convId: string }) {
   const t = useTelemetry(convId);
@@ -98,12 +103,12 @@ export function TelemetryDeck({ convId }: { convId: string }) {
     streaming,
     backgroundOps,
   });
-  const histogram = useActivityHistogram(t.totalCalls);
-  const motion = motionAllowed(true);
   // The deck is live for as long as the RUN is — a run spans the background work it launched,
   // so its clock keeps counting through it — or while anything else visibly happens.
   const runLive = useRunStartedAt(convId) !== null;
   const live = runLive || busy || inFlight.length > 0 || streaming || backgroundOps > 0;
+  const histogram = useActivityHistogram(t.totalCalls, live);
+  const motion = motionAllowed(true);
   const nodes = useLiveEngine(convId, {
     telemetry: t,
     inFlight,
@@ -113,7 +118,6 @@ export function TelemetryDeck({ convId }: { convId: string }) {
     live,
     motion,
   });
-  const maxCount = Math.max(1, ...TELEMETRY_DIALS.map((f) => t.counts[f]));
 
   return (
     <section
@@ -136,10 +140,36 @@ export function TelemetryDeck({ convId }: { convId: string }) {
         <div className={d.clockCol}>
           <span className={d.kicker}>Run</span>
           <span ref={nodes.bind("run")} className={d.clock} />
-          <span className={d.status}>{status.label}</span>
-          <span ref={nodes.bind("stateTimer")} className={d.stateTimer} />
+          <span className={d.status}>
+            {status.label}
+            <span ref={nodes.bind("stateTimer")} className={d.stateTimer} />
+          </span>
         </div>
       </div>
+
+      {/* The figures worth reading first, set larger than the rest. */}
+      <dl className={d.kpis}>
+        <div>
+          <dt>Cost</dt>
+          <dd title="API-equivalent, as reported by the CLI">
+            {t.costUsd == null ? "—" : `$${t.costUsd.toFixed(2)}`}
+          </dd>
+        </div>
+        <div>
+          <dt>Avg call</dt>
+          <dd title="Average measured duration of a tool call in this conversation">
+            {t.meanCallMs == null ? "—" : fmtSecs(t.meanCallMs)}
+          </dd>
+        </div>
+        <div>
+          <dt>Calls</dt>
+          <dd>{t.totalCalls}</dd>
+        </div>
+        <div>
+          <dt>Model</dt>
+          <dd>{t.modelMs == null ? "—" : fmtSpan(t.modelMs)}</dd>
+        </div>
+      </dl>
 
       <div className={d.gauges}>
         {GAUGES.map((g) => (
@@ -160,44 +190,44 @@ export function TelemetryDeck({ convId }: { convId: string }) {
         ))}
       </div>
 
-      <div className={d.scope}>
-        <div className={d.scopeHead}>
-          <span className={d.kicker}>Stream</span>
-          <span ref={nodes.bind("scopePeak")} className={d.scopeMeta} />
-        </div>
+      <div className={d.signals}>
+        <span className={d.kicker}>Stream</span>
         <canvas ref={nodes.bindCanvas} className={d.scopeCanvas} aria-label="Streaming rate over the last 15 seconds" />
+        <span ref={nodes.bind("scopePeak")} className={d.sigMeta} />
+        <span className={d.kicker}>Calls</span>
+        <Histogram bars={histogramBars(histogram.done, histogram.live, histogram.seq)} />
+        <span className={d.sigMeta}>{histogram.total} · 60 s</span>
       </div>
-
-      <InFlight events={inFlight} medians={t.familyMedianMs} bind={nodes.bind} />
 
       <div className={d.dials}>
         {TELEMETRY_DIALS.map((f) => (
-          <div key={f} className={d.dial} data-family={f}>
+          <div
+            key={f}
+            className={d.dial}
+            data-family={f}
+            title={
+              t.familyMeanMs[f] == null
+                ? `${FAMILY_LABEL[f]}: ${t.counts[f]} calls`
+                : `${FAMILY_LABEL[f]}: ${t.counts[f]} calls, ${fmtSecs(t.familyMeanMs[f]!)} on average`
+            }
+          >
             <span className={d.dialVal}>
               {/* Keyed by the value: each new count REMOUNTS the digits, which is what rolls
                   them in — a counter that ticks up is the one motion this dial makes. */}
               <span key={t.counts[f]} className={d.roll}>
                 {t.counts[f]}
               </span>
+              {t.errors[f] > 0 ? <span className={d.dialErr}>{t.errors[f]}!</span> : null}
             </span>
-            <span className={d.dialLabel}>
-              {FAMILY_LABEL[f]}
-              {t.errors[f] > 0 ? <span className={d.dialErr}>{t.errors[f]} err</span> : null}
-            </span>
-            <span className={d.dialBar} aria-hidden="true">
-              <span style={{ width: `${(t.counts[f] / maxCount) * 100}%` }} />
-            </span>
+            <span className={d.dialLabel}>{FAMILY_LABEL[f]}</span>
+            <span className={d.dialAvg}>{t.familyMeanMs[f] == null ? "—" : fmtSecs(t.familyMeanMs[f]!)}</span>
           </div>
         ))}
       </div>
 
-      <Histogram done={histogram.done} live={histogram.live} />
+      <LongCalls events={inFlight} medians={t.familyMedianMs} bind={nodes.bind} />
 
       <dl className={d.stats}>
-        <div>
-          <dt>Calls</dt>
-          <dd>{t.totalCalls}</dd>
-        </div>
         <div>
           <dt>Files</dt>
           <dd>{t.filesTouched}</dd>
@@ -205,16 +235,6 @@ export function TelemetryDeck({ convId }: { convId: string }) {
         <div>
           <dt>Turns</dt>
           <dd>{t.turns}</dd>
-        </div>
-        <div>
-          <dt>Cost</dt>
-          <dd title="API-equivalent, as reported by the CLI">
-            {t.costUsd == null ? "—" : `$${t.costUsd.toFixed(2)}`}
-          </dd>
-        </div>
-        <div>
-          <dt>Model</dt>
-          <dd>{t.modelMs == null ? "—" : fmtSpan(t.modelMs)}</dd>
         </div>
         <div>
           <dt>Think</dt>
@@ -256,6 +276,17 @@ interface LiveNodes {
   bindCanvas: (el: HTMLCanvasElement | null) => void;
 }
 
+/** Whether the page is visible — a hidden window draws nothing, so the loop has no reason to. */
+function usePageVisible(): boolean {
+  const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden);
+  useEffect(() => {
+    const on = () => setVisible(!document.hidden);
+    document.addEventListener("visibilitychange", on);
+    return () => document.removeEventListener("visibilitychange", on);
+  }, []);
+  return visible;
+}
+
 /**
  * The deck's single frame loop. Everything it reads per frame comes from `getState()` or from
  * refs React keeps up to date — so the loop never causes a render, and a render never restarts
@@ -266,6 +297,7 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
   const canvas = useRef<HTMLCanvasElement | null>(null);
   const latest = useRef(inputs);
   latest.current = inputs;
+  const visible = usePageVisible();
 
   // When the current STATE began, as the deck observed it — the fallback for the states the
   // store does not stamp itself (streaming, background work). Stamped in an effect, never
@@ -305,7 +337,7 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
     const now = Date.now();
     const perf = performance.now();
     const s = sim.current;
-    const dt = s.lastFrame ? Math.min(250, perf - s.lastFrame) : 16;
+    const dt = s.lastFrame ? Math.min(250, perf - s.lastFrame) : FRAME_MS;
     s.lastFrame = perf;
     const ease = motion ? 140 : 0;
     const text = (name: string, value: string) => {
@@ -317,7 +349,7 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
     const runStart = e ? (liveRunStart(e.runClock) ?? e.turnStartedAt) : null;
     const settled = e ? settledRunMs(e.runClock) : null;
     text("run", runStart !== null ? fmtClockMs(now - runStart) : settled !== null ? fmtClockMs(settled) : "–:––.–––");
-    text("stateTimer", fmtSecs(now - stateSince(latest.current.status, e, running, stateSeen.current.since)));
+    text("stateTimer", ` · ${fmtSecs(now - stateSince(latest.current.status, e, running, stateSeen.current.since))}`);
     if (e) text("think", fmtSpan(e.thinkingMs + (e.thinkingSince !== null ? now - e.thinkingSince : 0)));
 
     // Streaming rate: characters gained by every open bubble this frame.
@@ -341,7 +373,7 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
       s.lastSampleAt = perf;
       s.samples = pushSample(s.samples, s.tps, SCOPE_SAMPLES);
       const peak = drawScope(canvas.current, s.samples);
-      text("scopePeak", peak > 0 ? `peak ${Math.round(peak)} ≈ tok/s` : "idle");
+      text("scopePeak", peak > 0 ? `peak ${Math.round(peak)}` : "idle");
     }
 
     // Gauges: targets, eased needles, readouts.
@@ -365,10 +397,17 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
     text("value:par", String(inFlight.length));
     text("value:load", load === null ? "—" : `${Math.round(load * 100)}%`);
 
-    // In-flight board: each running call's timer and its latency bar.
+    // Long calls: a call joins the board once it has run LONG_CALL_MS (see there for why), then
+    // shows its own timer and its latency against the median of its kind.
+    let long = 0;
     for (const ev of inFlight) {
       if (ev.startedAt === null) continue;
       const elapsed = now - ev.startedAt;
+      const row = els.current.get(`row:${ev.id}`) as HTMLElement | undefined;
+      const shown = elapsed >= LONG_CALL_MS;
+      if (row && row.hasAttribute("data-shown") !== shown) row.toggleAttribute("data-shown", shown);
+      if (!shown) continue;
+      long += 1;
       text(`flight:${ev.id}`, fmtSecs(elapsed));
       const bar = els.current.get(`bar:${ev.id}`) as HTMLElement | undefined;
       if (bar) {
@@ -377,12 +416,16 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
         if (bar.dataset.level !== l.level) bar.dataset.level = l.level;
       }
     }
+    const board = els.current.get("longBoard") as HTMLElement | undefined;
+    if (board && board.hasAttribute("data-shown") !== long > 0) board.toggleAttribute("data-shown", long > 0);
+    text("longCount", String(long));
 
     return live || moving || s.tps > 0;
   }, [convId]);
 
-  // Drive the loop: rAF while something moves (motion allowed), a 1 Hz tick otherwise. It
-  // (re)starts whenever the deck goes live and stops itself once everything has settled.
+  // Drive the loop: frames (capped at FRAME_MS) while something moves and the window is
+  // visible, a 1 Hz tick under reduce-motion. It (re)starts whenever the deck goes live or the
+  // window comes back, and stops itself once everything has settled.
   useEffect(() => {
     const { live, motion } = inputs;
     const stop = () => {
@@ -391,12 +434,19 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
       if (tick.current !== null) clearInterval(tick.current);
       tick.current = null;
     };
+    if (!visible) return stop;
     if (!motion) {
       frame();
       if (live) tick.current = setInterval(frame, 1000);
       return stop;
     }
-    const loop = () => {
+    let lastWork = 0;
+    const loop = (ts: number) => {
+      if (ts - lastWork < FRAME_MS) {
+        raf.current = requestAnimationFrame(loop);
+        return;
+      }
+      lastWork = ts;
       raf.current = frame() ? requestAnimationFrame(loop) : null;
     };
     if (raf.current === null) {
@@ -404,8 +454,8 @@ function useLiveEngine(convId: string, inputs: EngineInputs): LiveNodes {
       raf.current = requestAnimationFrame(loop);
     }
     return stop;
-    // `frame` reads everything else through refs; these two decide whether a loop runs.
-  }, [inputs.live, inputs.motion, frame]); // eslint-disable-line react-hooks/exhaustive-deps
+    // `frame` reads everything else through refs; these decide whether a loop runs.
+  }, [inputs.live, inputs.motion, visible, frame]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A settled deck still shows its facts: one frame whenever they change while nothing runs.
   useEffect(() => {
@@ -450,8 +500,8 @@ function drawScope(c: HTMLCanvasElement | null, samples: readonly number[]): num
   ctx.clearRect(0, 0, w, h);
   ctx.strokeStyle = grid;
   ctx.lineWidth = 1;
-  for (let i = 1; i < 4; i++) {
-    const y = Math.round((h * i) / 4) + 0.5;
+  for (let i = 1; i < 3; i++) {
+    const y = Math.round((h * i) / 3) + 0.5;
     ctx.beginPath();
     ctx.moveTo(0, y);
     ctx.lineTo(w, y);
@@ -486,9 +536,13 @@ function drawScope(c: HTMLCanvasElement | null, samples: readonly number[]): num
 
 // ---- The React-rendered instruments -------------------------------------------------------
 
-/** Every call running right now, each with its own millisecond timer and a latency bar against
- *  the usual length of its kind in this conversation (the tick marks that median). */
-function InFlight({
+/**
+ * The calls that have been running for a while (LONG_CALL_MS), each with its own timer and a
+ * latency bar against the usual length of its kind here (the tick marks that median). Every
+ * running call has a row, but the frame loop only SHOWS it once it crosses the threshold, and
+ * the board itself only while one is shown — so short calls never flicker through it.
+ */
+function LongCalls({
   events,
   medians,
   bind,
@@ -498,36 +552,32 @@ function InFlight({
   bind: LiveNodes["bind"];
 }) {
   return (
-    <div className={d.flight}>
+    <div ref={bind("longBoard")} className={d.flight}>
       <div className={d.flightHead}>
-        <span className={d.kicker}>In flight</span>
-        <span className={d.flightMeta}>{events.length}</span>
+        <span className={d.kicker}>Long calls</span>
+        <span ref={bind("longCount")} className={d.flightMeta} />
       </div>
-      {events.length === 0 ? (
-        <span className={d.flightEmpty}>Nothing in flight.</span>
-      ) : (
-        <ol className={d.flightList}>
-          {events.map((e) => (
-            <li key={e.id} className={d.flightRow} data-family={e.family}>
-              <span className={d.feedTag}>{FAMILY_LABEL[e.family]}</span>
-              <span className={d.flightTarget} title={e.target ?? e.tool}>
-                {e.target ?? e.tool}
-              </span>
-              <span ref={bind(`flight:${e.id}`)} className={d.flightTimer} />
-              <span
-                className={d.flightTrack}
-                title={
-                  medians[e.family] === null
-                    ? "No finished call of this kind yet to compare with"
-                    : `Usual ${FAMILY_LABEL[e.family].toLowerCase()} call here: ${fmtSecs(medians[e.family]!)}`
-                }
-              >
-                <span ref={bind(`bar:${e.id}`)} className={d.flightBar} data-level="unknown" />
-              </span>
-            </li>
-          ))}
-        </ol>
-      )}
+      <ol className={d.flightList}>
+        {events.map((e) => (
+          <li key={e.id} ref={bind(`row:${e.id}`)} className={d.flightRow} data-family={e.family}>
+            <span className={d.feedTag}>{FAMILY_LABEL[e.family]}</span>
+            <span className={d.flightTarget} title={e.target ?? e.tool}>
+              {e.target ?? e.tool}
+            </span>
+            <span ref={bind(`flight:${e.id}`)} className={d.flightTimer} />
+            <span
+              className={d.flightTrack}
+              title={
+                medians[e.family] === null
+                  ? "No finished call of this kind yet to compare with"
+                  : `Usual ${FAMILY_LABEL[e.family].toLowerCase()} call here: ${fmtSecs(medians[e.family]!)}`
+              }
+            >
+              <span ref={bind(`bar:${e.id}`)} className={d.flightBar} data-level="unknown" />
+            </span>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -592,63 +642,61 @@ function ContextGauge({ convId, working }: { convId: string; working: boolean })
  * Calls per second over the last minute, the newest bucket filling live on the right.
  * Measured from ARRIVALS while the deck is open (see histogramArrivals): calls carry no time
  * in the store, so the history a conversation opens on is not drawn as a spike.
+ *
+ * The one-second tick runs while the deck is live AND until the minute has emptied — an idle
+ * deck whose window is all zeros has nothing left to slide, and must not wake every second.
  */
-function useActivityHistogram(totalCalls: number): { done: number[]; live: number } {
+function useActivityHistogram(
+  totalCalls: number,
+  live: boolean,
+): { done: number[]; live: number; seq: number; total: number } {
   const previous = useRef<number | null>(null);
   // ONE state, so closing the live bucket is a single pure transition.
   // ⚠️ It used to be two states closed by `setDone(p => closeBucket(p, liveRef.current))` +
   // `setLive(0)`: a ref read inside an updater, which React is free to run at a moment the ref no
   // longer holds the value it was meant to — measured in the browser: a call counted "1 call",
   // then vanished from the window a second later when its bucket closed.
-  const [h, setH] = useState<{ done: number[]; live: number }>({ done: [], live: 0 });
+  const [h, setH] = useState<{ done: number[]; live: number; seq: number }>({ done: [], live: 0, seq: 0 });
 
   useEffect(() => {
     const arrived = histogramArrivals(previous.current, totalCalls);
     previous.current = totalCalls;
-    if (arrived > 0) setH((s) => ({ done: s.done, live: s.live + arrived }));
+    if (arrived > 0) setH((s) => ({ ...s, live: s.live + arrived }));
   }, [totalCalls]);
 
+  const total = h.done.reduce((a, b) => a + b, 0) + h.live;
+  const ticking = live || total > 0;
   useEffect(() => {
+    if (!ticking) return;
     const id = setInterval(() => {
-      setH((s) => ({ done: closeBucket(s.done, s.live), live: 0 }));
+      setH((s) => ({ done: closeBucket(s.done, s.live), live: 0, seq: s.seq + 1 }));
     }, HISTOGRAM_BUCKET_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [ticking]);
 
-  return h;
+  return { ...h, total };
 }
 
-function Histogram({ done, live }: { done: number[]; live: number }) {
-  const pad = Math.max(0, HISTOGRAM_BUCKETS - 1 - done.length);
-  const bars = [...Array<number>(pad).fill(0), ...done, live];
+function Histogram({ bars }: { bars: ReturnType<typeof histogramBars> }) {
   // Never scaled below 3 calls: a single call must not fill the whole height.
-  const max = Math.max(3, ...bars);
-  const total = bars.reduce((a, b) => a + b, 0);
+  const max = Math.max(3, ...bars.map((b) => b.value));
   return (
-    <div className={d.histo}>
-      <div className={d.histoHead}>
-        <span className={d.kicker}>Activity</span>
-        <span className={d.histoMeta}>
-          {total} {total === 1 ? "call" : "calls"} · 60 s
-        </span>
-      </div>
-      <div className={d.bars} aria-label={`${total} tool calls in the last minute`} role="img">
-        {bars.map((v, i) => (
-          <span
-            key={i}
-            className={d.bar}
-            data-live={i === bars.length - 1 || undefined}
-            data-zero={v === 0 || undefined}
-            style={{ height: `${Math.max(v === 0 ? 0 : 8, (v / max) * 100)}%` }}
-          />
-        ))}
-      </div>
+    <div className={d.bars} role="img" aria-label="Tool calls per second over the last minute">
+      {bars.map((b) => (
+        <span
+          key={b.key}
+          className={d.bar}
+          data-live={b.live || undefined}
+          data-zero={b.value === 0 || undefined}
+          style={{ height: `${b.value === 0 ? 0 : Math.max(12, (b.value / max) * 100)}%` }}
+        />
+      ))}
     </div>
   );
 }
 
-/** The latest calls, newest on top, each with how long it took; a running one spins (its
- *  timer is on the in-flight board), a failed one turns red. */
+/** The latest calls, newest on top, each with how long it took; a running one spins, a failed
+ *  one turns red. */
 function Feed({ events }: { events: TelemetryEvent[] }) {
   return (
     <div className={d.feedWrap}>
