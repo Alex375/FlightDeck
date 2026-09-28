@@ -241,6 +241,18 @@ export function attachedMachineIds(
   return out;
 }
 
+/** Whether any live remote session has LOST its link (connecting / reconnecting) — the
+ *  only case a reconnect nudge can do anything for. Pure. */
+export function anyRemoteLinkDown(
+  sessions: Readonly<Record<string, Pick<SessionEntry, "state"> | undefined>>,
+): boolean {
+  for (const id in sessions) {
+    const st = sessions[id]?.state;
+    if (st && !st.ended && st.link != null) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Probing
 // ---------------------------------------------------------------------------

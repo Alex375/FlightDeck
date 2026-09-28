@@ -2412,6 +2412,10 @@ export const mockCommands = {
     return ok({ ...d });
   },
 
+  async reconnectRemoteSessions(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
   // Same verdict the full mock diagnosis carries, in the shape the ambient probe gets.
   async machineReachability(machineId: string): Promise<Result<MachineReachability, string>> {
     const d = mockDiagnoses.get(machineId);

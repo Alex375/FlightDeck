@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ServerDiagnosis, SessionStatePayload } from "../ipc/client";
 import {
+  anyRemoteLinkDown,
   attachedMachineIds,
   healthFromDiagnosis,
   healthFromReachability,
@@ -239,6 +240,17 @@ describe("attachedMachineIds", () => {
     expect(none({ ...attachedState, session_id: null })).toBe(0);
     expect(none(attachedState, { ...conv, handle: null as unknown as string })).toBe(0);
     expect(none(attachedState, { ...conv, repoId: "r-local" })).toBe(0);
+  });
+});
+
+describe("anyRemoteLinkDown", () => {
+  it("is true only while a live session's link is connecting or reconnecting", () => {
+    const st = (over: Partial<SessionStatePayload>) => ({ state: { ...neutralState(), ...over } });
+    expect(anyRemoteLinkDown({})).toBe(false);
+    expect(anyRemoteLinkDown({ a: st({ link: null }) })).toBe(false);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3 } }) })).toBe(true);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "connecting" } }) })).toBe(true);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3 }, ended: true }) })).toBe(false);
   });
 });
 

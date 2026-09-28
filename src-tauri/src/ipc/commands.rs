@@ -133,6 +133,17 @@ impl Sessions {
         claude
     }
 
+    /// Snapshot the live REMOTE (SSH) handles — the only sessions with a link to lose.
+    fn remote_handles(&self) -> Vec<SessionHandle> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.is_remote)
+            .map(|s| s.handle.clone())
+            .collect()
+    }
+
     /// Whether any session is still registered (still tearing down or live).
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
@@ -2609,6 +2620,19 @@ pub async fn generate_message_summary(
         .generate_summary(text, seq)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Retry every REMOTE session's lost link NOW rather than at the end of its backoff —
+/// fired by the front when the Mac's network comes back or the user returns to the app
+/// (see `SessionCommand::ReconnectNow`). Cheap and idempotent: an attached session, which
+/// is not waiting out a backoff, ignores it. A session that closed meanwhile is skipped.
+#[tauri::command]
+#[specta::specta]
+pub async fn reconnect_remote_sessions(sessions: tauri::State<'_, Sessions>) -> Result<(), String> {
+    for handle in sessions.remote_handles() {
+        let _ = handle.reconnect_now().await;
+    }
+    Ok(())
 }
 
 /// Interrupt the current turn (without killing the process).

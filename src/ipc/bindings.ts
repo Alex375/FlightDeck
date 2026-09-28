@@ -1301,6 +1301,20 @@ async interruptSession(session: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Retry every REMOTE session's lost link NOW rather than at the end of its backoff —
+ * fired by the front when the Mac's network comes back or the user returns to the app
+ * (see `SessionCommand::ReconnectNow`). Cheap and idempotent: an attached session, which
+ * is not waiting out a backoff, ignores it. A session that closed meanwhile is skipped.
+ */
+async reconnectRemoteSessions() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_remote_sessions") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Query a running session's LIVE MCP server status (real connection state +
  * tools per server) via the `mcp_status` control request — the authoritative
  * source the conversation view uses (NOT the stale `system/init` snapshot).

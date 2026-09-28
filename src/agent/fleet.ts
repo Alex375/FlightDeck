@@ -109,13 +109,36 @@ export function isFleetCalm(c: FleetCounts): boolean {
   return c.running === 0 && c.review === 0 && c.needAttention === 0;
 }
 
+/** Which conversations a fleet tally covers: all of them (the readout), or only those whose
+ *  `claude` runs on THIS Mac — see {@link localConversations}. */
+export type FleetScope = "all" | "local";
+
 /**
- * Live readout counts across every conversation — the same derive-per-conversation
- * path as {@link useFleetLanes}, tallied into the four stages instead. `useShallow`
- * over the counts means the banner only re-renders when a count actually moves.
+ * The conversations whose agent runs on THIS Mac — a repo with no `machineId`. A remote
+ * conversation's `claude` runs on its server under `flightdeckd`, which keeps working
+ * whether or not this Mac is awake: it is what the Caffeinate policy must NOT count. Pure.
  */
-export function useFleetCounts(): FleetCounts {
-  const convs = useConversations();
+export function localConversations(
+  convs: readonly Conversation[],
+  repos: ReadonlyArray<Pick<Repo, "id" | "machineId">>,
+): Conversation[] {
+  const remote = new Set(repos.filter((r) => r.machineId).map((r) => r.id));
+  return remote.size === 0 ? (convs as Conversation[]) : convs.filter((c) => !remote.has(c.repoId));
+}
+
+/**
+ * Live readout counts across every conversation (or, with `scope: "local"`, across those
+ * running on this Mac) — the same derive-per-conversation path as {@link useFleetLanes},
+ * tallied into the four stages instead. `useShallow` over the counts means the banner only
+ * re-renders when a count actually moves.
+ */
+export function useFleetCounts(scope: FleetScope = "all"): FleetCounts {
+  const allConvs = useConversations();
+  const repos = useRepos();
+  const convs = useMemo(
+    () => (scope === "all" ? allConvs : localConversations(allConvs, repos)),
+    [scope, allConvs, repos],
+  );
   const bg = useRunningCountsByConv();
   const bgBash = useRunningBashCountsByConv();
   const reAlertBash = useDisplay((s) => s.alertOnBackgroundBash);
