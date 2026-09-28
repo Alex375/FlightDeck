@@ -79,6 +79,7 @@ export function ConversationPane({
   // they attach to THIS conversation exactly as the composer's "+" would.
   const dropOver = useIsDropOver(session, "pane");
   const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
+  const readingWidth = useDisplay((s) => s.conversationWidth);
   // "Shown", not "open": a panel that stepped aside for lack of room is off screen, and the
   // summary line must stand in for it exactly as for a closed one.
   const panelOpen = useConvPanelShown();
@@ -87,7 +88,8 @@ export function ConversationPane({
     <div
       ref={paneRef}
       className="wf-col cv-pane"
-      style={{ flex: 1, minWidth: 0 }}
+      // The reading column's cap (thread text + composer) — the user's, see `conversationWidth`.
+      style={{ flex: 1, minWidth: 0, ["--cv-max" as string]: `${readingWidth}px` }}
       onClick={onBackgroundClick}
       {...dropZoneAttrs(session, "pane")}
       data-drop-over={dropOver || undefined}

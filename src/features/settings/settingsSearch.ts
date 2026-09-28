@@ -47,6 +47,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Thread", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Thread", keywords: "task-notification messages thread display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Thread", keywords: "pin last message apercu dernier message display affichage" },
+  { title: "Conversation width", section: "display", sub: "thread", group: "Thread", keywords: "largeur width column colonne texte text margin marge narrow étroit wide large composer composeur reading lecture thread fil" },
   { title: "Conversation side panel", section: "display", sub: "thread", group: "Thread", keywords: "sidebar panneau lateral droite todo goal artifacts artefacts tosse task tache worktree stream header display affichage" },
   { title: "Side panel fits its content", section: "display", sub: "thread", group: "Thread", keywords: "sidebar panneau lateral hauteur height fit content contenu ajuste flottant floating top right haut droite grow grandit animation full height pleine hauteur" },
   { title: "Telemetry deck", section: "display", sub: "thread", group: "Thread", keywords: "telemetry télémétrie gauge jauge dashboard tableau de bord instruments counters compteurs histogram activity activité palantir cockpit stats live panneau" },

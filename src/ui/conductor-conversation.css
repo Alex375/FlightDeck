@@ -254,9 +254,18 @@
 
 /* Single source of truth for the conversation's content width. The thread, the
    composer (input + footer controls) and the floating bars (todo / review) all
-   centre on this same max-width so they share one visual column, like Claude. */
+   centre on this same max-width so they share one visual column, like Claude.
+   `--cv-max` is the user's cap (`conversationWidth`, set inline by ConversationPane; 760 is only
+   the fallback). `--cv-gutter` is the margin each side keeps when the pane is NARROWER than the
+   cap — with both side bars open the column used to run edge to edge with 26px to spare. It
+   opens up to 56px, and gives it back only as the pane nears its floor: at
+   MIN_CONVERSATION_PANE_PX (composerLayout.ts) it is exactly 26px, so the composer still gets
+   its 500px (MIN_COMPOSER_PX — change one, change the other). A custom property holding a `%`
+   resolves where it is USED: every user below takes it against the pane's full width.
+   Consumers: .cv-thread's padding, and the `width` of .cv-composer, .cv-todobar, .cv-bgagents
+   and ConversationSummaryLine. */
 /* position:relative → the pane is the containing block for the floating .cv-lastpin. */
-.cv-pane { --cv-max:840px; position:relative; }
+.cv-pane { --cv-max:760px; --cv-gutter:clamp(26px, calc((100% - 500px) / 2), 56px); position:relative; }
 /* Files dragged from the Finder over the conversation column (FileDropHost): a framed
    veil over the whole pane + a centred hint — the drop attaches them as the composer's
    "+" would. Pseudo-elements don't match the global `*` box-sizing rule, hence the
@@ -460,16 +469,16 @@
   -webkit-line-clamp:14;
   overflow:hidden;
 }
-/* The thread's own right padding is 26px; the minimap sits in it. Give the thread a touch
-   more room on that side ONLY when the minimap is mounted, so a wide code block never
-   slides under the bars. */
-.cv-pane:has(.cv-mmap) .cv-thread { padding-right:42px; }
+/* The minimap sits in the thread's right gutter, which can be as narrow as 26px. Give the
+   thread at least 42px on that side ONLY when the minimap is mounted, so a wide code block
+   never slides under the bars. */
+.cv-pane:has(.cv-mmap) .cv-thread { padding-right:max(var(--cv-gutter), 42px); }
 
 /* Clickable http(s) link inside a message preview (LinkText): peek/pin/popover. */
 .cv-linktext { color:var(--wf-accent); text-decoration:underline; text-underline-offset:2px; cursor:pointer; overflow-wrap:anywhere; }
 .cv-linktext:hover { text-decoration:none; }
 
-.cv-thread { flex:1; min-width:0; min-height:0; overflow-y:auto; overscroll-behavior-y:contain; padding:22px 26px 0; }
+.cv-thread { flex:1; min-width:0; min-height:0; overflow-y:auto; overscroll-behavior-y:contain; padding:22px var(--cv-gutter) 0; }
 .cv-thread-inner { display:flex; flex-direction:column; gap:20px; margin:0 auto; max-width:var(--cv-max,840px); padding-bottom:24px; }
 .cv-day { display:flex; align-items:center; gap:12px; font-size:11px; color:var(--wf-tx-xlo); text-transform:lowercase; }
 .cv-day .wf-line { flex:1; height:1px; background:var(--wf-line); }
@@ -1160,7 +1169,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 /* The whole composer is ONE floating rounded card — like the Claude app: the text
    row AND the controls row live inside the same elevated block, centred on the
    conversation width and lifted off the window edge with a soft shadow. */
-.cv-composer { position:relative; margin:6px auto 14px; max-width:var(--cv-max,840px); width:calc(100% - 52px); padding:6px 8px 7px; background:var(--wf-panel); border:1px solid var(--wf-line-2); border-radius:20px; box-shadow:0 18px 44px -20px #000, 0 6px 16px -10px #0009, inset 0 1px 0 #ffffff0a; container:composer / inline-size; }
+.cv-composer { position:relative; margin:6px auto 14px; max-width:var(--cv-max,840px); width:calc(100% - 2 * var(--cv-gutter)); padding:6px 8px 7px; background:var(--wf-panel); border:1px solid var(--wf-line-2); border-radius:20px; box-shadow:0 18px 44px -20px #000, 0 6px 16px -10px #0009, inset 0 1px 0 #ffffff0a; container:composer / inline-size; }
 
 /* ---- Status inside the composer (Settings → Display → Appearance → "Status inside the composer") ----
    ComposerStatusBand is the card's FIRST child: a header band flush with the card's edges (it
@@ -1315,7 +1324,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
   flex:0 0 auto;
   margin:10px auto 4px;
   max-width:var(--cv-max,840px);
-  width:calc(100% - 52px);
+  width:calc(100% - 2 * var(--cv-gutter));
   background:var(--wf-panel);
   border:1px solid var(--wf-line-2);
   border-radius:12px;
@@ -1339,7 +1348,7 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
   flex:0 0 auto;
   margin:4px auto 2px;
   max-width:var(--cv-max,840px);
-  width:calc(100% - 52px);
+  width:calc(100% - 2 * var(--cv-gutter));
   max-height:22vh;
   overflow-y:auto;
   overscroll-behavior:contain;

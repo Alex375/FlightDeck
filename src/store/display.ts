@@ -5,6 +5,7 @@
 import { create } from "zustand";
 import { useConversationsStore } from "./conversationsStore";
 import { DEFAULT_ZOOM, sanitizeZoom } from "../ui/zoom";
+import { DEFAULT_READING_WIDTH, sanitizeReadingWidth } from "../ui/readingWidth";
 
 const STORAGE_KEY = "tosse:display";
 
@@ -52,6 +53,12 @@ export interface DisplayPrefs {
    *  {@link sanitizeZoom}d on load AND on write: a corrupted entry that reached the webview
    *  could leave the window unreadable with no way back through the UI. */
   uiZoom: number;
+
+  /** The widest the conversation's reading column may get, px — the thread's text and the
+   *  composer, which share it. 760 by default; stepped by 40 between 560 and 1080 and
+   *  {@link sanitizeReadingWidth}d on load and on write. It is a CAP: a narrower pane keeps a
+   *  side margin of its own on top (`--cv-gutter`). Read by {@link ConversationPane}. */
+  conversationWidth: number;
 
   /** Show the "Fleet readout" banner (the adaptive "N Running · N Review · …" stage
    *  counts across the whole fleet) at the TOP of the FlightDeck. On by default. Set
@@ -362,6 +369,7 @@ const DEFAULTS: DisplayPrefs = {
   cleanOutput: false,
   markdownMode: "warm",
   uiZoom: DEFAULT_ZOOM,
+  conversationWidth: DEFAULT_READING_WIDTH,
   fleetBannerFlightDeck: true,
   fleetBannerConversation: true,
   showTaskNotifications: false,
@@ -422,7 +430,12 @@ function load(): DisplayPrefs {
     // value could make the app unusable with (see `sanitizeZoom`), so it is re-checked
     // here rather than trusted from storage.
     const stored = JSON.parse(raw) as Partial<DisplayPrefs>;
-    return { ...DEFAULTS, ...stored, uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM) };
+    return {
+      ...DEFAULTS,
+      ...stored,
+      uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM),
+      conversationWidth: sanitizeReadingWidth(stored.conversationWidth),
+    };
   } catch {
     return DEFAULTS;
   }
@@ -449,6 +462,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         cleanOutput: patch.cleanOutput ?? s.cleanOutput,
         markdownMode: patch.markdownMode ?? s.markdownMode,
         uiZoom: sanitizeZoom(patch.uiZoom ?? s.uiZoom),
+        conversationWidth: sanitizeReadingWidth(patch.conversationWidth ?? s.conversationWidth),
         fleetBannerFlightDeck: patch.fleetBannerFlightDeck ?? s.fleetBannerFlightDeck,
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,

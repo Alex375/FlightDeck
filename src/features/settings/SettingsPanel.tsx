@@ -18,6 +18,12 @@ import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, formatZoom, nextZoom, prevZoom } from "../../ui/zoom";
+import {
+  DEFAULT_READING_WIDTH,
+  MAX_READING_WIDTH,
+  MIN_READING_WIDTH,
+  READING_WIDTH_STEP,
+} from "../../ui/readingWidth";
 import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
@@ -782,10 +788,25 @@ function ThreadPrefs() {
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const artifactsInApp = useDisplay((s) => s.artifactsInApp);
   const artifactHidesSidePanel = useDisplay((s) => s.artifactHidesSidePanel);
+  const conversationWidth = useDisplay((s) => s.conversationWidth);
   const set = useDisplay((s) => s.set);
   return (
     <>
       <SettingsGroup title="Thread" icon="chat">
+        <ToggleRow
+          title="Conversation width"
+          hint={
+            <>
+              The widest the conversation's <strong>text column</strong> gets — the thread and
+              the composer share it. Narrower leaves more margin on both sides; when the window
+              is too tight for the width you pick (both side bars open), the column still keeps
+              a margin of its own. <strong>{DEFAULT_READING_WIDTH} px by default.</strong>
+            </>
+          }
+          control={
+            <WidthStepper width={conversationWidth} onChange={(v) => set({ conversationWidth: v })} />
+          }
+        />
         <ToggleRow
           title="Clean output (default)"
           hint={
@@ -1099,6 +1120,44 @@ function ZoomStepper({ zoom, onChange }: { zoom: number; onChange: (next: number
         className={styles.zoomReset}
         onClick={() => onChange(DEFAULT_ZOOM)}
         disabled={zoom === DEFAULT_ZOOM}
+      >
+        Reset
+      </button>
+    </div>
+  );
+}
+
+/** The conversation width's − / value / + / Reset — the zoom stepper's shape and styles, one
+ *  {@link READING_WIDTH_STEP} per click (the store snaps anything else onto that grid). */
+function WidthStepper({ width, onChange }: { width: number; onChange: (next: number) => void }) {
+  return (
+    <div className={styles.zoomCtl}>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(width - READING_WIDTH_STEP)}
+        disabled={width <= MIN_READING_WIDTH}
+        aria-label="Narrower"
+      >
+        −
+      </button>
+      <span className={`${styles.zoomVal} ${styles.widthVal}`} aria-live="polite">
+        {width} px
+      </span>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(width + READING_WIDTH_STEP)}
+        disabled={width >= MAX_READING_WIDTH}
+        aria-label="Wider"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        className={styles.zoomReset}
+        onClick={() => onChange(DEFAULT_READING_WIDTH)}
+        disabled={width === DEFAULT_READING_WIDTH}
       >
         Reset
       </button>

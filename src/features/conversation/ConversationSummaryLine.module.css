@@ -6,7 +6,7 @@
   gap: 12px;
   margin: 4px auto 2px;
   max-width: var(--cv-max, 840px);
-  width: calc(100% - 52px);
+  width: calc(100% - 2 * var(--cv-gutter));
   min-width: 0;
   height: 28px;
   padding: 0 10px;
