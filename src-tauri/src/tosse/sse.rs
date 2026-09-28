@@ -41,13 +41,14 @@
 //!   a failure. It is recycled silently: no backoff, no state change, no indicator flicker
 //!   every 12 s. An idle timeout never qualifies, however long the socket stayed open — see
 //!   [`ended`], which is what keeps `Error` reachable for a stream that goes quiet.
-//! - The refetch owed per connection is throttled ON THE FRONT, or a recycle every 12 s
-//!   would become the very polling this feature exists to remove.
+//! - A recycle owes the front NO refetch (`TosseLiveHost`): only a real outage — the state
+//!   left `live` — does. Refetching for every recycle was a sweep every minute for as long
+//!   as the window stayed visible: the very polling this feature exists to remove.
 //!
-//! The real fix belongs to the CRM: a keepalive shorter than that timeout (~10 s) would hold
-//! one connection open indefinitely and make all of this moot. Worth doing — it would also
-//! close the ~200 ms gap each recycle leaves, which is the only window where a change can be
-//! missed until the next refetch.
+//! The real fix belongs to the CRM: a keepalive shorter than that timeout (~10 s) holds one
+//! connection open indefinitely and makes all of this moot (requested 28/09, CRM_max
+//! `apps/backend/src/routes/sse.ts`). It also closes the ~200 ms gap each recycle leaves —
+//! the only window where a change can be missed until the next event touches the same data.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
