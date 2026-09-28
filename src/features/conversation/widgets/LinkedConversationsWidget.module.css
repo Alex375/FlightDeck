@@ -1,0 +1,253 @@
+/* "Linked conversations" — a list ruled by hairlines inside the island, the same voice as the
+   Artifacts list: a row per partner (state dot, name over its repo, the exchange's figures),
+   quiet at rest. Colour only where it carries meaning: the partner's state, and a refusal. */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 -6px;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  border-top: 1px solid var(--wf-line);
+}
+
+/* The row's body: a button to the partner, or plain text once the partner is gone. */
+.open {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 7px 4px 7px 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+button.open {
+  cursor: pointer;
+}
+button.open:hover .name {
+  color: var(--wf-tx-hi);
+  text-decoration: underline;
+  text-decoration-color: var(--wf-tx-xlo);
+  text-underline-offset: 3px;
+}
+button.open:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 1px;
+}
+
+/* A fixed slot, so a gone partner (no dot) keeps its name aligned with the others. The dot's
+   3px halo needs the room. */
+.dotSlot {
+  flex: 0 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.dotTip {
+  display: inline-flex;
+  align-items: center;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nameTip {
+  display: block;
+  min-width: 0;
+}
+.name {
+  display: block;
+  font-size: 12.5px;
+  color: var(--wf-tx-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.repo {
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The exchange, compactly: « created », ↗ sent, ↙ received. Neutral — direction is the only
+   information, and the tooltip says it in words. */
+.figs {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--wf-mono);
+  font-size: 10.5px;
+  color: var(--wf-tx);
+  font-variant-numeric: tabular-nums;
+}
+.fig {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+/* One glyph (the kit's right arrow), turned: up-right = out, down-left = in. Doubled class to
+   outrank the wirekit's `.wf-ico.sm` (13px). */
+.fig :global(.wf-ico.sm) {
+  width: 10px;
+  height: 10px;
+  color: var(--wf-tx-lo);
+}
+.fig .arrowOut {
+  transform: rotate(-45deg);
+}
+.fig .arrowIn {
+  transform: rotate(135deg);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-lo);
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.01em;
+}
+
+/* Some sends were refused: a small red mark, the reason on hover. */
+.fail {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--wf-err) 18%, transparent);
+  color: var(--wf-err);
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* « Show in this thread »: revealed on the row's hover (or keyboard focus), its slot kept at
+   rest so the figures never shift under the pointer. */
+.here {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  opacity: 0;
+}
+.hereTip {
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+/* The same footprint on a row with nothing to scroll to — the figures stay in one column. */
+.hereSlot {
+  flex: 0 0 22px;
+  height: 22px;
+  margin-right: -4px;
+}
+.here :global(.wf-ico.sm) {
+  width: 12px;
+  height: 12px;
+}
+.row:hover .here,
+.row:focus-within .here {
+  opacity: 1;
+}
+.here:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.here:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 1px;
+}
+
+/* A partner no longer on the list: plain and dimmed, nothing to open. */
+.row[data-gone] .open {
+  opacity: 0.55;
+}
+
+/* « Show N more » — a quiet disclosure line under the list. */
+.more {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 -2px -2px;
+  padding: 4px 6px 4px 2px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.more:hover {
+  color: var(--wf-tx-hi);
+}
+.more:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 1px;
+}
+/* Doubled class to outrank the wirekit's `.wf-ico.sm` (13px). */
+.more :global(.wf-ico.sm) {
+  width: 10px;
+  height: 10px;
+}
+.more .moreChev {
+  transform: rotate(-90deg);
+}
+.more[aria-expanded="true"] .moreChev {
+  transform: rotate(0deg);
+}
+
+/* Motion: only feedback that explains a change (the hover reveal, the chevron turning). Scoped
+   under the list's / button's own state so it is off when panel animations are. */
+.list[data-motion] .here {
+  transition: opacity 0.15s cubic-bezier(0.32, 0.72, 0, 1), background 0.12s ease, color 0.12s ease;
+}
+.list[data-motion] button.open .name {
+  transition: color 0.12s ease;
+}
+.list[data-motion] ~ .more .moreChev {
+  transition: transform 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .list[data-motion] .here,
+  .list[data-motion] button.open .name,
+  .list[data-motion] ~ .more .moreChev {
+    transition: none;
+  }
+}

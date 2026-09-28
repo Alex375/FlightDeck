@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
 
-use super::assembler::{context_used_from_usage, normalize_blocks, token_usage_from};
-use super::model::{ContextFill, ConversationItem, GoalState};
+use super::assembler::{
+    context_used_from_usage, normalize_blocks, session_usage_from_model_usage, token_usage_from,
+};
+use super::model::{ContextFill, ConversationItem, GoalState, SessionUsage};
 
 /// Claude's config dir: `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`. Shared
 /// with [`super::subagents`], which reads the sibling task-artifact directories.
@@ -277,6 +279,102 @@ fn load_active_goal_in(config_dir: &Path, session_id: &str) -> Option<GoalState>
         }
     }
     active
+}
+
+/// Read a conversation's cumulative, all-agent token spend from its on-disk transcript — the
+/// seed of the side panel's session total on reopen, before the first live `result` refreshes
+/// it (see [`SessionUsage`]).
+///
+/// The source is the transcript's LAST `{"type":"cost-state", modelUsage, totalCostUSD, …}`
+/// line: a DISK-ONLY record the CLI writes when its process exits (and before a resume/fork
+/// switch), and the very line it restores its own counters from on `--resume`. So the seed is
+/// the value a resumed process will carry on from — or, when the transcript has none (the
+/// process was killed before it could write one, an older CLI), `None`: the total is unknown,
+/// never zero. A session whose process is still running has no fresh line yet; its last one
+/// (if any) is "as of the last close".
+///
+/// Cheap by construction: the line is normally the file's LAST, so only the tail is read, with
+/// a raw-substring pre-filter before any JSON parse; the whole file is read only when the tail
+/// has no such line (see [`read_last_matching_line`]).
+pub fn load_session_usage(session_id: &str) -> Option<SessionUsage> {
+    let dir = claude_config_dir()?;
+    load_session_usage_in(&dir, session_id)
+}
+
+fn load_session_usage_in(config_dir: &Path, session_id: &str) -> Option<SessionUsage> {
+    let path = find_transcript(config_dir, session_id)?;
+    read_last_matching_line(&path, "\"cost-state\"", |entry| {
+        if entry.get("type").and_then(Value::as_str) != Some("cost-state") {
+            return None;
+        }
+        let cost = entry.get("totalCostUSD").and_then(Value::as_f64);
+        session_usage_from_model_usage(entry.get("modelUsage")?, cost)
+    })
+}
+
+/// How much of a JSON-lines file's END [`read_last_matching_line`] reads before falling back to
+/// the whole file. A `cost-state` or `token_count` line weighs about a kilobyte; the room is for
+/// whatever a session appended after it (a resumed turn's first lines).
+const TAIL_READ_BYTES: u64 = 256 * 1024;
+
+/// The first line, scanning a JSON-lines file BACKWARDS, that contains `marker` verbatim and
+/// that `pick` accepts once parsed — what a reader of the LAST record of some kind needs.
+///
+/// Reads the file's last [`TAIL_READ_BYTES`] first, and the whole file only when that tail
+/// holds no accepted line. The tail's first line may be cut in half: it simply fails to parse
+/// and is skipped, and the full read then sees it whole. `marker` is a PRE-FILTER only (a line
+/// without it is never parsed; a line with it is still checked by `pick`), so a message that
+/// merely mentions the marker cannot pass for the record. An absent or unreadable file is
+/// `None` — logged when it is a real IO error, since the caller shows "unknown" either way.
+pub(crate) fn read_last_matching_line<T>(
+    path: &Path,
+    marker: &str,
+    pick: impl Fn(&Value) -> Option<T>,
+) -> Option<T> {
+    use std::io::{Read, Seek, SeekFrom};
+    let scan = |content: &str| {
+        content
+            .lines()
+            .rev()
+            .filter(|line| line.contains(marker))
+            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok().and_then(|v| pick(&v)))
+    };
+    let log = |e: &std::io::Error| {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("[history] cannot read {}: {e}", path.display());
+        }
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            log(&e);
+            return None;
+        }
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > TAIL_READ_BYTES {
+        let mut tail = Vec::with_capacity(TAIL_READ_BYTES as usize);
+        let read = file
+            .seek(SeekFrom::Start(len - TAIL_READ_BYTES))
+            .and_then(|_| file.read_to_end(&mut tail));
+        match read {
+            // Lossy: the cut can land inside a multi-byte character, which only ever spoils
+            // the cut (first) line — the one that is incomplete anyway.
+            Ok(_) => {
+                if let Some(found) = scan(&String::from_utf8_lossy(&tail)) {
+                    return Some(found);
+                }
+            }
+            Err(e) => log(&e),
+        }
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => scan(&content),
+        Err(e) => {
+            log(&e);
+            None
+        }
+    }
 }
 
 /// The inner text of a `user` line whose content is a single `<local-command-stdout>…</…>`
@@ -1934,6 +2032,78 @@ mod tests {
         // The window is NEVER inferred from the transcript (name can't tell 200k from
         // 1M) — it's sourced live / from the front cache.
         assert_eq!(fill.context_window, None);
+    }
+
+    #[test]
+    fn session_usage_seed_reads_the_last_cost_state_line() {
+        let base = std::env::temp_dir().join(format!("tosse-usage-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        write_transcript(
+            &base,
+            "-some-cwd",
+            sid,
+            &[
+                // An OLDER close of the session…
+                r#"{"type":"cost-state","sessionId":"x","totalCostUSD":0.5,"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":20,"thinkingTokens":5,"cacheReadInputTokens":300,"cacheCreationInputTokens":40,"costUSD":0.5}}}"#,
+                r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}"#,
+                // A message that merely MENTIONS the record is not the record.
+                r#"{"type":"user","uuid":"u2","message":{"role":"user","content":"what is \"cost-state\"?"}}"#,
+                // …then the latest one: it wins, both models counted, thinking not added.
+                r#"{"type":"cost-state","sessionId":"x","totalCostUSD":1.25,"modelUsage":{"claude-haiku-4-5":{"inputTokens":2228,"outputTokens":31,"thinkingTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.002},"claude-opus-5":{"inputTokens":12,"outputTokens":607,"thinkingTokens":242,"cacheReadInputTokens":1000,"cacheCreationInputTokens":79877,"costUSD":1.248}}}"#,
+                r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"resumed"}}"#,
+            ],
+        );
+        let u = load_session_usage_in(&base, sid).expect("a cost-state line is on disk");
+        assert_eq!(
+            u.total,
+            crate::supervisor::model::TokenUsage {
+                input: 2228 + 12,
+                cache_creation: 79877,
+                cache_read: 1000,
+                output: 31 + 607,
+            }
+        );
+        assert_eq!(u.cost_usd, Some(1.25));
+        assert_eq!(u.per_model[0].model, "claude-opus-5");
+
+        // No record at all (a killed process, an older CLI): unknown, never zero.
+        let none = "66666666-2222-3333-4444-555555555555";
+        write_transcript(
+            &base,
+            "-some-cwd",
+            none,
+            &[r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}"#],
+        );
+        assert_eq!(load_session_usage_in(&base, none), None);
+        // No transcript at all (a remote conversation, a new one).
+        assert_eq!(load_session_usage_in(&base, "missing"), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn last_matching_line_falls_back_to_the_whole_file_past_the_tail() {
+        let base = std::env::temp_dir().join(format!("tosse-tail-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"cost-state","n":1}}"#).unwrap();
+        // Far more than the tail window after the record, none of it matching.
+        let filler = format!(r#"{{"type":"user","pad":"{}"}}"#, "x".repeat(1000));
+        for _ in 0..(TAIL_READ_BYTES / 1000 + 50) {
+            writeln!(f, "{filler}").unwrap();
+        }
+        drop(f);
+        let pick = |v: &Value| v.get("n").and_then(Value::as_u64);
+        assert_eq!(read_last_matching_line(&path, "\"cost-state\"", pick), Some(1));
+        // A record inside the tail is found without the full read, and the LAST one wins.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, r#"{{"type":"cost-state","n":2}}"#).unwrap();
+        writeln!(f, "{filler}").unwrap();
+        drop(f);
+        assert_eq!(read_last_matching_line(&path, "\"cost-state\"", pick), Some(2));
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

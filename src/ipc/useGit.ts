@@ -14,8 +14,10 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
 import { commands, events } from "./client";
+import { createGitFsRefresh, invalidateGitQueries } from "../features/git/gitTurnRefresh";
 import type {
   BranchInfo,
   CommitFile,
@@ -148,32 +150,44 @@ export function useGitSync(cwd: string | null) {
   });
 }
 
+/** At most one fs-driven git refresh per this window (ms), fired at its END (trailing). */
+export const GIT_FS_REFRESH_THROTTLE_MS = 1_000;
+
+/** The shared fs-driven refreshers, one registry per QueryClient (the app has one; tests make
+ *  their own). A WeakMap, so a discarded client takes its registry with it. */
+const fsRefreshByClient = new WeakMap<QueryClient, (cwd: string) => () => void>();
+
+function fsRefreshFor(qc: QueryClient): (cwd: string) => () => void {
+  let retain = fsRefreshByClient.get(qc);
+  if (!retain) {
+    retain = createGitFsRefresh({
+      listen: (onPaths) => events.fsChangeEvent.listen((e) => onPaths(e.payload.paths)),
+      refresh: (cwd) => {
+        invalidateGitQueries(qc, ["git", cwd, "status"]);
+        invalidateGitQueries(qc, ["git", cwd, "diff"]);
+      },
+      throttleMs: GIT_FS_REFRESH_THROTTLE_MS,
+    });
+    fsRefreshByClient.set(qc, retain);
+  }
+  return retain;
+}
+
 /**
- * Re-pull status + open diffs whenever the fs watcher reports a working-tree
- * change (the watcher already debounces and ignores `.git`/`node_modules`).
- * Commit history and branches don't change on a file save, so they're left to
- * window-focus refetch + the write mutations — keeping a save cheap.
+ * Re-pull status + open diffs whenever the fs watcher reports a change UNDER `cwd` (the
+ * watcher already debounces and ignores `.git`/`node_modules`). Commit history and branches
+ * don't change on a file save, so they're left to the turn-end refresh
+ * (`useGlobalSessionEvents`), window-focus refetch and the write mutations.
+ *
+ * ⚠️ Every caller on the same cwd shares ONE refresher (see `createGitFsRefresh`): filtered to
+ * the cwd, throttled (trailing, {@link GIT_FS_REFRESH_THROTTLE_MS}) and read through
+ * {@link invalidateGitQueries}, which joins a fetch in flight rather than stacking a second
+ * uncancellable `git` process. The Git workspace and the side panel's git widget open together
+ * therefore still cost one `git status` per burst, not two.
  */
 export function useGitAutoRefresh(cwd: string | null) {
   const qc = useQueryClient();
-  useEffect(() => {
-    if (!cwd) return;
-    let off: (() => void) | undefined;
-    let disposed = false;
-    void events.fsChangeEvent
-      .listen(() => {
-        qc.invalidateQueries({ queryKey: ["git", cwd, "status"] });
-        qc.invalidateQueries({ queryKey: ["git", cwd, "diff"] });
-      })
-      .then((unlisten) => {
-        if (disposed) unlisten();
-        else off = unlisten;
-      });
-    return () => {
-      disposed = true;
-      off?.();
-    };
-  }, [cwd, qc]);
+  useEffect(() => (cwd ? fsRefreshFor(qc)(cwd) : undefined), [cwd, qc]);
 }
 
 export type { BranchInfo, CommitFile, CommitInfo, GitDiff, GitFileEntry, GitStatus };

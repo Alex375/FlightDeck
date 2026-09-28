@@ -8,7 +8,14 @@
 // "General". Sub-tabs carry the rest — growing the rail is the wrong axis.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import {
+  demoteBypassConversations,
+  useConversationsStore,
+  wipeAllData,
+} from "../../store/conversationsStore";
+import { useSidePanelLayout, useWidgetOn } from "../../store/sidePanelWidgetsStore";
+import { useEditorStore } from "../editor/editorStore";
+import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
@@ -774,7 +781,9 @@ function ThreadPrefs() {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
-  const conversationTelemetry = useDisplay((s) => s.conversationTelemetry);
+  const telemetryOn = useWidgetOn("telemetry");
+  const setWidgetOn = useSidePanelLayout((s) => s.setOn);
+  const activeConvId = useConversationsStore((s) => s.activeId);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
@@ -860,10 +869,46 @@ function ThreadPrefs() {
               )}
             </>
           }
-          checked={conversationTelemetry}
-          onChange={(v) => set({ conversationTelemetry: v })}
+          checked={telemetryOn}
+          onChange={(v) => setWidgetOn("telemetry", v)}
           label="Show the telemetry deck in the conversation panel"
           disabled={!conversationSidePanel}
+        />
+        <ToggleRow
+          title="Conversation panel widgets"
+          hint={
+            <>
+              Choose what the conversation panel shows — its task, goal, todo list, artifacts,
+              stats, context, git status, plan usage, linked conversations, and the stream,
+              worktree and machine rows at the bottom — in what order, and whether its sections
+              fold. Opens the panel's <strong>Customize</strong> view (also its header button).
+              A widget switched off gives its old place back (the header chip, the composer
+              chip, the todo bar).
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {!conversationSidePanel ? (
+                <> It needs the conversation panel, so turn that on first.</>
+              ) : !activeConvId ? (
+                <> Open a conversation first.</>
+              ) : null}
+            </>
+          }
+          control={
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.ghost}`}
+              disabled={!conversationSidePanel || !activeConvId}
+              onClick={() => {
+                if (!activeConvId) return;
+                // Into the conversation (which also closes Settings), its panel open, in its
+                // customize view.
+                useEditorStore.getState().setConvPanelOpen(true);
+                useSidePanelLayout.getState().setCustomizing(true);
+                openConversationAt(activeConvId, null);
+              }}
+            >
+              Customize…
+            </button>
+          }
         />
         <ToggleRow
           title="Message minimap"

@@ -56,6 +56,59 @@
   align-items: center;
   gap: 8px;
 }
+/* The fold target: lamp + title, a button only while the panel's sections fold. It takes the
+   free width so the badge and the chevron pack to the right. */
+.headToggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.headToggle:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+.foldChev {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-xlo);
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.foldChev :global(.wf-ico) {
+  width: 10px;
+  height: 10px;
+  transition: transform 0.2s var(--wf-ease-enter);
+}
+.head:hover .foldChev {
+  color: var(--wf-tx);
+}
+.deck[data-folded] .foldChev :global(.wf-ico) {
+  transform: rotate(-90deg);
+}
+/* Folded: the head alone, a slimmer well. */
+.deck[data-folded] {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
 .lamp {
   width: 7px;
   height: 7px;

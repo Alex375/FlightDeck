@@ -92,6 +92,14 @@ function reasonOf(d: ServerDiagnosis): string | null {
 
 interface MachineHealthState {
   byMachine: Record<string, MachineHealth>;
+  /** Machines with a probe in flight RIGHT NOW, whoever fired it (the ambient sweep, a live
+   *  trigger, a "Check now" button). A mirror of the module-private `inFlight` set, for the
+   *  UI only: a button that awaited its own `probeMachine` call would stop spinning at once
+   *  whenever its click landed on a probe already in flight (the dedup returns immediately),
+   *  while the round trip it is waiting on is still out. Read it with `useMachineProbing`.
+   *  ⚠️ `inFlight` stays the dedup authority — it is synchronous; a store update is not the
+   *  place to decide whether to dial. */
+  probing: Record<string, true>;
   /** Record a diagnosis — from the ambient poll, from the Settings server card, from
    *  anywhere that already paid for one. Every producer funnels through here so the
    *  badge can never disagree with the panel.
@@ -131,6 +139,7 @@ function isStaleProbe(machineId: string, startedAtMs: number | undefined): boole
 
 export const useMachineHealthStore = create<MachineHealthState>((set) => ({
   byMachine: {},
+  probing: {},
   record: (machineId, diagnosis, startedAtMs) => {
     if (isStaleProbe(machineId, startedAtMs)) return;
     appliedProbeStartMs.set(machineId, startedAtMs ?? Date.now());
@@ -192,6 +201,21 @@ export const useMachineHealthStore = create<MachineHealthState>((set) => ({
 /** `undefined` while nothing is known about this machine (or it is a local repo). */
 export const useMachineHealth = (machineId: string | null | undefined): MachineHealth | undefined =>
   useMachineHealthStore((s) => (machineId ? s.byMachine[machineId] : undefined));
+
+/** Whether a probe of this machine is in flight right now — whoever fired it. */
+export const useMachineProbing = (machineId: string | null | undefined): boolean =>
+  useMachineHealthStore((s) => (machineId ? s.probing[machineId] === true : false));
+
+/** Mirror the in-flight set into the store (see `MachineHealthState.probing`). */
+function setProbing(machineId: string, on: boolean): void {
+  useMachineHealthStore.setState((s) => {
+    if ((s.probing[machineId] === true) === on) return s;
+    const probing = { ...s.probing };
+    if (on) probing[machineId] = true;
+    else delete probing[machineId];
+    return { probing };
+  });
+}
 
 /** Every machine currently known to be out of reach. Stable identity while the set does
  *  not change, so a subscriber does not re-render on every probe that confirms health. */
@@ -285,6 +309,7 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
   const last = lastProbeAtMs.get(machineId) ?? 0;
   if (!force && Date.now() - last < PROBE_MIN_GAP_MS) return;
   inFlight.add(machineId);
+  setProbing(machineId, true);
   const startedAtMs = Date.now();
   lastProbeAtMs.set(machineId, startedAtMs);
   try {
@@ -300,13 +325,16 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
       .recordProbeError(machineId, e instanceof Error ? e.message : String(e), startedAtMs);
   } finally {
     inFlight.delete(machineId);
+    setProbing(machineId, false);
   }
 }
 
 /** Test seam — the module-level dedup state is deliberately not in the store (it is
- *  scheduling, not UI state), so a test needs a way to start clean. */
+ *  scheduling, not UI state), so a test needs a way to start clean. Clears its UI mirror
+ *  (`probing`) with it. */
 export function resetProbeStateForTests(): void {
   inFlight.clear();
   lastProbeAtMs.clear();
   appliedProbeStartMs.clear();
+  useMachineHealthStore.setState({ probing: {} });
 }

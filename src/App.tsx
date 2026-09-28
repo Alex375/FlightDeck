@@ -58,6 +58,7 @@ import { useNotifications } from "./store/notifications";
 import { useSettingsUi } from "./store/settingsUi";
 import { NavBtn, Win } from "./ui/kit";
 import { SystemTray } from "./ui/SystemTray";
+import { useWidgetOn } from "./store/sidePanelWidgetsStore";
 import { runAppAction } from "./ui/appActions";
 import {
   ACTION_BINDINGS,
@@ -105,6 +106,15 @@ export default function App() {
   // With the conversation side panel on, the header carries ACTIONS only: the task chip,
   // the worktree indicator and the stream control move into the panel.
   const sidePanel = useDisplay((s) => s.conversationSidePanel);
+  // …each only while its panel widget is shown: a widget switched off in the panel gives its
+  // header home back, so hiding it never makes the task, the worktree or the stream unreachable.
+  // (Hooks first, then the `&&`: a short-circuit would make the hook call conditional.)
+  const taskWidget = useWidgetOn("task");
+  const worktreeWidget = useWidgetOn("worktree");
+  const streamWidget = useWidgetOn("stream");
+  const taskInPanel = sidePanel && taskWidget;
+  const worktreeInPanel = sidePanel && worktreeWidget;
+  const streamInPanel = sidePanel && streamWidget;
   const titleBarMotion = useDisplay((s) => s.titleBarAnimations);
 
   // The IDE tab is conditional too, on its display preference alone (Settings → General →
@@ -328,7 +338,7 @@ export default function App() {
               {active ? <span className="wf-tb-sep" aria-hidden="true" /> : null}
               {/* Which TOSSE task this conversation carries. Only for a conversation
                   started from the tasks view; a click goes back to it. */}
-              {active && tosseAvailable && !sidePanel ? (
+              {active && tosseAvailable && !taskInPanel ? (
                 <TosseTaskChip
                   conv={active}
                   // Reads in the side panel rather than switching views: you are working IN
@@ -341,10 +351,10 @@ export default function App() {
                   }
                 />
               ) : null}
-              {active && !sidePanel ? (
+              {active && !worktreeInPanel ? (
                 <WorktreeIndicator conv={active} repoPath={activeRepo.path} />
               ) : null}
-              {active && !sidePanel ? <StreamControl key={active.id} conv={active} /> : null}
+              {active && !streamInPanel ? <StreamControl key={active.id} conv={active} /> : null}
               {active ? <EditorToggle convId={active.id} /> : null}
               {active ? <TerminalToggle /> : null}
               {active ? <GitToggle /> : null}

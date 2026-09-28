@@ -23,7 +23,7 @@ use crate::supervisor::control::PermissionDecision;
 use crate::supervisor::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, McpAuthResult,
     McpServerLive, NormalizedBlock, PermissionRequestPayload, RemoteControlState, SessionEmitter,
-    SessionStatePayload, TokenUsage,
+    SessionStatePayload, SessionUsage, TokenUsage,
 };
 use crate::supervisor::session::{InitialControls, SessionCommand, SessionError, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig, TransportError};
@@ -1018,6 +1018,15 @@ impl CodexCore {
                 // which keeps `input + cache_read` equal to the fill set just above.
                 if let Some(breakdown) = last.and_then(codex_token_usage) {
                     self.state.context_usage = Some(breakdown);
+                }
+                // What the THREAD has consumed over its whole life — the one figure this push
+                // carries that is a running total (see the ring above for why it is not the
+                // fill). Same mapping as `last`, cached input split out of the input. Replaced,
+                // never summed. ⚠️ This thread only: collab sub-agents run as their own threads,
+                // whose pushes the demux drops — the UI labels it « this thread ».
+                if let Some(total) = usage.and_then(|u| u.get("total")).and_then(codex_token_usage) {
+                    self.state.session_usage =
+                        Some(SessionUsage { total, cost_usd: None, per_model: Vec::new() });
                 }
                 self.push_state();
             }
@@ -2714,6 +2723,14 @@ mod tests {
             Some(42_000),
             "ring = last turn's input (current occupancy), NOT the 950k cumulative total"
         );
+        // …while the cumulative total is exactly what the session total reads, cached input
+        // split out of the input (900k of which 0 cached) and reasoning left inside the output.
+        let usage = st.session_usage.expect("the thread total is carried");
+        assert_eq!(
+            usage.total,
+            TokenUsage { input: 900_000, cache_creation: 0, cache_read: 0, output: 40_000 }
+        );
+        assert_eq!(usage.cost_usd, None, "Codex reports no cost");
     }
 
     #[test]

@@ -16,6 +16,7 @@ import type {
   PermissionDecision,
   PermissionRequestPayload,
   SessionStatePayload,
+  SessionUsage,
   TokenUsage,
   WorkflowJournal,
   WorkflowRun,
@@ -292,13 +293,61 @@ const CTX_DEMO =
 /** The capture fixture's last root call, broken down (see `context_usage`). */
 const DEMO_CONTEXT_USAGE: TokenUsage = { input: 5069, cache_creation: 9061, cache_read: 15626, output: 812 };
 
-/** What a demo turn consumed — scaled from the fixture, so totals across turns stay plausible. */
+/** Demo turns ended so far, and what their main loop consumed (see demoSessionUsage). */
+let demoTurns = 0;
+let demoMainSpend: TokenUsage = { input: 0, cache_creation: 0, cache_read: 0, output: 0 };
+
+/** What a demo turn consumed — scaled from the fixture, so totals across turns stay plausible.
+ *  Each call also adds the turn to the demo session's running spend (see demoSessionUsage):
+ *  every scripted `turn_result` is built through here, so the idle state that follows it
+ *  carries the grown total, exactly as the CLI's cumulative `modelUsage` rides the state
+ *  pushed after each `result`. */
 function demoTurnUsage(scale: number): TokenUsage {
-  return {
+  const u = {
     input: Math.round(5069 * scale),
     cache_creation: Math.round(9061 * scale * 0.4),
     cache_read: Math.round(15626 * scale * 2.2),
     output: Math.round(812 * scale),
+  };
+  demoTurns += 1;
+  demoMainSpend = {
+    input: demoMainSpend.input + u.input,
+    cache_creation: demoMainSpend.cache_creation + u.cache_creation,
+    cache_read: demoMainSpend.cache_read + u.cache_read,
+    output: demoMainSpend.output + u.output,
+  };
+  return u;
+}
+
+/**
+ * The demo session's cumulative, all-agent spend — the mock twin of `result.modelUsage`: the
+ * main loop's turns plus what sub-agents and helper calls spent on top (a real session's total
+ * is well above its main loop's, hence the multiplier), a helper Haiku among the models. `null`
+ * before the first demo turn ends, like a fresh session. `?ctx=nowindow` (a reloaded
+ * conversation) seeds it from "disk" instead: see {@link demoSessionUsageSeed}.
+ */
+function demoSessionUsage(): SessionUsage | null {
+  if (demoTurns === 0) return null;
+  const scale = (n: number) => Math.round(n * 2.6);
+  const opus: TokenUsage = {
+    input: scale(demoMainSpend.input),
+    cache_creation: scale(demoMainSpend.cache_creation),
+    cache_read: scale(demoMainSpend.cache_read) * 9,
+    output: scale(demoMainSpend.output),
+  };
+  const haiku: TokenUsage = { input: 514 * demoTurns, cache_creation: 0, cache_read: 0, output: 11 * demoTurns };
+  return {
+    total: {
+      input: opus.input + haiku.input,
+      cache_creation: opus.cache_creation,
+      cache_read: opus.cache_read,
+      output: opus.output + haiku.output,
+    },
+    cost_usd: 0.12 * demoTurns + 0.4,
+    per_model: [
+      { model: MODEL, usage: opus, cost_usd: 0.12 * demoTurns + 0.4 },
+      { model: "claude-haiku-4-5-20251001", usage: haiku, cost_usd: 0.0006 * demoTurns },
+    ],
   };
 }
 
@@ -329,7 +378,19 @@ const baseState: SessionStatePayload = {
   },
 };
 
-export const idleState = (): SessionStatePayload => ({ ...baseState });
+export const idleState = (): SessionStatePayload => ({ ...baseState, session_usage: demoSessionUsage() });
+
+/** What the mock seeds from "the transcript's last cost-state line" on load. Default: nothing
+ *  (the demo has no transcript). `?ctx=nowindow` reproduces a RELOADED conversation, which
+ *  shows the spend recorded at its last close until the next turn ends. */
+export const demoSessionUsageSeed = (): SessionUsage | null =>
+  CTX_DEMO === "nowindow"
+    ? {
+        total: { input: 48_210, cache_creation: 2_914_300, cache_read: 55_120_400, output: 412_900 },
+        cost_usd: 38.42,
+        per_model: [],
+      }
+    : null;
 
 /** What the mock seeds from "the transcript" on load. Default: nothing (the demo has no
  *  transcript). `?ctx=nowindow` reproduces a RELOADED conversation — the transcript

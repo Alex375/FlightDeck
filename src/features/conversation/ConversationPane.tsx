@@ -12,6 +12,7 @@ import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 import { useConvPanelShown } from "../editor/editorStore";
 import { ConversationSummaryLine } from "./ConversationSummaryLine";
@@ -83,6 +84,10 @@ export function ConversationPane({
   // summary line must stand in for it exactly as for a closed one.
   const panelOpen = useConvPanelShown();
   const inPanel = panelHost && sidePanelPref;
+  // The todo list lives in the panel only while its widget is shown there; switched off, the
+  // bar above the composer comes back.
+  const todosWidget = useWidgetOn("todos");
+  const todosInPanel = inPanel && todosWidget;
   return (
     <div
       ref={paneRef}
@@ -118,7 +123,7 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
-      {!inPanel ? (
+      {!todosInPanel ? (
         <TodoBar session={session} />
       ) : !panelOpen ? (
         <ConversationSummaryLine session={session} />

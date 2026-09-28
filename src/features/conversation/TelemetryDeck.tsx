@@ -1,4 +1,4 @@
-// The TELEMETRY deck: the side panel's opt-in instrument cluster (`conversationTelemetry`,
+// The TELEMETRY deck: the side panel's opt-in instrument cluster (its `telemetry` widget,
 // OFF by default) — millisecond clocks, needles, key figures, a streaming oscilloscope, a
 // per-second call histogram, the token mix, a counter per tool family, a board for the LONG calls
 // and a feed.
@@ -18,16 +18,18 @@
 //     stops once its minute has emptied. Under the OS "reduce motion" setting: 1 Hz, no easing.
 // Compact by design: the whole deck fits a 13-inch laptop's height with room to spare.
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useConversationStore, useRunStartedAt, useSessionState } from "../../store/conversationStore";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
 import { liveRunStart, settledRunMs } from "../../agent/runClock";
 import { motionAllowed } from "../../ui/motion";
+import { usePageVisible } from "../../ui/usePageVisible";
 import { Ico } from "../../ui/kit";
 import type { SessionEntry } from "../../store/types";
 import type { TokenUsage } from "../../ipc/client";
 import { fmtTokens } from "../../store/contextData";
 import { ContextUsageMenu } from "./ContextUsageMenu";
+import { useIsCodex } from "./ConvMark";
 import {
   closeBucket,
   deckStatus,
@@ -86,9 +88,10 @@ const SCOPE_SAMPLES = Math.round(15_000 / SCOPE_SAMPLE_MS);
 /** The frame loop's cap: plenty for a millisecond clock to read as running, half the work. */
 const FRAME_MS = 33;
 
-export function TelemetryDeck({ convId }: { convId: string }) {
+export function TelemetryDeck({ convId, onFold }: { convId: string; onFold?: () => void }) {
   const t = useTelemetry(convId);
   const state = useSessionState(convId);
+  const isCodex = useIsCodex(convId);
   const backgroundOps = useRunningTaskCount(convId);
   // TEXT streaming on the main thread — a thinking block streaming is "thinking", not output.
   const streaming = useConversationStore((s) => {
@@ -133,13 +136,11 @@ export function TelemetryDeck({ convId }: { convId: string }) {
       data-live={live || undefined}
       aria-label="Conversation telemetry"
     >
-      <div className={d.head}>
-        <span className={d.lamp} aria-hidden="true" />
-        <span className={d.title}>Telemetry</span>
+      <DeckHead onToggle={onFold} folded={false}>
         <span className={d.live} data-on={status.key !== "standby" || undefined}>
           Live
         </span>
-      </div>
+      </DeckHead>
 
       <div className={d.top}>
         <ContextGauge convId={convId} working={busy} />
@@ -153,13 +154,13 @@ export function TelemetryDeck({ convId }: { convId: string }) {
         </div>
       </div>
 
-      <Tokens call={state?.context_usage ?? null} session={t.tokens} />
+      <Tokens call={state?.context_usage ?? null} session={t.tokens} scope={t.tokensScope} codex={isCodex} />
 
       {/* The figures worth reading first, set larger than the rest. */}
       <dl className={d.kpis}>
         <div>
           <dt>Cost</dt>
-          <dd title="API-equivalent, as reported by the CLI">
+          <dd title="The whole session at API list prices, as the CLI estimates it — sub-agents included; not a bill on a plan">
             {t.costUsd == null ? "—" : `$${t.costUsd.toFixed(2)}`}
           </dd>
         </div>
@@ -284,16 +285,6 @@ interface LiveNodes {
   bindCanvas: (el: HTMLCanvasElement | null) => void;
 }
 
-/** Whether the page is visible — a hidden window draws nothing, so the loop has no reason to. */
-function usePageVisible(): boolean {
-  const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden);
-  useEffect(() => {
-    const on = () => setVisible(!document.hidden);
-    document.addEventListener("visibilitychange", on);
-    return () => document.removeEventListener("visibilitychange", on);
-  }, []);
-  return visible;
-}
 
 /**
  * The deck's single frame loop. Everything it reads per frame comes from `getState()` or from
@@ -646,13 +637,45 @@ function ContextGauge({ convId, working }: { convId: string; working: boolean })
   );
 }
 
+/** The second token row's label and hover text: what the figure it shows COVERS. The session
+ *  total (every agent) when known; else the main loop's turns this app watched finish — which
+ *  the row must not pass off as the session's. */
+function sessionRow(scope: Telemetry["tokensScope"], codex: boolean): { label: string; title: string } {
+  if (scope === "turns")
+    return {
+      label: "Turns",
+      title: "The main thread's turns that finished while this conversation was open — sub-agents not included",
+    };
+  if (codex)
+    return {
+      label: "Thread",
+      title: "Everything this Codex thread consumed — its sub-agents run as threads of their own, not counted here",
+    };
+  return {
+    label: "Session",
+    title: "Every model call of this session as the CLI counts it — main thread, sub-agents, workflow agents",
+  };
+}
+
 /**
  * The token mix, as two stacked bars sharing one legend: the LAST model call (its prompt — the
  * context fill the gauge shows, split into cached / being cached / fresh — then its reply) and
- * the SESSION (every turn that finished while the app watched, as the CLI totals them; Claude
- * only, so a Codex conversation reads "—" there rather than a made-up zero).
+ * the SESSION: the all-agent session total when known (Claude: every model call the CLI counted;
+ * Codex: this thread), else the main loop's turns this app watched finish (see `sessionRow`),
+ * else "—" rather than a made-up zero.
  */
-function Tokens({ call, session }: { call: TokenUsage | null; session: TokenUsage | null }) {
+function Tokens({
+  call,
+  session,
+  scope,
+  codex,
+}: {
+  call: TokenUsage | null;
+  session: TokenUsage | null;
+  scope: Telemetry["tokensScope"];
+  codex: boolean;
+}) {
+  const row = sessionRow(scope, codex);
   return (
     <div className={d.tokens}>
       <span className={d.kicker}>Tokens</span>
@@ -662,7 +685,7 @@ function Tokens({ call, session }: { call: TokenUsage | null; session: TokenUsag
         </span>
       ))}
       <TokenRow label="Call" title="The last model call: its prompt, then its reply" usage={call} />
-      <TokenRow label="Session" title="Every turn that finished while this conversation was open" usage={session} />
+      <TokenRow label={row.label} title={row.title} usage={session} />
     </div>
   );
 }
@@ -788,5 +811,72 @@ function Feed({ events }: { events: TelemetryEvent[] }) {
         </ol>
       )}
     </div>
+  );
+}
+
+// ---- Folding ----------------------------------------------------------------------------------
+
+/**
+ * The deck's head row — lamp, title, the caller's badge — and, when the panel's sections fold,
+ * the fold control: the title is the target (like every section header), a chevron at the end.
+ */
+function DeckHead({
+  onToggle,
+  folded,
+  children,
+}: {
+  onToggle?: () => void;
+  folded: boolean;
+  children?: ReactNode;
+}) {
+  const mark = (
+    <>
+      <span className={d.lamp} aria-hidden="true" />
+      <span className={d.title}>Telemetry</span>
+    </>
+  );
+  return (
+    <div className={d.head}>
+      {onToggle ? (
+        <button
+          type="button"
+          className={d.headToggle}
+          onClick={onToggle}
+          aria-expanded={!folded}
+          title={folded ? "Show the telemetry deck" : "Fold the telemetry deck"}
+        >
+          {mark}
+        </button>
+      ) : (
+        mark
+      )}
+      {children}
+      {onToggle ? (
+        <button type="button" className={d.foldChev} onClick={onToggle} aria-hidden="true" tabIndex={-1}>
+          <Ico name="chev" className="sm" />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The deck FOLDED to its head. ⚠️ None of the deck's machinery here — no telemetry derivation, no
+ * frame loop, no histogram tick: folded must cost what a section header costs. The lamp still
+ * tells the truth, from the one cheap signal there is — whether the agent is working or waiting.
+ */
+export function TelemetryDeckFolded({ convId, onUnfold }: { convId: string; onUnfold: () => void }) {
+  const state = useSessionState(convId);
+  const status: DeckStatusKey = state?.awaiting_permission
+    ? "permission"
+    : state?.retry
+      ? "retry"
+      : state?.busy
+        ? "thinking"
+        : "standby";
+  return (
+    <section className={d.deck} data-status={status} data-folded aria-label="Conversation telemetry (folded)">
+      <DeckHead onToggle={onUnfold} folded />
+    </section>
   );
 }

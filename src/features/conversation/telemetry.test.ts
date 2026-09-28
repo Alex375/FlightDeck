@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { JsonValue, NormalizedBlock } from "../../ipc/client";
+import type { JsonValue, NormalizedBlock, SessionStatePayload, SessionUsage } from "../../ipc/client";
 import type { SessionEntry } from "../../store/types";
 import {
   clearAllTelemetryCache,
@@ -82,6 +82,11 @@ function entryOf(
   } as unknown as SessionEntry;
 }
 
+/** The entry with a session total on its state (the rest of the state is irrelevant here). */
+function withSession(e: SessionEntry, usage: SessionUsage): SessionEntry {
+  return { ...e, state: { session_usage: usage } as unknown as SessionStatePayload };
+}
+
 describe("toolFamily", () => {
   it("sorts the agent's tools onto the six dials", () => {
     expect(toolFamily("Read")).toBe("read");
@@ -157,6 +162,29 @@ describe("selectTelemetry", () => {
     expect(selectTelemetry(e).filesTouched).toBe(3);
   });
 
+  it("adds no file for an edit that FAILED — it wrote nothing — but counts one still running", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Edit", { file_path: "/r/a.ts" }), // old_string not found
+            tuse("b", "Write", { file_path: "/r/b.ts" }), // denied
+            tuse("c", "Edit", { file_path: "/r/c.ts" }), // written
+            tuse("d", "Edit", { file_path: "/r/d.ts" }), // still running (no result yet)
+          ],
+        },
+      ],
+      { a: "x", b: "x", c: "ok" },
+      ["a", "b"],
+    );
+    const t = selectTelemetry(e);
+    expect(t.filesTouched).toBe(2);
+    // The failed calls still count as CALLS (and as errors) — only the file count ignores them.
+    expect(t.totalCalls).toBe(4);
+    expect(t.errors.edit).toBe(2);
+  });
+
   it("includes the work a SUB-AGENT did, flagged as such", () => {
     const e = entryOf(
       [
@@ -187,12 +215,25 @@ describe("selectTelemetry", () => {
     expect(t.events[1]).toMatchObject({ id: "c8", target: "f8.ts" });
   });
 
-  it("sums cost and model time only over the turns that reported them", () => {
-    const e = entryOf([], {}, [], [{ cost: 0.12, apiMs: 4000 }, { cost: null, apiMs: null }, { cost: 0.03, apiMs: 1500 }]);
+  it("takes the LATEST cost — the CLI's figure is cumulative — and sums per-turn model time", () => {
+    // Each result carries the running total: 0.12 after turn 1, 0.15 after turn 3. Summing
+    // them (the old bug) read 0.27 — the first turn counted twice.
+    const e = entryOf([], {}, [], [{ cost: 0.12, apiMs: 4000 }, { cost: null, apiMs: null }, { cost: 0.15, apiMs: 1500 }]);
     const t = selectTelemetry(e);
     expect(t.turns).toBe(3);
     expect(t.costUsd).toBeCloseTo(0.15);
+    // Model time IS per turn (the assembler turns the CLI's cumulative counter into deltas).
     expect(t.modelMs).toBe(5500);
+  });
+
+  it("averages the turns watched live, and knows nothing before one finished", () => {
+    expect(selectTelemetry(entryOf([], {}, [], [{ ms: null }])).meanTurnMs).toBeNull();
+    const e = entryOf([], {}, [], [{ ms: 10_000 }, { ms: 30_000 }, { ms: null }, { ms: 50_000 }]);
+    const t = selectTelemetry(e);
+    expect(t.meanTurnMs).toBe(30_000);
+    // Over the three turns that reported a duration, not the four that ended.
+    expect(t.turns).toBe(4);
+    expect(t.timedTurns).toBe(3);
   });
 
   it("sums tokens only over the turns that reported usage, and knows nothing without one", () => {
@@ -202,7 +243,79 @@ describe("selectTelemetry", () => {
       { usage: null }, // a turn the CLI reported without usage (or a Codex one)
       { usage: { input: 5, cache_creation: 0, cache_read: 3200, output: 60 } },
     ]);
-    expect(selectTelemetry(e).tokens).toEqual({ input: 15, cache_creation: 200, cache_read: 6200, output: 100 });
+    const t = selectTelemetry(e);
+    expect(t.tokens).toEqual({ input: 15, cache_creation: 200, cache_read: 6200, output: 100 });
+    expect(t.tokensScope).toBe("turns");
+  });
+
+  it("prefers the all-agent session total over the main-loop sum, never adding the two", () => {
+    const e = withSession(
+      entryOf([], {}, [], [
+        { cost: 0.5, usage: { input: 10, cache_creation: 200, cache_read: 3000, output: 40 } },
+      ]),
+      { total: { input: 900, cache_creation: 8000, cache_read: 90_000, output: 3000 }, cost_usd: 4.2, per_model: [] },
+    );
+    const t = selectTelemetry(e);
+    expect(t.tokens).toEqual({ input: 900, cache_creation: 8000, cache_read: 90_000, output: 3000 });
+    expect(t.tokensScope).toBe("session");
+    // Its cost is the session's too.
+    expect(t.costUsd).toBe(4.2);
+  });
+
+  it("shows a session total seeded from disk even before any call or turn", () => {
+    const t = selectTelemetry(
+      withSession(entryOf([]), {
+        total: { input: 1, cache_creation: 2, cache_read: 3, output: 4 },
+        cost_usd: null,
+        per_model: [],
+      }),
+    );
+    expect(t.tokens).toEqual({ input: 1, cache_creation: 2, cache_read: 3, output: 4 });
+    expect(t.costUsd).toBeNull();
+    expect(t.totalCalls).toBe(0);
+  });
+
+  it("counts sub-agents' calls and calls replayed from disk apart", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("ag", "Agent", {}), tuse("old", "Read", { file_path: "/r/a" })] },
+        { id: "s1", parent: "ag", blocks: [tuse("r1", "Read", {}), tuse("r2", "Bash", {})] },
+      ],
+      { ag: "done", old: "x", r1: "x", r2: "x" },
+      [],
+      [],
+      // Seen live: a frozen duration (finished) or a start stamp (running).
+      { durations: { ag: 5000, r1: 10 }, startedAt: { r2: 1 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.totalCalls).toBe(4);
+    expect(t.subCalls).toBe(2);
+    // `old` carries neither: replayed from the transcript.
+    expect(t.replayedCalls).toBe(1);
+  });
+
+  it("never takes a call that lost its stamp to a stream stop for a replayed one", () => {
+    // `run` was running when the stream went off: `clearState` dropped its start stamp and no
+    // result will ever come. It was seen live — not a sign the history was restored.
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("done", "Read", {}), tuse("run", "Bash", {})] }],
+      { done: "x" },
+      [],
+      [],
+      { durations: { done: 12 } },
+    );
+    expect(selectTelemetry(e).replayedCalls).toBe(0);
+  });
+
+  it("re-derives when only the session total moved, and keeps the object while it holds", () => {
+    clearAllTelemetryCache();
+    const base = entryOf([], {}, [], [{ ms: 1000 }]);
+    const u1 = { total: { input: 1, cache_creation: 0, cache_read: 0, output: 1 }, cost_usd: 0.1, per_model: [] };
+    const first = memoizedTelemetry("s", withSession(base, u1));
+    // A state push that kept the same session_usage reference changes nothing.
+    expect(memoizedTelemetry("s", withSession(base, u1))).toBe(first);
+    const u2 = { ...u1, total: { ...u1.total, output: 9 } };
+    expect(memoizedTelemetry("s", withSession(base, u2)).tokens?.output).toBe(9);
   });
 
   it("re-renders when only the token totals moved", () => {

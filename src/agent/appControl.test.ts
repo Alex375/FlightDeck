@@ -15,6 +15,7 @@ vi.mock("../ipc/client", () => {
       codexLoadHistory: vi.fn(() => ok([])),
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),
+      loadSessionUsage: vi.fn(() => ok(null)),
       pathExists: vi.fn(() => Promise.resolve(true)),
       readDir: vi.fn(() => ok([])),
       answerPermission: vi.fn(() => ok()),

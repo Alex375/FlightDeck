@@ -24,6 +24,7 @@ import type {
   JsonValue,
   PermissionRequestPayload,
   SessionStatePayload,
+  SessionUsage,
   TokenUsage,
 } from "../ipc/client";
 import type {
@@ -32,6 +33,7 @@ import type {
   NormalizedBlock,
   RoundMarker,
   SessionEntry,
+  SessionUsageSource,
   TimelineEntry,
   TodoItem,
   TodoSummary,
@@ -74,7 +76,76 @@ const connectingState: SessionStatePayload = {
   context_window: null,
   context_usage: null,
   rate_limit: null,
+  session_usage: null,
 };
+
+/**
+ * Two session totals that read the same — compared BY VALUE. The core re-emits the whole
+ * session state on many events (busy edges, activity, every root model call), and every push
+ * after the first `result` carries a freshly deserialized `session_usage` object: holding on to
+ * the SAME reference while the value is unchanged is what keeps every reader of it (the Stats
+ * widget, the memoised telemetry) from re-rendering per model call.
+ */
+export function sameSessionUsage(a: SessionUsage | null, b: SessionUsage | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const eq = (x: TokenUsage, y: TokenUsage) =>
+    x.input === y.input &&
+    x.cache_creation === y.cache_creation &&
+    x.cache_read === y.cache_read &&
+    x.output === y.output;
+  return (
+    eq(a.total, b.total) &&
+    a.cost_usd === b.cost_usd &&
+    a.per_model.length === b.per_model.length &&
+    a.per_model.every(
+      (m, i) =>
+        m.model === b.per_model[i].model &&
+        m.cost_usd === b.per_model[i].cost_usd &&
+        eq(m.usage, b.per_model[i].usage),
+    )
+  );
+}
+
+const usageSize = (u: SessionUsage) =>
+  u.total.input + u.total.cache_creation + u.total.cache_read + u.total.output;
+
+/**
+ * What a LIVE session total covers, given what the entry held before it (see
+ * {@link SessionUsageSource}). The first live snapshot after a disk seed tells whether the CLI
+ * carried the recorded spend over on resume: at least the seed → it did, the figure covers the
+ * whole session; below it → it restarted from zero, the figure only covers the time since the
+ * session was reopened. With no record on disk at all (`missing`), the CLI had nothing to carry
+ * over either. Once `reopened`, it stays so until the next reseed — later snapshots grow from
+ * the same restarted count.
+ */
+export function liveUsageSource(
+  prev: SessionUsageSource,
+  held: SessionUsage | null,
+  incoming: SessionUsage,
+): Exclude<SessionUsageSource, "disk" | "missing" | null> {
+  if (prev === "reopened" || prev === "missing") return "reopened";
+  if (prev === "disk" && held && usageSize(incoming) < usageSize(held)) return "reopened";
+  return "live";
+}
+
+/**
+ * What a held session total covers once its PROCESS is gone (it ended on its own, or the stream
+ * was turned off): a `live` figure becomes « as of the last close » (`disk`) — which is also
+ * what the process wrote to disk as it exited — so that the NEXT process's first snapshot is
+ * checked against it by {@link liveUsageSource}.
+ *
+ * ⚠️ Load-bearing: a message sent to a stopped conversation respawns it WITHOUT re-reading the
+ * transcript (no reseed). If the old process died without writing its `cost-state` (a crash, a
+ * SIGKILL), the CLI restarts its count from zero; left `live`, that lower figure would still
+ * read « every agent, this session ». `reopened` stays as is (the restarted count carries on).
+ */
+export function closedUsageSource(
+  source: SessionUsageSource,
+  held: SessionUsage | null,
+): SessionUsageSource {
+  return source === "live" && held ? "disk" : source;
+}
 
 function emptyEntry(session: string): SessionEntry {
   return {
@@ -108,6 +179,7 @@ function emptyEntry(session: string): SessionEntry {
     thinkingDurations: {},
     toolStartedAt: {},
     toolDurations: {},
+    sessionUsageSource: null,
   };
 }
 
@@ -174,6 +246,21 @@ interface ConversationState {
       context_window: number | null;
       context_usage: TokenUsage | null;
     },
+  ) => void;
+  /** Seed the session total (`state.session_usage`) from disk on open or stream-(re)start —
+   *  the transcript's last `cost-state` line (Claude) / the rollout's last token count (Codex),
+   *  read by `commands.loadSessionUsage`. Never clobbers a LIVE value: a snapshot from the
+   *  running process is always fresher.
+   *
+   *  `null` = disk holds no record. On CLAUDE that means the spend went unrecorded (the process
+   *  was killed, an older CLI): the total is unknown, and the next live snapshot only covers the
+   *  reopened session (`missing` → `reopened`). On CODEX a rollout without a token count is a
+   *  thread that never finished a model call — nothing was spent before, so a null seed changes
+   *  nothing and the first live total covers the whole thread. */
+  applySessionUsageSeed: (
+    session: string,
+    usage: SessionUsage | null,
+    backend?: "claude" | "codex",
   ) => void;
   /** Reset a session's live state to neutral (idle, not busy/ended) WITHOUT
    *  touching its timeline. Used when the stream is turned off: the terminal
@@ -368,6 +455,20 @@ export const useConversationStore = create<ConversationState>((set) => {
         // process that ENDED can leave nothing of any run running.
         let runClock = runBusy(entry.runClock, state.busy, Date.now());
         if (state.ended && !entry.state.ended) runClock = runEndAll(runClock, Date.now());
+        // The session total: carried forward like the meter (a fresh process reports none
+        // until its first `result`, and must not wipe the disk seed meanwhile), and kept by
+        // REFERENCE while its value is unchanged (see sameSessionUsage).
+        const held = entry.state.session_usage ?? null;
+        const incoming = state.session_usage ?? null;
+        let sessionUsage = held;
+        let sessionUsageSource = entry.sessionUsageSource;
+        if (incoming) {
+          sessionUsageSource = liveUsageSource(entry.sessionUsageSource, held, incoming);
+          if (!sameSessionUsage(held, incoming)) sessionUsage = incoming;
+        }
+        // The process is gone: its total now dates from its close (see closedUsageSource). On
+        // every `ended` push, not just the edge — a repeat would otherwise flip it back to live.
+        if (state.ended) sessionUsageSource = closedUsageSource(sessionUsageSource, sessionUsage);
         return {
           ...entry,
           turnStartedAt,
@@ -377,11 +478,13 @@ export const useConversationStore = create<ConversationState>((set) => {
           awaitingSince,
           turnCount,
           thinkingStartedAt,
+          sessionUsageSource,
           state: {
             ...state,
             context_tokens: state.context_tokens ?? entry.state.context_tokens,
             context_window: state.context_window ?? entry.state.context_window,
             rate_limit: state.rate_limit ?? entry.state.rate_limit,
+            session_usage: sessionUsage,
           },
         };
       }),
@@ -402,6 +505,21 @@ export const useConversationStore = create<ConversationState>((set) => {
         };
       }),
 
+    applySessionUsageSeed: (session, usage, backend = "claude") =>
+      withEntry(session, (entry) => {
+        const src = entry.sessionUsageSource;
+        // A live snapshot is fresher than anything on disk: leave it (and what it covers).
+        if (src === "live" || src === "reopened" || (src === null && entry.state.session_usage))
+          return entry;
+        if (!usage && backend === "codex") return entry;
+        if (!usage)
+          return src === "missing" && !entry.state.session_usage
+            ? entry
+            : { ...entry, sessionUsageSource: "missing", state: { ...entry.state, session_usage: null } };
+        if (src === "disk" && sameSessionUsage(entry.state.session_usage ?? null, usage)) return entry;
+        return { ...entry, sessionUsageSource: "disk", state: { ...entry.state, session_usage: usage } };
+      }),
+
     clearState: (session) =>
       // Also drop any "en attente" badge: the session is being turned off, so the
       // queued message will never be picked up — no message_started/turn_result will
@@ -410,7 +528,11 @@ export const useConversationStore = create<ConversationState>((set) => {
       withEntry(session, (entry) =>
         clearQueuedBadges({
           ...entry,
-          state: { ...connectingState },
+          // The session total survives the stream going off: what was spent stays spent (the
+          // process writes that same figure to disk as it exits) — now « as of the last
+          // close », so the next process's first snapshot is checked against it.
+          state: { ...connectingState, session_usage: entry.state.session_usage ?? null },
+          sessionUsageSource: closedUsageSource(entry.sessionUsageSource, entry.state.session_usage ?? null),
           turnStartedAt: null,
           // The process is going away with everything it was running.
           runClock: runEndAll(entry.runClock, Date.now()),

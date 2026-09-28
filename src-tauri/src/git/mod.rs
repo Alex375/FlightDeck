@@ -483,7 +483,10 @@ fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeInfo> {
 /// Status of a single worktree: dirtiness (from `git status --porcelain`) and
 /// the ahead/behind count against the branch's upstream (`None` when unset).
 pub fn worktree_status(worktree_path: &str) -> Result<WorktreeStatus, GitError> {
-    let porcelain = run_git(worktree_path, &["status", "--porcelain"])?;
+    // ⚠️ `--no-optional-locks` (top-level, before the subcommand): a read-only status must
+    // not take `.git/index.lock` from under the agent's own `git add` / `git commit` — see
+    // `status::STATUS_ARGS`.
+    let porcelain = run_git(worktree_path, &["--no-optional-locks", "status", "--porcelain"])?;
     let mut status = WorktreeStatus::default();
     for line in porcelain.lines() {
         if line.is_empty() {

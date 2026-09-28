@@ -50,6 +50,16 @@ async claudeAvailable() : Promise<boolean> {
     return await TAURI_INVOKE("claude_available");
 },
 /**
+ * This Mac's name as the user knows it — the "Computer Name" of System Settings → General →
+ * Sharing (`scutil --get ComputerName`, e.g. « MacBook Pro d'Alexandre »), else the host name.
+ * For the conversation side panel's Machine row, which says WHERE a local conversation runs.
+ * Read once per app run (a machine is not renamed under a running app often enough to poll),
+ * off the main thread. `None` only when neither can be read — the row then says « This Mac ».
+ */
+async localMachineName() : Promise<string | null> {
+    return await TAURI_INVOKE("local_machine_name");
+},
+/**
  * Whether a usable `codex` binary is installed on this machine. Gates the Codex
  * backend selector in the UI so "new Codex conversation" is only offered when the
  * CLI is present. Cheap: a `PATH` / well-known-location file check, never a spawn.
@@ -943,6 +953,22 @@ async loadSessionHistory(sessionId: string) : Promise<Result<ConversationItem[],
 async loadSessionContext(sessionId: string) : Promise<Result<ContextFill, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_session_context", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a conversation's cumulative token spend from disk — the seed of the side panel's
+ * session total on open / stream (re)start, before the first live snapshot. Claude: the
+ * transcript's last `cost-state` line (every agent, as of the process's last close). Codex: the
+ * rollout's last `token_count` total (this thread only). `None` when disk holds no such record
+ * (a killed process, a remote conversation whose transcript is on its server): unknown, which
+ * the UI reads as unknown — never zero. A tail read, off the async runtime.
+ */
+async loadSessionUsage(sessionId: string, backend: Backend) : Promise<Result<SessionUsage | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_session_usage", { sessionId, backend }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4064,13 +4090,21 @@ head: string | null;
  */
 upstream: string | null; 
 /**
- * Commits ahead of upstream.
+ * Commits ahead of upstream. ⚠️ Also `0` when there is NO upstream or it is GONE:
+ * read it only when `upstream` is set and `upstream_gone` is false.
  */
 ahead: number; 
 /**
- * Commits behind upstream.
+ * Commits behind upstream. Same caveat as `ahead`.
  */
 behind: number; 
+/**
+ * An upstream is configured but its commit is missing — typically the remote branch
+ * was deleted and pruned. git then prints `branch.upstream` WITHOUT `branch.ab`, so
+ * `ahead`/`behind` are not counts but the struct's defaults: without this flag a gone
+ * upstream reads as a fake "in sync" 0/0.
+ */
+upstream_gone: boolean; 
 /**
  * The branch has no commits yet (unborn HEAD).
  */
@@ -4577,6 +4611,18 @@ read_only: boolean | null;
  * `annotations.destructive` — the tool claims it may change or delete data.
  */
 destructive: boolean | null }
+/**
+ * One model's share of a [`SessionUsage`].
+ */
+export type ModelTokenUsage = { 
+/**
+ * The model id as the CLI keys it (it may carry a `[1m]` suffix).
+ */
+model: string; usage: TokenUsage; 
+/**
+ * This model's share of the cost estimate (`costUSD`), when reported.
+ */
+cost_usd: number | null }
 /**
  * One authoritative content block of an assistant message.
  */
@@ -5385,7 +5431,18 @@ context_window: number | null;
  * the CLI emits one. NOTE: the stream only carries status + reset, NOT a usage
  * percentage — that lives behind the `/api/oauth/usage` endpoint (separate task).
  */
-rate_limit: RateLimitSnapshot | null }
+rate_limit: RateLimitSnapshot | null; 
+/**
+ * What the WHOLE session has consumed so far, every agent included — see
+ * [`SessionUsage`]. Claude: the latest `result.modelUsage` (a cumulative snapshot the CLI
+ * re-sends in full at each turn end). Codex: the latest `thread/tokenUsage/updated`
+ * `total` (this thread only). `None` until the first of those arrives; once known it is
+ * REPLACED by each newer snapshot, never summed with it.
+ * 
+ * `serde(default)` keeps it OPTIONAL on the TypeScript side (`session_usage?:`), so the
+ * hand-written state literals of older tests and mocks stay valid without it.
+ */
+session_usage?: SessionUsage | null }
 /**
  * A model-generated few-word summary of the user's LAST message arrived (from a
  * `generate_session_title` control response — same wire as the title, a distinct
@@ -5410,6 +5467,42 @@ export type SessionTaskEvent = { session: string; task: BackgroundTask }
  * fresher title.
  */
 export type SessionTitleEvent = { session: string; title: string; seq: number }
+/**
+ * A session's CUMULATIVE token spend, as the CLI itself counts it.
+ * 
+ * ⚠️ ONE snapshot, never a sum. On Claude it is `result.modelUsage` summed over its models:
+ * every model call the CLI's query pipeline made — the main loop, `Task` sub-agents at every
+ * depth, sidechains, compaction and Workflow agents (the binary's own schema text), the
+ * permission classifier excepted. Each `result` carries the running total, so the latest
+ * one REPLACES the previous: adding results would count turn 1 N times. `result.usage` (the
+ * main loop's turn only) and every per-agent "tokens" figure of the wire (`task_notification`,
+ * `<subagent_tokens>`, a workflow manifest's `totalTokens`) are SUBSETS or a different unit
+ * (an agent's last call ≈ its final context size) — none of them may ever be added to this.
+ * 
+ * Claude restores it on `--resume` from the transcript's last `cost-state` line (written when
+ * the process exits), which is also what [`super::history::load_session_usage`] reads to seed
+ * a reopened conversation. A mid-session `/clear` resets it: the value can go DOWN.
+ * 
+ * Codex: the thread's lifetime `tokenUsage.total` — collab sub-agents run as SEPARATE threads
+ * and are NOT in it; no cost, no per-model split.
+ */
+export type SessionUsage = { 
+/**
+ * Every model's usage added up. `thinkingTokens` is already INSIDE `output` (never added
+ * again); on Codex the cached input is inside the input, split out as `cache_read`.
+ */
+total: TokenUsage; 
+/**
+ * The CLI's cost ESTIMATE for the same calls at API list prices (`result.total_cost_usd`
+ * live, `totalCostUSD` on disk) — cumulative like the tokens, and not a bill on a plan.
+ * `None` when the CLI reports none (Codex never does).
+ */
+cost_usd: number | null; 
+/**
+ * The same total split per model (a helper Haiku next to the conversation's Opus…),
+ * largest first. Empty on Codex, which reports the thread as a whole.
+ */
+per_model: ModelTokenUsage[] }
 /**
  * One skill available to a repository (file-based or plugin-provided).
  */
