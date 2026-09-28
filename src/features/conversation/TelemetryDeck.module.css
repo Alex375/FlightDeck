@@ -200,14 +200,24 @@
   min-width: 0;
 }
 .clock {
-  font-size: 24px;
+  font-size: 19px;
   line-height: 1;
   color: var(--wf-tx-lo);
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
 }
-.clock[data-live] {
+.deck[data-live] .clock {
   color: var(--wf-tx-hi);
+}
+/* How long the agent has been in its current state (this call, this thinking spell…). */
+.stateTimer {
+  font-size: 11px;
+  color: var(--lamp);
+  font-variant-numeric: tabular-nums;
+}
+.deck[data-status="standby"] .stateTimer {
+  color: var(--wf-tx-xlo);
 }
 .status {
   font-size: 10px;
@@ -220,6 +230,206 @@
 }
 .deck[data-status="standby"] .status {
   color: var(--wf-tx-lo);
+}
+
+/* ---- Live gauges ------------------------------------------------------------------------------ */
+
+/* Four small dials whose needles the frame loop turns directly (no CSS transition: the loop
+   eases them itself, frame by frame, towards a real reading). */
+.gauges {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.mini {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  min-width: 0;
+  padding: 6px 4px 5px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--wf-panel) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wf-line) 80%, transparent);
+}
+.mini svg {
+  width: 100%;
+  max-width: 64px;
+  height: auto;
+  overflow: visible;
+}
+.mTrack {
+  fill: none;
+  stroke: var(--wf-panel-3);
+  stroke-width: 5;
+}
+.mTicks {
+  fill: none;
+  stroke: var(--wf-tx-xlo);
+  stroke-width: 1.2;
+  stroke-linecap: round;
+}
+.mNeedle {
+  transform-box: view-box;
+  transform-origin: 50px 52px;
+}
+.mNeedle path {
+  stroke: var(--wf-tx-hi);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.mini[data-gauge="tps"] .mNeedle path {
+  stroke: var(--wf-wait);
+}
+.mini[data-gauge="load"] .mNeedle path {
+  stroke: var(--wf-att);
+}
+.mHub {
+  fill: var(--wf-tx-hi);
+}
+.mValue {
+  margin-top: -2px;
+  font-size: 13px;
+  line-height: 1.1;
+  color: var(--wf-tx-hi);
+  font-variant-numeric: tabular-nums;
+}
+.mLabel {
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+}
+
+/* ---- Oscilloscope ----------------------------------------------------------------------------- */
+
+.scope {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.scopeHead {
+  display: flex;
+  align-items: baseline;
+}
+.scopeMeta {
+  margin-left: auto;
+  font-size: 9.5px;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
+.scopeCanvas {
+  display: block;
+  width: 100%;
+  height: 44px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--wf-panel) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wf-line) 80%, transparent);
+  /* Read by the canvas painter (drawScope): the trace and its grid follow the theme. */
+  --trace: var(--wf-wait);
+  --grid: rgba(255, 255, 255, 0.05);
+}
+
+/* ---- In flight -------------------------------------------------------------------------------- */
+
+.flight {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.flightHead {
+  display: flex;
+  align-items: baseline;
+}
+.flightMeta {
+  margin-left: auto;
+  font-size: 9.5px;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
+.deck[data-live] .flightMeta {
+  color: var(--wf-wait);
+}
+.flightEmpty {
+  font-size: 10.5px;
+  color: var(--wf-tx-xlo);
+}
+.flightList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.flightRow {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  grid-template-rows: auto 3px;
+  column-gap: 7px;
+  row-gap: 3px;
+  align-items: center;
+  font-size: 10.5px;
+  --fam: var(--wf-tx);
+}
+.deck[data-motion] .flightRow {
+  animation: slideIn 0.28s ease-out;
+}
+.flightTarget {
+  min-width: 0;
+  color: var(--wf-tx-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.flightTimer {
+  color: var(--wf-tx-hi);
+  font-variant-numeric: tabular-nums;
+}
+/* The latency bar: the family's median sits at a third (the tick), a stall fills it. */
+.flightTrack {
+  grid-column: 1 / -1;
+  position: relative;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--wf-panel-3);
+  overflow: hidden;
+}
+.flightTrack::after {
+  content: "";
+  position: absolute;
+  left: 33.333%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--wf-tx-lo);
+}
+.flightBar {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--wf-run);
+}
+.flightBar[data-level="slow"] {
+  background: var(--wf-att);
+}
+.flightBar[data-level="stalled"] {
+  background: var(--wf-err);
+}
+/* No finished call of this kind to compare with: no verdict — a quiet moving stripe that only
+   says "running", never a fake fill. The width is forced because the loop writes `fill` (0). */
+.flightBar[data-level="unknown"] {
+  width: 100% !important;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0 6px,
+    color-mix(in srgb, var(--wf-wait) 45%, transparent) 6px 12px
+  );
+  background-size: 24px 100%;
+}
+.deck[data-motion] .flightBar[data-level="unknown"] {
+  animation: stripe 0.6s linear infinite;
 }
 
 /* ---- Tool dials ----------------------------------------------------------------------------- */
@@ -350,7 +560,7 @@
 .stats {
   margin: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px 6px;
   padding: 8px 0 2px;
   border-top: 1px dashed var(--wf-line);
@@ -443,6 +653,12 @@
   letter-spacing: 0.08em;
   color: var(--wf-tx-lo);
 }
+.feedDur {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
 .feedState {
   flex: 0 0 12px;
   display: inline-flex;
@@ -532,6 +748,11 @@
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+@keyframes stripe {
+  to {
+    background-position: 24px 0;
   }
 }
 

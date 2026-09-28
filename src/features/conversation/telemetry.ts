@@ -80,6 +80,12 @@ export interface TelemetryEvent {
   status: "running" | "ok" | "error";
   /** Called by a sub-agent rather than the conversation's own agent. */
   sub: boolean;
+  /** When the call started (`Date.now()`), stamped by the store as the tool_use arrived — or
+   *  null for a call replayed from disk, which carries no wall-clock time. */
+  startedAt: number | null;
+  /** How long it took (tool_use → tool_result), frozen when its result landed; null while it
+   *  runs and for a replayed call. */
+  durationMs: number | null;
 }
 
 export interface Telemetry {
@@ -101,6 +107,15 @@ export interface Telemetry {
   subAgents: number;
   /** The last few calls, NEWEST FIRST. */
   events: TelemetryEvent[];
+  /** Calls running RIGHT NOW with a live start stamp, OLDEST first — what the in-flight board
+   *  times. A call without a stamp (replayed from disk, its session gone) has nothing to time
+   *  and is left out rather than shown counting from an invented zero. */
+  inFlight: TelemetryEvent[];
+  /** The median measured duration of each family's calls in this conversation, or null
+   *  until one of them finished live — the baseline an in-flight call is compared against. */
+  familyMedianMs: Record<ToolFamily, number | null>;
+  /** The median length of this conversation's completed turns, or null before the first. */
+  medianTurnMs: number | null;
 }
 
 /** How many calls the feed keeps. */
@@ -122,7 +137,18 @@ const EMPTY: Telemetry = {
   modelMs: null,
   subAgents: 0,
   events: [],
+  inFlight: [],
+  familyMedianMs: { read: null, edit: null, shell: null, search: null, agent: null, web: null, other: null },
+  medianTurnMs: null,
 };
+
+/** The median of a list, or null when it is empty. */
+export function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
 
 function asObject(v: JsonValue): Record<string, JsonValue> {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, JsonValue>) : {};
@@ -159,6 +185,10 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
   const errors = zeroCounts();
   const files = new Set<string>();
   const events: TelemetryEvent[] = [];
+  const inFlight: TelemetryEvent[] = [];
+  const durationsByFamily: Record<ToolFamily, number[]> = {
+    read: [], edit: [], shell: [], search: [], agent: [], web: [], other: [],
+  };
   let totalCalls = 0;
   let subAgents = 0;
 
@@ -174,24 +204,32 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
       if (status === "error") errors[family] += 1;
       if (b.name === "Agent" || b.name === "Task") subAgents += 1;
       if (family === "edit") for (const p of editedPaths(b.name, b.input)) files.add(p);
-      events.push({
+      const durationMs = entry.toolDurations[b.id] ?? null;
+      if (durationMs != null) durationsByFamily[family].push(durationMs);
+      const event: TelemetryEvent = {
         id: b.id,
         family,
         tool: b.name,
         target: eventTarget(b.name, b.input),
         status,
         sub: turn.parentToolUseId !== null,
-      });
+        startedAt: entry.toolStartedAt[b.id] ?? null,
+        durationMs,
+      };
+      events.push(event);
+      if (status === "running" && event.startedAt != null) inFlight.push(event);
     }
   }
 
   let turns = 0;
   let cost: number | null = null;
   let modelMs: number | null = null;
+  const turnMs: number[] = [];
   for (const r of Object.values(entry.turnResults)) {
     turns += 1;
     if (r.totalCostUsd != null) cost = (cost ?? 0) + r.totalCostUsd;
     if (r.durationApiMs != null) modelMs = (modelMs ?? 0) + r.durationApiMs;
+    if (r.durationMs != null) turnMs.push(r.durationMs);
   }
 
   if (totalCalls === 0 && turns === 0) return EMPTY;
@@ -205,6 +243,17 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
     modelMs,
     subAgents,
     events: events.slice(-TELEMETRY_FEED_SIZE).reverse(),
+    inFlight,
+    familyMedianMs: {
+      read: median(durationsByFamily.read),
+      edit: median(durationsByFamily.edit),
+      shell: median(durationsByFamily.shell),
+      search: median(durationsByFamily.search),
+      agent: median(durationsByFamily.agent),
+      web: median(durationsByFamily.web),
+      other: median(durationsByFamily.other),
+    },
+    medianTurnMs: median(turnMs),
   };
 }
 
@@ -214,7 +263,9 @@ function telemetrySig(t: Telemetry): string {
   return (
     FAMILIES.map((f) => `${t.counts[f]}.${t.errors[f]}`).join(",") +
     `|${t.filesTouched}|${t.turns}|${t.costUsd ?? ""}|${t.modelMs ?? ""}|${t.subAgents}|` +
-    t.events.map((e) => `${e.id}:${e.status}`).join(",")
+    t.events.map((e) => `${e.id}:${e.status}:${e.durationMs ?? ""}`).join(",") +
+    `|${t.inFlight.map((e) => `${e.id}@${e.startedAt}`).join(",")}` +
+    `|${FAMILIES.map((f) => t.familyMedianMs[f] ?? "").join(",")}|${t.medianTurnMs ?? ""}`
   );
 }
 
@@ -225,6 +276,7 @@ const cache = new Map<
     toolResults: SessionEntry["toolResults"];
     subThreads: SessionEntry["subThreads"];
     turnResults: SessionEntry["turnResults"];
+    toolStartedAt: SessionEntry["toolStartedAt"];
     sig: string;
     result: Telemetry;
   }
@@ -233,8 +285,9 @@ const cache = new Map<
 /**
  * `selectTelemetry` memoised per session. Keyed on the references that move when a call can
  * appear or settle — the timeline (a main-thread turn settled), the sub-threads (a sub-agent
- * turn arrived), the tool results (a call finished) and the turn results (a turn ended) — and
- * NOT on `turns`, which is replaced on every streamed token. Ref-stable across recomputes that
+ * turn arrived), the tool start stamps (a call began), the tool results (a call finished, its
+ * duration frozen in the same update) and the turn results (a turn ended) — and NOT on
+ * `turns`, which is replaced on every streamed token. Ref-stable across recomputes that
  * change nothing, via the signature.
  */
 export function memoizedTelemetry(session: string, entry: SessionEntry | undefined): Telemetry {
@@ -245,7 +298,8 @@ export function memoizedTelemetry(session: string, entry: SessionEntry | undefin
     cached.timeline === entry.timeline &&
     cached.toolResults === entry.toolResults &&
     cached.subThreads === entry.subThreads &&
-    cached.turnResults === entry.turnResults
+    cached.turnResults === entry.turnResults &&
+    cached.toolStartedAt === entry.toolStartedAt
   ) {
     return cached.result;
   }
@@ -257,6 +311,7 @@ export function memoizedTelemetry(session: string, entry: SessionEntry | undefin
     toolResults: entry.toolResults,
     subThreads: entry.subThreads,
     turnResults: entry.turnResults,
+    toolStartedAt: entry.toolStartedAt,
     sig,
     result: kept,
   });
@@ -280,9 +335,10 @@ export function useTelemetry(session: string): Telemetry {
 
 // ---- Activity histogram ---------------------------------------------------------------
 
-/** Width of one histogram bucket, and how many the deck shows (2 minutes). */
-export const HISTOGRAM_BUCKET_MS = 5_000;
-export const HISTOGRAM_BUCKETS = 24;
+/** Width of one histogram bucket, and how many the deck shows: one bar a second over the last
+ *  minute — fine enough that a burst of calls reads as a burst, and the chart visibly moves. */
+export const HISTOGRAM_BUCKET_MS = 1_000;
+export const HISTOGRAM_BUCKETS = 60;
 
 /**
  * Close the live bucket: shift the window one step left and start a fresh bucket. Pure — the
@@ -332,24 +388,44 @@ function shortToolName(name: string): string {
 }
 
 /**
+ * The calls to show as RUNNING: those with a live start stamp — but only while the session is
+ * demonstrably doing something (a turn, background work, text streaming).
+ *
+ * ⚠️ A session that dies mid-call never delivers that call's result, so its stamp would stay
+ * "in flight" forever: a timer counting up for good, and a deck that never settles (its frame
+ * loop runs while anything is in flight). No activity, nothing in flight.
+ */
+export function liveInFlight(
+  inFlight: TelemetryEvent[],
+  s: { busy: boolean; backgroundOps: number; streaming: boolean },
+): TelemetryEvent[] {
+  return s.busy || s.backgroundOps > 0 || s.streaming ? inFlight : NO_EVENTS;
+}
+const NO_EVENTS: TelemetryEvent[] = [];
+
+/**
  * The one line the lamp reads — in priority order, since several can hold at once: a question
  * waiting on the USER beats everything (the agent is stopped until it is answered), a retry
  * beats the work it interrupts, and among the work the most specific signal wins (a named tool
  * running, then text streaming, then the silent "thinking" in between).
+ *
+ * A running tool and streaming text are FACTS, read as such even when the session has not (yet)
+ * reported itself busy; `runningTool` must come through {@link liveInFlight}, which is what
+ * keeps a dead session's orphan call from being named here.
  */
 export function deckStatus(s: {
   busy: boolean;
   awaitingPermission: boolean;
   retrying: boolean;
-  /** The newest call still waiting for its result, if any. */
+  /** The newest call still running (through {@link liveInFlight}), if any. */
   runningTool: string | null;
   streaming: boolean;
   backgroundOps: number;
 }): DeckStatus {
   if (s.awaitingPermission) return { key: "permission", label: "Awaiting permission" };
   if (s.retrying) return { key: "retry", label: "Retrying" };
-  if (s.busy && s.runningTool) return { key: "tool", label: `Running ${shortToolName(s.runningTool)}` };
-  if (s.busy && s.streaming) return { key: "streaming", label: "Streaming" };
+  if (s.runningTool) return { key: "tool", label: `Running ${shortToolName(s.runningTool)}` };
+  if (s.streaming) return { key: "streaming", label: "Streaming" };
   if (s.busy) return { key: "thinking", label: "Thinking" };
   if (s.backgroundOps > 0) return { key: "background", label: "Background ops" };
   return { key: "standby", label: "Standby" };

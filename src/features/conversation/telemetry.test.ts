@@ -9,6 +9,7 @@ import {
   fmtSpan,
   HISTOGRAM_BUCKETS,
   histogramArrivals,
+  liveInFlight,
   memoizedTelemetry,
   selectTelemetry,
   TELEMETRY_FEED_SIZE,
@@ -25,7 +26,8 @@ function entryOf(
   turns: Array<{ id: string; parent?: string | null; blocks: NormalizedBlock[] }>,
   results: Record<string, JsonValue> = {},
   errored: string[] = [],
-  turnResults: Array<{ cost?: number | null; apiMs?: number | null }> = [],
+  turnResults: Array<{ cost?: number | null; apiMs?: number | null; ms?: number | null }> = [],
+  stamps: { startedAt?: Record<string, number>; durations?: Record<string, number> } = {},
 ): SessionEntry {
   const turnMap: Record<string, unknown> = {};
   const timeline: Array<{ kind: "turn"; id: string }> = [];
@@ -55,12 +57,20 @@ function entryOf(
       apiErrorStatus: null,
       totalCostUsd: r.cost ?? null,
       numTurns: 1,
-      durationMs: null,
+      durationMs: r.ms ?? null,
       durationApiMs: r.apiMs ?? null,
       ttftMs: null,
     };
   });
-  return { timeline, turns: turnMap, toolResults, subThreads: {}, turnResults: tr } as unknown as SessionEntry;
+  return {
+    timeline,
+    turns: turnMap,
+    toolResults,
+    subThreads: {},
+    turnResults: tr,
+    toolStartedAt: stamps.startedAt ?? {},
+    toolDurations: stamps.durations ?? {},
+  } as unknown as SessionEntry;
 }
 
 describe("toolFamily", () => {
@@ -177,6 +187,61 @@ describe("selectTelemetry", () => {
   });
 });
 
+describe("live timing", () => {
+  it("lists only calls running WITH a live stamp as in flight, oldest first", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Bash", { command: "sleep 9" }),
+            tuse("b", "Read", { file_path: "/r/a.ts" }),
+            tuse("c", "Grep", { pattern: "x" }), // replayed from disk: no stamp
+          ],
+        },
+      ],
+      {},
+      [],
+      [],
+      { startedAt: { a: 1000, b: 1200 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.inFlight.map((ev) => ev.id)).toEqual(["a", "b"]);
+    expect(t.inFlight[0].startedAt).toBe(1000);
+  });
+
+  it("carries each finished call's frozen duration, and its family's median", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Read", { file_path: "/r/a.ts" }),
+            tuse("b", "Read", { file_path: "/r/b.ts" }),
+            tuse("c", "Read", { file_path: "/r/c.ts" }),
+            tuse("d", "Bash", { command: "ls" }),
+          ],
+        },
+      ],
+      { a: "", b: "", c: "", d: "" },
+      [],
+      [],
+      { durations: { a: 100, b: 300, c: 200 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.familyMedianMs.read).toBe(200);
+    // Nothing of the shell family finished LIVE: no baseline, not a zero one.
+    expect(t.familyMedianMs.shell).toBeNull();
+    expect(t.events.find((ev) => ev.id === "b")?.durationMs).toBe(300);
+    expect(t.events.find((ev) => ev.id === "d")?.durationMs).toBeNull();
+  });
+
+  it("takes the median of the completed turns' lengths", () => {
+    const e = entryOf([], {}, [], [{ ms: 10_000 }, { ms: 30_000 }, { ms: null }, { ms: 20_000 }]);
+    expect(selectTelemetry(e).medianTurnMs).toBe(20_000);
+  });
+});
+
 describe("memoizedTelemetry", () => {
   it("returns the SAME object when nothing it reads has changed", () => {
     clearAllTelemetryCache();
@@ -214,13 +279,27 @@ describe("deckStatus (the lamp)", () => {
     );
   });
 
-  it("never claims work on a call left without result once the turn is over", () => {
-    expect(deckStatus({ ...idle, runningTool: "Bash" }).key).toBe("standby");
+  it("reads streaming text as work even before the session reports itself busy", () => {
+    expect(deckStatus({ ...idle, streaming: true }).key).toBe("streaming");
   });
 
   it("tells background work apart from real standby", () => {
     expect(deckStatus({ ...idle, backgroundOps: 2 }).key).toBe("background");
     expect(deckStatus(idle).key).toBe("standby");
+  });
+});
+
+describe("liveInFlight (a dead session's orphan call)", () => {
+  const call = { id: "a", family: "shell", tool: "Bash", target: "sleep 99", status: "running", sub: false, startedAt: 1, durationMs: null } as const;
+
+  it("keeps a call in flight while the session does anything at all", () => {
+    expect(liveInFlight([call], { busy: true, backgroundOps: 0, streaming: false })).toHaveLength(1);
+    expect(liveInFlight([call], { busy: false, backgroundOps: 1, streaming: false })).toHaveLength(1);
+    expect(liveInFlight([call], { busy: false, backgroundOps: 0, streaming: true })).toHaveLength(1);
+  });
+
+  it("drops it once nothing runs: its result will never come, its timer must not count forever", () => {
+    expect(liveInFlight([call], { busy: false, backgroundOps: 0, streaming: false })).toEqual([]);
   });
 });
 
@@ -249,11 +328,12 @@ describe("the activity histogram", () => {
     expect(histogramArrivals(243, 180)).toBe(0);
   });
 
-  it("slides a fixed two-minute window", () => {
+  it("slides a fixed window, whatever its size", () => {
+    const pushes = HISTOGRAM_BUCKETS + 20;
     let done: number[] = [];
-    for (let i = 0; i < 40; i++) done = closeBucket(done, i);
+    for (let i = 0; i < pushes; i++) done = closeBucket(done, i);
     expect(done).toHaveLength(HISTOGRAM_BUCKETS - 1);
-    expect(done[done.length - 1]).toBe(39);
-    expect(done[0]).toBe(40 - (HISTOGRAM_BUCKETS - 1));
+    expect(done[done.length - 1]).toBe(pushes - 1);
+    expect(done[0]).toBe(pushes - (HISTOGRAM_BUCKETS - 1));
   });
 });
