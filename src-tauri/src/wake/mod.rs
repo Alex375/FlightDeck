@@ -14,9 +14,10 @@
 //! status is HONEST — `running`/`error` are the real post-apply state of the
 //! detector, not a switch that lies (mirroring the voice-bridge honest-toggle rule).
 //!
-//! Cost while on: the worker wakes once per 80 ms step (the capture batches), runs
-//! at UTILITY QoS (efficiency cores), sleeps when no audio comes, and the engine's
-//! silence gate skips the expensive stages while nobody is talking (`engine.rs`).
+//! Cost while on: the full neural pipeline runs on every 80 ms step, speech or
+//! silence — there is no silence-based battery guard (the VAD only vetoes fires).
+//! What is kept cheap is around it: the worker wakes once per step (the capture
+//! batches), runs at UTILITY QoS (efficiency cores), and sleeps when no audio comes.
 
 mod capture;
 mod debug;
@@ -384,8 +385,9 @@ struct WorkerLink {
 
 /// Move the calling thread to the UTILITY QoS class, which macOS schedules on the
 /// efficiency cores. Every ONNX session runs one intra-op thread, so the inference
-/// happens ON this thread and inherits the class. A step's work takes a few ms even
-/// there, against an 80 ms budget.
+/// happens ON this thread and inherits the class. A step's work is ~1.3 ms on a
+/// performance core (measured), against an 80 ms budget — room to spare for the
+/// slower efficiency cores.
 #[cfg(target_os = "macos")]
 fn lower_thread_qos() {
     // SAFETY: only changes the calling thread's own QoS class; no pointers.

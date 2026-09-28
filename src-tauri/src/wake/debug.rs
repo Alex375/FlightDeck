@@ -95,9 +95,7 @@ pub fn write_capture(
         "audio_file": wav_path.file_name().map(|n| n.to_string_lossy().to_string()),
         // Oldest step first, ending with the one that fired. `vad` is Silero's
         // speech probability — the fire-time veto reads its peak over the last 16
-        // steps — and `rms` the level of the window that step scored. Captures run
-        // ungated, so every `score` is present; `null` would mark a step the
-        // silence gate skipped.
+        // steps — and `rms` the level of the window that step scored.
         "trace": detection
             .trace
             .iter()
@@ -210,7 +208,7 @@ mod tests {
             suppressed_by: None,
             score,
             threshold: 0.6,
-            trace: vec![StepTrace { score: Some(score), vad: 0.9, rms: 0.05 }],
+            trace: vec![StepTrace { score, vad: 0.9, rms: 0.05 }],
             audio: Some(vec![0.25f32; samples]),
         }
     }

@@ -130,8 +130,8 @@ specta-typescript = "=0.0.9"
 # the captured audio never leaves the Mac. `cpal` captures the default input
 # device; `ort` (ONNX Runtime) runs the openWakeWord pipeline (melspectrogram →
 # shared speech embedding → per-phrase classifier) plus a Silero VAD, which vetoes
-# fires without speech and lets the engine skip the embedding + classifier while
-# nobody is talking (the battery guard — see `wake/engine.rs`). All six ONNX models are
+# a fire unless it heard speech. The whole pipeline runs on every 80 ms step while
+# the wake word is on — no silence-based battery guard. All six ONNX models are
 # bundled into the binary (`include_bytes!` from `assets/wake/`), so the feature
 # works offline on first launch — no download, no external asset host. `ort` is an
 # RC, pinned EXACTLY like the specta/tauri-specta RCs above.
