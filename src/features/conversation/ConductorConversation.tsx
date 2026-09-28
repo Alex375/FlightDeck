@@ -30,6 +30,7 @@ import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
 import { ConversationSidePanel } from "./ConversationSidePanel";
+import { useFitHeight, useFitRefs } from "./useFitHeight";
 import {
   clampSidePanelWidth,
   dockedSidePanelWidth,
@@ -212,14 +213,8 @@ function ConversationArea({
     const rect = areaRef.current?.getBoundingClientRect();
     if (rect) setConvPanelWidth(rect.right - clientX);
   };
-  // Quiet: the panel is a floating sheet with its own edge, so a standing rule in the gap beside
-  // it would be a third line between two framed surfaces. It lights up where the pointer finds it.
-  const panel = (
-    <>
-      <Splitter axis="x" onMove={onPanelDrag} quiet />
-      <ConversationSidePanel conv={conv} />
-    </>
-  );
+  const fit = useDisplay((s) => s.sidePanelFitContent);
+  const panel = <SidePanelColumn conv={conv} fit={fit} onDrag={onPanelDrag} />;
 
   return (
     <div
@@ -246,12 +241,60 @@ function ConversationArea({
             width,
             zIndex: 20,
             display: "flex",
+            // Click-through: only the sheet itself catches the pointer (see SidePanelColumn) —
+            // a fitted sheet leaves the thread below it usable, a full one its 8px margins.
+            pointerEvents: "none",
             // No shadow of its own: the sheet inside already floats with one, docked or not.
           }}
         >
           {panel}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The conversation side panel with its drag splitter, in the box it is given (its docked column
+ * or its floating overlay). Full height, or — `fit` (`sidePanelFitContent`) — a sheet at the top
+ * right only as tall as what it holds, the splitter as tall as the sheet (see useFitHeight).
+ *
+ * Two boxes: the HOST fills the box it is given and is the room the sheet may grow into; the
+ * ROW inside it (splitter + sheet) is stretched to the host, or pinned to its top when fitted.
+ * The host lets the pointer through, so a fitted sheet floating over the thread leaves the
+ * thread below it clickable; only the row catches it.
+ */
+function SidePanelColumn({
+  conv,
+  fit,
+  onDrag,
+}: {
+  conv: Conversation;
+  fit: boolean;
+  onDrag: (clientX: number) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const refs = useFitRefs();
+  useFitHeight(fit ? hostRef : undefined, refs);
+  return (
+    <div
+      ref={hostRef}
+      style={{
+        flex: 1,
+        minWidth: 0,
+        minHeight: 0,
+        display: "flex",
+        alignItems: fit ? "flex-start" : "stretch",
+        pointerEvents: "none",
+      }}
+    >
+      <div style={{ flex: 1, minWidth: 0, display: "flex", pointerEvents: "auto" }}>
+        {/* Quiet: the panel is a floating sheet with its own edge, so a standing rule in the gap
+            beside it would be a third line between two framed surfaces. It lights up where the
+            pointer finds it. */}
+        <Splitter axis="x" onMove={onDrag} quiet />
+        <ConversationSidePanel conv={conv} refs={refs} />
+      </div>
     </div>
   );
 }

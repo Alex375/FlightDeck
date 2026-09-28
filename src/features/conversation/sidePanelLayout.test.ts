@@ -3,6 +3,7 @@ import { MIN_CONVERSATION_PANE_PX } from "./composerLayout";
 import {
   clampSidePanelWidth,
   dockedSidePanelWidth,
+  fitHeightStep,
   floatingSidePanelWidth,
   SIDE_PANEL_MAX_PX,
   SIDE_PANEL_MIN_PX,
@@ -81,5 +82,44 @@ describe("floatingSidePanelWidth", () => {
 
   it("still never hangs off the window", () => {
     expect(floatingSidePanelWidth(480, 300)).toBe(300);
+  });
+});
+
+describe("fitHeightStep", () => {
+  const at = (natural: number, avail = 900, width = 340) => ({ natural, avail, width });
+
+  it("places the panel at its content's height the first time, without animating", () => {
+    expect(fitHeightStep(null, at(300))).toEqual({ height: 300, animate: false });
+  });
+
+  it("animates when a section arrives or leaves at the same width", () => {
+    expect(fitHeightStep(at(300), at(460))).toEqual({ height: 460, animate: true });
+    expect(fitHeightStep(at(460), at(300))).toEqual({ height: 300, animate: true });
+  });
+
+  it("caps the height at the room, and does nothing while the cap still holds", () => {
+    expect(fitHeightStep(at(300), at(1400))).toEqual({ height: 900, animate: true });
+    // Content grew again past the cap: the panel is already as tall as it can be.
+    expect(fitHeightStep(at(1400), at(1600))).toBeNull();
+  });
+
+  it("follows a window resize or a width drag instantly — a relayout, not new content", () => {
+    expect(fitHeightStep(at(1400, 900), at(1400, 700))).toEqual({ height: 700, animate: false });
+    expect(fitHeightStep(at(300, 900, 340), at(340, 900, 300))).toEqual({
+      height: 340,
+      animate: false,
+    });
+  });
+
+  it("ignores sub-pixel jitter", () => {
+    expect(fitHeightStep(at(300), at(299.6))).toBeNull();
+  });
+
+  it("rounds the content UP, so a fractional line never overflows into a scrollbar", () => {
+    expect(fitHeightStep(null, at(300.2))).toEqual({ height: 301, animate: false });
+  });
+
+  it("never goes negative on a host that is not laid out yet", () => {
+    expect(fitHeightStep(null, at(300, -16))).toEqual({ height: 0, animate: false });
   });
 });

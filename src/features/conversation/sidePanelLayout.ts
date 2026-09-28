@@ -86,3 +86,54 @@ export function dockedSidePanelWidth(
 export function floatingSidePanelWidth(desiredPx: number, areaPx: number): number {
   return Math.min(clampSidePanelWidth(desiredPx), Math.max(0, areaPx));
 }
+
+/**
+ * Fit-content mode (`sidePanelFitContent`): the panel is a sheet at the top right, only as tall
+ * as what it holds. These are the rules for its HEIGHT — the DOM side lives in useFitHeight.
+ */
+
+/** How long the sheet takes to grow into new content, ms. Slightly longer than a panel's slide
+ *  in: it reveals a section, so the eye has to land on what appeared. */
+export const FIT_GROW_MS = 240;
+/** How long it takes to shrink back once a section goes. */
+export const FIT_SHRINK_MS = 200;
+
+/** One reading of a fit-content panel, in CSS px. */
+export interface FitMeasure {
+  /** The height the panel would take to show everything — header, sections, footer. */
+  natural: number;
+  /** The most it may take: its host's height, minus the sheet's own vertical margins. */
+  avail: number;
+  /** Its width — a change here re-wraps the text, which is a relayout, not new content. */
+  width: number;
+}
+
+/**
+ * What a fit-content panel does with a new reading: the height to set, and whether to get there
+ * by animating. `null` → nothing to do.
+ *
+ * The height is the content's, capped by the room (past it the sections scroll). Only a change
+ * of CONTENT animates — a section arriving or leaving at the same width. The first placement,
+ * a window resize and a width drag are all relayouts: an animated height there would trail
+ * behind the pointer or the window edge instead of following it.
+ */
+export function fitHeightStep(
+  prev: FitMeasure | null,
+  next: FitMeasure,
+): { height: number; animate: boolean } | null {
+  const height = fitHeight(next);
+  if (prev && Math.abs(height - fitHeight(prev)) < 1) return null;
+  const contentMoved =
+    prev !== null &&
+    Math.abs(next.natural - prev.natural) >= 1 &&
+    Math.abs(next.width - prev.width) < 1 &&
+    Math.abs(next.avail - prev.avail) < 1;
+  return { height, animate: contentMoved };
+}
+
+/** The height a reading settles at: the content's, never past the room, never negative. The
+ *  content is rounded UP — a fractional line box rounded down would overflow by a hair and
+ *  summon a scrollbar over a panel that fits. */
+function fitHeight({ natural, avail }: FitMeasure): number {
+  return Math.max(0, Math.min(Math.ceil(natural), Math.floor(avail)));
+}

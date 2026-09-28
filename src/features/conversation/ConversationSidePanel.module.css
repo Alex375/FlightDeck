@@ -91,10 +91,19 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+/* The sections at their natural height — what the fit-content mode measures (useFitHeight). */
+.bodyInner {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 2px 10px 10px;
+}
+/* Fit-content mode, while the sheet grows or shrinks: the sections are momentarily taller than
+   the scroller, and a scrollbar blinking in for a quarter of a second would read as a glitch
+   (and, taking width, re-wrap the text mid-move). */
+.panel[data-fit-moving] .body {
+  overflow-y: hidden;
 }
 
 /* One island per section: a raised block, no rule, no border — the gaps do the separating. */

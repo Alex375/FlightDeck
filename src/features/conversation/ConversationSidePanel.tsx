@@ -8,6 +8,8 @@
 // with nothing to show is absent rather than empty; the empty hint covers "nothing at all".
 //
 // Only mounted while the `conversationSidePanel` display pref is on — see ConductorConversation.
+// Its HEIGHT is driven from there too: full height, or fitted to its content (useFitHeight),
+// which is why it exposes its chrome/scroller/sections as `refs`.
 
 import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Dot, Ico, TosseCrmMark } from "../../ui/kit";
@@ -45,9 +47,10 @@ import { artifactKind, openArtifactView } from "./artifactOpen";
 import { openConversationAt } from "../../store/threadJump";
 import { useClearGoalAction } from "./GoalPopover";
 import { useStreamActions } from "./StreamControl";
+import type { FitRefs } from "./useFitHeight";
 import s from "./ConversationSidePanel.module.css";
 
-export function ConversationSidePanel({ conv }: { conv: Conversation }) {
+export function ConversationSidePanel({ conv, refs }: { conv: Conversation; refs?: FitRefs }) {
   const closePanel = useEditorStore((st) => st.setConvPanelOpen);
   const tosseAvailable = useTosseAvailable();
   const goal = useActiveGoal(conv.id);
@@ -66,7 +69,7 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
     !telemetry && !showTask && !goal && todos.length === 0 && artifacts.length === 0 && !contextKnown;
 
   return (
-    <aside className={s.panel} aria-label="Conversation panel">
+    <aside ref={refs?.panel} className={s.panel} aria-label="Conversation panel">
       <div className={s.head}>
         <span className={s.headTab}>
           Conversation
@@ -87,24 +90,28 @@ export function ConversationSidePanel({ conv }: { conv: Conversation }) {
         </button>
       </div>
 
-      <div className={s.body}>
-        {/* First when on: it is the whole point of turning it on. */}
-        {telemetry ? <TelemetryDeck convId={conv.id} /> : null}
-        {showTask ? <TaskSection conv={conv} /> : null}
-        {goal ? (
-          <GoalSection convId={conv.id} condition={goal.condition} reason={goal.reason} />
-        ) : null}
-        {todos.length > 0 ? <TodoSection convId={conv.id} /> : null}
-        {artifacts.length > 0 ? <ArtifactsSection convId={conv.id} artifacts={artifacts} /> : null}
-        {/* Last of the scrolling sections: what the conversation IS (its task, goal, work and
-            output) comes before how much room it has left. */}
-        {contextKnown && !telemetry ? <ContextSection convId={conv.id} /> : null}
-        {empty ? (
-          <p className={s.empty}>
-            Nothing to track yet. This conversation's TOSSE task, goal, todo list, artifacts
-            and context use show up here as they appear.
-          </p>
-        ) : null}
+      {/* The scroller, and inside it the sections at their natural height — two boxes, so the
+          fit-content mode can read what the sections WANT whatever height the panel has. */}
+      <div ref={refs?.body} className={s.body}>
+        <div ref={refs?.inner} className={s.bodyInner}>
+          {/* First when on: it is the whole point of turning it on. */}
+          {telemetry ? <TelemetryDeck convId={conv.id} /> : null}
+          {showTask ? <TaskSection conv={conv} /> : null}
+          {goal ? (
+            <GoalSection convId={conv.id} condition={goal.condition} reason={goal.reason} />
+          ) : null}
+          {todos.length > 0 ? <TodoSection convId={conv.id} /> : null}
+          {artifacts.length > 0 ? <ArtifactsSection convId={conv.id} artifacts={artifacts} /> : null}
+          {/* Last of the scrolling sections: what the conversation IS (its task, goal, work and
+              output) comes before how much room it has left. */}
+          {contextKnown && !telemetry ? <ContextSection convId={conv.id} /> : null}
+          {empty ? (
+            <p className={s.empty}>
+              Nothing to track yet. This conversation's TOSSE task, goal, todo list, artifacts
+              and context use show up here as they appear.
+            </p>
+          ) : null}
+        </div>
       </div>
 
       {/* Pinned below the scrolling sections: the stream's controls stay one click away. */}

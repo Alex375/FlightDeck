@@ -101,6 +101,13 @@ export interface DisplayPrefs {
    *  {@link ConversationSidePanel}. */
   conversationTelemetry: boolean;
 
+  /** Shape the conversation side panel to what it holds: a sheet at the top right, only as
+   *  tall as its sections, that grows (animated) when a TOSSE task, a goal, todos or an
+   *  artifact arrive and shrinks when they go — scrolling inside once it reaches the bottom of
+   *  the window. ON by default. Off → the previous full-height column. Read by
+   *  {@link ConversationSidePanel} (see useFitHeight). */
+  sidePanelFitContent: boolean;
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -363,6 +370,7 @@ const DEFAULTS: DisplayPrefs = {
   showLastMessagePreview: true,
   conversationSidePanel: true,
   conversationTelemetry: false,
+  sidePanelFitContent: true,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -449,6 +457,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         conversationTelemetry: patch.conversationTelemetry ?? s.conversationTelemetry,
+        sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,

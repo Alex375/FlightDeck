@@ -775,6 +775,7 @@ function ThreadPrefs() {
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const conversationTelemetry = useDisplay((s) => s.conversationTelemetry);
+  const sidePanelFitContent = useDisplay((s) => s.sidePanelFitContent);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
@@ -842,6 +843,24 @@ function ThreadPrefs() {
           checked={conversationSidePanel}
           onChange={(v) => set({ conversationSidePanel: v })}
           label="Show the conversation side panel"
+        />
+        <ToggleRow
+          title="Side panel fits its content"
+          hint={
+            <>
+              The conversation panel sits at the <strong>top right</strong>, only as tall as what
+              it holds, and <strong>grows</strong> — animated — when a TOSSE task, a goal, todos
+              or an artifact show up (and shrinks when they go). Past the bottom of the window it
+              scrolls. Off → a full-height column. <strong>On by default.</strong>
+              {conversationSidePanel ? null : (
+                <> It shapes the conversation panel, so turn that on first.</>
+              )}
+            </>
+          }
+          checked={sidePanelFitContent}
+          onChange={(v) => set({ sidePanelFitContent: v })}
+          label="Fit the conversation panel to its content"
+          disabled={!conversationSidePanel}
         />
         <ToggleRow
           title="Telemetry deck"
