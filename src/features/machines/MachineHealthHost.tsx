@@ -14,13 +14,26 @@
 //    Refresh, and files its result in the SAME store — probing on top of it would
 //    double every round trip precisely when the user is already looking at the answer.
 //  - STAGGERED. Several machines do not all dial out on the same tick.
+//  - NEVER A MACHINE A SESSION IS ATTACHED TO. Its ssh link already answers keepalives;
+//    a probe would pay a fresh handshake to learn what the link proves for free. The
+//    attached link is filed as the verdict instead (see `attachedMachineIds`).
+//  - REACHABILITY ONLY. The probe is `ssh … true` (`machine_reachability`), not the full
+//    server diagnosis the Settings panel runs.
 //
 // The probe itself (dedup, rate limit, error filing) lives in `store/machineHealth.ts`;
 // this component only decides WHEN.
 import { useEffect } from "react";
-import { useMachines, useRepos } from "../../store/conversationsStore";
+import { useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
+import { useConversationStore } from "../../store/conversationStore";
+import { commands } from "../../ipc/client";
 import { useSettingsUi } from "../../store/settingsUi";
-import { probeMachine, useMachineHealthStore } from "../../store/machineHealth";
+import {
+  anyRemoteLinkDown,
+  attachedMachineIds,
+  probeMachine,
+  REACHED,
+  useMachineHealthStore,
+} from "../../store/machineHealth";
 
 /** How often a machine in use is re-checked. Generous on purpose: this exists to catch
  *  "the server died while I was working", a thing that happens on the scale of minutes,
@@ -31,6 +44,10 @@ const POLL_MS = 90_000;
 /** Spacing between successive machines' first probes, so a fleet of servers does not
  *  open N ssh connections in the same millisecond. */
 const STAGGER_MS = 700;
+/** Shortest gap between two reconnect nudges caused by the user coming back to the app:
+ *  each nudge dials once per reconnecting conversation, so not on every window focus. The
+ *  network coming back (`online`) always nudges. */
+const NUDGE_MIN_GAP_MS = 15_000;
 
 export function MachineHealthHost() {
   const machines = useMachines();
@@ -77,7 +94,13 @@ export function MachineHealthHost() {
       // next sweep starts is one this sweep is about to redo, and `probeMachine` dedupes.
       for (const t of timers) clearTimeout(t);
       timers.length = 0;
+      const { conversations, repos: allRepos } = useConversationsStore.getState();
+      const attached = attachedMachineIds(conversations, allRepos, useConversationStore.getState().sessions);
       ids.forEach((id, i) => {
+        if (attached.has(id)) {
+          useMachineHealthStore.getState().recordReachability(id, REACHED);
+          return;
+        }
         timers.push(
           setTimeout(() => {
             if (!disposed) void probeMachine(id);
@@ -102,6 +125,39 @@ export function MachineHealthHost() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [inUse, settingsOpen]);
+
+  // Reconnect nudges. A remote conversation that lost its server retries on a backoff that
+  // stretches to five minutes in a long outage (`next_reconnect_delay` in Rust), so the two
+  // moments the link is most likely back — this Mac's network returning, the user coming
+  // back to the app — cut the wait short instead of leaving it "Reconnecting…" for minutes.
+  // Only fired while some remote link is actually down, so it costs nothing otherwise.
+  useEffect(() => {
+    let last = 0;
+    const nudge = (always: boolean) => {
+      if (!anyRemoteLinkDown(useConversationStore.getState().sessions)) return;
+      const now = Date.now();
+      if (!always && now - last < NUDGE_MIN_GAP_MS) return;
+      last = now;
+      void commands
+        .reconnectRemoteSessions()
+        .then((res) => {
+          if (res.status === "error") console.warn("reconnectRemoteSessions failed:", res.error);
+        })
+        .catch((e) => console.error("reconnectRemoteSessions failed:", e));
+    };
+    const onOnline = () => nudge(true);
+    const onBack = () => {
+      if (!document.hidden) nudge(false);
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("focus", onBack);
+    document.addEventListener("visibilitychange", onBack);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("focus", onBack);
+      document.removeEventListener("visibilitychange", onBack);
+    };
+  }, []);
 
   return null;
 }

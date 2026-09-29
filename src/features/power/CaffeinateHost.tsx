@@ -1,5 +1,7 @@
-import { useFleetCounts } from "../../agent/fleet";
+import { useMemo } from "react";
+import { localConversations, useFleetCounts } from "../../agent/fleet";
 import { useRunningCountsByConv } from "../../store/backgroundTasksStore";
+import { useConversations, useRepos } from "../../store/conversationsStore";
 import { caffeineDesired, releaseGraceMs, useCaffeinate } from "../../store/caffeinate";
 import { useAwakeAssertion } from "./useAwakeAssertion";
 
@@ -18,15 +20,25 @@ import { useAwakeAssertion } from "./useAwakeAssertion";
  * mode would let the Mac sleep and stall a background sub-agent — exactly what the feature
  * exists to prevent.
  *
+ * LOCAL agents only: a conversation on a remote server runs its `claude` there, under
+ * `flightdeckd`, and keeps working while this Mac sleeps — the phone reaches it through the
+ * relay without the Mac, and the conversation reattaches (and replays what it missed) when
+ * the Mac wakes. Holding a laptop awake for work it is not doing was the costliest thing the
+ * remote feature did to the battery.
+ *
  * Its own component (not folded into App) so this subscription re-renders in isolation on
  * every fleet tick.
  */
 export function CaffeinateHost() {
   const enabled = useCaffeinate((s) => s.enabled);
   const mode = useCaffeinate((s) => s.mode);
-  const anyBackgroundTask = useRunningCountsByConv();
+  const backgroundByConv = useRunningCountsByConv();
+  const convs = useConversations();
+  const repos = useRepos();
+  const localIds = useMemo(() => new Set(localConversations(convs, repos).map((c) => c.id)), [convs, repos]);
   const anyAgentActive =
-    useFleetCounts().running > 0 || Object.values(anyBackgroundTask).some((n) => n > 0);
+    useFleetCounts("local").running > 0 ||
+    Object.entries(backgroundByConv).some(([convId, n]) => n > 0 && localIds.has(convId));
 
   useAwakeAssertion(caffeineDesired(enabled, mode, anyAgentActive), releaseGraceMs(enabled, mode));
 

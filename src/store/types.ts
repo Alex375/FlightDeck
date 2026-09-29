@@ -8,6 +8,7 @@ import type {
   NormalizedBlock,
   PermissionRequestPayload,
   SessionStatePayload,
+  TokenUsage,
 } from "../ipc/client";
 import type { RunClock } from "../agent/runClock";
 
@@ -148,6 +149,9 @@ export interface TurnResultMeta {
   durationApiMs: number | null;
   /** Time-to-first-token this turn. Captured but not surfaced in the UI yet. */
   ttftMs: number | null;
+  /** What this turn consumed, summed over its model calls (`result.usage`). Claude only —
+   *  `null` for Codex and for a turn the CLI reported without usage. */
+  usage: TokenUsage | null;
 }
 
 /** A surfaced system notice (compact boundary, sub-agent lifecycle, …). */
@@ -329,4 +333,30 @@ export interface SessionEntry {
    * mid-session. Absent on tools hydrated from disk → no duration shown there.
    */
   toolDurations: Record<string, number>;
+  /**
+   * What `state.session_usage` (the session's cumulative, all-agent spend) is worth right now —
+   * see {@link SessionUsageSource}. Set by `applySessionUsageSeed` (disk) and `applyState`
+   * (live); reset with the entry, since a reload re-seeds it.
+   */
+  sessionUsageSource: SessionUsageSource;
 }
+
+/**
+ * Where a conversation's session total (`state.session_usage`) comes from, which decides what
+ * it covers — the Stats widget words its coverage from this:
+ *  - `null`: nothing known yet (a new conversation, a Codex thread that never spent anything,
+ *    or disk was never read).
+ *  - `"disk"`: the spend as of the process's last close — read from the transcript's last
+ *    `cost-state` line (Claude) / rollout `token_count` (Codex), or a `"live"` total whose
+ *    process has since ended or been stopped in this app run (`closedUsageSource`). The next
+ *    live snapshot replaces it, and is checked against it.
+ *  - `"missing"` (Claude only): disk was read and holds NO such record (a killed process, an
+ *    older CLI). The total is unknown, and the CLI will restart its count from zero on resume.
+ *    (A Codex rollout without a count is a thread that never spent anything: no caveat there.)
+ *  - `"live"`: a snapshot from the running process covering the WHOLE session (restored from
+ *    disk on resume, or a session this app saw start).
+ *  - `"reopened"`: a live snapshot that does NOT cover the whole session — lower than the
+ *    `"disk"` total it replaced, or following a `"missing"` one: the CLI started counting again
+ *    when the session was reopened. Sticky until the next reseed.
+ */
+export type SessionUsageSource = "disk" | "missing" | "live" | "reopened" | null;

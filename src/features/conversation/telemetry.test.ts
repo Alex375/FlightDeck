@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { JsonValue, NormalizedBlock } from "../../ipc/client";
+import type { JsonValue, NormalizedBlock, SessionStatePayload, SessionUsage } from "../../ipc/client";
 import type { SessionEntry } from "../../store/types";
 import {
   clearAllTelemetryCache,
@@ -9,9 +9,13 @@ import {
   fmtSpan,
   HISTOGRAM_BUCKETS,
   histogramArrivals,
+  histogramBars,
+  liveInFlight,
   memoizedTelemetry,
   selectTelemetry,
   TELEMETRY_FEED_SIZE,
+  tokenShares,
+  tokenTotal,
   toolFamily,
 } from "./telemetry";
 
@@ -25,7 +29,13 @@ function entryOf(
   turns: Array<{ id: string; parent?: string | null; blocks: NormalizedBlock[] }>,
   results: Record<string, JsonValue> = {},
   errored: string[] = [],
-  turnResults: Array<{ cost?: number | null; apiMs?: number | null }> = [],
+  turnResults: Array<{
+    cost?: number | null;
+    apiMs?: number | null;
+    ms?: number | null;
+    usage?: { input: number; cache_creation: number; cache_read: number; output: number } | null;
+  }> = [],
+  stamps: { startedAt?: Record<string, number>; durations?: Record<string, number> } = {},
 ): SessionEntry {
   const turnMap: Record<string, unknown> = {};
   const timeline: Array<{ kind: "turn"; id: string }> = [];
@@ -55,12 +65,26 @@ function entryOf(
       apiErrorStatus: null,
       totalCostUsd: r.cost ?? null,
       numTurns: 1,
-      durationMs: null,
+      durationMs: r.ms ?? null,
       durationApiMs: r.apiMs ?? null,
       ttftMs: null,
+      usage: r.usage ?? null,
     };
   });
-  return { timeline, turns: turnMap, toolResults, subThreads: {}, turnResults: tr } as unknown as SessionEntry;
+  return {
+    timeline,
+    turns: turnMap,
+    toolResults,
+    subThreads: {},
+    turnResults: tr,
+    toolStartedAt: stamps.startedAt ?? {},
+    toolDurations: stamps.durations ?? {},
+  } as unknown as SessionEntry;
+}
+
+/** The entry with a session total on its state (the rest of the state is irrelevant here). */
+function withSession(e: SessionEntry, usage: SessionUsage): SessionEntry {
+  return { ...e, state: { session_usage: usage } as unknown as SessionStatePayload };
 }
 
 describe("toolFamily", () => {
@@ -138,6 +162,29 @@ describe("selectTelemetry", () => {
     expect(selectTelemetry(e).filesTouched).toBe(3);
   });
 
+  it("adds no file for an edit that FAILED — it wrote nothing — but counts one still running", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Edit", { file_path: "/r/a.ts" }), // old_string not found
+            tuse("b", "Write", { file_path: "/r/b.ts" }), // denied
+            tuse("c", "Edit", { file_path: "/r/c.ts" }), // written
+            tuse("d", "Edit", { file_path: "/r/d.ts" }), // still running (no result yet)
+          ],
+        },
+      ],
+      { a: "x", b: "x", c: "ok" },
+      ["a", "b"],
+    );
+    const t = selectTelemetry(e);
+    expect(t.filesTouched).toBe(2);
+    // The failed calls still count as CALLS (and as errors) — only the file count ignores them.
+    expect(t.totalCalls).toBe(4);
+    expect(t.errors.edit).toBe(2);
+  });
+
   it("includes the work a SUB-AGENT did, flagged as such", () => {
     const e = entryOf(
       [
@@ -168,12 +215,186 @@ describe("selectTelemetry", () => {
     expect(t.events[1]).toMatchObject({ id: "c8", target: "f8.ts" });
   });
 
-  it("sums cost and model time only over the turns that reported them", () => {
-    const e = entryOf([], {}, [], [{ cost: 0.12, apiMs: 4000 }, { cost: null, apiMs: null }, { cost: 0.03, apiMs: 1500 }]);
+  it("takes the LATEST cost — the CLI's figure is cumulative — and sums per-turn model time", () => {
+    // Each result carries the running total: 0.12 after turn 1, 0.15 after turn 3. Summing
+    // them (the old bug) read 0.27 — the first turn counted twice.
+    const e = entryOf([], {}, [], [{ cost: 0.12, apiMs: 4000 }, { cost: null, apiMs: null }, { cost: 0.15, apiMs: 1500 }]);
     const t = selectTelemetry(e);
     expect(t.turns).toBe(3);
     expect(t.costUsd).toBeCloseTo(0.15);
+    // Model time IS per turn (the assembler turns the CLI's cumulative counter into deltas).
     expect(t.modelMs).toBe(5500);
+  });
+
+  it("averages the turns watched live, and knows nothing before one finished", () => {
+    expect(selectTelemetry(entryOf([], {}, [], [{ ms: null }])).meanTurnMs).toBeNull();
+    const e = entryOf([], {}, [], [{ ms: 10_000 }, { ms: 30_000 }, { ms: null }, { ms: 50_000 }]);
+    const t = selectTelemetry(e);
+    expect(t.meanTurnMs).toBe(30_000);
+    // Over the three turns that reported a duration, not the four that ended.
+    expect(t.turns).toBe(4);
+    expect(t.timedTurns).toBe(3);
+  });
+
+  it("sums tokens only over the turns that reported usage, and knows nothing without one", () => {
+    expect(selectTelemetry(entryOf([], {}, [], [{ cost: 0.1 }])).tokens).toBeNull();
+    const e = entryOf([], {}, [], [
+      { usage: { input: 10, cache_creation: 200, cache_read: 3000, output: 40 } },
+      { usage: null }, // a turn the CLI reported without usage (or a Codex one)
+      { usage: { input: 5, cache_creation: 0, cache_read: 3200, output: 60 } },
+    ]);
+    const t = selectTelemetry(e);
+    expect(t.tokens).toEqual({ input: 15, cache_creation: 200, cache_read: 6200, output: 100 });
+    expect(t.tokensScope).toBe("turns");
+  });
+
+  it("prefers the all-agent session total over the main-loop sum, never adding the two", () => {
+    const e = withSession(
+      entryOf([], {}, [], [
+        { cost: 0.5, usage: { input: 10, cache_creation: 200, cache_read: 3000, output: 40 } },
+      ]),
+      { total: { input: 900, cache_creation: 8000, cache_read: 90_000, output: 3000 }, cost_usd: 4.2, per_model: [] },
+    );
+    const t = selectTelemetry(e);
+    expect(t.tokens).toEqual({ input: 900, cache_creation: 8000, cache_read: 90_000, output: 3000 });
+    expect(t.tokensScope).toBe("session");
+    // Its cost is the session's too.
+    expect(t.costUsd).toBe(4.2);
+  });
+
+  it("shows a session total seeded from disk even before any call or turn", () => {
+    const t = selectTelemetry(
+      withSession(entryOf([]), {
+        total: { input: 1, cache_creation: 2, cache_read: 3, output: 4 },
+        cost_usd: null,
+        per_model: [],
+      }),
+    );
+    expect(t.tokens).toEqual({ input: 1, cache_creation: 2, cache_read: 3, output: 4 });
+    expect(t.costUsd).toBeNull();
+    expect(t.totalCalls).toBe(0);
+  });
+
+  it("counts sub-agents' calls and calls replayed from disk apart", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("ag", "Agent", {}), tuse("old", "Read", { file_path: "/r/a" })] },
+        { id: "s1", parent: "ag", blocks: [tuse("r1", "Read", {}), tuse("r2", "Bash", {})] },
+      ],
+      { ag: "done", old: "x", r1: "x", r2: "x" },
+      [],
+      [],
+      // Seen live: a frozen duration (finished) or a start stamp (running).
+      { durations: { ag: 5000, r1: 10 }, startedAt: { r2: 1 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.totalCalls).toBe(4);
+    expect(t.subCalls).toBe(2);
+    // `old` carries neither: replayed from the transcript.
+    expect(t.replayedCalls).toBe(1);
+  });
+
+  it("never takes a call that lost its stamp to a stream stop for a replayed one", () => {
+    // `run` was running when the stream went off: `clearState` dropped its start stamp and no
+    // result will ever come. It was seen live — not a sign the history was restored.
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("done", "Read", {}), tuse("run", "Bash", {})] }],
+      { done: "x" },
+      [],
+      [],
+      { durations: { done: 12 } },
+    );
+    expect(selectTelemetry(e).replayedCalls).toBe(0);
+  });
+
+  it("re-derives when only the session total moved, and keeps the object while it holds", () => {
+    clearAllTelemetryCache();
+    const base = entryOf([], {}, [], [{ ms: 1000 }]);
+    const u1 = { total: { input: 1, cache_creation: 0, cache_read: 0, output: 1 }, cost_usd: 0.1, per_model: [] };
+    const first = memoizedTelemetry("s", withSession(base, u1));
+    // A state push that kept the same session_usage reference changes nothing.
+    expect(memoizedTelemetry("s", withSession(base, u1))).toBe(first);
+    const u2 = { ...u1, total: { ...u1.total, output: 9 } };
+    expect(memoizedTelemetry("s", withSession(base, u2)).tokens?.output).toBe(9);
+  });
+
+  it("re-renders when only the token totals moved", () => {
+    const a = entryOf([], {}, [], [{ usage: { input: 1, cache_creation: 0, cache_read: 0, output: 1 } }]);
+    const b = entryOf([], {}, [], [{ usage: { input: 1, cache_creation: 0, cache_read: 0, output: 2 } }]);
+    clearAllTelemetryCache();
+    const first = memoizedTelemetry("s", a);
+    expect(memoizedTelemetry("s", b)).not.toBe(first);
+    expect(memoizedTelemetry("s", b).tokens?.output).toBe(2);
+  });
+});
+
+describe("token shares (the stacked bar)", () => {
+  it("splits a call into its parts, summing to the whole", () => {
+    const u = { input: 5069, cache_creation: 9061, cache_read: 15626, output: 812 };
+    expect(tokenTotal(u)).toBe(30568);
+    const s = tokenShares(u);
+    expect(s.cache_read + s.cache_creation + s.input + s.output).toBeCloseTo(1);
+    expect(s.cache_read).toBeCloseTo(15626 / 30568);
+  });
+
+  it("draws an empty usage as an empty bar, not NaN", () => {
+    const s = tokenShares({ input: 0, cache_creation: 0, cache_read: 0, output: 0 });
+    expect(Object.values(s)).toEqual([0, 0, 0, 0]);
+  });
+});
+
+describe("live timing", () => {
+  it("lists only calls running WITH a live stamp as in flight, oldest first", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Bash", { command: "sleep 9" }),
+            tuse("b", "Read", { file_path: "/r/a.ts" }),
+            tuse("c", "Grep", { pattern: "x" }), // replayed from disk: no stamp
+          ],
+        },
+      ],
+      {},
+      [],
+      [],
+      { startedAt: { a: 1000, b: 1200 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.inFlight.map((ev) => ev.id)).toEqual(["a", "b"]);
+    expect(t.inFlight[0].startedAt).toBe(1000);
+  });
+
+  it("carries each finished call's frozen duration, and its family's median", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("a", "Read", { file_path: "/r/a.ts" }),
+            tuse("b", "Read", { file_path: "/r/b.ts" }),
+            tuse("c", "Read", { file_path: "/r/c.ts" }),
+            tuse("d", "Bash", { command: "ls" }),
+          ],
+        },
+      ],
+      { a: "", b: "", c: "", d: "" },
+      [],
+      [],
+      { durations: { a: 100, b: 300, c: 200 } },
+    );
+    const t = selectTelemetry(e);
+    expect(t.familyMedianMs.read).toBe(200);
+    // Nothing of the shell family finished LIVE: no baseline, not a zero one.
+    expect(t.familyMedianMs.shell).toBeNull();
+    expect(t.events.find((ev) => ev.id === "b")?.durationMs).toBe(300);
+    expect(t.events.find((ev) => ev.id === "d")?.durationMs).toBeNull();
+  });
+
+  it("takes the median of the completed turns' lengths", () => {
+    const e = entryOf([], {}, [], [{ ms: 10_000 }, { ms: 30_000 }, { ms: null }, { ms: 20_000 }]);
+    expect(selectTelemetry(e).medianTurnMs).toBe(20_000);
   });
 });
 
@@ -214,13 +435,27 @@ describe("deckStatus (the lamp)", () => {
     );
   });
 
-  it("never claims work on a call left without result once the turn is over", () => {
-    expect(deckStatus({ ...idle, runningTool: "Bash" }).key).toBe("standby");
+  it("reads streaming text as work even before the session reports itself busy", () => {
+    expect(deckStatus({ ...idle, streaming: true }).key).toBe("streaming");
   });
 
   it("tells background work apart from real standby", () => {
     expect(deckStatus({ ...idle, backgroundOps: 2 }).key).toBe("background");
     expect(deckStatus(idle).key).toBe("standby");
+  });
+});
+
+describe("liveInFlight (a dead session's orphan call)", () => {
+  const call = { id: "a", family: "shell", tool: "Bash", target: "sleep 99", status: "running", sub: false, startedAt: 1, durationMs: null } as const;
+
+  it("keeps a call in flight while the session does anything at all", () => {
+    expect(liveInFlight([call], { busy: true, backgroundOps: 0, streaming: false })).toHaveLength(1);
+    expect(liveInFlight([call], { busy: false, backgroundOps: 1, streaming: false })).toHaveLength(1);
+    expect(liveInFlight([call], { busy: false, backgroundOps: 0, streaming: true })).toHaveLength(1);
+  });
+
+  it("drops it once nothing runs: its result will never come, its timer must not count forever", () => {
+    expect(liveInFlight([call], { busy: false, backgroundOps: 0, streaming: false })).toEqual([]);
   });
 });
 
@@ -249,11 +484,31 @@ describe("the activity histogram", () => {
     expect(histogramArrivals(243, 180)).toBe(0);
   });
 
-  it("slides a fixed two-minute window", () => {
+  it("keys every bar by the SECOND it counts, so a tick moves bars instead of re-animating them", () => {
+    // Second 10 is live with 2 calls; a tick closes it and second 11 opens.
+    const before = histogramBars([3, 0, 1], 2, 10);
+    const after = histogramBars(closeBucket([3, 0, 1], 2), 0, 11);
+    const keyOf = (bars: typeof before, value: number, live: boolean) =>
+      bars.find((b) => b.value === value && b.live === live)?.key;
+    // The bucket that just closed keeps its key — same DOM bar, same height, nothing to animate.
+    expect(keyOf(before, 2, true)).toBe("b10");
+    expect(after.find((b) => b.key === "b10")).toMatchObject({ value: 2, live: false });
+    // So does every older bucket; only the new live bar is new.
+    expect(after.find((b) => b.key === "b7")?.value).toBe(3);
+    expect(after[after.length - 1]).toMatchObject({ key: "b11", value: 0, live: true });
+  });
+
+  it("always draws the full window", () => {
+    expect(histogramBars([], 0, 0)).toHaveLength(HISTOGRAM_BUCKETS);
+    expect(histogramBars(Array(HISTOGRAM_BUCKETS - 1).fill(1), 1, 500)).toHaveLength(HISTOGRAM_BUCKETS);
+  });
+
+  it("slides a fixed window, whatever its size", () => {
+    const pushes = HISTOGRAM_BUCKETS + 20;
     let done: number[] = [];
-    for (let i = 0; i < 40; i++) done = closeBucket(done, i);
+    for (let i = 0; i < pushes; i++) done = closeBucket(done, i);
     expect(done).toHaveLength(HISTOGRAM_BUCKETS - 1);
-    expect(done[done.length - 1]).toBe(39);
-    expect(done[0]).toBe(40 - (HISTOGRAM_BUCKETS - 1));
+    expect(done[done.length - 1]).toBe(pushes - 1);
+    expect(done[0]).toBe(pushes - (HISTOGRAM_BUCKETS - 1));
   });
 });

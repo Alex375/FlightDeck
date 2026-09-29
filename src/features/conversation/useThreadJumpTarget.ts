@@ -14,6 +14,7 @@ import { useEffect, type RefObject } from "react";
 import { useConversationStore } from "../../store/conversationStore";
 import {
   JUMP_TIMEOUT_MS,
+  jumpMissNote,
   jumpRequestExpired,
   useThreadJump,
   type JumpAnchor,
@@ -38,6 +39,22 @@ function byData(root: HTMLElement, attr: string, key: string, value: string): HT
   return null;
 }
 
+/** The sender's messaging card for `toolUseId`, or null for now. When clean output has folded
+ *  it away, opens the block that holds it (the card mounts on a later frame): a closed block
+ *  does not mount its children, only stamps their ids on itself (`data-jump-anchors`). */
+function locateSentCard(root: HTMLElement, session: string, toolUseId: string): HTMLElement | null {
+  const card = byData(root, "data-agent-msg-sent", "agentMsgSent", toolUseId);
+  if (card) return card;
+  for (const block of Array.from(root.querySelectorAll<HTMLElement>("[data-jump-anchors]"))) {
+    const key = block.dataset.foldKey;
+    if (key && block.dataset.jumpAnchors?.split(" ").includes(toolUseId)) {
+      useWorkFold.getState().setOpen(session, key, true);
+      break;
+    }
+  }
+  return null;
+}
+
 /** The anchored element, or null for now. May open a fold as a side effect (sender side).
  *  `sent` remembers the tool_use id once resolved, so later frames skip the result scan. */
 function locate(
@@ -52,23 +69,15 @@ function locate(
   if (anchor.kind === "artifact") {
     return byData(root, "data-artifact-publish", "artifactPublish", anchor.toolUseId);
   }
+  // Already addressed by its tool_use id: no result to scan for the message id.
+  if (anchor.kind === "sentTool") return locateSentCard(root, session, anchor.toolUseId);
   sent.toolUseId ??= findSentMessageToolUse(
     useConversationStore.getState().sessions[session],
     anchor.messageId,
   );
   const toolUseId = sent.toolUseId;
   if (!toolUseId) return null; // its result is not in the store yet
-  const card = byData(root, "data-agent-msg-sent", "agentMsgSent", toolUseId);
-  if (card) return card;
-  // Folded away under clean output: open the block that holds it; the card mounts later.
-  for (const block of Array.from(root.querySelectorAll<HTMLElement>("[data-jump-anchors]"))) {
-    const key = block.dataset.foldKey;
-    if (key && block.dataset.jumpAnchors?.split(" ").includes(toolUseId)) {
-      useWorkFold.getState().setOpen(session, key, true);
-      break;
-    }
-  }
-  return null;
+  return locateSentCard(root, session, toolUseId);
 }
 
 /** The element's top relative to the scroll container's top, in LAYOUT px (the Flight Deck
@@ -137,13 +146,7 @@ export function useThreadJumpTarget(
       }
       if (!found && now - request.at > JUMP_TIMEOUT_MS) {
         settle();
-        pushInfoToast(
-          anchor.kind === "sent"
-            ? "Couldn't find where that message was sent in this conversation."
-            : anchor.kind === "artifact"
-              ? "Couldn't find where that version was published in this conversation."
-              : "Couldn't find that message in this conversation.",
-        );
+        pushInfoToast(jumpMissNote(anchor));
         return;
       }
       raf = requestAnimationFrame(tick);

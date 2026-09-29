@@ -37,20 +37,36 @@ pub struct GitStatus {
     pub head: Option<String>,
     /// Upstream ref short name (e.g. `origin/main`); `None` when unset.
     pub upstream: Option<String>,
-    /// Commits ahead of upstream.
+    /// Commits ahead of upstream. ⚠️ Also `0` when there is NO upstream or it is GONE:
+    /// read it only when `upstream` is set and `upstream_gone` is false.
     pub ahead: u32,
-    /// Commits behind upstream.
+    /// Commits behind upstream. Same caveat as `ahead`.
     pub behind: u32,
+    /// An upstream is configured but its commit is missing — typically the remote branch
+    /// was deleted and pruned. git then prints `branch.upstream` WITHOUT `branch.ab`, so
+    /// `ahead`/`behind` are not counts but the struct's defaults: without this flag a gone
+    /// upstream reads as a fake "in sync" 0/0.
+    pub upstream_gone: bool,
     /// The branch has no commits yet (unborn HEAD).
     pub unborn: bool,
     /// Changed entries (staged + unstaged + untracked), in git's order.
     pub files: Vec<GitFileEntry>,
 }
 
-/// Status of the working tree at `cwd`. Uses porcelain v2 with `-z` so filenames
-/// with spaces/newlines and rename pairs parse unambiguously.
+/// Arguments of the status read. Porcelain v2 with `-z` so filenames with
+/// spaces/newlines and rename pairs parse unambiguously.
+///
+/// ⚠️ `--no-optional-locks` comes FIRST (a top-level git option, so it must precede the
+/// subcommand): a plain `git status` opportunistically refreshes the index and writes it
+/// back under `.git/index.lock`. This read runs in the BACKGROUND (panel refreshes, turn
+/// ends) while the agent may be running `git add` / `git commit` in the same checkout;
+/// holding that lock, even briefly, makes the AGENT's command fail with "Unable to create
+/// …/index.lock: File exists". A read must never break a write.
+const STATUS_ARGS: &[&str] = &["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z"];
+
+/// Status of the working tree at `cwd` (see [`STATUS_ARGS`]).
 pub fn status(cwd: &str) -> Result<GitStatus, GitError> {
-    let out = run_git(cwd, &["status", "--porcelain=v2", "--branch", "-z"])?;
+    let out = run_git(cwd, STATUS_ARGS)?;
     Ok(parse_status_v2(&out))
 }
 
@@ -75,13 +91,16 @@ pub fn diff_worktree(cwd: &str, path: &str, orig_path: Option<&str>) -> Result<G
 /// Pure function (no IO) — unit-tested directly.
 fn parse_status_v2(out: &str) -> GitStatus {
     let mut st = GitStatus::default();
+    // git prints `branch.ab` only "if upstream is set and the commit is present": an
+    // upstream with no `branch.ab` is a GONE upstream (see `GitStatus::upstream_gone`).
+    let mut saw_ab = false;
     let mut tokens = out.split('\0');
     while let Some(tok) = tokens.next() {
         if tok.is_empty() {
             continue;
         }
         if let Some(rest) = tok.strip_prefix("# ") {
-            parse_branch_header(rest, &mut st);
+            saw_ab |= parse_branch_header(rest, &mut st);
             continue;
         }
         match tok.as_bytes()[0] {
@@ -119,10 +138,14 @@ fn parse_status_v2(out: &str) -> GitStatus {
             _ => {}
         }
     }
+    st.upstream_gone = st.upstream.is_some() && !saw_ab;
     st
 }
 
-fn parse_branch_header(rest: &str, st: &mut GitStatus) {
+/// Apply one `# branch.*` header line. Returns whether it was the `branch.ab` line:
+/// the caller needs to know it was SEEN, not only its values, to tell a gone upstream
+/// from a genuine `+0 -0`.
+fn parse_branch_header(rest: &str, st: &mut GitStatus) -> bool {
     if let Some(oid) = rest.strip_prefix("branch.oid ") {
         if oid == "(initial)" {
             st.unborn = true;
@@ -146,7 +169,9 @@ fn parse_branch_header(rest: &str, st: &mut GitStatus) {
             .next()
             .and_then(|s| s.trim_start_matches('-').parse().ok())
             .unwrap_or(0);
+        return true;
     }
+    false
 }
 
 /// `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>` — 8 fixed fields then the path.
@@ -221,7 +246,42 @@ mod tests {
         assert_eq!(st.upstream.as_deref(), Some("origin/main"));
         assert_eq!(st.ahead, 2);
         assert_eq!(st.behind, 1);
+        assert!(!st.upstream_gone);
         assert!(!st.unborn);
+    }
+
+    // Verified against git 2.50: once the remote branch is deleted and pruned, the
+    // header keeps `branch.upstream` but drops `branch.ab`.
+    #[test]
+    fn upstream_without_ab_is_gone_not_in_sync() {
+        let out = "# branch.oid abc123\0# branch.head feat\0# branch.upstream origin/feat\0";
+        let st = parse_status_v2(out);
+        assert_eq!(st.upstream.as_deref(), Some("origin/feat"));
+        assert!(st.upstream_gone, "an upstream with no branch.ab is gone");
+        assert_eq!((st.ahead, st.behind), (0, 0), "the counts stay at their defaults");
+    }
+
+    #[test]
+    fn in_sync_upstream_is_not_gone() {
+        let out =
+            "# branch.oid abc123\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +0 -0\0";
+        let st = parse_status_v2(out);
+        assert!(!st.upstream_gone, "a real +0 -0 is in sync, not gone");
+    }
+
+    #[test]
+    fn no_upstream_is_not_gone() {
+        let out = "# branch.oid abc123\0# branch.head local\0";
+        let st = parse_status_v2(out);
+        assert_eq!(st.upstream, None);
+        assert!(!st.upstream_gone, "gone needs an upstream to be gone from");
+    }
+
+    #[test]
+    fn status_read_takes_no_optional_locks() {
+        // A top-level option: only valid BEFORE the subcommand.
+        assert_eq!(STATUS_ARGS.first(), Some(&"--no-optional-locks"));
+        assert_eq!(STATUS_ARGS.get(1), Some(&"status"));
     }
 
     #[test]

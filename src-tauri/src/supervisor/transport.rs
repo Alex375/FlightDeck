@@ -919,10 +919,16 @@ impl Transport {
                 // A REAL network cut (wifi off, cable pulled) sends no FIN: without
                 // keepalives the ssh client hangs on a dead TCP connection for many
                 // minutes and the actor never sees the EOF that triggers its
-                // auto-reconnect. 5s probes × 3 misses → a dead link is detected in
-                // ~15s and the reattach/replay path takes over.
+                // auto-reconnect. 10s probes × 3 misses → a dead link is detected in
+                // ~30s and the reattach/replay path takes over.
+                //
+                // ⚠️ Every live remote conversation holds its OWN ssh, and each probe is
+                // an encrypted round trip that wakes the Wi-Fi radio (and Tailscale's
+                // tunnel) even when nothing else is happening. 5s was twice the traffic
+                // at rest for 15s of detection nobody needed (decided 28/09: ~30s is the
+                // accepted time to notice a cut).
                 .arg("-o")
-                .arg("ServerAliveInterval=5")
+                .arg("ServerAliveInterval=10")
                 .arg("-o")
                 .arg("ServerAliveCountMax=3")
                 .arg("-o")

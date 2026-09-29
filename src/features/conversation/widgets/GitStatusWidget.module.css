@@ -1,0 +1,172 @@
+/* The Git status section (GitStatusWidget.tsx). The island, its header and its capsule are the
+   panel's own (ConversationSidePanel.module.css); this module draws only the body: the branch
+   line and the four counters.
+
+   Every attribute selector hangs off a local class: CSS modules do not hash attribute selectors,
+   and a bare `[data-motion]` would leak to the whole app. */
+
+.git {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* ---- Branch line: the branch (it gives way first) and, pushed right, the sync pill ------- */
+
+.branchLine {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.branch {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--wf-tx-hi);
+}
+/* « detached », « no commits » — a fact about HEAD, not a warning. */
+.tag {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+}
+/* The Tooltip's trigger span. */
+.pill {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: inline-flex;
+}
+/* Quiet at rest: a capsule in the island's own voice. Colour only for a gone upstream. */
+.pillText {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-lo);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+.pill:hover .pillText {
+  color: var(--wf-tx);
+}
+.git[data-motion] .pillText {
+  transition: color 0.12s ease;
+}
+.git .pillText[data-warn] {
+  background: var(--wf-att-bg);
+  color: var(--wf-att);
+}
+
+/* ---- Counters: value over label, spread across the island ---------------------------------
+   Content-sized, not equal columns: at the panel's narrowest the four uppercase labels only just
+   fit side by side, and equal quarters would clip « UNTRACKED » well before that. */
+
+.counters {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.counter {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* The figure's box clips the roll, so a changing figure slides in without moving its row. */
+.value {
+  display: block;
+  height: 16px;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wf-tx-hi);
+}
+/* A real 0 and an unknown are both quiet — the dash and the digit already say which. */
+.git .value[data-tone="zero"],
+.git .value[data-tone="unknown"] {
+  color: var(--wf-tx-xlo);
+}
+.git .value[data-tone="alarm"] {
+  color: var(--wf-err);
+}
+.figure {
+  display: inline-block;
+}
+.label {
+  font-size: 9.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A changed count rolls in from the side it moved towards: from below when it grew, from above
+   when it shrank. Once per change (the figure is re-keyed), never on the first reading. */
+.git[data-motion] .figure[data-roll="up"] {
+  animation: git-roll-up 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.git[data-motion] .figure[data-roll="down"] {
+  animation: git-roll-down 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+}
+@keyframes git-roll-up {
+  from {
+    opacity: 0;
+    transform: translateY(70%);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes git-roll-down {
+  from {
+    opacity: 0;
+    transform: translateY(-70%);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- One-line states: a remote repository, a folder gone, a failed read ------------------ */
+
+.note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--wf-tx-lo);
+  overflow-wrap: break-word;
+}
+.noteErr {
+  color: var(--wf-err);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .git[data-motion] .figure[data-roll] {
+    animation: none;
+  }
+  .git[data-motion] .pillText {
+    transition: none;
+  }
+}

@@ -13,80 +13,16 @@ import { useState } from "react";
 import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
-import { useConversationsStore } from "../../store/conversationsStore";
 import { useSessionState, useToolResult } from "../../store/conversationStore";
-import { openConversationAt, type JumpAnchor } from "../../store/threadJump";
 import { Expandable } from "../../ui/Expandable";
 import { Ico } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
+import { ConversationLink, repoLabel, useLiveConversation } from "./conversationRef";
 import {
   CREATE_CONVERSATION_TOOL,
   parseSendMessageResult,
   type AgentMessage,
 } from "./agentMessage";
-
-function repoLabel(path: string): string {
-  return path.replace(/\/+$/, "").split("/").pop() ?? path;
-}
-
-interface LiveConversation {
-  exists: boolean;
-  name: string | null;
-  repo: string | null;
-}
-
-/** The other conversation of the exchange, read LIVE by id (a rename shows up). Primitive
- *  selectors only, so a card re-renders on ITS values, not on every conversations write. */
-function useLiveConversation(id: string | null): LiveConversation {
-  const name = useConversationsStore((s) =>
-    id ? (s.conversations.find((c) => c.id === id)?.name ?? null) : null,
-  );
-  const repoPath = useConversationsStore((s) => {
-    const conv = id ? s.conversations.find((c) => c.id === id) : undefined;
-    return conv ? (s.repos.find((r) => r.id === conv.repoId)?.path ?? null) : null;
-  });
-  return { exists: name !== null, name, repo: repoPath ? repoLabel(repoPath) : null };
-}
-
-/** The other conversation's name. A link while it is on the list; once removed it stays as
- *  plain, dimmed text (with the snapshot title) rather than offering a dead jump. */
-function ConversationLink({
-  id,
-  live,
-  title,
-  anchor,
-}: {
-  id: string | null;
-  live: LiveConversation;
-  title: string | null;
-  anchor: JumpAnchor | null;
-}) {
-  const label = live.name?.trim() || title || "unknown conversation";
-  if (!id || !live.exists) {
-    return (
-      <span
-        className="cv-agentmsg-name"
-        data-gone={id ? "1" : undefined}
-        title={id ? "No longer in the conversation list" : undefined}
-      >
-        {label}
-      </span>
-    );
-  }
-  return (
-    <button
-      type="button"
-      className="cv-agentmsg-name"
-      title={anchor ? "Open this conversation at the message" : "Open this conversation"}
-      onClick={(e) => {
-        e.stopPropagation(); // neither the row's toggle nor the pane's background click
-        openConversationAt(id, anchor);
-      }}
-    >
-      {label}
-    </button>
-  );
-}
 
 /** A message another conversation sent to this one. */
 export function AgentMessageReceivedCard({

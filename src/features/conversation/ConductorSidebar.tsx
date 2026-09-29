@@ -153,6 +153,11 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   const rowState = {
     "data-pill": pill ?? undefined,
     "data-calm": pill ? undefined : status.kind === "off" ? "off" : "idle",
+    // A blue review row while background work still runs (the "re-alert on background Bash"
+    // finish edge): it keeps its blue, plus the green row's violet wash on its right end —
+    // "worth a look, AND something still runs behind it". Read from the raw count, since the
+    // derived `review` carries none.
+    "data-bgrun": pill === "review" && runningBgTasks > 0 ? "" : undefined,
   };
   const select = useConversationsStore((s) => s.selectConversation);
   const rename = useConversationsStore((s) => s.renameConversation);

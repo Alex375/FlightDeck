@@ -29,7 +29,7 @@ export function useFitRefs(): FitRefs {
  * Size `panel` to its content, capped by `host`. Off (and reset to the stylesheet's height)
  * while `host` is undefined.
  *
- * The panel must be a column of fixed chrome (header, footer) around ONE scroller, `body`,
+ * The panel must be a column of chrome (header, footer) around ONE flexible scroller, `body`,
  * whose single child `inner` carries the sections at their natural height. The natural height
  * is then the chrome plus `inner`: `panel − body + inner`, whatever the panel's current height.
  *
@@ -104,8 +104,11 @@ export function useFitHeight(host: RefObject<HTMLElement> | undefined, refs: Fit
     const ro = new ResizeObserver(apply);
     ro.observe(hostEl); // the room
     ro.observe(inner); // the sections
-    // The chrome — header and footer rows can come and go too (the worktree row, an error).
-    for (const child of Array.from(panel.children)) if (child !== body) ro.observe(child);
+    // The chrome, through the scroller: at a set height, a header or footer that grows, appears
+    // or goes (the footer is not rendered while customizing) takes its room from `body`. Watching
+    // the chrome's own elements would miss a footer mounted AFTER this effect ran. It also fires
+    // on every frame of our own transition — each reading then finds the height unchanged.
+    ro.observe(body);
 
     return () => {
       ro.disconnect();

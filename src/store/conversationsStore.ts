@@ -63,6 +63,7 @@ import {
   clearAllArtifactsCache,
 } from "../features/conversation/artifacts";
 import { clearAllTelemetryCache, clearTelemetryCache } from "../features/conversation/telemetry";
+import { clearAllLinkedCache, clearLinkedCache } from "../features/conversation/linkedConversations";
 import { clearCodexControls, clearAllCodexControls } from "../features/conversation/codexControls";
 import { clearAllPolicy, clearConvPolicy, sessionOverridesForConv } from "./mcpPolicy";
 import { clearWorkFold, clearAllWorkFold } from "./workFold";
@@ -700,6 +701,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   // tool results.
   clearArtifactsCache(id);
   clearTelemetryCache(id);
+  clearLinkedCache(id);
   useLastMessageSummaryStore.getState().clear(id);
   autoTitlePending.delete(id);
   titleContext.delete(id);
@@ -1947,6 +1949,22 @@ function rehydrateWorktreeCwd(convId: string, items: ConversationItem[]): void {
  * id, so a later live re-spawn never double-renders. A conversation with no
  * `sessionId` (never sent a message) has nothing to load.
  */
+/**
+ * Seed the side panel's session total (every agent's tokens) from disk: the transcript's last
+ * `cost-state` line (Claude) or the rollout's last token count (Codex). LOCAL repos only — a
+ * remote conversation's transcript lives on its server, and its CLI restores the total itself
+ * (and a null seed here would wrongly mark the total "missing").
+ */
+async function seedSessionUsage(convId: string, conv: Conversation): Promise<void> {
+  if (!conv.sessionId) return;
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId);
+  if (repo?.machineId) return;
+  const backend = conv.kind === "codex" ? "codex" : "claude";
+  const res = await commands.loadSessionUsage(conv.sessionId, backend);
+  if (res.status === "ok") useConversationStore.getState().applySessionUsageSeed(convId, res.data, backend);
+  else console.error("loadSessionUsage failed:", res.error);
+}
+
 export async function loadConversationHistory(convId: string): Promise<void> {
   if (historyLoaded.has(convId)) return;
   historyLoaded.add(convId); // mark before awaiting to avoid a double-load race
@@ -1975,12 +1993,13 @@ export async function loadConversationHistory(convId: string): Promise<void> {
     return;
   }
   if (res.data.length === 0) return;
-  const { ensureSession, applyItem, applyContextFill, markSeen, reanchorReplay } =
+  const { ensureSession, applyItems, applyContextFill, markSeen, reanchorReplay } =
     useConversationStore.getState();
   ensureSession(convId);
   // `hydrating: true` — replayed history has no wall-clock meaning, so suppress the
   // live tool/thinking duration stamps (else every reloaded tool shows a bogus "0ms").
-  for (const item of res.data) applyItem(convId, item, true);
+  // ONE commit for the whole history: subscribers derive once, not once per item.
+  applyItems(convId, res.data, true);
   // The transcript carries NO `turn_result`, so the remote-replay anchor was never
   // re-armed during hydration — pin it to the end now, so the FIRST live remote turn
   // splices at the tail of the restored history, not above it.
@@ -1991,6 +2010,8 @@ export async function loadConversationHistory(convId: string): Promise<void> {
   // Mark the restored history seen: a historical completion is not a fresh "Claude
   // just finished, go look", so only genuine LIVE completions surface as review.
   markSeen(convId);
+  // The side panel's session total (every agent's tokens), as the transcript last recorded it.
+  await seedSessionUsage(convId, conv);
   // Seed the context ring from the transcript so it shows immediately on open, before any
   // new live turn reports usage. CLAUDE only — Codex has no cold context source (its ring
   // fills from the first live `thread/tokenUsage/updated` push). A missing/unreadable
@@ -2004,6 +2025,7 @@ export async function loadConversationHistory(convId: string): Promise<void> {
       applyContextFill(convId, {
         context_tokens: ctx.data.context_tokens,
         context_window: getCachedWindow(convId),
+        context_usage: ctx.data.context_usage ?? null,
       });
     else console.error("loadSessionContext failed:", ctx.error);
   }
@@ -2041,11 +2063,12 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
     return; // keep the current timeline
   }
   if (res.data.length === 0) return; // nothing on disk → keep timeline
-  const { resetSession, applyItem, applyContextFill, markSeen, reanchorReplay } =
+  const { resetSession, applyItems, applyContextFill, markSeen, reanchorReplay } =
     useConversationStore.getState();
   resetSession(convId);
-  // `hydrating: true` — see loadConversationHistory: suppress live duration stamps on replay.
-  for (const item of res.data) applyItem(convId, item, true);
+  // `hydrating: true` — see loadConversationHistory: suppress live duration stamps on replay;
+  // one commit for the whole history.
+  applyItems(convId, res.data, true);
   // Transcript carries no `turn_result` → pin the remote-replay anchor to the tail so
   // a later live remote turn splices at the end, not above the restored history.
   reanchorReplay(convId);
@@ -2055,6 +2078,8 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
   // Mark restored history seen so turning the stream on doesn't flash an old
   // conversation as "review" (only fresh LIVE completions should).
   markSeen(convId);
+  // Re-seed the session total too — AFTER resetSession, which wiped it.
+  await seedSessionUsage(convId, conv);
   // Re-seed the context ring from the transcript (resetSession cleared it); window from
   // the persisted cache (the real 200k-vs-1M value learned on a prior turn). CLAUDE only —
   // Codex re-fills the ring from the first live `thread/tokenUsage/updated`.
@@ -2064,6 +2089,7 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
       applyContextFill(convId, {
         context_tokens: ctx.data.context_tokens,
         context_window: getCachedWindow(convId),
+        context_usage: ctx.data.context_usage ?? null,
       });
     else console.error("loadSessionContext failed:", ctx.error);
   }
@@ -2261,6 +2287,7 @@ export async function wipeAllData(): Promise<void> {
   useGoalStore.getState().clearAll();
   clearAllArtifactsCache();
   clearAllTelemetryCache();
+  clearAllLinkedCache();
   useCodexPlanUsageStore.getState().clear();
   useLastMessageSummaryStore.getState().clearAll();
 }

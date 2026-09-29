@@ -101,13 +101,8 @@ export interface DisplayPrefs {
    *  surface it replaces. */
   conversationSidePanel: boolean;
 
-  /** Turn the conversation side panel into a live TELEMETRY deck: a context gauge, the run's
-   *  clock and status lamp, a counter per tool family, a two-minute activity histogram and a
-   *  feed of the latest calls — all of it animated. OFF by default: it is for the fun of
-   *  watching an agent work, not something anyone needs. Every instrument reads a real signal
-   *  (see features/conversation/telemetry.ts); off → the plain panel. Read by
-   *  {@link ConversationSidePanel}. */
-  conversationTelemetry: boolean;
+  // (The telemetry deck's switch is no longer here: it became one of the side panel's widgets —
+  // store/sidePanelWidgetsStore.ts, which carries an old `conversationTelemetry: true` over once.)
 
   /** Shape the conversation side panel to what it holds: a sheet at the top right, only as
    *  tall as its sections, that grows (animated) when a TOSSE task, a goal, todos or an
@@ -378,7 +373,6 @@ const DEFAULTS: DisplayPrefs = {
   agentCreationToasts: true,
   showLastMessagePreview: true,
   conversationSidePanel: true,
-  conversationTelemetry: false,
   sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
@@ -471,7 +465,6 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
-        conversationTelemetry: patch.conversationTelemetry ?? s.conversationTelemetry,
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
