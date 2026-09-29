@@ -13,7 +13,7 @@ import {
   useConversationsStore,
   wipeAllData,
 } from "../../store/conversationsStore";
-import { useSidePanelLayout, useWidgetOn } from "../../store/sidePanelWidgetsStore";
+import { useSidePanelLayout } from "../../store/sidePanelWidgetsStore";
 import { useEditorStore } from "../editor/editorStore";
 import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
@@ -617,9 +617,10 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
   },
 ];
 
-/** The "Appearance" card of Display → Appearance: the app's global look and what the
- *  Flight Deck card shows. Shares its sub-page with {@link MotionPrefs} — both answer
- *  "how does the app itself look", as opposed to the thread ({@link ThreadPrefs}). */
+/** The "Appearance" and "Workflows" cards of Display → Appearance: the app's global look,
+ *  and how a running workflow shows on its Flight Deck card and in its detail view. Shares
+ *  its sub-page with {@link MotionPrefs} — all answer "how does the app itself look", as
+ *  opposed to the thread ({@link ThreadPrefs}). */
 function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
@@ -640,6 +641,9 @@ function AppearancePrefs() {
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Workflows" icon="grid">
         <ToggleRow
           title="Live workflow on the Flight Deck card"
           hint={
@@ -778,18 +782,18 @@ function IdePrefs() {
   );
 }
 
-/** The "Thread" card of Display → Thread: how the conversation itself reads. Every toggle
- *  here is a GLOBAL default — e.g. "clean output" folds each round's work behind a "Work"
- *  block, and a conversation's composer chip can still override its own. Rendered above
- *  the Markdown card (`ConversationSection`), which is the same subject. */
+/** The cards of Display → Thread, one per thing the user is looking at: how the thread
+ *  reads, how to move around it, the side panel beside it, and artifact previews. Every
+ *  toggle here is a GLOBAL default — e.g. "clean output" folds each round's work behind a
+ *  "Work" block, and a conversation's composer chip can still override its own. Rendered
+ *  above the Markdown card (`ConversationSection`), which is the same subject. The telemetry
+ *  deck has no switch here: it is a panel widget, chosen in the panel's Customize view. */
 function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const sidePanelFitContent = useDisplay((s) => s.sidePanelFitContent);
-  const telemetryOn = useWidgetOn("telemetry");
-  const setWidgetOn = useSidePanelLayout((s) => s.setOn);
   const activeConvId = useConversationsStore((s) => s.activeId);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
@@ -801,7 +805,7 @@ function ThreadPrefs() {
   const set = useDisplay((s) => s.set);
   return (
     <>
-      <SettingsGroup title="Thread" icon="chat">
+      <SettingsGroup title="Reading" icon="chat">
         <ToggleRow
           title="Conversation width"
           hint={
@@ -844,6 +848,9 @@ function ThreadPrefs() {
           onChange={(v) => set({ showTaskNotifications: v })}
           label="Show background task notifications"
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Navigation & controls" icon="list">
         <ToggleRow
           title="Preview of the last sent message"
           hint={
@@ -857,98 +864,6 @@ function ThreadPrefs() {
           checked={showLastMessagePreview}
           onChange={(v) => set({ showLastMessagePreview: v })}
           label="Preview of the last sent message"
-        />
-        <ToggleRow
-          title="Conversation side panel"
-          hint={
-            <>
-              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
-              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
-              so the header only holds actions. Open or close it with its header button or{" "}
-              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
-              above the composer. Off → the previous layout: those chips in the header and the
-              composer, the todo list above the composer. <strong>On by default.</strong>
-            </>
-          }
-          checked={conversationSidePanel}
-          onChange={(v) => set({ conversationSidePanel: v })}
-          label="Show the conversation side panel"
-        />
-        <ToggleRow
-          title="Side panel fits its content"
-          hint={
-            <>
-              The conversation panel sits at the <strong>top right</strong>, only as tall as what
-              it holds, and <strong>grows</strong> — animated — when a TOSSE task, a goal, todos
-              or an artifact show up (and shrinks when they go). Past the bottom of the window it
-              scrolls. Off → a full-height column. <strong>Off by default.</strong>
-              {conversationSidePanel ? null : (
-                <> It shapes the conversation panel, so turn that on first.</>
-              )}
-            </>
-          }
-          checked={sidePanelFitContent}
-          onChange={(v) => set({ sidePanelFitContent: v })}
-          label="Fit the conversation panel to its content"
-          disabled={!conversationSidePanel}
-        />
-        <ToggleRow
-          title="Telemetry deck"
-          hint={
-            <>
-              Turns the top of the conversation panel into a <strong>live instrument deck</strong>:
-              millisecond clocks, a context gauge, cost and average call time, live gauges, a
-              streaming oscilloscope, calls per second over the last minute, a counter per kind
-              of tool call, a board timing the calls that run long, and a feed of the latest
-              calls — all of it moving as the agent works. Every reading is real; nothing moves
-              on its own. <strong>Off by default</strong> — and off, it costs nothing: it is not
-              even loaded.
-              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
-              {conversationSidePanel ? null : (
-                <> It lives in the conversation panel, so turn that on first.</>
-              )}
-            </>
-          }
-          checked={telemetryOn}
-          onChange={(v) => setWidgetOn("telemetry", v)}
-          label="Show the telemetry deck in the conversation panel"
-          disabled={!conversationSidePanel}
-        />
-        <ToggleRow
-          title="Conversation panel widgets"
-          hint={
-            <>
-              Choose what the conversation panel shows — its task, goal, todo list, artifacts,
-              stats, context, git status, plan usage, linked conversations, and the stream,
-              worktree and machine rows at the bottom — in what order, and whether its sections
-              fold. Opens the panel's <strong>Customize</strong> view (also its header button).
-              A widget switched off gives its old place back (the header chip, the composer
-              chip, the todo bar).
-              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
-              {!conversationSidePanel ? (
-                <> It needs the conversation panel, so turn that on first.</>
-              ) : !activeConvId ? (
-                <> Open a conversation first.</>
-              ) : null}
-            </>
-          }
-          control={
-            <button
-              type="button"
-              className={`${styles.btn} ${styles.ghost}`}
-              disabled={!conversationSidePanel || !activeConvId}
-              onClick={() => {
-                if (!activeConvId) return;
-                // Into the conversation (which also closes Settings), its panel open, in its
-                // customize view.
-                useEditorStore.getState().setConvPanelOpen(true);
-                useSidePanelLayout.getState().setCustomizing(true);
-                openConversationAt(activeConvId, null);
-              }}
-            >
-              Customize…
-            </button>
-          }
         />
         <ToggleRow
           title="Message minimap"
@@ -1011,6 +926,84 @@ function ThreadPrefs() {
           onChange={(v) => set({ clickableFileMentions: v })}
           label="Make the filename on Read/Write rows clickable"
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Side panel" icon="sidebar">
+        <ToggleRow
+          title="Conversation side panel"
+          hint={
+            <>
+              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
+              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
+              so the header only holds actions. Open or close it with its header button or{" "}
+              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              above the composer. Off → the previous layout: those chips in the header and the
+              composer, the todo list above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={conversationSidePanel}
+          onChange={(v) => set({ conversationSidePanel: v })}
+          label="Show the conversation side panel"
+        />
+        <ToggleRow
+          title="Side panel fits its content"
+          hint={
+            <>
+              The conversation panel sits at the <strong>top right</strong>, only as tall as what
+              it holds, and <strong>grows</strong> — animated — when a TOSSE task, a goal, todos
+              or an artifact show up (and shrinks when they go). Past the bottom of the window it
+              scrolls. Off → a full-height column. <strong>Off by default.</strong>
+              {conversationSidePanel ? null : (
+                <> It shapes the conversation panel, so turn that on first.</>
+              )}
+            </>
+          }
+          checked={sidePanelFitContent}
+          onChange={(v) => set({ sidePanelFitContent: v })}
+          label="Fit the conversation panel to its content"
+          disabled={!conversationSidePanel}
+        />
+        <ToggleRow
+          title="Conversation panel widgets"
+          hint={
+            <>
+              Choose what the conversation panel shows — its task, goal, todo list, artifacts,
+              linked conversations, stats, context, git status, plan usage, the{" "}
+              <strong>telemetry deck</strong>, and the stream, worktree and machine rows at the
+              bottom — in what order, and whether its sections fold. Opens the panel's{" "}
+              <strong>Customize</strong> view (also its header button), with presets from{" "}
+              <strong>Essentials</strong> (the default) to <strong>Cockpit</strong>. A widget
+              switched off gives its old place back (the header chip, the composer chip, the todo
+              bar).
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {!conversationSidePanel ? (
+                <> It needs the conversation panel, so turn that on first.</>
+              ) : !activeConvId ? (
+                <> Open a conversation first.</>
+              ) : null}
+            </>
+          }
+          control={
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.ghost}`}
+              disabled={!conversationSidePanel || !activeConvId}
+              onClick={() => {
+                if (!activeConvId) return;
+                // Into the conversation (which also closes Settings), its panel open, in its
+                // customize view.
+                useEditorStore.getState().setConvPanelOpen(true);
+                useSidePanelLayout.getState().setCustomizing(true);
+                openConversationAt(activeConvId, null);
+              }}
+            >
+              Customize…
+            </button>
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Artifacts" icon="artifact">
         <ToggleRow
           title="Show hosted artifacts in Flight Deck"
           hint={

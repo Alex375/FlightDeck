@@ -3,6 +3,8 @@ import {
   applyPreset,
   defaultLayout,
   isCollapsed,
+  LAYOUT_VERSION,
+  layoutForVersion,
   matchingPreset,
   moveWidget,
   PANEL_PRESETS,
@@ -83,7 +85,7 @@ describe("sanitizeLayout (a stored layout is repaired, never trusted)", () => {
     const order = ids(l.main);
     // "stats" follows "linked" in the catalogue, so it lands right after it.
     expect(order.indexOf("stats")).toBe(order.indexOf("linked") + 1);
-    expect(l.main.find((e) => e.id === "stats")?.on).toBe(true);
+    expect(l.main.find((e) => e.id === "stats")?.on).toBe(false);
     // Every widget is present exactly once.
     expect(new Set(order).size).toBe(WIDGETS.filter((w) => w.zone === "main").length);
   });
@@ -96,7 +98,7 @@ describe("sanitizeLayout (a stored layout is repaired, never trusted)", () => {
 
 describe("layout edits", () => {
   it("switches a widget without touching the others, and is a no-op when unchanged", () => {
-    const l = defaultLayout();
+    const l = setWidgetOn(defaultLayout(), "plan", true);
     const off = setWidgetOn(l, "plan", false);
     expect(off.main.find((e) => e.id === "plan")?.on).toBe(false);
     expect(onIds(off.foot)).toEqual(onIds(l.foot));
@@ -130,10 +132,58 @@ describe("presets", () => {
     expect([...applied.main, ...applied.foot].every((e) => e.on)).toBe(true);
   });
 
-  it("the default layout reads as the Standard preset, and a hand-made one as none", () => {
-    expect(matchingPreset(defaultLayout())?.id).toBe("standard");
-    const essentials = PANEL_PRESETS.find((p) => p.id === "essentials")!;
-    expect(matchingPreset(applyPreset(defaultLayout(), essentials))?.id).toBe("essentials");
-    expect(matchingPreset(setWidgetOn(defaultLayout(), "stats", false))).toBeNull();
+  it("the default layout reads as the Essentials preset, and a hand-made one as none", () => {
+    expect(matchingPreset(defaultLayout())?.id).toBe("essentials");
+    expect(onIds([...defaultLayout().main, ...defaultLayout().foot])).toEqual([
+      "task",
+      "goal",
+      "todos",
+      "artifacts",
+      "stream",
+    ]);
+    const standard = PANEL_PRESETS.find((p) => p.id === "standard")!;
+    expect(matchingPreset(applyPreset(defaultLayout(), standard))?.id).toBe("standard");
+    expect(matchingPreset(setWidgetOn(defaultLayout(), "stats", true))).toBeNull();
+  });
+
+  it("Standard is the conversation, its code and where it runs — no context, plan or telemetry", () => {
+    const standard = PANEL_PRESETS.find((p) => p.id === "standard")!;
+    const l = applyPreset(defaultLayout(), standard);
+    expect(onIds(l.main)).toEqual(["task", "goal", "todos", "artifacts", "linked", "stats", "git"]);
+    expect(onIds(l.foot)).toEqual(["stream", "worktree", "machine"]);
+  });
+
+  it("no two presets show the same set", () => {
+    const sets = PANEL_PRESETS.map((p) => [...p.on].sort().join(","));
+    expect(new Set(sets).size).toBe(sets.length);
+  });
+});
+
+describe("layoutForVersion (the default moved to Essentials in v2)", () => {
+  const cockpit = PANEL_PRESETS.find((p) => p.id === "cockpit")!;
+  // The v1 default: every widget but the telemetry deck.
+  const v1Default = setWidgetOn(applyPreset(defaultLayout(), cockpit), "telemetry", false);
+
+  it("moves an untouched v1 layout to Essentials, keeping its order and folds", () => {
+    const stored = setCollapsed(moveWidget(v1Default, "plan", "task"), "todos", true);
+    const up = layoutForVersion(stored, 1);
+    expect(matchingPreset(up)?.id).toBe("essentials");
+    expect(ids(up.main)).toEqual(ids(stored.main));
+    expect(up.collapsed).toEqual(["todos"]);
+  });
+
+  it("keeps a telemetry deck carried over from its old switch", () => {
+    const up = layoutForVersion(setWidgetOn(v1Default, "telemetry", true), 1);
+    expect(up.main.find((e) => e.id === "telemetry")?.on).toBe(true);
+    expect(onIds(up.main)).toEqual(["telemetry", "task", "goal", "todos", "artifacts"]);
+  });
+
+  it("leaves a layout the user chose alone", () => {
+    const chosen = setWidgetOn(v1Default, "plan", false);
+    expect(layoutForVersion(chosen, 1)).toBe(chosen);
+  });
+
+  it("never re-judges a current layout", () => {
+    expect(layoutForVersion(v1Default, LAYOUT_VERSION)).toBe(v1Default);
   });
 });

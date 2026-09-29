@@ -12,6 +12,8 @@ import { useEditorStore } from "../features/editor/editorStore";
 import {
   applyPreset,
   defaultLayout,
+  LAYOUT_VERSION,
+  layoutForVersion,
   moveWidget,
   sanitizeLayout,
   setCollapsed,
@@ -53,7 +55,14 @@ function load(): PanelLayout {
     return first;
   }
   try {
-    return sanitizeLayout(JSON.parse(raw), defaultLayout());
+    const parsed: unknown = JSON.parse(raw);
+    const v = (parsed as { v?: unknown } | null)?.v;
+    const version = typeof v === "number" ? v : 1;
+    const layout = layoutForVersion(sanitizeLayout(parsed, defaultLayout()), version);
+    // Saved at once so the upgrade runs once: a layout left at v1 would be re-judged on every
+    // launch, and a user who later picked the old default by hand would lose it.
+    if (version < LAYOUT_VERSION) save(layout);
+    return layout;
   } catch {
     return defaultLayout();
   }
@@ -61,7 +70,7 @@ function load(): PanelLayout {
 
 function save(layout: PanelLayout): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...layout, v: LAYOUT_VERSION }));
   } catch {
     /* quota / disabled storage — best-effort, the layout still applies for this run */
   }
@@ -103,8 +112,8 @@ export const useSidePanelLayout = create<SidePanelLayoutState>((set) => {
   };
 });
 
-/** Whether one widget is switched on — the hook a surface outside the panel asks (Settings'
- *  telemetry switch). */
+/** Whether one widget is switched on — the hook a surface outside the panel asks (the header
+ *  and composer chips a widget takes over). */
 export function useWidgetOn(id: WidgetId): boolean {
   return useSidePanelLayout((s) =>
     [...s.layout.main, ...s.layout.foot].some((e) => e.id === id && e.on),

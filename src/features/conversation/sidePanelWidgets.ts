@@ -39,7 +39,7 @@ export interface WidgetDef {
   blurb: string;
   /** A kit icon name (see `Ico`), for the section header and the customize card. */
   icon: string;
-  /** Shown by a fresh layout. */
+  /** Shown by a fresh layout — the Essentials preset. */
   defaultOn: boolean;
 }
 
@@ -91,7 +91,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Linked conversations",
     blurb: "Conversations this one messaged or created",
     icon: "link",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "stats",
@@ -99,7 +99,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Stats",
     blurb: "Turn time, files touched, tool calls, total tokens",
     icon: "pulse",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "context",
@@ -107,7 +107,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Context",
     blurb: "How full the context window is",
     icon: "gauge",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "git",
@@ -115,7 +115,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Git status",
     blurb: "Uncommitted changes, ahead and behind",
     icon: "diff",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "plan",
@@ -123,7 +123,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Plan usage",
     blurb: "Your plan's usage windows and when they reset",
     icon: "clock",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "stream",
@@ -139,7 +139,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Worktree",
     blurb: "Where the agent works right now",
     icon: "branch",
-    defaultOn: true,
+    defaultOn: false,
   },
   {
     id: "machine",
@@ -147,7 +147,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     title: "Machine",
     blurb: "This Mac, or the server the conversation runs on",
     icon: "server",
-    defaultOn: true,
+    defaultOn: false,
   },
 ];
 
@@ -292,16 +292,17 @@ export interface PanelPreset {
 
 export const PANEL_PRESETS: readonly PanelPreset[] = [
   {
+    // Derived, so the default and its preset can never drift apart.
     id: "essentials",
     label: "Essentials",
-    blurb: "What the conversation is about",
-    on: ["task", "goal", "todos", "artifacts", "stream"],
+    blurb: "What the conversation is about — the default",
+    on: WIDGETS.filter((w) => w.defaultOn).map((w) => w.id),
   },
   {
     id: "standard",
     label: "Standard",
-    blurb: "The default set",
-    on: WIDGETS.filter((w) => w.defaultOn).map((w) => w.id),
+    blurb: "The conversation, its code and where it runs",
+    on: ["task", "goal", "todos", "artifacts", "linked", "stats", "git", "stream", "worktree", "machine"],
   },
   {
     id: "developer",
@@ -321,6 +322,30 @@ export function applyPreset(layout: PanelLayout, preset: PanelPreset): PanelLayo
   const on = new Set<WidgetId>(preset.on);
   const flip = (entries: LayoutEntry[]) => entries.map((e) => ({ ...e, on: on.has(e.id) }));
   return { ...layout, main: flip(layout.main), foot: flip(layout.foot) };
+}
+
+/** The version `layoutForVersion` upgrades a stored layout to. Unversioned (1) layouts were
+ *  saved while every widget but the telemetry deck was ON by default. */
+export const LAYOUT_VERSION = 2;
+
+/** The v1 defaults: everything but the telemetry deck. */
+const V1_DEFAULT_ON: ReadonlySet<WidgetId> = new Set(
+  WIDGETS.filter((w) => w.id !== "telemetry").map((w) => w.id),
+);
+
+/** A stored layout brought up to {@link LAYOUT_VERSION}. v1 → v2: the default moved from
+ *  "everything" to Essentials, so a layout whose visibility is still the untouched v1 default
+ *  (the telemetry deck aside — it was carried over from its old switch) takes the new one; a
+ *  layout the user chose keeps its visibility. Order and folds are always kept. */
+export function layoutForVersion(layout: PanelLayout, version: number): PanelLayout {
+  if (version >= LAYOUT_VERSION) return layout;
+  const on = new Set([...layout.main, ...layout.foot].filter((e) => e.on).map((e) => e.id));
+  on.delete("telemetry");
+  const untouched = on.size === V1_DEFAULT_ON.size && [...on].every((id) => V1_DEFAULT_ON.has(id));
+  if (!untouched) return layout;
+  const telemetry = layout.main.some((e) => e.id === "telemetry" && e.on);
+  const essentials = PANEL_PRESETS.find((p) => p.id === "essentials")!;
+  return setWidgetOn(applyPreset(layout, essentials), "telemetry", telemetry);
 }
 
 /** The preset the layout's visibility matches exactly, if any — the customize view lights it. */
