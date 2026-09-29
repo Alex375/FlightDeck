@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 import { useDisplay } from "../../store/display";
 import { Dot, Ico } from "../../ui/kit";
 import { useArtifacts, type Artifact } from "./artifacts";
+import { ArtifactFace } from "./artifactIcon";
 import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
 
 /** Fixed placement of the portaled popover, anchored to the chip. */
@@ -74,6 +75,10 @@ function ArtifactRow({
     url,
     filePath: art.latestFilePath,
     typed: art.typed,
+    // Also multiFile: a page published WITH sibling files can't be served by the local srcDoc
+    // preview (no origin to resolve them against) — without this the popover was the one entry
+    // point that rendered such a page stripped of its stylesheet, silently.
+    multiFile: art.multiFile,
     inert,
     hostedInApp,
   };
@@ -93,7 +98,7 @@ function ArtifactRow({
           title={url ? (inApp ? "Open in Flight Deck" : "Open in the browser") : "Not published yet"}
         >
           <span className="cv-artpop-fav" aria-hidden="true">
-            {art.favicon || "🎨"}
+            <ArtifactFace face={art.favicon} />
           </span>
           <span className="cv-artpop-main">
             <span className="cv-artpop-title">{art.title}</span>
@@ -123,8 +128,12 @@ function ArtifactRow({
             .reverse()
             .map((v, i) => (
               <div key={v.toolUseId} className="cv-artpop-vrow">
-                <span className="cv-artpop-vn wf-mono">v{vcount - i}</span>
-                <span className="cv-artpop-vlabel">{v.label ?? "—"}</span>
+                {/* The number the publish ack named, else the position — see
+                    `artifactVersionFromResult`: an older binary's ack carries none. */}
+                <span className="cv-artpop-vn wf-mono">v{v.version ?? vcount - i}</span>
+                <span className="cv-artpop-vlabel">
+                  {v.isError ? "Publishing failed" : v.label || v.description || "—"}
+                </span>
               </div>
             ))}
         </div>

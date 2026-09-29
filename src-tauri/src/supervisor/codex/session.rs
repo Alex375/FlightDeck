@@ -23,7 +23,7 @@ use crate::supervisor::control::PermissionDecision;
 use crate::supervisor::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, McpAuthResult,
     McpServerLive, NormalizedBlock, PermissionRequestPayload, RemoteControlState, SessionEmitter,
-    SessionStatePayload,
+    SessionStatePayload, SessionUsage, TokenUsage,
 };
 use crate::supervisor::session::{InitialControls, SessionCommand, SessionError, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig, TransportError};
@@ -1008,12 +1008,25 @@ impl CodexCore {
                 // reasoning across EVERY turn, which only ever grows — so the ring would creep
                 // toward "near full" turn after turn even on a mostly-empty window (a gpt-5.6
                 // conversation reading "near max" at ~350k against its own window is this bug).
-                if let Some(used) = usage
-                    .and_then(|u| u.get("last"))
-                    .and_then(|l| l.get("inputTokens"))
-                    .and_then(Value::as_u64)
-                {
+                let last = usage.and_then(|u| u.get("last"));
+                if let Some(used) = last.and_then(|l| l.get("inputTokens")).and_then(Value::as_u64) {
                     self.state.context_tokens = Some(used);
+                }
+                // The same last turn, broken down onto Claude's shape. OpenAI counts CACHED input
+                // INSIDE `inputTokens` (a subset, not an addition) and has no separate cache
+                // write — so `input` is the uncached remainder and `cache_creation` stays 0,
+                // which keeps `input + cache_read` equal to the fill set just above.
+                if let Some(breakdown) = last.and_then(codex_token_usage) {
+                    self.state.context_usage = Some(breakdown);
+                }
+                // What the THREAD has consumed over its whole life — the one figure this push
+                // carries that is a running total (see the ring above for why it is not the
+                // fill). Same mapping as `last`, cached input split out of the input. Replaced,
+                // never summed. ⚠️ This thread only: collab sub-agents run as their own threads,
+                // whose pushes the demux drops — the UI labels it « this thread ».
+                if let Some(total) = usage.and_then(|u| u.get("total")).and_then(codex_token_usage) {
+                    self.state.session_usage =
+                        Some(SessionUsage { total, cost_usd: None, per_model: Vec::new() });
                 }
                 self.push_state();
             }
@@ -1598,6 +1611,9 @@ impl CodexCore {
             // rider + TTFT are Claude-only; None keeps that part of the footer honest.
             duration_api_ms: None,
             ttft_ms: None,
+            // Codex reports usage per THREAD (`thread/tokenUsage/updated`), never per turn:
+            // there is no honest per-turn consumption to attach here.
+            usage: None,
         });
         self.streaming_ids.clear();
         self.carded.clear();
@@ -2490,9 +2506,43 @@ fn join_reasoning(summary: &[String], content: &[String]) -> String {
         .join("\n\n")
 }
 
+/// A Codex `tokenUsage.last` object on Claude's [`TokenUsage`] shape. OpenAI counts CACHED
+/// input as a SUBSET of `inputTokens` (not an addition, unlike Anthropic's cache fields), and
+/// has no separate cache write: so `input` is the uncached remainder, the cached part is
+/// `cache_read`, and `cache_creation` stays 0 — which keeps `input + cache_read` equal to the
+/// context fill read from the same object. `None` when it reports no counts at all.
+fn codex_token_usage(last: &Value) -> Option<TokenUsage> {
+    let field = |k: &str| last.get(k).and_then(Value::as_u64);
+    let input = field("inputTokens");
+    let cached = field("cachedInputTokens");
+    let output = field("outputTokens");
+    if input.is_none() && cached.is_none() && output.is_none() {
+        return None;
+    }
+    let cached = cached.unwrap_or(0);
+    Some(TokenUsage {
+        input: input.unwrap_or(0).saturating_sub(cached),
+        cache_creation: 0,
+        cache_read: cached,
+        output: output.unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_token_usage_counts_cached_input_inside_input_not_on_top() {
+        // OpenAI: 12_000 input of which 9_000 served from cache → 3_000 fresh + 9_000 cached,
+        // summing back to the 12_000 fill; no cache write on this backend.
+        let last = serde_json::json!({ "inputTokens": 12_000, "cachedInputTokens": 9_000, "outputTokens": 640 });
+        assert_eq!(
+            codex_token_usage(&last),
+            Some(TokenUsage { input: 3_000, cache_creation: 0, cache_read: 9_000, output: 640 })
+        );
+        assert_eq!(codex_token_usage(&serde_json::json!({})), None);
+    }
     use crate::supervisor::model::{BackgroundTask, SlashCommand};
     use std::sync::Mutex;
 
@@ -2673,6 +2723,14 @@ mod tests {
             Some(42_000),
             "ring = last turn's input (current occupancy), NOT the 950k cumulative total"
         );
+        // …while the cumulative total is exactly what the session total reads, cached input
+        // split out of the input (900k of which 0 cached) and reasoning left inside the output.
+        let usage = st.session_usage.expect("the thread total is carried");
+        assert_eq!(
+            usage.total,
+            TokenUsage { input: 900_000, cache_creation: 0, cache_read: 0, output: 40_000 }
+        );
+        assert_eq!(usage.cost_usd, None, "Codex reports no cost");
     }
 
     #[test]

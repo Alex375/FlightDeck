@@ -72,6 +72,12 @@ pub struct SessionStatePayload {
     /// `input + cache_creation + cache_read` (from `message_start` live, then the
     /// `result`). `None` until the first turn reports usage. Drives the context ring.
     pub context_tokens: Option<u64>,
+    /// The same last model call, broken down: what `context_tokens` is made of (fresh input,
+    /// cache written, cache read) plus the tokens it generated. `None` until a call reports
+    /// usage. Set wherever `context_tokens` is, from the same `usage` object — the two never
+    /// disagree — and its `output` completed by the call's `message_delta`. Drives the
+    /// telemetry deck's token breakdown.
+    pub context_usage: Option<TokenUsage>,
     /// Size of the active model's context window (from `result.modelUsage[…].contextWindow`,
     /// e.g. 200k or 1M for Opus in 1M mode). `None` until a `result` reports it; once
     /// known it is kept across turns that omit it. The ring's denominator.
@@ -80,6 +86,57 @@ pub struct SessionStatePayload {
     /// the CLI emits one. NOTE: the stream only carries status + reset, NOT a usage
     /// percentage — that lives behind the `/api/oauth/usage` endpoint (separate task).
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// What the WHOLE session has consumed so far, every agent included — see
+    /// [`SessionUsage`]. Claude: the latest `result.modelUsage` (a cumulative snapshot the CLI
+    /// re-sends in full at each turn end). Codex: the latest `thread/tokenUsage/updated`
+    /// `total` (this thread only). `None` until the first of those arrives; once known it is
+    /// REPLACED by each newer snapshot, never summed with it.
+    ///
+    /// `serde(default)` keeps it OPTIONAL on the TypeScript side (`session_usage?:`), so the
+    /// hand-written state literals of older tests and mocks stay valid without it.
+    #[serde(default)]
+    pub session_usage: Option<SessionUsage>,
+}
+
+/// A session's CUMULATIVE token spend, as the CLI itself counts it.
+///
+/// ⚠️ ONE snapshot, never a sum. On Claude it is `result.modelUsage` summed over its models:
+/// every model call the CLI's query pipeline made — the main loop, `Task` sub-agents at every
+/// depth, sidechains, compaction and Workflow agents (the binary's own schema text), the
+/// permission classifier excepted. Each `result` carries the running total, so the latest
+/// one REPLACES the previous: adding results would count turn 1 N times. `result.usage` (the
+/// main loop's turn only) and every per-agent "tokens" figure of the wire (`task_notification`,
+/// `<subagent_tokens>`, a workflow manifest's `totalTokens`) are SUBSETS or a different unit
+/// (an agent's last call ≈ its final context size) — none of them may ever be added to this.
+///
+/// Claude restores it on `--resume` from the transcript's last `cost-state` line (written when
+/// the process exits), which is also what [`super::history::load_session_usage`] reads to seed
+/// a reopened conversation. A mid-session `/clear` resets it: the value can go DOWN.
+///
+/// Codex: the thread's lifetime `tokenUsage.total` — collab sub-agents run as SEPARATE threads
+/// and are NOT in it; no cost, no per-model split.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct SessionUsage {
+    /// Every model's usage added up. `thinkingTokens` is already INSIDE `output` (never added
+    /// again); on Codex the cached input is inside the input, split out as `cache_read`.
+    pub total: TokenUsage,
+    /// The CLI's cost ESTIMATE for the same calls at API list prices (`result.total_cost_usd`
+    /// live, `totalCostUSD` on disk) — cumulative like the tokens, and not a bill on a plan.
+    /// `None` when the CLI reports none (Codex never does).
+    pub cost_usd: Option<f64>,
+    /// The same total split per model (a helper Haiku next to the conversation's Opus…),
+    /// largest first. Empty on Codex, which reports the thread as a whole.
+    pub per_model: Vec<ModelTokenUsage>,
+}
+
+/// One model's share of a [`SessionUsage`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+pub struct ModelTokenUsage {
+    /// The model id as the CLI keys it (it may carry a `[1m]` suffix).
+    pub model: String,
+    pub usage: TokenUsage,
+    /// This model's share of the cost estimate (`costUSD`), when reported.
+    pub cost_usd: Option<f64>,
 }
 
 /// One selectable model, as the RUNNING session reports it via the `list_models`
@@ -319,6 +376,21 @@ pub struct RemoteControlState {
 pub struct ContextFill {
     pub context_tokens: Option<u64>,
     pub context_window: Option<u64>,
+    /// The breakdown of `context_tokens` (see `SessionState::context_usage`), from the same
+    /// transcript line.
+    pub context_usage: Option<TokenUsage>,
+}
+
+/// The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
+/// the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),
+/// `cache_read` (prompt served from it) — and the `output` generated. Their prompt part sums
+/// to the context occupancy: `input + cache_creation + cache_read`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+    pub output: u64,
 }
 
 /// The active `/goal` of a conversation (Claude Code's native goal feature: Claude keeps
@@ -436,10 +508,17 @@ pub enum ConversationItem {
         total_cost_usd: Option<f64>,
         num_turns: Option<u64>,
         duration_ms: Option<u64>,
-        /// Cumulative model/API time this turn (the "N s of model" breakdown).
+        /// Model/API time spent during THIS turn (the "N s of model" breakdown), derived
+        /// from the CLI's cumulative per-session counter by the assembler. `None` when
+        /// unknown — the first turn of a resumed process (see
+        /// `Assembler::api_ms_baseline`) — or on a backend without the breakdown (Codex).
         duration_api_ms: Option<u64>,
         /// Time-to-first-token this turn; captured but not yet surfaced in the UI.
         ttft_ms: Option<u64>,
+        /// What the turn consumed: `result.usage`, the aggregate over every model call the
+        /// turn made (not its last call — that is `SessionState::context_usage`). `None` when
+        /// the result carries none (Codex reports usage per thread, not per turn).
+        usage: Option<TokenUsage>,
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),

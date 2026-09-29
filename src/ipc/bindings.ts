@@ -50,6 +50,16 @@ async claudeAvailable() : Promise<boolean> {
     return await TAURI_INVOKE("claude_available");
 },
 /**
+ * This Mac's name as the user knows it — the "Computer Name" of System Settings → General →
+ * Sharing (`scutil --get ComputerName`, e.g. « MacBook Pro d'Alexandre »), else the host name.
+ * For the conversation side panel's Machine row, which says WHERE a local conversation runs.
+ * Read once per app run (a machine is not renamed under a running app often enough to poll),
+ * off the main thread. `None` only when neither can be read — the row then says « This Mac ».
+ */
+async localMachineName() : Promise<string | null> {
+    return await TAURI_INVOKE("local_machine_name");
+},
+/**
  * Whether a usable `codex` binary is installed on this machine. Gates the Codex
  * backend selector in the UI so "new Codex conversation" is only offered when the
  * CLI is present. Cheap: a `PATH` / well-known-location file check, never a spawn.
@@ -949,6 +959,22 @@ async loadSessionContext(sessionId: string) : Promise<Result<ContextFill, string
 }
 },
 /**
+ * Read a conversation's cumulative token spend from disk — the seed of the side panel's
+ * session total on open / stream (re)start, before the first live snapshot. Claude: the
+ * transcript's last `cost-state` line (every agent, as of the process's last close). Codex: the
+ * rollout's last `token_count` total (this thread only). `None` when disk holds no such record
+ * (a killed process, a remote conversation whose transcript is on its server): unknown, which
+ * the UI reads as unknown — never zero. A tail read, off the async runtime.
+ */
+async loadSessionUsage(sessionId: string, backend: Backend) : Promise<Result<SessionUsage | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_session_usage", { sessionId, backend }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk
  * transcript. The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the
  * live stream), so the UI polls this at conversation load and on each turn edge to know whether a
@@ -1295,6 +1321,20 @@ async generateMessageSummary(session: string, text: string, seq: number) : Promi
 async interruptSession(session: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("interrupt_session", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Retry every REMOTE session's lost link NOW rather than at the end of its backoff —
+ * fired by the front when the Mac's network comes back or the user returns to the app
+ * (see `SessionCommand::ReconnectNow`). Cheap and idempotent: an attached session, which
+ * is not waiting out a backoff, ignores it. A session that closed meanwhile is skipped.
+ */
+async reconnectRemoteSessions() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_remote_sessions") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2745,6 +2785,18 @@ async machineDiagnose(machineId: string) : Promise<Result<ServerDiagnosis, strin
 }
 },
 /**
+ * The ambient health probe — see [`probe_reachability`] for why it is not
+ * [`machine_diagnose`].
+ */
+async machineReachability(machineId: string) : Promise<Result<MachineReachability, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("machine_reachability", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
  * running anything — `Err` with [`server_busy_error`] when a `bootstrap_server`/
  * `bootstrap_resume`/another `machine_repair` is already in flight against it (the
@@ -2859,7 +2911,6 @@ sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
-tickEvent: TickEvent,
 tosseCrmEvent: TosseCrmEvent,
 tosseLiveStateEvent: TosseLiveStateEvent,
 wakeWordEvent: WakeWordEvent,
@@ -2887,7 +2938,6 @@ sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
-tickEvent: "tick-event",
 tosseCrmEvent: "tosse-crm-event",
 tosseLiveStateEvent: "tosse-live-state-event",
 wakeWordEvent: "wake-word-event",
@@ -3603,7 +3653,12 @@ refs: string[] }
  * provisional window (the transcript carries no authoritative `modelUsage`); the
  * first live `result` later refines it.
  */
-export type ContextFill = { context_tokens: number | null; context_window: number | null }
+export type ContextFill = { context_tokens: number | null; context_window: number | null; 
+/**
+ * The breakdown of `context_tokens` (see `SessionState::context_usage`), from the same
+ * transcript line.
+ */
+context_usage: TokenUsage | null }
 /**
  * A normalized conversation event the UI applies incrementally. Tagged on
  * `kind` so the TS side is a simple discriminated union.
@@ -3639,7 +3694,7 @@ export type ConversationItem =
 /**
  * End of a turn (`result`).
  */
-{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null } | 
+{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null } | 
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
@@ -4035,13 +4090,21 @@ head: string | null;
  */
 upstream: string | null; 
 /**
- * Commits ahead of upstream.
+ * Commits ahead of upstream. ⚠️ Also `0` when there is NO upstream or it is GONE:
+ * read it only when `upstream` is set and `upstream_gone` is false.
  */
 ahead: number; 
 /**
- * Commits behind upstream.
+ * Commits behind upstream. Same caveat as `ahead`.
  */
 behind: number; 
+/**
+ * An upstream is configured but its commit is missing — typically the remote branch
+ * was deleted and pruned. git then prints `branch.upstream` WITHOUT `branch.ab`, so
+ * `ahead`/`behind` are not counts but the struct's defaults: without this flag a gone
+ * upstream reads as a fake "in sync" 0/0.
+ */
+upstream_gone: boolean; 
 /**
  * The branch has no commits yet (unborn HEAD).
  */
@@ -4286,6 +4349,16 @@ owned: boolean }
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
 export type MachineProvisionStatus = { machine_id: string; state: ProvisionState; checked_at_ms: number }
+/**
+ * The one fact the AMBIENT machine-health probe needs: can this Mac reach the server
+ * right now, and if not, why. See [`probe_reachability`].
+ */
+export type MachineReachability = { reachable: boolean; 
+/**
+ * The diagnosis's own wording for why, when unreachable — the SAME string a full
+ * [`diagnose`] would put in [`DiagnosisState::Failed`]. `None` when reachable.
+ */
+reason: string | null }
 /**
  * A remote host (a "server") reached over SSH, on which repos can live and their
  * conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
@@ -4538,6 +4611,18 @@ read_only: boolean | null;
  * `annotations.destructive` — the tool claims it may change or delete data.
  */
 destructive: boolean | null }
+/**
+ * One model's share of a [`SessionUsage`].
+ */
+export type ModelTokenUsage = { 
+/**
+ * The model id as the CLI keys it (it may carry a `[1m]` suffix).
+ */
+model: string; usage: TokenUsage; 
+/**
+ * This model's share of the cost estimate (`costUSD`), when reported.
+ */
+cost_usd: number | null }
 /**
  * One authoritative content block of an assistant message.
  */
@@ -5328,6 +5413,14 @@ ended: boolean;
  */
 context_tokens: number | null; 
 /**
+ * The same last model call, broken down: what `context_tokens` is made of (fresh input,
+ * cache written, cache read) plus the tokens it generated. `None` until a call reports
+ * usage. Set wherever `context_tokens` is, from the same `usage` object — the two never
+ * disagree — and its `output` completed by the call's `message_delta`. Drives the
+ * telemetry deck's token breakdown.
+ */
+context_usage: TokenUsage | null; 
+/**
  * Size of the active model's context window (from `result.modelUsage[…].contextWindow`,
  * e.g. 200k or 1M for Opus in 1M mode). `None` until a `result` reports it; once
  * known it is kept across turns that omit it. The ring's denominator.
@@ -5338,7 +5431,18 @@ context_window: number | null;
  * the CLI emits one. NOTE: the stream only carries status + reset, NOT a usage
  * percentage — that lives behind the `/api/oauth/usage` endpoint (separate task).
  */
-rate_limit: RateLimitSnapshot | null }
+rate_limit: RateLimitSnapshot | null; 
+/**
+ * What the WHOLE session has consumed so far, every agent included — see
+ * [`SessionUsage`]. Claude: the latest `result.modelUsage` (a cumulative snapshot the CLI
+ * re-sends in full at each turn end). Codex: the latest `thread/tokenUsage/updated`
+ * `total` (this thread only). `None` until the first of those arrives; once known it is
+ * REPLACED by each newer snapshot, never summed with it.
+ * 
+ * `serde(default)` keeps it OPTIONAL on the TypeScript side (`session_usage?:`), so the
+ * hand-written state literals of older tests and mocks stay valid without it.
+ */
+session_usage?: SessionUsage | null }
 /**
  * A model-generated few-word summary of the user's LAST message arrived (from a
  * `generate_session_title` control response — same wire as the title, a distinct
@@ -5363,6 +5467,42 @@ export type SessionTaskEvent = { session: string; task: BackgroundTask }
  * fresher title.
  */
 export type SessionTitleEvent = { session: string; title: string; seq: number }
+/**
+ * A session's CUMULATIVE token spend, as the CLI itself counts it.
+ * 
+ * ⚠️ ONE snapshot, never a sum. On Claude it is `result.modelUsage` summed over its models:
+ * every model call the CLI's query pipeline made — the main loop, `Task` sub-agents at every
+ * depth, sidechains, compaction and Workflow agents (the binary's own schema text), the
+ * permission classifier excepted. Each `result` carries the running total, so the latest
+ * one REPLACES the previous: adding results would count turn 1 N times. `result.usage` (the
+ * main loop's turn only) and every per-agent "tokens" figure of the wire (`task_notification`,
+ * `<subagent_tokens>`, a workflow manifest's `totalTokens`) are SUBSETS or a different unit
+ * (an agent's last call ≈ its final context size) — none of them may ever be added to this.
+ * 
+ * Claude restores it on `--resume` from the transcript's last `cost-state` line (written when
+ * the process exits), which is also what [`super::history::load_session_usage`] reads to seed
+ * a reopened conversation. A mid-session `/clear` resets it: the value can go DOWN.
+ * 
+ * Codex: the thread's lifetime `tokenUsage.total` — collab sub-agents run as SEPARATE threads
+ * and are NOT in it; no cost, no per-model split.
+ */
+export type SessionUsage = { 
+/**
+ * Every model's usage added up. `thinkingTokens` is already INSIDE `output` (never added
+ * again); on Codex the cached input is inside the input, split out as `cache_read`.
+ */
+total: TokenUsage; 
+/**
+ * The CLI's cost ESTIMATE for the same calls at API list prices (`result.total_cost_usd`
+ * live, `totalCostUSD` on disk) — cumulative like the tokens, and not a bill on a plan.
+ * `None` when the CLI reports none (Codex never does).
+ */
+cost_usd: number | null; 
+/**
+ * The same total split per model (a helper Haiku next to the conversation's Opus…),
+ * largest first. Empty on Codex, which reports the thread as a whole.
+ */
+per_model: ModelTokenUsage[] }
 /**
  * One skill available to a repository (file-based or plugin-provided).
  */
@@ -5603,9 +5743,12 @@ export type TerminalExitEvent = { id: string }
  */
 export type TerminalOutputEvent = { id: string; data: string }
 /**
- * Emitted periodically by a Rust timer. Proves Rust -> React (typed event).
+ * The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
+ * the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),
+ * `cache_read` (prompt served from it) — and the `output` generated. Their prompt part sums
+ * to the context occupancy: `input + cache_creation + cache_read`.
  */
-export type TickEvent = { seq: number; message: string }
+export type TokenUsage = { input: number; cache_creation: number; cache_read: number; output: number }
 /**
  * Which of Claude Code's three rule lists a rule sits in.
  */

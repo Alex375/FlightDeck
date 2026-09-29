@@ -45,14 +45,18 @@ export interface ActiveDrag {
 // it. This module-level latch (only one drag happens at a time) swallows that ONE click.
 let justDragged = false;
 let disarmTimer: ReturnType<typeof setTimeout> | null = null;
-function armReorderGuard() {
+/** Arm the latch at a drag's START. Exported for every DndContext outside
+ *  {@link useSurfaceOrderDnd} (the side panel's customize view…): ⚠️ without it,
+ *  {@link guardReorderClick} is a silent no-op there and a drop also clicks what it lands on. */
+export function armReorderGuard() {
   justDragged = true;
   if (disarmTimer) {
     clearTimeout(disarmTimer);
     disarmTimer = null;
   }
 }
-function disarmReorderGuardSoon() {
+/** Disarm the latch once the drag ENDS (or is cancelled) — after the trailing click. */
+export function disarmReorderGuardSoon() {
   // The trailing click fires synchronously right after pointerup; a macrotask reset runs
   // AFTER it, so the guard is still armed when that click arrives, then clears itself.
   if (disarmTimer) clearTimeout(disarmTimer);

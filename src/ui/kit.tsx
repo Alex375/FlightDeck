@@ -10,8 +10,12 @@ import {
   type CSSProperties,
   type ReactElement,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
+// The plan-usage wording (reset countdowns, « updated … ago », scoped-cap labels) lives in a pure
+// module shared with the side panel's Plan usage widget — see planUsageFormat.ts.
+import { fmtAgo, fmtReset, resetToEpochSeconds, scopedUsageLabel } from "./planUsageFormat";
 
 const WF_PATHS: Record<string, string> = {
   chat: "M3 11.5a6.5 6 0 0 1 6.5-6h1A6.5 6 0 0 1 17 11.5 6.5 6 0 0 1 10.5 17H6l-2.5 2v-3.2A6.4 6.4 0 0 1 3 11.5Z",
@@ -242,11 +246,56 @@ export function UserMark({ className }: { className?: string }) {
   );
 }
 
+/**
+ * Keeps the title bar's ONE underline under the current tab (the nav child carrying
+ * `data-on`). A single element that moves — rather than an underline per tab — is what lets it
+ * SLIDE from the old tab to the new one; the transition itself is CSS, gated on the bar's
+ * `data-motion`. Driven by observers rather than by React renders: the App re-renders the bar
+ * on many unrelated store changes, and measuring on each would force a layout every time. The
+ * MutationObserver catches a tab switch (`data-on` moving) and a tab appearing (TOSSE once
+ * signed in); the ResizeObserver catches widths changing (fonts landing). The line only gets
+ * `data-ready` — and with it the transition — after its first placement, so it does not sweep
+ * in from the left edge on launch.
+ */
+function useTabUnderline(
+  navRef: RefObject<HTMLDivElement>,
+  lineRef: RefObject<HTMLSpanElement>,
+  enabled: boolean,
+) {
+  useLayoutEffect(() => {
+    const nav = navRef.current;
+    const line = lineRef.current;
+    if (!enabled || !nav || !line) return;
+    const place = () => {
+      const tab = nav.querySelector<HTMLElement>(":scope > [data-on]");
+      if (!tab) {
+        line.style.opacity = "0";
+        return;
+      }
+      line.style.opacity = "1";
+      line.style.width = `${tab.offsetWidth}px`;
+      line.style.transform = `translateX(${tab.offsetLeft}px)`;
+    };
+    place();
+    const raf = requestAnimationFrame(() => line.setAttribute("data-ready", ""));
+    const mo = new MutationObserver(place);
+    mo.observe(nav, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-on"] });
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
+    ro?.observe(nav);
+    return () => {
+      cancelAnimationFrame(raf);
+      mo.disconnect();
+      ro?.disconnect();
+    };
+  }, [navRef, lineRef, enabled]);
+}
+
 export function Win({
   title,
   nav,
   right,
   banner,
+  motion = false,
   children,
 }: {
   title?: ReactNode;
@@ -254,12 +303,23 @@ export function Win({
   right?: ReactNode;
   /** Full-width strip between the title bar and the body (e.g. update banner). */
   banner?: ReactNode;
+  /** Animate the title bar (the tab underline slides, button states ease) — the
+   *  `titleBarAnimations` display pref. The OS "reduce motion" setting still wins, in CSS. */
+  motion?: boolean;
   children: ReactNode;
 }) {
+  const navRef = useRef<HTMLDivElement>(null);
+  const underlineRef = useRef<HTMLSpanElement>(null);
+  useTabUnderline(navRef, underlineRef, !!nav);
   return (
     <div className="wf-win">
-      <div className="wf-titlebar">
-        {nav ? <div className="wf-tbnav">{nav}</div> : null}
+      <div className="wf-titlebar" data-motion={motion ? "" : undefined}>
+        {nav ? (
+          <div className="wf-tbnav" ref={navRef}>
+            {nav}
+            <span className="wf-tbnav-line" ref={underlineRef} aria-hidden="true" />
+          </div>
+        ) : null}
         {/* `title` attribute when the caption is a plain string: it is truncated with an
             ellipsis, so the full name has to stay readable somewhere. */}
         {title ? (
@@ -275,19 +335,14 @@ export function Win({
   );
 }
 
+/** A title-bar view tab: plain text, underlined while current (see `.wf-tbnav`). */
 export function NavBtn({
-  icon,
-  glyph,
   label,
   on,
   badge,
   title,
   onClick,
 }: {
-  icon?: string;
-  /** A ready-made mark, for a tab whose identity isn't one of the `WF_PATHS` glyphs — the
-   *  TOSSE tab wears the CRM's own brand mark. Takes precedence over `icon`. */
-  glyph?: React.ReactNode;
   label: string;
   on?: boolean;
   badge?: number | null;
@@ -295,8 +350,7 @@ export function NavBtn({
   onClick?: () => void;
 }) {
   return (
-    <button {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
-      {glyph ?? (icon ? <Ico name={icon} className="sm" /> : null)}
+    <button type="button" {...(on ? { "data-on": "" } : {})} title={title} onClick={onClick}>
       {label}
       {badge != null ? <span className="wf-badge att">{badge}</span> : null}
     </button>
@@ -672,16 +726,6 @@ export interface PlanUsageWindow {
   resets_at: string | null;
 }
 
-/** Normalize a window's raw `resets_at` to Unix epoch SECONDS for `fmtReset`. Handles
- *  ISO 8601 (the live endpoint) via the native `Date` parser and a digits-only epoch
- *  (the alternate shape). `null` when absent/unparseable. */
-function resetToEpochSeconds(s: string | null): number | null {
-  if (!s) return null;
-  if (/^\d+$/.test(s)) return parseInt(s, 10);
-  const ms = Date.parse(s);
-  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
-}
-
 /** A rate-limit window scoped to ONE model rather than the whole account (e.g. Fable's
  *  weekly allowance). Mirrors the core's `ScopedUsageWindow`; the `label` comes straight
  *  from the endpoint, so a renamed/added scoped model needs no frontend change. */
@@ -714,14 +758,20 @@ export type PlanUsageError =
   | { kind: "unknown_account"; account_id: string }
   | { kind: "token_expired"; detail: string };
 
-/** Message + actionable next step + retry-applies + raw detail, per cause.
- *  Single source of the copy so it lives in one place. */
-function usageErrorCopy(e: PlanUsageError): {
+/** What a failed plan-usage fetch says: the message, the next step, whether a retry can help,
+ *  and the raw detail. */
+export interface UsageErrorCopy {
   msg: string;
   action: string;
   retry: boolean;
   detail: string | null;
-} {
+}
+
+/** Message + actionable next step + retry-applies + raw detail, per cause.
+ *  Single source of the copy so it lives in one place — exported so every surface that shows
+ *  plan usage (the popover's card, the side panel's compact line) reports a failure in the SAME
+ *  words. */
+export function usageErrorCopy(e: PlanUsageError): UsageErrorCopy {
   switch (e.kind) {
     case "no_token":
       return {
@@ -817,7 +867,7 @@ function usageErrorCopy(e: PlanUsageError): {
  *  - full (no data yet): message + action + optional "Retry" + "Details".
  *  - `stale` (data already shown above): a compact non-destructive warning so a failed
  *    refresh is NEVER silent — the bars stay, but the user is told they may be stale. */
-function UsageErrorCard({
+export function UsageErrorCard({
   error,
   loading,
   onRetry,
@@ -975,14 +1025,6 @@ function planStatus(status: string | null): { label: string; color: string } {
   }
 }
 
-/** Label a model-scoped cap: its name plus the window it spans ("Fable · 7d"), so it reads in
- *  the same idiom as the "5h"/"7d" rows above it. The suffix is derived from the payload's
- *  `group`, and dropped when that is absent or unknown — a duration is never guessed. */
-function scopedUsageLabel(s: PlanUsageScopedWindow): string {
-  const win = s.group === "weekly" ? "7d" : s.group === "session" ? "5h" : null;
-  return win ? `${s.label} · ${win}` : s.label;
-}
-
 /** Human label for a rate-limit window type. */
 function planWindow(limitType: string | null): string {
   switch (limitType) {
@@ -993,39 +1035,6 @@ function planWindow(limitType: string | null): string {
     default:
       return limitType ?? "";
   }
-}
-
-/** "in 3d 4h" (≥24h) / "in 2h14" / "in 43min" / "imminent" — computed at render
- *  (popover re-opens). The 7-day window resets days away, so above 24h we show days + hours
- *  (hours-only was impractical: "in 73h"); below 24h we keep hours + minutes. */
-function fmtReset(resetsAt: number | null): string {
-  if (!resetsAt) return "—";
-  const secs = resetsAt - Math.floor(Date.now() / 1000);
-  if (secs <= 0) return "imminent";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  if (h >= 24) {
-    const d = Math.floor(h / 24);
-    const rh = h % 24;
-    return rh > 0 ? `in ${d}d ${rh}h` : `in ${d}d`;
-  }
-  return h > 0 ? `in ${h}h${m.toString().padStart(2, "0")}` : `in ${m}min`;
-}
-
-/** "just now" / "3 min ago" / "2 h ago" / "1 d ago" — how long ago the shown
- *  usage figures were last successfully fetched. `null`/0 (never fetched) → null so the
- *  caller hides the line. Computed at render (the popover re-opens fresh each time). */
-function fmtAgo(ts: number | null | undefined): string | null {
-  if (!ts) return null;
-  const secs = Math.floor((Date.now() - ts) / 1000);
-  if (secs < 30) return "just now";
-  const m = Math.floor(secs / 60);
-  if (m < 1) return "less than 1 min ago";
-  if (m < 60) return `${m} min ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h} h ago`;
-  const d = Math.floor(h / 24);
-  return `${d} d ago`;
 }
 
 /** The context-window + real-usage data feeding both the ring and the meter popovers.
@@ -1054,9 +1063,10 @@ export interface ContextUsageData {
   onRefreshUsage?: () => void;
 }
 
-/** The popover BODY (context window + plan usage + "Compact context"),
- *  factored out so the ring and the card's clickable meter show an identical panel. */
-function ContextUsageBody({
+/** The popover BODY (context window + plan usage + "Compact context"), factored out so the
+ *  ring, the card's clickable meter and the conversation panel's context section all show an
+ *  identical panel — three surfaces, one answer about the same conversation. */
+export function ContextUsageBody({
   ctx,
   plan,
   onCompact,

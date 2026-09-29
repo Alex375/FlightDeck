@@ -315,6 +315,40 @@
   margin-right: 5px;
   opacity: 0.6;
 }
+/* A run that outlived its main answer: "— 3m 40s total" (Enter → last background task),
+   and while that work still runs, a live "— Background task running · 1m 12s" in the
+   green of the calm "backgrounding" state. The dash ties it to the frozen main time. */
+.turnMetaTotal::before,
+.turnMetaBg::before {
+  content: "—";
+  margin-right: 5px;
+  opacity: 0.6;
+  color: var(--wf-tx-lo);
+}
+.turnMetaBg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--wf-run);
+}
+.turnMetaBgDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wf-run);
+  animation: turn-meta-bg-pulse 1.6s ease-in-out infinite;
+}
+@keyframes turn-meta-bg-pulse {
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turnMetaBgDot { animation: none; }
+}
+.turnMetaBgTime::before {
+  content: "·";
+  margin-right: 5px;
+  opacity: 0.6;
+}
 
 /* Live elapsed counter at the right of the working indicator (shown on long turns). */
 .elapsed {

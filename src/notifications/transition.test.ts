@@ -19,6 +19,7 @@ const base: SessionStatePayload = {
   ended: false,
   context_tokens: null,
   context_window: null,
+  context_usage: null,
   rate_limit: null,
 };
 const s = (o: Partial<SessionStatePayload>): SessionStatePayload => ({ ...base, ...o });
@@ -143,6 +144,7 @@ describe("isNoOpTurn", () => {
     durationMs: null,
     durationApiMs: null,
     ttftMs: null,
+    usage: null,
   });
 
   // A local slash command (/status, /goal clear, an unknown command) is answered by

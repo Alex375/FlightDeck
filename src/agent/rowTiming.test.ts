@@ -49,6 +49,35 @@ describe("rowTiming", () => {
     expect(rowTiming(QUESTION, c)).toEqual({ mode: "paused", elapsedMs: 252_000 });
   });
 
+  it("counts from the run's Enter, not from a follow-up turn, when a run is known", () => {
+    // A follow-up turn (the CLI reporting on background work) restamped the turn clock.
+    const c = clock({
+      turnStartedAt: 40_000,
+      lastTurnStartedAt: 40_000,
+      runLiveSince: 1000,
+      runStartedAt: 1000,
+    });
+    expect(rowTiming(RUNNING, c)).toEqual({ mode: "live", startedAt: 1000 });
+  });
+
+  it("counts background work from the Enter of the earliest run still running some", () => {
+    const c = clock({ backgroundSince: 5000, backgroundRunSince: 1000, lastTurnStartedAt: 400_000 });
+    expect(rowTiming(BACKGROUNDING, c)).toEqual({ mode: "live", startedAt: 1000 });
+  });
+
+  it("freezes a settled state on the whole run, follow-ups included", () => {
+    // The last turn alone (a 3s follow-up) is not what the run took.
+    const c = clock({
+      lastTurnStartedAt: 250_000,
+      lastTurnEndedAt: 253_000,
+      runStartedAt: 1000,
+      runSettledAt: 253_000,
+    });
+    expect(rowTiming(REVIEW, c)).toEqual({ mode: "paused", elapsedMs: 252_000 });
+    expect(rowTiming(ERROR, c)).toEqual({ mode: "paused", elapsedMs: 252_000 });
+    expect(rowTiming(QUESTION, c)).toEqual({ mode: "paused", elapsedMs: 252_000 });
+  });
+
   it("freezes a blocked agent at the moment it asked, not at the turn's end", () => {
     const c = clock({ turnStartedAt: 1000, lastTurnStartedAt: 1000, awaitingSince: 9000 });
     expect(rowTiming(PERMISSION, c)).toEqual({ mode: "paused", elapsedMs: 8000 });

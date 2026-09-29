@@ -23,6 +23,7 @@ import type { SessionEntry } from "../../store/types";
 import { useConversationStore } from "../../store/conversationStore";
 import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
+import { artifactFace } from "./artifactIcon";
 import { basename } from "./toolMeta";
 
 /** The canonical hosted-artifact URL shape. The publish tool_result is free text that
@@ -149,6 +150,17 @@ export function artifactUrlFromResult(content: JsonValue | undefined): string | 
   return allArtifactUrls(text).find((u) => u !== typeUrl) ?? null;
 }
 
+/** The version number the publish ack names — `Published <path> at <url> (Version 3)`, a suffix
+ *  the CLI gained in 2.1.270. Null for an older ack that has none, and for a publish still in
+ *  flight. Anchored on the parenthesised form alone, never on the prose around it (which drifts):
+ *  a missing number degrades to counting positions in the list, never to a WRONG number. */
+export function artifactVersionFromResult(content: JsonValue | undefined): number | null {
+  const m = resultText(content).match(/\(Version (\d+)\)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 /** What one publish tells about the artifact it targets — the per-publish half of the typed
  *  detection, shared by the inline card (one publish) and `selectArtifacts` (all of them). */
 export interface PublishInfo {
@@ -187,7 +199,13 @@ export interface ArtifactVersion {
    *  type provides the page; the data files come in a later publish). */
   filePath: string | null;
   description: string | null;
+  /** The emoji face this publish asked for, resolved from its `icon` (a word, the current wire)
+   *  or its `favicon` (an emoji, the legacy one) — see {@link artifactFace}. */
   favicon: string | null;
+  /** The version number the ack named (`(Version 3)`), or null when the ack has none (an older
+   *  binary) or has not landed yet. NOT a position in {@link Artifact.versions}: a publish that
+   *  FAILED gets no number, so the two can legitimately disagree. */
+  version: number | null;
   /** True when THIS publish's tool_result came back `is_error` (a failed/refused publish).
    *  False while still in flight (no result yet) or on success. */
   isError: boolean;
@@ -204,8 +222,9 @@ export interface Artifact {
    *  publish tool_use and its tool_result landing — and for an artifact whose every publish
    *  FAILED (a failed publish's URL is not an artifact you can open). */
   url: string | null;
-  /** Emoji favicon — of the most recent version that set it (last-known-good, so a republish
-   *  that omits the favicon keeps the prior one), or null. */
+  /** Emoji face — of the most recent version that set one (last-known-good, so a republish that
+   *  omits it keeps the prior one), or null. Resolved from the publish's `icon`/`favicon`; see
+   *  {@link artifactFace} for why the wire needs both. */
   favicon: string | null;
   /** Gallery subtitle — of the most recent version that set it (last-known-good), or null. */
   description: string | null;
@@ -334,7 +353,9 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
       const label = field(b.input, "label") ?? null;
       const title = field(b.input, "title")?.trim() || null;
       const description = field(b.input, "description") ?? null;
-      const favicon = field(b.input, "favicon") ?? null;
+      // BOTH icon fields: `icon` (a word) is what the CLI sends now, `favicon` (an emoji) what
+      // every transcript already on disk carries. Reading only the old one is what emptied the tile.
+      const favicon = artifactFace(field(b.input, "icon"), field(b.input, "favicon"));
       const info = publishInfo(b.input, result?.content);
       const isError = !!result?.isError;
       // A failed publish's URL is NOT this artifact's identity: the tool refuses, for instance, a
@@ -377,7 +398,15 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
       }
       if (urlKey) byKey.set(urlKey, art);
       if (fileKey) byKey.set(fileKey, art);
-      art.versions.push({ label, toolUseId: b.id, filePath, description, favicon, isError });
+      art.versions.push({
+        label,
+        toolUseId: b.id,
+        filePath,
+        description,
+        favicon,
+        version: artifactVersionFromResult(result?.content),
+        isError,
+      });
       // Header fields = LAST-KNOWN-GOOD (timeline order = oldest→newest): keep the last non-null we
       // see, so a republish that omits a field doesn't blank the header. Typed is sticky: one typed
       // publish makes the whole artifact typed (its page is the type's, whatever a later publish
@@ -406,6 +435,10 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
     let lastLabel: string | null = null;
     for (const v of a.versions) if (v.label && v.label.trim()) lastLabel = v.label;
     a.typeName = a.typeUrl ? typeNames.get(a.typeUrl) ?? null : null;
+    // ⚠️ A TYPED artifact names NO icon at all (the tool ignores `icon` when the artifact comes
+    // from a type — verified over every publish of a real Design conversation), so the icon-wire
+    // fix alone still left it on the blank tile. Its type IS what it is: "Design" → 🎨.
+    a.favicon ??= artifactFace(null, null, a.typeName);
     a.title = artifactTitle(titles.get(a) ?? null, lastLabel, a.latestFilePath, {
       typed: a.typed,
       typeName: a.typeName,
@@ -416,13 +449,21 @@ export function selectArtifacts(entry: SessionEntry | undefined): Artifact[] {
 
 /** A cheap content signature — lets {@link memoizedArtifacts} return the SAME array reference
  *  when the derived list is unchanged, so a tool_result for an unrelated tool (frequent) never
- *  re-renders the chip. */
+ *  re-renders the chip.
+ *
+ *  ⚠️ It must cover EVERYTHING a surface reads, the versions included. The version list is on
+ *  screen (side panel, composer popover), and a republish's ack only fills in that version's
+ *  NUMBER — the artifact's own url/title/count are already settled by then. Signing the header
+ *  alone left the previous array in place and the number never appeared. */
 function artifactsSig(list: Artifact[]): string {
   return list
     .map(
       (a) =>
         `${a.id}#${a.url ?? ""}#${a.versions.length}#${a.favicon ?? ""}#${a.title}` +
-        `#${a.latestFilePath ?? ""}#${a.typed ? 1 : 0}#${a.typeName ?? ""}`,
+        `#${a.latestFilePath ?? ""}#${a.typed ? 1 : 0}#${a.typeName ?? ""}` +
+        `#${a.versions
+          .map((v) => `${v.version ?? ""}:${v.isError ? 1 : 0}:${v.label ?? ""}:${v.description ?? ""}`)
+          .join(",")}`,
     )
     .join("|");
 }

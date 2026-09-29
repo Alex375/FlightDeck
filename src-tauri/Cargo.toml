@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.6.0"
+version = "2.7.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -129,8 +129,9 @@ specta-typescript = "=0.0.9"
 # agent's microphone (see `wake/mod.rs`). 100% on-device: NO network, NO cloud,
 # the captured audio never leaves the Mac. `cpal` captures the default input
 # device; `ort` (ONNX Runtime) runs the openWakeWord pipeline (melspectrogram →
-# shared speech embedding → per-phrase classifier), gated by a Silero VAD so the
-# neural nets run ONLY on speech (the battery guard). All five ONNX models are
+# shared speech embedding → per-phrase classifier) plus a Silero VAD, which vetoes
+# a fire unless it heard speech. The whole pipeline runs on every 80 ms step while
+# the wake word is on — no silence-based battery guard. All six ONNX models are
 # bundled into the binary (`include_bytes!` from `assets/wake/`), so the feature
 # works offline on first launch — no download, no external asset host. `ort` is an
 # RC, pinned EXACTLY like the specta/tauri-specta RCs above.

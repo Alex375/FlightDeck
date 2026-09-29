@@ -19,6 +19,7 @@ vi.mock("../ipc/client", () => {
       codexLoadHistory: vi.fn(() => ok([])),
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),
+      loadSessionUsage: vi.fn(() => ok(null)),
       deleteConversation: vi.fn(() => ok()),
       deleteRepo: vi.fn(() => ok()),
       deleteMachine: vi.fn(() => ok()),
@@ -595,7 +596,7 @@ describe("conversationsStore — persisted reminder", () => {
     seed(baseConv({ id: "c-load", sessionId: "sess-load", pendingReminder: "review" }));
     const cs = useConversationStore.getState();
     const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
     const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
     // Non-empty history so the loader runs past its early return and reaches markSeen.
@@ -627,7 +628,7 @@ describe("conversationsStore — persisted reminder", () => {
     const id = createConversationInRepo("/tmp/r1");
     useConversationsStore.getState().noteSessionId(id, "sess-born");
     const cs = useConversationStore.getState();
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     vi.mocked(commands.loadSessionHistory).mockResolvedValueOnce({
       status: "ok",
       data: [{}],
@@ -653,7 +654,7 @@ describe("conversationsStore — persisted reminder", () => {
     } as unknown as DiskConversation);
     const cs = useConversationStore.getState();
     const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
     const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
     vi.mocked(commands.loadSessionHistory).mockResolvedValueOnce({
@@ -747,7 +748,7 @@ describe("conversationsStore — friction-free delete + undo", () => {
     seed(baseConv({ id: "u5", sessionId: "sess-u5" }));
     const cs = useConversationStore.getState();
     const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
     const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
     // Non-empty history so the loader runs past its early return and records the guard.
@@ -928,7 +929,7 @@ describe("conversationsStore — backend (kind) branches", () => {
     seed(baseConv({ id: "cx-hist", kind: "codex", sessionId: "thread-1" }));
     const cs = useConversationStore.getState();
     const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
     const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
     // Non-empty history so the loader runs past its early return, down to the seed gate.
@@ -955,7 +956,7 @@ describe("conversationsStore — backend (kind) branches", () => {
     seed(baseConv({ id: "cl-hist", sessionId: "sess-cl" }));
     const cs = useConversationStore.getState();
     const ensureSession = vi.spyOn(cs, "ensureSession").mockImplementation(() => {});
-    const applyItem = vi.spyOn(cs, "applyItem").mockImplementation(() => {});
+    const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
     const applyContextFill = vi.spyOn(cs, "applyContextFill").mockImplementation(() => {});
     const markSeen = vi.spyOn(cs, "markSeen").mockImplementation(() => {});
     vi.mocked(commands.loadSessionHistory).mockResolvedValueOnce({

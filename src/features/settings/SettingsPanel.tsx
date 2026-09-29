@@ -8,7 +8,14 @@
 // "General". Sub-tabs carry the rest — growing the rail is the wrong axis.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import {
+  demoteBypassConversations,
+  useConversationsStore,
+  wipeAllData,
+} from "../../store/conversationsStore";
+import { useSidePanelLayout } from "../../store/sidePanelWidgetsStore";
+import { useEditorStore } from "../editor/editorStore";
+import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
@@ -18,6 +25,12 @@ import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
 import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, formatZoom, nextZoom, prevZoom } from "../../ui/zoom";
+import {
+  DEFAULT_READING_WIDTH,
+  MAX_READING_WIDTH,
+  MIN_READING_WIDTH,
+  READING_WIDTH_STEP,
+} from "../../ui/readingWidth";
 import { UpdateSection } from "./UpdateSection";
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { NotificationsSection } from "./NotificationsSection";
@@ -604,9 +617,10 @@ const MINIMAP_HOVER_MODES: Array<{ id: MinimapHoverMode; label: string; desc: st
   },
 ];
 
-/** The "Appearance" card of Display → Appearance: the app's global look and what the
- *  Flight Deck card shows. Shares its sub-page with {@link MotionPrefs} — both answer
- *  "how does the app itself look", as opposed to the thread ({@link ThreadPrefs}). */
+/** The "Appearance" and "Workflows" cards of Display → Appearance: the app's global look,
+ *  and how a running workflow shows on its Flight Deck card and in its detail view. Shares
+ *  its sub-page with {@link MotionPrefs} — all answer "how does the app itself look", as
+ *  opposed to the thread ({@link ThreadPrefs}). */
 function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
@@ -627,6 +641,9 @@ function AppearancePrefs() {
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Workflows" icon="grid">
         <ToggleRow
           title="Live workflow on the Flight Deck card"
           hint={
@@ -765,24 +782,44 @@ function IdePrefs() {
   );
 }
 
-/** The "Thread" card of Display → Thread: how the conversation itself reads. Every toggle
- *  here is a GLOBAL default — e.g. "clean output" folds each round's work behind a "Work"
- *  block, and a conversation's composer chip can still override its own. Rendered above
- *  the Markdown card (`ConversationSection`), which is the same subject. */
+/** The cards of Display → Thread, one per thing the user is looking at: how the thread
+ *  reads, how to move around it, the side panel beside it, and artifact previews. Every
+ *  toggle here is a GLOBAL default — e.g. "clean output" folds each round's work behind a
+ *  "Work" block, and a conversation's composer chip can still override its own. Rendered
+ *  above the Markdown card (`ConversationSection`), which is the same subject. The telemetry
+ *  deck has no switch here: it is a panel widget, chosen in the panel's Customize view. */
 function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
+  const sidePanelFitContent = useDisplay((s) => s.sidePanelFitContent);
+  const activeConvId = useConversationsStore((s) => s.activeId);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const artifactsInApp = useDisplay((s) => s.artifactsInApp);
+  const artifactHidesSidePanel = useDisplay((s) => s.artifactHidesSidePanel);
+  const conversationWidth = useDisplay((s) => s.conversationWidth);
   const set = useDisplay((s) => s.set);
   return (
     <>
-      <SettingsGroup title="Thread" icon="chat">
+      <SettingsGroup title="Reading" icon="chat">
+        <ToggleRow
+          title="Conversation width"
+          hint={
+            <>
+              The widest the conversation's <strong>text column</strong> gets — the thread and
+              the composer share it. Narrower leaves more margin on both sides — handy with both
+              side bars open, where the default runs almost edge to edge.{" "}
+              <strong>{DEFAULT_READING_WIDTH} px by default.</strong>
+            </>
+          }
+          control={
+            <WidthStepper width={conversationWidth} onChange={(v) => set({ conversationWidth: v })} />
+          }
+        />
         <ToggleRow
           title="Clean output (default)"
           hint={
@@ -811,6 +848,9 @@ function ThreadPrefs() {
           onChange={(v) => set({ showTaskNotifications: v })}
           label="Show background task notifications"
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Navigation & controls" icon="list">
         <ToggleRow
           title="Preview of the last sent message"
           hint={
@@ -824,22 +864,6 @@ function ThreadPrefs() {
           checked={showLastMessagePreview}
           onChange={(v) => set({ showLastMessagePreview: v })}
           label="Preview of the last sent message"
-        />
-        <ToggleRow
-          title="Conversation side panel"
-          hint={
-            <>
-              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
-              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
-              so the header only holds actions. Open or close it with its header button or{" "}
-              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
-              above the composer. Off → the previous layout: those chips in the header and the
-              composer, the todo list above the composer. <strong>On by default.</strong>
-            </>
-          }
-          checked={conversationSidePanel}
-          onChange={(v) => set({ conversationSidePanel: v })}
-          label="Show the conversation side panel"
         />
         <ToggleRow
           title="Message minimap"
@@ -902,6 +926,84 @@ function ThreadPrefs() {
           onChange={(v) => set({ clickableFileMentions: v })}
           label="Make the filename on Read/Write rows clickable"
         />
+      </SettingsGroup>
+
+      <SettingsGroup title="Side panel" icon="sidebar">
+        <ToggleRow
+          title="Conversation side panel"
+          hint={
+            <>
+              Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
+              list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
+              so the header only holds actions. Open or close it with its header button or{" "}
+              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              above the composer. Off → the previous layout: those chips in the header and the
+              composer, the todo list above the composer. <strong>On by default.</strong>
+            </>
+          }
+          checked={conversationSidePanel}
+          onChange={(v) => set({ conversationSidePanel: v })}
+          label="Show the conversation side panel"
+        />
+        <ToggleRow
+          title="Side panel fits its content"
+          hint={
+            <>
+              The conversation panel sits at the <strong>top right</strong>, only as tall as what
+              it holds, and <strong>grows</strong> — animated — when a TOSSE task, a goal, todos
+              or an artifact show up (and shrinks when they go). Past the bottom of the window it
+              scrolls. Off → a full-height column. <strong>Off by default.</strong>
+              {conversationSidePanel ? null : (
+                <> It shapes the conversation panel, so turn that on first.</>
+              )}
+            </>
+          }
+          checked={sidePanelFitContent}
+          onChange={(v) => set({ sidePanelFitContent: v })}
+          label="Fit the conversation panel to its content"
+          disabled={!conversationSidePanel}
+        />
+        <ToggleRow
+          title="Conversation panel widgets"
+          hint={
+            <>
+              Choose what the conversation panel shows — its task, goal, todo list, artifacts,
+              linked conversations, stats, context, git status, plan usage, the{" "}
+              <strong>telemetry deck</strong>, and the stream, worktree and machine rows at the
+              bottom — in what order, and whether its sections fold. Opens the panel's{" "}
+              <strong>Customize</strong> view (also its header button), with presets from{" "}
+              <strong>Essentials</strong> (the default) to <strong>Cockpit</strong>. A widget
+              switched off gives its old place back (the header chip, the composer chip, the todo
+              bar).
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {!conversationSidePanel ? (
+                <> It needs the conversation panel, so turn that on first.</>
+              ) : !activeConvId ? (
+                <> Open a conversation first.</>
+              ) : null}
+            </>
+          }
+          control={
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.ghost}`}
+              disabled={!conversationSidePanel || !activeConvId}
+              onClick={() => {
+                if (!activeConvId) return;
+                // Into the conversation (which also closes Settings), its panel open, in its
+                // customize view.
+                useEditorStore.getState().setConvPanelOpen(true);
+                useSidePanelLayout.getState().setCustomizing(true);
+                openConversationAt(activeConvId, null);
+              }}
+            >
+              Customize…
+            </button>
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Artifacts" icon="artifact">
         <ToggleRow
           title="Show hosted artifacts in Flight Deck"
           hint={
@@ -918,6 +1020,20 @@ function ThreadPrefs() {
           onChange={(v) => set({ artifactsInApp: v })}
           label="Show claude.ai-hosted artifacts in the side panel"
         />
+        <ToggleRow
+          title="Hide the conversation panel while previewing an artifact"
+          hint={
+            <>
+              Puts the <strong>conversation panel</strong> away while an artifact preview is open,
+              and brings it back when you close the preview — side by side they leave the thread a
+              sliver. <strong>On by default.</strong> It only ever hides a panel that was already
+              on screen, so an artifact never opens one you had closed. Off → both stay up.
+            </>
+          }
+          checked={artifactHidesSidePanel}
+          onChange={(v) => set({ artifactHidesSidePanel: v })}
+          label="Hide the conversation panel while an artifact is open"
+        />
       </SettingsGroup>
 
     </>
@@ -930,6 +1046,7 @@ function MotionPrefs() {
   const flightdeckModalZoom = useDisplay((s) => s.flightdeckModalZoom);
   const panelAnimations = useDisplay((s) => s.panelAnimations);
   const conversationAnimations = useDisplay((s) => s.conversationAnimations);
+  const titleBarAnimations = useDisplay((s) => s.titleBarAnimations);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -984,6 +1101,21 @@ function MotionPrefs() {
           onChange={(v) => set({ conversationAnimations: v })}
           label="Animate work folding and unfolding"
         />
+        <ToggleRow
+          title="Animate the title bar"
+          hint={
+            <>
+              The underline under the current view <strong>slides to the tab you pick</strong>,
+              a panel button's <strong>open dot grows in and out</strong>, and the system
+              switches give under the click. <strong>On by default</strong> (under a fifth of a
+              second). Off → the bar changes state in one frame. Your system's{" "}
+              <strong>"reduce motion"</strong> setting always wins over this.
+            </>
+          }
+          checked={titleBarAnimations}
+          onChange={(v) => set({ titleBarAnimations: v })}
+          label="Animate the title bar"
+        />
       </SettingsGroup>
     </>
   );
@@ -1028,6 +1160,44 @@ function ZoomStepper({ zoom, onChange }: { zoom: number; onChange: (next: number
         className={styles.zoomReset}
         onClick={() => onChange(DEFAULT_ZOOM)}
         disabled={zoom === DEFAULT_ZOOM}
+      >
+        Reset
+      </button>
+    </div>
+  );
+}
+
+/** The conversation width's − / value / + / Reset — the zoom stepper's shape and styles, one
+ *  {@link READING_WIDTH_STEP} per click (the store snaps anything else onto that grid). */
+function WidthStepper({ width, onChange }: { width: number; onChange: (next: number) => void }) {
+  return (
+    <div className={styles.zoomCtl}>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(width - READING_WIDTH_STEP)}
+        disabled={width <= MIN_READING_WIDTH}
+        aria-label="Narrower"
+      >
+        −
+      </button>
+      <span className={`${styles.zoomVal} ${styles.widthVal}`} aria-live="polite">
+        {width} px
+      </span>
+      <button
+        type="button"
+        className={styles.zoomBtn}
+        onClick={() => onChange(width + READING_WIDTH_STEP)}
+        disabled={width >= MAX_READING_WIDTH}
+        aria-label="Wider"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        className={styles.zoomReset}
+        onClick={() => onChange(DEFAULT_READING_WIDTH)}
+        disabled={width === DEFAULT_READING_WIDTH}
       >
         Reset
       </button>
@@ -1154,9 +1324,10 @@ function TimingPrefs() {
         title="Turn duration"
         hint={
           <>
-            Under each finished turn, the <strong>total time</strong> it took; and a{" "}
-            <strong>live counter</strong> when a turn runs past 40&nbsp;s.{" "}
-            <strong>On by default.</strong>
+            Under each answer, the <strong>time since your message</strong> — and, when
+            background tasks outlive the answer, a live counter until they finish, then the{" "}
+            <strong>total</strong>. Plus a <strong>live counter</strong> while the agent works
+            past 40&nbsp;s. <strong>On by default.</strong>
           </>
         }
         checked={showTurnDuration}

@@ -10,9 +10,14 @@ import styles from "./editor.module.css";
 export function Splitter({
   axis,
   onMove,
+  quiet = false,
 }: {
   axis: "x" | "y";
   onMove: (clientX: number, clientY: number) => void;
+  /** Draw no rule at rest — only on hover and while dragging. For a divider that sits in a
+   *  GAP between two surfaces that already frame themselves (a floating panel's edge), where a
+   *  standing line would be a third edge between two. The hit area is unchanged. */
+  quiet?: boolean;
 }) {
   const dragging = useRef(false);
 
@@ -36,7 +41,7 @@ export function Splitter({
 
   return (
     <div
-      className={axis === "x" ? styles.splitterX : styles.splitterY}
+      className={`${axis === "x" ? styles.splitterX : styles.splitterY}${quiet ? ` ${styles.splitterQuiet}` : ""}`}
       role="separator"
       aria-orientation={axis === "x" ? "vertical" : "horizontal"}
       onPointerDown={onDown}

@@ -39,6 +39,7 @@ import {
   type SlideAxis,
   type SlideEdge,
   type SlidePlan,
+  type SlideTiming,
 } from "./panelSlide";
 
 type Phase = "closed" | "measure" | "sliding" | "open";
@@ -66,6 +67,14 @@ export interface PanelSlideOptions {
   /** The slot's style once settled — the parent's own flex/min sizing. Also the style the
    *  slot is measured in, so it must be exactly what the panel rests at. */
   restStyle: CSSProperties;
+  /**
+   * Override the duration + curve this travel would otherwise pick from its direction.
+   *
+   * The ONE caller: a HAND-OFF, where this panel is only leaving (or coming back) because
+   * another is taking (or giving back) its column — see {@link SWAP_TIMING}. Both halves pass
+   * it, so the two slides run as one movement instead of on two clocks.
+   */
+  timing?: SlideTiming;
   /** Set false to switch to instant open/close for this panel while keeping the hook (and
    *  its phase) alive. Used when an ANCESTOR is already animating the same appearance —
    *  a panel sliding inside a sliding panel reads as a stutter, not as depth. Defaults
@@ -125,6 +134,7 @@ export function usePanelSlide({
   axis,
   edge = "end",
   restStyle,
+  timing,
   enabled = true,
 }: PanelSlideOptions): PanelSlide {
   const [phase, setPhase] = useState<Phase>(open ? "open" : "closed");
@@ -143,6 +153,11 @@ export function usePanelSlide({
   phaseRef.current = phase;
   const openRef = useRef(open);
   openRef.current = open;
+  // Read from the effects rather than declared as a dep: it is an object literal, so a dep
+  // would re-run the handshake on every render — and it only ever matters at the instant a
+  // travel is posted, which is exactly when the effects read it.
+  const timingRef = useRef(timing);
+  timingRef.current = timing;
 
   const stop = useCallback(() => {
     animRef.current?.cancel();
@@ -182,7 +197,7 @@ export function usePanelSlide({
       setPhase("measure");
       return;
     }
-    const plan = slidePlan(from, 0);
+    const plan = slidePlan(from, 0, timingRef.current);
     if (!plan) {
       setPhase("closed");
       return;
@@ -194,7 +209,7 @@ export function usePanelSlide({
   useLayoutEffect(() => {
     if (phase !== "measure") return;
     const to = sizeAlong(slotRef.current, axis);
-    const plan = slidePlan(fromRef.current, to);
+    const plan = slidePlan(fromRef.current, to, timingRef.current);
     if (!plan) {
       // Nothing worth playing (a zero-size region, or a panel already at its target):
       // land open rather than animate a pixel.

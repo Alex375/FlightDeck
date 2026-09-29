@@ -22,6 +22,7 @@ import type {
   LoginResultReason,
   LoginSession,
   MachineProvisionStatus,
+  MachineReachability,
   MachineRecord,
   MachineRevokeStatus,
   RepairAction,
@@ -106,7 +107,6 @@ import type {
   HostBounds,
   TerminalExitEvent,
   TerminalOutputEvent,
-  TickEvent,
   UsageError,
   ClientSecret,
   FolderTree,
@@ -123,8 +123,9 @@ import type {
   ManagedMemory,
   SpendReport,
   SubagentRouting,
+  SessionUsage,
 } from "../bindings";
-import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
@@ -199,7 +200,6 @@ const accountLoginEvent = new MockEmitter<AccountLoginEvent>();
 // host's reconnection handling run for real here.
 const tosseCrmEvent = new MockEmitter<TosseCrmEvent>();
 const tosseLiveStateEvent = new MockEmitter<TosseLiveStateEvent>();
-const tickEvent = new MockEmitter<TickEvent>();
 // No real filesystem in the browser mock — these never fire, but must exist so
 // the editor's `useFsWatch` can subscribe without crashing.
 const fsChangeEvent = new MockEmitter<FsChangeEvent>();
@@ -246,7 +246,6 @@ export const mockEvents = {
   accountLoginEvent,
   tosseCrmEvent,
   tosseLiveStateEvent,
-  tickEvent,
   fsChangeEvent,
   fsWatchErrorEvent,
   workflowJournalEvent,
@@ -1056,6 +1055,10 @@ export const mockCommands = {
   async codexAvailable(): Promise<boolean> {
     return true;
   },
+  // The side panel's Machine row names the local Mac.
+  async localMachineName(): Promise<string | null> {
+    return "MacBook Pro";
+  },
   async codexListModels(): Promise<
     Result<
       { id: string; displayName: string; efforts: string[]; defaultEffort: string | null; isDefault: boolean }[],
@@ -1647,6 +1650,7 @@ export const mockCommands = {
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
     else if (demo === "remotelinkblockedhost") driver.startRemoteLinkBlocked("ssh_host_key_changed");
+    else if (demo === "artifacts") driver.startPageArtifacts();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).
@@ -1893,6 +1897,12 @@ export const mockCommands = {
     return ok(demoContextFill());
   },
 
+  async loadSessionUsage(_sessionId: string, _backend: Backend): Promise<Result<SessionUsage | null, string>> {
+    // No transcript in the browser mock: nothing on "disk" — except under `?ctx=nowindow`,
+    // which reproduces a reloaded conversation (see `demoSessionUsageSeed`).
+    return ok(demoSessionUsageSeed());
+  },
+
   async loadSessionGoal(_sessionId: string): Promise<Result<GoalState | null, string>> {
     // No transcript in the browser mock; goal-active scenarios seed the goal store directly.
     return ok(null);
@@ -2059,7 +2069,7 @@ export const mockCommands = {
     if (remoteDemo && mockMachines.length === 0) {
       const up = findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
       const down = findOrCreateMockMachine("build-box", "10.0.0.5", 22, "ci");
-      // The ambient health poll runs `machineDiagnose` against both — seeding their
+      // The ambient health poll runs `machineReachability` against both — seeding their
       // diagnoses is what makes the mark's two states appear in the browser build.
       mockDiagnoses.set(up.id, readyDiagnosis());
       mockDiagnoses.set(down.id, {
@@ -2412,6 +2422,20 @@ export const mockCommands = {
     const d = mockDiagnoses.get(machineId);
     if (!d) return err("unknown server");
     return ok({ ...d });
+  },
+
+  async reconnectRemoteSessions(): Promise<Result<null, string>> {
+    return ok(null);
+  },
+
+  // Same verdict the full mock diagnosis carries, in the shape the ambient probe gets.
+  async machineReachability(machineId: string): Promise<Result<MachineReachability, string>> {
+    const d = mockDiagnoses.get(machineId);
+    if (!d) return err("unknown server");
+    return ok({
+      reachable: d.reachable,
+      reason: !d.reachable && d.state.kind === "failed" ? d.state.reason : null,
+    });
   },
 
   async machineRepair(machineId: string, action: RepairAction, sudoPassword: string | null): Promise<Result<RepairOutcome, string>> {
@@ -3351,6 +3375,7 @@ const MOCK_GIT_STATUS: GitStatus = {
   upstream: "origin/main",
   ahead: 2,
   behind: 1,
+  upstream_gone: false,
   unborn: false,
   files: MOCK_GIT_FILES,
 };

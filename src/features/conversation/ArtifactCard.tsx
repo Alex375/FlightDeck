@@ -19,6 +19,7 @@ import { useToolResult } from "../../store/conversationStore";
 import { Dot, Ico } from "../../ui/kit";
 import { useDisplay } from "../../store/display";
 import { artifactHeadline, publishInfo, useArtifacts } from "./artifacts";
+import { ArtifactFace, artifactFace } from "./artifactIcon";
 import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
 import { useHostInert } from "./FileMention";
 import { basename } from "./toolMeta";
@@ -48,7 +49,9 @@ export function ArtifactCard({
   // typed artifact's name (set at creation, while this may be the later data fill) and its type.
   const artifact = useArtifacts(session).find((a) => (url ? a.url === url : a.versions.some((v) => v.toolUseId === toolUseId)));
   const typed = info.typed || !!artifact?.typed;
-  const favicon = field(input, "favicon") ?? artifact?.favicon ?? null;
+  // `icon` (a word) is the wire today, `favicon` (an emoji) what older transcripts carry — see
+  // artifactIcon.ts. This publish's own choice wins; the artifact's is the last-known-good.
+  const favicon = artifactFace(field(input, "icon"), field(input, "favicon")) ?? artifact?.favicon ?? null;
   const label = field(input, "label")?.trim() || null;
   const description = field(input, "description")?.trim() || null;
   const filePath = field(input, "file_path") ?? "";
@@ -106,6 +109,10 @@ export function ArtifactCard({
   return (
     <div
       className="cv-art"
+      // The anchor a "go to this version" click scrolls to (side panel → version row, via
+      // threadJump). This card is its OWN segment, never folded by clean output, so the target
+      // is always mounted — no fold to open first, unlike the agent-message anchors.
+      data-artifact-publish={toolUseId}
       data-open={clickable || undefined}
       data-state={errored ? "error" : undefined}
       onClick={clickable ? open : undefined}
@@ -121,7 +128,7 @@ export function ArtifactCard({
       }
     >
       <span className="cv-art-tile" aria-hidden="true">
-        {favicon || "🎨"}
+        <ArtifactFace face={favicon} />
       </span>
       <span className="cv-art-body">
         <span className="cv-art-title">{headline}</span>

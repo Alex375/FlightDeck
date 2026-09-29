@@ -2,10 +2,25 @@ import { describe, it, expect } from "vitest";
 import {
   effortLabel,
   EFFORT_LABELS,
+  fmtDuration,
   isDetachedAgentAck,
   runIdFromResult,
   shortModel,
 } from "./subagentMeta";
+
+describe("fmtDuration", () => {
+  it("formats ms, seconds, then minutes + seconds", () => {
+    expect(fmtDuration(850)).toBe("850ms");
+    expect(fmtDuration(6300)).toBe("6.3s");
+    expect(fmtDuration(46_000)).toBe("46s");
+    expect(fmtDuration(220_000)).toBe("3m 40s");
+  });
+
+  it("never prints an impossible 60 seconds", () => {
+    expect(fmtDuration(119_600)).toBe("2m 00s");
+    expect(fmtDuration(179_700)).toBe("3m 00s");
+  });
+});
 
 describe("effortLabel", () => {
   it("maps each CLI effort level to its display label", () => {

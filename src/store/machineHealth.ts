@@ -27,7 +27,9 @@
 //    fixes. Same reasoning the remote mark itself already carries.
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
-import { commands, type ServerDiagnosis } from "../ipc/client";
+import { commands, type MachineReachability, type ServerDiagnosis } from "../ipc/client";
+import type { Conversation, Repo } from "./conversationsStore";
+import type { SessionEntry } from "./types";
 
 /** What we know about one machine's reachability. Absent from the store = UNKNOWN. */
 export interface MachineHealth {
@@ -61,11 +63,22 @@ export function healthFromDiagnosis(
   d: ServerDiagnosis,
   nowMs: number,
 ): MachineHealth {
+  return healthFromReachability(prev, { reachable: d.reachable, reason: d.reachable ? null : reasonOf(d) }, nowMs);
+}
+
+/** Fold a reachability-only verdict (the ambient probe, `machine_reachability`) into what
+ *  we already knew. Same fold as {@link healthFromDiagnosis} — the backend builds
+ *  `reason` from the very same classifier, in the very same words. Pure. */
+export function healthFromReachability(
+  prev: MachineHealth | undefined,
+  r: MachineReachability,
+  nowMs: number,
+): MachineHealth {
   return {
-    reachable: d.reachable,
+    reachable: r.reachable,
     checkedAtMs: nowMs,
-    lastReachedAtMs: d.reachable ? nowMs : (prev?.lastReachedAtMs ?? null),
-    reason: d.reachable ? null : reasonOf(d),
+    lastReachedAtMs: r.reachable ? nowMs : (prev?.lastReachedAtMs ?? null),
+    reason: r.reachable ? null : r.reason,
     probeError: null,
   };
 }
@@ -79,6 +92,14 @@ function reasonOf(d: ServerDiagnosis): string | null {
 
 interface MachineHealthState {
   byMachine: Record<string, MachineHealth>;
+  /** Machines with a probe in flight RIGHT NOW, whoever fired it (the ambient sweep, a live
+   *  trigger, a "Check now" button). A mirror of the module-private `inFlight` set, for the
+   *  UI only: a button that awaited its own `probeMachine` call would stop spinning at once
+   *  whenever its click landed on a probe already in flight (the dedup returns immediately),
+   *  while the round trip it is waiting on is still out. Read it with `useMachineProbing`.
+   *  ⚠️ `inFlight` stays the dedup authority — it is synchronous; a store update is not the
+   *  place to decide whether to dial. */
+  probing: Record<string, true>;
   /** Record a diagnosis — from the ambient poll, from the Settings server card, from
    *  anywhere that already paid for one. Every producer funnels through here so the
    *  badge can never disagree with the panel.
@@ -87,6 +108,9 @@ interface MachineHealthState {
    *  are in flight at once (see `isStaleProbe`). Omit it only where no newer probe can
    *  possibly exist. */
   record: (machineId: string, diagnosis: ServerDiagnosis, startedAtMs?: number) => void;
+  /** Record a reachability-only verdict — the ambient probe's, or the evidence of a live
+   *  session that is attached to the machine right now. Same ordering rule as `record`. */
+  recordReachability: (machineId: string, verdict: MachineReachability, startedAtMs?: number) => void;
   /** A probe that never produced a verdict. Keeps whatever we already knew. */
   recordProbeError: (machineId: string, error: string, startedAtMs?: number) => void;
   /** Drop a machine's row — it was unpaired. */
@@ -115,6 +139,7 @@ function isStaleProbe(machineId: string, startedAtMs: number | undefined): boole
 
 export const useMachineHealthStore = create<MachineHealthState>((set) => ({
   byMachine: {},
+  probing: {},
   record: (machineId, diagnosis, startedAtMs) => {
     if (isStaleProbe(machineId, startedAtMs)) return;
     appliedProbeStartMs.set(machineId, startedAtMs ?? Date.now());
@@ -127,6 +152,17 @@ export const useMachineHealthStore = create<MachineHealthState>((set) => ({
       byMachine: {
         ...s.byMachine,
         [machineId]: healthFromDiagnosis(s.byMachine[machineId], diagnosis, Date.now()),
+      },
+    }));
+  },
+  recordReachability: (machineId, verdict, startedAtMs) => {
+    if (isStaleProbe(machineId, startedAtMs)) return;
+    appliedProbeStartMs.set(machineId, startedAtMs ?? Date.now());
+    lastProbeAtMs.set(machineId, Date.now());
+    set((s) => ({
+      byMachine: {
+        ...s.byMachine,
+        [machineId]: healthFromReachability(s.byMachine[machineId], verdict, Date.now()),
       },
     }));
   },
@@ -166,6 +202,21 @@ export const useMachineHealthStore = create<MachineHealthState>((set) => ({
 export const useMachineHealth = (machineId: string | null | undefined): MachineHealth | undefined =>
   useMachineHealthStore((s) => (machineId ? s.byMachine[machineId] : undefined));
 
+/** Whether a probe of this machine is in flight right now — whoever fired it. */
+export const useMachineProbing = (machineId: string | null | undefined): boolean =>
+  useMachineHealthStore((s) => (machineId ? s.probing[machineId] === true : false));
+
+/** Mirror the in-flight set into the store (see `MachineHealthState.probing`). */
+function setProbing(machineId: string, on: boolean): void {
+  useMachineHealthStore.setState((s) => {
+    if ((s.probing[machineId] === true) === on) return s;
+    const probing = { ...s.probing };
+    if (on) probing[machineId] = true;
+    else delete probing[machineId];
+    return { probing };
+  });
+}
+
 /** Every machine currently known to be out of reach. Stable identity while the set does
  *  not change, so a subscriber does not re-render on every probe that confirms health. */
 export const useUnreachableMachineIds = (): string[] =>
@@ -181,6 +232,50 @@ export const useUnreachableMachineIds = (): string[] =>
  *  we have never reached a verdict on is NOT unreachable — it is unknown. */
 export const isUnreachable = (h: MachineHealth | undefined): boolean =>
   h !== undefined && h.checkedAtMs > 0 && !h.reachable;
+
+/** The verdict a live, attached session is evidence of. */
+export const REACHED: MachineReachability = { reachable: true, reason: null };
+
+/**
+ * Machines that a live session is ATTACHED to right now — i.e. whose ssh link is up and
+ * answering its keepalives this very moment (`link === null` once `fd_attach` landed;
+ * `connecting`/`reconnecting` otherwise). For those, a probe would only re-prove what the
+ * session already proves, at the price of a fresh ssh handshake: the ambient poll skips
+ * them and files the attached link as the evidence instead. The moment the link drops,
+ * its state flips to `reconnecting`, which probes at once (`useGlobalSessionEvents`).
+ *
+ * Pure (types only, no store import — `conversationsStore` imports this module).
+ * `session_id` must be known too: a freshly spawned entry starts from the neutral
+ * connecting state (`link: null`) before its first real state event, and must not read
+ * as attached.
+ */
+export function attachedMachineIds(
+  conversations: ReadonlyArray<Pick<Conversation, "id" | "repoId" | "handle">>,
+  repos: ReadonlyArray<Pick<Repo, "id" | "machineId">>,
+  sessions: Readonly<Record<string, Pick<SessionEntry, "state"> | undefined>>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const c of conversations) {
+    if (!c.handle) continue;
+    const st = sessions[c.id]?.state;
+    if (!st || st.ended || st.link != null || st.session_id == null) continue;
+    const machineId = repos.find((r) => r.id === c.repoId)?.machineId;
+    if (machineId) out.add(machineId);
+  }
+  return out;
+}
+
+/** Whether any live remote session has LOST its link (connecting / reconnecting) — the
+ *  only case a reconnect nudge can do anything for. Pure. */
+export function anyRemoteLinkDown(
+  sessions: Readonly<Record<string, Pick<SessionEntry, "state"> | undefined>>,
+): boolean {
+  for (const id in sessions) {
+    const st = sessions[id]?.state;
+    if (st && !st.ended && st.link != null) return true;
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Probing
@@ -214,11 +309,15 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
   const last = lastProbeAtMs.get(machineId) ?? 0;
   if (!force && Date.now() - last < PROBE_MIN_GAP_MS) return;
   inFlight.add(machineId);
+  setProbing(machineId, true);
   const startedAtMs = Date.now();
   lastProbeAtMs.set(machineId, startedAtMs);
   try {
-    const res = await commands.machineDiagnose(machineId);
-    if (res.status === "ok") useMachineHealthStore.getState().record(machineId, res.data, startedAtMs);
+    // Reachability only — see `machine_reachability`'s doc in Rust: the full diagnosis is a
+    // dozen server-side commands (two of them Node.js start-ups) for a glyph that reads one
+    // boolean. The server panel still runs `machine_diagnose` and files it through `record`.
+    const res = await commands.machineReachability(machineId);
+    if (res.status === "ok") useMachineHealthStore.getState().recordReachability(machineId, res.data, startedAtMs);
     else useMachineHealthStore.getState().recordProbeError(machineId, res.error, startedAtMs);
   } catch (e) {
     useMachineHealthStore
@@ -226,13 +325,16 @@ export async function probeMachine(machineId: string, force = false): Promise<vo
       .recordProbeError(machineId, e instanceof Error ? e.message : String(e), startedAtMs);
   } finally {
     inFlight.delete(machineId);
+    setProbing(machineId, false);
   }
 }
 
 /** Test seam — the module-level dedup state is deliberately not in the store (it is
- *  scheduling, not UI state), so a test needs a way to start clean. */
+ *  scheduling, not UI state), so a test needs a way to start clean. Clears its UI mirror
+ *  (`probing`) with it. */
 export function resetProbeStateForTests(): void {
   inFlight.clear();
   lastProbeAtMs.clear();
   appliedProbeStartMs.clear();
+  useMachineHealthStore.setState({ probing: {} });
 }

@@ -4,6 +4,7 @@ import {
   fleetSegments,
   isFleetCalm,
   lanesToTokens,
+  localConversations,
   mergedFleetSegments,
   orderLanes,
   rebuildLanes,
@@ -285,5 +286,24 @@ describe("rebuildLanes ↔ lanesToTokens round-trip", () => {
 
     expect(rebuilt.map((l) => l.repo.id)).toEqual(["a"]);
     expect(rebuilt[0].conversations.map((c) => c.id)).toEqual(["a1"]);
+  });
+});
+
+describe("localConversations", () => {
+  // The Caffeinate policy's scope: a conversation on a remote server keeps working while
+  // this Mac sleeps, so it must never hold the Mac awake.
+  it("keeps only the conversations of repos that live on this Mac", () => {
+    const repos = [
+      { id: "local", machineId: null },
+      { id: "remote", machineId: "m1" },
+      { id: "legacy" }, // pre-machines row: no field at all = local
+    ];
+    const convs = [conv("a", "local", 1), conv("b", "remote", 2), conv("c", "legacy", 3)];
+    expect(localConversations(convs, repos).map((c) => c.id)).toEqual(["a", "c"]);
+  });
+
+  it("returns every conversation when no repo is remote", () => {
+    const convs = [conv("a", "local", 1)];
+    expect(localConversations(convs, [{ id: "local", machineId: null }])).toBe(convs);
   });
 });

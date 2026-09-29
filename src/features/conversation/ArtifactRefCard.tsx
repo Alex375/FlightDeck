@@ -10,6 +10,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Ico } from "../../ui/kit";
 import { useArtifacts } from "./artifacts";
+import { ArtifactFace } from "./artifactIcon";
 import { openArtifactView } from "./artifactOpen";
 
 function childrenText(children: ReactNode): string {
@@ -69,7 +70,7 @@ export function ArtifactRefCard({
       }}
     >
       <span className="cv-artref-fav" aria-hidden="true">
-        {favicon || "🎨"}
+        <ArtifactFace face={favicon} />
       </span>
       <span className="cv-artref-t">{title}</span>
       <Ico name="external" className="sm" />

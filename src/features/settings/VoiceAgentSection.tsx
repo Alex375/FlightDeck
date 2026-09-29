@@ -86,6 +86,18 @@ export function VoiceAgentSection() {
     };
   }, []);
 
+  // The core re-applies the wake word whenever the key changes (no key = paused,
+  // microphone off; a key back = resumed), so re-read its status after either.
+  const refreshWake = useCallback(() => {
+    void commands
+      .wakeWordStatus()
+      .then((s) => {
+        setWake(s);
+        useWakeStore.getState().setStatus(s);
+      })
+      .catch((e) => setError(`Could not read the wake word status: ${String(e)}`));
+  }, []);
+
   const applyWake = useCallback(
     async (patch: {
       enabled?: boolean;
@@ -125,25 +137,30 @@ export function VoiceAgentSection() {
       if (res.status === "ok") {
         publish(res.data);
         setKeyDraft("");
+        refreshWake();
       } else {
         setError(res.error);
       }
     } finally {
       setBusy(false);
     }
-  }, [keyDraft, publish]);
+  }, [keyDraft, publish, refreshWake]);
 
   const removeKey = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
       const res = await commands.clearVoiceAgentKey();
-      if (res.status === "ok") publish(res.data);
-      else setError(res.error);
+      if (res.status === "ok") {
+        publish(res.data);
+        refreshWake();
+      } else {
+        setError(res.error);
+      }
     } finally {
       setBusy(false);
     }
-  }, [publish]);
+  }, [publish, refreshWake]);
 
   /** Store the picked voice, then tell the truth about when it will be heard. */
   const pickVoice = useCallback(async (next: string) => {
@@ -539,6 +556,9 @@ export function VoiceAgentSection() {
       </SettingsGroup>
 
       <SettingsGroup title="Wake word" icon="spark">
+        {/* Switching the wake word OFF is never blocked — it is an always-on
+            microphone. Only switching it ON needs a key, and the reason is in the
+            hint as plain text (a disabled control's tooltip never shows). */}
         <ToggleRow
           title="Listen for the wake word"
           hint={
@@ -550,13 +570,15 @@ export function VoiceAgentSection() {
                 lit).
                 {wake?.error ? <div className={styles.dangerText}>⚠️ {wake.error}</div> : null}
               </>
+            ) : wake?.enabled ? (
+              "Paused: there is no OpenAI key, so the microphone is off — the wake word only opens the voice agent. It resumes by itself once a key is added above; switch it off to stop it for good."
             ) : (
               "Add an OpenAI key above first — the wake word opens the voice agent."
             )
           }
           checked={!!wake?.enabled}
           onChange={(next) => void applyWake({ enabled: next })}
-          disabled={!configured || !wake || wakeBusy}
+          disabled={!wake || wakeBusy || (!configured && !wake.enabled)}
         />
         <ToggleRow
           title="Wake phrase"
@@ -640,7 +662,8 @@ export function VoiceAgentSection() {
           }
           checked={!!wake?.debug_capture}
           onChange={(next) => void applyWake({ debugCapture: next })}
-          disabled={!configured || !wake || !wake.enabled || wakeBusy}
+          // It records microphone audio to disk: turning it OFF is never blocked.
+          disabled={!wake || wakeBusy || (!wake.debug_capture && (!configured || !wake.enabled))}
         />
       </SettingsGroup>
     </>

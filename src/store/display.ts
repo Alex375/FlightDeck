@@ -5,6 +5,7 @@
 import { create } from "zustand";
 import { useConversationsStore } from "./conversationsStore";
 import { DEFAULT_ZOOM, sanitizeZoom } from "../ui/zoom";
+import { DEFAULT_READING_WIDTH, sanitizeReadingWidth } from "../ui/readingWidth";
 
 const STORAGE_KEY = "tosse:display";
 
@@ -53,6 +54,13 @@ export interface DisplayPrefs {
    *  could leave the window unreadable with no way back through the UI. */
   uiZoom: number;
 
+  /** The widest the conversation's reading column may get, px — the thread's text and the
+   *  composer, which share it. 840 by default — the column's historical width, so nothing
+   *  changes until someone narrows it; stepped by 40 between 560 and 1080 and
+   *  {@link sanitizeReadingWidth}d on load and on write. A CAP: a pane narrower than it keeps
+   *  its usual 26px either side. Read by {@link ConversationPane}. */
+  conversationWidth: number;
+
   /** Show the "Fleet readout" banner (the adaptive "N Running · N Review · …" stage
    *  counts across the whole fleet) at the TOP of the FlightDeck. On by default. Set
    *  from Settings → General. Independent of {@link fleetBannerConversation}. */
@@ -92,6 +100,16 @@ export interface DisplayPrefs {
    *  the todo list pinned above the composer. Read by {@link ConversationSidePanel} and every
    *  surface it replaces. */
   conversationSidePanel: boolean;
+
+  // (The telemetry deck's switch is no longer here: it became one of the side panel's widgets —
+  // store/sidePanelWidgetsStore.ts, which carries an old `conversationTelemetry: true` over once.)
+
+  /** Shape the conversation side panel to what it holds: a sheet at the top right, only as
+   *  tall as its sections, that grows (animated) when a TOSSE task, a goal, todos or an
+   *  artifact arrive and shrinks when they go — scrolling inside once it reaches the bottom of
+   *  the window. OFF by default (the full-height column); opt-in. Read by
+   *  {@link ConversationSidePanel} (see useFitHeight). */
+  sidePanelFitContent: boolean;
 
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
@@ -148,6 +166,13 @@ export interface DisplayPrefs {
    *  necessarily the person who wants panels to stop sliding. */
   conversationAnimations: boolean;
 
+  /** Animate the title bar: the current view's underline SLIDES to the tab you pick instead
+   *  of jumping there, a panel button's "open" dot grows in and out, and the system switches
+   *  give under the click. ON by default (~0.18 s for the slide, ~0.14 s for the rest). Off →
+   *  the bar changes state in one frame. The OS "reduce motion" setting overrides this
+   *  whichever way it is set (CSS media query). Read by App → {@link Win}'s `motion` flag. */
+  titleBarAnimations: boolean;
+
   /** Show the hover controls on conversation messages — "resume from here" (rewind
    *  the conversation in place) and "fork" (branch a new conversation at this message),
    *  offered on both the user's and Claude's messages. ON by default. Off → messages have no
@@ -183,6 +208,14 @@ export interface DisplayPrefs {
    *  page artifacts with their local file still preview in-app either way. Read by
    *  {@link openArtifactView} and the {@link ArtifactViewer}'s missing-file fallback. */
   artifactsInApp: boolean;
+
+  /** Put the conversation side panel away while an artifact preview is open, and bring it back
+   *  when the preview closes. ON by default: the panel and the preview are both "what this
+   *  conversation produced", and side by side they leave the thread a sliver. It only ever
+   *  HIDES a panel that was on screen — an artifact never opens one that was closed, so closing
+   *  the preview can't reveal something nobody asked for. Off → both stay up, the panel floating
+   *  over the right edge when the row runs out of room. Read by {@link openArtifactView}. */
+  artifactHidesSidePanel: boolean;
 
   /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
    *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
@@ -256,15 +289,18 @@ export interface DisplayPrefs {
    *  Read by {@link ClientAvatar}. */
   tosseClientFavicons: boolean;
 
-  /** Show the TURN's own timing in the conversation thread. Gates two surfaces: the total
-   *  wall-clock in the FINISHED-turn footer (`result.duration_ms`) — {@link TurnResultRow};
-   *  AND the LIVE elapsed counter on a running turn past the threshold — {@link LiveElapsed}.
-   *  ON by default. Off → neither is rendered. */
+  /** Show a prompt's RUN timing in the conversation thread, counted from the user's Enter
+   *  (see `agent/runClock.ts`). Gates two surfaces: the timing line under a run's latest
+   *  result — main-answer time, then a live "background task running" counter or the total
+   *  once its background work is done — {@link TurnResultRow}; AND the LIVE elapsed counter
+   *  while the agent works past the threshold — {@link LiveElapsed}. ON by default. Off →
+   *  neither is rendered. */
   showTurnDuration: boolean;
 
-  /** Show the "· N s of model" breakdown (`result.duration_api_ms`) next to the turn's
-   *  total in the footer. Rides the footer, so only visible when {@link showTurnDuration} is
-   *  also on. ON by default. Read by {@link TurnResultRow}. */
+  /** Show the "· N s of model" breakdown (the per-turn share of the CLI's cumulative
+   *  `result.duration_api_ms`, summed over the run) next to the run's time in the footer.
+   *  Rides the footer, so only visible when {@link showTurnDuration} is also on. ON by
+   *  default. Read by {@link TurnResultRow}. */
   showModelTime: boolean;
 
   /** Show the reflection time on each thinking block — a live counter while thinking, frozen
@@ -329,6 +365,7 @@ const DEFAULTS: DisplayPrefs = {
   cleanOutput: false,
   markdownMode: "warm",
   uiZoom: DEFAULT_ZOOM,
+  conversationWidth: DEFAULT_READING_WIDTH,
   fleetBannerFlightDeck: true,
   fleetBannerConversation: true,
   showTaskNotifications: false,
@@ -336,6 +373,7 @@ const DEFAULTS: DisplayPrefs = {
   agentCreationToasts: true,
   showLastMessagePreview: true,
   conversationSidePanel: true,
+  sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
   // two messages, so it costs nothing on the short conversations where it has nothing to
   // map. Summary hover by default: one line reads at a glance; "full" is a click away in
@@ -347,10 +385,12 @@ const DEFAULTS: DisplayPrefs = {
   flightdeckModalZoom: true,
   panelAnimations: true,
   conversationAnimations: true,
+  titleBarAnimations: true,
   messageControls: true,
   clickableFileMentions: true,
   tosseToolCards: true,
   artifactsInApp: true,
+  artifactHidesSidePanel: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
   ideView: true,
@@ -385,7 +425,12 @@ function load(): DisplayPrefs {
     // value could make the app unusable with (see `sanitizeZoom`), so it is re-checked
     // here rather than trusted from storage.
     const stored = JSON.parse(raw) as Partial<DisplayPrefs>;
-    return { ...DEFAULTS, ...stored, uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM) };
+    return {
+      ...DEFAULTS,
+      ...stored,
+      uiZoom: sanitizeZoom(stored.uiZoom ?? DEFAULT_ZOOM),
+      conversationWidth: sanitizeReadingWidth(stored.conversationWidth),
+    };
   } catch {
     return DEFAULTS;
   }
@@ -412,6 +457,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         cleanOutput: patch.cleanOutput ?? s.cleanOutput,
         markdownMode: patch.markdownMode ?? s.markdownMode,
         uiZoom: sanitizeZoom(patch.uiZoom ?? s.uiZoom),
+        conversationWidth: sanitizeReadingWidth(patch.conversationWidth ?? s.conversationWidth),
         fleetBannerFlightDeck: patch.fleetBannerFlightDeck ?? s.fleetBannerFlightDeck,
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
@@ -419,6 +465,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
+        sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
@@ -426,10 +473,12 @@ export const useDisplay = create<DisplayState>((set) => ({
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
         panelAnimations: patch.panelAnimations ?? s.panelAnimations,
         conversationAnimations: patch.conversationAnimations ?? s.conversationAnimations,
+        titleBarAnimations: patch.titleBarAnimations ?? s.titleBarAnimations,
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
         artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
+        artifactHidesSidePanel: patch.artifactHidesSidePanel ?? s.artifactHidesSidePanel,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         ideView: patch.ideView ?? s.ideView,

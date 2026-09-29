@@ -30,6 +30,7 @@ import {
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { effectiveCwd } from "../git/worktree";
 import { openInIdeBlockedReason } from "../ide/openInIde";
 import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions";
@@ -184,6 +185,10 @@ export const ConductorComposer = forwardRef<
   }
 >(function ConductorComposer({ session, onSent, hasPanels = true, stateInPanel = false }, ref) {
   const state = useSessionState(session);
+  // The panel shows the goal and the artifacts only while their widgets are on; a widget
+  // switched off gives its chip back to the composer.
+  const artifactsOn = useWidgetOn("artifacts");
+  const goalOn = useWidgetOn("goal");
   const send = useSendMessage(session);
   const interrupt = useInterrupt(session);
   // The unsent draft is NOT component-local state: the conversation pane is keyed by
@@ -1098,7 +1103,7 @@ export const ConductorComposer = forwardRef<
     // Artifacts index — every artifact Claude published in THIS conversation, with its
     // versions. Renders only when there is ≥1 (Codex conversations never yield any).
     // Read-only toward claude.ai (surfaces the transcript; never republishes).
-    artifacts: stateInPanel ? null : (
+    artifacts: stateInPanel && artifactsOn ? null : (
       // `hasPanels` IS the "does this host have a side region?" signal the pane already
       // threads down (it is `!inertMentions`), so the chip is told rather than made to guess.
       <ArtifactsChip session={session} inert={!hasPanels} />
@@ -1142,7 +1147,7 @@ export const ConductorComposer = forwardRef<
     ),
     // Active `/goal` — a target button; click opens a popover with the condition + a clear
     // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
-    goal: !isCodex && !stateInPanel ? <GoalChip convId={session} /> : null,
+    goal: !isCodex && !(stateInPanel && goalOn) ? <GoalChip convId={session} /> : null,
     // Worktree checkbox — only before the session spawns (first message).
     // Explicit empty/checked box so the on/off state is unambiguous.
     worktree: isFresh ? (

@@ -124,6 +124,11 @@ pub enum SessionCommand {
     /// `/compact` text command on the app-server). Fire-and-forget — a failure is
     /// surfaced by the Codex actor as a timeline notice.
     Compact,
+    /// Cut a REMOTE session's reconnect backoff short and retry now: the Mac's network
+    /// just came back, or the user just returned to the app. Only meaningful while the
+    /// actor is waiting out a backoff (see `run_actor`); a no-op everywhere else — an
+    /// attached remote session, a local one, Codex.
+    ReconnectNow,
     /// Tear the session down. `ack`, when present, is fired by the actor ONLY after the
     /// process is fully reaped (the graceful EOF→SIGTERM→SIGKILL ladder has run), so a
     /// caller can wait for the `claude` process to ACTUALLY be gone — required before any
@@ -503,6 +508,12 @@ impl SessionHandle {
         self.send(SessionCommand::Compact).await
     }
 
+    /// Retry a remote session's lost link NOW instead of at the end of its backoff — see
+    /// [`SessionCommand::ReconnectNow`]. Fire-and-forget.
+    pub async fn reconnect_now(&self) -> Result<(), SessionError> {
+        self.send(SessionCommand::ReconnectNow).await
+    }
+
     /// Request teardown WITHOUT waiting for the process to be reaped (the quit path uses
     /// this and then polls [`Sessions::is_empty`]). For a REMOTE session this only
     /// DETACHES — the server-side `claude` keeps running (quitting the app must never
@@ -561,7 +572,13 @@ pub fn spawn_session(
     appmcp: Option<Arc<crate::appmcp::ControlHub>>,
 ) -> Result<SessionHandle, SessionError> {
     let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
-    let core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
+    let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
+    // A brand-new session's cumulative model-time counter starts at zero, so even its
+    // first turn's model time is exact. A resumed / re-attached one restores an unknown
+    // total first (see `Assembler::api_ms_baseline`).
+    if cfg.resume.is_none() && cfg.attach.is_none() {
+        core.assembler.mark_fresh_session();
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit, cfg));
     Ok(SessionHandle { id, cmd_tx })
@@ -1022,7 +1039,7 @@ async fn run_actor(
         } else {
             // Still in the same outage (the previous attempt spawned ssh but
             // never got an fd_attach): escalate the backoff.
-            delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            delay = next_reconnect_delay(delay, outage_attempts);
         }
         // A6: past the threshold against the SAME candidate, try the next
         // recorded address (see `next_candidate_after_failure`'s doc for the
@@ -1046,6 +1063,13 @@ async fn run_actor(
                         break 'outer false;
                     }
                     None => break 'outer false,
+                    // The network came back, or the user returned to the app: retry
+                    // now rather than sleep out a backoff that can reach minutes.
+                    Some(SessionCommand::ReconnectNow) => {}
+                    // A send while offline still fails (send_failed) — but the user is
+                    // plainly here and wants THIS conversation: retry now too, so the
+                    // next send can land instead of waiting out the backoff.
+                    Some(cmd @ SessionCommand::SendUser { .. }) => core.on_command(cmd),
                     Some(cmd) => { core.on_command(cmd); continue; }
                 },
             }
@@ -1092,7 +1116,7 @@ async fn run_actor(
                 }
                 Err(e) => {
                     eprintln!("[session] remote reconnect failed (retrying in {delay:?}): {e}");
-                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                    delay = next_reconnect_delay(delay, outage_attempts);
                     // A6: the spawn itself (forking the local ssh client) never even
                     // got off the ground — mirrors the `!attach_seen` failure signal
                     // above, against whichever candidate `cfg2.remote.host` (== the
@@ -1408,6 +1432,31 @@ fn reattach_cursor_delta(lines_seen: u64, first_unparseable_offset: Option<u64>,
     } else {
         first_unparseable_offset.unwrap_or(lines_seen)
     }
+}
+
+/// Failed reconnect attempts, in one outage, before the backoff turns patient. At the
+/// quick cap (doubling from 1 s, then every 30 s) that is ~3 minutes: long enough to ride
+/// out a blip, a Wi-Fi hand-off or a server reboot at full speed.
+const QUICK_RECONNECT_ATTEMPTS: u32 = 10;
+/// Backoff ceiling while the outage is young.
+const QUICK_RECONNECT_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backoff ceiling once it is not. A long outage is a plane, a laptop off the network, a
+/// server switched off — every attempt forks `ssh` and dials for up to 10 s, per remote
+/// conversation, for as long as it lasts. The two moments the link is likely back — the
+/// Mac's network returning, the user coming back to the app — cut the wait short through
+/// [`SessionCommand::ReconnectNow`], and so does a send; this ceiling is only the floor
+/// of how fast an outage nobody is looking at gets noticed.
+const PATIENT_RECONNECT_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The next backoff of a remote session's reconnect loop, after `outage_attempts`
+/// failed attempts in the current outage. Pure — see [`QUICK_RECONNECT_ATTEMPTS`].
+fn next_reconnect_delay(delay: std::time::Duration, outage_attempts: u32) -> std::time::Duration {
+    let cap = if outage_attempts >= QUICK_RECONNECT_ATTEMPTS {
+        PATIENT_RECONNECT_CAP
+    } else {
+        QUICK_RECONNECT_CAP
+    };
+    (delay * 2).min(cap)
 }
 
 /// A6 — sustained reconnect failure address rotation: how many CONSECUTIVE
@@ -2421,6 +2470,9 @@ impl SessionCore {
             // slash-command turn the composer sends directly), so there's nothing to do
             // on the control channel here.
             SessionCommand::Compact => {}
+            // Only acted on inside `run_actor`'s backoff wait; outside an outage there is
+            // nothing to reconnect.
+            SessionCommand::ReconnectNow => {}
             // Shutdown is handled in the run loop (breaks before reaching here).
             SessionCommand::Shutdown { .. } => {}
         }
@@ -2451,6 +2503,23 @@ mod tests {
     use super::*;
     use crate::supervisor::model::{ConversationItem, PermissionRequestPayload, SessionStatePayload};
     use serde_json::json;
+
+    /// Quick while the outage is young (a blip, a reboot), patient once it is not (a
+    /// plane): 1 s doubling to 30 s for the first attempts, then up to 5 min.
+    #[test]
+    fn reconnect_backoff_turns_patient_after_a_long_outage() {
+        let s = std::time::Duration::from_secs;
+        let mut delay = s(1);
+        let mut seen = Vec::new();
+        for attempt in 1..=14 {
+            delay = next_reconnect_delay(delay, attempt);
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 30, 30, 30, 30, 30, 60, 120, 240, 300, 300]);
+        // The attempt count, not the delay, decides the ceiling.
+        assert_eq!(next_reconnect_delay(s(30), QUICK_RECONNECT_ATTEMPTS - 1), QUICK_RECONNECT_CAP);
+        assert_eq!(next_reconnect_delay(s(30), QUICK_RECONNECT_ATTEMPTS), s(60));
+    }
 
     /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var —
     /// the SAME crate-wide lock `transport::tests` uses for its own direct

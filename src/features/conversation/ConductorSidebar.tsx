@@ -28,6 +28,7 @@ import {
 } from "../../agent/status";
 import { useConversationStore } from "../../store/conversationStore";
 import { rowTiming } from "../../agent/rowTiming";
+import { rowRunClock } from "../../agent/runClock";
 import { fmtFrozenElapsed, useLiveElapsed } from "../../ui/liveElapsed";
 import { useShallow } from "zustand/react/shallow";
 import { useSettingsUi } from "../../store/settingsUi";
@@ -74,6 +75,7 @@ function RowLive({ convId, status }: { convId: string; status: AgentStatus }) {
             lastTurnStartedAt: e.lastTurnStartedAt,
             lastTurnEndedAt: e.lastTurnEndedAt,
             awaitingSince: e.awaitingSince,
+            ...rowRunClock(e.runClock),
           }
         : undefined;
     }),
@@ -151,6 +153,11 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   const rowState = {
     "data-pill": pill ?? undefined,
     "data-calm": pill ? undefined : status.kind === "off" ? "off" : "idle",
+    // A blue review row while background work still runs (the "re-alert on background Bash"
+    // finish edge): it keeps its blue, plus the green row's violet wash on its right end —
+    // "worth a look, AND something still runs behind it". Read from the raw count, since the
+    // derived `review` carries none.
+    "data-bgrun": pill === "review" && runningBgTasks > 0 ? "" : undefined,
   };
   const select = useConversationsStore((s) => s.selectConversation);
   const rename = useConversationsStore((s) => s.renameConversation);

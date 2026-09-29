@@ -16,8 +16,8 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationItem, GoalState, SlashCommand, WorkflowJournal, WorkflowPhase,
-    WorkflowRun,
+    ContextFill, ConversationItem, GoalState, SessionUsage, SlashCommand, WorkflowJournal,
+    WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig};
@@ -131,6 +131,17 @@ impl Sessions {
             .collect();
         claude.sort_by(|a, b| a.id.cmp(&b.id));
         claude
+    }
+
+    /// Snapshot the live REMOTE (SSH) handles — the only sessions with a link to lose.
+    fn remote_handles(&self) -> Vec<SessionHandle> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.is_remote)
+            .map(|s| s.handle.clone())
+            .collect()
     }
 
     /// Whether any session is still registered (still tearing down or live).
@@ -454,6 +465,47 @@ pub async fn spawn_session(
 #[specta::specta]
 pub fn codex_available() -> bool {
     crate::supervisor::codex::codex_available()
+}
+
+/// This Mac's name as the user knows it — the "Computer Name" of System Settings → General →
+/// Sharing (`scutil --get ComputerName`, e.g. « MacBook Pro d'Alexandre »), else the host name.
+/// For the conversation side panel's Machine row, which says WHERE a local conversation runs.
+/// Read once per app run (a machine is not renamed under a running app often enough to poll),
+/// off the main thread. `None` only when neither can be read — the row then says « This Mac ».
+#[tauri::command]
+#[specta::specta]
+pub async fn local_machine_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(name) = NAME.get() {
+        return name.clone();
+    }
+    let name = tokio::task::spawn_blocking(read_local_machine_name).await.ok().flatten();
+    NAME.get_or_init(|| name).clone()
+}
+
+fn read_local_machine_name() -> Option<String> {
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    let computer_name = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| clean(&String::from_utf8_lossy(&o.stdout)));
+    computer_name.or_else(|| {
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer outlives the call and its length is passed; gethostname writes a
+        // NUL-terminated name within it (or truncates) and reports failure through its return.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        // A host name reads better without its local-network suffix (« alex-mbp.local »).
+        clean(String::from_utf8_lossy(&buf[..end]).trim_end_matches(".local"))
+    })
 }
 
 /// Whether a usable `claude` binary is installed on this machine. Powers the proactive
@@ -2028,6 +2080,26 @@ pub async fn load_session_context(session_id: String) -> Result<ContextFill, Str
         .map_err(|e| e.to_string())
 }
 
+/// Read a conversation's cumulative token spend from disk — the seed of the side panel's
+/// session total on open / stream (re)start, before the first live snapshot. Claude: the
+/// transcript's last `cost-state` line (every agent, as of the process's last close). Codex: the
+/// rollout's last `token_count` total (this thread only). `None` when disk holds no such record
+/// (a killed process, a remote conversation whose transcript is on its server): unknown, which
+/// the UI reads as unknown — never zero. A tail read, off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_session_usage(
+    session_id: String,
+    backend: Backend,
+) -> Result<Option<SessionUsage>, String> {
+    tokio::task::spawn_blocking(move || match backend {
+        Backend::Claude => crate::supervisor::history::load_session_usage(&session_id),
+        Backend::Codex => crate::supervisor::codex::load_thread_usage(&session_id),
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk
 /// transcript. The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the
 /// live stream), so the UI polls this at conversation load and on each turn edge to know whether a
@@ -2609,6 +2681,19 @@ pub async fn generate_message_summary(
         .generate_summary(text, seq)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Retry every REMOTE session's lost link NOW rather than at the end of its backoff —
+/// fired by the front when the Mac's network comes back or the user returns to the app
+/// (see `SessionCommand::ReconnectNow`). Cheap and idempotent: an attached session, which
+/// is not waiting out a backoff, ignores it. A session that closed meanwhile is skipped.
+#[tauri::command]
+#[specta::specta]
+pub async fn reconnect_remote_sessions(sessions: tauri::State<'_, Sessions>) -> Result<(), String> {
+    for handle in sessions.remote_handles() {
+        let _ = handle.reconnect_now().await;
+    }
+    Ok(())
 }
 
 /// Interrupt the current turn (without killing the process).
@@ -5623,19 +5708,48 @@ pub async fn voice_agent_status() -> Result<crate::voice::VoiceAgentStatus, Stri
 /// read-back). Returns the fresh status.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_voice_agent_key(key: String) -> Result<crate::voice::VoiceAgentStatus, String> {
-    tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
+pub async fn set_voice_agent_key(
+    app: tauri::AppHandle,
+    key: String,
+) -> Result<crate::voice::VoiceAgentStatus, String> {
+    let status = tokio::task::spawn_blocking(move || crate::voice::set_key(&key))
         .await
-        .map_err(|e| format!("keychain task failed: {e}"))?
+        .map_err(|e| format!("keychain task failed: {e}"))??;
+    reapply_wake_after_key_change(&app, status.configured).await;
+    Ok(status)
 }
 
 /// Forget the stored OpenAI key (absent item = success).
 #[tauri::command]
 #[specta::specta]
-pub async fn clear_voice_agent_key() -> Result<crate::voice::VoiceAgentStatus, String> {
-    tokio::task::spawn_blocking(crate::voice::clear_key)
+pub async fn clear_voice_agent_key(
+    app: tauri::AppHandle,
+) -> Result<crate::voice::VoiceAgentStatus, String> {
+    let status = tokio::task::spawn_blocking(crate::voice::clear_key)
         .await
-        .map_err(|e| format!("keychain task failed: {e}"))?
+        .map_err(|e| format!("keychain task failed: {e}"))??;
+    reapply_wake_after_key_change(&app, status.configured).await;
+    Ok(status)
+}
+
+/// The wake word is held off while no OpenAI key is stored
+/// (`crate::wake::require_voice_key`), so a key change re-applies it: removing
+/// the key stops an always-on microphone whose every detection would now be
+/// dropped, adding one resumes a wake word the user left enabled. Best-effort —
+/// the key change itself already succeeded, and the wake status carries its own
+/// outcome for Settings to show.
+async fn reapply_wake_after_key_change(app: &tauri::AppHandle, key_configured: bool) {
+    let cfg = load_wake_config(app, &app.state::<Store>());
+    let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
+    // Nothing to pause or resume for a wake word the user never enabled, and a
+    // detector already running with a key stored needs no restart.
+    if !cfg.enabled || (key_configured && wake.status().running) {
+        return;
+    }
+    let apply = move || wake.apply(crate::wake::require_voice_key(cfg, key_configured));
+    if let Err(e) = tokio::task::spawn_blocking(apply).await {
+        eprintln!("[wake] re-applying the wake word after a key change failed: {e}");
+    }
 }
 
 /// Mint a short-lived Realtime client secret for ONE voice session — the only
@@ -5684,6 +5798,7 @@ pub fn load_wake_config(app: &tauri::AppHandle, store: &Store) -> crate::wake::W
         sensitivity,
         debug_capture: read(WAKE_DEBUG_CAPTURE_KEY).as_deref() == Some("1"),
         debug_dir: wake_debug_dir(app),
+        paused: None, // decided at apply time (`crate::wake::require_voice_key`)
     }
 }
 
@@ -5743,9 +5858,14 @@ pub async fn set_wake_word_config(
         cfg
     };
     let wake = (*app.state::<Arc<crate::wake::WakeController>>()).clone();
-    tokio::task::spawn_blocking(move || wake.apply(cfg))
-        .await
-        .map_err(|e| format!("wake apply task failed: {e}"))
+    tokio::task::spawn_blocking(move || {
+        // No OpenAI key → held off, choice kept (`require_voice_key`). The Keychain
+        // is only read when it can matter.
+        let has_key = cfg.enabled && crate::voice::status().configured;
+        wake.apply(crate::wake::require_voice_key(cfg, has_key))
+    })
+    .await
+    .map_err(|e| format!("wake apply task failed: {e}"))
 }
 
 /// A compact, bounded directory tree for AGENT orientation (the `browse_folders`

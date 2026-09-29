@@ -616,3 +616,190 @@ describe("canonicalArtifactUrl", () => {
     expect(canonicalArtifactUrl("")).toBeNull();
   });
 });
+
+describe("the artifact icon wire (favicon → icon)", () => {
+  it("resolves a publish that only carries the NEW `icon` word", () => {
+    // Verbatim shape of a 2026-09-20 publish: `icon`, no `favicon` at all. Reading only
+    // `favicon` is what left every recent artifact on the empty fallback tile.
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("u1", { file_path: "/tmp/marks.html", icon: "sparkle", description: "Marks" })] }],
+      { u1: `Published /tmp/marks.html at ${URL_A} (Version 1) Icon: "sparkle".` },
+    );
+    expect(selectArtifacts(e)[0].favicon).toBe("✨");
+  });
+
+  it("still resolves an OLD publish that only carries `favicon`", () => {
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html", favicon: "🛬" })] }],
+      { u1: SHORT("/tmp/x.html", URL_A) },
+    );
+    expect(selectArtifacts(e)[0].favicon).toBe("🛬");
+  });
+
+  it("gives a TYPED artifact its type's face — it names no icon at all", () => {
+    // ⚠️ Verified over all 16 `Artifact` calls of a real Claude Design conversation: not one
+    // carries `icon` or `favicon`. The icon-wire fix alone still left every canvas blank.
+    const type = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+    const own = "https://claude.ai/artifact/RERMMCbeNkCTyL7i8WgZrB";
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("q", { action: "quickstart", intent: "design" }),
+            tuse("c", { action: "publish", type_url: type, title: "Sidebar layouts" }),
+          ],
+        },
+      ],
+      {
+        q: `Quickstart for a design.\n\n- Design [core] — Design canvas for websites and screens. — type_url: ${type}`,
+        c: `Created a new Artifact at ${own} from the Artifact type ${type} (release 1789673869-b48e).`,
+      },
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.typed).toBe(true);
+    expect(a.typeName).toBe("Design");
+    expect(a.favicon).toBe("🎨");
+  });
+
+  it("leaves a typed artifact faceless rather than guessing when its type is unnamed", () => {
+    // No quickstart in this conversation → nothing ever named the type. The surfaces then draw
+    // the generic mark, which must stay distinguishable from a real Design artifact's 🎨.
+    const type = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+    const own = "https://claude.ai/artifact/RERMMCbeNkCTyL7i8WgZrB";
+    const e = entryOf(
+      [{ id: "t1", blocks: [tuse("c", { action: "publish", type_url: type, title: "Canvas" })] }],
+      { c: `Created a new Artifact at ${own} from the Artifact type ${type}.` },
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.typed).toBe(true);
+    expect(a.typeName).toBeNull();
+    expect(a.favicon).toBeNull();
+  });
+
+  it("keeps last-known-good across a republish that drops the icon", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html", icon: "chart" })] },
+        { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/x.html" })] },
+      ],
+      { u1: SHORT("/tmp/x.html", URL_A), u2: SHORT("/tmp/x.html", URL_A) },
+    );
+    expect(selectArtifacts(e)[0].favicon).toBe("📊");
+  });
+});
+
+describe("artifact version numbers", () => {
+  it("reads the number the ack names, per version", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html", label: "first" })] },
+        { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/x.html", label: "second" })] },
+        { id: "t3", blocks: [tuse("u3", { file_path: "/tmp/x.html", label: "third" })] },
+      ],
+      {
+        u1: `Published /tmp/x.html at ${URL_A} (Version 1)`,
+        u2: `Published /tmp/x.html at ${URL_A} (Version 2)`,
+        u3: `Published /tmp/x.html at ${URL_A} (Version 3)`,
+      },
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.versions.map((v) => v.version)).toEqual([1, 2, 3]);
+    expect(a.versions.map((v) => v.label)).toEqual(["first", "second", "third"]);
+  });
+
+  it("is null for an older ack with no suffix, and while a publish is in flight", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html" })] },
+        { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/x.html" })] },
+      ],
+      { u1: SHORT("/tmp/x.html", URL_A) }, // u2 has no result yet
+    );
+    expect(selectArtifacts(e)[0].versions.map((v) => v.version)).toEqual([null, null]);
+  });
+
+  it("does not renumber when the file was republished after a FAILED attempt", () => {
+    // A refused publish gets no number: position and version legitimately disagree, so the UI
+    // must read the ack rather than count rows.
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html" })] },
+        { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/x.html" })] },
+        { id: "t3", blocks: [tuse("u3", { file_path: "/tmp/x.html" })] },
+      ],
+      {
+        u1: `Published /tmp/x.html at ${URL_A} (Version 1)`,
+        u2: "Refused: the artifact is locked.",
+        u3: `Published /tmp/x.html at ${URL_A} (Version 2)`,
+      },
+      ["u2"],
+    );
+    const a = selectArtifacts(e)[0];
+    expect(a.versions.map((v) => v.version)).toEqual([1, null, 2]);
+    expect(a.versions.map((v) => v.isError)).toEqual([false, true, false]);
+  });
+
+  it("re-derives when a version's number lands LATE (the memo signature covers versions)", () => {
+    // A republish's ack only fills in that version's NUMBER — url/title/count are already
+    // settled — so a signature over the header alone kept the previous array and the number
+    // never appeared.
+    clearAllArtifactsCache();
+    const turns = [
+      { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/x.html" })] },
+      { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/x.html" })] },
+    ];
+    const pending = entryOf(turns, { u1: `Published /tmp/x.html at ${URL_A} (Version 1)` });
+    expect(memoizedArtifacts("s", pending)[0].versions.map((v) => v.version)).toEqual([1, null]);
+    const landed = entryOf(turns, {
+      u1: `Published /tmp/x.html at ${URL_A} (Version 1)`,
+      u2: `Published /tmp/x.html at ${URL_A} (Version 2)`,
+    });
+    expect(memoizedArtifacts("s", landed)[0].versions.map((v) => v.version)).toEqual([1, 2]);
+    clearArtifactsCache("s");
+  });
+});
+
+describe("several different artifacts in ONE conversation", () => {
+  it("keeps them apart, each with its own versions, face and file", () => {
+    const e = entryOf(
+      [
+        { id: "t1", blocks: [tuse("u1", { file_path: "/tmp/report.html", icon: "report", label: "report" })] },
+        { id: "t2", blocks: [tuse("u2", { file_path: "/tmp/deck.html", icon: "plane", label: "deck" })] },
+        { id: "t3", blocks: [tuse("u3", { file_path: "/tmp/report.html", label: "report fix" })] },
+      ],
+      {
+        u1: `Published /tmp/report.html at ${URL_A} (Version 1)`,
+        u2: `Published /tmp/deck.html at ${URL_B} (Version 1)`,
+        u3: `Published /tmp/report.html at ${URL_A} (Version 2)`,
+      },
+    );
+    const arts = selectArtifacts(e);
+    expect(arts).toHaveLength(2);
+    // Order = first appearance, so the list stays stable as republishes land.
+    expect(arts.map((a) => a.url)).toEqual([URL_A, URL_B]);
+    expect(arts.map((a) => a.versions.length)).toEqual([2, 1]);
+    expect(arts.map((a) => a.favicon)).toEqual(["📑", "✈️"]);
+    expect(arts.map((a) => a.latestFilePath)).toEqual(["/tmp/report.html", "/tmp/deck.html"]);
+    // The republish belongs to the FIRST artifact, and titles don't leak across.
+    expect(arts[0].versions.map((v) => v.toolUseId)).toEqual(["u1", "u3"]);
+    expect(arts[0].title).toBe("report fix");
+    expect(arts[1].title).toBe("deck");
+  });
+
+  it("does not merge two artifacts published in the SAME turn under one label", () => {
+    const e = entryOf(
+      [
+        {
+          id: "t1",
+          blocks: [
+            tuse("u1", { file_path: "/tmp/a.html", label: "shared-label" }),
+            tuse("u2", { file_path: "/tmp/b.html", label: "shared-label" }),
+          ],
+        },
+      ],
+      { u1: SHORT("/tmp/a.html", URL_A), u2: SHORT("/tmp/b.html", URL_B) },
+    );
+    expect(selectArtifacts(e).map((a) => a.url)).toEqual([URL_A, URL_B]);
+  });
+});

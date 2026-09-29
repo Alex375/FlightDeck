@@ -10,8 +10,6 @@ import { EditorToggle } from "./features/editor/EditorToggle";
 import { FlightDeck } from "./features/flightdeck/FlightDeck";
 import { FlightDeckReplyModal } from "./features/flightdeck/FlightDeckReplyModal";
 import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
-import { SoundToggle } from "./features/notifications/SoundToggle";
-import { CaffeinateToggle } from "./features/power/CaffeinateToggle";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
 import { MachineHealthHost } from "./features/machines/MachineHealthHost";
 import { AutoAccountSwitchHost } from "./features/settings/AutoAccountSwitchHost";
@@ -44,7 +42,6 @@ import { useThreadJump } from "./store/threadJump";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
-import { VoiceMicToggle, VoiceModeToggle } from "./voice/VoiceToggle";
 import { startUpdaterAutoCheck } from "./store/updater";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
 import { initNotifications } from "./notifications/notify";
@@ -59,7 +56,9 @@ import {
 import { useDisplay } from "./store/display";
 import { useNotifications } from "./store/notifications";
 import { useSettingsUi } from "./store/settingsUi";
-import { NavBtn, TosseCrmMark, Win } from "./ui/kit";
+import { NavBtn, Win } from "./ui/kit";
+import { SystemTray } from "./ui/SystemTray";
+import { useWidgetOn } from "./store/sidePanelWidgetsStore";
 import { runAppAction } from "./ui/appActions";
 import {
   ACTION_BINDINGS,
@@ -107,6 +106,16 @@ export default function App() {
   // With the conversation side panel on, the header carries ACTIONS only: the task chip,
   // the worktree indicator and the stream control move into the panel.
   const sidePanel = useDisplay((s) => s.conversationSidePanel);
+  // …each only while its panel widget is shown: a widget switched off in the panel gives its
+  // header home back, so hiding it never makes the task, the worktree or the stream unreachable.
+  // (Hooks first, then the `&&`: a short-circuit would make the hook call conditional.)
+  const taskWidget = useWidgetOn("task");
+  const worktreeWidget = useWidgetOn("worktree");
+  const streamWidget = useWidgetOn("stream");
+  const taskInPanel = sidePanel && taskWidget;
+  const worktreeInPanel = sidePanel && worktreeWidget;
+  const streamInPanel = sidePanel && streamWidget;
+  const titleBarMotion = useDisplay((s) => s.titleBarAnimations);
 
   // The IDE tab is conditional too, on its display preference alone (Settings → General →
   // Display). Off → no tab, no "Open in IDE" entry points, and the view is never mounted.
@@ -271,6 +280,7 @@ export default function App() {
 
   return (
     <Win
+      motion={titleBarMotion}
       title={
         view === "flightdeck"
           ? "Flight Deck"
@@ -286,14 +296,12 @@ export default function App() {
       nav={
         <>
           <NavBtn
-            icon="chat"
             label="Conversation"
             on={view === "conversation"}
             title="Conversation (⌘1)"
             onClick={() => changeView("conversation")}
           />
           <NavBtn
-            icon="grid"
             label="Flight Deck"
             on={view === "flightdeck"}
             title="Flight Deck (⌘2)"
@@ -302,7 +310,6 @@ export default function App() {
           {/* Only while signed in to TOSSE — no tab rather than an empty one. */}
           {tosseAvailable ? (
             <NavBtn
-              glyph={<TosseCrmMark className="sm" />}
               label="TOSSE"
               on={view === "tosse"}
               title="TOSSE tasks (⌘3)"
@@ -312,7 +319,6 @@ export default function App() {
           {/* Last, so it keeps ⌘4 whether or not the conditional TOSSE tab is showing. */}
           {ideAvailable ? (
             <NavBtn
-              icon="ide"
               label="IDE"
               on={view === "ide"}
               title="IDE (⌘4)"
@@ -323,22 +329,16 @@ export default function App() {
       }
       right={
         <>
-          {/* Always visible (both views): mute/unmute the notification chime on the
-              spot, without opening Settings. Also bound to ⌘⇧M. */}
-          {/* Voice agent: arm/disarm the session, then open/close the mic within
-              it. Both render nothing until an OpenAI key is configured. */}
-          <VoiceModeToggle />
-          <VoiceMicToggle />
-          <SoundToggle />
-          {/* Always visible (both views): arm/disarm Caffeinate (keep the Mac awake). */}
-          <CaffeinateToggle />
+          {/* Always visible (every view): the app-wide switches — voice session + mic,
+              notification sound (also ⌘⇧M), Caffeinate — folded into one tray. */}
+          <SystemTray />
           {view === "conversation" && activeRepo ? (
             <>
               {/* App-wide toggles | this conversation's actions. */}
               {active ? <span className="wf-tb-sep" aria-hidden="true" /> : null}
               {/* Which TOSSE task this conversation carries. Only for a conversation
                   started from the tasks view; a click goes back to it. */}
-              {active && tosseAvailable && !sidePanel ? (
+              {active && tosseAvailable && !taskInPanel ? (
                 <TosseTaskChip
                   conv={active}
                   // Reads in the side panel rather than switching views: you are working IN
@@ -351,10 +351,10 @@ export default function App() {
                   }
                 />
               ) : null}
-              {active && !sidePanel ? (
+              {active && !worktreeInPanel ? (
                 <WorktreeIndicator conv={active} repoPath={activeRepo.path} />
               ) : null}
-              {active && !sidePanel ? <StreamControl key={active.id} conv={active} /> : null}
+              {active && !streamInPanel ? <StreamControl key={active.id} conv={active} /> : null}
               {active ? <EditorToggle convId={active.id} /> : null}
               {active ? <TerminalToggle /> : null}
               {active ? <GitToggle /> : null}

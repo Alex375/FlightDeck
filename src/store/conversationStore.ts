@@ -24,6 +24,8 @@ import type {
   JsonValue,
   PermissionRequestPayload,
   SessionStatePayload,
+  SessionUsage,
+  TokenUsage,
 } from "../ipc/client";
 import type {
   ErrorItem,
@@ -31,6 +33,7 @@ import type {
   NormalizedBlock,
   RoundMarker,
   SessionEntry,
+  SessionUsageSource,
   TimelineEntry,
   TodoItem,
   TodoSummary,
@@ -43,6 +46,17 @@ import { isBackgroundAgentInput, isDetachedAgentAck } from "../agent/subagentMet
 import { latestTodosInBlocks, todoSummary } from "./todos";
 import { THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
 import { parseSpecialMessage } from "../features/conversation/specialMessage";
+import {
+  EMPTY_RUN_CLOCK,
+  liveRunStart,
+  runBusy,
+  runEndAll,
+  runFooterFor,
+  runResult,
+  runSend,
+  runTask,
+  type RunFooter,
+} from "../agent/runClock";
 
 const connectingState: SessionStatePayload = {
   busy: false,
@@ -60,8 +74,78 @@ const connectingState: SessionStatePayload = {
   ended: false,
   context_tokens: null,
   context_window: null,
+  context_usage: null,
   rate_limit: null,
+  session_usage: null,
 };
+
+/**
+ * Two session totals that read the same — compared BY VALUE. The core re-emits the whole
+ * session state on many events (busy edges, activity, every root model call), and every push
+ * after the first `result` carries a freshly deserialized `session_usage` object: holding on to
+ * the SAME reference while the value is unchanged is what keeps every reader of it (the Stats
+ * widget, the memoised telemetry) from re-rendering per model call.
+ */
+export function sameSessionUsage(a: SessionUsage | null, b: SessionUsage | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const eq = (x: TokenUsage, y: TokenUsage) =>
+    x.input === y.input &&
+    x.cache_creation === y.cache_creation &&
+    x.cache_read === y.cache_read &&
+    x.output === y.output;
+  return (
+    eq(a.total, b.total) &&
+    a.cost_usd === b.cost_usd &&
+    a.per_model.length === b.per_model.length &&
+    a.per_model.every(
+      (m, i) =>
+        m.model === b.per_model[i].model &&
+        m.cost_usd === b.per_model[i].cost_usd &&
+        eq(m.usage, b.per_model[i].usage),
+    )
+  );
+}
+
+const usageSize = (u: SessionUsage) =>
+  u.total.input + u.total.cache_creation + u.total.cache_read + u.total.output;
+
+/**
+ * What a LIVE session total covers, given what the entry held before it (see
+ * {@link SessionUsageSource}). The first live snapshot after a disk seed tells whether the CLI
+ * carried the recorded spend over on resume: at least the seed → it did, the figure covers the
+ * whole session; below it → it restarted from zero, the figure only covers the time since the
+ * session was reopened. With no record on disk at all (`missing`), the CLI had nothing to carry
+ * over either. Once `reopened`, it stays so until the next reseed — later snapshots grow from
+ * the same restarted count.
+ */
+export function liveUsageSource(
+  prev: SessionUsageSource,
+  held: SessionUsage | null,
+  incoming: SessionUsage,
+): Exclude<SessionUsageSource, "disk" | "missing" | null> {
+  if (prev === "reopened" || prev === "missing") return "reopened";
+  if (prev === "disk" && held && usageSize(incoming) < usageSize(held)) return "reopened";
+  return "live";
+}
+
+/**
+ * What a held session total covers once its PROCESS is gone (it ended on its own, or the stream
+ * was turned off): a `live` figure becomes « as of the last close » (`disk`) — which is also
+ * what the process wrote to disk as it exited — so that the NEXT process's first snapshot is
+ * checked against it by {@link liveUsageSource}.
+ *
+ * ⚠️ Load-bearing: a message sent to a stopped conversation respawns it WITHOUT re-reading the
+ * transcript (no reseed). If the old process died without writing its `cost-state` (a crash, a
+ * SIGKILL), the CLI restarts its count from zero; left `live`, that lower figure would still
+ * read « every agent, this session ». `reopened` stays as is (the restarted count carries on).
+ */
+export function closedUsageSource(
+  source: SessionUsageSource,
+  held: SessionUsage | null,
+): SessionUsageSource {
+  return source === "live" && held ? "disk" : source;
+}
 
 function emptyEntry(session: string): SessionEntry {
   return {
@@ -84,6 +168,7 @@ function emptyEntry(session: string): SessionEntry {
     seq: 0,
     replayAnchor: 0,
     turnStartedAt: null,
+    runClock: EMPTY_RUN_CLOCK,
     lastTurnStartedAt: null,
     lastTurnEndedAt: null,
     awaitingSince: null,
@@ -94,6 +179,7 @@ function emptyEntry(session: string): SessionEntry {
     thinkingDurations: {},
     toolStartedAt: {},
     toolDurations: {},
+    sessionUsageSource: null,
   };
 }
 
@@ -155,7 +241,26 @@ interface ConversationState {
    *  Only fills a field that's still null — never clobbers a fresher live value. */
   applyContextFill: (
     session: string,
-    fill: { context_tokens: number | null; context_window: number | null },
+    fill: {
+      context_tokens: number | null;
+      context_window: number | null;
+      context_usage: TokenUsage | null;
+    },
+  ) => void;
+  /** Seed the session total (`state.session_usage`) from disk on open or stream-(re)start —
+   *  the transcript's last `cost-state` line (Claude) / the rollout's last token count (Codex),
+   *  read by `commands.loadSessionUsage`. Never clobbers a LIVE value: a snapshot from the
+   *  running process is always fresher.
+   *
+   *  `null` = disk holds no record. On CLAUDE that means the spend went unrecorded (the process
+   *  was killed, an older CLI): the total is unknown, and the next live snapshot only covers the
+   *  reopened session (`missing` → `reopened`). On CODEX a rollout without a token count is a
+   *  thread that never finished a model call — nothing was spent before, so a null seed changes
+   *  nothing and the first live total covers the whole thread. */
+  applySessionUsageSeed: (
+    session: string,
+    usage: SessionUsage | null,
+    backend?: "claude" | "codex",
   ) => void;
   /** Reset a session's live state to neutral (idle, not busy/ended) WITHOUT
    *  touching its timeline. Used when the stream is turned off: the terminal
@@ -175,6 +280,11 @@ interface ConversationState {
    *  would otherwise record a bogus ~0ms for every replayed tool. Live calls omit
    *  it (default false). */
   applyItem: (session: string, item: ConversationItem, hydrating?: boolean) => void;
+  /** Apply a whole replayed history in ONE store commit — the same reducer as {@link applyItem},
+   *  folded over the items. ⚠️ One `set` per item made every subscriber re-derive once per item
+   *  (the side panel's stats and links walk the whole thread each time): opening a long
+   *  conversation was quadratic. Subscribers now see the history land once. */
+  applyItems: (session: string, items: ConversationItem[], hydrating?: boolean) => void;
   appendText: (session: string, messageId: string, text: string) => void;
   appendThinking: (session: string, messageId: string, text: string) => void;
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
@@ -210,6 +320,10 @@ interface ConversationState {
   reanchorReplay: (session: string) => void;
   /** Forget a session's timeline entirely (e.g. its conversation was deleted). */
   dropSession: (session: string) => void;
+  /** A background task snapshot, for the run clock: `taskId` is (still) running or not.
+   *  No-op for a session the store does not hold, and when the task's state is unchanged
+   *  (snapshots arrive on every progress tick). */
+  noteTask: (session: string, taskId: string, running: boolean) => void;
 }
 
 export const useConversationStore = create<ConversationState>((set) => {
@@ -288,6 +402,308 @@ export const useConversationStore = create<ConversationState>((set) => {
       };
     });
 
+  /** One ConversationItem applied to one session entry — pure on the entry (a new entry, or the
+   *  same one to skip). Shared by {@link applyItem} (live, one at a time) and {@link applyItems}
+   *  (a replayed history, all at once). */
+  function reduceItem(entry: SessionEntry, item: ConversationItem, hydrating: boolean): SessionEntry {
+    switch (item.kind) {
+      case "message_started": {
+        const opened = openTurn(entry, item.id, item.parent_tool_use_id);
+        // A new ROOT assistant message = the agent's next model call, which is
+        // past the boundary where the CLI injects queued messages. So a message
+        // that was waiting "en attente" has now been delivered to the agent —
+        // clear its badge here (not only at turn_result, the end of the whole
+        // loop). Sub-agent (Task) messages don't count: the queued message is
+        // injected into the ROOT loop, not the sub-thread.
+        return item.parent_tool_use_id === null ? clearQueuedBadges(opened) : opened;
+      }
+
+      case "text_delta":
+      case "thinking_delta": {
+        // Normally deltas come via appendText/appendThinking (rAF-coalesced);
+        // handle here too for completeness / out-of-band delivery.
+        const field =
+          item.kind === "text_delta" ? "streamingText" : "streamingThinking";
+        const key = rootKey(null);
+        const messageId = item.message_id ?? entry.openBubble[key];
+        if (!messageId) return entry;
+        const turn = entry.turns[messageId];
+        if (!turn || turn.status !== "streaming") return entry;
+        // Same thinking-start stamp as appendBuffer (this is the out-of-band path).
+        const thinkStart =
+          field === "streamingThinking" && turn.streamingThinking === "";
+        const nextTurn: Turn = {
+          ...turn,
+          [field]: turn[field] + item.text,
+          hasThinking:
+            field === "streamingThinking" ? true : turn.hasThinking,
+        };
+        return {
+          ...entry,
+          thinkingStartedAt: thinkStart ? Date.now() : entry.thinkingStartedAt,
+          turns: { ...entry.turns, [messageId]: nextTurn },
+        };
+      }
+
+      case "user_message": {
+        // A user turn from the stream. Our OWN turns are suppressed in the core (by
+        // the uuid we stamped), so only REMOTE (phone/web) turns and history replays
+        // reach here; both are keyed by their transcript uuid, so a re-delivery
+        // dedupes. Mirrors addUserTurn (role "user", text in streamingText).
+        if (entry.turns[item.id]) return entry;
+        const turn: Turn = {
+          id: item.id,
+          role: "user",
+          status: "final",
+          streamingText: item.text,
+          streamingThinking: "",
+          blocks: [],
+          parentToolUseId: item.parent_tool_use_id,
+          hasThinking: false,
+          // A message restored from a mid-turn injection (a transcript's queued_command)
+          // carries the same durable flag a live mid-turn send sets, so clean output
+          // groups the restored round as it did live.
+          injectedMidTurn: item.mid_turn === true,
+        };
+        const line = { kind: "turn", id: item.id } as const;
+        // A HISTORY restore (`replay:false`) is already chronological → APPEND. It
+        // must NOT go through the splice: the anchor isn't re-armed during a resume
+        // (the transcript carries no `turn_result`), so splicing would bunch every
+        // user turn above the replies. Only a LIVE remote echo (`replay:true`) —
+        // which can arrive out-of-order, after its own answer already streamed — is
+        // spliced at the frozen anchor (the current turn boundary), landing right
+        // before this turn's whole response; the anchor advances so several queued
+        // replays keep their order. See `SessionEntry.replayAnchor`.
+        if (!item.replay) {
+          return {
+            ...entry,
+            turns: { ...entry.turns, [item.id]: turn },
+            timeline: hasTimelineId(entry.timeline, item.id)
+              ? entry.timeline
+              : [...entry.timeline, line],
+          };
+        }
+        const at = Math.min(entry.replayAnchor, entry.timeline.length);
+        return {
+          ...entry,
+          turns: { ...entry.turns, [item.id]: turn },
+          timeline: [...entry.timeline.slice(0, at), line, ...entry.timeline.slice(at)],
+          replayAnchor: at + 1,
+        };
+      }
+
+      case "assistant_message": {
+        // Claude delivers one logical message (same id) as SEPARATE events,
+        // one per finalized content block (thinking, then text, then tool_use).
+        // APPEND the new block(s) to whatever the turn already shows — never
+        // replace — otherwise the text rendered between two tools would be
+        // overwritten by the following tool_use block and vanish. The live
+        // buffers are cleared because the block they were typing is now
+        // authoritative in `blocks`. The turn stays "streaming"; turn_result
+        // finalizes it. (Resume takes a faster path: history.rs has already
+        // merged the same-id lines, so this just appends the one merged event.)
+        const base = openTurn(entry, item.id, item.parent_tool_use_id);
+        const existing = base.turns[item.id];
+        const blocks = [...existing.blocks, ...item.blocks];
+        const turn: Turn = {
+          ...existing,
+          blocks,
+          streamingText: "",
+          streamingThinking: "",
+          hasThinking: blocks.some((b) => b.type === "thinking"),
+          // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
+          // Null on Claude; keep any prior value if a later block omits it.
+          codexTurnId: item.turn_id ?? existing.codexTurnId,
+        };
+        // Freeze the elapsed of any thinking block finalized here, keyed by its text
+        // (what the renderer receives). Clear the live start so the next block re-stamps.
+        // Skipped during hydration: a replayed assistant_message carries no live delta,
+        // so `thinkingStartedAt` is already null there — the guard is belt-and-suspenders.
+        let thinkingStartedAt = base.thinkingStartedAt;
+        let thinkingDurations = base.thinkingDurations;
+        if (!hydrating && thinkingStartedAt != null) {
+          const finalized = item.blocks.filter(
+            (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
+              b.type === "thinking" && !!b.text,
+          );
+          if (finalized.length > 0) {
+            const dur = Date.now() - thinkingStartedAt;
+            thinkingDurations = { ...thinkingDurations };
+            for (const b of finalized) thinkingDurations[b.text] = dur;
+            thinkingStartedAt = null;
+          }
+        }
+        // Stamp the start of each tool call appearing here (keyed by tool_use_id), so a
+        // running tool row can show a live counter and its tool_result can freeze the
+        // duration. Only the first sighting stamps (an assistant_message can't re-open a
+        // tool). Sub-agent (Task) tool_uses are included — they get durations too.
+        // NEVER stamp during hydration: replayed history has no wall-clock meaning, and
+        // its tool_result lands in the SAME synchronous loop, freezing ~0ms → every tool
+        // of a reloaded conversation would show a bogus "0ms" chip. Live only.
+        let toolStartedAt = base.toolStartedAt;
+        const toolUses = item.blocks.filter(
+          (b): b is Extract<NormalizedBlock, { type: "tool_use" }> => b.type === "tool_use",
+        );
+        if (!hydrating && toolUses.length > 0) {
+          const t = Date.now();
+          toolStartedAt = { ...toolStartedAt };
+          for (const b of toolUses) if (toolStartedAt[b.id] == null) toolStartedAt[b.id] = t;
+        }
+        let next = {
+          ...base,
+          turns: { ...base.turns, [item.id]: turn },
+          thinkingStartedAt,
+          thinkingDurations,
+          toolStartedAt,
+        };
+        // Record any detached sub-agent (`Agent` with run_in_background) launched in
+        // this message, so the pinned AgentBar can list it WITHOUT re-scanning every
+        // block on each streamed token. Done once per assistant_message.
+        //
+        // MAIN THREAD ONLY (same scoping as the TodoWrite capture below). A sub-agent
+        // can spawn its own agents — the CLI nests them up to depth 3 by default, and
+        // we pass `--forward-subagent-text`, so those messages reach us. Collecting
+        // them here would list a GRANDCHILD in the conversation-level AgentBar as if
+        // the user had launched it, and hide its block from the parent sub-agent's own
+        // drill-in transcript (bgAgentIds also drives that fold).
+        const newBg = (item.parent_tool_use_id === null
+          ? backgroundAgentIdsIn(item.blocks)
+          : []
+        ).filter((id) => !next.bgAgentIds.includes(id));
+        if (newBg.length > 0) {
+          next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
+        }
+        // Capture the agent's to-do list from a TodoWrite tool_use (last
+        // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
+        // its own todos and must not overwrite the conversation-level list.
+        if (item.parent_tool_use_id === null) {
+          const todos = latestTodosInBlocks(item.blocks);
+          if (todos) return { ...next, todos };
+        }
+        return next;
+      }
+
+      case "tool_result": {
+        const result: ToolResult = {
+          toolUseId: item.tool_use_id,
+          content: item.content,
+          isError: item.is_error,
+          parentToolUseId: item.parent_tool_use_id,
+        };
+        // Freeze the tool's duration (tool_use → tool_result) if we stamped its start.
+        // Skipped during hydration (belt-and-suspenders: a replayed tool_use never gets a
+        // stamp, so `startedAt` is already null here — but make the intent explicit).
+        let toolDurations = entry.toolDurations;
+        const startedAt = entry.toolStartedAt[item.tool_use_id];
+        if (!hydrating && startedAt != null && toolDurations[item.tool_use_id] == null) {
+          toolDurations = { ...toolDurations, [item.tool_use_id]: Date.now() - startedAt };
+        }
+        const next: SessionEntry = {
+          ...entry,
+          toolResults: { ...entry.toolResults, [item.tool_use_id]: result },
+          toolDurations,
+        };
+        // Robustness: a DETACHED sub-agent whose live `Agent` block arrived WITHOUT
+        // `run_in_background` (a transient wire drop) would otherwise render inline as a
+        // foreground card and never reach the AgentBar. Its launch ack is an independent,
+        // reliable "detached" signal — fold the id into bgAgentIds so the AgentBar lists
+        // it AND the inline hiding drops it, exactly as if the input flag had been present.
+        if (
+          isDetachedAgentByAck(entry, item.tool_use_id, item.content) &&
+          !next.bgAgentIds.includes(item.tool_use_id)
+        ) {
+          next.bgAgentIds = [...next.bgAgentIds, item.tool_use_id];
+        }
+        return next;
+      }
+
+      case "turn_result": {
+        const id = `tr_${entry.seq}`;
+        const meta: TurnResultMeta = {
+          subtype: item.subtype,
+          isError: item.is_error,
+          result: item.result,
+          apiErrorStatus: item.api_error_status ?? null,
+          totalCostUsd: item.total_cost_usd,
+          numTurns: item.num_turns,
+          durationMs: item.duration_ms,
+          durationApiMs: item.duration_api_ms,
+          ttftMs: item.ttft_ms,
+          usage: item.usage ?? null,
+        };
+        // finalize any still-streaming turns
+        const turns = { ...entry.turns };
+        let touched = false;
+        for (const [tid, t] of Object.entries(turns)) {
+          if (t.status === "streaming") {
+            turns[tid] = {
+              ...t,
+              status: item.subtype === "interrupted" ? "interrupted" : "final",
+            };
+            touched = true;
+          }
+        }
+        // Safety net for the "en attente" badge: normally cleared at the next
+        // message_started, but a loop can end (e.g. interrupted) without one, so
+        // clear any still-queued user turn now that the loop is over.
+        return clearQueuedBadges({
+          ...entry,
+          seq: entry.seq + 1,
+          turns: touched ? turns : entry.turns,
+          turnResults: { ...entry.turnResults, [id]: meta },
+          timeline: [...entry.timeline, { kind: "turn_result", id }],
+          // Attach it to its run (a history replay carries no results; guarded anyway).
+          runClock: hydrating
+            ? entry.runClock
+            : runResult(entry.runClock, id, Date.now(), item.duration_api_ms),
+          openBubble: {},
+          pendingPermissions: [],
+          // Re-anchor the replay insert point to the (new) end of the timeline at
+          // this turn boundary, so the NEXT remote turn's echo splices right after
+          // this turn — never inside the response that just finished. (+1 = the
+          // turn_result footer we just appended.) See `SessionEntry.replayAnchor`.
+          replayAnchor: entry.timeline.length + 1,
+          // A turn just finished → it's now "to review", UNLESS it was
+          // interrupted (the user did that, so they're already aware).
+          turnSeen: item.subtype === "interrupted",
+        });
+      }
+
+      case "notice": {
+        const id = `nt_${entry.seq}`;
+        const notice: NoticeItem = {
+          id,
+          subtype: item.subtype,
+          detail: item.detail,
+        };
+        const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
+        // A notice landing AT the anchor (nothing of the current turn sits above it) is
+        // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
+        // the anchor past it so a LATER remote echo splices below it, not above — else a
+        // "Background task failed" would read as happening after a message the user only
+        // sent afterwards. A notice arriving MID-response (anchor already behind the
+        // streaming reply) leaves the anchor alone: the late echo of the prompt that
+        // caused that reply still belongs before the whole response.
+        // See `SessionEntry.replayAnchor`.
+        const atBoundary = entry.replayAnchor >= entry.timeline.length;
+        return {
+          ...entry,
+          seq: entry.seq + 1,
+          notices: { ...entry.notices, [id]: notice },
+          timeline,
+          replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
+        };
+      }
+
+      default:
+        // A ConversationItem kind we don't handle (a new core/protocol variant
+        // landing before the front catches up). TS has no exhaustiveness guard on
+        // this switch, so it would be dropped without a trace — log it instead.
+        console.warn("[conversationStore] unhandled ConversationItem kind:", (item as { kind?: string }).kind);
+        return entry;
+    }
+  }
+
   return {
     sessions: {},
 
@@ -342,19 +758,40 @@ export const useConversationStore = create<ConversationState>((set) => {
         } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
           awaitingSince = null;
         }
+        // The run clock follows the same busy edges (a no-op on a mid-turn re-emit), and a
+        // process that ENDED can leave nothing of any run running.
+        let runClock = runBusy(entry.runClock, state.busy, Date.now());
+        if (state.ended && !entry.state.ended) runClock = runEndAll(runClock, Date.now());
+        // The session total: carried forward like the meter (a fresh process reports none
+        // until its first `result`, and must not wipe the disk seed meanwhile), and kept by
+        // REFERENCE while its value is unchanged (see sameSessionUsage).
+        const held = entry.state.session_usage ?? null;
+        const incoming = state.session_usage ?? null;
+        let sessionUsage = held;
+        let sessionUsageSource = entry.sessionUsageSource;
+        if (incoming) {
+          sessionUsageSource = liveUsageSource(entry.sessionUsageSource, held, incoming);
+          if (!sameSessionUsage(held, incoming)) sessionUsage = incoming;
+        }
+        // The process is gone: its total now dates from its close (see closedUsageSource). On
+        // every `ended` push, not just the edge — a repeat would otherwise flip it back to live.
+        if (state.ended) sessionUsageSource = closedUsageSource(sessionUsageSource, sessionUsage);
         return {
           ...entry,
           turnStartedAt,
+          runClock,
           lastTurnStartedAt,
           lastTurnEndedAt,
           awaitingSince,
           turnCount,
           thinkingStartedAt,
+          sessionUsageSource,
           state: {
             ...state,
             context_tokens: state.context_tokens ?? entry.state.context_tokens,
             context_window: state.context_window ?? entry.state.context_window,
             rate_limit: state.rate_limit ?? entry.state.rate_limit,
+            session_usage: sessionUsage,
           },
         };
       }),
@@ -364,8 +801,30 @@ export const useConversationStore = create<ConversationState>((set) => {
         const s = entry.state;
         const tokens = s.context_tokens ?? fill.context_tokens;
         const window = s.context_window ?? fill.context_window;
-        if (tokens === s.context_tokens && window === s.context_window) return entry;
-        return { ...entry, state: { ...s, context_tokens: tokens, context_window: window } };
+        // The breakdown travels WITH the tokens: take the transcript's only when its total
+        // is the one being seeded, so the bar never splits a fill it didn't sum to.
+        const usage = s.context_tokens === null ? fill.context_usage : s.context_usage;
+        if (tokens === s.context_tokens && window === s.context_window && usage === s.context_usage)
+          return entry;
+        return {
+          ...entry,
+          state: { ...s, context_tokens: tokens, context_window: window, context_usage: usage },
+        };
+      }),
+
+    applySessionUsageSeed: (session, usage, backend = "claude") =>
+      withEntry(session, (entry) => {
+        const src = entry.sessionUsageSource;
+        // A live snapshot is fresher than anything on disk: leave it (and what it covers).
+        if (src === "live" || src === "reopened" || (src === null && entry.state.session_usage))
+          return entry;
+        if (!usage && backend === "codex") return entry;
+        if (!usage)
+          return src === "missing" && !entry.state.session_usage
+            ? entry
+            : { ...entry, sessionUsageSource: "missing", state: { ...entry.state, session_usage: null } };
+        if (src === "disk" && sameSessionUsage(entry.state.session_usage ?? null, usage)) return entry;
+        return { ...entry, sessionUsageSource: "disk", state: { ...entry.state, session_usage: usage } };
       }),
 
     clearState: (session) =>
@@ -376,8 +835,14 @@ export const useConversationStore = create<ConversationState>((set) => {
       withEntry(session, (entry) =>
         clearQueuedBadges({
           ...entry,
-          state: { ...connectingState },
+          // The session total survives the stream going off: what was spent stays spent (the
+          // process writes that same figure to disk as it exits) — now « as of the last
+          // close », so the next process's first snapshot is checked against it.
+          state: { ...connectingState, session_usage: entry.state.session_usage ?? null },
+          sessionUsageSource: closedUsageSource(entry.sessionUsageSource, entry.state.session_usage ?? null),
           turnStartedAt: null,
+          // The process is going away with everything it was running.
+          runClock: runEndAll(entry.runClock, Date.now()),
           awaitingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
@@ -443,6 +908,8 @@ export const useConversationStore = create<ConversationState>((set) => {
           // Sending the next message consumes any pending review/question: the
           // user has clearly moved on from the previous result.
           turnSeen: true,
+          // The Enter a run is timed from. A message sent mid-turn joins the run in flight.
+          runClock: runSend(entry.runClock, Date.now(), !!queued),
         };
       });
       return createdId;
@@ -531,301 +998,22 @@ export const useConversationStore = create<ConversationState>((set) => {
         return { sessions: next };
       }),
 
-    applyItem: (session, item, hydrating = false) =>
-      withEntry(session, (entry) => {
-        switch (item.kind) {
-          case "message_started": {
-            const opened = openTurn(entry, item.id, item.parent_tool_use_id);
-            // A new ROOT assistant message = the agent's next model call, which is
-            // past the boundary where the CLI injects queued messages. So a message
-            // that was waiting "en attente" has now been delivered to the agent —
-            // clear its badge here (not only at turn_result, the end of the whole
-            // loop). Sub-agent (Task) messages don't count: the queued message is
-            // injected into the ROOT loop, not the sub-thread.
-            return item.parent_tool_use_id === null ? clearQueuedBadges(opened) : opened;
-          }
-
-          case "text_delta":
-          case "thinking_delta": {
-            // Normally deltas come via appendText/appendThinking (rAF-coalesced);
-            // handle here too for completeness / out-of-band delivery.
-            const field =
-              item.kind === "text_delta" ? "streamingText" : "streamingThinking";
-            const key = rootKey(null);
-            const messageId = item.message_id ?? entry.openBubble[key];
-            if (!messageId) return entry;
-            const turn = entry.turns[messageId];
-            if (!turn || turn.status !== "streaming") return entry;
-            // Same thinking-start stamp as appendBuffer (this is the out-of-band path).
-            const thinkStart =
-              field === "streamingThinking" && turn.streamingThinking === "";
-            const nextTurn: Turn = {
-              ...turn,
-              [field]: turn[field] + item.text,
-              hasThinking:
-                field === "streamingThinking" ? true : turn.hasThinking,
-            };
-            return {
-              ...entry,
-              thinkingStartedAt: thinkStart ? Date.now() : entry.thinkingStartedAt,
-              turns: { ...entry.turns, [messageId]: nextTurn },
-            };
-          }
-
-          case "user_message": {
-            // A user turn from the stream. Our OWN turns are suppressed in the core (by
-            // the uuid we stamped), so only REMOTE (phone/web) turns and history replays
-            // reach here; both are keyed by their transcript uuid, so a re-delivery
-            // dedupes. Mirrors addUserTurn (role "user", text in streamingText).
-            if (entry.turns[item.id]) return entry;
-            const turn: Turn = {
-              id: item.id,
-              role: "user",
-              status: "final",
-              streamingText: item.text,
-              streamingThinking: "",
-              blocks: [],
-              parentToolUseId: item.parent_tool_use_id,
-              hasThinking: false,
-              // A message restored from a mid-turn injection (a transcript's queued_command)
-              // carries the same durable flag a live mid-turn send sets, so clean output
-              // groups the restored round as it did live.
-              injectedMidTurn: item.mid_turn === true,
-            };
-            const line = { kind: "turn", id: item.id } as const;
-            // A HISTORY restore (`replay:false`) is already chronological → APPEND. It
-            // must NOT go through the splice: the anchor isn't re-armed during a resume
-            // (the transcript carries no `turn_result`), so splicing would bunch every
-            // user turn above the replies. Only a LIVE remote echo (`replay:true`) —
-            // which can arrive out-of-order, after its own answer already streamed — is
-            // spliced at the frozen anchor (the current turn boundary), landing right
-            // before this turn's whole response; the anchor advances so several queued
-            // replays keep their order. See `SessionEntry.replayAnchor`.
-            if (!item.replay) {
-              return {
-                ...entry,
-                turns: { ...entry.turns, [item.id]: turn },
-                timeline: hasTimelineId(entry.timeline, item.id)
-                  ? entry.timeline
-                  : [...entry.timeline, line],
-              };
-            }
-            const at = Math.min(entry.replayAnchor, entry.timeline.length);
-            return {
-              ...entry,
-              turns: { ...entry.turns, [item.id]: turn },
-              timeline: [...entry.timeline.slice(0, at), line, ...entry.timeline.slice(at)],
-              replayAnchor: at + 1,
-            };
-          }
-
-          case "assistant_message": {
-            // Claude delivers one logical message (same id) as SEPARATE events,
-            // one per finalized content block (thinking, then text, then tool_use).
-            // APPEND the new block(s) to whatever the turn already shows — never
-            // replace — otherwise the text rendered between two tools would be
-            // overwritten by the following tool_use block and vanish. The live
-            // buffers are cleared because the block they were typing is now
-            // authoritative in `blocks`. The turn stays "streaming"; turn_result
-            // finalizes it. (Resume takes a faster path: history.rs has already
-            // merged the same-id lines, so this just appends the one merged event.)
-            const base = openTurn(entry, item.id, item.parent_tool_use_id);
-            const existing = base.turns[item.id];
-            const blocks = [...existing.blocks, ...item.blocks];
-            const turn: Turn = {
-              ...existing,
-              blocks,
-              streamingText: "",
-              streamingThinking: "",
-              hasThinking: blocks.some((b) => b.type === "thinking"),
-              // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
-              // Null on Claude; keep any prior value if a later block omits it.
-              codexTurnId: item.turn_id ?? existing.codexTurnId,
-            };
-            // Freeze the elapsed of any thinking block finalized here, keyed by its text
-            // (what the renderer receives). Clear the live start so the next block re-stamps.
-            // Skipped during hydration: a replayed assistant_message carries no live delta,
-            // so `thinkingStartedAt` is already null there — the guard is belt-and-suspenders.
-            let thinkingStartedAt = base.thinkingStartedAt;
-            let thinkingDurations = base.thinkingDurations;
-            if (!hydrating && thinkingStartedAt != null) {
-              const finalized = item.blocks.filter(
-                (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
-                  b.type === "thinking" && !!b.text,
-              );
-              if (finalized.length > 0) {
-                const dur = Date.now() - thinkingStartedAt;
-                thinkingDurations = { ...thinkingDurations };
-                for (const b of finalized) thinkingDurations[b.text] = dur;
-                thinkingStartedAt = null;
-              }
-            }
-            // Stamp the start of each tool call appearing here (keyed by tool_use_id), so a
-            // running tool row can show a live counter and its tool_result can freeze the
-            // duration. Only the first sighting stamps (an assistant_message can't re-open a
-            // tool). Sub-agent (Task) tool_uses are included — they get durations too.
-            // NEVER stamp during hydration: replayed history has no wall-clock meaning, and
-            // its tool_result lands in the SAME synchronous loop, freezing ~0ms → every tool
-            // of a reloaded conversation would show a bogus "0ms" chip. Live only.
-            let toolStartedAt = base.toolStartedAt;
-            const toolUses = item.blocks.filter(
-              (b): b is Extract<NormalizedBlock, { type: "tool_use" }> => b.type === "tool_use",
-            );
-            if (!hydrating && toolUses.length > 0) {
-              const t = Date.now();
-              toolStartedAt = { ...toolStartedAt };
-              for (const b of toolUses) if (toolStartedAt[b.id] == null) toolStartedAt[b.id] = t;
-            }
-            let next = {
-              ...base,
-              turns: { ...base.turns, [item.id]: turn },
-              thinkingStartedAt,
-              thinkingDurations,
-              toolStartedAt,
-            };
-            // Record any detached sub-agent (`Agent` with run_in_background) launched in
-            // this message, so the pinned AgentBar can list it WITHOUT re-scanning every
-            // block on each streamed token. Done once per assistant_message.
-            //
-            // MAIN THREAD ONLY (same scoping as the TodoWrite capture below). A sub-agent
-            // can spawn its own agents — the CLI nests them up to depth 3 by default, and
-            // we pass `--forward-subagent-text`, so those messages reach us. Collecting
-            // them here would list a GRANDCHILD in the conversation-level AgentBar as if
-            // the user had launched it, and hide its block from the parent sub-agent's own
-            // drill-in transcript (bgAgentIds also drives that fold).
-            const newBg = (item.parent_tool_use_id === null
-              ? backgroundAgentIdsIn(item.blocks)
-              : []
-            ).filter((id) => !next.bgAgentIds.includes(id));
-            if (newBg.length > 0) {
-              next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
-            }
-            // Capture the agent's to-do list from a TodoWrite tool_use (last
-            // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
-            // its own todos and must not overwrite the conversation-level list.
-            if (item.parent_tool_use_id === null) {
-              const todos = latestTodosInBlocks(item.blocks);
-              if (todos) return { ...next, todos };
-            }
-            return next;
-          }
-
-          case "tool_result": {
-            const result: ToolResult = {
-              toolUseId: item.tool_use_id,
-              content: item.content,
-              isError: item.is_error,
-              parentToolUseId: item.parent_tool_use_id,
-            };
-            // Freeze the tool's duration (tool_use → tool_result) if we stamped its start.
-            // Skipped during hydration (belt-and-suspenders: a replayed tool_use never gets a
-            // stamp, so `startedAt` is already null here — but make the intent explicit).
-            let toolDurations = entry.toolDurations;
-            const startedAt = entry.toolStartedAt[item.tool_use_id];
-            if (!hydrating && startedAt != null && toolDurations[item.tool_use_id] == null) {
-              toolDurations = { ...toolDurations, [item.tool_use_id]: Date.now() - startedAt };
-            }
-            const next: SessionEntry = {
-              ...entry,
-              toolResults: { ...entry.toolResults, [item.tool_use_id]: result },
-              toolDurations,
-            };
-            // Robustness: a DETACHED sub-agent whose live `Agent` block arrived WITHOUT
-            // `run_in_background` (a transient wire drop) would otherwise render inline as a
-            // foreground card and never reach the AgentBar. Its launch ack is an independent,
-            // reliable "detached" signal — fold the id into bgAgentIds so the AgentBar lists
-            // it AND the inline hiding drops it, exactly as if the input flag had been present.
-            if (
-              isDetachedAgentByAck(entry, item.tool_use_id, item.content) &&
-              !next.bgAgentIds.includes(item.tool_use_id)
-            ) {
-              next.bgAgentIds = [...next.bgAgentIds, item.tool_use_id];
-            }
-            return next;
-          }
-
-          case "turn_result": {
-            const id = `tr_${entry.seq}`;
-            const meta: TurnResultMeta = {
-              subtype: item.subtype,
-              isError: item.is_error,
-              result: item.result,
-              apiErrorStatus: item.api_error_status ?? null,
-              totalCostUsd: item.total_cost_usd,
-              numTurns: item.num_turns,
-              durationMs: item.duration_ms,
-              durationApiMs: item.duration_api_ms,
-              ttftMs: item.ttft_ms,
-            };
-            // finalize any still-streaming turns
-            const turns = { ...entry.turns };
-            let touched = false;
-            for (const [tid, t] of Object.entries(turns)) {
-              if (t.status === "streaming") {
-                turns[tid] = {
-                  ...t,
-                  status: item.subtype === "interrupted" ? "interrupted" : "final",
-                };
-                touched = true;
-              }
-            }
-            // Safety net for the "en attente" badge: normally cleared at the next
-            // message_started, but a loop can end (e.g. interrupted) without one, so
-            // clear any still-queued user turn now that the loop is over.
-            return clearQueuedBadges({
-              ...entry,
-              seq: entry.seq + 1,
-              turns: touched ? turns : entry.turns,
-              turnResults: { ...entry.turnResults, [id]: meta },
-              timeline: [...entry.timeline, { kind: "turn_result", id }],
-              openBubble: {},
-              pendingPermissions: [],
-              // Re-anchor the replay insert point to the (new) end of the timeline at
-              // this turn boundary, so the NEXT remote turn's echo splices right after
-              // this turn — never inside the response that just finished. (+1 = the
-              // turn_result footer we just appended.) See `SessionEntry.replayAnchor`.
-              replayAnchor: entry.timeline.length + 1,
-              // A turn just finished → it's now "to review", UNLESS it was
-              // interrupted (the user did that, so they're already aware).
-              turnSeen: item.subtype === "interrupted",
-            });
-          }
-
-          case "notice": {
-            const id = `nt_${entry.seq}`;
-            const notice: NoticeItem = {
-              id,
-              subtype: item.subtype,
-              detail: item.detail,
-            };
-            const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
-            // A notice landing AT the anchor (nothing of the current turn sits above it) is
-            // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
-            // the anchor past it so a LATER remote echo splices below it, not above — else a
-            // "Background task failed" would read as happening after a message the user only
-            // sent afterwards. A notice arriving MID-response (anchor already behind the
-            // streaming reply) leaves the anchor alone: the late echo of the prompt that
-            // caused that reply still belongs before the whole response.
-            // See `SessionEntry.replayAnchor`.
-            const atBoundary = entry.replayAnchor >= entry.timeline.length;
-            return {
-              ...entry,
-              seq: entry.seq + 1,
-              notices: { ...entry.notices, [id]: notice },
-              timeline,
-              replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
-            };
-          }
-
-          default:
-            // A ConversationItem kind we don't handle (a new core/protocol variant
-            // landing before the front catches up). TS has no exhaustiveness guard on
-            // this switch, so it would be dropped without a trace — log it instead.
-            console.warn("[conversationStore] unhandled ConversationItem kind:", (item as { kind?: string }).kind);
-            return entry;
-        }
+    noteTask: (session, taskId, running) =>
+      set((s) => {
+        const entry = s.sessions[session];
+        if (!entry) return s;
+        const runClock = runTask(entry.runClock, taskId, running, Date.now());
+        if (runClock === entry.runClock) return s;
+        return { sessions: { ...s.sessions, [session]: { ...entry, runClock } } };
       }),
+
+    applyItem: (session, item, hydrating = false) =>
+      withEntry(session, (entry) => reduceItem(entry, item, hydrating)),
+
+    applyItems: (session, items, hydrating = false) =>
+      withEntry(session, (entry) => items.reduce((acc, item) => reduceItem(acc, item, hydrating), entry)),
   };
+
 });
 
 // ---- Fine-grained selector hooks -------------------------------------------
@@ -839,10 +1027,21 @@ const EMPTY_STRINGS: string[] = [];
 export const useSessionState = (session: string): SessionStatePayload | undefined =>
   useConversationStore((s) => s.sessions[session]?.state);
 
-/** Wall-clock start of the in-flight turn (`Date.now()`), or `null` when idle. Drives
- *  the live elapsed counter in the working indicator. See {@link SessionEntry.turnStartedAt}. */
-export const useTurnStartedAt = (session: string): number | null =>
-  useConversationStore((s) => s.sessions[session]?.turnStartedAt ?? null);
+/** Start of the run in flight — the user's Enter, NOT the current turn's start, so a
+ *  follow-up turn the CLI runs on its own never restarts the count — falling back to the
+ *  turn's start when no run is known; `null` when idle. Drives the live elapsed counter
+ *  in the working indicator. See {@link SessionEntry.runClock}. */
+export const useRunStartedAt = (session: string): number | null =>
+  useConversationStore((s) => {
+    const e = s.sessions[session];
+    return e ? (liveRunStart(e.runClock) ?? e.turnStartedAt) : null;
+  });
+
+/** What the footer of `turn_result` `resultId` shows for its run (see `runFooterFor`):
+ *  `null` = no run known (show the turn's own duration), `"hidden"` = not its run's latest
+ *  result. Shallow-compared, so the footer re-renders only when a figure moves. */
+export const useRunFooter = (session: string, resultId: string): RunFooter | "hidden" | null =>
+  useConversationStore(useShallow((s) => runFooterFor(s.sessions[session]?.runClock, resultId)));
 
 /** Wall-clock start of the thinking block currently streaming, or `null`. Drives the live
  *  counter on a streaming ThinkingBlock. See {@link SessionEntry.thinkingStartedAt}. */

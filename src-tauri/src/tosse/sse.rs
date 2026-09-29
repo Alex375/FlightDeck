@@ -33,21 +33,24 @@
 //! Against production (2026-08-11), an idle stream ends CLEANLY — a finished body, not an
 //! error — after **12.0 s**, reproducibly, over HTTP/1.1. It is an INACTIVITY timeout: a
 //! probe that received a `task:updated` at ~12 s stayed connected until 24 s, i.e. the clock
-//! restarts on every byte. The server's own `: keepalive` is documented at 15 s, so it never
-//! gets the chance to fire and the connection it exists to hold open is dropped first.
+//! restarts on every byte. The server's own `: keepalive` was sent every 15 s, so it never
+//! got the chance to fire and the connection it exists to hold open was dropped first.
+//!
+//! ✅ FIXED server-side (2026-09-28, CRM_max `bd6705f` + `a8456e5`). The culprit was NOT the
+//! Railway edge (the first guess): it was `Bun.serve`'s own `idleTimeout` (10 s by default,
+//! checked in ~4 s steps — hence ~12 s), which closes any request that stays quiet. The SSE
+//! route now opts out of it (`server.timeout(req, 0)`) and the keepalive went to 10 s;
+//! production logs show no more `/api/v1/sse` endings. The recycle handling below stays as
+//! the safety net it always was — a redeploy or a proxy change can end a stream cleanly.
 //!
 //! Two consequences the loop is built around:
 //! - A clean end after a connection that RAN ([`ESTABLISHED_AFTER`]) **and delivered** is not
 //!   a failure. It is recycled silently: no backoff, no state change, no indicator flicker
 //!   every 12 s. An idle timeout never qualifies, however long the socket stayed open — see
 //!   [`ended`], which is what keeps `Error` reachable for a stream that goes quiet.
-//! - The refetch owed per connection is throttled ON THE FRONT, or a recycle every 12 s
-//!   would become the very polling this feature exists to remove.
-//!
-//! The real fix belongs to the CRM: a keepalive shorter than that timeout (~10 s) would hold
-//! one connection open indefinitely and make all of this moot. Worth doing — it would also
-//! close the ~200 ms gap each recycle leaves, which is the only window where a change can be
-//! missed until the next refetch.
+//! - A recycle owes the front NO refetch (`TosseLiveHost`): only a real outage — the state
+//!   left `live` — does. Refetching for every recycle was a sweep every minute for as long
+//!   as the window stayed visible: the very polling this feature exists to remove.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -64,7 +67,7 @@ const SSE_PATH: &str = "/api/v1/sse";
 
 /// How long a silent socket is allowed to stay silent before we treat it as dead.
 ///
-/// The server sends a `: keepalive` comment every 15 s, so three missed ones is a stream
+/// The server sends a `: keepalive` comment every 10 s, so five missed ones is a stream
 /// that is no longer being served — a TCP connection can otherwise sit "open" for many
 /// minutes after the peer is gone, and a frozen view that claims to be live is the worst
 /// outcome this feature can produce.
@@ -1000,7 +1003,7 @@ mod tests {
 
         let mut parser = SseParser::new();
         let mut saw_bytes = false;
-        // Bounded: the server sends `connected` at once, then a keepalive every 15 s.
+        // Bounded: the server sends `connected` at once, then a keepalive every 10 s.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_secs(20), resp.chunk()).await {

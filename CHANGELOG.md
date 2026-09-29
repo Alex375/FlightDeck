@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.7.0
+
+- New: a **customizable conversation side panel** — choose its widgets (git status, stats with the total tokens of every agent, linked conversations, plan usage, the machine it runs on…), reorder and fold them, or start from a preset. It can be resized, and can fit its content.
+- New: an opt-in **telemetry deck** in the side panel — live gauges, clocks and the token mix of the running agent.
+- New: a cleaner **title bar** — underlined view tabs and one tray for voice, sound and Caffeinate.
+- New: an adjustable **conversation width**, and Display settings sorted into clearer cards.
+- Fix: the **turn duration** now times the whole run, background tasks included, instead of resetting.
+- Fix: **artifact icons** show again and older versions are reachable; **less battery drain** at rest (idle wake-ups, remote servers, wake word).
+
 ## v2.6.0
 
 - New: **per-tool permissions for MCP tools** — Allow / Ask / Block each tool, and choose where it applies (this conversation, the repository, or everywhere). Extensions now live under Settings → Claude Code.

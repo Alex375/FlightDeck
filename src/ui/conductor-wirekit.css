@@ -56,6 +56,9 @@
   --wf-r-xl:14px;
   --wf-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
   --wf-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  /* The app's entrance curve, for stylesheets — ⚠️ the same curve as EASE_ENTER (ui/motion.ts):
+     change one, change the other. */
+  --wf-ease-enter: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 /* ---- window frame (macOS) ---------------------------------- */
@@ -72,12 +75,14 @@
   box-shadow: 0 0 0 1px var(--wf-line);
   -webkit-font-smoothing: antialiased;
 }
+/* The title bar sits flush with the app ("Épuré"): same ground as the body, a hairline
+   under it, no framed controls — the tabs are underlined text, the buttons bare glyphs. */
 .wf-titlebar {
   height: 38px; flex: 0 0 38px;
-  display: flex; align-items: center; gap: 14px;
-  padding: 0 14px;
-  background: var(--wf-bg-2);
-  border-bottom: 1px solid var(--wf-line);
+  display: flex; align-items: center; gap: 20px;
+  padding: 0 16px;
+  background: var(--wf-bg);
+  border-bottom: 1px solid color-mix(in srgb, var(--wf-line) 70%, var(--wf-bg));
   user-select: none;
 }
 .wf-traffic { display: flex; gap: 8px; }
@@ -94,27 +99,124 @@
    also the FIRST thing to give way (`flex: 0 1 auto` here, `0 0 auto` on the nav and the
    controls): the title is the one part already shown elsewhere, in the sidebar. */
 .wf-title {
-  font-size: 12px; color: var(--wf-tx-lo); letter-spacing: .2px;
+  font-size: 12.5px; font-weight: 500; color: var(--wf-tx-hi);
   flex: 0 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.wf-tbnav { flex: 0 0 auto; display: flex; gap: 2px; margin-left: 4px; background: var(--wf-panel); padding: 3px; border-radius: 8px; border: 1px solid var(--wf-line); }
-.wf-tbnav button {
-  font: inherit; font-size: 11.5px; color: var(--wf-tx-lo);
-  background: transparent; border: 0; padding: 4px 11px; border-radius: 6px; cursor: default;
-  display: flex; align-items: center; gap: 6px;
+/* View tabs: plain text, the current one underlined on the bar's bottom edge. The nav
+   stretches to the bar's full height so that underline can sit ON the hairline (bottom:-1px).
+   Every tab carries the same weight — a bolder current tab would change its width and nudge
+   its neighbours on each switch; colour alone tells them apart. The thin rule after the nav
+   separates the tabs from the window title. */
+.wf-tbnav {
+  flex: 0 0 auto; align-self: stretch; position: relative;
+  display: flex; align-items: stretch; gap: 18px;
 }
-.wf-tbnav button[data-on] { background: var(--wf-panel-3); color: var(--wf-tx-hi); }
+.wf-tbnav::after {
+  content: ""; position: absolute; right: -10px; top: 50%;
+  width: 1px; height: 16px; margin-top: -8px; background: var(--wf-line);
+}
+.wf-tbnav button {
+  font: inherit; font-size: 12.5px; font-weight: 500; color: var(--wf-tx-lo);
+  position: relative; background: transparent; border: 0; padding: 0 2px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px;
+  transition: color .15s ease;
+}
+.wf-tbnav button:hover { color: var(--wf-tx); }
+.wf-tbnav button[data-on] { color: var(--wf-tx-hi); }
+/* ONE underline for the whole nav, placed under the current tab by `useTabUnderline` (kit.tsx)
+   — a single element is what lets it slide from tab to tab (see the motion block below). */
+.wf-tbnav-line {
+  position: absolute; left: 0; bottom: -1px; width: 0; height: 2px;
+  border-radius: 2px; background: var(--wf-tx-hi); pointer-events: none; opacity: 0;
+}
 .wf-tbnav .wf-badge { font-size: 9.5px; padding: 0 5px; }
 /* The controls are allowed to SHRINK, but their buttons are not: `flex: 0 1 auto` +
    `min-width: 0` is what passes the pressure down to the one child with variable-width
    content (the TOSSE task chip, which truncates), instead of the whole row spilling past
    the window. A fixed-size button has no give and keeps its hit area — half a button
    would be worse than a shorter caption. Order of sacrifice: the title, then that chip. */
-.wf-tbright { flex: 0 1 auto; margin-left: auto; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.wf-tbright { flex: 0 1 auto; margin-left: auto; display: flex; align-items: center; gap: 4px; min-width: 0; }
+
+/* Title-bar buttons are bare glyphs (the `.wf-icon-btn` frame is dropped HERE only — the
+   sidebar and the Flight Deck keep theirs). Open = the glyph lights up and a dot sits under
+   it, like the Dock marks a running app. */
+.wf-titlebar .wf-icon-btn {
+  position: relative; width: 30px; height: 30px;
+  border-color: transparent; background: transparent; color: var(--wf-tx-lo);
+  border-radius: 8px;
+}
+.wf-titlebar .wf-icon-btn .wf-ico { width: 15px; height: 15px; }
+.wf-titlebar .wf-icon-btn:hover:not(:disabled):not([aria-disabled]) {
+  background: var(--wf-panel); border-color: transparent; color: var(--wf-tx-hi);
+  transform: none;
+}
+.wf-titlebar .wf-icon-btn:active:not(:disabled):not([aria-disabled]) {
+  background: var(--wf-panel-2); transform: scale(.94);
+}
+.wf-titlebar .wf-icon-btn[data-on] { background: transparent; border-color: transparent; color: var(--wf-tx-hi); }
+/* The dot is always there, shrunk to nothing while closed, so it can grow in and out. */
+.wf-titlebar .wf-icon-btn::after {
+  content: ""; position: absolute; left: 50%; bottom: 1px;
+  width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--wf-tx-hi);
+  transform: scale(0); opacity: 0;
+}
+.wf-titlebar .wf-icon-btn[data-on]::after { transform: scale(1); opacity: 1; }
+/* The chips that join the bar when the conversation panel is off (stream control, worktree)
+   lose their frame the same way — a surface only on hover / while their menu is open. */
+.wf-titlebar .wf-streamctl { border-color: transparent; background: transparent; }
+.wf-titlebar .wf-streamctl:hover,
+.wf-titlebar .wf-streamctl[data-open] { background: var(--wf-panel); border-color: transparent; }
+
+/* ---- title-bar system tray ---------------------------------
+   The app-wide switches (voice session + mic, notification sound, Caffeinate) share one
+   pill. Each glyph is a one-click toggle that lights up while on; Caffeinate's small chevron
+   opens its mode menu. Qualified with `.wf-tray` so the icon sizes beat `.wf-ico.sm`, which
+   is declared further down. */
+.wf-tray {
+  flex: none; height: 28px; margin-right: 8px; padding: 0 2px; box-sizing: border-box;
+  display: inline-flex; align-items: center; gap: 1px;
+  border-radius: 999px; border: 1px solid var(--wf-line); background: var(--wf-bg-2);
+}
+.wf-tray-b, .wf-tray-more {
+  font: inherit; cursor: pointer; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 999px; background: transparent; color: var(--wf-tx-xlo);
+  transition: background .15s ease, color .15s ease;
+}
+.wf-tray-b { width: 26px; }
+.wf-tray .wf-tray-b .wf-ico { width: 13px; height: 13px; }
+/* On/off is the glyph's colour alone — lit white vs dim grey; the surface is hover-only. */
+.wf-tray-b[data-on] { color: var(--wf-tx-hi); }
+.wf-tray-b:hover, .wf-tray-more:hover, .wf-tray-more[data-open] { background: var(--wf-panel-3); color: var(--wf-tx-hi); }
+.wf-tray-b:active { background: var(--wf-panel-2); }
+.wf-tray-b[data-err] { color: var(--wf-err); }
+/* Caffeinate's mode chevron: a narrow tab tucked against the coffee glyph. */
+.wf-tray-more { width: 14px; margin-left: -1px; color: var(--wf-tx-xlo); }
+.wf-tray .wf-tray-more .wf-ico { width: 10px; height: 10px; transition: transform .15s ease; }
+.wf-tray-more[data-open] .wf-ico { transform: rotate(180deg); }
+
+/* ---- title-bar motion ---------------------------------------
+   Short and quiet, only where it explains a change: the underline slides to the tab just
+   picked, a panel's "open" dot grows in and out, a system switch gives under the click.
+   Gated twice: the `titleBarAnimations` pref (the bar's `data-motion`) and the OS "reduce
+   motion" setting, which always wins. The underline only travels once it has been placed
+   (`data-ready`), so it does not sweep in from the left edge on launch. */
+@media (prefers-reduced-motion: no-preference) {
+  .wf-titlebar[data-motion] .wf-tbnav-line[data-ready] {
+    transition: transform .18s cubic-bezier(0.32, 0.72, 0, 1), width .18s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .wf-titlebar[data-motion] .wf-icon-btn::after {
+    transition: transform .14s cubic-bezier(0.32, 0.72, 0, 1), opacity .1s ease;
+  }
+  .wf-titlebar[data-motion] .wf-tray-b {
+    transition: background .15s ease, color .15s ease, transform .1s ease;
+  }
+  .wf-titlebar[data-motion] .wf-tray-b:active { transform: scale(.88); }
+}
 
 .wf-body { flex: 1; display: flex; min-height: 0; }
 .wf-col  { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -232,7 +334,7 @@
 .wf-btn:disabled { opacity: .4; cursor: default; }
 /* A thin vertical rule between groups of title-bar controls (app-wide toggles | conversation
    actions | the conversation panel toggle). */
-.wf-tb-sep { flex: none; width: 1px; height: 18px; margin: 0 4px; background: var(--wf-line); }
+.wf-tb-sep { flex: none; width: 1px; height: 16px; margin: 0 6px; background: color-mix(in srgb, var(--wf-line) 80%, var(--wf-bg)); }
 .wf-icon-btn {
   width: 28px; height: 28px; display: inline-flex; align-items:center; justify-content:center;
   border-radius: var(--wf-r); border: 1px solid var(--wf-line); background: var(--wf-panel); color: var(--wf-tx);
@@ -475,6 +577,7 @@
   .wf-eff-fill.ultra, .wf-eff-thumb.ultra { animation:none; }
   .wf-icon-btn { transition:none; }
   .wf-icon-btn:hover:not(:disabled), .wf-icon-btn:active:not(:disabled) { transform:none; }
+  .wf-tbnav button, .wf-tray-b, .wf-tray-more, .wf-tray-more .wf-ico { transition:none; }
 }
 
 /* ---- context ring ------------------------------------------ */
