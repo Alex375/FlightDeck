@@ -8,7 +8,14 @@
 // "General". Sub-tabs carry the rest — growing the rail is the wrong axis.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { demoteBypassConversations, wipeAllData } from "../../store/conversationsStore";
+import {
+  demoteBypassConversations,
+  useConversationsStore,
+  wipeAllData,
+} from "../../store/conversationsStore";
+import { useSidePanelLayout, useWidgetOn } from "../../store/sidePanelWidgetsStore";
+import { useEditorStore } from "../editor/editorStore";
+import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
@@ -774,11 +781,15 @@ function ThreadPrefs() {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
+  const telemetryOn = useWidgetOn("telemetry");
+  const setWidgetOn = useSidePanelLayout((s) => s.setOn);
+  const activeConvId = useConversationsStore((s) => s.activeId);
   const messageMinimap = useDisplay((s) => s.messageMinimap);
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
   const artifactsInApp = useDisplay((s) => s.artifactsInApp);
+  const artifactHidesSidePanel = useDisplay((s) => s.artifactHidesSidePanel);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -840,6 +851,64 @@ function ThreadPrefs() {
           checked={conversationSidePanel}
           onChange={(v) => set({ conversationSidePanel: v })}
           label="Show the conversation side panel"
+        />
+        <ToggleRow
+          title="Telemetry deck"
+          hint={
+            <>
+              Turns the top of the conversation panel into a <strong>live instrument deck</strong>:
+              millisecond clocks, a context gauge, cost and average call time, live gauges, a
+              streaming oscilloscope, calls per second over the last minute, a counter per kind
+              of tool call, a board timing the calls that run long, and a feed of the latest
+              calls — all of it moving as the agent works. Every reading is real; nothing moves
+              on its own. <strong>Off by default</strong> — and off, it costs nothing: it is not
+              even loaded.
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {conversationSidePanel ? null : (
+                <> It lives in the conversation panel, so turn that on first.</>
+              )}
+            </>
+          }
+          checked={telemetryOn}
+          onChange={(v) => setWidgetOn("telemetry", v)}
+          label="Show the telemetry deck in the conversation panel"
+          disabled={!conversationSidePanel}
+        />
+        <ToggleRow
+          title="Conversation panel widgets"
+          hint={
+            <>
+              Choose what the conversation panel shows — its task, goal, todo list, artifacts,
+              stats, context, git status, plan usage, linked conversations, and the stream,
+              worktree and machine rows at the bottom — in what order, and whether its sections
+              fold. Opens the panel's <strong>Customize</strong> view (also its header button).
+              A widget switched off gives its old place back (the header chip, the composer
+              chip, the todo bar).
+              {/* The reason goes in the text, not a tooltip: a disabled control never shows one. */}
+              {!conversationSidePanel ? (
+                <> It needs the conversation panel, so turn that on first.</>
+              ) : !activeConvId ? (
+                <> Open a conversation first.</>
+              ) : null}
+            </>
+          }
+          control={
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.ghost}`}
+              disabled={!conversationSidePanel || !activeConvId}
+              onClick={() => {
+                if (!activeConvId) return;
+                // Into the conversation (which also closes Settings), its panel open, in its
+                // customize view.
+                useEditorStore.getState().setConvPanelOpen(true);
+                useSidePanelLayout.getState().setCustomizing(true);
+                openConversationAt(activeConvId, null);
+              }}
+            >
+              Customize…
+            </button>
+          }
         />
         <ToggleRow
           title="Message minimap"
@@ -917,6 +986,20 @@ function ThreadPrefs() {
           checked={artifactsInApp}
           onChange={(v) => set({ artifactsInApp: v })}
           label="Show claude.ai-hosted artifacts in the side panel"
+        />
+        <ToggleRow
+          title="Hide the conversation panel while previewing an artifact"
+          hint={
+            <>
+              Puts the <strong>conversation panel</strong> away while an artifact preview is open,
+              and brings it back when you close the preview — side by side they leave the thread a
+              sliver. <strong>On by default.</strong> It only ever hides a panel that was already
+              on screen, so an artifact never opens one you had closed. Off → both stay up.
+            </>
+          }
+          checked={artifactHidesSidePanel}
+          onChange={(v) => set({ artifactHidesSidePanel: v })}
+          label="Hide the conversation panel while an artifact is open"
         />
       </SettingsGroup>
 

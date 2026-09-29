@@ -18,8 +18,9 @@ use serde_json::Value;
 
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, NormalizedBlock,
-    RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent, SessionStatePayload,
+    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, ModelTokenUsage,
+    NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
+    SessionStatePayload, SessionUsage, TokenUsage,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
@@ -712,13 +713,18 @@ impl Assembler {
                 // have `parent_tool_use_id` set and their own window — never let them
                 // clobber the conversation's context meter.
                 if se.parent_tool_use_id.is_none() {
-                    if let Some(used) = event
-                        .get("message")
-                        .and_then(|m| m.get("usage"))
-                        .and_then(context_used_from_usage)
-                    {
+                    let usage = event.get("message").and_then(|m| m.get("usage"));
+                    if let Some(used) = usage.and_then(context_used_from_usage) {
                         if self.state.context_tokens != Some(used) {
                             self.state.context_tokens = Some(used);
+                            state_changed = true;
+                        }
+                    }
+                    // Its breakdown, from the SAME object (so the two never disagree). The
+                    // output is only a stub here; the call's `message_delta` completes it.
+                    if let Some(breakdown) = usage.and_then(token_usage_from) {
+                        if self.state.context_usage != Some(breakdown) {
+                            self.state.context_usage = Some(breakdown);
                             state_changed = true;
                         }
                     }
@@ -783,8 +789,23 @@ impl Assembler {
                     }
                 }
             }
-            // content_block_stop, message_delta, message_stop carry no incremental
-            // text we surface yet.
+            // A root call's `message_delta` carries its final `output_tokens` — the one figure
+            // of its usage that `message_start` could not know yet. One per model call, so this
+            // is one state event per call, not per token.
+            "message_delta" if se.parent_tool_use_id.is_none() => {
+                let output = event
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_u64);
+                if let (Some(output), Some(usage)) = (output, self.state.context_usage.as_mut()) {
+                    if usage.output != output {
+                        usage.output = output;
+                        out.push(SessionEvent::State(self.state.clone()));
+                    }
+                }
+            }
+            // content_block_stop, message_stop, and a sub-agent's message_delta carry nothing
+            // we surface yet.
             _ => {}
         }
     }
@@ -1109,6 +1130,9 @@ impl Assembler {
         if let Some(used) = context_used_from_usage(final_usage) {
             self.state.context_tokens = Some(used);
         }
+        if let Some(breakdown) = token_usage_from(final_usage) {
+            self.state.context_usage = Some(breakdown);
+        }
         // Authoritative window for THIS session's model (distinguishes 200k vs 1M).
         // Only updates when the result reports the session model's own entry — a
         // sub-agent-only turn returns None and keeps the last known window.
@@ -1116,6 +1140,13 @@ impl Assembler {
             context_window_from_model_usage(&r.model_usage, self.state.model.as_deref())
         {
             self.state.context_window = Some(window);
+        }
+        // What the whole session has consumed, every agent included: the CLI's cumulative
+        // `modelUsage` snapshot, REPLACED (never summed, never max'd — a `/clear` legitimately
+        // lowers it). A result without one (an absent/empty map) keeps the last known value
+        // rather than reading as "nothing spent". Rides the State event pushed just below.
+        if let Some(usage) = session_usage_from_model_usage(&r.model_usage, r.total_cost_usd) {
+            self.state.session_usage = Some(usage);
         }
         out.push(SessionEvent::Item(ConversationItem::TurnResult {
             subtype: r.subtype.clone(),
@@ -1129,6 +1160,9 @@ impl Assembler {
             duration_ms: r.duration_ms,
             duration_api_ms: self.turn_api_ms(r.duration_api_ms),
             ttft_ms: r.ttft_ms,
+            // The TOP-LEVEL usage: the turn's aggregate over all its calls — what it consumed —
+            // where the context reading above takes the LAST call's.
+            usage: token_usage_from(&r.usage),
         }));
         out.push(SessionEvent::State(self.state.clone()));
     }
@@ -1391,6 +1425,79 @@ pub(crate) fn context_used_from_usage(usage: &Value) -> Option<u64> {
         return None;
     }
     Some(input.unwrap_or(0) + cache_creation.unwrap_or(0) + cache_read.unwrap_or(0))
+}
+
+/// The four token counts of a `usage` object, broken down (see [`TokenUsage`]). `None` when
+/// it carries none of them — an empty/`null` usage must not zero a known breakdown, exactly as
+/// [`context_used_from_usage`] refuses to zero a known fill. Its prompt part always sums to
+/// what that function returns for the same object.
+pub(crate) fn token_usage_from(usage: &Value) -> Option<TokenUsage> {
+    let field = |k: &str| usage.get(k).and_then(Value::as_u64);
+    let input = field("input_tokens");
+    let cache_creation = field("cache_creation_input_tokens");
+    let cache_read = field("cache_read_input_tokens");
+    let output = field("output_tokens");
+    if input.is_none() && cache_creation.is_none() && cache_read.is_none() && output.is_none() {
+        return None;
+    }
+    Some(TokenUsage {
+        input: input.unwrap_or(0),
+        cache_creation: cache_creation.unwrap_or(0),
+        cache_read: cache_read.unwrap_or(0),
+        output: output.unwrap_or(0),
+    })
+}
+
+/// A session's cumulative, all-agent spend (see [`SessionUsage`]) from a `modelUsage` map —
+/// `result.modelUsage` live, or the `modelUsage` of the transcript's `cost-state` line (the
+/// same camelCase shape). Each model's `inputTokens + cacheCreationInputTokens +
+/// cacheReadInputTokens + outputTokens` is added into the total; `thinkingTokens` is NOT, it is
+/// already inside `outputTokens`. `cost_usd` is the caller's session cost (`total_cost_usd` /
+/// `totalCostUSD`), passed through as is.
+///
+/// `None` when the map is absent, not an object, or names no model with a single token count:
+/// an empty snapshot must not overwrite a known total with zeros.
+pub(crate) fn session_usage_from_model_usage(
+    model_usage: &Value,
+    cost_usd: Option<f64>,
+) -> Option<SessionUsage> {
+    let obj = model_usage.as_object()?;
+    let mut per_model: Vec<ModelTokenUsage> = obj
+        .iter()
+        .filter_map(|(model, entry)| {
+            let field = |k: &str| entry.get(k).and_then(Value::as_u64);
+            let input = field("inputTokens");
+            let cache_creation = field("cacheCreationInputTokens");
+            let cache_read = field("cacheReadInputTokens");
+            let output = field("outputTokens");
+            if input.is_none() && cache_creation.is_none() && cache_read.is_none() && output.is_none() {
+                return None;
+            }
+            Some(ModelTokenUsage {
+                model: model.clone(),
+                usage: TokenUsage {
+                    input: input.unwrap_or(0),
+                    cache_creation: cache_creation.unwrap_or(0),
+                    cache_read: cache_read.unwrap_or(0),
+                    output: output.unwrap_or(0),
+                },
+                cost_usd: entry.get("costUSD").and_then(Value::as_f64),
+            })
+        })
+        .collect();
+    if per_model.is_empty() {
+        return None;
+    }
+    let size = |u: &TokenUsage| u.input + u.cache_creation + u.cache_read + u.output;
+    // Largest first; the id breaks a tie so the order never depends on the map's.
+    per_model.sort_by(|a, b| size(&b.usage).cmp(&size(&a.usage)).then_with(|| a.model.cmp(&b.model)));
+    let total = per_model.iter().fold(TokenUsage::default(), |acc, m| TokenUsage {
+        input: acc.input.saturating_add(m.usage.input),
+        cache_creation: acc.cache_creation.saturating_add(m.usage.cache_creation),
+        cache_read: acc.cache_read.saturating_add(m.usage.cache_read),
+        output: acc.output.saturating_add(m.usage.output),
+    });
+    Some(SessionUsage { total, cost_usd, per_model })
 }
 
 /// The AUTHORITATIVE context-window size for the session's own model, read from a
@@ -1792,6 +1899,71 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_breaks_down_the_same_fill_from_the_fixture() {
+        let mut asm = Assembler::new();
+        for line in CAPTURE.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            asm.ingest(&serde_json::from_str::<CliMessage>(line).unwrap());
+        }
+        let u = asm.state().context_usage.expect("the fixture reports usage");
+        assert_eq!((u.input, u.cache_creation, u.cache_read), (5069, 9061, 15626));
+        // The breakdown and the fill come from the same object: they can never disagree.
+        assert_eq!(Some(u.input + u.cache_creation + u.cache_read), asm.state().context_tokens);
+    }
+
+    #[test]
+    fn a_root_call_s_output_is_completed_by_its_message_delta() {
+        let line = |s: &str| serde_json::from_str::<CliMessage>(s).unwrap();
+        let mut asm = Assembler::new();
+        asm.ingest(&line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","usage":{"input_tokens":40,"cache_creation_input_tokens":300,"cache_read_input_tokens":9000,"output_tokens":1}}},"session_id":"s"}"#,
+        ));
+        let at_start = asm.state().context_usage.unwrap();
+        assert_eq!((at_start.input, at_start.cache_creation, at_start.cache_read), (40, 300, 9000));
+        // A SUB-AGENT's delta must not overwrite the conversation's own call.
+        asm.ingest(&line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":7777}},"parent_tool_use_id":"tu_sub","session_id":"s"}"#,
+        ));
+        assert_eq!(asm.state().context_usage.unwrap().output, 1);
+        let evs = asm.ingest(&line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":512}},"session_id":"s"}"#,
+        ));
+        assert_eq!(asm.state().context_usage.unwrap().output, 512);
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::State(_))), "the new output reaches the UI");
+    }
+
+    #[test]
+    fn a_turn_reports_what_it_consumed_while_the_context_reads_its_last_call() {
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "ok",
+            "stop_reason": "end_turn", "session_id": "s", "uuid": "u",
+            "usage": {
+                "input_tokens": 2100, "cache_read_input_tokens": 18000,
+                "cache_creation_input_tokens": 500, "output_tokens": 900,
+                "iterations": [
+                    {"input_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 500, "output_tokens": 300},
+                    {"input_tokens": 2000, "cache_read_input_tokens": 18000, "cache_creation_input_tokens": 0, "output_tokens": 600}
+                ]
+            }
+        });
+        let mut asm = Assembler::new();
+        let evs = asm.ingest(&serde_json::from_value::<CliMessage>(result).unwrap());
+        // The window holds the LAST call's prompt…
+        assert_eq!(
+            asm.state().context_usage,
+            Some(TokenUsage { input: 2000, cache_creation: 0, cache_read: 18000, output: 600 })
+        );
+        // …while the turn consumed the aggregate.
+        let usage = evs.iter().find_map(|e| match e {
+            SessionEvent::Item(ConversationItem::TurnResult { usage, .. }) => Some(*usage),
+            _ => None,
+        });
+        assert_eq!(
+            usage,
+            Some(Some(TokenUsage { input: 2100, cache_creation: 500, cache_read: 18000, output: 900 }))
+        );
+    }
+
+    #[test]
     fn context_helpers_sum_and_pick_window() {
         let usage = serde_json::json!({
             "input_tokens": 100,
@@ -1836,6 +2008,90 @@ mod tests {
         );
         assert_eq!(context_window_from_model_usage(&model_usage, None), None);
         assert_eq!(context_window_from_model_usage(&Value::Null, Some("x")), None);
+    }
+
+    #[test]
+    fn session_usage_sums_every_model_and_never_adds_thinking() {
+        let model_usage = serde_json::json!({
+            "claude-haiku-4-5": {"inputTokens": 514, "outputTokens": 11, "costUSD": 0.0006},
+            "claude-opus-5[1m]": {
+                "inputTokens": 5069, "outputTokens": 900, "thinkingTokens": 400,
+                "cacheReadInputTokens": 15626, "cacheCreationInputTokens": 9061,
+                "costUSD": 0.12, "contextWindow": 1000000
+            },
+            // A model the map lists without a single count adds nothing and is not listed.
+            "claude-sonnet-4-6": {"contextWindow": 200000}
+        });
+        let u = session_usage_from_model_usage(&model_usage, Some(0.1206)).expect("known");
+        // `thinkingTokens` is already inside `outputTokens`: 900 + 11, not 1311.
+        assert_eq!(
+            u.total,
+            TokenUsage { input: 5069 + 514, cache_creation: 9061, cache_read: 15626, output: 911 }
+        );
+        assert_eq!(u.cost_usd, Some(0.1206));
+        // Largest first; the helper Haiku is IN the total.
+        let models: Vec<&str> = u.per_model.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(models, ["claude-opus-5[1m]", "claude-haiku-4-5"]);
+        assert_eq!(u.per_model[1].cost_usd, Some(0.0006));
+        // Nothing to read → None, so a result without a map never zeroes a known total.
+        assert_eq!(session_usage_from_model_usage(&Value::Null, Some(1.0)), None);
+        assert_eq!(session_usage_from_model_usage(&serde_json::json!({}), None), None);
+        assert_eq!(
+            session_usage_from_model_usage(&serde_json::json!({"m": {"contextWindow": 1}}), None),
+            None
+        );
+    }
+
+    #[test]
+    fn fixture_result_carries_the_all_model_session_usage() {
+        let mut asm = Assembler::new();
+        let mut last = None;
+        for line in CAPTURE.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let msg: CliMessage = serde_json::from_str(line).unwrap();
+            for ev in asm.ingest(&msg) {
+                if let SessionEvent::State(s) = ev {
+                    last = Some(s.session_usage);
+                }
+            }
+        }
+        // The fixture's result: Opus 5069/9061/15626/5 + a helper Haiku 514/11.
+        let u = last.flatten().expect("the result's state carries the session usage");
+        assert_eq!(
+            u.total,
+            TokenUsage { input: 5069 + 514, cache_creation: 9061, cache_read: 15626, output: 5 + 11 }
+        );
+        assert_eq!(u.cost_usd, Some(0.124462));
+        assert_eq!(u.per_model.len(), 2);
+    }
+
+    #[test]
+    fn session_usage_is_replaced_by_each_result_never_summed() {
+        let result = |input: u64, cost: f64| -> CliMessage {
+            serde_json::from_value(serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false,
+                "total_cost_usd": cost,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "modelUsage": {"claude-opus-5": {"inputTokens": input, "outputTokens": 10}}
+            }))
+            .unwrap()
+        };
+        let mut asm = Assembler::new();
+        asm.ingest(&result(100, 0.5));
+        // The second result carries the RUNNING total (100 + 50): it replaces, never adds.
+        asm.ingest(&result(150, 0.8));
+        let u = asm.state().session_usage.clone().unwrap();
+        assert_eq!(u.total.input, 150);
+        assert_eq!(u.cost_usd, Some(0.8));
+        // A `/clear` resets the CLI's counter: the value goes DOWN, and is taken as is.
+        asm.ingest(&result(20, 0.05));
+        assert_eq!(asm.state().session_usage.as_ref().unwrap().total.input, 20);
+        // A result without a map keeps the last known total.
+        let bare: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true
+        }))
+        .unwrap();
+        asm.ingest(&bare);
+        assert_eq!(asm.state().session_usage.as_ref().unwrap().total.input, 20);
     }
 
     #[test]

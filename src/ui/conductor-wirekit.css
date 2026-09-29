@@ -56,6 +56,9 @@
   --wf-r-xl:14px;
   --wf-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
   --wf-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  /* The app's entrance curve, for stylesheets — ⚠️ the same curve as EASE_ENTER (ui/motion.ts):
+     change one, change the other. */
+  --wf-ease-enter: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 /* ---- window frame (macOS) ---------------------------------- */

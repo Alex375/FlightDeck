@@ -16,8 +16,8 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationItem, GoalState, SlashCommand, WorkflowJournal, WorkflowPhase,
-    WorkflowRun,
+    ContextFill, ConversationItem, GoalState, SessionUsage, SlashCommand, WorkflowJournal,
+    WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig};
@@ -465,6 +465,47 @@ pub async fn spawn_session(
 #[specta::specta]
 pub fn codex_available() -> bool {
     crate::supervisor::codex::codex_available()
+}
+
+/// This Mac's name as the user knows it — the "Computer Name" of System Settings → General →
+/// Sharing (`scutil --get ComputerName`, e.g. « MacBook Pro d'Alexandre »), else the host name.
+/// For the conversation side panel's Machine row, which says WHERE a local conversation runs.
+/// Read once per app run (a machine is not renamed under a running app often enough to poll),
+/// off the main thread. `None` only when neither can be read — the row then says « This Mac ».
+#[tauri::command]
+#[specta::specta]
+pub async fn local_machine_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(name) = NAME.get() {
+        return name.clone();
+    }
+    let name = tokio::task::spawn_blocking(read_local_machine_name).await.ok().flatten();
+    NAME.get_or_init(|| name).clone()
+}
+
+fn read_local_machine_name() -> Option<String> {
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    let computer_name = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| clean(&String::from_utf8_lossy(&o.stdout)));
+    computer_name.or_else(|| {
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer outlives the call and its length is passed; gethostname writes a
+        // NUL-terminated name within it (or truncates) and reports failure through its return.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        // A host name reads better without its local-network suffix (« alex-mbp.local »).
+        clean(String::from_utf8_lossy(&buf[..end]).trim_end_matches(".local"))
+    })
 }
 
 /// Whether a usable `claude` binary is installed on this machine. Powers the proactive
@@ -2037,6 +2078,26 @@ pub async fn load_session_context(session_id: String) -> Result<ContextFill, Str
     tokio::task::spawn_blocking(move || crate::supervisor::history::load_context_fill(&session_id))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Read a conversation's cumulative token spend from disk — the seed of the side panel's
+/// session total on open / stream (re)start, before the first live snapshot. Claude: the
+/// transcript's last `cost-state` line (every agent, as of the process's last close). Codex: the
+/// rollout's last `token_count` total (this thread only). `None` when disk holds no such record
+/// (a killed process, a remote conversation whose transcript is on its server): unknown, which
+/// the UI reads as unknown — never zero. A tail read, off the async runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_session_usage(
+    session_id: String,
+    backend: Backend,
+) -> Result<Option<SessionUsage>, String> {
+    tokio::task::spawn_blocking(move || match backend {
+        Backend::Claude => crate::supervisor::history::load_session_usage(&session_id),
+        Backend::Codex => crate::supervisor::codex::load_thread_usage(&session_id),
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk

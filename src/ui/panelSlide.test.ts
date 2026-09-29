@@ -4,6 +4,7 @@ import {
   EASE_SLIDE_OUT,
   SLIDE_IN_MS,
   SLIDE_OUT_MS,
+  SWAP_TIMING,
   frozenPaneStyle,
   restingPaneStyle,
   sizeAlong,
@@ -11,6 +12,34 @@ import {
   slidePlan,
   slidingSlotStyle,
 } from "./panelSlide";
+
+describe("SWAP_TIMING (a hand-off is ONE movement)", () => {
+  it("gives both halves of a swap the same clock, whichever way each is going", () => {
+    // ⚠️ The regression it exists for: left to their own directions, the panel LEAVING took
+    // the 135ms exit and the artifact ARRIVING the 190ms entrance — opposite curves on
+    // different clocks, so the row's edge lurched one way and then back. Matching numbers on
+    // both sides IS the contract; asserting on one alone would not have caught it.
+    const leaving = slidePlan(340, 0, SWAP_TIMING);
+    const arriving = slidePlan(0, 578, SWAP_TIMING);
+    expect(leaving?.durationMs).toBe(arriving?.durationMs);
+    expect(leaving?.easing).toBe(arriving?.easing);
+  });
+
+  it("is the ENTRANCE timing — the arrival sets the pace of the exchange", () => {
+    expect(SWAP_TIMING).toEqual({ durationMs: SLIDE_IN_MS, easing: EASE_SLIDE_IN });
+    // Which is why a panel COMING BACK needs no override: it already picks exactly this.
+    expect(slidePlan(0, 340)).toMatchObject({ durationMs: SLIDE_IN_MS, easing: EASE_SLIDE_IN });
+  });
+
+  it("leaves every other travel on the timing its own direction chose", () => {
+    expect(slidePlan(340, 0)).toMatchObject({ durationMs: SLIDE_OUT_MS, easing: EASE_SLIDE_OUT });
+  });
+
+  it("still refuses a travel that is not worth playing, override or not", () => {
+    expect(slidePlan(200, 200, SWAP_TIMING)).toBeNull();
+    expect(slidePlan(Number.NaN, 200, SWAP_TIMING)).toBeNull();
+  });
+});
 
 describe("slidePlan", () => {
   it("opens with the entrance timing and closes with the (shorter) exit one", () => {

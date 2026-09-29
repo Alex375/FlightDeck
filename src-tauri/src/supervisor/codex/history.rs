@@ -40,7 +40,7 @@ use super::server::CLIENT_NAME_INTERNAL;
 use crate::supervisor::history::{
     self, DiskConversation, IndexedConversation, EXCERPT_CHARS, HEAD_SCAN_LINES, INDEX_BODY_CAP,
 };
-use crate::supervisor::model::{ConversationItem, NormalizedBlock};
+use crate::supervisor::model::{ConversationItem, NormalizedBlock, SessionUsage, TokenUsage};
 
 /// Find the rollout file for `thread_id` under `<home>/sessions` (nested
 /// `YYYY/MM/DD/`). The thread id is the tail of the filename
@@ -98,6 +98,50 @@ pub fn load_thread_history(thread_id: &str) -> Vec<ConversationItem> {
         return Vec::new();
     };
     parse_rollout(&path)
+}
+
+/// Read a Codex thread's cumulative token usage from its rollout — the cold seed of the side
+/// panel's session total, the disk twin of the live `thread/tokenUsage/updated` `total`. The
+/// source is the LAST `event_msg` of `type:"token_count"` that carries
+/// `info.total_token_usage` (Codex also writes rate-limit-only `token_count`s with a null
+/// `info`, which are skipped). ⚠️ This thread only — collab sub-agents are threads of their own.
+/// `None` when the rollout has no such line or cannot be found: unknown, never zero.
+pub fn load_thread_usage(thread_id: &str) -> Option<SessionUsage> {
+    load_thread_usage_in(&codex_sessions_dir()?, thread_id)
+}
+
+/// [`load_thread_usage`] against an explicit sessions dir — the testable core (no env).
+fn load_thread_usage_in(sessions_dir: &Path, thread_id: &str) -> Option<SessionUsage> {
+    let path = find_rollout(sessions_dir, thread_id)?;
+    history::read_last_matching_line(&path, "\"token_count\"", |line| {
+        let payload = line.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            return None;
+        }
+        let total = rollout_total_usage(payload.get("info")?.get("total_token_usage")?)?;
+        Some(SessionUsage { total, cost_usd: None, per_model: Vec::new() })
+    })
+}
+
+/// A rollout `total_token_usage` (snake_case) on Claude's [`TokenUsage`] shape — the mapping
+/// the live side applies to the camelCase `tokenUsage.total`: the cached input is INSIDE
+/// `input_tokens` (split out as `cache_read`), the reasoning is inside `output_tokens`, and
+/// `total_tokens` is their sum (so it is not read). `None` when it reports no counts at all.
+fn rollout_total_usage(u: &Value) -> Option<TokenUsage> {
+    let field = |k: &str| u.get(k).and_then(Value::as_u64);
+    let input = field("input_tokens");
+    let cached = field("cached_input_tokens");
+    let output = field("output_tokens");
+    if input.is_none() && cached.is_none() && output.is_none() {
+        return None;
+    }
+    let cached = cached.unwrap_or(0);
+    Some(TokenUsage {
+        input: input.unwrap_or(0).saturating_sub(cached),
+        cache_creation: 0,
+        cache_read: cached,
+        output: output.unwrap_or(0),
+    })
 }
 
 // ---- Disk listing + search index (the Codex analogue of the Claude scan in
@@ -2003,5 +2047,44 @@ mod tests {
             items.iter().any(|i| matches!(i, ConversationItem::Notice { subtype, .. } if subtype == "history_error")),
             "an unreadable rollout must surface a history_error notice, not an empty conversation"
         );
+    }
+
+    #[test]
+    fn thread_usage_seed_reads_the_last_token_count_total() {
+        let base = std::env::temp_dir().join(format!("tosse-codex-usage-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let id = "01a0def6-bc25-7612-abd0-086272d73197";
+        let count = |input: u64, cached: u64, output: u64| {
+            line(
+                "event_msg",
+                json!({ "type": "token_count", "info": {
+                    "total_token_usage": { "input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": 0, "output_tokens": output, "reasoning_output_tokens": 717, "total_tokens": input + output },
+                    "last_token_usage": { "input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1, "total_tokens": 2 },
+                    "model_context_window": 258400 } }),
+            )
+        };
+        write_rollout(
+            &base,
+            "26",
+            &format!("rollout-2026-07-26T20-25-07-{id}"),
+            &[
+                line("session_meta", json!({ "id": id, "cwd": "/r" })),
+                count(1000, 800, 20),
+                // The latest total wins (verified shape: 74,353 + 920 = 75,273).
+                count(74_353, 67_840, 920),
+                // A rate-limit-only count (null info) after it is not a total.
+                line("event_msg", json!({ "type": "token_count", "info": null, "rate_limits": {} })),
+            ],
+        );
+        let u = load_thread_usage_in(&base, id).expect("a total is on disk");
+        assert_eq!(
+            u.total,
+            TokenUsage { input: 74_353 - 67_840, cache_creation: 0, cache_read: 67_840, output: 920 }
+        );
+        // Summing back to the rollout's own total_tokens: nothing double-counted.
+        assert_eq!(u.total.input + u.total.cache_read + u.total.output, 75_273);
+        assert_eq!(u.cost_usd, None);
+        assert_eq!(load_thread_usage_in(&base, "nope"), None);
+        std::fs::remove_dir_all(&base).ok();
     }
 }

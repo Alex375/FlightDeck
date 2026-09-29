@@ -1,0 +1,125 @@
+/* The Stats widget — one row of four readings, equal columns: a mono value over a small caption,
+   and a coverage hint where the value needs one. Quiet at rest: no fill, no colour but the
+   caveat's; a tile lights on hover because hovering it is how its full wording is read. */
+
+.wrap {
+  container: stats / inline-size;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 2px;
+  /* The tiles pad themselves for their hover fill; this puts their TEXT back on the island's
+     edge, aligned with every other section's. */
+  margin: 0 -6px;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 4px 6px 5px;
+  border-radius: 7px;
+  cursor: default;
+  transition: background 0.12s ease;
+}
+.tile:hover {
+  background: var(--wf-panel-3);
+}
+
+.value {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--wf-mono);
+  font-size: 13px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wf-tx-hi);
+}
+/* « — »: not known, and it looks it. */
+.value[data-unknown] {
+  color: var(--wf-tx-xlo);
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-tx-lo);
+}
+
+/* Up to two lines: a quarter of the panel is too narrow for "since reopened" or "38 by
+   sub-agents" on one, and a cut hint says less than the plain figure. */
+.hint {
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.3;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wf-tx-xlo);
+}
+/* The figure covers less than it seems (a total restarted on reopen): the one coloured word. */
+.hint[data-caveat] {
+  color: var(--wf-att);
+}
+
+/* A value that just changed rolls up into place — short, once, and only when motion is on. */
+.grid[data-motion] .value[data-roll] {
+  animation: statRoll 0.2s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+@keyframes statRoll {
+  from {
+    opacity: 0;
+    transform: translateY(40%);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* The OS setting wins even while `data-motion` is stale (it is read at render; the setting can
+   flip under a mounted panel). ⚠️ Same selector as the rule above, or its higher specificity
+   would keep the animation. */
+@media (prefers-reduced-motion: reduce) {
+  .grid[data-motion] .value[data-roll] {
+    animation: none;
+  }
+  .tile {
+    transition: none;
+  }
+}
+
+/* The tooltip (portalled to <body>, so these classes are its only styling). */
+.tipHead {
+  display: block;
+  font-variant-numeric: tabular-nums;
+}
+.tipLine {
+  display: block;
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
+
+/* At the panel's narrowest a quarter of the island cannot hold "AVG TURN" or a "12m 30s": the
+   four readings go two by two rather than be cut. (Queried on .wrap's width.) */
+@container stats (max-width: 250px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 4px;
+  }
+}

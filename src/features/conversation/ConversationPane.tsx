@@ -12,6 +12,7 @@ import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
+import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 import { useConvPanelShown } from "../editor/editorStore";
 import { ConversationSummaryLine } from "./ConversationSummaryLine";
@@ -83,6 +84,12 @@ export function ConversationPane({
   // summary line must stand in for it exactly as for a closed one.
   const panelOpen = useConvPanelShown();
   const inPanel = panelHost && sidePanelPref;
+  // The todo list lives in the panel only while its widget is shown there; switched off, the
+  // bar above the composer comes back.
+  const todosWidget = useWidgetOn("todos");
+  const goalWidget = useWidgetOn("goal");
+  const todosInPanel = inPanel && todosWidget;
+  const goalInPanel = inPanel && goalWidget;
   return (
     <div
       ref={paneRef}
@@ -118,10 +125,12 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
-      {!inPanel ? (
-        <TodoBar session={session} />
-      ) : !panelOpen ? (
-        <ConversationSummaryLine session={session} />
+      {/* The todo bar whenever the todo list is NOT in the panel; the one-line stand-in for
+          what IS in the panel while the panel is closed — each decided on its own, so switching
+          one widget off never hides (or doubles) the other's state. */}
+      {!todosInPanel ? <TodoBar session={session} /> : null}
+      {!panelOpen && (todosInPanel || goalInPanel) ? (
+        <ConversationSummaryLine session={session} showGoal={goalInPanel} showTodos={todosInPanel} />
       ) : null}
       <ConductorComposer
           ref={composerRef}

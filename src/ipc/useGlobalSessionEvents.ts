@@ -70,6 +70,11 @@ import {
 import { syncReminderFromLive } from "../agent/reminderSync";
 import type { SessionStatePayload } from "./client";
 import { worktreesKey } from "./useWorktrees";
+import {
+  gitKeysToRefreshOnTurnEnd,
+  invalidateGitQueries,
+  isGitRefreshEdge,
+} from "../features/git/gitTurnRefresh";
 import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
@@ -574,6 +579,19 @@ export function useGlobalSessionEvents(): void {
         lastCwd.set(session, cwd);
         const repoPath = repoPathForConv(session);
         if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath) });
+      }
+      // A turn end (or the process ending) is when the agent's git work lands: its commits,
+      // stages and branch switches touch only `.git`, which the fs watcher ignores — nothing
+      // else would refresh the Git views, the side panel's git widget or the worktree row's
+      // branch until the window regained focus. Mounted views only; see gitTurnRefresh.ts.
+      if (isGitRefreshEdge(prev, payload.state)) {
+        const convs = useConversationsStore.getState();
+        const conv = convs.conversations.find((c) => c.id === session);
+        if (conv) {
+          const repo = convs.repos.find((r) => r.id === conv.repoId) ?? null;
+          for (const queryKey of gitKeysToRefreshOnTurnEnd(conv, payload.state, repo))
+            invalidateGitQueries(queryClient, queryKey);
+        }
       }
       if (payload.state.session_id) {
         useConversationsStore.getState().noteSessionId(session, payload.state.session_id);

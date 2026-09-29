@@ -128,7 +128,9 @@ export function openArtifactView(meta: ArtifactOpenMeta): void {
     hostedInApp: meta.hostedInApp ?? useDisplay.getState().artifactsInApp,
   });
   if (route.kind === "viewer") {
-    useEditorStore.getState().openArtifact(route.view);
+    useEditorStore
+      .getState()
+      .openArtifact(route.view, { preemptPanel: useDisplay.getState().artifactHidesSidePanel });
     return;
   }
   if (route.kind === "browser") {

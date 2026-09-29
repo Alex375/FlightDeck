@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { useAppErrors } from "../../store/appErrors";
 import { resetMockDisk, touchMockFile } from "../../ipc/mock/mockBindings";
 import { ancestorDirs, useEditorStore, type FileBuffer } from "./editorStore";
+import { SIDE_PANEL_MAX_PX, SIDE_PANEL_MIN_PX } from "../conversation/sidePanelLayout";
 
 const CONV = "conv-1";
 const ROOT = "/repo";
@@ -842,11 +843,18 @@ describe("explorer mutations — folder rename rebases open buffers", () => {
 describe("conversation side panel toggle", () => {
   const shown = () => {
     const s = useEditorStore.getState();
-    return s.convPanelOpen && !s.convPanelYielded;
+    return s.convPanelOpen && !s.convPanelYielded && !s.convPanelPreempted;
   };
 
   beforeEach(() => {
-    useEditorStore.setState({ convPanelOpen: true, convPanelYielded: false });
+    useEditorStore.setState({
+      convPanelOpen: true,
+      convPanelYielded: false,
+      convPanelPreempted: false,
+      artifactView: null,
+      tosseTaskView: null,
+      gitOpen: false,
+    });
   });
 
   it("closes a visible panel and reopens a closed one", () => {
@@ -879,5 +887,95 @@ describe("conversation side panel toggle", () => {
     const s = useEditorStore.getState();
     expect(s.open).toBe(true);
     expect(s.terminalOpen).toBe(true);
+  });
+});
+
+describe("the panel steps aside for an artifact preview", () => {
+  const VIEW = {
+    convId: "c1",
+    title: "Demo",
+    favicon: "✨",
+    url: null,
+    filePath: "/tmp/x.html",
+    kind: "html" as const,
+  };
+  const shown = () => {
+    const s = useEditorStore.getState();
+    return s.convPanelOpen && !s.convPanelYielded && !s.convPanelPreempted;
+  };
+
+  beforeEach(() => {
+    useEditorStore.setState({
+      convPanelOpen: true,
+      convPanelYielded: false,
+      convPanelPreempted: false,
+      artifactView: null,
+      tosseTaskView: null,
+      gitOpen: false,
+      open: false,
+      terminalOpen: false,
+    });
+  });
+
+  it("hides a visible panel while the preview is up, and brings it back on close", () => {
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    expect(shown()).toBe(false);
+    // ⚠️ The user's own answer is untouched: only the transient flag moved.
+    expect(useEditorStore.getState().convPanelOpen).toBe(true);
+    useEditorStore.getState().closeArtifact();
+    expect(shown()).toBe(true);
+  });
+
+  it("never OPENS a panel the user had closed", () => {
+    useEditorStore.setState({ convPanelOpen: false });
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    expect(useEditorStore.getState().convPanelPreempted).toBe(false);
+    useEditorStore.getState().closeArtifact();
+    expect(shown()).toBe(false);
+    expect(useEditorStore.getState().convPanelOpen).toBe(false);
+  });
+
+  it("never claims a panel that had already stepped aside for lack of room", () => {
+    useEditorStore.setState({ convPanelYielded: true });
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    expect(useEditorStore.getState().convPanelPreempted).toBe(false);
+  });
+
+  it("does nothing when the preference is off", () => {
+    useEditorStore.getState().openArtifact(VIEW);
+    expect(shown()).toBe(true);
+  });
+
+  it("gives the panel back when the side region is taken over instead of closed", () => {
+    // ⌘B while an artifact is up: the editor clears the viewer, so the reason the panel was
+    // away is gone too — it must not stay hidden with nothing previewing.
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    useEditorStore.getState().setOpen(true);
+    expect(useEditorStore.getState().artifactView).toBeNull();
+    expect(shown()).toBe(true);
+  });
+
+  it("gives the panel back when a TOSSE task takes the region over", () => {
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    useEditorStore.getState().openTosseTask({ convId: "c1", taskId: "t1" });
+    expect(shown()).toBe(true);
+  });
+
+  it("asking for the panel outranks the preview — and the preview stays up", () => {
+    useEditorStore.getState().openArtifact(VIEW, { preemptPanel: true });
+    useEditorStore.getState().toggleConvPanel();
+    expect(shown()).toBe(true);
+    expect(useEditorStore.getState().artifactView).not.toBeNull();
+  });
+});
+
+describe("conversation side panel width", () => {
+  it("persists a dragged width, held inside the panel's bounds", () => {
+    useEditorStore.getState().setConvPanelWidth(420);
+    expect(useEditorStore.getState().convPanelWidth).toBe(420);
+    useEditorStore.getState().setConvPanelWidth(10);
+    expect(useEditorStore.getState().convPanelWidth).toBe(SIDE_PANEL_MIN_PX);
+    useEditorStore.getState().setConvPanelWidth(9999);
+    expect(useEditorStore.getState().convPanelWidth).toBe(SIDE_PANEL_MAX_PX);
   });
 });

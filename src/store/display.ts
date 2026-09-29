@@ -93,6 +93,9 @@ export interface DisplayPrefs {
    *  surface it replaces. */
   conversationSidePanel: boolean;
 
+  // (The telemetry deck's switch is no longer here: it became one of the side panel's widgets —
+  // store/sidePanelWidgetsStore.ts, which carries an old `conversationTelemetry: true` over once.)
+
   /** Show the message minimap: a column of small bars floating over the RIGHT edge of the
    *  conversation, one per message you sent — hover previews it, click scrolls to it. ON by
    *  default. Read by {@link MessageMinimap}. */
@@ -190,6 +193,14 @@ export interface DisplayPrefs {
    *  page artifacts with their local file still preview in-app either way. Read by
    *  {@link openArtifactView} and the {@link ArtifactViewer}'s missing-file fallback. */
   artifactsInApp: boolean;
+
+  /** Put the conversation side panel away while an artifact preview is open, and bring it back
+   *  when the preview closes. ON by default: the panel and the preview are both "what this
+   *  conversation produced", and side by side they leave the thread a sliver. It only ever
+   *  HIDES a panel that was on screen — an artifact never opens one that was closed, so closing
+   *  the preview can't reveal something nobody asked for. Off → both stay up, the panel floating
+   *  over the right edge when the row runs out of room. Read by {@link openArtifactView}. */
+  artifactHidesSidePanel: boolean;
 
   /** Show the TOSSE mark on a repository's sidebar header — solid when the folder is
    *  associated with a CRM repository, hollow-on-hover when it is not (an invitation to
@@ -362,6 +373,7 @@ const DEFAULTS: DisplayPrefs = {
   clickableFileMentions: true,
   tosseToolCards: true,
   artifactsInApp: true,
+  artifactHidesSidePanel: true,
   tosseRepoBadge: true,
   tosseTasksView: true,
   ideView: true,
@@ -442,6 +454,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
         artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
+        artifactHidesSidePanel: patch.artifactHidesSidePanel ?? s.artifactHidesSidePanel,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,
         tosseTasksView: patch.tosseTasksView ?? s.tosseTasksView,
         ideView: patch.ideView ?? s.ideView,

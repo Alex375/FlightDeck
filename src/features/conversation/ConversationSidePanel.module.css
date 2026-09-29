@@ -1,6 +1,7 @@
-/* The conversation side panel — design "A": a quiet column of sections separated by hairlines,
-   labels in the small-caps voice the rest of the app uses for section headers, content at
-   thread size, and a darker Session footer pinned at the bottom. */
+/* The conversation side panel — design "B, floating": a sheet lifted off the app (inset from
+   the window's edges, rounded, shadowed) whose sections are ISLANDS on it rather than rows
+   ruled apart. The header is a pill in the title bar's "tray" voice; the session footer is the
+   last island, pinned. Same elements as the ruled design it replaces — only the look moved. */
 
 .panel {
   flex: 1;
@@ -8,51 +9,81 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--wf-bg-2);
-  border-left: 1px solid var(--wf-line);
+  /* Floating: the sheet stands off the window's top, right and bottom edges. The LEFT inset
+     is only 2px because the 6px drag splitter already sits in that gap — together they make
+     the same 8px as the other three sides. ⚠️ These insets are counted in SIDE_PANEL_MIN_PX
+     (sidePanelLayout.ts): change one, change the other. */
+  margin: 8px 8px 8px 2px;
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r-xl);
+  background: var(--wf-panel);
+  box-shadow:
+    0 24px 56px -24px rgba(0, 0, 0, 0.9),
+    0 2px 8px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
 }
 
-/* ---- Header: a single tab-like title + close ------------------------------------------- */
+/* ---- Header: the title and its chord in one pill, the close button bare ---------------- */
 
 .head {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 2px;
-  height: 40px;
-  padding: 0 8px;
-  box-sizing: border-box;
-  border-bottom: 1px solid var(--wf-line);
+  gap: 8px;
+  padding: 10px 10px 8px;
 }
 .headTab {
   display: inline-flex;
   align-items: center;
-  height: 28px;
-  padding: 0 10px;
-  border-radius: var(--wf-r);
-  background: var(--wf-panel-2);
+  gap: 8px;
+  height: 26px;
+  padding: 0 4px 0 11px;
+  box-sizing: border-box;
+  border: 1px solid var(--wf-line);
+  border-radius: 9px;
+  background: var(--wf-bg-2);
   color: var(--wf-tx-hi);
   font-size: 12px;
   font-weight: 500;
 }
 
-/* The panel's chord, always on show next to the close button. */
+/* The panel's chord, a standing reminder inside the title pill. */
 .kbd {
-  margin-left: auto;
-  margin-right: 2px;
   display: inline-flex;
   align-items: center;
   height: 18px;
   padding: 0 5px;
-  border-radius: 4px;
-  border: 1px solid var(--wf-line-2);
-  box-shadow: 0 1px 0 var(--wf-line);
-  background: var(--wf-panel);
-  color: var(--wf-tx);
+  border-radius: 5px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-lo);
   font-family: var(--wf-mono);
-  font-size: 10.5px;
+  font-size: 10px;
+  font-weight: 400;
   line-height: 1;
   white-space: nowrap;
+}
+
+/* The pill's word — « Conversation », or « Customize » while the panel is being set up. Keyed
+   in the markup, so a change of mode swaps the word with a short fade rather than a jump. */
+.headTitle {
+  animation: titleIn 0.18s var(--wf-ease-enter) both;
+}
+@keyframes titleIn {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.headActs {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .iconBtn {
@@ -62,7 +93,7 @@
   width: 26px;
   height: 26px;
   border: 0;
-  border-radius: var(--wf-r);
+  border-radius: 8px;
   background: transparent;
   color: var(--wf-tx-lo);
   cursor: pointer;
@@ -73,86 +104,287 @@
   color: var(--wf-tx-hi);
 }
 
-/* ---- Scrolling sections ---------------------------------------------------------------- */
+/* « Done » — the customize view's only exit, so it is the one filled button of the panel. */
+.doneBtn {
+  height: 26px;
+  padding: 0 12px;
+  margin-right: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--wf-accent);
+  color: var(--wf-bg);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  animation: titleIn 0.18s var(--wf-ease-enter) both;
+  transition: filter 0.12s ease, transform 0.12s ease;
+}
+.doneBtn:hover {
+  filter: brightness(1.08);
+}
+.doneBtn:active {
+  transform: scale(0.97);
+}
+.doneBtn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--wf-accent) 55%, transparent);
+  outline-offset: 2px;
+}
 
+/* ---- Scrolling islands ------------------------------------------------------------------ */
+
+/* One scroller with ONE child carrying the islands — the shape a content-fitted panel measures
+   (a fixed chrome around a single scrolling body). */
 .body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+.bodyInner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 2px 10px 10px;
+}
+/* The telemetry deck's host: a plain box, so the deck stays a direct island of the stack. */
+.deckHost {
   display: flex;
   flex-direction: column;
 }
 
-.section {
+/* The widget stack. Coming back from the customize view it rises in, like the view did. */
+.stack {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 14px 16px;
-  border-bottom: 1px solid color-mix(in srgb, var(--wf-line) 75%, var(--wf-bg-2));
+  gap: 8px;
+}
+.panel:not([data-customizing]) .stack[data-returning] {
+  animation: stackIn 0.24s var(--wf-ease-enter) both;
+}
+@keyframes stackIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.panel:not([data-motion]) .headTitle,
+.panel:not([data-motion]) .doneBtn,
+.panel:not([data-motion]) .stack[data-returning] {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .headTitle,
+  .doneBtn,
+  .stack[data-returning] {
+    animation: none;
+  }
+}
+
+/* One island per section: a raised block, no rule, no border — the gaps do the separating. The
+   header-to-body spacing lives in the FOLD (see .foldBody), so a folded island is its header
+   alone. */
+.section {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  border-radius: 11px;
+  background: var(--wf-panel-2);
+  transition: padding 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+}
+/* Folded: a slimmer island, the header alone. */
+.section[data-collapsed] {
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+.section:not([data-motion]) {
+  transition: none;
 }
 
 .label {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  min-height: 20px;
+  font-size: 11px;
   color: var(--wf-tx-lo);
 }
 .label :global(.wf-ico) {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
   flex: 0 0 auto;
 }
+/* The header's icon + title — a button when sections fold (the whole title area is the target),
+   plain text otherwise. It takes the free width, so the reading, the action and the chevron
+   pack to the right edge whichever of them a section has. */
+.labelToggle,
+.labelStatic {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  align-self: stretch;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.labelToggle {
+  cursor: pointer;
+  border-radius: 5px;
+  transition: color 0.12s ease;
+}
+.labelToggle:hover {
+  color: var(--wf-tx-hi);
+}
+.labelToggle:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+.labelIco {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.labelTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The fold's chevron: quiet at rest, it lights with the header and turns with the fold. */
+.foldBtn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--wf-tx-xlo);
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.foldBtn :global(.wf-ico) {
+  width: 10px;
+  height: 10px;
+  transition: transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.section[data-collapsed] .foldBtn :global(.wf-ico) {
+  transform: rotate(-90deg);
+}
+.label:hover .foldBtn {
+  color: var(--wf-tx);
+}
+.foldBtn:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.section:not([data-motion]) .foldBtn :global(.wf-ico) {
+  transition: none;
+}
+
+/* The fold: a one-row grid whose row animates between 0fr and 1fr — the content's real height,
+   never a measured or guessed one. ⚠️ `min-width: 0` on the inner box too: a grid item's
+   automatic minimum width would otherwise let a long line widen the island past the panel. */
+.fold {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.fold[data-open] {
+  grid-template-rows: 1fr;
+}
+.section:not([data-motion]) .fold {
+  transition: none;
+}
+.foldInner {
+  min-height: 0;
+  min-width: 0;
+}
+/* Clipped only while folded or folding: at rest a permanent clip would cut the focus rings and
+   shadows the rows inside draw past their own box. */
+.fold[data-clip] .foldInner {
+  overflow: hidden;
+}
+/* The body proper — the spacing sits HERE, inside what the fold clips, so a folded section
+   keeps none of it. It also fades with the fold, which reads as "tucked away", not "cut". */
+.foldBody {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  transition: opacity 0.18s ease;
+}
+.section[data-collapsed] .foldBody {
+  opacity: 0;
+}
+/* A count or a reading at the end of a label, in a soft capsule. */
 .meta {
   margin-left: auto;
-  font-size: 11px;
-  letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  background: var(--wf-panel-3);
+  font-size: 10.5px;
   color: var(--wf-tx);
   font-variant-numeric: tabular-nums;
 }
 
+/* The label's action (« Open », « Clear »): a small filled chip, like the island's buttons. */
 .textBtn {
   margin-left: auto;
-  padding: 2px 6px;
-  margin-right: -6px;
+  height: 20px;
+  padding: 0 8px;
   border: 0;
-  border-radius: 5px;
-  background: transparent;
+  border-radius: 6px;
+  background: var(--wf-panel-3);
   color: var(--wf-tx);
   font: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
+  font-size: 11px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
 }
 .textBtn:hover {
-  background: var(--wf-panel-3);
+  background: var(--wf-line-2);
   color: var(--wf-tx-hi);
 }
+.textBtn:focus-visible {
+  outline: 1px solid var(--wf-accent);
+  outline-offset: 2px;
+}
 
-/* A small status pill (TOSSE status, goal state). */
+/* A small status pill (goal state). */
 .pill {
   display: inline-flex;
   align-items: center;
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: 10px;
   font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0;
-  text-transform: none;
-  background: var(--wf-panel-2);
+  font-weight: 500;
+  background: var(--wf-panel-3);
   color: var(--wf-tx);
 }
 .label .pill {
-  padding: 1px 6px;
+  padding: 1px 7px;
   font-size: 10.5px;
-  font-weight: 500;
 }
 .pillAtt {
   background: var(--wf-att-bg);
@@ -162,29 +394,22 @@
 /* ---- TOSSE task ------------------------------------------------------------------------ */
 
 .tosseMark {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
   flex: 0 0 auto;
   color: var(--wf-tosse-accent);
 }
 
+/* The island IS the card now: the card keeps its job (a click on its background opens the
+   task) but draws nothing of its own. */
 .card {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 11px 12px;
-  border-radius: var(--wf-r-l);
-  background: var(--wf-panel);
-  border: 1px solid var(--wf-line);
 }
-/* The task card is clickable as a whole (opens the task); its controls keep their own job. */
 .taskCard {
-  gap: 7px;
+  gap: 8px;
   cursor: pointer;
-  transition: border-color 0.12s ease, background 0.12s ease;
-}
-.taskCard:hover {
-  border-color: var(--wf-line-2);
 }
 .taskKicker {
   font-size: 11px;
@@ -198,7 +423,7 @@
   border: 0;
   background: transparent;
   font: inherit;
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   line-height: 1.4;
   color: var(--wf-tx-hi);
@@ -237,11 +462,15 @@
 }
 
 /* Subtasks: a disclosure line (« Show subtasks 1/4 ») over the TOSSE view's own tickable
-   rows, set a size down for the card. */
+   rows, sunk into a well a shade darker than the island. */
 .subtasks {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
+  margin-top: 2px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--wf-panel);
   cursor: default;
 }
 .subtasksHead {
@@ -249,24 +478,23 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 6px 2px 2px;
+  padding: 4px 6px 4px 2px;
   margin-left: -2px;
   border: 0;
   border-radius: 5px;
   background: transparent;
   color: var(--wf-tx-lo);
   font: inherit;
-  font-size: 11.5px;
+  font-size: 11px;
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: color 0.12s ease;
 }
 .subtasksHead:hover {
-  background: var(--wf-panel-2);
   color: var(--wf-tx-hi);
 }
 .subtasksChev {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   transform: rotate(-90deg);
   transition: transform 0.15s ease;
 }
@@ -284,7 +512,7 @@
 .subtasksList button {
   padding-top: 5px;
   padding-bottom: 5px;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 .taskError {
   font-size: 11.5px;
@@ -296,7 +524,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 3px;
+  margin-top: 2px;
   cursor: default;
 }
 .taskActs:empty {
@@ -324,9 +552,13 @@
 /* ---- Todo ------------------------------------------------------------------------------ */
 
 .progress {
-  height: 3px;
+  /* `display` stated, not inherited from the element: the todo bar is a <div> but the context
+     bar is a <span> inside a button, and an inline box ignores `height`. */
+  display: block;
+  height: 4px;
   border-radius: 2px;
-  background: var(--wf-line);
+  /* A track sunk into the island, the same shade as the subtasks' well. */
+  background: var(--wf-panel);
   overflow: hidden;
 }
 .progressFill {
@@ -353,20 +585,19 @@
   width: 14px;
   height: 14px;
   box-sizing: border-box;
-  border-radius: 4px;
+  border-radius: 7px;
   border-width: 1.5px;
 }
 .todos :global(.cv-todo-i .cv-check.done) {
-  background: var(--wf-run-bg);
+  background: var(--wf-run);
   border-color: transparent;
-  color: var(--wf-run);
+  color: var(--wf-panel);
 }
 .todos :global(.cv-todo-i .cv-check.done .wf-ico) {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
 }
 .todos :global(.cv-todo-i .cv-check.doing) {
-  border-radius: 50%;
   border-style: solid;
   border-color: var(--wf-accent);
   animation: none;
@@ -389,45 +620,225 @@
   font-weight: 500;
 }
 
-/* ---- Artifacts ------------------------------------------------------------------------- */
+/* ---- Context ---------------------------------------------------------------------------- */
 
-.artifacts {
+/* The whole reading is the trigger for the shared usage popover (plan + « Compact context »),
+   so there is no separate affordance to hunt for. */
+.ctxBtn {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-}
-.artCard {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  gap: 7px;
   width: 100%;
-  min-width: 0;
-  padding: 7px 8px;
-  border-radius: 8px;
-  background: var(--wf-panel);
-  border: 1px solid var(--wf-line);
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
 }
-.artCard:hover {
+.ctxFill {
+  display: block;
+  height: 100%;
+  min-width: 4px;
+  border-radius: 2px;
+  background: var(--wf-accent);
+  transition: width 0.3s ease;
+}
+/* Past 70% the bar stops being information and becomes a warning — the same threshold the
+   composer's ring and the Flight Deck meter turn on. */
+.ctxBtn[data-warn] .ctxFill {
+  background: var(--wf-att);
+}
+.ctxRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.ctxUsed {
+  font-size: 11.5px;
+  color: var(--wf-tx);
+  font-variant-numeric: tabular-nums;
+}
+.ctxBtn[data-warn] .ctxUsed {
+  color: var(--wf-att);
+}
+.ctxHint {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctxBtn:hover .ctxHint {
+  color: var(--wf-tx);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ctxFill {
+    transition: none;
+  }
+}
+
+/* ---- Artifacts ------------------------------------------------------------------------- */
+
+/* A list ruled by hairlines inside the island, not a stack of bordered cards. */
+.artifacts {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: -6px;
+}
+/* The card is a CONTAINER (open + version badge + the expanded history), not one button:
+   nesting a button inside a button is invalid, and the badge must not open the artifact. */
+.artCard {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-top: 1px solid var(--wf-line);
+}
+.artHead {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.artOpen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 7px 4px 7px 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.artOpen:hover .artTitle {
+  color: var(--wf-tx-hi);
+}
+
+/* « v3 › » — the version history's disclosure, a small capsule. A single-version artifact
+   keeps the same slot as static text, so the rows line up whether or not they have a history. */
+.artVbtn,
+.artV1 {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 20px;
+  padding: 0 5px 0 7px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.artVbtn {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.artVbtn:hover {
+  background: var(--wf-line-2);
+  color: var(--wf-tx-hi);
+}
+.artV1 {
+  padding-right: 7px;
+  color: var(--wf-tx-xlo);
+}
+.artVchev {
+  width: 10px;
+  height: 10px;
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+.artVbtn[aria-expanded="true"] .artVchev {
+  transform: rotate(0deg);
+}
+
+/* The history itself: one row per publish, newest first. Each row GOES TO the message that
+   published it — the only place that version's contents still exist (see ArtifactVersions). */
+.artVersions {
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 8px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--wf-panel);
+}
+.artVrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.artVrow:hover {
   background: var(--wf-panel-2);
-  border-color: var(--wf-line-2);
+}
+.artVn {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+}
+.artVrow[data-state="error"] .artVn,
+.artVrow[data-state="error"] .artVlabel {
+  color: var(--wf-err);
+}
+.artVlabel {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--wf-tx);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artVgo {
+  flex: 0 0 auto;
+  color: var(--wf-tx-lo);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.artVrow:hover .artVgo {
+  opacity: 1;
 }
 .artTile {
-  flex: 0 0 28px;
-  width: 28px;
-  height: 28px;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 7px;
-  background: var(--wf-panel-2);
+  border-radius: 8px;
+  background: var(--wf-panel);
   color: var(--wf-tx);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1;
+}
+/* The generic mark (no icon on the publish, no type to name it) — see <ArtifactFace>: it
+   carries no size class, so each tile states its own. */
+.artTile :global(.wf-ico) {
+  width: 14px;
+  height: 14px;
+  color: var(--wf-tx-lo);
 }
 .artMain {
   flex: 1;
@@ -442,9 +853,10 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: color 0.12s ease;
 }
 .artSub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--wf-tx-lo);
 }
 .artGo {
@@ -453,35 +865,67 @@
   opacity: 0;
   transition: opacity 0.12s ease;
 }
-.artCard:hover .artGo {
+.artOpen:hover .artGo {
   opacity: 1;
 }
 
+/* The hint for a panel with nothing in it — shown only while the widget stack rendered nothing
+   (each widget renders null until it has something to show, so emptiness is the stack's). */
 .empty {
+  display: none;
   margin: 0;
-  padding: 18px 16px;
+  padding: 14px 6px;
   font-size: 12px;
   line-height: 1.55;
   color: var(--wf-tx-lo);
 }
+.stack:empty {
+  display: none;
+}
+.stack:empty + .empty {
+  display: block;
+}
+.emptyLink {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--wf-line-2);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.emptyLink:hover {
+  color: var(--wf-tx-hi);
+  text-decoration-color: var(--wf-tx-lo);
+}
 
-/* ---- Session footer -------------------------------------------------------------------- */
+/* ---- Session footer: the last island, pinned ------------------------------------------ */
 
+/* Rows render nothing when they have nothing to say (a worktree row outside a repository): an
+   island with no row must not be drawn. */
+.foot:empty {
+  display: none;
+}
 .foot {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 8px 10px;
-  border-top: 1px solid var(--wf-line);
-  background: color-mix(in srgb, var(--wf-bg) 70%, var(--wf-bg-2));
+  margin: 0 10px 10px;
+  padding: 4px 10px;
+  border-radius: 11px;
+  background: var(--wf-bg-2);
 }
 .row {
   display: flex;
   align-items: center;
   gap: 10px;
   min-height: 38px;
-  padding: 0 6px;
+}
+/* The stream and the worktree, told apart by a hairline rather than by two boxes. */
+.row + .row {
+  border-top: 1px solid color-mix(in srgb, var(--wf-line) 70%, var(--wf-bg-2));
 }
 .rowIco {
   flex: 0 0 14px;
@@ -491,8 +935,8 @@
   color: var(--wf-tx);
 }
 .rowIco :global(.wf-ico) {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
 }
 .rowMain {
   flex: 1;
@@ -509,7 +953,7 @@
   white-space: nowrap;
 }
 .rowSub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--wf-tx-lo);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -529,7 +973,7 @@
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
 }
 .rowBtn {
   display: inline-flex;
@@ -538,8 +982,8 @@
   width: 26px;
   height: 26px;
   border: 0;
-  border-radius: var(--wf-r);
-  background: transparent;
+  border-radius: 8px;
+  background: var(--wf-panel-2);
   color: var(--wf-tx);
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -553,19 +997,19 @@
   cursor: default;
 }
 .smallBtn {
-  height: 24px;
-  padding: 0 9px;
-  border-radius: var(--wf-r);
-  border: 1px solid var(--wf-line);
-  background: var(--wf-panel);
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--wf-panel-2);
   color: var(--wf-tx);
   font: inherit;
-  font-size: 11.5px;
+  font-size: 11px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
 }
 .smallBtn:hover {
-  background: var(--wf-panel-2);
+  background: var(--wf-panel-3);
   color: var(--wf-tx-hi);
 }
 

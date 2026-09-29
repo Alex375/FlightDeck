@@ -632,3 +632,13 @@
 .splitterY:hover::after {
   background: var(--wf-accent);
 }
+/* A divider in a gap between two self-framed surfaces: invisible at rest, the accent rule only
+   when the pointer finds it (see Splitter's `quiet`). Doubled class so it outranks the base
+   rule without depending on stylesheet order. */
+.splitterQuiet.splitterQuiet::after {
+  background: transparent;
+}
+.splitterQuiet.splitterQuiet:hover::after,
+.splitterQuiet.splitterQuiet:active::after {
+  background: var(--wf-accent);
+}

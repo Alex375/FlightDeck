@@ -123,8 +123,9 @@ import type {
   ManagedMemory,
   SpendReport,
   SubagentRouting,
+  SessionUsage,
 } from "../bindings";
-import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
+import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
@@ -1054,6 +1055,10 @@ export const mockCommands = {
   async codexAvailable(): Promise<boolean> {
     return true;
   },
+  // The side panel's Machine row names the local Mac.
+  async localMachineName(): Promise<string | null> {
+    return "MacBook Pro";
+  },
   async codexListModels(): Promise<
     Result<
       { id: string; displayName: string; efforts: string[]; defaultEffort: string | null; isDefault: boolean }[],
@@ -1645,6 +1650,7 @@ export const mockCommands = {
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
     else if (demo === "remotelinkblockedhost") driver.startRemoteLinkBlocked("ssh_host_key_changed");
+    else if (demo === "artifacts") driver.startPageArtifacts();
     else driver.start();
     // A stable-ish wire uuid so the demo exercises the same "this bubble is addressable"
     // path as production (the demo has no queue, so cancelling it always reports false).
@@ -1889,6 +1895,12 @@ export const mockCommands = {
     // context fill, so there is nothing to seed here — except for the `?ctx=` overrides
     // that reproduce the ring's pre-window states (see `demoContextFill`).
     return ok(demoContextFill());
+  },
+
+  async loadSessionUsage(_sessionId: string, _backend: Backend): Promise<Result<SessionUsage | null, string>> {
+    // No transcript in the browser mock: nothing on "disk" — except under `?ctx=nowindow`,
+    // which reproduces a reloaded conversation (see `demoSessionUsageSeed`).
+    return ok(demoSessionUsageSeed());
   },
 
   async loadSessionGoal(_sessionId: string): Promise<Result<GoalState | null, string>> {
@@ -3363,6 +3375,7 @@ const MOCK_GIT_STATUS: GitStatus = {
   upstream: "origin/main",
   ahead: 2,
   behind: 1,
+  upstream_gone: false,
   unborn: false,
   files: MOCK_GIT_FILES,
 };

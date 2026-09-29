@@ -166,6 +166,7 @@ function baseState(busy: boolean) {
     ended: false,
     context_tokens: null,
     context_window: null,
+    context_usage: null,
     rate_limit: null,
   };
 }

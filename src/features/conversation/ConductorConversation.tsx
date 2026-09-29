@@ -30,9 +30,16 @@ import { ConversationPane } from "./ConversationPane";
 import { type ComposerHandle } from "./ConductorComposer";
 import { ConductorSidebar } from "./ConductorSidebar";
 import { ConversationSidePanel } from "./ConversationSidePanel";
-import { SIDE_PANEL_PX, SIDE_REGION_MIN_PX, sidePanelDocks } from "./sidePanelLayout";
+import {
+  clampSidePanelWidth,
+  dockedSidePanelWidth,
+  floatingSidePanelWidth,
+  SIDE_REGION_MIN_PX,
+  sidePanelDocks,
+} from "./sidePanelLayout";
 import { useDisplay } from "../../store/display";
 import { neighborFlex, useFrozenWhile, usePanelSlide } from "../../ui/usePanelSlide";
+import { SWAP_TIMING } from "../../ui/panelSlide";
 
 // Lazy: the Git workspace pulls in Monaco's diff editor + ribbon overlay — its
 // own chunk, off the startup bundle, fetched only when Git mode is opened.
@@ -147,6 +154,8 @@ function ConversationArea({
   const sidePanelPref = useDisplay((s) => s.conversationSidePanel);
   const panelShown = useConvPanelShown();
   const sideRegionOpen = useSideRegionOpen(conv.id);
+  const convPanelWidth = useEditorStore((s) => s.convPanelWidth);
+  const setConvPanelWidth = useEditorStore((s) => s.setConvPanelWidth);
   const areaRef = useRef<HTMLDivElement>(null);
   const areaWidth = useLayoutWidth(areaRef);
   // Unmeasured (first commit) → assume it docks: the common case, and a wrong guess is
@@ -168,12 +177,49 @@ function ConversationArea({
   const docksRef = useRef(docks);
   const docksChanged = docksRef.current !== docks;
   docksRef.current = docks;
+  // The panel is away FOR an artifact → its exit is half of a hand-off, and takes the swap's
+  // clock instead of the 135ms exit it would pick on its own (see SWAP_TIMING). A plain ⌘I
+  // close, where nothing takes its place, keeps that exit.
+  //
+  // ⚠️ Read as STATE, never as an edge. `preempted` is true for the whole time the panel is
+  // put away, so there is no render to miss; diffing it against a ref written during render —
+  // as `docksChanged` does for its own, different question — silently answered `false` here,
+  // and the panel went on leaving on the wrong clock. Its RETURN needs no override: an opening
+  // panel already picks exactly SWAP_TIMING.
+  const preempted = useEditorStore((s) => s.convPanelPreempted);
+  // The width the user dragged the panel to, held inside its own bounds AND inside the room
+  // actually left beside the conversation — a stored 560 on a narrow window renders at the
+  // room available, never by pushing the composer under its floor.
+  const width =
+    areaWidth === null
+      ? clampSidePanelWidth(convPanelWidth)
+      : docks
+        ? dockedSidePanelWidth(convPanelWidth, areaWidth, sideRegionOpen)
+        : floatingSidePanelWidth(convPanelWidth, areaWidth);
   const slide = usePanelSlide({
     open: want && docks,
     axis: "x",
     enabled: !docksChanged,
-    restStyle: { flex: `0 0 ${SIDE_PANEL_PX}px`, minWidth: 0, minHeight: 0, display: "flex" },
+    timing: preempted ? SWAP_TIMING : undefined,
+    restStyle: { flex: `0 0 ${width}px`, minWidth: 0, minHeight: 0, display: "flex" },
   });
+
+  // The slot's left edge IS the divider, so the width the user is asking for is simply the
+  // distance from the pointer to the area's right edge. Zoom needs no correction: the webview
+  // zooms CSS pixels themselves (see ui/zoom.ts), so client coordinates stay in the same space
+  // as the widths — unlike a `transform`, which would need visualScale.
+  const onPanelDrag = (clientX: number) => {
+    const rect = areaRef.current?.getBoundingClientRect();
+    if (rect) setConvPanelWidth(rect.right - clientX);
+  };
+  // Quiet: the panel is a floating sheet with its own edge, so a standing rule in the gap beside
+  // it would be a third line between two framed surfaces. It lights up where the pointer finds it.
+  const panel = (
+    <>
+      <Splitter axis="x" onMove={onPanelDrag} quiet />
+      <ConversationSidePanel conv={conv} />
+    </>
+  );
 
   return (
     <div
@@ -184,10 +230,10 @@ function ConversationArea({
         <MainArea conv={conv} composerRef={composerRef} onBackgroundClick={onBackgroundClick} />
       </div>
       {slide.mounted ? (
+        // The splitter travels INSIDE the animated slot, as the side region's does, so the
+        // divider slides in with the panel instead of blinking into place 6px early.
         <div ref={slide.slotRef} style={slide.slotStyle}>
-          <div style={slide.paneStyle}>
-            <ConversationSidePanel conv={conv} />
-          </div>
+          <div style={slide.paneStyle}>{panel}</div>
         </div>
       ) : null}
       {want && !docks ? (
@@ -197,13 +243,13 @@ function ConversationArea({
             top: 0,
             right: 0,
             bottom: 0,
-            width: SIDE_PANEL_PX,
+            width,
             zIndex: 20,
             display: "flex",
-            boxShadow: "-18px 0 36px -20px #000",
+            // No shadow of its own: the sheet inside already floats with one, docked or not.
           }}
         >
-          <ConversationSidePanel conv={conv} />
+          {panel}
         </div>
       ) : null}
     </div>
@@ -249,9 +295,20 @@ function MainArea({
   // (splitter + panel) animates its size while the conversation gives way over the same
   // fraction of a second. `animating` is why the conversation's grow factor is read from it
   // — see PanelSlide.animating.
+  // The other half of the hand-off (see ConversationArea): when the conversation panel gave up
+  // its column for THIS artifact, both slides take the swap's clock, so the row's edge travels
+  // once instead of lurching each way in turn.
+  //
+  // ⚠️ FROZEN while the region closes, for the same reason its CONTENT is (see `shown` below):
+  // the preemption is lifted in the very `set()` that dismisses the artifact, so reading it
+  // live would answer "no hand-off" on the one render that decides how the exit is timed. The
+  // frozen value is the answer from while it was still up.
+  const preempted = useEditorStore((s) => s.convPanelPreempted);
+  const swapping = useFrozenWhile(sideOpen, preempted);
   const slide = usePanelSlide({
     open: sideOpen,
     axis: sideBySide ? "x" : "y",
+    timing: swapping ? SWAP_TIMING : undefined,
     restStyle: {
       flex: `${editorFraction} 1 0`,
       minWidth: sideBySide ? SIDE_REGION_MIN_PX : 0,

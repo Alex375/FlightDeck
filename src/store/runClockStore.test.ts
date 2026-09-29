@@ -26,6 +26,7 @@ function result(durationApiMs: number | null): ConversationItem {
     duration_ms: 1,
     duration_api_ms: durationApiMs,
     ttft_ms: null,
+    usage: null,
   };
 }
 

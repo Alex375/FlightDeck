@@ -1,6 +1,6 @@
 // Geometry of the conversation side panel — pure, so the "does it fit?" rule is testable.
 //
-// The panel is a fixed-width column at the far right of the conversation view. It must never
+// The panel is a resizable column at the far right of the conversation view. It must never
 // crush the conversation below the width its composer needs, nor the editor/terminal region
 // below its own floor. When the three cannot sit side by side, the panel stops PUSHING the
 // layout and floats OVER the right edge instead (its open/closed state is untouched: an open
@@ -8,23 +8,81 @@
 
 import { MIN_CONVERSATION_PANE_PX } from "./composerLayout";
 
-/** Width of the conversation side panel, px. */
+/**
+ * Every width here is the width of the panel's SLOT — the 6px splitter that drags it included,
+ * since the splitter lives inside the animated slot (so the divider slides in with the panel)
+ * and therefore counts against the same budget. Mirrors {@link SIDE_REGION_MIN_PX}.
+ */
+
+/** Default width of the conversation side panel, px — what it opens at before anyone drags it. */
 export const SIDE_PANEL_PX = 340;
+
+/**
+ * Narrowest the panel may be dragged to.
+ *
+ * 280px of sheet + the 6px splitter + the sheet's floating insets (2px left, 8px right — see
+ * `.panel` in ConversationSidePanel.module.css; change one, change the other). The floor is set
+ * by the panel's own rows, not by taste: at 280 the header still holds its title pill and the
+ * close button; the session footer's rows still fit an icon, a two-line label and their two
+ * 26px buttons; and the TOSSE card's status chip and assignee picker still share one line.
+ */
+export const SIDE_PANEL_MIN_PX = 296;
+
+/** Widest the panel may be dragged to. Past this it stops being a column of status and starts
+ *  eating the thread, which is the surface the window is for. */
+export const SIDE_PANEL_MAX_PX = 560;
 
 /** Narrowest the editor/terminal side region may be dragged to: the 280px the panel itself
  *  needs, plus the 6px splitter — which lives INSIDE the animated slot (so the divider slides
  *  in with the panel), and therefore counts against the same minimum. */
 export const SIDE_REGION_MIN_PX = 286;
 
+/** How much of `areaPx` is left for the panel once the conversation — and the editor/terminal/
+ *  Git region when it is open — keep their floors. May be negative. */
+export function sidePanelRoom(areaPx: number, sideRegionOpen: boolean): number {
+  return areaPx - MIN_CONVERSATION_PANE_PX - (sideRegionOpen ? SIDE_REGION_MIN_PX : 0);
+}
+
 /**
  * Whether the side panel can DOCK (take its own column) in an area `areaPx` wide — the width
  * shared by the conversation, the editor/terminal/Git region when it is open, and the panel.
+ *
+ * The test is against the panel's MINIMUM, not its current width: a window with room for a
+ * narrow panel docks a narrow panel rather than floating a wide one over the thread. What it
+ * then actually gets is {@link dockedSidePanelWidth}.
  *
  * `sideRegionOpen` must be true whenever that region shows ANYTHING (editor, terminal, Git,
  * an artifact or a TOSSE task): each of them claims its floor next to the conversation.
  */
 export function sidePanelDocks(areaPx: number, sideRegionOpen: boolean): boolean {
-  const needed =
-    MIN_CONVERSATION_PANE_PX + (sideRegionOpen ? SIDE_REGION_MIN_PX : 0) + SIDE_PANEL_PX;
-  return areaPx >= needed;
+  return sidePanelRoom(areaPx, sideRegionOpen) >= SIDE_PANEL_MIN_PX;
+}
+
+/** A width the user asked for, held inside the panel's own bounds. What gets PERSISTED — it
+ *  must not depend on the window that happened to be open when the drag ended. */
+export function clampSidePanelWidth(desiredPx: number): number {
+  if (!Number.isFinite(desiredPx)) return SIDE_PANEL_PX;
+  return Math.min(SIDE_PANEL_MAX_PX, Math.max(SIDE_PANEL_MIN_PX, Math.round(desiredPx)));
+}
+
+/**
+ * The width a DOCKED panel actually gets: what the user asked for, capped by the room left
+ * beside the conversation and the side region. Never below the panel's floor — below it the
+ * panel doesn't dock at all ({@link sidePanelDocks}), so clamping up here is what keeps a
+ * shrinking window from rendering a squashed column for the frame before it floats.
+ */
+export function dockedSidePanelWidth(
+  desiredPx: number,
+  areaPx: number,
+  sideRegionOpen: boolean,
+): number {
+  const want = clampSidePanelWidth(desiredPx);
+  return Math.max(SIDE_PANEL_MIN_PX, Math.min(want, sidePanelRoom(areaPx, sideRegionOpen)));
+}
+
+/** The width a FLOATING panel gets: the same request, capped only by the window itself (it
+ *  overlays the thread rather than sharing the row, so the conversation's floor doesn't apply
+ *  — but a panel wider than the area would hang off the edge). */
+export function floatingSidePanelWidth(desiredPx: number, areaPx: number): number {
+  return Math.min(clampSidePanelWidth(desiredPx), Math.max(0, areaPx));
 }
