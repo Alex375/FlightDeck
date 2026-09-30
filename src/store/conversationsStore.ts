@@ -38,7 +38,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 // value. modelPrefs only imports `BackendKind` as a TYPE from here (erased at runtime),
 // so this value edge is acyclic.
 import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
-import { FACTORY_CLAUDE_MODEL } from "../features/conversation/models";
+import { FACTORY_CLAUDE_MODEL, modelFamily } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
@@ -1118,15 +1118,27 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
 
   setConvModel: (id, model) => {
     const conv = get().conversations.find((c) => c.id === id);
-    if (!conv || conv.model === model) return;
-    const updated = { ...conv, model };
-    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
-    syncToCore("upsertConversation(model)", () => commands.upsertConversation(convToRecord(updated)));
+    if (!conv) return;
     // Claude pushes the model live (set_model); Codex has no such channel — the model
     // rides the next turn as an override (see codexControls.buildCodexControls), so only
-    // the persisted record matters here.
-    if (conv.handle && conv.kind === "claude")
-      syncToCore("setModel(live)", () => commands.setModel(conv.handle!, model));
+    // the persisted record matters there.
+    const pushLive = !!conv.handle && conv.kind === "claude";
+    // The record can already hold this model while the live session still reports
+    // another (a switch the CLI refused, or a read-back that raced it): a pick must then
+    // be pushed again, not swallowed because the RECORD already agrees — that left the
+    // user clicking a model that "did nothing".
+    const liveModel = pushLive ? useConversationStore.getState().sessions[id]?.state.model : null;
+    // Compared as picker rows: the live id is the resolved one (`claude-fable-5-1`), the
+    // pick an alias (`fable`). An id outside the catalogue compares as itself.
+    const row = (m: string) => modelFamily(m) ?? m;
+    const liveAgrees = !pushLive || (liveModel != null && row(liveModel) === row(model));
+    if (conv.model === model && liveAgrees) return;
+    if (conv.model !== model) {
+      const updated = { ...conv, model };
+      set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+      syncToCore("upsertConversation(model)", () => commands.upsertConversation(convToRecord(updated)));
+    }
+    if (pushLive) syncToCore("setModel(live)", () => commands.setModel(conv.handle!, model));
   },
 
   setConvBackend: (id, kind, model) => {

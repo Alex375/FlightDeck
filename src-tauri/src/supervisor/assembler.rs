@@ -85,6 +85,14 @@ pub struct Assembler {
     /// starts at zero — see [`Assembler::mark_fresh_session`]); `None` while unknown (a
     /// resumed or re-attached process, until its first `result` sets it).
     api_ms_baseline: Option<u64>,
+    /// `set_model` requests sent but not yet acked. The CLI DEFERS a model switch
+    /// (claude 2.1.285: a per-session promise chain, PreModelSwitch hooks and, for a
+    /// pinned id, a server entitlement check of up to 5 s) and acks only once it is
+    /// applied — while `get_settings` and each turn's `system/init` answer from the
+    /// model in force RIGHT NOW. Until the last switch acks, both still describe the
+    /// PREVIOUS model: letting them through overwrote the pick with the old model and
+    /// left the picker one click behind. See [`Assembler::begin_model_switch`].
+    model_switches_in_flight: u32,
 }
 
 /// The last-announced friendly labels for the three controls (see [`Assembler`]).
@@ -183,6 +191,29 @@ impl Assembler {
     pub fn set_model(&mut self, model: &str) -> SessionEvent {
         self.state.model = Some(model.to_string());
         SessionEvent::State(self.state.clone())
+    }
+
+    /// A `set_model` request just went out: until its ack, every live report of the
+    /// model predates it (see [`Assembler::model_switches_in_flight`]).
+    pub fn begin_model_switch(&mut self) {
+        self.model_switches_in_flight += 1;
+    }
+
+    /// A `set_model` request was acked (applied or refused).
+    pub fn end_model_switch(&mut self) {
+        self.model_switches_in_flight = self.model_switches_in_flight.saturating_sub(1);
+    }
+
+    /// Stop waiting for switches whose ack can no longer be relied on (the link that
+    /// carried them died). A late ack still lands harmlessly on the saturating decrement.
+    pub fn forget_model_switches(&mut self) {
+        self.model_switches_in_flight = 0;
+    }
+
+    /// Whether a model switch is still pending on the CLI side — while it is, the live
+    /// settings describe the model we are switching AWAY from.
+    pub fn model_switch_in_flight(&self) -> bool {
+        self.model_switches_in_flight > 0
     }
 
     /// Seed the live state with the spawn controls, so the FIRST emitted state event
@@ -363,7 +394,13 @@ impl Assembler {
         match sys {
             SystemMsg::Init(init) => {
                 self.state.session_id = init.session_id.clone();
-                self.state.model = init.model.clone();
+                // A turn that starts while a model switch is still pending reports the
+                // model it is switching AWAY from: keep the pick shown (the switch's ack
+                // re-reads the settings) instead of flipping the picker back to it.
+                let model_settled = !self.model_switch_in_flight();
+                if model_settled {
+                    self.state.model = init.model.clone();
+                }
                 self.state.permission_mode = init.permission_mode.clone();
                 // `system/init` is re-emitted at the start of EACH turn, so when the
                 // agent moves the session into/out of a worktree (EnterWorktree /
@@ -381,7 +418,7 @@ impl Assembler {
                 // `system/init` carries the authoritative model + permission each
                 // turn: announce a change made from the chat (e.g. /model) too. Same
                 // value → silent (announce_* dedupes).
-                if let Some(m) = &init.model {
+                if let Some(m) = init.model.as_ref().filter(|_| model_settled) {
                     self.announce_model(m, out);
                 }
                 if let Some(pm) = &init.permission_mode {
@@ -2623,6 +2660,32 @@ mod tests {
         assert_eq!(detail["control"], serde_json::json!("Model"));
         assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
+    }
+
+    /// A turn that starts while a `set_model` is still pending reports the model being
+    /// switched AWAY from: it must neither put that model back in the picker nor
+    /// announce it. Once the switch settles, `system/init` is authoritative again.
+    #[test]
+    fn system_init_during_a_pending_model_switch_keeps_the_pick() {
+        let mut asm = seeded();
+        let _ = asm.set_model("fable");
+        asm.begin_model_switch();
+        let init = |model: &str| -> CliMessage {
+            serde_json::from_value(serde_json::json!({
+                "type": "system", "subtype": "init",
+                "session_id": "s", "uuid": "u", "cwd": "/x",
+                "model": model, "permissionMode": "default",
+                "tools": ["Bash"], "slash_commands": []
+            }))
+            .unwrap()
+        };
+        let evs = asm.ingest(&init("claude-opus-5-5[1m]"));
+        assert!(first_notice(evs).is_none(), "no notice for the model being replaced");
+        assert_eq!(asm.state().model.as_deref(), Some("fable"));
+
+        asm.end_model_switch();
+        let _ = asm.ingest(&init("claude-fable-5-1"));
+        assert_eq!(asm.state().model.as_deref(), Some("claude-fable-5-1"));
     }
 
     /// Opus 4.8 is a DISTINCT row from the Opus family alias (and the app default), so

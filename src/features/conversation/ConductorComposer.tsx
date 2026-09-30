@@ -22,7 +22,8 @@ import {
   useUserMessageHistory,
 } from "../../store/conversationStore";
 import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
-import { defaultEffortFor, defaultModelFor, useModelPrefs } from "../../store/modelPrefs";
+import { useModelPrefs } from "../../store/modelPrefs";
+import { shownControls } from "./shownControls";
 import {
   prefetchSlashCommands,
   refetchSlashCommands,
@@ -199,9 +200,10 @@ export const ConductorComposer = forwardRef<
   const setText = (v: string) => useComposerDrafts.getState().setDraft(session, v);
   // The controls are NOT component-local state (that would reset on every
   // conversation switch and lie about the stream). DISPLAY source of truth, in
-  // order: the LIVE session state while running, else this conversation's persisted
-  // record, else the product default. The live session's get_settings/system/init
-  // keep the live values honest; the persisted record carries them across (re)spawns.
+  // order: the LIVE session state while the process runs, else this conversation's
+  // persisted record, else the product default (see shownControls — shared with the
+  // Flight Deck card). The live session's get_settings/system/init keep the live values
+  // honest; the persisted record carries them across (re)spawns.
   const ctl = useConversationsStore(
     useShallow((s) => {
       const c = s.conversations.find((cv) => cv.id === session);
@@ -218,10 +220,7 @@ export const ConductorComposer = forwardRef<
       };
     }),
   );
-  const modelId = state?.model ?? ctl.model ?? defaultModelFor(ctl.kind);
-  const effortLevel = (state?.effort ?? ctl.effort ?? defaultEffortFor(ctl.kind)) as EffortLevel;
-  const ultracodeOn = state?.ultracode ?? ctl.ultracode;
-  const gaugeValue: EffortLevel = ultracodeOn ? "ultracode" : effortLevel;
+  const { model: modelId, gauge: gaugeValue } = shownControls(state, ctl);
   // "Start this conversation in a fresh worktree" toggle — only meaningful on the
   // FIRST message (before the session spawns); it disappears once spawned.
   const [useWorktree, setUseWorktree] = useState(false);
@@ -461,12 +460,10 @@ export const ConductorComposer = forwardRef<
     choosePerm(PERM_CYCLE[(idx + 1) % PERM_CYCLE.length]);
   };
 
-  // The blast must play ONLY when Ultra code really turns on — never eagerly on the
-  // click. On a re-opened conversation the reset placeholder state (connectingState,
-  // ultracode:false) masks the optimistic pick, so the gauge can stay off "ultracode":
-  // firing on click there would animate a mode that never activated (blast plays while
-  // the slider can't even reach Ultra code). So we only record the INTENT here and let
-  // the effect below fire iff activation actually sticks.
+  // The blast must play ONLY when the gauge really lands on Ultra code — never eagerly
+  // on the click. On a live session the tier arrives with the core's state event, not
+  // with the click, and a pick that doesn't take must animate nothing. So we only record
+  // the INTENT here and let the effect below fire iff the gauge actually gets there.
   const pendingUltraFireRef = useRef(false);
 
   const applyEffort = (lvl: EffortLevel) => {
@@ -493,7 +490,7 @@ export const ConductorComposer = forwardRef<
   // Fire the full-screen blast the moment Ultra code ACTUALLY becomes the active tier
   // after the user asked for it — driven by the same `gaugeValue` the slider reads, so
   // the animation and the slider landing on "ultracode" can never disagree. If the pick
-  // doesn't take (masked-placeholder case), the intent stays pending and nothing fires.
+  // doesn't take, the intent stays pending and nothing fires.
   useEffect(() => {
     if (gaugeValue === "ultracode" && pendingUltraFireRef.current) {
       pendingUltraFireRef.current = false;

@@ -137,6 +137,34 @@ describe("conversationsStore — per-conversation controls", () => {
     expect(commands.setModel).not.toHaveBeenCalled(); // nothing live to push to
   });
 
+  // Armand's report: the record already said "fable" while the live session still ran
+  // Opus — re-clicking Fable was swallowed because only the RECORD was compared.
+  it("setConvModel re-pushes a model the record holds but the live session doesn't run", () => {
+    seed(baseConv({ handle: "session-7", model: "fable" }));
+    useConversationStore.getState().ensureSession("c1");
+    useConversationStore.getState().applyState("c1", {
+      ...useConversationStore.getState().sessions["c1"].state,
+      model: "claude-opus-5-5[1m]",
+    });
+    useConversationsStore.getState().setConvModel("c1", "fable");
+    expect(commands.setModel).toHaveBeenCalledWith("session-7", "fable");
+    expect(commands.upsertConversation).not.toHaveBeenCalled(); // the record already agrees
+    useConversationStore.getState().dropSession("c1");
+  });
+
+  it("setConvModel stays a no-op when record AND live session already run the pick", () => {
+    seed(baseConv({ handle: "session-7", model: "fable" }));
+    useConversationStore.getState().ensureSession("c1");
+    useConversationStore.getState().applyState("c1", {
+      ...useConversationStore.getState().sessions["c1"].state,
+      model: "claude-fable-5-1", // the resolved id of the `fable` alias
+    });
+    useConversationsStore.getState().setConvModel("c1", "fable");
+    expect(commands.setModel).not.toHaveBeenCalled();
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
+    useConversationStore.getState().dropSession("c1");
+  });
+
   it("pushes to the live session when a handle is present", () => {
     seed(baseConv({ handle: "session-7" }));
     useConversationsStore.getState().setConvEffort("c1", "high");

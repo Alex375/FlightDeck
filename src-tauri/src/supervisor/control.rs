@@ -220,6 +220,14 @@ pub struct AppliedSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub ultracode: Option<bool>,
+    /// Whether the session's settings ASK for ultracode (`ultracodeRequested`), whatever
+    /// the CLI then makes of it. With `ultracode_available` false, a request the CLI
+    /// accepted but will not run — verified against claude 2.1.285.
+    pub ultracode_requested: Option<bool>,
+    /// Whether ultracode can run at all right now (`ultracodeAvailable`): workflows
+    /// enabled (not turned off by a setting, an env var or an organization policy) AND a
+    /// model that takes `xhigh`. `applied.ultracode` is `requested && available`.
+    pub ultracode_available: Option<bool>,
 }
 
 /// Parse the `applied` block out of a `get_settings` control response. Returns
@@ -230,6 +238,8 @@ pub fn parse_get_settings_applied(line: &Value) -> Option<AppliedSettings> {
         model: applied.get("model").and_then(Value::as_str).map(str::to_string),
         effort: applied.get("effort").and_then(Value::as_str).map(str::to_string),
         ultracode: applied.get("ultracode").and_then(Value::as_bool),
+        ultracode_requested: applied.get("ultracodeRequested").and_then(Value::as_bool),
+        ultracode_available: applied.get("ultracodeAvailable").and_then(Value::as_bool),
     })
 }
 
@@ -1262,9 +1272,32 @@ mod tests {
         assert_eq!(applied.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(applied.effort.as_deref(), Some("high"));
         assert_eq!(applied.ultracode, Some(false));
+        // An older CLI without the availability fields: unknown, never a verdict.
+        assert_eq!(applied.ultracode_requested, None);
+        assert_eq!(applied.ultracode_available, None);
         // A response with no `applied` yields None (so the caller skips it).
         let bare = json!({ "response": { "subtype": "success", "request_id": "x", "response": {} } });
         assert!(parse_get_settings_applied(&bare).is_none());
+    }
+
+    /// claude 2.1.285 reports an ultracode request it will not run: requested, but not
+    /// available (workflows off / a model without xhigh) → `ultracode:false`.
+    #[test]
+    fn parses_ultracode_availability() {
+        let line = json!({
+            "response": {
+                "subtype": "success",
+                "request_id": "g-1",
+                "response": { "applied": {
+                    "model": "claude-haiku-4-5", "effort": null, "ultracode": false,
+                    "ultracodeRequested": true, "ultracodeAvailable": false
+                } }
+            }
+        });
+        let applied = parse_get_settings_applied(&line).expect("applied present");
+        assert_eq!(applied.ultracode, Some(false));
+        assert_eq!(applied.ultracode_requested, Some(true));
+        assert_eq!(applied.ultracode_available, Some(false));
     }
 
     #[test]
