@@ -408,6 +408,31 @@ describe("appControl — conversations", () => {
     ]);
   });
 
+  it("read_conversation tells another agent where the conversation was compacted", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "keep going" }] });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "compact_boundary",
+      detail: { message: "Conversation compacted", trigger: "auto", pre_tokens: 970407, post_tokens: 24986, duration_ms: 108596 },
+    });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "compact_boundary",
+      detail: { message: "Conversation compacted" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "user", text: "keep going" },
+      { role: "system", text: "[Conversation compacted (auto · 970.4k → 25.0k tokens · 1m 49s)]" },
+      { role: "system", text: "[Conversation compacted]" },
+    ]);
+  });
+
   // Zero silent error, on the MCP surface too: a conversation that DIED must not read to
   // another agent as one still thinking. Every error-bearing notice subtype the core can
   // emit (the thread's own NOTICE_ERROR_HEADINGS) becomes a visible system line.

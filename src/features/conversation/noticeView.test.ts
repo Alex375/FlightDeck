@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { BackgroundTask } from "../../ipc/client";
-import { NOTICE_ERROR_HEADINGS, NoticeBlock, taskFailedDetail } from "./noticeView";
+import { NOTICE_ERROR_HEADINGS, NoticeBlock, compactSummary, taskFailedDetail } from "./noticeView";
 
 const task = (over: Partial<BackgroundTask> = {}): BackgroundTask => ({
   task_id: "t1",
@@ -93,5 +93,57 @@ describe("NoticeBlock remote_link_blocked", () => {
     expect(html).toContain("reach this server");
     expect(html).toContain("This Mac");
     expect(html).toContain("saved key was refused");
+  });
+});
+
+describe("compactSummary", () => {
+  it("states the trigger, the tokens before → after and the duration (whole seconds)", () => {
+    expect(
+      compactSummary({ trigger: "auto", pre_tokens: 970407, post_tokens: 24986, duration_ms: 108596 }),
+    ).toBe("auto · 970.4k → 25.0k tokens · 1m 49s");
+    expect(compactSummary({ trigger: "manual", pre_tokens: 36488, post_tokens: 5964, duration_ms: 13250 })).toBe(
+      "manual · 36.5k → 6.0k tokens · 13s",
+    );
+  });
+
+  it("shows only what the backend reported", () => {
+    // An older CLI: trigger + pre_tokens only.
+    expect(compactSummary({ trigger: "auto", pre_tokens: 180000 })).toBe("auto · 180k tokens summarized");
+    // Codex: nothing at all.
+    expect(compactSummary({ message: "Conversation compacted", trigger: null, pre_tokens: null })).toBeNull();
+    expect(compactSummary(null)).toBeNull();
+  });
+});
+
+describe("NoticeBlock compact_boundary", () => {
+  it("renders a separator with its facts line, never an alert", () => {
+    const html = renderToStaticMarkup(
+      createElement(NoticeBlock, {
+        subtype: "compact_boundary",
+        detail: { message: "Conversation compacted", trigger: "auto", pre_tokens: 970407, post_tokens: 24986, duration_ms: 108596 },
+      }),
+    );
+    expect(html).toContain('role="separator"');
+    expect(html).toContain("Conversation compacted");
+    expect(html).toContain("auto · 970.4k → 25.0k tokens · 1m 49s");
+    expect(html).not.toContain('role="alert"');
+  });
+
+  it("renders bare when nothing is known beyond the fact (Codex)", () => {
+    const html = renderToStaticMarkup(
+      createElement(NoticeBlock, { subtype: "compact_boundary", detail: { message: "Conversation compacted" } }),
+    );
+    expect(html).toContain("Conversation compacted");
+    expect(html).not.toContain("tokens");
+  });
+
+  it("a failed compaction is a visible error", () => {
+    expect(NOTICE_ERROR_HEADINGS.compact_failed).toBe("Compaction failed");
+    const html = renderToStaticMarkup(
+      createElement(NoticeBlock, { subtype: "compact_failed", detail: { message: "Not enough messages to compact." } }),
+    );
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("Compaction failed");
+    expect(html).toContain("Not enough messages to compact.");
   });
 });

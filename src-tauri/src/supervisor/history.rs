@@ -26,7 +26,7 @@ use specta::Type;
 use super::assembler::{
     context_used_from_usage, normalize_blocks, session_usage_from_model_usage, token_usage_from,
 };
-use super::model::{ContextFill, ConversationItem, GoalState, SessionUsage};
+use super::model::{CompactInfo, ContextFill, ConversationItem, GoalState, SessionUsage};
 
 /// Claude's config dir: `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`. Shared
 /// with [`super::subagents`], which reads the sibling task-artifact directories.
@@ -143,6 +143,17 @@ fn load_context_fill_in(config_dir: &Path, session_id: &str) -> ContextFill {
         // Sub-agent (sidechain) turns run on their own window — never let them drive
         // the conversation's meter.
         if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        // A compaction resets the fill to its compacted size — what a conversation reopened
+        // right after a `/compact` must show, not the full context that preceded it. The
+        // breakdown described the old prompt, so it goes until the next real call.
+        if entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+            let meta = entry.get("compactMetadata").unwrap_or(&Value::Null);
+            if let Some(post) = CompactInfo::from_disk(meta).post_tokens {
+                fill.context_tokens = Some(post);
+                fill.context_usage = None;
+            }
             continue;
         }
         let Some(message) = entry.get("message") else {
@@ -531,8 +542,10 @@ pub(crate) fn classify_injected_text(text: &str) -> Option<InjectedText> {
     // than to the user. `/goal`'s own stdout never reaches here (dropped above).
     if let Some(inner) = strip_wrapper(t, "local-command-stdout") {
         let message = inner.trim().to_string();
-        return Some(if message.is_empty() {
-            // Nothing to show and nothing lost — an empty stdout carries no information.
+        return Some(if message.is_empty() || is_compact_stdout(&message) {
+            // Nothing to show and nothing lost — an empty stdout carries no information, and
+            // `/compact`'s "Compacted" is said better by the compaction separator (the
+            // `compact_boundary` that precedes it, on both surfaces).
             InjectedText::Drop
         } else {
             InjectedText::Notice { subtype: "command_output", message }
@@ -545,6 +558,20 @@ pub(crate) fn classify_injected_text(text: &str) -> Option<InjectedText> {
         return Some(InjectedText::Drop);
     }
     None
+}
+
+/// `/compact`'s own stdout ("Compacted", seen with and without a trailing space). A FAILED
+/// `/compact` says something else, so it still reaches the thread.
+fn is_compact_stdout(message: &str) -> bool {
+    message
+        .strip_prefix("Compacted")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+}
+
+/// Is this user line the echo of a `/compact` command? Field order varies across CLI versions
+/// (`<command-name>` first today, `<command-message>` first on older transcripts).
+fn is_compact_command_echo(text: &str) -> bool {
+    text.trim_start().starts_with('<') && text.contains("<command-name>/compact</command-name>")
 }
 
 /// The inner text of `<tag>…</tag>` when `t` is exactly that wrapper, else `None`.
@@ -662,6 +689,11 @@ pub(crate) fn parse_transcript_str(
 ) -> (Vec<ConversationItem>, usize) {
     let mut items = Vec::new();
     let mut skipped = 0usize;
+    // A MANUAL compaction's separator, held back until the next rendered item. On disk the
+    // boundary is written BEFORE the `/compact` echo that caused it, while live the user's
+    // `/compact` bubble is shown first and the separator lands under it — so the reload
+    // places it after that echo to read the same way. Any other item flushes it in place.
+    let mut pending_compact: Option<ConversationItem> = None;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -674,16 +706,45 @@ pub(crate) fn parse_transcript_str(
         if skip_sidechain && entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        let before = items.len();
         match entry.get("type").and_then(Value::as_str) {
             Some("user") => push_user(&entry, &mut items),
             Some("assistant") => push_assistant(&entry, &mut items),
             // The one attachment that carries a turn: a message another conversation sent
             // mid-turn (see `push_queued_agent_message`).
             Some("attachment") => push_queued_agent_message(&entry, &mut items),
-            // mode / system / file-history-snapshot / summary / … —
+            // The one `system` line rendered: a compaction → the thread separator.
+            Some("system") if entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
+                if let Some(held) = pending_compact.take() {
+                    items.push(held);
+                }
+                let info = CompactInfo::from_disk(entry.get("compactMetadata").unwrap_or(&Value::Null));
+                let manual = info.trigger.as_deref() == Some("manual");
+                let notice = info.into_notice();
+                if manual {
+                    pending_compact = Some(notice);
+                } else {
+                    items.push(notice);
+                }
+                continue;
+            }
+            // mode / other system lines / file-history-snapshot / summary / … —
             // bookkeeping the UI does not render.
             _ => {}
         }
+        if items.len() > before {
+            if let Some(held) = pending_compact.take() {
+                match &items[before..] {
+                    [ConversationItem::UserMessage { text, .. }] if is_compact_command_echo(text) => {
+                        items.push(held)
+                    }
+                    _ => items.insert(before, held),
+                }
+            }
+        }
+    }
+    if let Some(held) = pending_compact {
+        items.push(held);
     }
     (items, skipped)
 }
@@ -2032,6 +2093,97 @@ mod tests {
         // The window is NEVER inferred from the transcript (name can't tell 200k from
         // 1M) — it's sourced live / from the front cache.
         assert_eq!(fill.context_window, None);
+    }
+
+    /// A real `/compact`, as claude 2.1.286 writes it to disk (captured, see the fixture): the
+    /// boundary line precedes the `/compact` echo that caused it.
+    const CAPTURE_COMPACT_DISK: &str = include_str!("fixtures/capture_compact_disk.jsonl");
+
+    fn notices<'a>(items: &'a [ConversationItem], wanted: &str) -> Vec<&'a Value> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Notice { subtype, detail } if subtype == wanted => Some(detail),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_manual_compaction_restores_as_a_separator_under_its_command() {
+        let (items, skipped) = parse_transcript_str(CAPTURE_COMPACT_DISK, true);
+        assert_eq!(skipped, 0);
+        let compactions = notices(&items, "compact_boundary");
+        assert_eq!(compactions.len(), 1, "exactly one separator, got {items:?}");
+        let d = compactions[0];
+        assert_eq!(d["trigger"], "manual");
+        assert_eq!(d["pre_tokens"], 36488);
+        assert_eq!(d["post_tokens"], 5964);
+        assert_eq!(d["duration_ms"], 13250);
+        // Placed like the live thread shows it: the `/compact` bubble, THEN the separator —
+        // although the boundary comes first on disk.
+        let echo = items
+            .iter()
+            .position(|i| matches!(i, ConversationItem::UserMessage { text, .. } if is_compact_command_echo(text)))
+            .expect("the /compact echo stays a user turn");
+        let sep = items
+            .iter()
+            .position(|i| matches!(i, ConversationItem::Notice { subtype, .. } if subtype == "compact_boundary"))
+            .unwrap();
+        assert_eq!(sep, echo + 1, "the separator must sit right under the /compact bubble");
+        // "Compacted" is said by the separator; the summary is never a bubble.
+        assert!(notices(&items, "command_output").is_empty(), "got {items:?}");
+        assert!(!items.iter().any(
+            |i| matches!(i, ConversationItem::UserMessage { text, .. } if text.contains("This session is being continued"))
+        ));
+    }
+
+    #[test]
+    fn an_auto_compaction_restores_in_place_and_a_held_one_never_vanishes() {
+        let auto = r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","compactMetadata":{"trigger":"auto","preTokens":970407,"postTokens":24986,"durationMs":108596}}"#;
+        let after = r#"{"type":"assistant","uuid":"a9","message":{"id":"m9","role":"assistant","content":[{"type":"text","text":"continuing"}]}}"#;
+        let (items, _) = parse_transcript_str(&format!("{auto}\n{after}"), true);
+        assert!(matches!(&items[0], ConversationItem::Notice { subtype, .. } if subtype == "compact_boundary"));
+        assert_eq!(items.len(), 2);
+
+        // A manual boundary followed by something OTHER than its echo is flushed in place,
+        // and one at the very end of the file is not lost.
+        let manual = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":10}}"#;
+        let (items, _) = parse_transcript_str(&format!("{manual}\n{after}"), true);
+        assert!(matches!(&items[0], ConversationItem::Notice { subtype, .. } if subtype == "compact_boundary"));
+        let (items, _) = parse_transcript_str(manual, true);
+        assert_eq!(notices(&items, "compact_boundary").len(), 1);
+    }
+
+    #[test]
+    fn compact_stdout_is_dropped_but_other_command_output_stays() {
+        for s in ["<local-command-stdout>Compacted </local-command-stdout>", "<local-command-stdout>Compacted</local-command-stdout>"] {
+            assert!(matches!(classify_injected_text(s), Some(InjectedText::Drop)), "{s}");
+        }
+        assert!(matches!(
+            classify_injected_text("<local-command-stdout>Set model to opus</local-command-stdout>"),
+            Some(InjectedText::Notice { subtype: "command_output", .. })
+        ));
+        // A word that merely starts the same way is not /compact's stdout.
+        assert!(matches!(
+            classify_injected_text("<local-command-stdout>Compactedness</local-command-stdout>"),
+            Some(InjectedText::Notice { .. })
+        ));
+    }
+
+    #[test]
+    fn context_fill_after_a_compaction_is_the_compacted_size() {
+        let base = std::env::temp_dir().join(format!("tosse-ctx-compact-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let sid = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let lines: Vec<&str> = CAPTURE_COMPACT_DISK.lines().collect();
+        write_transcript(&base, "-some-cwd", sid, &lines);
+        let fill = load_context_fill_in(&base, sid);
+        std::fs::remove_dir_all(&base).ok();
+        // The boundary's postTokens, not the ~36k of the last call before it.
+        assert_eq!(fill.context_tokens, Some(5964));
+        // That call's breakdown no longer sums to the fill.
+        assert_eq!(fill.context_usage, None);
     }
 
     #[test]

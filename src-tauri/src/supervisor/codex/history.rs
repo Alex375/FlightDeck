@@ -40,7 +40,7 @@ use super::server::CLIENT_NAME_INTERNAL;
 use crate::supervisor::history::{
     self, DiskConversation, IndexedConversation, EXCERPT_CHARS, HEAD_SCAN_LINES, INDEX_BODY_CAP,
 };
-use crate::supervisor::model::{ConversationItem, NormalizedBlock, SessionUsage, TokenUsage};
+use crate::supervisor::model::{CompactInfo, ConversationItem, NormalizedBlock, SessionUsage, TokenUsage};
 
 /// Find the rollout file for `thread_id` under `<home>/sessions` (nested
 /// `YYYY/MM/DD/`). The thread id is the tail of the filename
@@ -668,8 +668,14 @@ pub(crate) fn parse_rollout_str(content: &str) -> (Vec<ConversationItem>, usize)
                 );
                 stamp_turn(&mut items, before, current_turn.as_deref());
             }
-            // session_meta, turn_context, compacted (compaction boundary — the pre-compaction
-            // turns still precede it in the file, so the full history renders) …
+            // The legacy dialect's compaction boundary (the pre-compaction turns still precede
+            // it in the file, so the full history renders above the separator). A 0.153.x
+            // rollout writes this line TOO, but its `item_completed{ContextCompaction}` is the
+            // one rendered there — reading both would draw the separator twice.
+            Some("compacted") if !has_completed_items => {
+                items.push(CompactInfo::default().into_notice());
+            }
+            // session_meta, turn_context, … — bookkeeping the UI does not render.
             _ => {}
         }
     }
@@ -821,6 +827,8 @@ fn push_completed_item(item: &Value, msg_seq: &mut u64, items: &mut Vec<Conversa
                 push_tool_result(items, &mut open, &id, json!(format!("Codex extension: {name}")), false);
             }
         }
+        // The cold twin of the live `ThreadItem::ContextCompaction` → the shared separator.
+        "ContextCompaction" => items.push(CompactInfo::default().into_notice()),
         // Any other (or FUTURE) item → a generic card named after its raw type, mirroring the
         // live `ThreadItem::Unknown` arm. Never a silent drop.
         other => {

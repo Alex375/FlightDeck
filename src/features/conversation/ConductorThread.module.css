@@ -142,6 +142,45 @@
   color: var(--wf-tx, inherit);
 }
 
+/* A context compaction: a full-width rule with its label centred on it, the facts line
+   (trigger · tokens before → after · duration) under it. Quiet text, but a real break in the
+   thread — everything above it now reaches the model only as a summary. */
+.compactSep {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin: 16px 0 12px;
+}
+.compactSepRule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.compactSepRule::before,
+.compactSepRule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--wf-line);
+}
+.compactSepLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--wf-tx-lo);
+  cursor: default;
+}
+.compactSepMeta {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--wf-tx-lo);
+}
+
 /* A failed background task: the controlChange line with a small alert glyph — the weight of
    a failed tool step (cv-step-errico), never an error bubble. The detail opens below it. */
 .taskFailed {

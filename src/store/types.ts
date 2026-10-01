@@ -291,6 +291,12 @@ export interface SessionEntry {
    */
   awaitingSince: number | null;
   /**
+   * Wall-clock start of the compaction in flight (`state.activity` turned `"compacting"`),
+   * `null` otherwise. Drives the working line's "Compacting conversation…" counter.
+   * Live-only, like every clock here.
+   */
+  compactingSince: number | null;
+  /**
    * Number of turns started in this conversation, incremented on each `state.busy` false→true
    * edge (same edge as {@link turnStartedAt}). `0` before the first turn. Feeds the playful
    * "Thinking…" word rotation as a per-turn seed (the word re-draws on every new turn); the

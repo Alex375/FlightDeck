@@ -149,14 +149,21 @@ function isStreamingText(entry: SessionEntry): boolean {
   return false;
 }
 
+/** The working line while the CLI compacts the conversation. */
+export const COMPACTING_LABEL = "Compacting conversation…";
+
 /**
  * Single classification of "what's happening now", so describeActivity and isGenericThinking
- * never disagree. Priority: a tool in flight (most concrete) → the current to-do's active
- * phrasing → writing a reply → the generic "thinking" state (nothing else in flight). Never
- * the raw protocol hint ("requesting"). `generic` marks the last-resort thinking state — the
+ * never disagree. Priority: a compaction in progress → a tool in flight (most concrete) → the
+ * current to-do's active phrasing → writing a reply → the generic "thinking" state (nothing
+ * else in flight). Never the raw protocol hint ("requesting"). `generic` marks the last-resort thinking state — the
  * ONLY case the playful word ladder substitutes.
  */
 function classifyActivity(entry: SessionEntry): { generic: boolean; label: string } {
+  // The CLI is summarizing the conversation (`system/status` "compacting"): it says so itself,
+  // and it trumps everything else — no tool or reply makes progress until it ends.
+  if (entry.state.activity === "compacting") return { generic: false, label: COMPACTING_LABEL };
+
   const tool = lastInFlightMainToolUse(entry);
   if (tool) return { generic: false, label: toolActivityLabel(tool.name, tool.input) };
 

@@ -3713,7 +3713,7 @@ export type ConversationItem =
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
- * compact boundaries, …
+ * `compact_boundary` (a context compaction — the thread separator), …
  * - errors: `control_error`, `process_exited`, `send_failed`, `protocol_error`,
  * and the generic `error` — each carries `detail.message` (+ optional
  * `detail.detail`/`stderr`/`exit_code`) and renders as a visible error bubble.

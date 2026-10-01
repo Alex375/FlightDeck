@@ -542,7 +542,7 @@ pub enum ConversationItem {
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
-    ///    compact boundaries, …
+    ///    `compact_boundary` (a context compaction — the thread separator), …
     ///  - errors: `control_error`, `process_exited`, `send_failed`, `protocol_error`,
     ///    and the generic `error` — each carries `detail.message` (+ optional
     ///    `detail.detail`/`stderr`/`exit_code`) and renders as a visible error bubble.
@@ -552,6 +552,69 @@ pub enum ConversationItem {
         subtype: String,
         detail: Value,
     },
+}
+
+/// One context compaction ("the conversation was condensed into a summary"), whichever side
+/// of the CLI reported it. The live `system/compact_boundary` carries `compact_metadata` in
+/// snake_case; its transcript twin carries `compactMetadata` in camelCase — two readers, one
+/// shape, so live and reload render the same marker. Every field is optional: Codex reports a
+/// compaction with no numbers at all, and an older `claude` only sends `trigger` + `pre_tokens`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactInfo {
+    /// `"manual"` (`/compact`) or `"auto"` (the context filled up).
+    pub trigger: Option<String>,
+    /// Context size before the compaction.
+    pub pre_tokens: Option<u64>,
+    /// Context size right after it — the new fill of the context ring.
+    pub post_tokens: Option<u64>,
+    /// How long the summarization took.
+    pub duration_ms: Option<u64>,
+}
+
+/// The `Notice` subtype of a compaction marker — the front renders it as a thread separator.
+pub const COMPACT_BOUNDARY_NOTICE: &str = "compact_boundary";
+
+impl CompactInfo {
+    /// From the live wire's `compact_metadata` (snake_case).
+    pub fn from_wire(meta: &Value) -> Self {
+        Self::read(meta, ["pre_tokens", "post_tokens", "duration_ms"])
+    }
+
+    /// From a transcript line's `compactMetadata` (camelCase).
+    pub fn from_disk(meta: &Value) -> Self {
+        Self::read(meta, ["preTokens", "postTokens", "durationMs"])
+    }
+
+    /// Lenient on purpose: a field of an unexpected type reads as absent rather than failing
+    /// the whole line, so a CLI that reshapes one number still gets its marker.
+    fn read(meta: &Value, [pre, post, duration]: [&str; 3]) -> Self {
+        let num = |k: &str| meta.get(k).and_then(Value::as_u64);
+        Self {
+            trigger: meta
+                .get("trigger")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            pre_tokens: num(pre),
+            post_tokens: num(post),
+            duration_ms: num(duration),
+        }
+    }
+
+    /// The timeline marker. `message` is the plain-text line; the numbers ride alongside for
+    /// the front to format (one formatter, shared by the thread and `read_conversation`).
+    pub fn into_notice(self) -> ConversationItem {
+        ConversationItem::Notice {
+            subtype: COMPACT_BOUNDARY_NOTICE.to_string(),
+            detail: serde_json::json!({
+                "message": "Conversation compacted",
+                "trigger": self.trigger,
+                "pre_tokens": self.pre_tokens,
+                "post_tokens": self.post_tokens,
+                "duration_ms": self.duration_ms,
+            }),
+        }
+    }
 }
 
 /// An in-flight automatic retry of the current turn's API call.

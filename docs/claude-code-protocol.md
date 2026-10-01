@@ -190,8 +190,21 @@ Subtypes: `init`, `status`, `compact_boundary`, `model_refusal_fallback`, `task_
   `output_style`, `agents[]`, `skills[]`, `plugins[{name,path,source}]`, `analytics_disabled`,
   `product_feedback_disabled`, `uuid`, `memory_paths{auto}`, `fast_mode_state`. Mixed
   camelCase/snake_case — use per-field `#[serde(rename)]`.
-- **`status`** (capture L2) — `{status, permissionMode?}` (e.g. `"requesting"`).
-- **`compact_boundary`** — `{compact_metadata:{trigger, pre_tokens}}` (snake_case on wire).
+- **`status`** (capture L2) — `{status, permissionMode?, compact_result?, compact_error?}` (e.g.
+  `"requesting"`). A compaction is bracketed by two of them (verified live, 2.1.286):
+  `status:"compacting"` when it starts, then `status:null` + `compact_result:"success"|"failed"`
+  when it ends — a failure adds the reason in `compact_error` (string; the binary withholds it
+  in some modes) and is followed by NO boundary.
+- **`compact_boundary`** — `{uuid, compact_metadata:{trigger:"manual"|"auto", pre_tokens,
+  post_tokens?, duration_ms?, cumulative_dropped_tokens?, user_context?, messages_summarized?,
+  precomputed?, preserved_segment?, preserved_messages?, pre_compact_discovered_tools?,
+  pre_compact_artifact_read_versions?}, logical_parent_uuid?}` (snake_case on wire; the
+  transcript's twin line is camelCase `compactMetadata{preTokens, postTokens, durationMs, …}`).
+  Live order of a `/compact` (2.1.286): `status compacting` → `status null + compact_result` →
+  `init` → `compact_boundary` → the summary (`user`, `isSynthetic`) → `<local-command-stdout>
+  Compacted` → the command echo → a `result` with ALL-ZERO usage and `iterations:[]` (no model
+  call — it must not reset the context fill). On disk the boundary precedes the command echo.
+  Fixtures: `supervisor/fixtures/capture_compact_{live,disk}.jsonl`.
 - **`task_started`** (`task_type==="local_agent"`), **`task_progress`**, **`task_notification`**
   — sub-agent lifecycle (§3.9). Exact field set medium-confidence (not in capture; see §7).
 - **`thinking_tokens`** — `{estimated_tokens}`.
