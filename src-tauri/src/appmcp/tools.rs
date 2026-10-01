@@ -179,7 +179,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         ToolSpec {
             name: "interrupt_conversation",
             description: "Interrupt the conversation's CURRENT turn (the stop button) without \
-                killing the session — the agent stops working and waits for the next message.",
+                killing the session — the agent stops working and waits for the next message. \
+                Its background tasks (agents, workflows, shells) keep running: stop those \
+                with stop_background_task.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
