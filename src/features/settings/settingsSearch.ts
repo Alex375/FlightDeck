@@ -101,6 +101,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Markdown rendering", section: "display", sub: "thread", group: "Markdown", keywords: "markdown mode warm classic minimal thread rendering conversation rendu" },
   { title: "Shown in the picker", section: "display", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
   { title: "New conversations", section: "display", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
+  { title: "Suggest my next message", section: "display", sub: "composer", group: "Suggestions", keywords: "prompt suggestion ghost text tab autocomplete predict next message prédiction suggestion texte grisé composer composeur" },
   { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
   { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 

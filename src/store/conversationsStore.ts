@@ -31,6 +31,7 @@ import { useRemoteControlStore } from "./remoteControl";
 import { refreshActiveGoal, useGoalStore } from "./goalStore";
 import { useCodexPlanUsageStore } from "./codexPlanUsage";
 import { useLastMessageSummaryStore } from "./lastMessageSummary";
+import { clearPromptSuggestion, noteSuggestionsOptIn } from "./promptSuggestions";
 // The user's configured defaults (Settings → Models) — per backend, so a Codex
 // conversation is always seeded with a real Codex wire id (a Claude alias would be
 // rejected at thread/start) and vice versa. Read through these helpers, never captured
@@ -703,6 +704,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   clearTelemetryCache(id);
   clearLinkedCache(id);
   useLastMessageSummaryStore.getState().clear(id);
+  clearPromptSuggestion(id);
   autoTitlePending.delete(id);
   titleContext.delete(id);
   titleGenCount.delete(id);
@@ -1777,6 +1779,8 @@ export async function ensureConversationSession(
     // so every spawn carries it to be re-applied right after `initialize`.
     const sessionOverrides =
       atSpawn.kind === "claude" ? sessionOverridesForConv(convId, atSpawn.repoId ?? null) : null;
+    // Prompt suggestions ride the process's `initialize`, so they too are decided here.
+    const promptSuggestions = atSpawn.kind === "claude" && useDisplay.getState().promptSuggestions;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1792,6 +1796,7 @@ export async function ensureConversationSession(
         claudeAccountId,
         conversationTitle,
         sessionOverrides,
+        promptSuggestions,
       },
     );
     if (res.status !== "ok") {
@@ -1834,6 +1839,7 @@ export async function ensureConversationSession(
             claudeAccountId,
             conversationTitle,
             sessionOverrides,
+            promptSuggestions,
           },
         );
       }
@@ -1850,6 +1856,9 @@ export async function ensureConversationSession(
       if (spawnMachineId) void probeMachine(spawnMachineId);
       throw new Error(res.error);
     }
+    // Before setHandle: the pause host reacts to the new handle and must know already
+    // whether this process can generate suggestions at all.
+    noteSuggestionsOptIn(res.data, promptSuggestions);
     useConversationsStore
       .getState()
       .setHandle(convId, res.data, allowBypass, claudeAccountId);
@@ -2136,6 +2145,8 @@ export async function rewindConversation(
 ): Promise<RewindOutcome | null> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.sessionId) return null;
+  // The suggestion predicted a reply to the turn being cut away.
+  clearPromptSuggestion(convId);
   if (conv.kind === "codex") {
     // Native Codex rewind: Codex has no in-place truncation, so FORK the thread THROUGH the
     // chosen turn (thread/fork{lastTurnId}, inclusive) and SWAP this conversation onto the

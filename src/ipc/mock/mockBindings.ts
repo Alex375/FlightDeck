@@ -88,6 +88,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  SessionPromptSuggestionEvent,
   TosseAccountStatus,
   TosseOffBoardTask,
   TosseTaskProject,
@@ -216,6 +217,11 @@ const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
 const sessionTitleEvent = new MockEmitter<SessionTitleEvent>();
 const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
+// Fired a beat after each demo turn ends, for sessions spawned with `promptSuggestions`
+// (the real binary sends one 3-10 s after `result`, and only when the next step is obvious).
+const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
+/** Mock sessions spawned with the prompt-suggestion opt-in. */
+const suggestingSessions = new Set<string>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -270,6 +276,7 @@ export const mockEvents = {
   sessionTaskEvent,
   sessionTitleEvent,
   sessionSummaryEvent,
+  sessionPromptSuggestionEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
@@ -308,7 +315,12 @@ function getRecord(session: string): SessionRecord {
         rec!.lastState = s;
         sessionStateEvent.emit({ session, state: s });
       },
-      item: (item) => sessionMessageEvent.emit({ session, item }),
+      item: (item) => {
+        sessionMessageEvent.emit({ session, item });
+        if (item.kind === "turn_result" && suggestingSessions.has(session)) {
+          setTimeout(() => sessionPromptSuggestionEvent.emit({ session, suggestion: "run the tests" }), 600);
+        }
+      },
       permission: (request) => sessionPermissionEvent.emit({ session, request }),
       task: (task) => sessionTaskEvent.emit({ session, task }),
     });
@@ -1630,11 +1642,12 @@ export const mockCommands = {
     effort: string | null,
     permissionMode: string | null,
     _backend: "claude" | "codex",
-    flags: { ultracode: boolean },
+    flags: { ultracode: boolean; promptSuggestions?: boolean },
   ): Promise<Result<string, string>> {
     const { ultracode } = flags;
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
+    if (flags.promptSuggestions) suggestingSessions.add(session);
     const rec = getRecord(session);
     // Emit the initial idle state + the slash-command catalogue once listeners
     // have had a tick to subscribe (mirrors the core's initialize handshake).
@@ -3258,6 +3271,10 @@ export const mockCommands = {
       rec.lastState = { ...rec.lastState, loaded_plugins: MOCK_SERVER_PLUGINS };
       sessionStateEvent.emit({ session, state: rec.lastState });
     }, 400);
+    return ok(null);
+  },
+  async setPromptSuggestionsPaused(session: string, paused: boolean): Promise<Result<null, string>> {
+    console.info("[mock] setPromptSuggestionsPaused:", session, paused);
     return ok(null);
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {

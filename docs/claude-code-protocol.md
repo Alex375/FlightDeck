@@ -176,6 +176,7 @@ are CONTENT BLOCKS inside `message.content[]`, NEVER top-level types** (`confirm
 | `control_cancel_request` | cancel in-flight control req | bundle    |
 | `keep_alive`     | housekeeping — **consume, no reply** | bundle    |
 | `transcript_mirror` | housekeeping — consume     | bundle           |
+| `prompt_suggestion` | predicted next user prompt, opt-in (§3.3.1) | live 2.1.286 |
 
 Add a catch-all `Unknown(Value)` (`#[serde(other)]`) for forward-compat.
 
@@ -205,6 +206,25 @@ Subtypes: `init`, `status`, `compact_boundary`, `model_refusal_fallback`, `task_
 ```
 Inner fields are **camelCase** (`resetsAt`, `rateLimitType`, `overageStatus`, `isUsingOverage`)
 → use `#[serde(rename)]`. `status:"allowed"` = no warning.
+
+### 3.3.1 `prompt_suggestion` (`confirmed` live, 2.1.286)
+
+```json
+{"type":"prompt_suggestion","suggestion":"yes","uuid":"...","session_id":"..."}
+```
+Emitted only when `initialize` carried `promptSuggestions: true`, **3–10 s after** the turn's
+`result` (an async model fork; the next user command aborts it in flight, but one already on the
+wire can land after a new turn started → drop it while busy). The model is told to stay silent
+when the next step isn't obvious, then a client-side filter drops empty / "done" / meta /
+>12-word / ≥100-char / multi-sentence / formatted text — so most turns emit none. Other binary
+suppressions: <2 assistant message lines, API-error turn, pending permission/elicitation, plan
+mode, rate-limit status ≠ `allowed`, cold cache; user veto `settings.promptSuggestionEnabled:false`
+or env `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0`.
+
+Pause: `control_request{subtype:"set_prompt_suggestions_paused", paused:bool}` (@internal) →
+empty `success`. ⚠️ Verified live that the pause is **acked but ignored** while the server-side
+gate (`tengu_chomp_sable`) is off: treat it as best effort. One boolean per process — a respawn or
+resume starts unpaused.
 
 ### 3.4 `stream_event` envelope (`confirmed`, capture L4–L11)
 

@@ -846,6 +846,10 @@ pub enum SessionEvent {
     /// every session. Fire-and-forget: `run_actor` does not wait for (or learn the
     /// outcome of) the write.
     PreferredHostChanged { machine_id: String, host: String },
+    /// The binary's predicted next user prompt (`prompt_suggestion`), shown as ghost text
+    /// in the composer and accepted with Tab. Only emitted between turns: one that lands
+    /// while a turn is already running is stale and dropped by the assembler.
+    PromptSuggestion { suggestion: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -879,4 +883,7 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// sinks that don't care stay unchanged; only [`crate::ipc::events::TauriEmitter`]
     /// (which can reach the `Store` through its `AppHandle`) overrides it.
     fn emit_preferred_host(&self, _session: &str, _machine_id: &str, _host: &str) {}
+    /// See [`SessionEvent::PromptSuggestion`]. Default no-op: only the Claude backend
+    /// produces it, and only the Tauri emitter forwards it.
+    fn emit_prompt_suggestion(&self, _session: &str, _suggestion: &str) {}
 }

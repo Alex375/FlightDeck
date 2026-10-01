@@ -94,6 +94,13 @@ export interface DisplayPrefs {
    *  default. Read by {@link LastMessagePin}. */
   showLastMessagePreview: boolean;
 
+  /** Prompt suggestions: after each turn Claude predicts your next message, shown greyed
+   *  out in the empty composer — Tab takes it. ON by default, like the terminal. Read at
+   *  SPAWN (the opt-in rides the process's `initialize`), so turning it on reaches a running
+   *  conversation only once it restarts; turning it off hides them at once. Claude only.
+   *  Set from Settings → Display → Composer. */
+  promptSuggestions: boolean;
+
   /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
    *  worktree) into a side panel at the far right, leaving the header with actions only. ON
    *  by default. Off → the previous layout: those chips back in the header and the composer,
@@ -372,6 +379,7 @@ const DEFAULTS: DisplayPrefs = {
   agentMessageToasts: true,
   agentCreationToasts: true,
   showLastMessagePreview: true,
+  promptSuggestions: true,
   conversationSidePanel: true,
   sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
@@ -464,6 +472,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
+        promptSuggestions: patch.promptSuggestions ?? s.promptSuggestions,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,

@@ -373,6 +373,15 @@ impl Assembler {
                 self.ingest_result(r, &mut out)
             }
             CliMessage::RateLimitEvent(rl) => self.ingest_rate_limit(rl, &mut out),
+            // Generated after `result`; the binary aborts it when the next command
+            // arrives, but one already on the wire can still land after a new turn
+            // started — it predicts a reply to a turn that is no longer the last one.
+            CliMessage::PromptSuggestion(p) => {
+                let suggestion = p.suggestion.trim();
+                if !self.state.busy && !suggestion.is_empty() {
+                    out.push(SessionEvent::PromptSuggestion { suggestion: suggestion.to_string() });
+                }
+            }
             // A top-level `"type"` we do not model — almost always CLI protocol drift
             // after a binary upgrade. Nothing to render (we don't know its shape), but
             // log it so the drift is diagnosable instead of vanishing without a trace.

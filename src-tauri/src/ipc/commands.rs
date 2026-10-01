@@ -204,6 +204,11 @@ pub struct SpawnFlags {
     /// with the previous one). Claude only; `None`/empty = nothing of its own.
     #[serde(default)]
     pub session_overrides: Option<crate::supervisor::model::SessionOverrides>,
+    /// Opt this process in to prompt suggestions (Settings → Conversation → Composer):
+    /// after each turn the binary predicts the user's next message, shown as ghost text
+    /// in the composer. Claude only; ignored for Codex, which has no equivalent.
+    #[serde(default)]
+    pub prompt_suggestions: bool,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -246,6 +251,7 @@ pub async fn spawn_session(
         claude_account_id,
         conversation_title,
         session_overrides,
+        prompt_suggestions,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -406,6 +412,7 @@ pub async fn spawn_session(
         permission_mode: cfg.permission_mode.clone(),
         ultracode,
         session_overrides,
+        prompt_suggestions,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -3682,6 +3689,23 @@ pub async fn update_plugin(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Pause (or resume) a running Claude session's prompt suggestions — the front pauses
+/// every conversation whose composer is off screen. The CLI's refusal (an older binary
+/// without the subtype) is returned, not swallowed; Codex refuses it as unsupported.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_prompt_suggestions_paused(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    paused: bool,
+) -> Result<(), String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .set_prompt_suggestions_paused(paused)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Hot-reload a running session's plugins after an update (`reload_plugins` control

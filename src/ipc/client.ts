@@ -108,6 +108,7 @@ export type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  SessionPromptSuggestionEvent,
   SkillInfo,
   SlashCommand,
   StepId,

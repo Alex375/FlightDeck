@@ -27,6 +27,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  SessionPromptSuggestionEvent,
   WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
@@ -49,6 +50,7 @@ import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
 import { useLastMessageSummaryStore } from "../store/lastMessageSummary";
+import { clearPromptSuggestion, usePromptSuggestions } from "../store/promptSuggestions";
 import { setCachedWindow } from "../store/contextWindowCache";
 import { useAccountLoginStore } from "../store/accountLogin";
 import {
@@ -542,6 +544,9 @@ export function useGlobalSessionEvents(): void {
       if (payload.state.context_window) {
         setCachedWindow(session, payload.state.context_window);
       }
+      // A turn starting makes any pending suggestion stale, whoever started it (the
+      // composer clears on its own send; this covers every other path in).
+      if (payload.state.busy && !prev?.busy) clearPromptSuggestion(session);
       if (prev) {
         // A notification failure must never break conversation event processing.
         try {
@@ -646,6 +651,17 @@ export function useGlobalSessionEvents(): void {
       // Replace the optimistic truncation with the Haiku summary — applied only if its
       // seq still matches the conversation's latest message (drops a superseded response).
       useLastMessageSummaryStore.getState().apply(convId, payload.summary, payload.seq);
+    }
+
+    // The binary's guess at the user's next message, a few seconds after a turn ended.
+    // Kept only while it can still show: the feature on, and no new turn under way (the
+    // core drops one that lands mid-turn; this also covers a send still in flight).
+    function onPromptSuggestion(payload: SessionPromptSuggestionEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      if (!useDisplay.getState().promptSuggestions) return;
+      if (useConversationStore.getState().sessions[convId]?.state?.busy) return;
+      usePromptSuggestions.getState().set(convId, payload.suggestion);
     }
 
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
@@ -839,6 +855,10 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onSummary(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("summaries", e));
+    events.sessionPromptSuggestionEvent
+      .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("prompt suggestions", e));
     events.sessionTaskEvent
       .listen((e) => { if (!disposed) onTask(e.payload); })
       .then((un) => unlisteners.push(un))

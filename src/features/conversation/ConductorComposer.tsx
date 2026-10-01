@@ -30,6 +30,7 @@ import {
   useSlashCommands,
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
+import { showsGhost, usePromptSuggestion, usePromptSuggestions } from "../../store/promptSuggestions";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { effectiveCwd } from "../git/worktree";
@@ -410,6 +411,21 @@ export const ConductorComposer = forwardRef<
   };
 
   const busy = state?.busy ?? false;
+
+  // ---- Prompt suggestion (ghost text) -------------------------------------
+  // Claude's guess at the next message, offered in the EMPTY box between turns and taken
+  // with Tab (filled in, not sent — like the terminal's agents view). Registering this
+  // composer as on screen is what keeps the conversation's suggestions un-paused (see
+  // PromptSuggestionPauseHost). Claude only: Codex has no equivalent.
+  useEffect(() => usePromptSuggestions.getState().mountComposer(session), [session]);
+  const suggestion = usePromptSuggestion(session);
+  const suggestionsOn = useDisplay((s) => s.promptSuggestions);
+  const ghost =
+    !isCodex &&
+    showsGhost({ suggestion, text, attachments: attachments.length, busy, enabled: suggestionsOn })
+      ? suggestion
+      : null;
+
   // Permission DISPLAY source of truth, in order: live state, persisted record,
   // product default. The generated contract types permission_mode loosely as
   // string; narrow it back to PermissionMode for the helpers below.
@@ -788,6 +804,21 @@ export const ConductorComposer = forwardRef<
     });
   };
 
+  /** Take the suggestion: it becomes the draft, caret at its end, ready to edit or send. */
+  const acceptSuggestion = (t: string) => {
+    histNav.current = IDLE_NAV;
+    setText(t);
+    setSlashToken(null);
+    setSlashDismissed(false);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(t.length, t.length);
+      autoGrow();
+    });
+  };
+
   /** Fill the composer with a recalled message and park the caret at its end. */
   const applyRecall = (res: RecallResult) => {
     histNav.current = res.nav;
@@ -833,6 +864,15 @@ export const ConductorComposer = forwardRef<
       e.preventDefault();
       if (backend === "claude") cyclePermMode();
       else cyclePreset();
+      return;
+    }
+    // Tab takes the suggestion. Only while it shows (an empty box), so Tab keeps moving
+    // focus everywhere else, and the `/` menu above has already had its turn.
+    const bareTab =
+      e.key === "Tab" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
+    if (bareTab && ghost && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      acceptSuggestion(ghost);
       return;
     }
     // ↑/↓ recall previously-sent messages, shell-style — but only at the field's
@@ -1209,15 +1249,29 @@ export const ConductorComposer = forwardRef<
         >
           <Ico name="plus" className="sm" />
         </button>
+        {/* The key that takes the suggestion, right where the suggestion starts (at the far
+            right it read as unrelated to the text). Clickable for the mouse. */}
+        {ghost ? (
+          <button
+            type="button"
+            className={styles.tabHint}
+            onClick={() => acceptSuggestion(ghost)}
+            title="Use this suggestion (Tab)"
+            aria-label="Use the suggested message"
+          >
+            <span aria-hidden="true">⇥</span> Tab
+          </button>
+        ) : null}
         <textarea
           ref={taRef}
-          className={styles.ta}
+          className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
           rows={1}
           value={text}
           placeholder={
-            busy
+            ghost ??
+            (busy
               ? "The agent is working — your message will be picked up along the way…"
-              : "Ask the agent, @ for a file, / for a command…"
+              : "Ask the agent, @ for a file, / for a command…")
           }
           onChange={(e) => {
             // Genuine typing exits history navigation: the edited text becomes the
