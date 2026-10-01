@@ -168,6 +168,10 @@ export function sessionOverridesForConv(convId: string, repoId: string | null): 
  *  to persist would silently undo the first. */
 let policyWrites: Promise<unknown> = Promise.resolve();
 
+/** Bumped by a full reset: a change that was waiting when everything was wiped must not
+ *  bring its level back. */
+let policyEpoch = 0;
+
 /**
  * Change one level, then push the result to every running Claude conversation it reaches.
  * A conversation's own change is only kept once its running session accepted it (the panel
@@ -184,9 +188,19 @@ export function applyPolicyChange(target: PolicyTarget, changes: PolicyChanges):
 async function applyPolicyChangeNow(target: PolicyTarget, changes: PolicyChanges): Promise<void> {
   const before = useMcpPolicy.getState();
   const after = withLevel(before, target, withChanges(levelOf(before, target), changes));
+  const epoch = policyEpoch;
   // Re-applied on the state as it is when kept: a writer outside this chain (the tool
-  // cache a live session refreshes) may have moved it during the round trip.
+  // cache a live session refreshes) may have moved it during the round trip. Not kept at
+  // all when what it was for is gone — everything reset, or its conversation removed —
+  // or it would bring back a level the removal just cleared.
   const keep = () => {
+    if (epoch !== policyEpoch) return;
+    if (
+      target.scope === "conversation" &&
+      !useConversationsStore.getState().conversations.some((c) => c.id === target.key)
+    ) {
+      return;
+    }
     const cur = useMcpPolicy.getState();
     persist(withLevel(cur, target, withChanges(levelOf(cur, target), changes)));
   };
@@ -250,5 +264,6 @@ export function clearConvPolicy(convId: string): void {
 }
 
 export function clearAllPolicy(): void {
+  policyEpoch++;
   persist(EMPTY);
 }

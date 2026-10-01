@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   askWaiting,
+  extensionsBody,
   groupByPlugin,
   NO_ASK,
   pluginOverrides,
@@ -8,6 +9,28 @@ import {
   visibleAskError,
 } from "./remoteExtensions";
 import { EMPTY_LEVEL } from "./mcpToolPermissions";
+
+describe("extensionsBody", () => {
+  it("never describes a remote repository with this Mac's pictures", () => {
+    expect(extensionsBody({ remote: true, liveBackend: "codex", activeTab: "codex" })).toBe("remote-codex");
+    expect(extensionsBody({ remote: true, liveBackend: "claude", activeTab: "claude" })).toBe("conversation");
+    expect(extensionsBody({ remote: true, liveBackend: null, activeTab: "claude" })).toBe("remote-repository");
+    // A stale Codex tab on a remote repository changes nothing.
+    expect(extensionsBody({ remote: true, liveBackend: null, activeTab: "codex" })).toBe("remote-repository");
+  });
+
+  it("keeps a local Codex conversation on its Codex body, detected or not", () => {
+    expect(extensionsBody({ remote: false, liveBackend: "codex", activeTab: "codex" })).toBe("codex");
+  });
+
+  it("keeps the local lenses as they were", () => {
+    expect(extensionsBody({ remote: false, liveBackend: "claude", activeTab: "claude" })).toBe("conversation");
+    expect(extensionsBody({ remote: false, liveBackend: "claude", activeTab: "codex" })).toBe("codex");
+    expect(extensionsBody({ remote: false, liveBackend: "codex", activeTab: "claude" })).toBe("repository");
+    expect(extensionsBody({ remote: false, liveBackend: null, activeTab: "claude" })).toBe("repository");
+    expect(extensionsBody({ remote: false, liveBackend: null, activeTab: "codex" })).toBe("codex");
+  });
+});
 
 describe("remoteListView", () => {
   it("shows the list once known, whatever the request state", () => {

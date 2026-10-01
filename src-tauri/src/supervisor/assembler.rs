@@ -187,7 +187,6 @@ impl Assembler {
         SessionEvent::State(self.state.clone())
     }
 
-    /// Reflect the fresh plugin list a `reload_plugins` response carries.
     /// Reflect an acknowledged `reload_plugins`: the fresh plugin and sub-agent lists it
     /// carries (each `None` when the response has none — an older CLI — and then left as
     /// is). The skills are FORGOTTEN: the reload may have added or dropped a plugin's
@@ -208,8 +207,8 @@ impl Assembler {
         SessionEvent::State(self.state.clone())
     }
 
-    /// Reflect the sub-agents (with descriptions) an `initialize` / `reload_plugins`
-    /// response carries.
+    /// Reflect the sub-agents (with descriptions) the `initialize` response carries. A
+    /// reload goes through [`Self::apply_reload`], which also forgets the skills.
     pub fn set_loaded_agents(&mut self, agents: Vec<LoadedAgent>) -> SessionEvent {
         self.state.loaded_agents = Some(agents);
         SessionEvent::State(self.state.clone())

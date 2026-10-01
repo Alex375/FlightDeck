@@ -9,6 +9,39 @@
 
 import type { Cascade } from "./mcpToolPermissions";
 
+/** Which body the Extensions panel renders. */
+export type ExtensionsBody =
+  /** A Codex conversation in a remote repository: Codex never runs on a server. */
+  | "remote-codex"
+  /** The Codex tab of a repository on this Mac. */
+  | "codex"
+  /** A Claude conversation's live lens (on this Mac or on a server). */
+  | "conversation"
+  /** The repository lens of a repository on a server: no scan of this Mac. */
+  | "remote-repository"
+  /** The repository lens (Claude's configured inventory) on this Mac. */
+  | "repository";
+
+/**
+ * Pick the panel's body. The REMOTE question comes first: on a server neither this Mac's
+ * scan nor its Codex picture describes anything. Codex being detected or not only decides
+ * whether the tab bar shows — never which body a local Codex conversation gets (gating on
+ * it sent such a conversation to Claude's inventory, whose toggles write `~/.claude`).
+ */
+export function extensionsBody(o: {
+  remote: boolean;
+  /** The conversation's backend; `null` for the repository lens. */
+  liveBackend: "claude" | "codex" | null;
+  activeTab: "claude" | "codex";
+}): ExtensionsBody {
+  if (o.remote) {
+    if (o.liveBackend === "codex") return "remote-codex";
+    return o.liveBackend === "claude" ? "conversation" : "remote-repository";
+  }
+  if (o.activeTab === "codex") return "codex";
+  return o.liveBackend === "claude" ? "conversation" : "repository";
+}
+
 /** A pending "Ask now" (a `reload_plugins` sent to make the session report its lists). */
 export interface AskState {
   /** The session the request went to — an answer, or an error, concerns that one only. */

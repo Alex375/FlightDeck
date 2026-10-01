@@ -5,8 +5,10 @@ vi.mock("./conversationsStore", () => ({ useConversationsStore: { getState: vi.f
 
 import { commands } from "../ipc/client";
 import { useConversationsStore } from "./conversationsStore";
+import type { SessionOverrides } from "../ipc/bindings";
 import {
   applyPolicyChange,
+  clearAllPolicy,
   clearConvPolicy,
   noteServerTools,
   sessionOverridesForConv,
@@ -47,6 +49,55 @@ describe("Flight Deck's permission cascade", () => {
     const level = useMcpPolicy.getState().convs.c1;
     expect(level.plugins).toEqual({}); // the Clear was NOT undone by the later write
     expect(level.servers).toEqual({ mcp__claude_ai_Gmail: false });
+    // …and the live session was told the same: the second push starts from the first.
+    const second = apply.mock.calls[1][1] as SessionOverrides;
+    expect(second.enabled_plugins ?? {}).not.toHaveProperty("p@m");
+    expect(second.deny).toEqual(["mcp__claude_ai_Gmail"]);
+  });
+
+  it("keeps the tool cache a live session refreshed during the round trip", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    let release!: () => void;
+    apply.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ status: "ok", data: null }))),
+    );
+    const change = applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "a", on: false }] });
+    await Promise.resolve();
+    noteServerTools("claude.ai Gmail", ["send_message"]);
+    release();
+    await change;
+    const d = useMcpPolicy.getState();
+    expect(d.toolCache.mcp__claude_ai_Gmail).toEqual(["send_message"]);
+    expect(d.convs.c1.servers).toEqual({ mcp__a: false });
+  });
+
+  it("does not bring back a conversation removed while its change waited", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    let release!: () => void;
+    apply.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ status: "ok", data: null }))),
+    );
+    const change = applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "a", on: false }] });
+    await Promise.resolve();
+    convs([]); // c1 removed meanwhile (its teardown clears its level)
+    clearConvPolicy("c1");
+    release();
+    await change;
+    expect(useMcpPolicy.getState().convs).not.toHaveProperty("c1");
+  });
+
+  it("does not bring back a level wiped while its change waited", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    let release!: () => void;
+    apply.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ status: "ok", data: null }))),
+    );
+    const change = applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "a", on: false }] });
+    await Promise.resolve();
+    clearAllPolicy();
+    release();
+    await change;
+    expect(useMcpPolicy.getState().convs).toEqual({});
   });
 
   it("a refused change does not block the next one", async () => {
@@ -94,6 +145,7 @@ describe("Flight Deck's permission cascade", () => {
   });
 
   it("a spawn gets the resolved set; nothing at all → null", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: null }]); // a conversation not spawned yet
     expect(sessionOverridesForConv("c1", "r1")).toBeNull();
     await applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "claude.ai Gmail", on: false }] });
     expect(sessionOverridesForConv("c1", "r1")).toMatchObject({ deny: ["mcp__claude_ai_Gmail"] });

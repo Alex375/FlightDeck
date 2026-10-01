@@ -3318,7 +3318,8 @@ export const mockCommands = {
       name, scope, status, tools: [], tool_count: 0, transport: null, command: null, url: null,
     });
     return ok([
-      server("playwright", "project", "connected"),
+      // With tools: its per-tool permission editor must open on a remote session too.
+      { ...server("playwright", "project", "connected"), tools: ["browser_click", "browser_navigate"], tool_count: 2 },
       server("sentry", "project", "disabled"),
       server("claude.ai TOSSE", "claudeai", "connected"),
       server("claude.ai Gmail", "claudeai", "disabled"),

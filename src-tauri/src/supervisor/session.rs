@@ -3784,9 +3784,24 @@ mod tests {
     #[test]
     fn reload_plugins_ack_refreshes_the_reported_inventory() {
         let (mut core, mut events, mut out) = test_core();
+        // A turn already reported the skills — the reload must forget them, not keep them.
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "uuid": "u", "cwd": "/w",
+                "model": "claude-opus-5-5", "permissionMode": "default", "tools": [],
+                "skills": ["railway:use-railway"]
+            }))
+            .unwrap(),
+        );
+        let seeded = drain(&mut events).into_iter().rev().find_map(|e| match e {
+            SessionEvent::State(s) => Some(s),
+            _ => None,
+        });
+        assert_eq!(seeded.and_then(|s| s.loaded_skills), Some(vec!["railway:use-railway".to_string()]));
         core.on_command(SessionCommand::ReloadPlugins);
-        let sent = out.try_recv().expect("a reload_plugins request goes out");
-        assert_eq!(sent["request"]["subtype"], json!("reload_plugins"));
+        let sent = std::iter::from_fn(|| out.try_recv().ok())
+            .find(|l| l["request"]["subtype"] == json!("reload_plugins"))
+            .expect("a reload_plugins request goes out");
         let rid = sent["request_id"].as_str().expect("tracked by request id").to_string();
         drain(&mut events);
 

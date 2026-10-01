@@ -12,6 +12,7 @@ import { applyPolicyChange, cascadeOf, useMcpPolicy, type PolicyChanges } from "
 import {
   TOOL_CHOICES,
   describeFrom,
+  externalRules,
   mcpToolRuleName,
   pluginAt,
   pluginWrite,
@@ -47,8 +48,12 @@ export interface PermissionTarget {
   /** Flight Deck's levels that apply here (the scope and the broader ones). */
   cascade: Cascade;
   /** Claude Code's own rules from its settings files — the baseline "Default" falls back
-   *  to (undefined while loading). */
+   *  to (undefined while loading; `[]` when they cannot be read from here, see below). */
   external: PermissionRule[] | undefined;
+  /** Claude Code's files are not on this Mac (a repository on a paired server): nothing is
+   *  read, `external` is `[]`, and "Default" follows rules this panel cannot see — a state
+   *  of its own, distinct from loading, that the panel says. */
+  rulesUnknown: boolean;
   loadError: string | null;
   /** Claude Code's files' say on a plugin. */
   pluginFiles: (pluginId: string) => PluginFileSay[];
@@ -113,8 +118,8 @@ export function useExtensionScope(
   return {
     scope,
     cascade: cascadeOf(policy, repoId, convId),
-    external: readFiles ? view?.rules : undefined,
-    loadError: files.isError ? (files.error as Error).message : null,
+    ...externalRules(readFiles, view?.rules),
+    loadError: readFiles && files.isError ? (files.error as Error).message : null,
     pluginFiles: (pluginId) =>
       (readFiles ? (view?.plugins ?? []) : []).filter((p) => p.plugin_id === pluginId).map((p) => ({ source: p.source, enabled: p.enabled })),
     readOnlyReason:
@@ -230,11 +235,14 @@ export function McpPermissionSummary({ server, target }: { server: McpServerLive
   );
 }
 
-function choiceTitle(c: ToolChoice, s: ToolRowState, scope: PermissionScope): string | undefined {
+function choiceTitle(c: ToolChoice, s: ToolRowState, scope: PermissionScope, rulesUnknown: boolean): string | undefined {
   if (s.impossible.has(c)) return undefined;
   switch (c) {
     case "default":
       if (s.from && s.shown) return `Follow ${describeFrom(s.from)}: ${KIND_LABEL[s.shown]}.`;
+      if (rulesUnknown) {
+        return "Follow the broader settings — then Claude Code's own rules on the server, which can't be read from here, then the permission mode.";
+      }
       return scope === "global"
         ? "No setting — the conversation's permission mode decides. In Auto mode the classifier may run it without asking."
         : "Follow the broader settings — none says anything, so the permission mode decides.";
@@ -292,7 +300,7 @@ function ToolRow({
               styles[`permOpt_${c}`] ?? "",
             ].join(" ")}
             disabled={disabled || s.impossible.has(c)}
-            title={choiceTitle(c, s, target.scope)}
+            title={choiceTitle(c, s, target.scope, target.rulesUnknown)}
             onClick={() => s.choice !== c && onChoose(rule, c)}
           >
             {CHOICE_LABEL[c]}
@@ -324,6 +332,12 @@ export function McpToolPermissions({ server, target }: { server: McpServerLive; 
   const resetChanges = resetServer(cascade, scope, server.name, tools);
   return (
     <div className={styles.permPanel}>
+      {target.rulesUnknown ? (
+        <div className={styles.permMsg}>
+          Claude Code&apos;s own rules on the server can&apos;t be read from here: &quot;Default&quot; follows them
+          without showing them. Flight Deck&apos;s settings below still apply.
+        </div>
+      ) : null}
       <div className={styles.permBar}>
         <button
           className={styles.actBtn}

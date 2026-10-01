@@ -56,6 +56,7 @@ import type { PermissionScope } from "./mcpToolPermissions";
 import { applyPolicyChange, cascadeOf, noteServerTools, useMcpPolicy } from "../../store/mcpPolicy";
 import {
   askWaiting,
+  extensionsBody,
   groupByPlugin,
   NO_ASK,
   pluginOverrides,
@@ -482,8 +483,9 @@ export function ExtensionsManager() {
   // live lens (ConversationBody / Codex live MCP) is shown only on the matching tab; the
   // other tab shows that backend's CONFIGURED inventory (project-style, no live process).
   const liveBackend: BackendKind | null = isConversation ? target.backend : null;
-  // Hidden for a remote repository (`showCodex`): its picture is never the Codex one.
-  const onCodexTab = showCodex && activeTab === "codex";
+  // Which body renders — the remote question first (see `extensionsBody`).
+  const body = extensionsBody({ remote: server != null, liveBackend, activeTab });
+  const onCodexTab = body === "codex";
   // Which query the header refresh + spinner track (the active tab's inventory + any live).
   const tabFetching = onCodexTab ? codexExt.isFetching : ext.isFetching;
   const liveFetching = isConversation && activeTab === liveBackend && live.isFetching;
@@ -557,16 +559,16 @@ export function ExtensionsManager() {
           </div>
         ) : null}
 
-        {server != null && liveBackend === "codex" ? (
+        {body === "remote-codex" ? (
           // A Codex conversation in a remote repository: Codex never runs on a server (its
           // spawn is refused), so there is no session to describe — say so.
           <div className={styles.body}>
             <RemoteBanner>
-              This is a Codex conversation, and Codex can&apos;t run on {server}: it has no session there,
+              This is a Codex conversation, and Codex can&apos;t run on {server ?? "the server"}: it has no session there,
               so there are no extensions to show. Start a Claude conversation to work on this repository.
             </RemoteBanner>
           </div>
-        ) : onCodexTab ? (
+        ) : body === "codex" ? (
           <CodexExtensionsBody
             codexExt={codexExt}
             live={live}
@@ -578,7 +580,7 @@ export function ExtensionsManager() {
             onOpenDoc={setDoc}
             onOpenPlugin={openCodexPlugin}
           />
-        ) : liveBackend === "claude" ? (
+        ) : body === "conversation" ? (
           <ConversationBody
             ext={ext}
             live={live}
@@ -593,7 +595,7 @@ export function ExtensionsManager() {
             resetToken={openKey ?? ""}
             server={server}
           />
-        ) : server != null ? (
+        ) : body === "remote-repository" && server != null ? (
           <RemoteRepositoryBody server={server} repoId={projectRepoId} />
         ) : (
           <ProjectBody
