@@ -106,7 +106,8 @@ pub struct SessionStatePayload {
     #[serde(default)]
     pub loaded_plugins: Option<Vec<LoadedPlugin>>,
     /// The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
-    /// or `plugin:skill`. `None` until the first turn: no control response carries them.
+    /// or `plugin:skill`. `None` until the first turn (no control response carries them),
+    /// and again after a `reload_plugins`, which may have changed them.
     /// Same purpose as `loaded_plugins` (the truthful list for a remote session).
     #[serde(default)]
     pub loaded_skills: Option<Vec<String>>,

@@ -2210,16 +2210,14 @@ impl SessionCore {
                 if let Some(cmds) = control::parse_initialize_commands(&v) {
                     self.emit(SessionEvent::Commands(cmds));
                 }
-                // Same envelope, fresh plugin list: the panel's live picture follows the
-                // reload without waiting for the next turn's `system/init`.
-                if let Some(plugins) = control::parse_reload_plugins_plugins(&v) {
-                    let ev = self.assembler.set_loaded_plugins(plugins);
-                    self.emit(ev);
-                }
-                if let Some(agents) = control::parse_response_agents(&v) {
-                    let ev = self.assembler.set_loaded_agents(agents);
-                    self.emit(ev);
-                }
+                // Same envelope, fresh plugin and sub-agent lists: the panel's live picture
+                // follows the reload without waiting for the next turn's `system/init`
+                // (which alone carries the skills — forgotten until then).
+                let ev = self.assembler.apply_reload(
+                    control::parse_reload_plugins_plugins(&v),
+                    control::parse_response_agents(&v),
+                );
+                self.emit(ev);
             }
         }
     }
@@ -2592,7 +2590,9 @@ fn describe_exit(status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::model::{ConversationItem, PermissionRequestPayload, SessionStatePayload};
+    use crate::supervisor::model::{
+        ConversationItem, LoadedAgent, LoadedPlugin, PermissionRequestPayload, SessionStatePayload,
+    };
     use serde_json::json;
 
     /// Quick while the outage is young (a blip, a reboot), patient once it is not (a
@@ -3730,6 +3730,7 @@ mod tests {
                             { "name": "compact", "description": "Compact the conversation", "argumentHint": "" },
                             { "name": "tosse-workflow:pickup", "description": "Start a task", "argumentHint": "<task_id>" }
                         ],
+                        "agents": [{ "name": "Explore", "description": "Read-only search agent" }],
                         "models": []
                     }
                 }
@@ -3737,7 +3738,20 @@ mod tests {
             .unwrap(),
         );
 
-        let cmds = drain(&mut events)
+        let evs = drain(&mut events);
+        // The sub-agents are known from spawn (with their descriptions).
+        let agents = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::State(s) => s.loaded_agents.clone(),
+                _ => None,
+            })
+            .expect("a State event carrying the sub-agents");
+        assert_eq!(
+            agents,
+            vec![LoadedAgent { name: "Explore".into(), description: Some("Read-only search agent".into()) }]
+        );
+        let cmds = evs
             .into_iter()
             .find_map(|e| match e {
                 SessionEvent::Commands(c) => Some(c),
@@ -3762,6 +3776,53 @@ mod tests {
             !drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Commands(_))),
             "the initialize handshake should be consumed exactly once"
         );
+    }
+
+    /// A tracked `reload_plugins` (the panel's "Ask now", a plugin Clear): its ack carries
+    /// the fresh plugins and sub-agents, which land on the state in ONE event — and the
+    /// skills, which no response carries, are forgotten rather than left stale.
+    #[test]
+    fn reload_plugins_ack_refreshes_the_reported_inventory() {
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::ReloadPlugins);
+        let sent = out.try_recv().expect("a reload_plugins request goes out");
+        assert_eq!(sent["request"]["subtype"], json!("reload_plugins"));
+        let rid = sent["request_id"].as_str().expect("tracked by request id").to_string();
+        drain(&mut events);
+
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": rid, "response": {
+                    "commands": [], "mcpServers": [], "error_count": 0,
+                    "plugins": [
+                        { "name": "railway", "path": "/p", "source": "railway@claude-plugins-official", "version": "1.5.2" },
+                        { "name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin" }
+                    ],
+                    "agents": [{ "name": "Plan", "description": "Architect" }]
+                } }
+            }))
+            .unwrap(),
+        );
+        let states: Vec<SessionStatePayload> = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states.len(), 1, "one State for the whole reload");
+        let s = &states[0];
+        assert_eq!(
+            s.loaded_plugins,
+            Some(vec![LoadedPlugin {
+                name: "railway".into(),
+                id: Some("railway@claude-plugins-official".into()),
+                version: Some("1.5.2".into()),
+            }])
+        );
+        assert_eq!(s.loaded_agents, Some(vec![LoadedAgent { name: "Plan".into(), description: Some("Architect".into()) }]));
+        assert_eq!(s.loaded_skills, None);
     }
 
     /// ACCEPTANCE (deterministic): an `McpStatus` command writes an `mcp_status`

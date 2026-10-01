@@ -482,7 +482,8 @@ export function ExtensionsManager() {
   // live lens (ConversationBody / Codex live MCP) is shown only on the matching tab; the
   // other tab shows that backend's CONFIGURED inventory (project-style, no live process).
   const liveBackend: BackendKind | null = isConversation ? target.backend : null;
-  const onCodexTab = activeTab === "codex";
+  // Hidden for a remote repository (`showCodex`): its picture is never the Codex one.
+  const onCodexTab = showCodex && activeTab === "codex";
   // Which query the header refresh + spinner track (the active tab's inventory + any live).
   const tabFetching = onCodexTab ? codexExt.isFetching : ext.isFetching;
   const liveFetching = isConversation && activeTab === liveBackend && live.isFetching;
@@ -556,7 +557,16 @@ export function ExtensionsManager() {
           </div>
         ) : null}
 
-        {onCodexTab ? (
+        {server != null && liveBackend === "codex" ? (
+          // A Codex conversation in a remote repository: Codex never runs on a server (its
+          // spawn is refused), so there is no session to describe — say so.
+          <div className={styles.body}>
+            <RemoteBanner>
+              This is a Codex conversation, and Codex can&apos;t run on {server}: it has no session there,
+              so there are no extensions to show. Start a Claude conversation to work on this repository.
+            </RemoteBanner>
+          </div>
+        ) : onCodexTab ? (
           <CodexExtensionsBody
             codexExt={codexExt}
             live={live}
@@ -775,7 +785,7 @@ function ConversationBody({
   // one), and only what exists at that level; tool rules, servers and plugins follow it.
   const [scope, setScope] = useState<PermissionScope>("conversation");
   const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
-  const perms = useExtensionScope(scope, path, repoId, convId);
+  const perms = useExtensionScope(scope, path, repoId, convId, !remote);
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     const write = pluginAtScope(p, perms).write(next);
     // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
@@ -829,7 +839,8 @@ function ConversationBody({
       {server != null ? (
         <RemoteBanner>
           This conversation runs on {server}. Its skills, sub-agents and plugins below are the ones its
-          session reported — those on this Mac are not available to it.
+          session reported — those on this Mac are not available to it. Claude Code&apos;s own permission
+          rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.
         </RemoteBanner>
       ) : null}
       <ScopeSwitcher scope={scope} onChange={setScope} hint={perms.hint} />
@@ -1232,7 +1243,10 @@ function PluginOverridesSection({
       await applyPolicyChange({ scope: o.level, key }, { plugins: [{ id: o.id, enabled: null }] });
     },
   });
-  if (!overrides.length) return null;
+  // Kept while a Clear is out or has failed: a repository Clear is saved BEFORE the live
+  // sessions answer, so the list can empty while one of them refuses — and that refusal
+  // must still show.
+  if (!overrides.length && !clear.isPending && !clear.isError) return null;
   return (
     <div className={styles.section}>
       <div className={styles.sectionH}>

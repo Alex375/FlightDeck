@@ -77,16 +77,19 @@ const HINT: Record<PermissionScope, string> = {
 /**
  * One scope's view and writer. `repoPath` = where Claude Code's files are read for (null
  * on the conversation-less Settings page); `repoId`/`convId` = the app's repository and
- * conversation the Repository / Conversation levels belong to.
+ * conversation the Repository / Conversation levels belong to. `readFiles` false = those
+ * files are not on this Mac (a repository on a paired server): nothing is read, so the
+ * Mac's own rules are never presented as the server's — Claude Code's say is unknown.
  */
 export function useExtensionScope(
   scope: PermissionScope,
   repoPath: string | null,
   repoId: string | null,
   convId: string | null,
+  readFiles = true,
 ): PermissionTarget {
   const qc = useQueryClient();
-  const files = useMcpPermissionRules(repoPath);
+  const files = useMcpPermissionRules(repoPath, readFiles);
   const policy = useMcpPolicy();
   const key = scope === "repository" ? repoId : scope === "conversation" ? convId : null;
   const write = useMutation({
@@ -110,10 +113,10 @@ export function useExtensionScope(
   return {
     scope,
     cascade: cascadeOf(policy, repoId, convId),
-    external: view?.rules,
+    external: readFiles ? view?.rules : undefined,
     loadError: files.isError ? (files.error as Error).message : null,
     pluginFiles: (pluginId) =>
-      (view?.plugins ?? []).filter((p) => p.plugin_id === pluginId).map((p) => ({ source: p.source, enabled: p.enabled })),
+      (readFiles ? (view?.plugins ?? []) : []).filter((p) => p.plugin_id === pluginId).map((p) => ({ source: p.source, enabled: p.enabled })),
     readOnlyReason:
       scope !== "global" && !key
         ? scope === "repository"

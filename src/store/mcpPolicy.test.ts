@@ -29,6 +29,36 @@ beforeEach(() => {
 });
 
 describe("Flight Deck's permission cascade", () => {
+  it("runs changes one at a time, so two made during one round trip both stick", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    let release!: () => void;
+    apply.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ status: "ok", data: null }))),
+    );
+    // A plugin Clear on the conversation, still waiting on its session…
+    useMcpPolicy.setState({ ...useMcpPolicy.getState(), convs: { c1: { tools: {}, servers: {}, plugins: { "p@m": true } } } }, true);
+    const clear = applyPolicyChange({ scope: "conversation", key: "c1" }, { plugins: [{ id: "p@m", enabled: null }] });
+    // …while a server is turned off at the same level.
+    const toggle = applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "claude.ai Gmail", on: false }] });
+    await Promise.resolve();
+    expect(apply).toHaveBeenCalledTimes(1); // the second waits for the first
+    release();
+    await Promise.all([clear, toggle]);
+    const level = useMcpPolicy.getState().convs.c1;
+    expect(level.plugins).toEqual({}); // the Clear was NOT undone by the later write
+    expect(level.servers).toEqual({ mcp__claude_ai_Gmail: false });
+  });
+
+  it("a refused change does not block the next one", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    apply.mockResolvedValueOnce({ status: "error", error: "gone" });
+    await expect(
+      applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "a", on: false }] }),
+    ).rejects.toThrow("gone");
+    await applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "b", on: false }] });
+    expect(useMcpPolicy.getState().convs.c1.servers).toEqual({ mcp__b: false });
+  });
+
   it("a Global change reaches every live Claude conversation, resolved for each", async () => {
     convs([
       { id: "c1", repoId: "r1", handle: "s1" },

@@ -188,8 +188,23 @@ impl Assembler {
     }
 
     /// Reflect the fresh plugin list a `reload_plugins` response carries.
-    pub fn set_loaded_plugins(&mut self, plugins: Vec<LoadedPlugin>) -> SessionEvent {
-        self.state.loaded_plugins = Some(plugins);
+    /// Reflect an acknowledged `reload_plugins`: the fresh plugin and sub-agent lists it
+    /// carries (each `None` when the response has none — an older CLI — and then left as
+    /// is). The skills are FORGOTTEN: the reload may have added or dropped a plugin's
+    /// skills, and no response carries the new list — showing the old one would contradict
+    /// the fresh plugins next to it. The next turn's `system/init` brings it back.
+    pub fn apply_reload(
+        &mut self,
+        plugins: Option<Vec<LoadedPlugin>>,
+        agents: Option<Vec<LoadedAgent>>,
+    ) -> SessionEvent {
+        if let Some(p) = plugins {
+            self.state.loaded_plugins = Some(p);
+        }
+        if let Some(a) = agents {
+            self.state.loaded_agents = Some(a);
+        }
+        self.state.loaded_skills = None;
         SessionEvent::State(self.state.clone())
     }
 
@@ -2773,6 +2788,65 @@ mod tests {
         let _ = asm.ingest(&init(serde_json::json!({})));
         assert_eq!(asm.state().loaded_skills.as_ref().map(Vec::len), Some(2), "absent field keeps the list");
         assert_eq!(asm.state().loaded_agents.as_ref().map(Vec::len), Some(2));
+
+        // A malformed field neither wipes the lists nor fails the init: the rest of it
+        // (here its cwd) still applies.
+        let mut odd = init(serde_json::json!({ "skills": "oops", "agents": { "x": 1 } }));
+        if let CliMessage::System(SystemMsg::Init(i)) = &mut odd {
+            i.cwd = Some("/moved".into());
+        }
+        let _ = asm.ingest(&odd);
+        assert_eq!(asm.state().cwd.as_deref(), Some("/moved"));
+        assert_eq!(asm.state().loaded_skills.as_ref().map(Vec::len), Some(2));
+        assert_eq!(asm.state().loaded_agents.as_ref().map(Vec::len), Some(2));
+
+        // Empty arrays are a real answer: nothing loaded.
+        let _ = asm.ingest(&init(serde_json::json!({ "skills": [], "agents": [] })));
+        assert_eq!(asm.state().loaded_skills, Some(vec![]));
+        assert_eq!(asm.state().loaded_agents, Some(vec![]));
+    }
+
+    /// The real captured `system/init` (fixture): its skills and sub-agents parse — so a
+    /// typing of these fields that the wire would fail cannot slip in unnoticed.
+    #[test]
+    fn captured_system_init_yields_skills_and_agents() {
+        let mut asm = seeded();
+        let line = CAPTURE.lines().next().expect("the fixture opens on system/init");
+        let msg: CliMessage = serde_json::from_str(line).expect("the captured init parses");
+        let _ = asm.ingest(&msg);
+        let skills = asm.state().loaded_skills.clone().expect("skills captured");
+        assert!(skills.iter().any(|s| s == "deep-research"));
+        assert!(skills.iter().any(|s| s == "tosse-workflow:pickup"));
+        let agents = asm.state().loaded_agents.clone().expect("agents captured");
+        assert!(agents.iter().any(|a| a.name == "Explore"));
+        assert!(agents.iter().any(|a| a.name == "tosse-workflow:tosse-manager"));
+        let plugins = asm.state().loaded_plugins.clone().expect("plugins captured");
+        assert!(plugins.iter().any(|p| p.id.as_deref() == Some("railway@claude-plugins-official")));
+    }
+
+    /// A `reload_plugins` ack replaces plugins and sub-agents and FORGETS the skills (it may
+    /// have changed them; no response carries the new list). A response without a list
+    /// leaves that list alone.
+    #[test]
+    fn reload_refreshes_plugins_and_agents_and_forgets_skills() {
+        let mut asm = seeded();
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "s", "uuid": "u", "cwd": "/x",
+            "model": "claude-opus-5-5", "permissionMode": "default", "tools": [],
+            "skills": ["railway:use-railway"], "plugins": [{"name": "railway", "source": "railway@m"}]
+        }))
+        .unwrap();
+        let _ = asm.ingest(&init);
+        assert!(asm.state().loaded_skills.is_some());
+
+        let _ = asm.apply_reload(Some(vec![]), Some(vec![LoadedAgent { name: "Plan".into(), description: None }]));
+        assert_eq!(asm.state().loaded_plugins, Some(vec![]));
+        assert_eq!(asm.state().loaded_agents.as_ref().map(Vec::len), Some(1));
+        assert_eq!(asm.state().loaded_skills, None, "stale after a reload");
+
+        let _ = asm.apply_reload(None, None);
+        assert_eq!(asm.state().loaded_plugins, Some(vec![]), "no list in the response: kept");
+        assert_eq!(asm.state().loaded_agents.as_ref().map(Vec::len), Some(1));
     }
 
     /// A turn that starts while a `set_model` is still pending reports the model being

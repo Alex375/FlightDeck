@@ -5494,7 +5494,8 @@ session_usage?: SessionUsage | null;
 loaded_plugins?: LoadedPlugin[] | null; 
 /**
  * The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
- * or `plugin:skill`. `None` until the first turn: no control response carries them.
+ * or `plugin:skill`. `None` until the first turn (no control response carries them),
+ * and again after a `reload_plugins`, which may have changed them.
  * Same purpose as `loaded_plugins` (the truthful list for a remote session).
  */
 loaded_skills?: string[] | null; 
