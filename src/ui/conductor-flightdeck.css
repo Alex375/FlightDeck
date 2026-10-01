@@ -177,6 +177,7 @@
 .ag-wfpeek-sub { display:flex; align-items:center; gap:6px; min-width:0; font-size:10.5px; color:var(--wf-tx-lo); }
 .ag-wfpeek-phase { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ag-wfpeek-agents { flex:0 0 auto; margin-left:auto; color:var(--wf-tx-xlo); }
+.ag-wfpeek-failed { color:var(--wf-err); }
 
 /* --- clickable to-do pips on the card footer (→ popover with the full plan) --- */
 /* Hit-area enlarged ~10% (padding up from 2/5 → 3/7); the matching negative margin

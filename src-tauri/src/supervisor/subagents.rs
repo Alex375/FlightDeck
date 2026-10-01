@@ -185,23 +185,38 @@ fn load_workflow_run_in(
         .map_err(|e| format!("unreadable manifest {}: {e}", path.display()))
 }
 
-/// The two fields of a journal entry we care about. Deliberately NOT `serde_json::Value`:
-/// a `result` entry embeds the agent's ENTIRE return value (real journals reach hundreds of
-/// KiB), and this file is re-read on every change of a running workflow. Deserializing into
-/// this struct lets serde SKIP `result` (and the cache `key`) without materializing them.
+/// The fields of a journal entry we care about. Deliberately NOT `serde_json::Value`: a
+/// `result` entry embeds the agent's ENTIRE return value (real journals reach hundreds of KiB),
+/// and this file is re-read on every change of a running workflow. Deserializing into this
+/// struct lets serde SKIP `result` without materializing it.
+///
+/// Wire (verified against the claude 2.1.286 binary's own journal reader + 41 real runs):
+/// `{type:"launched"}` once, then `started{key,agentId,label?,phase?}` per spawn,
+/// `result{key,agentId,result}` / `failed{key,agentId}` per settle. `label`/`phase` (and the
+/// `launched` header) appeared around 2.1.270 (absent on 2.1.263); `failed` already existed (a
+/// 2.1.260 run on disk has 281 of them). `key` (`v2:<sha>`) is a CHAINED hash — unique per `agent()` call —
+/// and a call the CLI runs again is re-`started` under the SAME key with a NEW agentId: a retry
+/// (seen live: one call started 4 times, only the last attempt getting a `result`), or a
+/// re-execution when the run is resumed (`resumeFromRunId` appends to the same journal, so a
+/// new `started` can follow an old `result`). A call that dies before spawning writes
+/// `failed{key, agentId:""}` with no `started` at all.
 #[derive(serde::Deserialize)]
 struct JournalLine {
     #[serde(rename = "type")]
     kind: String,
+    key: Option<String>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
+    label: Option<String>,
+    phase: Option<String>,
 }
 
 /// Read a RUNNING workflow's live progress from its append-only journal
 /// (`subagents/workflows/<run_id>/journal.jsonl`). The rich manifest is written only at the
-/// END of a run, so during the run this journal is the only on-disk "how far along" signal:
-/// `{"type":"started",agentId}` (agent spawned) then `{"type":"result",agentId}` (agent done).
-/// We keep the AGENT IDS, not just tallies — they key each agent's incrementally-written
+/// END of a run, so during the run this journal is the only on-disk "how far along" signal: one
+/// `started` per spawn, then a `result` or `failed` per agent that settles (full wire on
+/// [`JournalLine`], fold rules on [`parse_workflow_journal`]). We keep each call's latest AGENT
+/// ID, label and phase, not just tallies — the id keys the agent's incrementally-written
 /// transcript, so the UI can show (and drill into) what is running right now. The run dir is
 /// named exactly `<run_id>` (the `wf_…` id). Probes every project slug holding the session (a
 /// cwd move splits artifacts across slugs).
@@ -263,15 +278,50 @@ fn load_workflow_journal_in(
     Ok(Some(parse_workflow_journal(&content)))
 }
 
-/// Fold a journal's text into per-agent state. Agents are keyed by `agentId` and kept in
-/// FIRST-SEEN order, so a re-emitted `started` can't double-count and a `result` for an agent
-/// whose `started` we never saw (a resumed/cached run) still registers rather than vanishing.
-/// A malformed line (e.g. the final partial line of a live append) is skipped — expected, not
-/// an error. An entry without an `agentId` still moves the tallies via a positional key, so a
-/// shape change in the CLI degrades to "counts only" instead of to zero.
+/// Fold a journal's text into per-agent state, one entry per agent CALL, in FIRST-SEEN order.
+///
+/// An entry is identified by its `key` (unique per call) when present, else by its `agentId`.
+/// That is what keeps a call the CLI runs again to ONE row: keyed by agentId, every abandoned
+/// attempt (re-`started` under the same key, never given a `result`) stayed "in flight" for good.
+///
+/// Each line is then read against the call's attempts, by its agentId:
+///  - the CURRENT attempt (or no id at all — a line about the call itself): a `started` is a
+///    re-emit and changes nothing; a `result`/`failed` settles the call.
+///  - a NEWER attempt (an id this call has not used yet): it becomes the live one. A `started`
+///    reopens the call even after a `result` — a resumed run (`resumeFromRunId`) re-executes
+///    calls under the same key, and hiding that re-run would hide its outcome too.
+///  - an OLDER, superseded attempt: its `started`/`failed` is stale and ignored. Its `result`
+///    still settles the call — a delivered value is never thrown away.
+/// A `failed` with no id (the call died before spawning, possibly after an earlier execution
+/// delivered) settles the call as failed AND drops its agent id: an empty id is the CLI's own
+/// "this execution never got an id", so there is no transcript of the failure — pointing at an
+/// earlier execution's transcript would show a success under a failed row.
+///
+/// A `result` for an agent whose `started` we never saw (a resumed/cached run) still registers
+/// rather than vanishing. A malformed line (e.g. the final partial line of a live append) is
+/// skipped — expected, not an error. An entry without any id still moves the tallies via a
+/// positional key, so a shape change in the CLI degrades to "counts only" instead of to zero.
 fn parse_workflow_journal(content: &str) -> WorkflowJournal {
+    use std::collections::HashMap;
+
+    enum Kind {
+        Started,
+        Result,
+        Failed,
+    }
+    enum Attempt {
+        Current,
+        Newer,
+        Older,
+    }
+
     let mut agents: Vec<WorkflowJournalAgent> = Vec::new();
-    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    // Every id an entry has EVER used points at it: that is how a line without a `key` still
+    // finds its call, and how an id that is no longer the current one is recognized as an OLDER
+    // attempt rather than a new one.
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut names_agents = false;
     for (n, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -280,27 +330,99 @@ fn parse_workflow_journal(content: &str) -> WorkflowJournal {
         let Ok(entry) = serde_json::from_str::<JournalLine>(line) else {
             continue;
         };
-        let done = match entry.kind.as_str() {
-            "started" => false,
-            "result" => true,
+        let kind = match entry.kind.as_str() {
+            "started" => Kind::Started,
+            "result" => Kind::Result,
+            "failed" => Kind::Failed,
+            // The run header carries no agent — but only a claude that names its agents writes it.
+            "launched" => {
+                names_agents = true;
+                continue;
+            }
             _ => continue,
         };
-        // No id (unexpected shape): fall back to a per-line key so the agent is still counted.
-        let key = entry.agent_id.unwrap_or_else(|| format!("#line-{n}"));
-        match index.get(&key) {
-            Some(&i) => {
-                // `done` only ever moves false → true: a stray later `started` for an already
-                // finished agent must not resurrect it as in-flight.
-                agents[i].done |= done;
-            }
+        if entry.label.is_some() || entry.phase.is_some() {
+            names_agents = true;
+        }
+        // The CLI writes `agentId: ""` on a `failed` for a call that died before it got an id.
+        let agent_id = entry.agent_id.filter(|id| !id.is_empty());
+        let key = entry.key.filter(|k| !k.is_empty());
+        let found = key
+            .as_ref()
+            .and_then(|k| by_key.get(k))
+            .or_else(|| agent_id.as_ref().and_then(|id| by_id.get(id)))
+            .copied();
+        let i = match found {
+            Some(i) => i,
             None => {
-                index.insert(key.clone(), agents.len());
-                agents.push(WorkflowJournalAgent { agent_id: key, done });
+                let i = agents.len();
+                agents.push(WorkflowJournalAgent {
+                    // No key and no id (unexpected shape): a positional identity still counts
+                    // the agent. It is a row key only — `agent_id` stays honestly `None`.
+                    key: key
+                        .clone()
+                        .or_else(|| agent_id.clone())
+                        .unwrap_or_else(|| format!("#line-{n}")),
+                    agent_id: None,
+                    label: None,
+                    phase: None,
+                    done: false,
+                    failed: false,
+                    last_started: None,
+                });
+                if let Some(k) = &key {
+                    by_key.insert(k.clone(), i);
+                }
+                i
             }
+        };
+        let attempt = match &agent_id {
+            None => Attempt::Current,
+            Some(id) if agents[i].agent_id.as_deref() == Some(id.as_str()) => Attempt::Current,
+            Some(id) if by_id.get(id) == Some(&i) => Attempt::Older,
+            Some(_) => Attempt::Newer,
+        };
+        if let Some(id) = &agent_id {
+            by_id.entry(id.clone()).or_insert(i);
+        }
+        let agent = &mut agents[i];
+        if let Attempt::Newer = attempt {
+            agent.agent_id = agent_id.clone();
+        }
+        match (kind, attempt) {
+            (Kind::Started, Attempt::Newer) => {
+                agent.done = false;
+                agent.failed = false;
+                agent.last_started = Some(n as u64);
+            }
+            (Kind::Started, Attempt::Current) => {
+                // An id-less `started` (shape drift) still dates the call once.
+                agent.last_started.get_or_insert(n as u64);
+            }
+            (Kind::Started, Attempt::Older) => {}
+            (Kind::Result, _) => {
+                agent.done = true;
+                agent.failed = false;
+            }
+            (Kind::Failed, Attempt::Older) => {}
+            (Kind::Failed, _) => {
+                agent.done = true;
+                agent.failed = true;
+                if agent_id.is_none() {
+                    agent.agent_id = None;
+                }
+            }
+        }
+        if let Some(label) = entry.label {
+            agent.label = Some(label);
+        }
+        if let Some(phase) = entry.phase {
+            agent.phase = Some(phase);
         }
     }
     let done = agents.iter().filter(|a| a.done).count() as u64;
-    WorkflowJournal { started: agents.len() as u64, done, agents }
+    let failed = agents.iter().filter(|a| a.failed).count() as u64;
+    WorkflowJournal { started: agents.len() as u64, done, failed, names_agents, agents }
 }
 
 /// The declared phases of a workflow, read from its SCRIPT's `meta.phases` — the only source
@@ -830,8 +952,8 @@ mod tests {
         // The agent IDS survive (they key each agent's live transcript) in spawn order, with
         // `c` — started, no result yet — still in flight.
         assert_eq!(
-            j.agents.iter().map(|a| (a.agent_id.as_str(), a.done)).collect::<Vec<_>>(),
-            [("a", true), ("b", true), ("c", false)],
+            j.agents.iter().map(|a| (a.agent_id.as_deref(), a.done)).collect::<Vec<_>>(),
+            [(Some("a"), true), (Some("b"), true), (Some("c"), false)],
         );
 
         // Absent journal (no run dir) → Ok(None), not an error.
@@ -878,7 +1000,178 @@ mod tests {
         );
         let j = parse_workflow_journal(&fat);
         assert_eq!((j.started, j.done), (1, 1));
-        assert_eq!(j.agents[0].agent_id, "a");
+        assert_eq!(j.agents[0].agent_id.as_deref(), Some("a"));
+    }
+
+    /// A recent claude's journal names every agent: `started` carries the script's `label`
+    /// and `phase`. Shape copied from a real 2.1.286 run, where one phase fanned out to agents
+    /// SHARING a label — the case the old wire-label zip collapsed into unnamed, uncounted rows.
+    #[test]
+    fn journal_carries_each_agents_label_and_phase() {
+        let j = parse_workflow_journal(
+            "{\"type\":\"launched\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"label\":\"review:tests\",\"phase\":\"Review\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\",\"label\":\"verify:tests:assembler.rs\",\"phase\":\"Verify\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:k3\",\"agentId\":\"a3\",\"label\":\"verify:tests:assembler.rs\",\"phase\":\"Verify\"}\n\
+             {\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":{\"x\":1}}\n\
+             {\"type\":\"started\",\"key\":\"v2:k4\",\"agentId\":\"a4\",\"label\":\"phase-less\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (4, 1, 0), "`launched` is not an agent");
+        let rows: Vec<_> = j
+            .agents
+            .iter()
+            .map(|a| (a.agent_id.as_deref().unwrap(), a.label.as_deref(), a.phase.as_deref(), a.done))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("a1", Some("review:tests"), Some("Review"), true),
+                // Same label twice in one phase: TWO agents, both named, both in their phase.
+                ("a2", Some("verify:tests:assembler.rs"), Some("Verify"), false),
+                ("a3", Some("verify:tests:assembler.rs"), Some("Verify"), false),
+                // `phase` is optional on the wire (the CLI omits an empty one).
+                ("a4", Some("phase-less"), None, false),
+            ],
+        );
+        assert!(j.names_agents);
+        // An older journal has neither field: the agent is still listed, just unnamed — and the
+        // journal says it does not name its agents.
+        let j = parse_workflow_journal("{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a\"}\n");
+        assert_eq!((j.agents[0].label.as_deref(), j.agents[0].phase.as_deref()), (None, None));
+        assert!(!j.names_agents);
+        // The `launched` header alone settles it, from the first line — even when the only entry
+        // so far is a call that failed before spawning (it carries no label).
+        let j = parse_workflow_journal(
+            "{\"type\":\"launched\"}\n{\"type\":\"failed\",\"key\":\"v2:z\",\"agentId\":\"\"}\n",
+        );
+        assert!(j.names_agents);
+    }
+
+    /// A call the CLI retries is re-`started` under the SAME key with a NEW agentId; only the
+    /// last attempt gets a `result` (real run: one call started 4 times). It must stay ONE agent,
+    /// pointing at its latest attempt, under a key that does NOT change with the attempt (the UI
+    /// selects by it) — keyed by agentId, each abandoned attempt stayed "in flight" for good.
+    #[test]
+    fn a_retried_call_is_one_agent_on_its_latest_attempt() {
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\",\"label\":\"verify:stats\",\"phase\":\"Verify\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try2\",\"label\":\"verify:stats\",\"phase\":\"Verify\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try3\",\"label\":\"verify:stats\",\"phase\":\"Verify\"}\n",
+        );
+        assert_eq!((j.started, j.done), (1, 0));
+        assert_eq!(j.agents[0].agent_id.as_deref(), Some("try3"), "the drill-in reads the LIVE attempt");
+        assert_eq!(j.agents[0].key, "v2:s", "the row identity survives the retry");
+
+        // A superseded attempt's late lines are stale: its `started` does not repoint the call
+        // and its `failed` does not settle it while the newer attempt is still working…
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try2\"}\n\
+             {\"type\":\"failed\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (1, 0, 0));
+        assert_eq!(j.agents[0].agent_id.as_deref(), Some("try2"));
+
+        // …but a value it delivered is never thrown away.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try2\"}\n\
+             {\"type\":\"result\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (1, 1, 0));
+
+        // A re-emitted `started` of the attempt that delivered changes nothing.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n\
+             {\"type\":\"result\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:s\",\"agentId\":\"try1\"}\n",
+        );
+        assert_eq!((j.started, j.done), (1, 1));
+    }
+
+    /// A resumed run (`resumeFromRunId`) appends to the SAME journal and re-executes calls under
+    /// their old key — so a NEW attempt can follow an old `result`. That re-run is real work: it
+    /// must show as in flight on its own transcript, and its failure must read as a failure, not
+    /// as the success the previous execution delivered.
+    #[test]
+    fn a_resumed_run_reexecuting_a_delivered_call_is_shown() {
+        let delivered = "{\"type\":\"started\",\"key\":\"v2:k3\",\"agentId\":\"c1\",\"label\":\"l\",\"phase\":\"P\"}\n\
+                         {\"type\":\"result\",\"key\":\"v2:k3\",\"agentId\":\"c1\"}\n";
+        let rerun = format!("{delivered}{{\"type\":\"launched\"}}\n{{\"type\":\"started\",\"key\":\"v2:k3\",\"agentId\":\"c2\",\"label\":\"l\",\"phase\":\"P\"}}\n");
+        let j = parse_workflow_journal(&rerun);
+        assert_eq!((j.started, j.done), (1, 0), "the re-execution is in flight");
+        assert_eq!(j.agents[0].agent_id.as_deref(), Some("c2"), "on its own transcript");
+        assert_eq!(j.agents[0].last_started, Some(3), "dated by its LATEST start");
+
+        // Recency is what tells the UI where a resumed run IS: an earlier-phase call re-run after
+        // a later phase keeps its first-seen slot, but carries the newest start.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a1\",\"label\":\"a\",\"phase\":\"Scout\"}\n\
+             {\"type\":\"failed\",\"key\":\"v2:a\",\"agentId\":\"a1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:v\",\"agentId\":\"v1\",\"label\":\"v\",\"phase\":\"Verify\"}\n\
+             {\"type\":\"result\",\"key\":\"v2:v\",\"agentId\":\"v1\"}\n\
+             {\"type\":\"launched\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a2\",\"label\":\"a\",\"phase\":\"Scout\"}\n",
+        );
+        assert_eq!(j.agents[0].phase.as_deref(), Some("Scout"));
+        assert!(j.agents[0].last_started > j.agents[1].last_started);
+
+        let j = parse_workflow_journal(&format!("{rerun}{{\"type\":\"failed\",\"key\":\"v2:k3\",\"agentId\":\"c2\"}}\n"));
+        assert_eq!((j.done, j.failed), (1, 1), "the re-run's failure is a failure");
+
+        // The re-execution died before spawning this time: an id-less `failed` for a call an
+        // earlier execution delivered is still THIS call failing — and the failed execution has
+        // no transcript. Keeping c1 would open the earlier SUCCESS under the failed row.
+        let j = parse_workflow_journal(&format!("{delivered}{{\"type\":\"failed\",\"key\":\"v2:k3\",\"agentId\":\"\"}}\n"));
+        assert_eq!((j.done, j.failed), (1, 1));
+        assert_eq!(j.agents[0].agent_id, None);
+        assert_eq!(j.agents[0].label.as_deref(), Some("l"), "it keeps its name and phase");
+    }
+
+    /// `failed` settles an agent — the fold used to ignore it, so a failed agent read as
+    /// "running" until the run ended. A retry after a failure is real work and reopens it.
+    #[test]
+    fn failed_entries_settle_agents() {
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a\",\"label\":\"x\",\"phase\":\"P\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:b\",\"agentId\":\"b\",\"label\":\"y\",\"phase\":\"P\"}\n\
+             {\"type\":\"failed\",\"key\":\"v2:a\",\"agentId\":\"a\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (2, 1, 1));
+        assert!(j.agents[0].done && j.agents[0].failed);
+        assert!(!j.agents[1].done);
+
+        // Retried after failing → in flight again, on the new attempt.
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a1\"}\n\
+             {\"type\":\"failed\",\"key\":\"v2:a\",\"agentId\":\"a1\"}\n\
+             {\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a2\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (1, 0, 0));
+        assert_eq!(j.agents[0].agent_id.as_deref(), Some("a2"));
+    }
+
+    /// A call that dies before spawning (unknown agent type, refused by the safety classifier…)
+    /// writes `failed{key, agentId:""}` and no `started`. It is counted as a failure — never
+    /// dropped — but with NO agent id: there is no transcript, and a made-up id would be offered
+    /// to the UI as one (it used to surface as a clickable "#line-N" row claiming to be working).
+    #[test]
+    fn a_call_that_failed_before_spawning_has_no_agent_id() {
+        let j = parse_workflow_journal(
+            "{\"type\":\"started\",\"key\":\"v2:a\",\"agentId\":\"a\",\"label\":\"x\",\"phase\":\"P\"}\n\
+             {\"type\":\"failed\",\"key\":\"v2:z\",\"agentId\":\"\"}\n",
+        );
+        assert_eq!((j.started, j.done, j.failed), (2, 1, 1));
+        let ghost = &j.agents[1];
+        assert_eq!(ghost.agent_id, None);
+        assert_eq!(ghost.key, "v2:z", "still a stable row identity");
+        assert!(ghost.done && ghost.failed);
+
+        // No key and no id at all (shape drift): counted under a positional row key, still no id.
+        let j = parse_workflow_journal("{\"type\":\"started\"}\n");
+        assert_eq!(j.agents[0].agent_id, None);
+        assert_eq!(j.agents[0].key, "#line-0");
     }
 
     /// Reality check against the developer's REAL `~/.claude` artifacts (ignored by default;

@@ -163,6 +163,20 @@ export function runIdFromResult(content: JsonValue | undefined): string | null {
 }
 
 /**
+ * The background task id of a `Workflow` launch, parsed from its tool_result ack
+ * ("Workflow launched in background. Task ID: w8s5qg6mv"). The only durable trace of WHICH
+ * execution a card belongs to: the task registry is live-only (empty after a restart), and a
+ * resumed run reuses the run id — so this is what tells a card's own report from a later
+ * execution's. Null when the ack carries none.
+ */
+export function taskIdFromResult(content: JsonValue | undefined): string | null {
+  const text = resultText(content);
+  if (!text) return null;
+  const m = text.match(/Task ID:\s*([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/**
  * Best available `agent_id` for drilling into a sub-agent's transcript:
  *  1. the BackgroundTask's own `agent_id` (set at task_notification, foreground), else
  *  2. parsed from the immediate tool_result ack (background, available during the run), else

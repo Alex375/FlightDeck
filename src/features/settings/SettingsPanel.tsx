@@ -664,13 +664,13 @@ function AppearancePrefs() {
           hint={
             <>
               In a running workflow's detail view, break each phase open into its individual{" "}
-              <strong>agents</strong> — their real labels, a running/done dot, and a one-line{" "}
-              <strong>“doing X now”</strong> read from each agent's transcript — the closest we
-              get to Claude Code's own <code>/workflows</code> readout. The wire gives no live
-              agent→label mapping, so labels are matched to the run <strong>by spawn order</strong>{" "}
-              (approximate, and stated as such); the exact mapping arrives with the end-of-run
-              report. Off → the flat launched/running/done counts and the opaque id list.{" "}
-              <strong>On by default.</strong>
+              <strong>agents</strong> — their script labels, a running/done/failed dot, and a
+              one-line <strong>“doing X now”</strong> read from each agent's transcript — the
+              closest we get to Claude Code's own <code>/workflows</code> readout. Labels and
+              phases come from the run's own journal (exact on recent Claude Code versions; on
+              older ones they are matched by spawn order, approximately, and stated as such).
+              Off → the launched/running/done/failed counts, the in-flight agents (by label, or by
+              short id on older Claude Code) and the step list. <strong>On by default.</strong>
             </>
           }
           checked={workflowAgentDetail}

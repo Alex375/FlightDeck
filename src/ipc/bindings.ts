@@ -6296,12 +6296,12 @@ export type WakeWordEvent = { phrase: string; score: number }
  * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
  * only written when the run FINISHES, so during the run the journal is the sole on-disk
- * source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
- * `{"type":"result",…}` per agent completion.
+ * source of "how far along are we": one `{"type":"started",…}` per agent spawn (or retry),
+ * then one `{"type":"result",…}` or `{"type":"failed",…}` per agent that settles.
  * 
- * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
- * than from raw line counts, so a re-emitted entry can never inflate the total past the
- * number of agents that actually exist.
+ * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent call) rather
+ * than from raw line counts, so a re-emitted entry or a retry can never inflate the total
+ * past the number of agents that actually exist.
  */
 export type WorkflowJournal = { 
 /**
@@ -6309,9 +6309,20 @@ export type WorkflowJournal = {
  */
 started: number; 
 /**
- * Agents whose `result` entry has landed.
+ * Agents that have SETTLED (`result` or `failed`) — includes [`Self::failed`].
  */
 done: number; 
+/**
+ * Of [`Self::done`], the agents that settled by failing.
+ */
+failed: number; 
+/**
+ * Whether this journal names its agents itself: it was written by a claude that records
+ * each agent's `label`/`phase` (its `launched` header, or any label/phase, says so). Lets
+ * the UI pick the exact path from the very first line — even before a labelled agent shows
+ * up (a journal whose only entries so far are calls that failed before spawning).
+ */
+namesAgents: boolean; 
 /**
  * Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
  * set — and drill into a running agent's incrementally-written transcript — instead
@@ -6319,22 +6330,58 @@ done: number;
  */
 agents: WorkflowJournalAgent[] }
 /**
- * One agent of a running workflow, as the live journal knows it. The journal carries
- * ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
- * those exist solely in the end-of-run manifest. The id is what matters, because it is
- * the key to that agent's transcript on disk
+ * One agent of a running workflow, as the live journal knows it — one per `agent()` CALL of
+ * the script (the journal's per-call `key`), not per spawned process: a call the CLI runs
+ * again (a retry, or a re-execution when the run is resumed) keeps ONE entry, pointing at its
+ * latest attempt. That attempt's id keys its transcript on disk
  * (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
  * INCREMENTALLY — so a still-running agent can be read live.
+ * 
+ * Recent claude versions (around 2.1.270 and later; absent on 2.1.263) also write the script's
+ * `label` and `phase` on the `started` entry, so the live view can name every agent EXACTLY;
+ * older ones wrote neither (both `None`). Metrics (model, tokens) still exist only in the
+ * end-of-run manifest.
  */
 export type WorkflowJournalAgent = { 
 /**
- * Key for [`super::subagents::load_subagent_transcript`].
+ * Stable identity of the CALL, unchanged across its attempts: the journal `key`, else the
+ * first agent id seen, else a positional placeholder. Opaque — a row/selection key for the
+ * UI, NEVER a transcript key.
  */
-agentId: string; 
+key: string; 
 /**
- * Whether a `result` entry closed this agent. `false` = still in flight.
+ * The latest attempt's id — the key for [`super::subagents::load_subagent_transcript`].
+ * `None` when the latest execution never got an id: it failed before spawning (unknown
+ * agent type, a call refused by the safety classifier…), so no transcript of it exists —
+ * even when an EARLIER execution of the same call (before a resume) had one.
  */
-done: boolean }
+agentId: string | null; 
+/**
+ * The script's `label` for this call (`None` on an older journal, or on a call the CLI
+ * never recorded a `started` for).
+ */
+label: string | null; 
+/**
+ * The phase the call ran in. `None` on an older journal, for an agent the script spawned
+ * outside any phase (before its first `phase()`, or in a phase-less script), and for a call
+ * that failed before spawning (the CLI records no phase for it).
+ */
+phase: string | null; 
+/**
+ * Whether the agent has SETTLED — a `result` or a `failed` entry closed it. `false` =
+ * still in flight.
+ */
+done: boolean; 
+/**
+ * Whether it settled by FAILING (a `failed` entry). Implies `done`.
+ */
+failed: boolean; 
+/**
+ * Journal line index of this call's latest `started` — RECENCY, which the list order is
+ * not: a call the CLI re-runs (a retry, or a re-execution after a resume) keeps its
+ * first-seen slot. `None` for a call that never spawned.
+ */
+lastStarted: number | null }
 /**
  * A RUNNING workflow's on-disk journal changed: the fresh per-agent progress of that run
  * ([`crate::supervisor::workflow_watch`]). Keyed by `session_id` (Claude's durable id) +

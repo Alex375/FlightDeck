@@ -20,16 +20,25 @@ import type { WorkflowJournal, WorkflowJournalAgent } from "../ipc/client";
 export interface WfJournalView {
   /** Distinct agents the journal knows about. */
   started: number;
-  /** Agents whose result has landed. */
+  /** Agents that have settled — a `result` OR a `failed` entry closed them. Progress, not
+   *  success: what a surface calls "done" is {@link delivered}. */
   done: number;
+  /** Of `done`, the agents that settled by FAILING. */
+  failed: number;
+  /** Of `done`, the agents that DELIVERED (`done - failed`) — the one number every surface shows
+   *  as "done", always next to the failures (see {@link progressText}). */
+  delivered: number;
   /** Agents the journal shows as unfinished — `started - done`, never negative.
    *  ⚠️ This is "not closed in the journal", NOT "working right now": the CLI does not
    *  guarantee a `result` line per agent (a real run on disk has 38 `started` / 0 `result`
    *  with a `completed` manifest). Only present it as "running" while the TASK itself is
    *  running — see {@link journalTally}. */
   running: number;
-  /** Every agent in spawn order (id + done), for the in-flight list and drill-in. */
+  /** Every agent in spawn order (id, label/phase when the CLI wrote them, settled state), for
+   *  the in-flight list and drill-in. */
   agents: WorkflowJournalAgent[];
+  /** Whether the journal names its agents itself (a recent claude) — picks the exact live path. */
+  namesAgents: boolean;
   /** Set when the journal EXISTS but could not be read. The numbers above are then the last
    *  known ones and MUST NOT be shown as live — a stale readout presented as fresh is the
    *  silent failure this field exists to prevent. */
@@ -40,8 +49,11 @@ const EMPTY_AGENTS: WorkflowJournalAgent[] = [];
 export const EMPTY_JOURNAL: WfJournalView = {
   started: 0,
   done: 0,
+  failed: 0,
+  delivered: 0,
   running: 0,
   agents: EMPTY_AGENTS,
+  namesAgents: false,
   error: null,
 };
 
@@ -57,10 +69,53 @@ export function toJournalView(journal: WorkflowJournal | null | undefined): WfJo
   return {
     started: journal.started,
     done: journal.done,
+    failed: journal.failed,
+    delivered: Math.max(0, journal.done - journal.failed),
     running: Math.max(0, journal.started - journal.done),
     agents: journal.agents,
+    namesAgents: journal.namesAgents,
     error: null,
   };
+}
+
+/**
+ * "delivered/total" plus the failures — the ONE wording of a workflow's progress, shared by the
+ * tally, the Flight Deck card, the detail modal and its phase rows so they can never tell one run
+ * two ways. A failed agent has settled but did NOT deliver: it is never folded into the first
+ * number, and never left unsaid. `unit` follows the ratio ("3/5 done · 2 failed"). `noResult`
+ * names, in a run that is OVER, the agents the journal never closed — a kill writes no line for
+ * the agents it interrupts, and some CLI versions wrote no `result` line at all (a real completed
+ * run on disk ends 38 started / 0 result). Whether they finished is unknown, so they are neither
+ * counted as delivered nor called unfinished: they are named for what the journal says.
+ */
+export function progressText(
+  delivered: number,
+  total: number,
+  failed: number,
+  unit?: string,
+  noResult = 0,
+): string {
+  return (
+    `${delivered}/${total}${unit ? ` ${unit}` : ""}` +
+    (failed > 0 ? ` · ${failed} failed` : "") +
+    (noResult > 0 ? ` · ${noResult} no result` : "")
+  );
+}
+
+/**
+ * The Flight Deck card's activity line: what is happening right now, and — whenever any agent
+ * failed — the failures, in their own (error-toned) part. Failures are named here because the
+ * card's count is "delivered/started" only: without this line a failed agent would sit in none
+ * of the card's numbers, and an all-settled run would read as merely "between steps…".
+ */
+export function peekStatus(view: WfJournalView): { text: string | null; failed: string | null } {
+  if (view.error) return { text: JOURNAL_UNAVAILABLE, failed: null };
+  if (view.started === 0) return { text: "starting…", failed: null };
+  const failed = view.failed > 0 ? `${view.failed} failed` : null;
+  if (view.running > 0) {
+    return { text: `${view.running} agent${view.running > 1 ? "s" : ""} running`, failed };
+  }
+  return { text: failed ? null : "between steps…", failed };
 }
 
 /** Agents still in flight, in spawn order — the "who is working right now" list. */
@@ -82,11 +137,15 @@ export function journalTally(view: WfJournalView, running: boolean): string | nu
   if (view.error) return JOURNAL_UNAVAILABLE;
   if (view.started === 0) return null;
   const inFlight = running && view.running > 0 ? `${view.running} running · ` : "";
-  return `${inFlight}${view.done}/${view.started} done`;
+  // Once the run is over, an unclosed agent is no longer "running" — but it delivered nothing
+  // the journal knows of either.
+  const noResult = running ? 0 : view.running;
+  return `${inFlight}${progressText(view.delivered, view.started, view.failed, "done", noResult)}`;
 }
 
-/** Whether `a` is at least as far along as `b`. Journal counters only ever grow within a run
- *  (agents are appended, never removed), so "further along" is a sound proxy for "fresher" —
+/** Whether `a` is at least as far along as `b`. `started` only ever grows within a run (agents
+ *  are appended, never removed) and `done` almost always does (it steps back only when a resumed
+ *  run re-executes a delivered call), so "further along" is a sound proxy for "fresher" —
  *  which a timestamp would give us but the journal does not carry. */
 function atLeastAsAdvanced(a: WfJournalView, b: WfJournalView): boolean {
   return a.started > b.started || (a.started === b.started && a.done >= b.done);
@@ -120,7 +179,12 @@ export function pickJournal(
   if (!hasDisk) return pushed!;
   // A successful read beats a flagged one: the flag says "the watcher could not read it", and a
   // fresh successful read is proof that it can be read now.
-  if (pushed!.error && !disk!.error) return disk!;
+  // …unless the run is still going and that read is OLDER than the push: the modal's disk read
+  // is its open-time snapshot, and presenting it as live would freeze (or rewind) the view —
+  // the flagged push makes the surface say "unavailable" instead, which is true.
+  if (pushed!.error && !disk!.error) {
+    return running && !atLeastAsAdvanced(disk!, pushed!) ? pushed! : disk!;
+  }
   if (disk!.error && !pushed!.error) return pushed!;
   if (running) return pushed!;
   return atLeastAsAdvanced(disk!, pushed!) ? disk! : pushed!;
@@ -133,13 +197,25 @@ function viewEqual(a: WfJournalView, b: WfJournalView): boolean {
   if (
     a.started !== b.started ||
     a.done !== b.done ||
+    a.failed !== b.failed ||
+    a.namesAgents !== b.namesAgents ||
     a.error !== b.error ||
     a.agents.length !== b.agents.length
   ) {
     return false;
   }
   for (let i = 0; i < a.agents.length; i++) {
-    if (a.agents[i].agentId !== b.agents[i].agentId || a.agents[i].done !== b.agents[i].done) {
+    const x = a.agents[i];
+    const y = b.agents[i];
+    if (
+      x.key !== y.key ||
+      x.agentId !== y.agentId ||
+      x.done !== y.done ||
+      x.failed !== y.failed ||
+      x.label !== y.label ||
+      x.phase !== y.phase ||
+      x.lastStarted !== y.lastStarted
+    ) {
       return false;
     }
   }

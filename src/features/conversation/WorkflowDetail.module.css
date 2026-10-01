@@ -183,7 +183,8 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Per-phase "done/total" badge — green pill once the phase is complete, accent while active. */
+/* Per-phase "delivered/total (· N failed)" badge — green once complete, accent while current,
+   err once a phase that lost agents has settled; "—" for a phase passed with no agents. */
 .livePhaseCount {
   flex: 0 0 auto;
   font-size: 11px;
@@ -201,8 +202,14 @@
   color: var(--wf-accent);
   background: color-mix(in srgb, var(--wf-accent) 16%, transparent);
 }
+/* A settled phase that lost agents: never the green "done" pill. */
+.livePhaseCount[data-state="err"] {
+  color: var(--wf-err);
+  background: color-mix(in srgb, var(--wf-err) 16%, transparent);
+}
 
-/* Three colour-coded count boxes: launched (neutral) · running (accent) · done (green). */
+/* Colour-coded count boxes: launched (neutral) · running (accent) · done (green), plus failed
+   (err) when any agent failed. */
 .statBoxes {
   display: flex;
   gap: 8px;
@@ -250,14 +257,21 @@
 .sbDone .sbN {
   color: var(--wf-run);
 }
+.sbFail {
+  background: color-mix(in srgb, var(--wf-err) 12%, transparent);
+  border-color: color-mix(in srgb, var(--wf-err) 30%, transparent);
+}
+.sbFail .sbN {
+  color: var(--wf-err);
+}
 .liveNote {
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--wf-tx-lo);
 }
 
-/* The in-flight agents: the only per-agent handle that exists mid-run (an opaque id, which
-   keys a transcript the CLI writes as the agent works). One row per running agent, drillable. */
+/* The in-flight agents, named by their script label (by short id for a pre-2.1.272 journal);
+   each keys a transcript the CLI writes as the agent works. One row per running agent, drillable. */
 .liveAgents {
   display: flex;
   flex-direction: column;
@@ -425,7 +439,8 @@
   font-size: 10.5px;
   color: var(--wf-tx-lo);
 }
-/* Per-phase "done/total" badge — neutral by default, green once complete, accent while current. */
+/* Per-phase "delivered/total (· N failed)" badge — neutral by default, green once complete,
+   accent while current, err once a phase that lost agents has settled. */
 .phaseCount {
   flex: 0 0 auto;
   font-size: 10.5px;
@@ -442,6 +457,10 @@
 .phaseCount[data-state="cur"] {
   color: var(--wf-accent);
   background: color-mix(in srgb, var(--wf-accent) 16%, transparent);
+}
+.phaseCount[data-state="err"] {
+  color: var(--wf-err);
+  background: color-mix(in srgb, var(--wf-err) 16%, transparent);
 }
 /* A short honesty line under the live phase list (only while the run is mid-flight). */
 .colFootNote {
@@ -505,6 +524,16 @@
   text-overflow: ellipsis;
   padding-left: 21px;
 }
+/* How a settled agent ended — its own line: a failure in the error tone, "no result recorded"
+   (a run that is over) muted. */
+.agentOutcome {
+  font-size: 10.5px;
+  color: var(--wf-err);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 21px;
+}
 .agentMeta {
   font-size: 10.5px;
   color: var(--wf-tx-xlo);
@@ -549,6 +578,19 @@
   color: var(--wf-tx-lo);
   white-space: pre-wrap;
   word-break: break-word;
+}
+.txOutcome {
+  color: var(--wf-err);
+}
+.agentOutcome[data-tone="muted"],
+.txOutcome[data-tone="muted"] {
+  color: var(--wf-tx-xlo);
+}
+/* Our own buckets ("(no phase)", "(failed before start)", "(phase unknown)") — not script phases,
+   so they never read as one even when a script names a phase the same. */
+.synthetic {
+  font-style: italic;
+  color: var(--wf-tx-lo);
 }
 .txPreviewLbl {
   font-size: 10px;

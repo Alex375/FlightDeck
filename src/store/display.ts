@@ -135,13 +135,14 @@ export interface DisplayPrefs {
   workflowLiveCard: boolean;
 
   /** In the workflow detail modal's LIVE view, break each phase open into the individual
-   *  agents running under it — real labels (matched to the run's spawn-ordered agents),
-   *  a running/done dot, and a one-line "doing X now" read from each agent's transcript —
-   *  the closest we get to Claude Code's own `/workflows` per-agent readout. ON by default.
-   *  Off → the live view falls back to the flat counts + opaque in-flight id list it showed
-   *  before. Only affects a RUNNING workflow (the finished run has the exact manifest view).
-   *  The agent↔label match is a spawn-order heuristic (the wire gives no live mapping), so
-   *  it is labelled approximate. Read by {@link WorkflowDetail}. */
+   *  agents running under it — their script labels, a running/done/failed dot, and a one-line
+   *  "doing X now" read from each agent's transcript — the closest we get to Claude Code's own
+   *  `/workflows` per-agent readout. ON by default. Off → the live view falls back to the
+   *  compact counts (launched/running/done/failed), the in-flight agents (by label, or by short
+   *  id on an older journal) and the step list. Only affects a RUNNING workflow (the finished run
+   *  has the exact manifest view). Labels and phases come from the run's journal — exact on
+   *  recent claude versions; for an older journal (ids only) they are matched by spawn order and
+   *  the view says it is approximate. Read by {@link WorkflowDetail}. */
   workflowAgentDetail: boolean;
 
   /** Animate the Flight Deck's reply modal open and closed: the panel GROWS out of the card

@@ -146,24 +146,55 @@ export function parseWorkflow(run: WorkflowRun | null | undefined): WfModel {
   return { phases, agents };
 }
 
-/** "done" count + total for a phase's agents — the "3/5" the phase row shows. */
-export function phaseProgress(phase: WfPhase): { done: number; total: number } {
+/** Settled (`done`, failures included), failed and total counts over a list of agents — the same
+ *  three numbers the live journal gives, so the report words a run exactly like the live view. */
+function progressOf(agents: WfAgent[]): { done: number; failed: number; total: number } {
   let done = 0;
-  for (const a of phase.agents) if (isTerminalState(a.state)) done++;
-  return { done, total: phase.agents.length };
+  let failed = 0;
+  for (const a of agents) {
+    if (isTerminalState(a.state)) done++;
+    if (isFailedState(a.state)) failed++;
+  }
+  return { done, failed, total: agents.length };
 }
 
-/** Run-wide done/total across every agent. */
-export function runProgress(model: WfModel): { done: number; total: number } {
-  let done = 0;
-  for (const a of model.agents) if (isTerminalState(a.state)) done++;
-  return { done, total: model.agents.length };
+/** A phase's settled/failed/total — the phase row shows "delivered/total" + failures from it. */
+export function phaseProgress(phase: WfPhase): { done: number; failed: number; total: number } {
+  return progressOf(phase.agents);
+}
+
+/** Run-wide settled/failed/total across every agent. */
+export function runProgress(model: WfModel): { done: number; failed: number; total: number } {
+  return progressOf(model.agents);
+}
+
+/**
+ * Whether a manifest on disk is THIS execution's end-of-run report. Never while the run is going
+ * (it has none yet — any report under the run id is a PREVIOUS execution's, from before a
+ * resume), and only when it was written by this execution's task. Anything else would show an
+ * earlier run's outcome — a re-executed call as delivered, its failure as a success — in place
+ * of this one's. An unknown id on either side (an old manifest without `taskId`, a card whose ack
+ * carried none) cannot be told apart, so it is accepted.
+ */
+export function acceptReport(
+  run: WorkflowRun | null,
+  running: boolean,
+  taskId: string | null | undefined,
+): WorkflowRun | null {
+  if (running || run == null) return null;
+  return taskId == null || run.taskId == null || run.taskId === taskId ? run : null;
 }
 
 /** A workflow agent state that means "no longer working" (settled), for the X/N count. */
 export function isTerminalState(state: string): boolean {
   const s = state.toLowerCase();
   return s === "done" || s === "completed" || s === "error" || s === "failed" || s === "skipped";
+}
+
+/** A settled state that is a FAILURE — counted apart, never as delivered. */
+export function isFailedState(state: string): boolean {
+  const s = state.toLowerCase();
+  return s === "error" || s === "failed";
 }
 
 /** Map a raw workflow-agent state to the design's status-dot colour token. Unknown

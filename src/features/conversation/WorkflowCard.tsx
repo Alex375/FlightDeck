@@ -11,9 +11,10 @@
 import { useState } from "react";
 import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
-import { runIdFromResult, taskStatusDot } from "../../agent/subagentMeta";
-import { useTaskByToolUse } from "../../store/backgroundTasksStore";
-import { useToolResult } from "../../store/conversationStore";
+import { runIdFromResult, taskIdFromResult, taskStatusDot } from "../../agent/subagentMeta";
+import { currentStepLabel } from "./workflowTree";
+import { useBackgroundWorkflowTasks, useTaskByToolUse } from "../../store/backgroundTasksStore";
+import { useConversationStore, useToolResult } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { journalTally, useWorkflowJournal } from "../../store/workflowJournal";
@@ -40,6 +41,22 @@ export function WorkflowCard({
   // tool_result, so it is available whether or not the detail modal has ever been opened.
   const journal = useWorkflowJournal(session, runIdFromResult(result?.content));
   const [open, setOpen] = useState(false);
+  // Whether ANOTHER execution of this run id (a resume, i.e. a later Workflow call) is running
+  // right now: the run's journal is shared, so it then describes that execution, not this card's.
+  // Cheap — only the conversation's running workflows are looked at (a handful at most).
+  const runningWorkflows = useBackgroundWorkflowTasks(session);
+  const ownTaskId = task?.task_id ?? taskIdFromResult(result?.content);
+  const ownRunId = runIdFromResult(result?.content);
+  const superseded = useConversationStore((s) => {
+    if (!ownRunId || task?.status === "running") return false;
+    const results = s.sessions[session]?.toolResults;
+    return runningWorkflows.some(
+      (t) =>
+        t.task_id !== ownTaskId &&
+        t.tool_use_id != null &&
+        runIdFromResult(results?.[t.tool_use_id]?.content) === ownRunId,
+    );
+  });
   // Bloc A (Phase 4.5): defensive — `Workflow` is a Claude-only tool, so a Codex thread
   // never yields a workflow segment; guard anyway so a drifting classification can never
   // render a Claude-only workflow card on Codex.
@@ -49,13 +66,20 @@ export function WorkflowCard({
   const name = field(input, "description") ?? task?.label ?? "Workflow";
   const runId = runIdFromResult(result?.content);
   const running = task?.status === "running";
-  // Current phase (running) from the wire's "<phase>: <label>".
-  const phase = running && task?.progress ? task.progress.split(":")[0]?.trim() : null;
+  // Current step (running): the journal's own phase when it names its agents, else the wire's —
+  // the same rule as the Flight Deck peek, so the two never name different phases.
+  const phase = currentStepLabel(journal, task?.progress, running);
+  // Which EXECUTION this card is: the live task when it is in memory, else the id its ack
+  // carries (the task registry is empty after a restart) — so a later resume's report, written
+  // under the same run id, is never shown as this card's.
+  const taskId = ownTaskId;
   // The fleet behind that phase, worded exactly as the pinned bar words it (null until the run
   // has an agent). `running` is passed because this card OUTLIVES the run: once settled, an
   // unclosed journal entry no longer means "an agent is working" — the CLI does not guarantee
   // a `result` line per agent, and a real run on disk ends 38-started / 0-result.
-  const tally = journalTally(journal, running);
+  // A resume running elsewhere owns the shared journal: its in-flight agents are not this card's
+  // missing results — say where the run went instead of tallying another execution.
+  const tally = superseded ? "resumed by another execution" : journalTally(journal, running);
 
   return (
     <div className="cv-tool">
@@ -74,7 +98,9 @@ export function WorkflowCard({
           {tally ? ` · ${tally}` : null}
         </span>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
-          {running ? <RunDots /> : <Dot s={taskStatusDot(task?.status ?? "completed")} />}
+          {/* No task in memory (after a restart): its outcome is unknown here — a neutral dot,
+              never a made-up green "completed". */}
+          {running ? <RunDots /> : <Dot s={task ? taskStatusDot(task.status) : "off"} />}
           <Ico name="arrow" className="sm" />
         </span>
       </div>
@@ -83,6 +109,9 @@ export function WorkflowCard({
         open={open}
         sessionId={claudeSessionId}
         runId={runId}
+        taskId={taskId}
+        status={task?.status ?? null}
+        superseded={superseded}
         running={running}
         workflowName={name}
         currentProgress={task?.progress ?? null}
