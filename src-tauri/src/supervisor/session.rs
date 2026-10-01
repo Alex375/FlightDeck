@@ -2180,6 +2180,12 @@ impl SessionCore {
                 if let Some(cmds) = control::parse_initialize_commands(&v) {
                     self.emit(SessionEvent::Commands(cmds));
                 }
+                // Same envelope, fresh plugin list: the panel's live picture follows the
+                // reload without waiting for the next turn's `system/init`.
+                if let Some(plugins) = control::parse_reload_plugins_plugins(&v) {
+                    let ev = self.assembler.set_loaded_plugins(plugins);
+                    self.emit(ev);
+                }
             }
         }
     }

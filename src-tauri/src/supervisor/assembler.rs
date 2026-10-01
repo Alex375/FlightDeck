@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, ModelTokenUsage,
-    NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
+    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, LoadedPlugin,
+    ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
 use super::protocol::{
@@ -184,6 +184,12 @@ impl Assembler {
     /// Reflect a permission-mode change (after `set_permission_mode`).
     pub fn set_permission_mode(&mut self, mode: &str) -> SessionEvent {
         self.state.permission_mode = Some(mode.to_string());
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// Reflect the fresh plugin list a `reload_plugins` response carries.
+    pub fn set_loaded_plugins(&mut self, plugins: Vec<LoadedPlugin>) -> SessionEvent {
+        self.state.loaded_plugins = Some(plugins);
         SessionEvent::State(self.state.clone())
     }
 
@@ -410,6 +416,11 @@ impl Assembler {
                 // Output style is re-emitted each turn like cwd/model; keep the state's
                 // copy in step so the UI shows the style the binary is actually running.
                 self.state.output_style = init.output_style.clone();
+                // The plugins the binary loaded, wherever it runs. An init WITHOUT the
+                // field (older CLI) keeps the last known list rather than claiming none.
+                if let Some(Value::Array(plugins)) = &init.plugins {
+                    self.state.loaded_plugins = Some(control::loaded_plugins_from_array(plugins));
+                }
                 // Do NOT force busy here: `system/init` is emitted at the start of
                 // each turn (not at spawn). Marking busy on init is fine for turns,
                 // but busy is driven by user-send (set_busy) + message_start /
@@ -2660,6 +2671,43 @@ mod tests {
         assert_eq!(detail["control"], serde_json::json!("Model"));
         assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
         assert_eq!(detail["to"], serde_json::json!("Sonnet 5"));
+    }
+
+    /// `system/init.plugins` is the live session's own list (the only truthful one for a
+    /// remote session). An init without the field (older CLI) keeps the last known list
+    /// instead of wiping it; a malformed field never fails the init itself.
+    #[test]
+    fn system_init_carries_the_loaded_plugins() {
+        let mut asm = seeded();
+        let init = |plugins: Option<serde_json::Value>| -> CliMessage {
+            let mut v = serde_json::json!({
+                "type": "system", "subtype": "init",
+                "session_id": "s", "uuid": "u", "cwd": "/x",
+                "model": "claude-opus-5-5", "permissionMode": "default", "tools": []
+            });
+            if let Some(p) = plugins {
+                v["plugins"] = p;
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        assert_eq!(asm.state().loaded_plugins, None, "unknown before any init");
+
+        let _ = asm.ingest(&init(Some(serde_json::json!([
+            {"name": "cowork-plugin-management", "path": "/home/alex/.claude/plugins/synced/x",
+             "source": "cowork-plugin-management@knowledge-work-plugins"},
+            {"name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin"}
+        ]))));
+        let names: Vec<_> = asm.state().loaded_plugins.as_ref().unwrap().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["cowork-plugin-management"], "the CLI's builtins are dropped");
+
+        let _ = asm.ingest(&init(None));
+        assert_eq!(asm.state().loaded_plugins.as_ref().map(Vec::len), Some(1), "absent field keeps the list");
+
+        let _ = asm.ingest(&init(Some(serde_json::json!("not-an-array"))));
+        assert_eq!(asm.state().loaded_plugins.as_ref().map(Vec::len), Some(1), "malformed field keeps the list");
+
+        let _ = asm.ingest(&init(Some(serde_json::json!([]))));
+        assert_eq!(asm.state().loaded_plugins, Some(vec![]), "an empty list is a real answer");
     }
 
     /// A turn that starts while a `set_model` is still pending reports the model being

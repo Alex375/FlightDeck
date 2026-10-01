@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::model::{
-    LiveModel, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState, RewindFilesResult,
-    SessionOverrides, SlashCommand,
+    LiveModel, LoadedPlugin, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState,
+    RewindFilesResult, SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -161,6 +161,32 @@ pub fn parse_initialize_agents(line: &Value) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+/// Map a raw `plugins` array (`[{name, path, source, version}]`) to the plugins a live
+/// session loaded. Shared by `system/init` and the `reload_plugins` response — the
+/// `initialize` response does NOT carry one (verified against claude 2.1.286). Drops the
+/// CLI's internal plugins (`path: "builtin"`, e.g. `cc-plugin-telemetry@builtin`): they
+/// are not extensions the user installed. Entries without a `name` are skipped.
+pub fn loaded_plugins_from_array(arr: &[Value]) -> Vec<LoadedPlugin> {
+    let text = |p: &Value, k: &str| p.get(k).and_then(Value::as_str).map(str::to_string);
+    arr.iter()
+        .filter(|p| p.get("path").and_then(Value::as_str) != Some("builtin"))
+        .filter_map(|p| {
+            Some(LoadedPlugin {
+                name: text(p, "name")?,
+                id: text(p, "source"),
+                version: text(p, "version"),
+            })
+        })
+        .collect()
+}
+
+/// The fresh plugin list a `reload_plugins` response carries at
+/// `response.response.plugins`. `None` when the response has no such array.
+pub fn parse_reload_plugins_plugins(line: &Value) -> Option<Vec<LoadedPlugin>> {
+    let arr = line.get("response")?.get("response")?.get("plugins")?.as_array()?;
+    Some(loaded_plugins_from_array(arr))
 }
 
 /// Map a raw `commands` array to [`SlashCommand`]s. Shared by the three surfaces
@@ -918,6 +944,33 @@ pub fn control_error_response(request_id: &str, error: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A REAL `reload_plugins` response, captured from claude 2.1.286 driven with the
+    /// production flags (paths trimmed). It carries the fresh plugin list, builtins included.
+    #[test]
+    fn reload_plugins_response_yields_the_loaded_plugins_without_builtins() {
+        let v = json!({ "type": "control_response", "response": {
+            "subtype": "success", "request_id": "r1", "response": {
+                "commands": [], "agents": [], "mcpServers": [], "error_count": 0,
+                "plugins": [
+                    {"name": "tosse-workflow", "path": "/Users/a/.claude/plugins/cache/tosse-plugins/tosse-workflow/1.4.0",
+                     "source": "tosse-workflow@tosse-plugins", "version": "1.4.0"},
+                    {"name": "cc-plugin-agents-md", "path": "builtin", "source": "cc-plugin-agents-md@builtin"},
+                    {"path": "/no/name"}
+                ]
+            }
+        }});
+        assert_eq!(
+            parse_reload_plugins_plugins(&v),
+            Some(vec![LoadedPlugin {
+                name: "tosse-workflow".into(),
+                id: Some("tosse-workflow@tosse-plugins".into()),
+                version: Some("1.4.0".into()),
+            }])
+        );
+        // An ack without the array (an older CLI) is not "no plugins".
+        assert_eq!(parse_reload_plugins_plugins(&json!({"response": {"response": {}}})), None);
+    }
 
     /// A REAL `list_models` response, captured from claude 2.1.224 driven with the
     /// production flags (trimmed to three entries). Re-capture on a binary upgrade.

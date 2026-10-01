@@ -79,6 +79,7 @@ export type {
   PlanUsage,
   PluginContents,
   PluginInfo,
+  LoadedPlugin,
   Pong,
   RemoteControlState,
   RemoteLinkState,

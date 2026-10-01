@@ -421,6 +421,7 @@ function RepoGroup({
               path: repo.path,
               title: repoName(repo.path),
               session: null,
+              machineId: repo.machineId ?? null,
             })
           }
         >

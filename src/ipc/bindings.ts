@@ -4251,6 +4251,16 @@ export type LiveState =
  */
 "error"
 /**
+ * One plugin as the live session reports it (`{name, path, source, version}` on the
+ * wire). The CLI's own internal plugins (`path: "builtin"`) are dropped at parse.
+ */
+export type LoadedPlugin = { name: string; 
+/**
+ * `<plugin>@<marketplace>` (the wire's `source`) — the same key as the
+ * on-disk inventory's `PluginInfo.id`.
+ */
+id: string | null; version: string | null }
+/**
  * A clone found on this Mac that matches one of the urls asked about.
  */
 export type LocalRepoMatch = { path: string; 
@@ -5442,7 +5452,17 @@ rate_limit: RateLimitSnapshot | null;
  * `serde(default)` keeps it OPTIONAL on the TypeScript side (`session_usage?:`), so the
  * hand-written state literals of older tests and mocks stay valid without it.
  */
-session_usage?: SessionUsage | null }
+session_usage?: SessionUsage | null; 
+/**
+ * The plugins the RUNNING binary actually loaded, as it reports them itself
+ * (`system/init.plugins`, re-emitted each turn, and the `reload_plugins` response).
+ * `None` until one of those arrives — a session that has not run a turn yet.
+ * 
+ * This is the only truthful source for a REMOTE conversation: the on-disk
+ * inventory (`list_extensions`) reads THIS Mac's `~/.claude`, not the server's.
+ * `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
+ */
+loaded_plugins?: LoadedPlugin[] | null }
 /**
  * A model-generated few-word summary of the user's LAST message arrived (from a
  * `generate_session_title` control response — same wire as the title, a distinct

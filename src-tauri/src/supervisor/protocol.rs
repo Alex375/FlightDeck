@@ -367,6 +367,12 @@ pub struct InitMsg {
     #[serde(rename = "apiKeySource")]
     pub api_key_source: Option<String>,
     pub uuid: Option<String>,
+    /// The plugins this binary loaded (`[{name, path, source, version}]`) — the only
+    /// truthful list for a REMOTE session (the on-disk inventory reads this Mac). Kept
+    /// RAW and parsed leniently by `control::loaded_plugins_from_array`: a strictly typed
+    /// field whose shape drifts would fail the WHOLE init, and the session with it.
+    #[serde(default)]
+    pub plugins: Option<Value>,
 }
 
 /// `assistant` message. The inner `message` (Anthropic message shape with its

@@ -56,11 +56,19 @@ import type { PermissionScope } from "./mcpToolPermissions";
 import { noteServerTools } from "../../store/mcpPolicy";
 import { homeDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useConversationsStore, type BackendKind, type Conversation } from "../../store/conversationsStore";
+import {
+  useConversationsStore,
+  useMachines,
+  type BackendKind,
+  type Conversation,
+} from "../../store/conversationsStore";
+import { useSessionState } from "../../store/conversationStore";
+import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import type {
   AgentInfo,
   ExtScope,
+  LoadedPlugin,
   McpServerInfo,
   McpServerLive,
   PluginInfo,
@@ -122,8 +130,21 @@ function configBadgeCls(scope: ExtScope): string {
   return styles["scope_" + scope] ?? "";
 }
 
-/** Badge label + class for a LIVE scope string (from `mcp_status`). */
-function liveBadge(scope: string | null | undefined): { label: string; cls: string } {
+/** Live statuses of a server that is not running. Its scope badge drops its colour —
+ *  a green/blue/violet badge reads as "on" and would contradict the greyed status. */
+const OFF_STATUSES = new Set(["disabled", "disconnected", "failed"]);
+
+/** Badge label + class for a LIVE scope string (from `mcp_status`). The label is kept
+ *  whatever the status (the scope stays useful); only the colour follows the status. */
+function liveBadge(
+  scope: string | null | undefined,
+  status: string | null,
+): { label: string; cls: string } {
+  const b = liveScopeBadge(scope);
+  return status != null && OFF_STATUSES.has(status) ? { label: b.label, cls: "" } : b;
+}
+
+function liveScopeBadge(scope: string | null | undefined): { label: string; cls: string } {
   switch (scope) {
     case "claudeai":
       return { label: "Claude connector", cls: styles.scope_connector };
@@ -229,8 +250,11 @@ function liveRank(status: string): number {
 /** Partition servers into buckets, PRESERVING input order (the caller freezes the
  *  order at window-open via `useStableOrder`). No re-sort here — so toggling a server
  *  doesn't make it jump within its bucket. Empty buckets are dropped. */
-function bucketizeLive(servers: McpServerLive[]): McpGroup<McpServerLive>[] {
-  return BUCKET_ORDER.map((bucket) => ({
+function bucketizeLive(servers: McpServerLive[], withPlugins = false): McpGroup<McpServerLive>[] {
+  // On a REMOTE session there are no plugin boxes (they would describe this Mac), so its
+  // own plugin servers stay in the live list as a bucket of their own.
+  const order: McpBucket[] = withPlugins ? ["repo", "user", "plugin", "connector"] : BUCKET_ORDER;
+  return order.map((bucket) => ({
     bucket,
     items: servers.filter((m) => liveBucket(m.scope) === bucket),
   })).filter((g) => g.items.length > 0);
@@ -308,6 +332,17 @@ export function ExtensionsManager() {
       : null,
   );
   const codexAvailable = useCodexAvailable();
+  // The paired server the repository lives on (`null` = this Mac). The conversation lens
+  // reads it off its conversation; the repository lens is handed it by the opener.
+  const machineId = useConversationsStore((s) => {
+    if (target?.kind !== "conversation") return target?.machineId ?? null;
+    const conv = s.conversations.find((c) => c.id === target.session);
+    return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
+  });
+  const mark = remoteMarkFor(machineId, useMachines());
+  // Its display name. On a server, the on-disk inventory (this Mac's `~/.claude`) is NOT
+  // what the agent has: its plugins come from the session's own report instead.
+  const server = mark.kind === "remote" ? mark.label : mark.kind === "unknown" ? "the server" : null;
   // Which backend's extensions are shown. Tabs let the user flip between Claude and Codex;
   // the default is the target's OWN backend (a Codex conversation opens on the Codex tab).
   // Reset to that default whenever the target changes (see the open effect below).
@@ -519,6 +554,7 @@ export function ExtensionsManager() {
             onOpenPlugin={openPlugin}
             onOpenMarketplaces={() => setMktOpen(true)}
             resetToken={openKey ?? ""}
+            server={server}
           />
         ) : (
           <ProjectBody
@@ -529,6 +565,7 @@ export function ExtensionsManager() {
             onOpenDoc={setDoc}
             onOpenPlugin={openPlugin}
             onOpenMarketplaces={() => setMktOpen(true)}
+            server={server}
           />
         )}
       </div>
@@ -564,6 +601,7 @@ function ProjectBody({
   onOpenDoc,
   onOpenPlugin,
   onOpenMarketplaces,
+  server,
 }: {
   ext: ReturnType<typeof useExtensions>;
   path: string;
@@ -572,6 +610,8 @@ function ProjectBody({
   onOpenDoc: (d: OpenDoc) => void;
   onOpenPlugin: (p: PluginInfo) => void;
   onOpenMarketplaces: () => void;
+  /** The paired server the repository lives on — `null` on this Mac. */
+  server: string | null;
 }) {
   // No live session in the project lens → updates apply on the next session spawn
   // (handle is null, so no reload_plugins hot-apply).
@@ -611,27 +651,33 @@ function ProjectBody({
               <AgentRow key={a.path} agent={a} onOpen={() => onOpenDoc({ name: a.name, source: CONFIG_SCOPE_LABEL[a.scope], path: a.path, description: a.description })} />
             )} empty="" />
           ) : null}
-          <PluginUpdateOutcome mutation={updatePlugin} />
-          <Section
-            icon="layers"
-            title="Plugins"
-            count={plugins.length}
-            empty="No plugins for this repository."
-            action={<MarketplacesButton updates={totalUpdates(plugins)} onOpen={onOpenMarketplaces} />}
-          >
-            {plugins.map((p) => (
-              <PluginRow
-                key={p.id}
-                plugin={p}
-                busy={setPluginEnabled.isPending}
-                onToggle={(enabled) => onPluginToggle(p.id, enabled)}
-                onOpen={() => onOpenPlugin(p)}
-                onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
-                updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
-                anyUpdating={updatePlugin.isPending}
-              />
-            ))}
-          </Section>
+          {server != null ? (
+            <RemotePluginsSection server={server} plugins={null} />
+          ) : (
+            <>
+              <PluginUpdateOutcome mutation={updatePlugin} />
+              <Section
+                icon="layers"
+                title="Plugins"
+                count={plugins.length}
+                empty="No plugins for this repository."
+                action={<MarketplacesButton updates={totalUpdates(plugins)} onOpen={onOpenMarketplaces} />}
+              >
+                {plugins.map((p) => (
+                  <PluginRow
+                    key={p.id}
+                    plugin={p}
+                    busy={setPluginEnabled.isPending}
+                    onToggle={(enabled) => onPluginToggle(p.id, enabled)}
+                    onOpen={() => onOpenPlugin(p)}
+                    onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
+                    updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
+                    anyUpdating={updatePlugin.isPending}
+                  />
+                ))}
+              </Section>
+            </>
+          )}
         </>
       )}
     </div>
@@ -677,6 +723,7 @@ function ConversationBody({
   onOpenPlugin,
   onOpenMarketplaces,
   resetToken,
+  server,
 }: {
   ext: ReturnType<typeof useExtensions>;
   live: ReturnType<typeof useMcpStatus>;
@@ -692,8 +739,13 @@ function ConversationBody({
   onOpenPlugin: (p: PluginInfo, section?: ExplorerSectionKey) => void;
   onOpenMarketplaces: () => void;
   resetToken: string;
+  /** The paired server the session runs on — `null` on this Mac. On a server, plugins
+   *  are the session's own report (this Mac's inventory would describe the wrong host). */
+  server: string | null;
 }) {
   const actions = useMcpActions(handle);
+  const remote = server != null;
+  const loadedPlugins = useSessionState(convId)?.loaded_plugins ?? null;
   // WHERE the changes made below apply — picked at the top, "This conversation" by default.
   // Each scope shows its own value (else the broader one it inherits — never a narrower
   // one), and only what exists at that level; tool rules, servers and plugins follow it.
@@ -737,12 +789,15 @@ function ConversationBody({
     (s) => liveRank(s.status),
     resetToken,
   );
-  const mcpGroups = bucketizeLive(orderedServers);
+  const mcpGroups = bucketizeLive(orderedServers, remote);
   const mcpTotal = mcpGroups.reduce((n, g) => n + g.items.length, 0);
   // Enabled plugins that contribute skills / sub-agents / MCP → one summary box each.
-  const skillContribs = allPlugins.filter((p) => p.enabled && p.skill_count > 0);
-  const agentContribs = allPlugins.filter((p) => p.enabled && p.agent_count > 0);
-  const mcpContribs = allPlugins.filter((p) => p.enabled && p.mcp_count > 0);
+  // None on a server: they would be THIS Mac's plugins, which the remote agent lacks.
+  const contribs = (count: (p: PluginInfo) => number) =>
+    remote ? [] : allPlugins.filter((p) => p.enabled && count(p) > 0);
+  const skillContribs = contribs((p) => p.skill_count);
+  const agentContribs = contribs((p) => p.agent_count);
+  const mcpContribs = contribs((p) => p.mcp_count);
   const sum = (ps: PluginInfo[], pick: (p: PluginInfo) => number) => ps.reduce((n, p) => n + pick(p), 0);
 
   return (
@@ -831,33 +886,144 @@ function ConversationBody({
           footer={agentContribs.length ? <PluginContribFooter plugins={agentContribs} kind="agents" onOpen={onOpenPlugin} /> : null}
         />
       ) : null}
-      <PluginUpdateOutcome mutation={updatePlugin} />
-      <Section
-        icon="layers"
-        title="Plugins"
-        count={plugins.length}
-        empty="No plugins."
-        action={<MarketplacesButton updates={totalUpdates(allPlugins)} onOpen={onOpenMarketplaces} />}
-      >
-        {plugins.map((p) => {
-          const at = pluginAtScope(p, perms);
-          return (
-            <PluginRow
-              key={p.id}
-              plugin={{ ...p, enabled: at.enabled }}
-              busy={perms.pending}
-              onToggle={(enabled) => togglePlugin(p, enabled)}
-              toggleTitle={at.title}
-              toggleLocked={at.locked}
-              note={at.note}
-              onOpen={() => onOpenPlugin(p)}
-              onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
-              updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
-              anyUpdating={updatePlugin.isPending}
-            />
-          );
-        })}
-      </Section>
+      {remote ? (
+        <RemotePluginsSection server={server} plugins={loadedPlugins} handle={handle} />
+      ) : (
+        <>
+          <PluginUpdateOutcome mutation={updatePlugin} />
+          <Section
+            icon="layers"
+            title="Plugins"
+            count={plugins.length}
+            empty="No plugins."
+            action={<MarketplacesButton updates={totalUpdates(allPlugins)} onOpen={onOpenMarketplaces} />}
+          >
+            {plugins.map((p) => {
+              const at = pluginAtScope(p, perms);
+              return (
+                <PluginRow
+                  key={p.id}
+                  plugin={{ ...p, enabled: at.enabled }}
+                  busy={perms.pending}
+                  onToggle={(enabled) => togglePlugin(p, enabled)}
+                  toggleTitle={at.title}
+                  toggleLocked={at.locked}
+                  note={at.note}
+                  onOpen={() => onOpenPlugin(p)}
+                  onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
+                  updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
+                  anyUpdating={updatePlugin.isPending}
+                />
+              );
+            })}
+          </Section>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---- Remote session: the plugins the server's own binary loaded -----------------
+
+/** How long "Ask now" waits for the session's plugin list before saying it got none. */
+const ASK_PLUGINS_TIMEOUT_MS = 15_000;
+
+/** Plugins of a repository that lives on a paired SERVER. The on-disk inventory reads
+ *  THIS Mac's `~/.claude`, so there it would list plugins the remote agent does not have
+ *  (no `/pickup`, no `/done`…). The only truthful list is the one the live session
+ *  reports itself (`system/init` each turn, or a `reload_plugins` response). Read-only:
+ *  a toggle or an update here would write this Mac's config, not the server's. */
+function RemotePluginsSection({
+  server,
+  plugins,
+  handle,
+}: {
+  /** Display name of the paired server. */
+  server: string;
+  /** What the session reported — `null` while it has not said yet (or no session). */
+  plugins: LoadedPlugin[] | null;
+  /** The conversation's live session — lets the user ask it now rather than wait for its
+   *  next turn. Absent in the repository lens (no conversation there). */
+  handle?: string | null;
+}) {
+  const [asked, setAsked] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  // The answer lands on the session's state (not on this call), so a reload the session
+  // rejects — or an older CLI whose response has no plugin list — would otherwise leave
+  // "Asking…" up forever. Give it a bounded wait, then say so.
+  const waiting = asked && plugins == null;
+  useEffect(() => {
+    if (!waiting) return;
+    const t = setTimeout(() => {
+      setAsked(false);
+      setAskError("the session did not report its plugins. Its next turn will.");
+    }, ASK_PLUGINS_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [waiting]);
+  const askNow = async () => {
+    setAskError(null);
+    setAsked(true);
+    try {
+      const res = await commands.reloadPlugins(handle!);
+      if (res.status === "error") throw new Error(res.error);
+    } catch (e) {
+      setAsked(false);
+      setAskError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const meta = (p: LoadedPlugin) => {
+    const at = p.id?.indexOf("@") ?? -1;
+    const marketplace = p.id && at >= 0 ? p.id.slice(at + 1) : null;
+    return [marketplace, p.version ? `v${p.version}` : null].filter(Boolean).join(" · ");
+  };
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionH}>
+        <Ico name="layers" className="sm" />
+        <span className={styles.sectionT}>Plugins</span>
+        <span className={styles.sectionC}>{plugins?.length ?? "—"}</span>
+      </div>
+      <div className={styles.remoteNote}>
+        <Ico name="globe" className="sm" />
+        <span>
+          {handle === undefined
+            ? `This repository lives on ${server}: its agents have the plugins installed there, not the ones on this Mac.`
+            : `Loaded by the session on ${server}. Plugins installed on this Mac are not available to it.`}
+        </span>
+      </div>
+      {askError ? <div className={styles.error}>Could not ask the session: {askError}</div> : null}
+      {plugins == null ? (
+        <div className={styles.sectionEmpty}>
+          {handle === undefined ? (
+            "A conversation's extensions (composer chip) list the plugins its session loaded."
+          ) : handle == null ? (
+            `Send a message to see the plugins this session loaded on ${server}.`
+          ) : asked ? (
+            "Asking the session…"
+          ) : (
+            <>
+              The session reports its plugins at its next turn.{" "}
+              <button type="button" className={styles.actBtn} onClick={() => void askNow()}>
+                Ask now
+              </button>
+            </>
+          )}
+        </div>
+      ) : plugins.length === 0 ? (
+        <div className={styles.sectionEmpty}>No plugins loaded on {server}.</div>
+      ) : (
+        <div className={styles.list}>
+          {plugins.map((p) => (
+            <div key={p.id ?? p.name} className={styles.row}>
+              <span className={`${styles.dot} ${styles.sOk}`} />
+              <div className={styles.rowMain}>
+                <span className={styles.rowName}>{p.name}</span>
+                {meta(p) ? <span className={styles.rowMeta}>{meta(p)}</span> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1742,7 +1908,7 @@ function McpLiveRow({
 }) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
-  const b = liveBadge(mcp.scope);
+  const b = liveBadge(mcp.scope, mcp.status);
   const conn = connType(mcp);
   const canExpand = mcp.tools.length > 0;
   const enabled = mcp.status !== "disabled";
@@ -2327,7 +2493,7 @@ function useHomeDir(): string | null {
 function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTarget }) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
-  const b = liveBadge(mcp.scope);
+  const b = liveBadge(mcp.scope, mcp.status);
   const conn = connType(mcp);
   const canExpand = mcp.tools.length > 0;
   return (
