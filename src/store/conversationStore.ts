@@ -172,6 +172,7 @@ function emptyEntry(session: string): SessionEntry {
     lastTurnStartedAt: null,
     lastTurnEndedAt: null,
     awaitingSince: null,
+    compactingSince: null,
     turnCount: 0,
     thinkingMs: 0,
     thinkingSince: null,
@@ -758,6 +759,12 @@ export const useConversationStore = create<ConversationState>((set) => {
         } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
           awaitingSince = null;
         }
+        // A compaction's own clock, from the CLI's `status:"compacting"` edge — the working
+        // line counts the summarization itself, not the whole turn it interrupted.
+        const compacting = state.activity === "compacting";
+        const compactingSince = compacting
+          ? (entry.state.activity === "compacting" ? entry.compactingSince : null) ?? Date.now()
+          : null;
         // The run clock follows the same busy edges (a no-op on a mid-turn re-emit), and a
         // process that ENDED can leave nothing of any run running.
         let runClock = runBusy(entry.runClock, state.busy, Date.now());
@@ -783,6 +790,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           lastTurnStartedAt,
           lastTurnEndedAt,
           awaitingSince,
+          compactingSince,
           turnCount,
           thinkingStartedAt,
           sessionUsageSource,
@@ -844,6 +852,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           // The process is going away with everything it was running.
           runClock: runEndAll(entry.runClock, Date.now()),
           awaitingSince: null,
+          compactingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
           toolStartedAt: {},
@@ -1048,6 +1057,10 @@ export const useRunFooter = (session: string, resultId: string): RunFooter | "hi
 export const useThinkingStartedAt = (session: string): number | null =>
   useConversationStore((s) => s.sessions[session]?.thinkingStartedAt ?? null);
 
+/** Start of the compaction in flight, or `null`. See {@link SessionEntry.compactingSince}. */
+export const useCompactingSince = (session: string): number | null =>
+  useConversationStore((s) => s.sessions[session]?.compactingSince ?? null);
+
 /** Frozen duration (ms) of a finalized thinking block, looked up by its text, or `null`
  *  when unknown (still live, or hydrated from disk). See {@link SessionEntry.thinkingDurations}. */
 export const useThinkingDuration = (session: string, text: string): number | null =>
@@ -1115,7 +1128,8 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
 
 /** A `notice` that is a NEUTRAL in-band marker (folds into a clean-output round without
  *  cutting the work): a confirmed control change, or a local command's echoed output
- *  (`command_output` — "Compacted", "Set model to opus"). Every other notice — errors, and
+ *  (`command_output` — "Set model to opus", "Login successful"). Every other notice — errors,
+ *  `compact_boundary` (a real break: its separator must stay visible, never folded) and
  *  `interrupted`, which really does end the work — is a hard boundary that ends the round.
  *
  *  Keeping `command_output` soft matters: these lines used to arrive as fake USER bubbles,

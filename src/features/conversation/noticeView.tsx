@@ -7,6 +7,9 @@
 import { useState, type ReactNode } from "react";
 import type { BackgroundTask, JsonValue } from "../../ipc/client";
 import { Ico } from "../../ui/kit";
+import { Tooltip } from "../../ui/Tooltip";
+import { fmtTokens } from "../../store/contextData";
+import { fmtDuration } from "../../agent/subagentMeta";
 import styles from "./ConductorThread.module.css";
 
 /** An error bubble with an optional heading and a collapsed "technical detail" disclosure.
@@ -58,6 +61,9 @@ export const NOTICE_ERROR_HEADINGS: Record<string, string> = {
   session_budget_exceeded: "Codex session budget exceeded",
   permission_error: "Unreadable permission request",
   history_error: "Problem restoring history",
+  // The CLI's summarization failed (`system/status` `compact_result:"failed"`): the context
+  // was NOT freed, so the next turn may hit the window's limit.
+  compact_failed: "Compaction failed",
   // A terminal ssh-level failure (key refused / host identity changed) — see
   // `ssh_link::classify_transport_close` (Rust). Falls through to the generic
   // heading-lookup path below; `detail.message` already carries the specific
@@ -111,6 +117,47 @@ function TaskFailedLine({ label, detail }: { label: string | null; detail: strin
   );
 }
 
+/** The facts line under a compaction separator — "auto · 970k → 25k tokens · 1m 49s" — from a
+ *  `compact_boundary` notice's detail. Each part shows only when the backend reported it (Codex
+ *  reports none, an older `claude` no `post_tokens`), so `null` = nothing known beyond the
+ *  fact itself. Shared with `read_conversation`, which hands the same line to other agents. */
+export function compactSummary(d: Record<string, JsonValue> | null): string | null {
+  const num = (k: string): number | null => {
+    const v = d?.[k];
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+  };
+  const parts: string[] = [];
+  const trigger = d?.trigger;
+  if (typeof trigger === "string" && trigger.trim()) parts.push(trigger.trim());
+  const pre = num("pre_tokens");
+  const post = num("post_tokens");
+  if (pre != null && post != null) parts.push(`${fmtTokens(pre)} → ${fmtTokens(post)} tokens`);
+  else if (pre != null) parts.push(`${fmtTokens(pre)} tokens summarized`);
+  const ms = num("duration_ms");
+  // Whole seconds: "13s" reads better than "13.3s" on a one-off fact.
+  if (ms != null && ms > 0) parts.push(fmtDuration(ms < 1000 ? ms : Math.round(ms / 1000) * 1000));
+  return parts.length ? parts.join(" · ") : null;
+}
+
+/** A compaction: a full-width separator, since everything above it now reaches the model only
+ *  as a summary. The facts line rides under it when the backend reported any. */
+function CompactSeparator({ detail }: { detail: Record<string, JsonValue> | null }) {
+  const summary = compactSummary(detail);
+  const explain =
+    "Earlier messages were summarized to free up context. They stay visible here, but the model now works from that summary.";
+  return (
+    <div className={styles.compactSep} role="separator" aria-label="Conversation compacted">
+      <div className={styles.compactSepRule}>
+        <Tooltip content={explain} label={explain} className={styles.compactSepLabel}>
+          <Ico name="layers" className="sm" />
+          Conversation compacted
+        </Tooltip>
+      </div>
+      {summary ? <div className={styles.compactSepMeta + " wf-mono"}>{summary}</div> : null}
+    </div>
+  );
+}
+
 /** Pull a human-readable detail string out of a notice's raw `detail` payload, for the
  *  collapsed "Technical details" disclosure. Prefers explicit `detail`, then any technical
  *  fields (stderr / exit code), else nothing. */
@@ -130,6 +177,7 @@ export function noticeDetailText(d: Record<string, JsonValue> | null): string | 
  *  (the history preview). Mirrors the live thread's routing exactly:
  *   - `control_change`: a subtle inline "control: from → to" line.
  *   - `task_failed`: a discreet inline line (failed background task) with a detail toggle.
+ *   - `compact_boundary`: a full-width "Conversation compacted" separator.
  *   - `control_error` + every subtype in NOTICE_ERROR_HEADINGS (and the generic `error`):
  *     a visible red error bubble — never silent.
  *   - any other subtype: nothing (stays quiet). */
@@ -178,6 +226,8 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
       </div>
     );
   }
+
+  if (subtype === "compact_boundary") return <CompactSeparator detail={d} />;
 
   if (subtype === "task_failed") {
     const detailText = get("detail");

@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, LoadedPlugin,
+    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedPlugin,
     ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
@@ -449,6 +449,8 @@ impl Assembler {
                 status,
                 permission_mode,
                 session_id,
+                compact_result,
+                compact_error,
             } => {
                 if let Some(pm) = permission_mode {
                     self.state.permission_mode = Some(pm.clone());
@@ -456,10 +458,17 @@ impl Assembler {
                 if session_id.is_some() {
                     self.state.session_id = session_id.clone();
                 }
+                // `"compacting"` lands here too: the UI's working line reads it to say
+                // "Compacting conversation…" for as long as the summarization runs.
                 self.state.activity = status.clone();
                 out.push(SessionEvent::State(self.state.clone()));
                 if let Some(pm) = permission_mode {
                     self.announce_permission(pm, out);
+                }
+                // A compaction that FAILED says so only here — no boundary follows. Without
+                // this the "compacting" line just vanished and the context stayed full.
+                if compact_result.as_ref().and_then(Value::as_str) == Some("failed") {
+                    out.push(SessionEvent::Item(compact_failed_notice(compact_error.as_ref())));
                 }
             }
             SystemMsg::TaskStarted(t) => self.ingest_task_started(t, out),
@@ -516,9 +525,22 @@ impl Assembler {
                 });
                 out.push(SessionEvent::State(self.state.clone()));
             }
+            // The conversation was compacted: a separator in the thread, and the context
+            // ring drops to the compacted size at once. (A manual `/compact` ends on a
+            // model-call-free `result` that must not then zero it — see `ingest_result`.)
+            SystemMsg::CompactBoundary { compact_metadata } => {
+                let info = CompactInfo::from_wire(compact_metadata);
+                if let Some(post) = info.post_tokens {
+                    self.state.context_tokens = Some(post);
+                    // The last call's breakdown described the PRE-compaction prompt; it no
+                    // longer sums to the fill. Unknown until the next model call.
+                    self.state.context_usage = None;
+                    out.push(SessionEvent::State(self.state.clone()));
+                }
+                out.push(SessionEvent::Item(info.into_notice()));
+            }
             SystemMsg::LocalCommand
             | SystemMsg::StopHookSummary
-            | SystemMsg::CompactBoundary
             | SystemMsg::TurnDuration
             | SystemMsg::Informational
             | SystemMsg::ThinkingTokens
@@ -1184,11 +1206,14 @@ impl Assembler {
             .and_then(Value::as_array)
             .and_then(|it| it.last())
             .unwrap_or(&r.usage);
-        if let Some(used) = context_used_from_usage(final_usage) {
+        // A turn that made NO model call (a local slash command: `/compact`, `/model`, …)
+        // ends on an all-zero usage. That is "nothing measured", not an empty context: it
+        // must keep the last known fill — after `/compact`, the boundary's compacted size.
+        if let Some(used) = context_used_from_usage(final_usage).filter(|&used| used > 0) {
             self.state.context_tokens = Some(used);
-        }
-        if let Some(breakdown) = token_usage_from(final_usage) {
-            self.state.context_usage = Some(breakdown);
+            if let Some(breakdown) = token_usage_from(final_usage) {
+                self.state.context_usage = Some(breakdown);
+            }
         }
         // Authoritative window for THIS session's model (distinguishes 200k vs 1M).
         // Only updates when the result reports the session model's own entry — a
@@ -1469,6 +1494,28 @@ fn permission_label(mode: &str) -> String {
     .to_string()
 }
 
+/// The error notice for a compaction that failed (`system/status` with
+/// `compact_result:"failed"`). The CLI's reason (`compact_error`) is the message when it sent
+/// one — it may not: the binary withholds it in some modes — else a generic line, so the
+/// failure is never silent either way.
+fn compact_failed_notice(compact_error: Option<&Value>) -> ConversationItem {
+    let reason = match compact_error {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    ConversationItem::Notice {
+        subtype: "compact_failed".to_string(),
+        detail: serde_json::json!({
+            "message": if reason.is_empty() {
+                "Claude Code couldn't compact the conversation.".to_string()
+            } else {
+                reason
+            },
+        }),
+    }
+}
+
 /// Sum the tokens that occupy the context window from a `usage` object:
 /// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` (the full
 /// prompt sent to the model). Returns `None` when the object carries no token counts
@@ -1632,6 +1679,110 @@ mod tests {
     /// the armed skill-body drop can. This is the fixture the ON-DISK `capture_skill.jsonl`
     /// could NOT model.
     const CAPTURE_SKILL_LIVE: &str = include_str!("fixtures/capture_skill_live.jsonl");
+
+    /// A real `/compact` on the LIVE wire (claude 2.1.286, production flags): the previous
+    /// turn's `result`, then `status:"compacting"` → `status:null`+`compact_result:"success"` →
+    /// `init` → `compact_boundary` → the synthetic summary → "Compacted" → the command echo →
+    /// a model-call-free `result`.
+    const CAPTURE_COMPACT_LIVE: &str = include_str!("fixtures/capture_compact_live.jsonl");
+
+    fn ingest_lines(asm: &mut Assembler, lines: &str) -> Vec<SessionEvent> {
+        lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .flat_map(|l| asm.ingest(&serde_json::from_str::<CliMessage>(l).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn live_compaction_marks_the_thread_and_resets_the_ring() {
+        let mut asm = Assembler::new();
+        // The app stamps the `/compact` it sends, so its echo is recognised as ours.
+        asm.note_sent_user_message("4a47e22e-0526-4735-8629-a312e238a537");
+        let events = ingest_lines(&mut asm, CAPTURE_COMPACT_LIVE);
+
+        let activities: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s.activity.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            activities.contains(&Some("compacting".to_string())),
+            "the working line must learn a compaction is running, got {activities:?}"
+        );
+
+        let notices: Vec<(&str, &Value)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype, detail }) => Some((subtype.as_str(), detail)),
+                _ => None,
+            })
+            .collect();
+        // ONE separator, carrying the facts; no "Compacted" line, no failure.
+        assert_eq!(notices.len(), 1, "got {notices:?}");
+        let (subtype, d) = notices[0];
+        assert_eq!(subtype, "compact_boundary");
+        assert_eq!(d["trigger"], "manual");
+        assert_eq!(d["pre_tokens"], 36488);
+        assert_eq!(d["post_tokens"], 5964);
+        assert_eq!(d["duration_ms"], 13250);
+        // Neither the summary nor our own echo becomes a bubble.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Item(ConversationItem::UserMessage { .. }))));
+
+        // The ring shows the compacted size — and the closing all-zero `result` (no model
+        // call) leaves it there instead of zeroing it.
+        let last = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last.context_tokens, Some(5964));
+        assert_eq!(last.context_usage, None);
+        assert_eq!(last.activity, None);
+    }
+
+    #[test]
+    fn a_failed_compaction_is_an_error_notice() {
+        let mut asm = Assembler::new();
+        let with_reason = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Not enough messages to compact.","session_id":"s"}"#;
+        let bare = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","session_id":"s"}"#;
+        let ok = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s"}"#;
+        let messages: Vec<String> = ingest_lines(&mut asm, &format!("{with_reason}\n{bare}\n{ok}"))
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype, detail }) => {
+                    assert_eq!(subtype, "compact_failed");
+                    detail["message"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "Not enough messages to compact.".to_string(),
+                "Claude Code couldn't compact the conversation.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compaction_field_of_an_unexpected_type_never_fails_the_status_line() {
+        let mut asm = Assembler::new();
+        // `compact_error` as an object: the line still parses, so its permission mode lands.
+        let line = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan","compact_result":"failed","compact_error":{"code":42}}"#;
+        let events = ingest_lines(&mut asm, line);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::State(s) if s.permission_mode.as_deref() == Some("plan"))));
+    }
 
     #[test]
     fn assembles_fixture_into_normalized_events() {

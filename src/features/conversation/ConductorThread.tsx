@@ -35,6 +35,7 @@ import {
   useTurnResult,
   useRunFooter,
   useRunStartedAt,
+  useCompactingSince,
   useThinkingStartedAt,
   useThinkingDuration,
 } from "../../store/conversationStore";
@@ -1665,6 +1666,22 @@ function LiveElapsed({ session }: { session: string }) {
   );
 }
 
+/** How long the compaction in flight has been running, shown from its first second: unlike a
+ *  turn, a compaction is one opaque wait (it can take minutes on a full window), so the count
+ *  is the only sign it is progressing. Same `showTurnDuration` gate as the turn counter. */
+function CompactingElapsed({ session }: { session: string }) {
+  const show = useDisplay((s) => s.showTurnDuration);
+  const since = useCompactingSince(session);
+  const now = useNow(1000);
+  if (!show || since == null) return null;
+  return (
+    <span className={styles.elapsed + " wf-mono"} title="Time spent compacting">
+      <Ico name="clock" className="sm" />
+      {fmtDuration(Math.max(0, Math.floor((now - since) / 1000)) * 1000)}
+    </span>
+  );
+}
+
 /**
  * The live "what's happening now" line shown under the timeline while the agent
  * works. Its own leaf so the per-token activity recompute (`useActivityLabel`
@@ -1705,6 +1722,20 @@ function WorkingIndicator({ session }: { session: string }) {
         <Ico name="refresh" className={"sm " + styles.retrySpin} />
         <RollText text={`Connection lost — reconnecting${progress}`} />
         <LiveElapsed session={session} />
+      </div>
+    );
+  }
+  // The CLI is compacting the conversation: its own clock, not the turn's.
+  if (sessionState?.activity === "compacting") {
+    return (
+      <div className={styles.activity}>
+        <span className={styles.typing} aria-hidden="true">
+          <i />
+          <i />
+          <i />
+        </span>
+        <RollText text={activity} />
+        <CompactingElapsed session={session} />
       </div>
     );
   }

@@ -179,12 +179,22 @@ pub enum SystemMsg {
     /// First message of a session: carries `session_id`, the available tools,
     /// the model, the permission mode, etc.
     Init(Box<InitMsg>),
-    /// Transient activity status (`requesting`, …).
+    /// Transient activity status (`requesting`, `compacting`, …).
+    ///
+    /// A compaction is bracketed by two of these (VERIFIED live, 2.1.286): `status:"compacting"`
+    /// when it starts, then `status:null` + `compact_result:"success"|"failed"` when it ends,
+    /// a failure adding the reason in `compact_error`. Both compact fields are read as raw
+    /// JSON so an unexpected type can never fail the whole line — it also carries the
+    /// permission mode.
     Status {
         status: Option<String>,
         #[serde(rename = "permissionMode")]
         permission_mode: Option<String>,
         session_id: Option<String>,
+        #[serde(default)]
+        compact_result: Option<Value>,
+        #[serde(default)]
+        compact_error: Option<Value>,
     },
     /// A background task was created (a sub-agent `Agent` run, a `Workflow` run, a
     /// `Bash run_in_background`, or a `Monitor` watch). Carries the `task_type` and
@@ -227,8 +237,8 @@ pub enum SystemMsg {
     /// traffic fell into it, its warning would fire on every normal session and a
     /// genuinely new subtype would be indistinguishable from the noise. The set below
     /// is what actually occurs on this machine's transcripts (`api_error`,
-    /// `local_command`, `stop_hook_summary`, `compact_boundary`, `turn_duration`,
-    /// `informational`) plus the ones the spec documents.
+    /// `local_command`, `stop_hook_summary`, `turn_duration`, `informational`) plus the
+    /// ones the spec documents. (`compact_boundary`, listed among them, IS rendered.)
     ///
     /// ⚠️ `api_error` is the most frequent by far (199 occurrences across this machine's
     /// transcripts). VERIFIED against the 2.1.220 binary: it is `yield`ed into the live
@@ -258,8 +268,15 @@ pub enum SystemMsg {
     LocalCommand,
     #[serde(rename = "stop_hook_summary")]
     StopHookSummary,
+    /// The conversation was compacted (summarized to free context). `compact_metadata` =
+    /// `{trigger:"manual"|"auto", pre_tokens, post_tokens?, duration_ms?, …}` — kept raw and
+    /// read leniently by [`crate::supervisor::model::CompactInfo::from_wire`]. Rendered as a
+    /// thread separator.
     #[serde(rename = "compact_boundary")]
-    CompactBoundary,
+    CompactBoundary {
+        #[serde(default)]
+        compact_metadata: Value,
+    },
     #[serde(rename = "turn_duration")]
     TurnDuration,
     #[serde(rename = "informational")]

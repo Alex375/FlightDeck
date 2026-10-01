@@ -36,7 +36,7 @@ import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
 // core error subtype surfaces here the same day it surfaces on screen.
-import { NOTICE_ERROR_HEADINGS } from "../features/conversation/noticeView";
+import { NOTICE_ERROR_HEADINGS, compactSummary } from "../features/conversation/noticeView";
 import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
 import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
@@ -313,6 +313,13 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
       if (n.subtype === "task_failed") {
         const msg = (n.detail as { message?: unknown } | null)?.message;
         pushSystem(`[${typeof msg === "string" ? msg : "Background task failed"}]`);
+        continue;
+      }
+      // A compaction: what precedes it reaches the model only as a summary — context a
+      // reader of this conversation needs to weigh what came before.
+      if (n.subtype === "compact_boundary") {
+        const facts = compactSummary((n.detail ?? null) as Record<string, JsonValue> | null);
+        pushSystem(`[Conversation compacted${facts ? ` (${facts})` : ""}]`);
         continue;
       }
       // …and so is every OTHER error-bearing notice: a dead process, a rejected control
