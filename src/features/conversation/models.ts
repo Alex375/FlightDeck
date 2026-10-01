@@ -53,7 +53,7 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
 
 /**
  * Every Claude model the CLI knows, transcribed from the model registry BAKED INTO the
- * binary (2.1.280 — a plain `{id,family,display_name,capabilities,default_effort,…}`
+ * binary (2.1.286 — a plain `{id,family,display_name,capabilities,default_effort,…}`
  * array). That registry is the authority for two things we used to guess at:
  *   • the effort ladder (`caps`) — which is how we learn that Opus 4.6 and Sonnet 4.6
  *     take `max` but NOT `xhigh`, and that everything at 4.5 and below has no effort
@@ -67,7 +67,8 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
  * An alias row carries the id it resolves to in `modelId`, so its label stays honest.
  *
  * ⚠️ When the binary ships a new model, the alias silently moves on: the alias row then
- * RUNS the new model under the old label (Opus 5.5 ran as "Opus 5" for a CLI release).
+ * RUNS the new model under the old label (Opus 5.5 ran as "Opus 5" for a CLI release,
+ * and Sonnet 5.5 as "Sonnet 5" from 2.1.284).
  * The update is: relabel the alias row + bump its `modelId`, add a pinned row for the
  * model it used to name, and move the alias arm of the Rust `assembler.rs::model_label`.
  * Picker preferences reconcile on their own (store/modelPrefs).
@@ -92,7 +93,8 @@ export const CLAUDE_MODELS: ModelOption[] = [
   { label: "Opus 4.5", value: "claude-opus-4-5", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Opus 4.1", value: "claude-opus-4-1", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Opus 4", value: "claude-opus-4-0", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 5", value: "sonnet", modelId: "claude-sonnet-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Sonnet 5.5", value: "sonnet", modelId: "claude-sonnet-5-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Sonnet 5", value: "claude-sonnet-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Sonnet 4.6", value: "claude-sonnet-4-6", family: "sonnet", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
   { label: "Sonnet 4.5", value: "claude-sonnet-4-5", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Sonnet 4", value: "claude-sonnet-4-0", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
@@ -204,7 +206,7 @@ export function codexFactoryHidden(models: readonly Pick<ModelOption, "value">[]
 
 /**
  * What the picker hides on a fresh install. Claude: all but the NEWEST model of each
- * family — today Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 are shown — and never Mythos.
+ * family — today Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 4.5 are shown — and never Mythos.
  * Codex: all but the newest of each line (codexFactoryHidden), re-applied to the live list
  * when it loads. Derived, not listed, so a model added at the top of its family replaces
  * its predecessor in the factory picker with no other edit. Everything else starts in

@@ -1385,7 +1385,8 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
 /// resolved id it stands for: the change notice compares labels, and a seed of `opus`
 /// read back as `claude-opus-5-5[1m]` is a confirmation, not a model switch.
 /// ⚠️ Keep the alias arms in step with the `modelId` of the front's alias rows — the CLI
-/// moves an alias on each release (`opus` went Opus 5 → Opus 5.5 in 2.1.280).
+/// moves an alias on each release (`opus` went Opus 5 → Opus 5.5 in 2.1.280, `sonnet`
+/// Sonnet 5 → Sonnet 5.5 in 2.1.284).
 ///
 /// Every other id is read off its own name (`claude-<family>-<major>[-<minor>]`, or the
 /// older `claude-<major>-<minor>-<family>`), so a pinned version can never be mistaken
@@ -1394,7 +1395,7 @@ fn model_label(id: &str) -> String {
     let s = id.to_lowercase();
     match s.as_str() {
         "opus" => return "Opus 5.5".to_string(),
-        "sonnet" => return "Sonnet 5".to_string(),
+        "sonnet" => return "Sonnet 5.5".to_string(),
         "haiku" => return "Haiku 4.5".to_string(),
         "fable" => return "Fable 5.1".to_string(),
         _ => {}
@@ -2787,7 +2788,7 @@ mod tests {
     fn model_labels_match_the_catalogue() {
         for (alias, resolved) in [
             ("opus", "claude-opus-5-5[1m]"),
-            ("sonnet", "claude-sonnet-5"),
+            ("sonnet", "claude-sonnet-5-5"),
             ("haiku", "claude-haiku-4-5-20251001"),
             ("fable", "claude-fable-5-1"),
         ] {
@@ -2800,6 +2801,8 @@ mod tests {
             ("claude-opus-4-0", "Opus 4"),
             ("claude-opus-4-20250514", "Opus 4"),
             ("claude-opus-4-1@20250805", "Opus 4.1"),
+            ("claude-sonnet-5-5", "Sonnet 5.5"),
+            ("claude-sonnet-5", "Sonnet 5"),
             ("us.anthropic.claude-opus-4-6-v1", "Opus 4.6"),
             ("claude-3-5-sonnet-20241022", "Sonnet 3.5"),
             ("claude-3-7-sonnet", "Sonnet 3.7"),

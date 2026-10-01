@@ -51,7 +51,10 @@ describe("matching a transcript model id to the catalogue", () => {
     // history now lands on its own pinned row, never on the alias.
     expect(catalogueIdForTranscriptModel("claude-opus-5")).toBe("claude-opus-5");
     expect(catalogueIdForTranscriptModel("claude-opus-4-8")).toBe("claude-opus-4-8");
-    expect(catalogueIdForTranscriptModel("claude-sonnet-5")).toBe("sonnet");
+    // Same story for Sonnet 5 once `sonnet` moved on to Sonnet 5.5 (2.1.284).
+    expect(catalogueIdForTranscriptModel("claude-sonnet-5-5")).toBe("sonnet");
+    expect(catalogueIdForTranscriptModel("claude-sonnet-5")).toBe("claude-sonnet-5");
+    expect(pricingKeyForTranscriptModel("claude-sonnet-5")).toBe("claude-sonnet-5");
     expect(catalogueIdForTranscriptModel("claude-haiku-4-5-20251001")).toBe("haiku");
     expect(catalogueIdForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
     expect(pricingKeyForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
@@ -60,6 +63,8 @@ describe("matching a transcript model id to the catalogue", () => {
   it("keeps Opus 5 and Opus 5.5 apart (the same prefix trap as Fable)", () => {
     expect(labelForTranscriptModel("claude-opus-5")).toBe("Opus 5");
     expect(labelForTranscriptModel("claude-opus-5-5")).toBe("Opus 5.5");
+    expect(labelForTranscriptModel("claude-sonnet-5")).toBe("Sonnet 5");
+    expect(labelForTranscriptModel("claude-sonnet-5-5")).toBe("Sonnet 5.5");
   });
 
   it("returns null for a model the catalogue has never heard of", () => {
