@@ -61,6 +61,7 @@ import {
   NO_ASK,
   pluginOverrides,
   remoteListView,
+  ruleAccess,
   visibleAskError,
   type AskState,
   type PluginOverride,
@@ -490,7 +491,8 @@ export function ExtensionsManager() {
   const isConversation = target.kind === "conversation";
   // What the header refresh + spinner track: the body's snapshot, plus the live MCP status
   // when the body shows it (a conversation's own lens, or a live Codex conversation's).
-  const liveShown = body === "conversation" || (body === "codex" && liveBackend === "codex");
+  const liveShown =
+    handle != null && (body === "conversation" || (body === "codex" && liveBackend === "codex"));
   const tabFetching = body === "codex" ? codexExt.isFetching : ext.isFetching;
   const liveFetching = liveShown && live.isFetching;
 
@@ -574,11 +576,13 @@ export function ExtensionsManager() {
           </div>
         ) : body === "codex" ? (
           <CodexExtensionsBody
+            locked={codexDetected === false}
             notice={
               codexDetected === false ? (
                 <RemoteBanner>
                   Codex isn&apos;t detected on this Mac: what needs it (its plugins, hooks and live servers)
-                  can&apos;t be read. Its configuration files below still are.
+                  can&apos;t be read, and the switches below can&apos;t change anything. Its configuration files
+                  are still listed.
                 </RemoteBanner>
               ) : null
             }
@@ -799,15 +803,10 @@ function ConversationBody({
   // one), and only what exists at that level; tool rules, servers and plugins follow it.
   const [scope, setScope] = useState<PermissionScope>("conversation");
   const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
-  // On a server, the repository's own Claude Code files are not readable from here — but
-  // Global also reaches this Mac's conversations, so its baseline stays this Mac's rules.
-  const perms = useExtensionScope(
-    scope,
-    remote && scope === "global" ? null : path,
-    repoId,
-    convId,
-    !remote || scope === "global",
-  );
+  // On a server, no file of this Mac describes the session's rows (and Global is read-only
+  // from here) — see `ruleAccess`.
+  const access = ruleAccess(remote, scope, path);
+  const perms = useExtensionScope(scope, access.repoPath, repoId, convId, access.readFiles, access.readOnlyReason);
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     const write = pluginAtScope(p, perms).write(next);
     // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
@@ -865,7 +864,8 @@ function ConversationBody({
           rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.
         </RemoteBanner>
       ) : null}
-      <ScopeSwitcher scope={scope} onChange={setScope} hint={perms.hint} />
+      {/* A disabled switch never shows its title: why a scope is read-only goes here. */}
+      <ScopeSwitcher scope={scope} onChange={setScope} hint={access.readOnlyReason ?? perms.hint} />
       {perms.error ? <div className={styles.error}>{perms.error}</div> : null}
       {actions.toggle.isError || actions.reconnect.isError || actions.authenticate.isError || actions.clearAuth.isError ? (
         <div className={styles.error}>
@@ -1401,6 +1401,7 @@ function CodexExtensionsBody({
   onOpenDoc,
   onOpenPlugin,
   notice,
+  locked = false,
 }: {
   codexExt: ReturnType<typeof useCodexExtensions>;
   live: ReturnType<typeof useMcpStatus>;
@@ -1410,6 +1411,8 @@ function CodexExtensionsBody({
   onOpenPlugin: (p: PluginInfo, codexMeta: { pluginName: string; marketplacePath: string | null }) => void;
   /** Shown first, whatever the state below (e.g. Codex not detected on this Mac). */
   notice?: React.ReactNode;
+  /** Every change goes through the codex binary: without it, the switches are off. */
+  locked?: boolean;
 }) {
   // Live inventories layered over the instant config snapshot (each spawns a transient
   // app-server, so they load in ~1s while the snapshot renders immediately).
@@ -1477,7 +1480,7 @@ function CodexExtensionsBody({
                 key={m.name}
                 mcp={m}
                 enabled={configEnabled(m.name)}
-                busy={toggles.mcp.isPending}
+                busy={locked || toggles.mcp.isPending}
                 // Injected servers (not in config.toml) can't be toggled via config —
                 // render them read-only with a "managed by Codex" note instead of a
                 // toggle that would fail with an "invalid transport" error.
@@ -1500,7 +1503,7 @@ function CodexExtensionsBody({
               mcp={m}
               toggle={{
                 checked: m.enabled,
-                busy: toggles.mcp.isPending,
+                busy: locked || toggles.mcp.isPending,
                 onChange: (enabled) => toggles.mcp.mutate({ name: m.name, enabled }),
               }}
             />
@@ -1521,7 +1524,7 @@ function CodexExtensionsBody({
             onOpen={() => onOpenDoc({ name: s.name, source: "Codex", path: s.path, description: s.description })}
             toggle={{
               checked: s.enabled,
-              busy: toggles.skill.isPending,
+              busy: locked || toggles.skill.isPending,
               onChange: (enabled) => toggles.skill.mutate({ path: s.path, enabled }),
             }}
           />
@@ -1531,7 +1534,7 @@ function CodexExtensionsBody({
       <CodexPluginsSection
         codexPlugins={codexPlugins}
         configPlugins={configPlugins}
-        busy={toggles.plugin.isPending}
+        busy={locked || toggles.plugin.isPending}
         onToggle={(pluginId, enabled) => toggles.plugin.mutate({ pluginId, enabled })}
         onOpenPlugin={onOpenPlugin}
       />

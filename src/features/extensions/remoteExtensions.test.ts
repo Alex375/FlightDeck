@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   askWaiting,
   extensionsBody,
+  GLOBAL_FROM_REMOTE,
+  ruleAccess,
   groupByPlugin,
   NO_ASK,
   pluginOverrides,
@@ -9,6 +11,26 @@ import {
   visibleAskError,
 } from "./remoteExtensions";
 import { EMPTY_LEVEL } from "./mcpToolPermissions";
+
+describe("ruleAccess", () => {
+  it("reads this Mac's files for a local conversation, at every scope", () => {
+    for (const scope of ["conversation", "repository", "global"] as const) {
+      expect(ruleAccess(false, scope, "/r")).toEqual({ repoPath: "/r", readFiles: true, readOnlyReason: null });
+    }
+  });
+
+  it("never judges a remote session's rows by this Mac's rules — Global included", () => {
+    expect(ruleAccess(true, "conversation", "/srv").readFiles).toBe(false);
+    expect(ruleAccess(true, "repository", "/srv").readFiles).toBe(false);
+    expect(ruleAccess(true, "global", "/srv").readFiles).toBe(false);
+  });
+
+  it("leaves Global read-only from a remote conversation, and says why", () => {
+    expect(ruleAccess(true, "global", "/srv").readOnlyReason).toBe(GLOBAL_FROM_REMOTE);
+    expect(ruleAccess(true, "conversation", "/srv").readOnlyReason).toBeNull();
+    expect(ruleAccess(true, "repository", "/srv").readOnlyReason).toBeNull();
+  });
+});
 
 describe("extensionsBody", () => {
   it("never describes a remote repository with this Mac's pictures", () => {

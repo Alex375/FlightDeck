@@ -7,7 +7,37 @@
 // `SessionStatePayload.loaded_*`). This module holds the pure decisions behind those
 // sections — kept out of the component so they are unit-tested.
 
-import type { Cascade } from "./mcpToolPermissions";
+import type { Cascade, PermissionScope } from "./mcpToolPermissions";
+
+/** What a conversation's scope may read and write of Claude Code's permission rules. */
+export interface RuleAccess {
+  /** Folder whose Claude Code files are read (`null` = this Mac's user/managed only). */
+  repoPath: string | null;
+  /** Whether any file is read at all — not for a remote session, whose rules are on the server. */
+  readFiles: boolean;
+  /** Why the scope can't be changed from this panel (`null`: it can). */
+  readOnlyReason: string | null;
+}
+
+export const GLOBAL_FROM_REMOTE =
+  "Global also reaches this Mac's conversations, which follow this Mac's own rules — rules this remote conversation's rows don't show. Change Global in Settings → Extensions, or from a conversation on this Mac.";
+
+/**
+ * Rules access for a conversation's scope. On this Mac: its files. On a server, the rows are
+ * the REMOTE session's servers and tools, whose own Claude Code rules can't be read from here
+ * — and this Mac's rules don't govern them, so they must not lock or explain them either.
+ * Global is then read-only: it also reaches this Mac's conversations, whose baseline
+ * (managed policy included) this panel doesn't show — writing it blind could offer an
+ * "Allow" that policy forbids. Settings → Extensions shows that baseline.
+ */
+export function ruleAccess(remote: boolean, scope: PermissionScope, path: string): RuleAccess {
+  if (!remote) return { repoPath: path, readFiles: true, readOnlyReason: null };
+  return {
+    repoPath: path,
+    readFiles: false,
+    readOnlyReason: scope === "global" ? GLOBAL_FROM_REMOTE : null,
+  };
+}
 
 /** Which body the Extensions panel renders. */
 export type ExtensionsBody =

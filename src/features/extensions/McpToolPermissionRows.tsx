@@ -92,6 +92,8 @@ export function useExtensionScope(
   repoId: string | null,
   convId: string | null,
   readFiles = true,
+  /** A caller's own reason to keep this scope read-only (see `ruleAccess`). */
+  readOnly: string | null = null,
 ): PermissionTarget {
   const qc = useQueryClient();
   const files = useMcpPermissionRules(repoPath, readFiles);
@@ -123,11 +125,12 @@ export function useExtensionScope(
     pluginFiles: (pluginId) =>
       (readFiles ? (view?.plugins ?? []) : []).filter((p) => p.plugin_id === pluginId).map((p) => ({ source: p.source, enabled: p.enabled })),
     readOnlyReason:
-      scope !== "global" && !key
+      readOnly ??
+      (scope !== "global" && !key
         ? scope === "repository"
           ? "This conversation doesn't belong to a repository."
           : "No conversation to apply this to."
-        : null,
+        : null),
     applyTools: (tools) => write.mutate({ tools }),
     setServer: (server, on) => write.mutate({ servers: [{ server, on }] }),
     setPlugin: (id, enabled) => write.mutateAsync({ plugins: [{ id, enabled }] }),
