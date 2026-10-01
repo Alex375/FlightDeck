@@ -128,12 +128,17 @@ pub struct Assembler {
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
 pub type LaunchResolver = fn(&str, &str) -> Option<String>;
 
-/// The last-announced friendly labels for the three controls (see [`Assembler`]).
+/// The last-announced friendly labels for the controls (see [`Assembler`]).
 #[derive(Debug, Default)]
 struct Announced {
     model: Option<String>,
     effort: Option<String>,
     permission: Option<String>,
+    /// Ultracode's last-announced on/off. Unlike the others it is NOT seeded from the
+    /// spawn: the first read-back sets it silently. A spawn that asks for ultracode where
+    /// it can't run (workflows turned off) already raises its own control error; a seeded
+    /// baseline would add a second, redundant "Ultracode: On → Off" line on top.
+    ultracode: Option<bool>,
 }
 
 /// A background-capable `tool_use` the assembler is tracking by id (see
@@ -295,7 +300,7 @@ impl Assembler {
         ultracode: bool,
     ) {
         self.announced.model = model.as_deref().map(model_label);
-        self.announced.effort = effort_label(effort.as_deref(), ultracode);
+        self.announced.effort = effort.as_deref().and_then(effort_label);
         self.announced.permission = permission_mode.as_deref().map(permission_label);
         self.state.model = model;
         self.state.effort = effort;
@@ -303,31 +308,34 @@ impl Assembler {
         self.state.ultracode = ultracode;
     }
 
-    /// Optimistically reflect an effort/ultracode change from a UI click: updates the
-    /// display state immediately, but does NOT announce — the timeline line waits for
-    /// the `get_settings` read-back ([`apply_settings`]), so it shows the CONFIRMED
-    /// value, never the optimistic one.
-    pub fn set_effort_optimistic(
-        &mut self,
-        effort: Option<String>,
-        ultracode: bool,
-    ) -> SessionEvent {
-        if let Some(e) = effort {
-            self.state.effort = Some(e);
-        }
-        self.state.ultracode = ultracode;
+    /// Optimistically reflect an effort change from a UI click: updates the display
+    /// state immediately, but does NOT announce — the timeline line waits for the
+    /// `get_settings` read-back ([`apply_settings`]), so it shows the CONFIRMED value,
+    /// never the optimistic one. Leaves ultracode alone: it is independent of the effort.
+    pub fn set_effort_optimistic(&mut self, effort: String) -> SessionEvent {
+        self.state.effort = Some(effort);
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// Optimistically reflect an ultracode switch from a UI click — never announced
+    /// either (see [`set_effort_optimistic`]). Turning it on where the last read-back
+    /// said it can't run leaves it off: the switch must not show what won't happen.
+    pub fn set_ultracode_optimistic(&mut self, on: bool) -> SessionEvent {
+        self.state.ultracode = on && self.state.ultracode_available != Some(false);
         SessionEvent::State(self.state.clone())
     }
 
     /// Apply a live `get_settings` read-back: the authoritative model / effort /
-    /// ultracode the CLI reports. A field absent from the response (`None`) is left
-    /// untouched. Returns the state event PLUS a "control changed" notice for each
-    /// value that actually MOVED (the model-felt source of truth).
+    /// ultracode (and whether ultracode can run at all) the CLI reports. A field absent
+    /// from the response (`None`) is left untouched. Returns the state event PLUS a
+    /// "control changed" notice for each value that actually MOVED (the model-felt
+    /// source of truth).
     pub fn apply_settings(
         &mut self,
         model: Option<String>,
         effort: Option<String>,
         ultracode: Option<bool>,
+        ultracode_available: Option<bool>,
     ) -> Vec<SessionEvent> {
         if let Some(m) = &model {
             self.state.model = Some(m.clone());
@@ -338,12 +346,18 @@ impl Assembler {
         if let Some(u) = ultracode {
             self.state.ultracode = u;
         }
+        if ultracode_available.is_some() {
+            self.state.ultracode_available = ultracode_available;
+        }
         let mut out = vec![SessionEvent::State(self.state.clone())];
         if let Some(m) = &model {
             self.announce_model(m, &mut out);
         }
-        if effort.is_some() || ultracode.is_some() {
+        if effort.is_some() {
             self.announce_effort(&mut out);
+        }
+        if let Some(u) = ultracode {
+            self.announce_ultracode(u, &mut out);
         }
         out
     }
@@ -374,10 +388,9 @@ impl Assembler {
         }
     }
 
-    /// Emit a "Thinking effort: X → Y" notice if the confirmed effort/ultracode
-    /// moved (the Ultra code tier folds in as its own label).
+    /// Emit a "Thinking effort: X → Y" notice if the confirmed effort moved.
     fn announce_effort(&mut self, out: &mut Vec<SessionEvent>) {
-        let Some(to) = effort_label(self.state.effort.as_deref(), self.state.ultracode) else {
+        let Some(to) = self.state.effort.as_deref().and_then(effort_label) else {
             return;
         };
         match self.announced.effort.clone() {
@@ -387,6 +400,21 @@ impl Assembler {
                 self.announced.effort = Some(to);
             }
             None => self.announced.effort = Some(to),
+        }
+    }
+
+    /// Emit an "Ultracode: Off → On" notice if the confirmed ultracode moved. Its own
+    /// line, no longer folded into the effort: the two are independent since 2.1.284.
+    /// The first sighting only records the baseline (see [`Announced::ultracode`]).
+    fn announce_ultracode(&mut self, on: bool, out: &mut Vec<SessionEvent>) {
+        let label = |v: bool| if v { "On" } else { "Off" };
+        match self.announced.ultracode {
+            Some(from) if from == on => {}
+            Some(from) => {
+                out.push(change_notice("Ultracode", "bolt", label(from), label(on)));
+                self.announced.ultracode = Some(on);
+            }
+            None => self.announced.ultracode = Some(on),
         }
     }
 
@@ -1698,19 +1726,17 @@ fn parse_model_label(s: &str) -> Option<String> {
     Some(format!("{label} {}", version.join(".")))
 }
 
-/// Friendly effort label, folding the ultracode tier in. `None` when there is no
-/// known effort yet (so we never announce a phantom transition).
-fn effort_label(effort: Option<&str>, ultracode: bool) -> Option<String> {
-    if ultracode {
-        return Some("Ultra code".to_string());
-    }
+/// Friendly effort label. Ultracode is NOT folded in — it is its own control (see
+/// [`Assembler::announce_ultracode`]). `Option` so callers chain it on an effort that
+/// may not be known yet (never announce a phantom transition).
+fn effort_label(effort: &str) -> Option<String> {
     // ⚠️ Must mirror the front's EFFORT_LABELS (`src/agent/subagentMeta.ts`) verbatim:
     // this label lands in the in-thread "Thinking effort: X → Y" notice, right under
     // the composer chip that renders the SAME value from the front's table. Any drift
     // makes the two disagree about one setting (they did: "Extra high" vs "Extra", and
     // `max` fell through raw as "max" next to a chip reading "Max").
     Some(
-        match effort? {
+        match effort {
             "low" => "Low",
             "medium" => "Medium",
             "high" => "High",
@@ -3023,27 +3049,66 @@ mod tests {
         // resolved id has to be the one the `opus` alias actually names — the LATEST
         // Opus, i.e. Opus 5.5 (Opus 5 and 4.8 are their own catalogue rows, so reading
         // one back against an `opus` seed is a genuine model change, not a confirmation).
-        let evs = asm.apply_settings(Some("claude-opus-5-5[1m]".into()), Some("xhigh".into()), Some(false));
+        let evs = asm.apply_settings(Some("claude-opus-5-5[1m]".into()), Some("xhigh".into()), Some(false), Some(true));
         assert!(first_notice(evs).is_none(), "confirming the seed must stay silent");
         // Now a genuine change xhigh → high.
-        let (subtype, detail) = first_notice(asm.apply_settings(None, Some("high".into()), Some(false)))
+        let (subtype, detail) = first_notice(asm.apply_settings(None, Some("high".into()), Some(false), Some(true)))
             .expect("a control_change notice");
         assert_eq!(subtype, "control_change");
         assert_eq!(detail["control"], serde_json::json!("Thinking effort"));
         assert_eq!(detail["from"], serde_json::json!("Extra"));
         assert_eq!(detail["to"], serde_json::json!("High"));
         // Re-reading the same value is silent (idempotent).
-        assert!(first_notice(asm.apply_settings(None, Some("high".into()), Some(false))).is_none());
+        assert!(first_notice(asm.apply_settings(None, Some("high".into()), Some(false), Some(true))).is_none());
     }
 
-    /// Ultra code is announced as its own label, not as "Extra".
+    /// Ultracode is announced on its own line, independent of the effort: switching it
+    /// on at `high` leaves the effort line silent and says "Ultracode: Off → On".
     #[test]
-    fn ultracode_change_announces_its_own_label() {
+    fn ultracode_change_announces_its_own_line() {
         let mut asm = seeded();
-        let (_, detail) = first_notice(asm.apply_settings(None, Some("xhigh".into()), Some(true)))
+        // First read-back: the ultracode baseline is recorded silently.
+        assert!(first_notice(asm.apply_settings(None, Some("xhigh".into()), Some(false), Some(true))).is_none());
+        let (_, detail) = first_notice(asm.apply_settings(None, Some("xhigh".into()), Some(true), Some(true)))
             .expect("a notice");
-        assert_eq!(detail["from"], serde_json::json!("Extra"));
-        assert_eq!(detail["to"], serde_json::json!("Ultra code"));
+        assert_eq!(detail["control"], serde_json::json!("Ultracode"));
+        assert_eq!(detail["from"], serde_json::json!("Off"));
+        assert_eq!(detail["to"], serde_json::json!("On"));
+        // An effort move with ultracode still on announces the effort only.
+        let notices: Vec<_> = asm
+            .apply_settings(None, Some("high".into()), Some(true), Some(true))
+            .into_iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::Item(ConversationItem::Notice { detail, .. }) => Some(detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["control"], serde_json::json!("Thinking effort"));
+    }
+
+    /// A spawn seeded with ultracode never announces its own confirmation — nor its
+    /// refusal: the refusal has its own control error (see `Announced::ultracode`).
+    #[test]
+    fn seeded_ultracode_first_read_back_is_silent() {
+        let mut asm = Assembler::new();
+        asm.seed_controls(Some("opus".into()), Some("high".into()), None, true);
+        assert!(asm.state().ultracode, "the seed shows the spawn's ultracode before any round-trip");
+        let evs = asm.apply_settings(None, Some("high".into()), Some(false), Some(false));
+        assert!(first_notice(evs).is_none());
+        assert!(!asm.state().ultracode);
+        assert_eq!(asm.state().ultracode_available, Some(false));
+    }
+
+    /// Switching ultracode on where the last read-back said it can't run stays off.
+    #[test]
+    fn ultracode_optimistic_respects_known_unavailability() {
+        let mut asm = seeded();
+        asm.set_ultracode_optimistic(true);
+        assert!(asm.state().ultracode, "unknown availability: optimistic on");
+        asm.apply_settings(None, None, Some(false), Some(false));
+        asm.set_ultracode_optimistic(true);
+        assert!(!asm.state().ultracode, "known unavailable: the switch can't claim it runs");
     }
 
     /// A confirmed permission move announces; re-confirming the same mode is silent.

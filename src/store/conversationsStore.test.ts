@@ -108,18 +108,22 @@ beforeEach(() => {
 });
 
 describe("conversationsStore — per-conversation controls", () => {
-  it("setConvEffort stores the level and clears ultracode", () => {
-    useConversationsStore.getState().setConvUltracode("c1"); // turn it on first
+  it("setConvEffort stores the level and leaves Ultracode on", () => {
+    useConversationsStore.getState().setConvUltracode("c1", true); // turn it on first
     expect(conv0().ultracode).toBe(true);
     useConversationsStore.getState().setConvEffort("c1", "low");
     expect(conv0().effort).toBe("low");
-    expect(conv0().ultracode).toBe(false);
+    expect(conv0().ultracode).toBe(true); // independent since CLI 2.1.284
   });
 
-  it("setConvUltracode sets xhigh effort + the ultracode flag", () => {
-    useConversationsStore.getState().setConvUltracode("c1");
-    expect(conv0().effort).toBe("xhigh");
+  it("setConvUltracode switches the flag alone — the effort stays", () => {
+    useConversationsStore.getState().setConvEffort("c1", "medium");
+    useConversationsStore.getState().setConvUltracode("c1", true);
+    expect(conv0().effort).toBe("medium");
     expect(conv0().ultracode).toBe(true);
+    useConversationsStore.getState().setConvUltracode("c1", false);
+    expect(conv0().ultracode).toBe(false);
+    expect(conv0().effort).toBe("medium");
   });
 
   it("setConvModel stores the chosen alias", () => {

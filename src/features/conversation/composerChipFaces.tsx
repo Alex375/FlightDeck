@@ -49,8 +49,8 @@ export function ModelFace({
   );
 }
 
-/** Thinking effort — the bolt plus the level, lit when above the floor, violet on Ultra
- *  code (the tier's own tint, which the slider's animation matches). */
+/** Thinking effort — the bolt plus the level, lit when above the floor, violet while
+ *  Ultracode is on (its own tint, which the slider's animation matches). */
 export function EffortFace({
   level,
   lit,

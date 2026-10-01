@@ -16,8 +16,8 @@ import {
   type ConfigArg,
 } from "../conversation/composerActions";
 import { CLAUDE_MODELS, CODEX_MODELS } from "../conversation/models";
-import { effortLevelsForModel } from "../conversation/EffortGauge";
-import { EFFORT_LABELS } from "../../agent/subagentMeta";
+import { effortLevelsForModel, ultracodeSupportedFor } from "../conversation/EffortGauge";
+import { EFFORT_LABELS, ULTRACODE_LABEL } from "../../agent/subagentMeta";
 import { DEFAULT_MODEL } from "../../store/conversationsStore";
 import type { CustomButton } from "../conversation/composerLayout";
 import styles from "./SettingsPanel.module.css";
@@ -68,12 +68,15 @@ export function CustomButtonEditor({
   }, []);
 
   const effortsForConfig = effortLevelsForModel(cfg.model ?? DEFAULT_MODEL);
+  // Ultracode is offered for the model the button lands on — or, with no model set, any
+  // Claude conversation: the button is then judged against the conversation's own model.
+  const ultracodeOffered = !cfg.model || ultracodeSupportedFor(cfg.model);
 
   // A button with no tooltip would be a mystery glyph: the icon is all the bar shows.
   const canSave = label.trim().length > 0 && !!desc &&
     (desc.arg === "none" ||
       (desc.arg === "config"
-        ? !!(cfg.model || cfg.effort || cfg.permission)
+        ? !!(cfg.model || cfg.effort || cfg.ultracode !== undefined || cfg.permission)
         : arg.trim().length > 0));
 
   const save = () => {
@@ -213,6 +216,19 @@ export function CustomButtonEditor({
                   </option>
                 ))}
               </select>
+              {ultracodeOffered || cfg.ultracode !== undefined ? (
+                <select
+                  className="cvset-input"
+                  value={cfg.ultracode === undefined ? "" : cfg.ultracode ? "on" : "off"}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, ultracode: e.target.value === "" ? undefined : e.target.value === "on" })
+                  }
+                >
+                  <option value="">{ULTRACODE_LABEL} — leave unchanged</option>
+                  <option value="on">{ULTRACODE_LABEL} on</option>
+                  <option value="off">{ULTRACODE_LABEL} off</option>
+                </select>
+              ) : null}
               <select
                 className="cvset-input"
                 value={cfg.permission ?? ""}

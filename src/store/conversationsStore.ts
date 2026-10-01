@@ -228,9 +228,10 @@ export interface Conversation {
   // these are what we spawn/restore from and what a pre-spawn pick writes to.
   /** Model ALIAS chosen in the UI (e.g. "opus"); null → product default at spawn. */
   model: string | null;
-  /** Reasoning-effort level (low/medium/high/xhigh); null → product default. */
+  /** Reasoning-effort level (low/medium/high/xhigh/max); null → product default. */
   effort: string | null;
-  /** Whether the "ultracode" tier (xhigh + orchestration) is on. */
+  /** Whether Ultracode (standing workflow orchestration) is switched on — independent
+   *  of the effort since CLI 2.1.284, it runs at any level. Claude only. */
   ultracode: boolean;
   /** Permission mode (default/plan/acceptEdits/auto/…); null → product default. */
   permissionMode: string | null;
@@ -626,10 +627,10 @@ interface ConversationsState {
    * (`sessionId` and `handle` both null). Nothing to push live — there is no handle.
    */
   setConvBackend: (id: string, kind: BackendKind, model: string) => void;
-  /** Set a plain effort level — clears the ultracode tier. */
+  /** Set the effort level. Leaves Ultracode as it is. */
   setConvEffort: (id: string, effort: string) => void;
-  /** Enable the ultracode tier (effort xhigh + the separate flag). */
-  setConvUltracode: (id: string) => void;
+  /** Switch Ultracode on or off. Leaves the effort as it is. */
+  setConvUltracode: (id: string, on: boolean) => void;
   /** Set the permission mode. */
   setConvPermission: (id: string, mode: PermissionMode) => void;
   /**
@@ -1167,7 +1168,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   setConvEffort: (id, effort) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv) return;
-    const updated = { ...conv, effort, ultracode: false };
+    const updated = { ...conv, effort };
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
     syncToCore("upsertConversation(effort)", () => commands.upsertConversation(convToRecord(updated)));
     // Codex effort rides the next turn as an override, not a live command (see setConvModel).
@@ -1175,13 +1176,22 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       syncToCore("setEffortLevel(live)", () => commands.setEffortLevel(conv.handle!, effort));
   },
 
-  setConvUltracode: (id) => {
+  setConvUltracode: (id, on) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv) return;
-    const updated = { ...conv, effort: "xhigh", ultracode: true };
-    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
-    syncToCore("upsertConversation(ultracode)", () => commands.upsertConversation(convToRecord(updated)));
-    if (conv.handle) syncToCore("setUltracode(live)", () => commands.setUltracode(conv.handle!));
+    // Claude only: Codex has no such flag — a stray `true` there would be persisted and
+    // then shown nowhere. Switching OFF is always accepted: a fresh conversation just
+    // flipped to Codex still has to drop the Claude-side request it carried.
+    if (on && conv.kind !== "claude") return;
+    if (conv.ultracode !== on) {
+      const updated = { ...conv, ultracode: on };
+      set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+      syncToCore("upsertConversation(ultracode)", () => commands.upsertConversation(convToRecord(updated)));
+    }
+    // Pushed even when the record already agrees: the live session can still disagree
+    // (a refused switch, or one turned from elsewhere), and a click must not be swallowed.
+    if (conv.handle && conv.kind === "claude")
+      syncToCore("setUltracode(live)", () => commands.setUltracode(conv.handle!, on));
   },
 
   setConvPermission: (id, mode) => {
@@ -1588,7 +1598,7 @@ export function materializeCodexBranch(
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
     model: forkModel ?? inherit.model ?? defaultModelFor("codex"),
     effort: inherit.effort ?? defaultEffortFor("codex"),
-    // "Ultra code" is a Claude-only app tier — a Codex branch never carries it, whatever
+    // Ultracode is a Claude-only switch — a Codex branch never carries it, whatever
     // the source says (its own top rung is the `ultra` EFFORT, covered by `effort` above).
     ultracode: false,
     permissionMode: inherit.permissionMode,

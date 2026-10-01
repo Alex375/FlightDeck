@@ -14,12 +14,11 @@ export function shortModel(m: string): string {
   return m.replace(/^claude-/, "").replace(/-\d{8}$/, "").replace(/\[.*\]$/, "");
 }
 
-/** Canonical display labels for the reasoning-effort levels, folding the ultracode
- *  tier in. Claude's effort enum is low/medium/high/xhigh/max (2.1.187), `max` the
- *  deepest pure-effort level above `xhigh` ("Extra"); `ultra` is the Codex-only rung
- *  above `max` (gpt-5.6). "Ultra code" is xhigh + a separate `ultracode` flag (see
- *  EffortGauge, which reuses this map so the gauge and every read-only surface never
- *  drift). */
+/** Canonical display labels for the reasoning-effort levels. Claude's effort enum is
+ *  low/medium/high/xhigh/max (2.1.187), `max` the deepest pure-effort level above
+ *  `xhigh` ("Extra"); `ultra` is the Codex-only rung above `max` (gpt-5.6). Ultracode
+ *  is NOT a level — it is a switch of its own, at any effort ({@link ULTRACODE_LABEL}).
+ *  EffortGauge reuses this map so the gauge and every read-only surface never drift. */
 export const EFFORT_LABELS = {
   low: "Low",
   medium: "Medium",
@@ -27,14 +26,18 @@ export const EFFORT_LABELS = {
   xhigh: "Extra",
   max: "Max",
   ultra: "Ultra",
-  ultracode: "Ultra code",
 } as const;
 
-/** Friendly label for a conversation's live reasoning effort, or null when
- *  unknown (no `get_settings` read-back yet). `ultracode` outranks the raw
- *  effort. An unrecognised effort string falls through to itself (forward-compat). */
-export function effortLabel(effort: string | null | undefined, ultracode?: boolean): string | null {
-  if (ultracode) return EFFORT_LABELS.ultracode;
+/** The Ultracode toggle's name — the CLI's own spelling (`/effort ultracode`). ⚠️ The
+ *  in-thread "Ultracode: Off → On" notice (`assembler.rs::announce_ultracode`) spells it
+ *  the same way. */
+export const ULTRACODE_LABEL = "Ultracode";
+
+/** Friendly label for a conversation's live reasoning effort, or null when unknown (no
+ *  `get_settings` read-back yet). Ultracode is not folded in: it is its own toggle, shown
+ *  by tint (the violet chip), not by text. An unrecognised effort string falls through to
+ *  itself (forward-compat). */
+export function effortLabel(effort: string | null | undefined): string | null {
   if (!effort) return null;
   return (EFFORT_LABELS as Record<string, string>)[effort] ?? effort;
 }

@@ -171,9 +171,8 @@ describe("effortLevelsForModel is backend-aware", () => {
 
 describe("clampEffort into Codex steps on a backend switch", () => {
   const codexSteps = ["low", "medium", "high", "xhigh"] as const;
-  it("drops a Claude-only max / Ultra code down to the Codex top (xhigh)", () => {
+  it("drops a Claude-only max down to the Codex top (xhigh)", () => {
     expect(clampEffort("max", "gpt-5.5", [...codexSteps])).toBe("xhigh");
-    expect(clampEffort("ultracode", "gpt-5.5", [...codexSteps])).toBe("xhigh");
   });
   it("leaves a supported effort unchanged", () => {
     expect(clampEffort("high", "gpt-5.5", [...codexSteps])).toBe("high");

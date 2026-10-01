@@ -37,7 +37,11 @@ import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
 // core error subtype surfaces here the same day it surfaces on screen.
 import { NOTICE_ERROR_HEADINGS, compactSummary } from "../features/conversation/noticeView";
-import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
+import {
+  effortLevelsForModel,
+  ultracodeSupportedFor,
+  type EffortLevel,
+} from "../features/conversation/EffortGauge";
 import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
   runningBashCountsByConv,
@@ -372,7 +376,8 @@ function listConversations(session: string | null): unknown {
       backend: c.kind,
       status: statusJson(statusFor(c)),
       model: c.model,
-      effort: c.ultracode ? "ultracode" : c.effort,
+      effort: c.effort,
+      ultracode: c.ultracode,
       last_activity_at: c.lastActivityAt,
       // Background work running NOW, whatever the status: `status.background_tasks` only
       // exists in `backgrounding`, so a remote client could not otherwise tell that a
@@ -416,7 +421,8 @@ async function readConversation(args: Record<string, unknown>, session: string |
     title: conv.name,
     status: statusJson(statusFor(conv)),
     model: conv.model,
-    effort: conv.ultracode ? "ultracode" : conv.effort,
+    effort: conv.effort,
+    ultracode: conv.ultracode,
     turns,
     // Additive (C9) — same meaning as in list_conversations, see `hostedOnFor`.
     session_id: conv.sessionId,
@@ -633,19 +639,34 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
 function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
   const conv = resolveTarget(args, session);
   const effort = typeof args.effort === "string" ? args.effort.trim() : "";
-  if (!effort) throw new Error("set_conversation_effort: 'effort' is required");
-  const store = useConversationsStore.getState();
-  if (effort === "ultracode") {
-    store.setConvUltracode(conv.id);
-  } else {
+  const ultracode = typeof args.ultracode === "boolean" ? args.ultracode : null;
+  if (!effort && ultracode === null)
+    throw new Error("set_conversation_effort: pass 'effort', 'ultracode', or both");
+  // Validate EVERYTHING before applying anything: a half-applied call that then throws
+  // would leave the caller believing nothing changed.
+  if (effort === "ultracode")
+    throw new Error(
+      "set_conversation_effort: Ultracode is no longer an effort level — it runs at any " +
+        "effort; pass ultracode: true (with or without an effort)",
+    );
+  if (effort) {
     const valid = effortLevelsForModel(conv.model);
     if (!valid.includes(effort as EffortLevel))
       throw new Error(
         `set_conversation_effort: '${effort}' not available for this model (valid: ${valid.join(", ")})`,
       );
-    store.setConvEffort(conv.id, effort);
   }
-  return { conversation_id: conv.id, effort };
+  if (ultracode && (conv.kind !== "claude" || !ultracodeSupportedFor(conv.model)))
+    throw new Error(
+      conv.kind !== "claude"
+        ? "set_conversation_effort: Ultracode is Claude-only"
+        : "set_conversation_effort: this model can't run Ultracode (it needs a model with the 'xhigh' effort)",
+    );
+  const store = useConversationsStore.getState();
+  if (effort) store.setConvEffort(conv.id, effort);
+  if (ultracode !== null) store.setConvUltracode(conv.id, ultracode);
+  const after = useConversationsStore.getState().conversations.find((c) => c.id === conv.id) ?? conv;
+  return { conversation_id: conv.id, effort: after.effort, ultracode: after.ultracode };
 }
 
 async function sendMessage(args: Record<string, unknown>, session: string | null) {

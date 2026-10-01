@@ -69,6 +69,7 @@ const connectingState: SessionStatePayload = {
   output_style: null,
   effort: null,
   ultracode: false,
+  ultracode_available: null,
   activity: null,
   awaiting_permission: false,
   retry: null,

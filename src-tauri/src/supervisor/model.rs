@@ -40,9 +40,14 @@ pub struct SessionStatePayload {
     /// by `system/init` — sourced from the `get_settings` control read-back (and the
     /// spawn seed). `None` until the first read-back. Drives the effort gauge.
     pub effort: Option<String>,
-    /// Whether "ultracode" (xhigh effort + standing dynamic-workflow orchestration)
-    /// is active right now. A SEPARATE boolean flag in the CLI, not an effort value.
+    /// Whether "ultracode" (standing dynamic-workflow orchestration) is RUNNING right
+    /// now. A boolean flag of its own in the CLI, independent of the effort level since
+    /// 2.1.284 (it stays on at any effort). Effective value: requested AND available.
     pub ultracode: bool,
+    /// Whether ultracode CAN run in this session (`get_settings.applied.ultracodeAvailable`:
+    /// workflows enabled AND a model that takes `xhigh`). `None` until a read-back carries
+    /// it (an older CLI never does). The switch is offered only while this isn't `false`.
+    pub ultracode_available: Option<bool>,
     /// Fine-grained activity hint from `system/status` (e.g. `"requesting"`).
     pub activity: Option<String>,
     /// `true` while waiting on the user to answer a permission prompt.

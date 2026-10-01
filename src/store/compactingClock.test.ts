@@ -17,6 +17,7 @@ function state(activity: string | null): SessionStatePayload {
     output_style: null,
     effort: null,
     ultracode: false,
+    ultracode_available: null,
     activity,
     awaiting_permission: false,
     retry: null,

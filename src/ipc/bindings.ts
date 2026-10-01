@@ -1252,13 +1252,12 @@ async setEffortLevel(session: string, level: string) : Promise<Result<null, stri
 }
 },
 /**
- * Enable "ultracode" (xhigh effort + standing dynamic-workflow orchestration) at
- * runtime. Disabling is done by selecting any plain effort level via
- * [`set_effort_level`], which clears the flag.
+ * Switch "ultracode" (standing dynamic-workflow orchestration) on or off at runtime.
+ * Independent of the effort level since CLI 2.1.284: neither touches the other.
  */
-async setUltracode(session: string) : Promise<Result<null, string>> {
+async setUltracode(session: string, enabled: boolean) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_ultracode", { session }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_ultracode", { session, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3787,7 +3786,8 @@ backend: string;
  * defaults at spawn (opus / xhigh / default).
  * 
  * `model` is the CLI alias chosen in the UI (e.g. "opus"); `effort` is one of
- * low/medium/high/xhigh; `ultracode` is the separate xhigh+orchestration tier;
+ * low/medium/high/xhigh/max; `ultracode` is the workflow-orchestration switch,
+ * independent of the effort (CLI 2.1.284+);
  * `permission_mode` is one of the CLI modes (default/plan/acceptEdits/auto/…).
  */
 model: string | null; effort: string | null; ultracode: boolean; permission_mode: string | null; 
@@ -5421,10 +5421,17 @@ output_style: string | null;
  */
 effort: string | null; 
 /**
- * Whether "ultracode" (xhigh effort + standing dynamic-workflow orchestration)
- * is active right now. A SEPARATE boolean flag in the CLI, not an effort value.
+ * Whether "ultracode" (standing dynamic-workflow orchestration) is RUNNING right
+ * now. A boolean flag of its own in the CLI, independent of the effort level since
+ * 2.1.284 (it stays on at any effort). Effective value: requested AND available.
  */
 ultracode: boolean; 
+/**
+ * Whether ultracode CAN run in this session (`get_settings.applied.ultracodeAvailable`:
+ * workflows enabled AND a model that takes `xhigh`). `None` until a read-back carries
+ * it (an older CLI never does). The switch is offered only while this isn't `false`.
+ */
+ultracode_available: boolean | null; 
 /**
  * Fine-grained activity hint from `system/status` (e.g. `"requesting"`).
  */
@@ -5621,8 +5628,8 @@ argument_hint: string }
  */
 export type SpawnFlags = { 
 /**
- * The xhigh + orchestration tier. Not a spawn flag of its own: the session
- * re-enables it over the control channel right after `initialize`.
+ * Ultracode (standing workflow orchestration, at any effort). Not a spawn flag of
+ * its own: the session re-enables it over the control channel after `initialize`.
  */
 ultracode: boolean; 
 /**

@@ -46,7 +46,7 @@ function buildParticles(): Particle[] {
 
 /**
  * Global, mount-once overlay that replays a full-screen activation blast every
- * time the Ultra code tier flips ON (driven by the `ultraBlast` token). Renders
+ * time Ultracode is switched ON (driven by the `ultraBlast` token). Renders
  * nothing between blasts; self-unmounts after the animation and removes the
  * transient <body> shake class. Steady-state UI is never touched.
  */
@@ -128,8 +128,8 @@ export function UltraCodeBlast() {
           />
         ))}
       </div>
-      <div className="ultra-blast-title" data-text="⚡ ULTRA CODE ⚡">
-        ⚡ ULTRA CODE ⚡
+      <div className="ultra-blast-title" data-text="⚡ ULTRACODE ⚡">
+        ⚡ ULTRACODE ⚡
       </div>
     </div>,
     document.body,

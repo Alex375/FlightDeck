@@ -50,12 +50,12 @@ pub enum SessionCommand {
     },
     SetPermissionMode(PermissionMode),
     SetModel(String),
-    /// Set a plain reasoning-effort level (low/medium/high/xhigh). Also clears the
-    /// ultracode flag — selecting a plain level always turns ultracode off.
+    /// Set the reasoning-effort level (low/medium/high/xhigh/max). Leaves ultracode as
+    /// it is: the two are independent since CLI 2.1.284.
     SetEffortLevel(String),
-    /// Enable "ultracode" (xhigh effort + standing dynamic-workflow orchestration).
-    /// Disabling is done by selecting a plain [`SessionCommand::SetEffortLevel`].
-    EnableUltracode,
+    /// Switch "ultracode" (standing dynamic-workflow orchestration) on or off, at
+    /// whatever effort the session runs — the CLI's `/effort` toggle.
+    SetUltracode(bool),
     /// Ask the binary to generate a short conversation title from `description` (the
     /// user's accumulated messages so far). `seq` is a monotonic per-conversation tag
     /// echoed back in [`SessionEvent::Title`] so the UI can drop an out-of-order
@@ -148,7 +148,7 @@ pub enum SessionCommand {
 /// The controls a session starts with, threaded from the spawn config so the core
 /// can (1) seed its live state immediately (the UI shows the right values before
 /// the first `get_settings` round-trip) and (2) restore ultracode after init (the
-/// `--effort` flag sets the effort LEVEL but not the separate ultracode flag).
+/// `--effort` flag sets the effort LEVEL; ultracode is a flag of its own).
 #[derive(Debug, Clone, Default)]
 pub struct InitialControls {
     pub model: Option<String>,
@@ -207,7 +207,7 @@ enum PendingControl {
 /// Why an accepted ultracode request is not running, per the CLI's own gate
 /// (`ultracodeAvailable` = workflows enabled AND a model that takes xhigh). Rendered as
 /// `Setting "ultracode" rejected by Claude Code: <this>.` — hence no final period.
-const ULTRACODE_UNAVAILABLE: &str = "Ultra code isn't available in this session — workflows \
+const ULTRACODE_UNAVAILABLE: &str = "Ultracode isn't available in this session — workflows \
      are turned off (in settings or by an organization policy) or the current model doesn't support it";
 
 impl PendingControl {
@@ -326,8 +326,8 @@ impl SessionHandle {
         self.send(SessionCommand::SetEffortLevel(level)).await
     }
 
-    pub async fn enable_ultracode(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::EnableUltracode).await
+    pub async fn set_ultracode(&self, on: bool) -> Result<(), SessionError> {
+        self.send(SessionCommand::SetUltracode(on)).await
     }
 
     pub async fn generate_title(&self, description: String, seq: u32) -> Result<(), SessionError> {
@@ -1601,13 +1601,18 @@ struct SessionCore {
     /// Cleared once consumed (the handshake happens once per session).
     init_request_id: Option<String>,
     /// Whether to restore the ultracode flag after init (the `--effort` spawn flag
-    /// sets the effort level but not the separate ultracode flag).
+    /// sets the effort level; ultracode is a flag of its own, with no spawn flag).
     restore_ultracode: bool,
     /// Ultracode was just asked for (a pick, or the restore after `initialize`) and the
     /// next applied read-back must say whether the CLI will actually run it. It accepts
     /// the flag even when it can't (workflows off, or a model without xhigh) and only
-    /// the read-back tells — so without this check the gauge fell back with no reason.
+    /// the read-back tells — so without this check the switch fell back with no reason.
     ultracode_verdict_pending: bool,
+    /// Whether the session's settings ASK for ultracode (`ultracodeRequested`, else the
+    /// effective `ultracode` on a CLI that doesn't report it), kept so an effort change
+    /// re-asserts it in the same request — sent alone, an effort move switches it off
+    /// (see [`control::set_effort_level_request`]).
+    ultracode_requested: bool,
     /// The conversation's own overrides, to re-apply after `initialize` (see
     /// [`InitialControls::session_overrides`]). `None` when it has none.
     restore_session_overrides: Option<SessionOverrides>,
@@ -1668,6 +1673,7 @@ impl SessionCore {
             init_request_id: None,
             restore_ultracode: initial.ultracode,
             ultracode_verdict_pending: false,
+            ultracode_requested: initial.ultracode,
             auto_allow: initial
                 .session_overrides
                 .as_ref()
@@ -1965,7 +1971,7 @@ impl SessionCore {
         };
         self.send(control::session_initialize_request(&rid, sdk_servers, self.prompt_suggestions));
         // The `--effort` spawn flag set the effort LEVEL; if this conversation was
-        // running ultracode, re-enable the separate flag (it has no spawn flag).
+        // running ultracode, re-enable its own flag (it has no spawn flag).
         if self.restore_ultracode {
             self.ultracode_verdict_pending = self.send_tracked(PendingControl::SetUltracode, |rid| {
                 control::set_ultracode_request(rid, true)
@@ -2149,10 +2155,15 @@ impl SessionCore {
                     let ultracode_refused = std::mem::take(&mut self.ultracode_verdict_pending)
                         && applied.ultracode_requested == Some(true)
                         && applied.ultracode_available == Some(false);
-                    for ev in
-                        self.assembler
-                            .apply_settings(applied.model, applied.effort, applied.ultracode)
-                    {
+                    if let Some(requested) = applied.ultracode_requested.or(applied.ultracode) {
+                        self.ultracode_requested = requested;
+                    }
+                    for ev in self.assembler.apply_settings(
+                        applied.model,
+                        applied.effort,
+                        applied.ultracode,
+                        applied.ultracode_available,
+                    ) {
                         self.emit(ev);
                     }
                     if ultracode_refused {
@@ -2436,32 +2447,30 @@ impl SessionCore {
                 }
             }
             SessionCommand::SetEffortLevel(level) => {
-                // Selecting a plain level always clears ultracode first (mirrors the
-                // extension), then sets the level. get_settings reads the truth back.
-                self.send_tracked(PendingControl::SetUltracode, |rid| {
-                    control::set_ultracode_request(rid, false)
-                });
+                // The effort alone — ultracode stays as it is. While it's on, the SAME
+                // request re-asserts it: an effort move sent alone switches it off.
+                let keep_ultracode = self.ultracode_requested;
                 self.send_tracked(PendingControl::SetEffort, |rid| {
-                    control::set_effort_level_request(rid, &level)
+                    control::set_effort_level_request(rid, &level, keep_ultracode)
                 });
                 // Optimistic (snappy chip) WITHOUT announcing — the timeline line is
                 // emitted by the get_settings read-back below, i.e. the confirmed value.
-                let ev = self.assembler.set_effort_optimistic(Some(level), false);
+                let ev = self.assembler.set_effort_optimistic(level);
                 self.emit(ev);
                 self.refresh_settings();
             }
-            SessionCommand::EnableUltracode => {
-                // Ultracode = effortLevel xhigh + the separate ultracode flag, in
-                // that order (the extension's sequence).
-                self.send_tracked(PendingControl::SetEffort, |rid| {
-                    control::set_effort_level_request(rid, "xhigh")
+            SessionCommand::SetUltracode(on) => {
+                // The flag alone — the effort is left where it is (CLI >= 2.1.284).
+                let sent = self.send_tracked(PendingControl::SetUltracode, |rid| {
+                    control::set_ultracode_request(rid, on)
                 });
-                self.ultracode_verdict_pending = self.send_tracked(PendingControl::SetUltracode, |rid| {
-                    control::set_ultracode_request(rid, true)
-                });
-                let ev = self
-                    .assembler
-                    .set_effort_optimistic(Some("xhigh".to_string()), true);
+                if sent {
+                    self.ultracode_requested = on;
+                }
+                // Only a switch ON awaits a verdict: the CLI accepts it even where it
+                // can't run. Switching off drops any verdict still pending.
+                self.ultracode_verdict_pending = on && sent;
+                let ev = self.assembler.set_ultracode_optimistic(on);
                 self.emit(ev);
                 self.refresh_settings();
             }
@@ -3282,6 +3291,28 @@ mod tests {
         );
     }
 
+    /// A conversation that ran ultracode gets it back after `initialize` — the flag
+    /// ALONE: the effort came with `--effort` and must not be forced back to xhigh.
+    #[test]
+    fn initialize_restores_ultracode_without_touching_the_effort() {
+        let (event_tx, _events) = mpsc::unbounded_channel();
+        let (out_tx, mut out) = mpsc::unbounded_channel();
+        let initial = InitialControls {
+            model: Some("opus".into()),
+            effort: Some("medium".into()),
+            ultracode: true,
+            ..InitialControls::default()
+        };
+        let mut core = SessionCore::new("s".into(), initial, Arc::new(ChannelEmitter { tx: event_tx }), out_tx, None);
+        core.initialize();
+        let lines = drain(&mut out);
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "ultracode": true }));
+        assert_eq!(core.assembler.state().effort.as_deref(), Some("medium"));
+        assert!(core.assembler.state().ultracode);
+    }
+
     /// A get_settings ack updates the live state with the applied effort + ultracode
     /// (the model id is the resolved one) — the read-back source of truth.
     #[test]
@@ -3318,49 +3349,88 @@ mod tests {
         assert_eq!(last_state.model.as_deref(), Some("claude-opus-4-8"));
     }
 
-    /// Selecting a plain effort level clears ultracode (off) then sets the level,
-    /// then reads back — and the optimistic state reflects it immediately.
+    fn flag_requests(lines: &[Value]) -> Vec<&Value> {
+        lines
+            .iter()
+            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
+            .collect()
+    }
+
+    /// With ultracode off, an effort pick is ONE request carrying the level only — it
+    /// never touches the ultracode flag — then a read-back; the optimistic state
+    /// reflects it immediately.
     #[test]
-    fn set_effort_clears_ultracode_then_sets_level() {
+    fn set_effort_sends_the_level_alone() {
         let (mut core, mut events, mut out) = test_core();
         core.on_command(SessionCommand::SetEffortLevel("medium".to_string()));
         let lines = drain(&mut out);
-        // ultracode:null (off) BEFORE the effortLevel, plus a get_settings read-back.
-        let flags: Vec<_> = lines
-            .iter()
-            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
-            .collect();
-        assert_eq!(flags[0]["request"]["settings"]["ultracode"], Value::Null);
-        assert_eq!(flags[1]["request"]["settings"]["effortLevel"], json!("medium"));
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "effortLevel": "medium" }));
         assert!(find_req(&lines, "get_settings").is_some());
-        let s = drain(&mut events)
-            .into_iter()
-            .filter_map(|e| match e { SessionEvent::State(s) => Some(s), _ => None })
-            .last()
-            .unwrap();
+        let s = last_state(&mut events).unwrap();
         assert_eq!(s.effort.as_deref(), Some("medium"));
         assert!(!s.ultracode);
     }
 
-    /// Enabling ultracode sends xhigh then ultracode:true (in that order).
+    /// With ultracode on, an effort pick re-asserts it IN THE SAME request — sent alone,
+    /// an effort move switches it off (verified live, 2.1.286) — and the state keeps it.
     #[test]
-    fn enable_ultracode_sends_xhigh_then_flag() {
+    fn set_effort_keeps_ultracode_on() {
         let (mut core, mut events, mut out) = test_core();
-        core.on_command(SessionCommand::EnableUltracode);
+        core.on_command(SessionCommand::SetUltracode(true));
+        drain(&mut out);
+        core.on_command(SessionCommand::SetEffortLevel("high".to_string()));
         let lines = drain(&mut out);
-        let flags: Vec<_> = lines
-            .iter()
-            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
-            .collect();
-        assert_eq!(flags[0]["request"]["settings"]["effortLevel"], json!("xhigh"));
-        assert_eq!(flags[1]["request"]["settings"]["ultracode"], json!(true));
-        let s = drain(&mut events)
-            .into_iter()
-            .filter_map(|e| match e { SessionEvent::State(s) => Some(s), _ => None })
-            .last()
-            .unwrap();
-        assert_eq!(s.effort.as_deref(), Some("xhigh"));
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "effortLevel": "high", "ultracode": true }));
+        let s = last_state(&mut events).unwrap();
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert!(s.ultracode, "an effort change leaves ultracode on");
+    }
+
+    /// The switch sends the ultracode flag ALONE — the effort is left where it is —
+    /// `true` to turn it on, `null` to turn it off.
+    #[test]
+    fn set_ultracode_sends_the_flag_alone() {
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetEffortLevel("low".to_string()));
+        drain(&mut out);
+        core.on_command(SessionCommand::SetUltracode(true));
+        let lines = drain(&mut out);
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "ultracode": true }));
+        assert!(find_req(&lines, "get_settings").is_some());
+        let s = last_state(&mut events).unwrap();
+        assert_eq!(s.effort.as_deref(), Some("low"), "ultracode no longer forces xhigh");
         assert!(s.ultracode);
+
+        core.on_command(SessionCommand::SetUltracode(false));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"], json!({ "ultracode": null }));
+        assert!(!last_state(&mut events).unwrap().ultracode);
+        // Off: the next effort pick no longer re-asserts it.
+        core.on_command(SessionCommand::SetEffortLevel("high".to_string()));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"], json!({ "effortLevel": "high" }));
+    }
+
+    /// A read-back that reports ultracode requested (turned on from elsewhere, e.g. the
+    /// claude.ai remote) makes the next effort pick keep it too.
+    #[test]
+    fn read_back_ultracode_request_is_kept_by_the_next_effort_pick() {
+        let (mut core, _events, mut out) = test_core();
+        core.on_command(SessionCommand::SetEffortLevel("medium".to_string()));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        ack(&mut core, &gid, json!({ "applied": {
+            "model": "claude-opus-5-5", "effort": "medium", "ultracode": true,
+            "ultracodeRequested": true, "ultracodeAvailable": true
+        } }));
+        core.on_command(SessionCommand::SetEffortLevel("low".to_string()));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"]["ultracode"], json!(true));
     }
 
     /// A rejected control request surfaces a `control_error` notice — never silent.
@@ -3523,7 +3593,7 @@ mod tests {
     #[test]
     fn an_unavailable_ultracode_is_surfaced_once() {
         let (mut core, mut events, mut out) = opus_core();
-        core.on_command(SessionCommand::EnableUltracode);
+        core.on_command(SessionCommand::SetUltracode(true));
         let gid = req_id(&drain(&mut out), "get_settings");
         let refused = json!({ "applied": {
             "model": "claude-opus-5-5", "effort": "xhigh", "ultracode": false,
@@ -3534,7 +3604,7 @@ mod tests {
         let detail = notice_detail(&evs, "control_error").expect("the refusal is surfaced");
         assert_eq!(detail["control"], json!("ultracode"));
         assert_eq!(detail["message"], json!(ULTRACODE_UNAVAILABLE));
-        assert!(!core.assembler.state().ultracode, "the gauge shows what really runs");
+        assert!(!core.assembler.state().ultracode, "the switch shows what really runs");
 
         // A later read-back (e.g. after an effort change) does not repeat it.
         core.on_command(SessionCommand::SetEffortLevel("high".into()));
@@ -3548,7 +3618,7 @@ mod tests {
     #[test]
     fn an_available_ultracode_raises_no_notice() {
         let (mut core, mut events, mut out) = opus_core();
-        core.on_command(SessionCommand::EnableUltracode);
+        core.on_command(SessionCommand::SetUltracode(true));
         let gid = req_id(&drain(&mut out), "get_settings");
         ack(&mut core, &gid, json!({ "applied": {
             "model": "claude-opus-5-5", "effort": "xhigh", "ultracode": true,

@@ -164,16 +164,19 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "set_conversation_effort",
-            description: "Set the reasoning-effort level of a conversation. Valid levels depend \
-                on the model (see list_models); 'ultracode' is the top Claude tier.",
+            description: "Set the reasoning-effort level of a conversation and/or switch Ultracode \
+                (standing workflow orchestration, Claude only) on or off. The two are independent: \
+                Ultracode runs at any effort. Valid levels depend on the model (see list_models).",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
                     "conversation_id": conversation_id_prop("Target conversation id."),
                     "effort": { "type": "string",
-                        "description": "Effort level: low | medium | high | xhigh | max | ultracode." },
+                        "description": "Effort level: low | medium | high | xhigh | max (Codex: also ultra). Omit to leave it." },
+                    "ultracode": { "type": "boolean",
+                        "description": "Switch Ultracode on (true) or off (false). Omit to leave it." },
                 }),
-                &["conversation_id", "effort"],
+                &["conversation_id"],
             ),
         },
         ToolSpec {

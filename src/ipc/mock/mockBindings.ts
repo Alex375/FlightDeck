@@ -1769,18 +1769,20 @@ export const mockCommands = {
     session: string,
     level: string,
   ): Promise<Result<null, string>> {
-    // Mirror the real core's read-back: a plain level clears ultracode, then the
-    // state reflects the applied effort.
+    // Mirror the real core's read-back: the effort moves, Ultracode stays as it is
+    // (independent since CLI 2.1.284 — the core re-asserts it in the same request).
     const rec = getRecord(session);
-    rec.lastState = { ...rec.lastState, effort: level, ultracode: false };
+    rec.lastState = { ...rec.lastState, effort: level };
     sessionStateEvent.emit({ session, state: rec.lastState });
     return ok(null);
   },
 
-  async setUltracode(session: string): Promise<Result<null, string>> {
-    // Ultra code = xhigh effort + the separate flag (read-back equivalent).
+  async setUltracode(session: string, enabled: boolean): Promise<Result<null, string>> {
+    // The flag alone — the effort is left where it is. Like the CLI, a model that can't
+    // run it (no xhigh: Haiku) accepts the switch but reports it unavailable and off.
     const rec = getRecord(session);
-    rec.lastState = { ...rec.lastState, effort: "xhigh", ultracode: true };
+    const available = !/haiku/i.test(rec.lastState.model ?? "");
+    rec.lastState = { ...rec.lastState, ultracode: enabled && available, ultracode_available: available };
     sessionStateEvent.emit({ session, state: rec.lastState });
     return ok(null);
   },
