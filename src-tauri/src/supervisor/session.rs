@@ -642,6 +642,11 @@ async fn run_actor(
     // `None` by construction). See `RemoteLinkState::Connecting`'s own doc.
     if cfg.remote.is_some() {
         core.set_link_connecting();
+    } else {
+        // Its sub-agent artifacts live on THIS disk: a cold SendMessage wake can find its
+        // launching Agent there. (A remote session's live on the server — none to read.)
+        core.assembler
+            .set_launch_resolver(crate::supervisor::subagents::launch_tool_use_id);
     }
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.

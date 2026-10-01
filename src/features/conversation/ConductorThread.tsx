@@ -44,8 +44,19 @@ import type { RunFooter } from "../../agent/runClock";
 import { imageDataUrl } from "./composerAttachments";
 import { useConversationsStore, rewindConversation, forkConversation } from "../../store/conversationsStore";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
-import { useBackgroundTasksStore, useTaskByToolUse, useRunningTaskCount } from "../../store/backgroundTasksStore";
-import { fmtDuration, isBackgroundAgentInput, shortModel } from "../../agent/subagentMeta";
+import {
+  launchTask,
+  useBackgroundTasksStore,
+  useLaunchTask,
+  useRunningTaskCount,
+} from "../../store/backgroundTasksStore";
+import {
+  fmtDuration,
+  isBackgroundAgentInput,
+  isWokenRunLive,
+  launchAgentId,
+  shortModel,
+} from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
 import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
@@ -469,7 +480,9 @@ function taskDotState(o: { running: boolean; failed: boolean; stopped: boolean }
  * degrades to the live sub-thread / a clear "unavailable" note instead.
  *
  * Renders nothing for a DETACHED sub-agent (`run_in_background`): those are surfaced
- * in the pinned <AgentBar>, not inline, to keep the thread clean.
+ * in the pinned <AgentBar>, not inline, to keep the thread clean. Nor, while it is live,
+ * for a run started by a SendMessage wake (the AgentBar lists it too); once that run
+ * settles the card returns, describing its own launch (its result, not the later run's).
  */
 function SubAgentCard({
   session,
@@ -480,8 +493,13 @@ function SubAgentCard({
   toolUseId: string;
   input: JsonValue;
 }) {
-  const task = useTaskByToolUse(session, toolUseId);
   const result = useToolResult(session, toolUseId);
+  // Its task by id — or, for a woken agent the socle could not re-key onto its launch (a
+  // session hosted on another machine), by the agent id this launch gave itself.
+  const task = useLaunchTask(session, toolUseId, result?.content);
+  // Once its agent was woken, the task tracks a LATER run, while this card still describes
+  // its launch: its state comes from its own result, and the later run's figures stay off it.
+  const run = task?.woken_by != null ? undefined : task;
   const state = useSessionState(session);
   const liveIds = useSubThread(session, toolUseId);
   // Detached even if this block's input lacked `run_in_background`: the store recovers it
@@ -492,7 +510,7 @@ function SubAgentCard({
     (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
   );
 
-  const status: BackgroundTaskStatus | null = task?.status ?? null;
+  const status: BackgroundTaskStatus | null = run?.status ?? null;
   const label = field(input, "description") ?? task?.label ?? "Sub-agent";
   const subagentType = field(input, "subagent_type") ?? task?.subagent_type ?? null;
   const agentId = task?.agent_id ?? null;
@@ -539,14 +557,20 @@ function SubAgentCard({
   useEffect(() => {
     if (open) void fetchTranscript();
   }, [open, fetchTranscript]);
+  // Keyed on the TASK's status (not this card's launch-run view): a woken run settling
+  // appended to the same transcript.
+  const taskStatus = task?.status ?? null;
   useEffect(() => {
-    if (open && status && status !== "running") void fetchTranscript();
-  }, [open, status, fetchTranscript]);
+    if (open && taskStatus && taskStatus !== "running") void fetchTranscript();
+  }, [open, taskStatus, fetchTranscript]);
 
   // A detached (run_in_background) sub-agent lives in the pinned AgentBar, not inline —
   // keep the thread clean. `detachedByAck` covers the case where the live block lacked the
-  // input flag. All hooks above have run, so this conditional render is safe.
-  if (isBackgroundAgentInput(input) || detachedByAck) return null;
+  // input flag. A FOREGROUND agent woken by SendMessage runs detached too: while that run
+  // is live the AgentBar owns it (one surface per agent); the card comes back once it
+  // settles, so the first run's result is not lost from the thread. All hooks above have
+  // run, so this conditional render is safe.
+  if (isBackgroundAgentInput(input) || detachedByAck || isWokenRunLive(task)) return null;
 
   // The prompt sent to the sub-agent (the Agent tool's `prompt` input) — prepended to
   // the live view since the live sub-thread streams only the sub-agent's REPLIES. (The
@@ -620,12 +644,12 @@ function SubAgentCard({
           </span>
         </span>
       </div>
-      {model || (task && (task.tokens != null || task.duration_ms != null || task.tool_uses != null)) ? (
+      {model || (run && (run.tokens != null || run.duration_ms != null || run.tool_uses != null)) ? (
         <div className={styles.subStats + " wf-mono"}>
           {model ? <span title={model}>{shortModel(model)}</span> : null}
-          {task?.tokens != null ? <span>{fmtTokens(task.tokens)} tk</span> : null}
-          {task?.tool_uses != null ? <span>{task.tool_uses} tools</span> : null}
-          {task?.duration_ms != null ? <span>{fmtDuration(task.duration_ms)}</span> : null}
+          {run?.tokens != null ? <span>{fmtTokens(run.tokens)} tk</span> : null}
+          {run?.tool_uses != null ? <span>{run.tool_uses} tools</span> : null}
+          {run?.duration_ms != null ? <span>{fmtDuration(run.duration_ms)}</span> : null}
         </div>
       ) : null}
       {open ? <div className="cv-tool-b">{body}</div> : null}
@@ -924,14 +948,23 @@ function renderFoldedWork(
    *  Always passed (its slot map is empty when the fold is closed, since a closed block renders
    *  nothing to animate into) — see the reconciliation warning on {@link renderSegments}. */
   motion: WorkMotion,
+  /** Sub-agents whose card steps aside while a SendMessage-woken run is live (the AgentBar
+   *  shows it): not counted as steps of this fold, which they don't appear in. */
+  woken: ReadonlySet<string>,
 ): ReactNode {
+  const isWoken = (s: Segment) => s.kind === "agent" && woken.has(s.step.id);
+  const steps = (segs: Segment[]) => countWorkSteps(segs) - segs.filter(isWoken).length;
+  // A block whose only content is a card stepping aside shows nothing: hidden, NOT unmounted —
+  // unmounting would drop that card's state (its open transcript) for the wake's duration.
   // A `plan`, an `artifact` or a `question` is a decision/deliverable that must never hide
   // inside the fold, even when buried mid-round (e.g. an answered AskUserQuestion followed by
   // more work in the same group): split the fold at each so it renders in clear between runs.
   if (!folded.some(isDecisionKind)) {
     return (
       <ClaudeWorkBlock
-        count={countWorkSteps(folded)}
+        count={steps(folded)}
+        landCount={countWorkSteps(folded)}
+        hidden={folded.every(isWoken)}
         foldConv={session}
         foldKey={roundKey}
         jumpAnchors={sentMessageIds(folded)}
@@ -950,7 +983,9 @@ function renderFoldedWork(
     out.push(
       <ClaudeWorkBlock
         key={`fold-${idx}`}
-        count={countWorkSteps(c)}
+        count={steps(c)}
+        landCount={countWorkSteps(c)}
+        hidden={c.every(isWoken)}
         foldConv={session}
         foldKey={`${roundKey}#${idx}`}
         jumpAnchors={sentMessageIds(c)}
@@ -1017,20 +1052,33 @@ function CleanBlocks({
       return ids.map((id) => !!tr?.[id]);
     }),
   );
+  // The id each sub-agent LAUNCH of this round gave its agent (memoised per result), so a
+  // woken task still keyed on its SendMessage resolves to the same card the card itself
+  // does (`launchTask`). Only sub-agents: no other atom can be one.
+  const agentIds = new Set(work.flatMap((s) => (s.kind === "agent" ? [s.step.id] : [])));
+  const launchAgents = useConversationStore(
+    useShallow((s) => {
+      const tr = s.sessions[session]?.toolResults;
+      return ids.map((id) => (agentIds.has(id) ? launchAgentId(tr?.[id]?.content) : null));
+    }),
+  );
   // Per-id background-task status (or null when none). A sub-agent's tool_result can land
   // before its terminal task_notification, so the result alone would fold a card that still
-  // shows the running dot — see atomStillRunning. Shallow-compared, same scoping as above.
+  // shows the running dot — see atomStillRunning. A run started by a SendMessage wake is
+  // NOT this round's work (the AgentBar shows it, the card steps aside): it reads "woken",
+  // so the round settles on its own result instead of reopening as running, and the fold
+  // does not count a card it won't show. Shallow-compared, same scoping as above.
   const taskStatus = useBackgroundTasksStore(
-    useShallow((s) => {
+    useShallow((s): (BackgroundTaskStatus | "woken" | null)[] => {
       const tasks = s.sessions[session];
-      return ids.map((id) => {
-        if (tasks) {
-          for (const t of Object.values(tasks)) if (t.tool_use_id === id) return t.status;
-        }
-        return null;
+      return ids.map((id, i) => {
+        const t = launchTask(tasks, id, launchAgents[i] ?? null);
+        if (!t) return null;
+        return isWokenRunLive(t) ? "woken" : t.status;
       });
     }),
   );
+  const wokenIds = new Set(ids.filter((_, i) => taskStatus[i] === "woken"));
   // Is this round's fold OPEN? Then the arriving work is actually VISIBLE inside the block, so
   // it gets the landing half of the travel — growing in exactly as its outgoing copy shrinks
   // away, which is what keeps the thread's total height constant. Closed, the block renders
@@ -1049,9 +1097,13 @@ function CleanBlocks({
   });
 
   const runningById = new Map<string, boolean>();
-  ids.forEach((id, i) =>
-    runningById.set(id, atomStillRunning({ hasResult: hasResult[i] ?? false, taskStatus: taskStatus[i] ?? null })),
-  );
+  ids.forEach((id, i) => {
+    const status = taskStatus[i] ?? null;
+    runningById.set(
+      id,
+      atomStillRunning({ hasResult: hasResult[i] ?? false, taskStatus: status === "woken" ? null : status }),
+    );
+  });
   const isRunning = (id: string) => runningById.get(id) ?? false;
 
   const atoms = flattenWork(work);
@@ -1095,7 +1147,7 @@ function CleanBlocks({
 
   return (
     <>
-      {folded.length > 0 ? renderFoldedWork(session, folded, roundKey, arriving) : null}
+      {folded.length > 0 ? renderFoldedWork(session, folded, roundKey, arriving, wokenIds) : null}
       {visible.length > 0 ? renderSegments(session, visible, true, liveIdx, leaving) : null}
       {final.length > 0 ? renderSegments(session, final, false, -1) : null}
     </>

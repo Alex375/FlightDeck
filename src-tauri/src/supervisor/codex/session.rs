@@ -389,6 +389,8 @@ impl CodexCore {
                 duration_ms: None,
                 summary: None,
                 output_file: None,
+                // Codex has no SendMessage wake (every Codex sub-agent is background anyway).
+                woken_by: None,
             },
         );
     }

@@ -48,6 +48,7 @@ function taskOf(p: Partial<BackgroundTask> & { task_id: string }): BackgroundTas
     duration_ms: null,
     summary: null,
     output_file: null,
+    woken_by: null,
     ...p,
   };
 }

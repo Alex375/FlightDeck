@@ -6,6 +6,7 @@ import {
   orderWorkflowTasks,
   runningCountsByConv,
   runningBashCountsByConv,
+  launchTask,
   useBackgroundTasksStore,
 } from "./backgroundTasksStore";
 
@@ -26,6 +27,7 @@ function task(over: Partial<BackgroundTask> = {}): BackgroundTask {
     duration_ms: null,
     summary: null,
     output_file: null,
+    woken_by: null,
     ...over,
   };
 }
@@ -54,6 +56,15 @@ describe("backgroundTasksStore", () => {
     const before = useBackgroundTasksStore.getState().sessions;
     applyTask("conv-a", task()); // same snapshot (Tauri delivers at-least-once)
     expect(useBackgroundTasksStore.getState().sessions).toBe(before); // same reference
+  });
+
+  // Task 9ab0edf7 (review): a snapshot differing ONLY by the wake flag (a running task the
+  // wire then confirms as woken by the main thread) must reach the AgentBar.
+  it("a woken_by change is NOT deduped", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task({ woken_by: null }));
+    applyTask("conv-a", task({ woken_by: "tu-send" }));
+    expect(useBackgroundTasksStore.getState().sessions["conv-a"]["tk1"].woken_by).toBe("tu-send");
   });
 
   it("a model change is NOT deduped (the sub-agent's model must reach the UI)", () => {
@@ -271,5 +282,27 @@ describe("runningCountsByConv / runningBashCountsByConv", () => {
   it("both are empty objects when nothing runs anywhere", () => {
     expect(runningCountsByConv({})).toEqual({});
     expect(runningBashCountsByConv({})).toEqual({});
+  });
+});
+
+// Task 9ab0edf7 (round 3): the task an Agent launch card / fold atom stands for.
+describe("launchTask", () => {
+  const woken = task({ task_id: "agentA", tool_use_id: "tu-send", agent_id: "agentA", woken_by: "tu-send" });
+
+  it("is the task keyed on the launch id when there is one", () => {
+    const own = task({ task_id: "x", tool_use_id: "tu-launch" });
+    expect(launchTask({ x: own, agentA: woken }, "tu-launch", "agentA")).toBe(own);
+  });
+
+  it("falls back to the woken task of the agent this launch gave its OWN id to", () => {
+    expect(launchTask({ agentA: woken }, "tu-launch", "agentA")).toBe(woken);
+  });
+
+  it("never adopts another agent's task, nor a task that is not a wake", () => {
+    expect(launchTask({ agentA: woken }, "tu-launch", "agentB")).toBeUndefined();
+    expect(launchTask({ agentA: woken }, "tu-launch", null)).toBeUndefined();
+    const plain = task({ task_id: "agentA", tool_use_id: "tu-elsewhere", agent_id: "agentA" });
+    expect(launchTask({ agentA: plain }, "tu-launch", "agentA")).toBeUndefined();
+    expect(launchTask(undefined, "tu-launch", "agentA")).toBeUndefined();
   });
 });

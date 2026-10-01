@@ -80,6 +80,7 @@ import {
 import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
+import { failureNoticeDue } from "./taskFailureDedup";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
 function repoPathForConv(convId: string): string | null {
@@ -777,10 +778,10 @@ export function useGlobalSessionEvents(): void {
       // the turn_result / busy edges have long passed by then. Cheap: gated to a terminal
       // snapshot (rare) and `setReminder` is idempotent.
       if (task.status !== "running") syncReminderFromLive(session);
-      // (2) failure surfacing (de-duped per task — re-emitted on each transition).
-      if (task.status !== "failed") return;
-      if (seenFailedTasks.has(task.task_id)) return; // re-emitted per transition
-      seenFailedTasks.add(task.task_id);
+      // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
+      // woken by SendMessage re-uses its task_id for a NEW run, which may fail again: a
+      // running snapshot re-arms the notice, or that second failure would pass in silence.
+      if (!failureNoticeDue(seenFailedTasks, task)) return;
       ensureOnce(session);
       // A discreet inline notice (same weight as a failed tool step), NOT an error turn: a
       // background task failing is common and benign — Claude is told via its

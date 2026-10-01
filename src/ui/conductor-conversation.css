@@ -948,6 +948,9 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
    same margin would instead yank the neighbouring block into it. */
 .cv-aibody > .cv-motion, .cv-work-b > .cv-motion { --cv-exit-gap:13px; }
 .cv-steps-b > .cv-motion { --cv-exit-gap:1px; }
+/* A wrapper whose item renders nothing (a sub-agent card stepping aside while its
+   SendMessage-woken run shows in the AgentBar) would still hold a gap between its siblings. */
+.cv-motion:has(> .cv-motion-in:empty) { display:none; }
 .cv-motion[data-motion="exit"]:not(:last-child) { margin-bottom:calc(-1 * var(--cv-exit-gap, 0px)); }
 .cv-motion[data-motion="enter"]:first-child { --cv-exit-gap:0px; }
 /* The translate rides the CONTENT inside the clipping window (never the window itself, which

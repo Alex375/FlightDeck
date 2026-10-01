@@ -3150,7 +3150,11 @@ export type BackgroundTask = {
 task_id: string; kind: BackgroundTaskKind; 
 /**
  * The `tool_use` block that spawned the task (== `parent_tool_use_id` of any
- * streamed child content). Lets the UI anchor the task under its tool card.
+ * streamed child content). Lets the UI anchor the task under its tool card. One
+ * exception: a sub-agent woken by `SendMessage` in a process that never saw its launch,
+ * when the launch could not be found on disk (a session hosted on another machine) —
+ * then the waking `SendMessage`'s id, while its content keeps streaming under the
+ * launch (the front resolves it: `agentStreamKey`).
  */
 tool_use_id: string | null; 
 /**
@@ -3180,9 +3184,9 @@ subagent_type: string | null;
 model: string | null; 
 /**
  * The sub-agent's id (`Agent` only), i.e. the key for [`super::subagents::load_subagent_transcript`].
- * Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), since
- * the wire carries it only inside that path. Lets the UI drill into the transcript
- * without re-parsing the path itself.
+ * Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), or — for
+ * a sub-agent woken by `SendMessage` — its task_id, which IS its agentId (the
+ * SendMessage's `to`). Lets the UI drill into the transcript without re-parsing.
  */
 agent_id: string | null; status: BackgroundTaskStatus; 
 /**
@@ -3212,7 +3216,18 @@ summary: string | null;
  * tool_result at start, then `task_notification.output_file`) is the ONLY reliable
  * way to read it back. For an `Agent` it is the sub-agent transcript path.
  */
-output_file: string | null }
+output_file: string | null; 
+/**
+ * `Agent` only: the tool_use id of the MAIN-THREAD `SendMessage` that started this
+ * sub-agent's CURRENT run (a wake re-uses its task_id), or `None` when the current run is
+ * not such a wake. A woken agent works detached — the caller is never blocked on it — so
+ * it is the conversation's background work whatever its launch was, and the UI lists it
+ * as such; the id also tells the drill-in which message that run answers. Per run: a
+ * later run started otherwise (a sub-agent waking it) clears it. Not derivable from
+ * `tool_use_id`, which names the launch (or, when it could not be found, the waking
+ * SendMessage — see `tool_use_id`).
+ */
+woken_by: string | null }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`

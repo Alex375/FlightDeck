@@ -58,6 +58,7 @@ import {
 } from "../features/conversation/agentMessage";
 import { pushAgentMessageToast, pushConversationCreatedToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
+import { isDetachedAgentTask } from "./subagentMeta";
 import type { AgentStatus } from "./status";
 import type { NoticeItem, SessionEntry, Turn } from "../store/types";
 import type { View } from "../ui/shortcuts";
@@ -465,13 +466,13 @@ async function stopStream(args: Record<string, unknown>, session: string | null)
  * A task the registry holds that is NOT background work: a FOREGROUND sub-agent (the
  * `Agent` tool without run_in_background). It is part of the running turn and renders
  * inline in the thread, never in the pinned bars — AgentBar keeps only the detached ones
- * (`bgAgentIds`). Codex has no detached/foreground split: every sub-agent is background
- * (mirrors AgentBar).
+ * (`isDetachedAgentTask`: a detached launch, or a SendMessage wake). Codex has no
+ * detached/foreground split: every sub-agent is background (mirrors AgentBar).
  */
 function isForegroundTask(t: BackgroundTask, conv: Conversation): boolean {
   if (t.kind !== "agent" || conv.kind === "codex") return false;
   const detached = useConversationStore.getState().sessions[conv.id]?.bgAgentIds ?? [];
-  return t.tool_use_id == null || !detached.includes(t.tool_use_id);
+  return !isDetachedAgentTask(t, new Set(detached));
 }
 
 /** How many background tasks are running now — what the desktop's pinned bars list. */

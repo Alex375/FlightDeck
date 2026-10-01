@@ -2074,6 +2074,25 @@ mod tests {
                     }
                 }
                 CliMessage::User(u) => {
+                    // A sub-agent's own prompt (launch OR wake) streams as a TEXT user line
+                    // under its spawning tool_use — log it so the wake's correlation key
+                    // (which parent, which text) is visible.
+                    if let Some(parent) = u.parent_tool_use_id.as_deref() {
+                        let text = match u.message.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Array(a)) => a
+                                .iter()
+                                .filter(|x| x.get("type").and_then(Value::as_str) == Some("text"))
+                                .filter_map(|x| x.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            _ => String::new(),
+                        };
+                        if !text.is_empty() {
+                            let head: String = text.chars().take(240).collect();
+                            logln!("[sub user text] parent={parent} uuid={:?} text={:?}", u.uuid, head);
+                        }
+                    }
                     for (id, text) in tool_results(&u.message) {
                         let head: String = text.chars().take(240).collect();
                         logln!("[tool_result] tool_use_id={id} text={:?}", head);

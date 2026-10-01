@@ -15,7 +15,7 @@ import { useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { useWorkflowJournal } from "../../store/workflowJournal";
-import { useToolResult } from "../../store/conversationStore";
+import { useAgentStreamKey, useToolResult } from "../../store/conversationStore";
 import type { BackgroundTask, BackgroundTaskKind } from "../../ipc/client";
 import { resolveAgentId, runIdFromResult, shortModel, taskStatusDot } from "../../agent/subagentMeta";
 import { TranscriptPopover } from "../conversation/TranscriptPopover";
@@ -68,6 +68,9 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   const liveOpen = openTask ? tasks[openTask.task_id] ?? openTask : null;
   const openedResult = useToolResult(convId, openTask?.tool_use_id ?? "");
   const openedAgentId = openTask ? resolveAgentId(openTask, openedResult?.content) : null;
+  // Where its live messages stream — not always `tool_use_id` for an agent woken after a
+  // reload (see agentStreamKey). Read off the live task, like `running`.
+  const openedStreamKey = useAgentStreamKey(convId, liveOpen);
   // A workflow drills into the 3-panel detail (not a transcript); its run id lives in the
   // Workflow tool_result ack.
   const openedRunId =
@@ -201,7 +204,8 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         sessionId={claudeSessionId}
         agentId={openedAgentId}
         liveSession={convId}
-        toolUseId={openTask?.tool_use_id ?? null}
+        toolUseId={openedStreamKey}
+        wokenBy={liveOpen?.woken_by ?? null}
         running={liveOpen?.status === "running"}
         label={openTask?.label ?? "Sub-agent"}
         subtitle={

@@ -137,6 +137,7 @@ const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
   duration_ms: null,
   summary: null,
   output_file: null,
+  woken_by: null,
   ...over,
 });
 
@@ -294,6 +295,9 @@ describe("appControl — conversations", () => {
           b2: bgTask({ task_id: "b2", kind: "agent", tool_use_id: "tu-bg" }), // detached
           b3: bgTask({ task_id: "b3", kind: "agent", tool_use_id: "tu-fg" }), // foreground: part of the turn
           b4: bgTask({ task_id: "b4", status: "completed" }), // finished: not counted
+          // Woken by SendMessage after a reload: carries the SendMessage's id, which no
+          // bgAgentIds entry holds — still background work.
+          b5: bgTask({ task_id: "b5", kind: "agent", tool_use_id: "tu-send", woken_by: "tu-send" }),
         },
       },
     });
@@ -303,7 +307,7 @@ describe("appControl — conversations", () => {
       null,
       helpers(),
     )) as Array<Record<string, unknown>>;
-    expect(out[0].background_tasks).toBe(2);
+    expect(out[0].background_tasks).toBe(3);
     expect(out[1].background_tasks).toBe(0);
   });
 

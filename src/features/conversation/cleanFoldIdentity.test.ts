@@ -67,6 +67,7 @@ function seed(busy: boolean) {
     openBubble: {},
     subThreads: {},
     bgAgentIds: [],
+    wakes: {},
     todos: [],
     toolDurations: {},
     toolStartedAt: {},
