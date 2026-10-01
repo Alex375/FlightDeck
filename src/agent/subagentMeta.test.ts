@@ -4,9 +4,140 @@ import {
   EFFORT_LABELS,
   fmtDuration,
   isDetachedAgentAck,
+  agentIdFromResult,
+  isDetachedAgentTask,
+  isWokenRunLive,
+  launchAgentId,
+  reportsFailure,
   runIdFromResult,
   shortModel,
 } from "./subagentMeta";
+import type { BackgroundTask } from "../ipc/client";
+
+describe("isDetachedAgentTask", () => {
+  const agent = (over: Partial<BackgroundTask>): BackgroundTask => ({
+    task_id: "a1",
+    kind: "agent",
+    tool_use_id: null,
+    label: null,
+    command: null,
+    subagent_type: null,
+    model: null,
+    agent_id: null,
+    status: "running",
+    progress: null,
+    tokens: null,
+    tool_uses: null,
+    duration_ms: null,
+    summary: null,
+    output_file: null,
+    woken_by: null,
+    ...over,
+  });
+  const bg = new Set(["tu-bg"]);
+
+  it("is a detached launch when its Agent tool_use is in the background set", () => {
+    expect(isDetachedAgentTask(agent({ tool_use_id: "tu-bg" }), bg)).toBe(true);
+  });
+
+  it("is foreground when its launch is not detached", () => {
+    expect(isDetachedAgentTask(agent({ tool_use_id: "tu-fg" }), bg)).toBe(false);
+    expect(isDetachedAgentTask(agent({ tool_use_id: null }), bg)).toBe(false);
+  });
+
+  // Task 9ab0edf7: after a reload between launch and wake, the woken task carries the
+  // SendMessage's tool_use_id — never in the set — and used to read as foreground.
+  it("is detached when woken by SendMessage, whatever its tool_use_id", () => {
+    expect(isDetachedAgentTask(agent({ tool_use_id: "tu-send", woken_by: "tu-send" }), bg)).toBe(true);
+    expect(isDetachedAgentTask(agent({ tool_use_id: "tu-fg", woken_by: "tu-send" }), bg)).toBe(true);
+  });
+
+  // Option A of the review: while a woken run is live the AgentBar owns it, so the inline
+  // card of a foreground-launched agent steps aside — and comes back once it settles.
+  it("isWokenRunLive holds only while a woken run is running", () => {
+    expect(isWokenRunLive(agent({ woken_by: "tu-send", status: "running" }))).toBe(true);
+    expect(isWokenRunLive(agent({ woken_by: "tu-send", status: "completed" }))).toBe(false);
+    expect(isWokenRunLive(agent({ woken_by: null, status: "running" }))).toBe(false);
+    expect(isWokenRunLive(undefined)).toBe(false);
+  });
+});
+
+describe("agentIdFromResult", () => {
+  it("skips the 2.1.286 ack's 'agentId below' preamble and reads the real id", () => {
+    const ack =
+      "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\n" +
+      "agentId: a68e26aa615c9f436 (internal ID - do not mention to user.)";
+    expect(agentIdFromResult([{ type: "text", text: ack }])).toBe("a68e26aa615c9f436");
+  });
+
+  it("reads the older ack, the SendMessage JSON result and a transcript path", () => {
+    expect(agentIdFromResult("Async agent launched successfully.\nagentId: abc123\nworking")).toBe("abc123");
+    expect(
+      agentIdFromResult('{"success":true,"message":"Resuming agent a68e26a","resumedAgentId":"a68e26aa615c9f436"}'),
+    ).toBe("a68e26aa615c9f436");
+    expect(agentIdFromResult('{"agent_id": "x_1"}')).toBe("x_1");
+    expect(agentIdFromResult("see /p/subagents/agent-deadbeef.jsonl")).toBe("deadbeef");
+  });
+
+  it("returns null when no id is named", () => {
+    expect(agentIdFromResult("The agentId identifies each sub-agent.")).toBeNull();
+    expect(agentIdFromResult(undefined)).toBeNull();
+  });
+
+  // A foreground agent's result is its free-prose report, with the CLI's trailer appended.
+  it("reads the CLI trailer of a foreground report that names other 'agent_id:' tokens first", () => {
+    const report = "The model has `agent_id: Option<String>` and `resolveAgentId:168`.\n\nagentId: a87dab34494f95f13 (use SendMessage with to: 'a87dab34494f95f13' to continue this agent)";
+    expect(agentIdFromResult(report)).toBe("a87dab34494f95f13");
+    // Trailer not at a line start: still the LAST labelled id.
+    expect(agentIdFromResult("type { agentId: string } — agentId: a87dab34494f95f13 (use SendMessage")).toBe("a87dab34494f95f13");
+    // '=' is no separator the CLI writes: prose like 'agent_id = Some(id)' is not an id.
+    expect(agentIdFromResult("set agent_id = Some(task_id). agentId: abc (use SendMessage")).toBe("abc");
+  });
+});
+
+// Task 9ab0edf7 (review round 3): a launch is tied to an agent only by the id the CLI gives
+// it in that launch's own result — never by an id its report merely mentions.
+describe("launchAgentId", () => {
+  it("reads the ack line and the foreground trailer", () => {
+    expect(launchAgentId("Async agent launched successfully. (… the agentId below …)\nagentId: a68e26aa615c9f436 (internal")).toBe(
+      "a68e26aa615c9f436",
+    );
+    expect(launchAgentId("Report.\n\nagentId: a87d (use SendMessage with to: 'a87d')")).toBe("a87d");
+  });
+
+  it("reads a trailer sent as its OWN block (blocks join by newline, not space)", () => {
+    const content = [
+      { type: "text", text: "The ack looks like:\nagentId: aaaa (internal ID…)" },
+      { type: "text", text: "agentId: bbbb (use SendMessage with to: 'bbbb')" },
+    ];
+    expect(launchAgentId(content)).toBe("bbbb");
+    expect(agentIdFromResult(content)).toBe("bbbb");
+  });
+
+  it("ignores ids a report merely mentions (prose, paths, JSON)", () => {
+    expect(launchAgentId("Read subagents/agent-a68e26aa615c9f436.jsonl — helper (agentId: a68e) done")).toBeNull();
+    expect(launchAgentId('{"success":true,"resumedAgentId":"a68e"}')).toBeNull();
+    expect(launchAgentId(undefined)).toBeNull();
+  });
+
+  it("is memoised per content object", () => {
+    const content = [{ type: "text", text: "agentId: cafe" }];
+    expect(launchAgentId(content)).toBe("cafe");
+    (content[0] as { text: string }).text = "agentId: other"; // same object: cached answer
+    expect(launchAgentId(content)).toBe("cafe");
+  });
+});
+
+describe("reportsFailure", () => {
+  it("is true only for an explicit success:false body", () => {
+    expect(reportsFailure('{"success":false,"message":"Agent x was stopped by the user"}')).toBe(true);
+    expect(reportsFailure([{ type: "text", text: '{"success":false,"message":"no"}' }])).toBe(true);
+    expect(reportsFailure('{"success":true,"message":"Resuming agent x"}')).toBe(false);
+    expect(reportsFailure("Agent x was stopped (completed); resumed it")).toBe(false);
+    expect(reportsFailure('the reply mentions "success": false in prose')).toBe(false);
+    expect(reportsFailure(undefined)).toBe(false);
+  });
+});
 
 describe("fmtDuration", () => {
   it("formats ms, seconds, then minutes + seconds", () => {

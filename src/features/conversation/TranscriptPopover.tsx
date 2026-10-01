@@ -4,11 +4,11 @@
 // closes it. The body reuses the read-only <SubAgentTranscript> renderer; the items
 // are read from disk via `load_subagent_transcript` when it opens.
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { ConversationItem } from "../../ipc/client";
 import { commands } from "../../ipc/client";
-import { useSubAgentPrompt, useSubThread } from "../../store/conversationStore";
+import { useAgentWake, useSubAgentPrompt, useSubThread } from "../../store/conversationStore";
 import { Ico } from "../../ui/kit";
 import { SubAgentTranscript } from "./SubAgentTranscript";
 import { LiveSubThread } from "./LiveSubThread";
@@ -22,6 +22,7 @@ export function TranscriptPopover({
   liveSession,
   toolUseId,
   running = false,
+  wokenBy,
   label,
   subtitle,
   onClose,
@@ -37,6 +38,9 @@ export function TranscriptPopover({
   toolUseId?: string | null;
   /** Whether the task is still running (prefer the live sub-thread while it is). */
   running?: boolean;
+  /** The SendMessage that started the task's current run (`BackgroundTask.woken_by`), when
+   *  it is a wake: the live view then follows THAT run. */
+  wokenBy?: string | null;
   label: ReactNode;
   /** Optional second line in the header (e.g. subagent_type · model). */
   subtitle?: ReactNode;
@@ -51,10 +55,17 @@ export function TranscriptPopover({
   // transcript isn't written yet) but the agent streamed into the store, render that —
   // the same source the inline <SubAgentCard> uses. Fixes the FlightDeck drill-down
   // showing "transcript unavailable" for an agent that renders fine in the thread.
-  const liveIds = useSubThread(liveSession ?? "", toolUseId ?? "");
+  const threadIds = useSubThread(liveSession ?? "", toolUseId ?? "");
   // The prompt the sub-agent was launched with — the live sub-thread carries only its
   // replies, so prepend it as the opening user turn (the disk transcript already has it).
-  const promptText = useSubAgentPrompt(liveSession ?? "", toolUseId ?? "");
+  const launchPrompt = useSubAgentPrompt(liveSession ?? "", toolUseId ?? "");
+  // A WOKEN run answers the SendMessage that woke it, not the launch prompt — and the
+  // sub-thread may still hold the earlier run's turns (no reload in between): show that
+  // message, then only the turns that came after it.
+  const wake = useAgentWake(liveSession ?? "", wokenBy ?? null);
+  const cut = wake ? (wake.cuts[toolUseId ?? ""] ?? 0) : 0;
+  const liveIds = useMemo(() => (cut > 0 ? threadIds.slice(cut) : threadIds), [threadIds, cut]);
+  const promptText = wake ? wake.message : launchPrompt;
 
   // Open at the BOTTOM (most recent), like the conversation thread: a sub-agent's
   // transcript is read from its latest output, not its opening prompt. Tracks both the
@@ -107,7 +118,9 @@ export function TranscriptPopover({
   switch (
     resolveTranscriptSource({
       running,
-      liveCount: liveIds.length,
+      // A live woken run opens on the message that woke it, even before its first turn —
+      // never on the disk transcript, which still ends on the PREVIOUS run.
+      liveCount: liveIds.length + (wake?.message ? 1 : 0),
       diskCount: items?.length ?? 0,
       loading,
       error: err != null,

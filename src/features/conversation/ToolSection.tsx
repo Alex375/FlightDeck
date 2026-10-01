@@ -399,12 +399,20 @@ export function ToolSection({
  */
 export function ClaudeWorkBlock({
   count,
+  landCount,
+  hidden = false,
   children,
   foldConv,
   foldKey,
   jumpAnchors,
 }: {
   count: number;
+  /** The count whose growth means work LANDED in the block (the pulse), when it differs from
+   *  the shown `count` — a card coming back from stepping aside is no arrival. */
+  landCount?: number;
+  /** Nothing in it to show right now (its only card steps aside): kept MOUNTED but not
+   *  displayed, so the children keep their state until they show again. */
+  hidden?: boolean;
   children: ReactNode;
   /** When BOTH are set, the open/collapsed state is remembered per conversation across
    *  switches (and app restarts) via the workFold store — the live thread passes them.
@@ -437,17 +445,19 @@ export function ClaudeWorkBlock({
   // glyph is what REPLAYS the animation when several items land in a row (a CSS animation
   // does not restart just because an attribute's value changed).
   const [land, setLand] = useState(0);
-  const prevCount = useRef(count);
+  const arrivals = landCount ?? count;
+  const prevCount = useRef(arrivals);
   useEffect(() => {
-    if (count > prevCount.current) setLand((n) => n + 1);
-    prevCount.current = count;
-  }, [count]);
+    if (arrivals > prevCount.current) setLand((n) => n + 1);
+    prevCount.current = arrivals;
+  }, [arrivals]);
   // Backend-neutral label (the fold serves both Claude and Codex conversations),
   // matching the neighbouring labels ("Executed N steps").
   const label = count > 0 ? `Work · ${count} step${count > 1 ? "s" : ""}` : "Work";
   return (
     <div
       className="cv-work"
+      hidden={hidden}
       data-jump-anchors={anchored ? jumpAnchors!.join(" ") : undefined}
       data-fold-key={anchored ? foldKey : undefined}
     >

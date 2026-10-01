@@ -10,7 +10,8 @@
 
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import type { BackgroundTask } from "../ipc/client";
+import type { BackgroundTask, JsonValue } from "../ipc/client";
+import { launchAgentId } from "../agent/subagentMeta";
 
 /** Field-wise equality (everything but the immutable `task_id`), so a duplicated
  *  snapshot — Tauri delivery is at-least-once — is a no-op instead of a re-render. */
@@ -29,7 +30,8 @@ function taskEqual(a: BackgroundTask, b: BackgroundTask): boolean {
     a.tool_uses === b.tool_uses &&
     a.duration_ms === b.duration_ms &&
     a.summary === b.summary &&
-    a.output_file === b.output_file
+    a.output_file === b.output_file &&
+    a.woken_by === b.woken_by
   );
 }
 
@@ -298,6 +300,39 @@ export function runningBashCountsByConv(
 
 export const useRunningBashCountsByConv = (): Record<string, number> =>
   useBackgroundTasksStore(useShallow((s) => runningBashCountsByConv(s.sessions)));
+
+/**
+ * The task an `Agent` launch block stands for: the one keyed on its tool_use id, else — the
+ * fallback for a woken task the socle could not re-key onto its launch (a session hosted on
+ * another machine), still keyed on the waking SendMessage — the woken task of the agent this
+ * launch gave its OWN id to (`launchAgent`, from {@link launchAgentId}). Exact id equality:
+ * a launch merely mentioning another agent never adopts it. Shared by the inline card and
+ * the clean-output fold, so both see the same task.
+ */
+export function launchTask(
+  tasks: Record<string, BackgroundTask> | undefined,
+  launchToolUseId: string,
+  launchAgent: string | null,
+): BackgroundTask | undefined {
+  if (!tasks) return undefined;
+  let woken: BackgroundTask | undefined;
+  for (const t of Object.values(tasks)) {
+    if (t.tool_use_id === launchToolUseId) return t;
+    if (launchAgent && !woken && t.woken_by != null && t.agent_id === launchAgent) woken = t;
+  }
+  return woken;
+}
+
+/** {@link launchTask} for one launch block. A stable snapshot reference → re-renders only on
+ *  a real change. */
+export const useLaunchTask = (
+  session: string,
+  launchToolUseId: string,
+  launchResult: JsonValue | undefined,
+): BackgroundTask | undefined =>
+  useBackgroundTasksStore((s) =>
+    launchTask(s.sessions[session], launchToolUseId, launchAgentId(launchResult)),
+  );
 
 /**
  * The background task spawned by a given `tool_use` block (an `Agent` / `Bash` /

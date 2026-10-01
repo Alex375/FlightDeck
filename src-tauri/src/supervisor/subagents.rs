@@ -131,6 +131,44 @@ fn load_subagent_transcript_in(
     }
 }
 
+/// The `tool_use` id of the `Agent` call that LAUNCHED sub-agent `agent_id`, read from the
+/// sidecar the CLI writes beside its transcript (`subagents/agent-<agentId>.meta.json`:
+/// `{"agentType","description","toolUseId",…}`). The CLI reads that same field back when a
+/// `SendMessage` wakes the agent, and streams the woken agent's messages under it — so it is
+/// the exact key that ties a wake seen by a fresh process back to its launch.
+///
+/// `None` when there is no sidecar (a session hosted on another machine, an older binary)
+/// or it carries no id. A sidecar that exists but can't be read or parsed is logged first —
+/// a real failure, never silently equated with "absent".
+pub fn launch_tool_use_id(session_id: &str, agent_id: &str) -> Option<String> {
+    launch_tool_use_id_in(&claude_config_dir()?, session_id, agent_id)
+}
+
+fn launch_tool_use_id_in(config_dir: &Path, session_id: &str, agent_id: &str) -> Option<String> {
+    if !is_safe_id(session_id) || !is_safe_id(agent_id) {
+        eprintln!("[subagents] refusing unsafe id (session={session_id:?}, agent={agent_id:?})");
+        return None;
+    }
+    let file_name = format!("agent-{agent_id}.meta.json");
+    let path = session_dirs(config_dir, session_id)
+        .into_iter()
+        .find_map(|dir| find_file_recursive(&dir.join("subagents"), &file_name, MAX_SUBAGENT_DEPTH))?;
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(meta) => meta
+            .get("toolUseId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        Err(e) => {
+            eprintln!("[subagents] cannot read sub-agent metadata {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 /// Read a workflow run's manifest (`workflows/<run_id>.json`) into a [`WorkflowRun`].
 /// `run_id` is the `"wf_…"` id; for convenience a bare id is also tried with the `wf_` prefix.
 ///
@@ -682,6 +720,35 @@ mod tests {
     use super::*;
     use crate::supervisor::model::NormalizedBlock;
     use std::io::Write;
+
+    /// The launching `Agent` id comes from the sidecar beside the sub-agent transcript;
+    /// absent, unparseable or id-less metadata yields `None`, and an unsafe id never reaches
+    /// the filesystem.
+    #[test]
+    fn launch_tool_use_id_reads_the_sub_agent_sidecar() {
+        let base = std::env::temp_dir().join(format!("tosse-sub-meta-{}", std::process::id()));
+        let session_id = "ssssssss-5555-6666-7777-888888888888";
+        let subagents = base.join("projects").join("-a-cwd").join(session_id).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join("agent-a68e26aa615c9f436.meta.json"),
+            r#"{"agentType":"general-purpose","description":"Sleep","toolUseId":"toolu_01Yc4","spawnDepth":1,"requestShape":"background"}"#,
+        )
+        .unwrap();
+        std::fs::write(subagents.join("agent-broken.meta.json"), "{not json").unwrap();
+        std::fs::write(subagents.join("agent-noid.meta.json"), r#"{"agentType":"Explore"}"#).unwrap();
+
+        assert_eq!(
+            launch_tool_use_id_in(&base, session_id, "a68e26aa615c9f436").as_deref(),
+            Some("toolu_01Yc4")
+        );
+        assert_eq!(launch_tool_use_id_in(&base, session_id, "absent"), None);
+        assert_eq!(launch_tool_use_id_in(&base, session_id, "broken"), None);
+        assert_eq!(launch_tool_use_id_in(&base, session_id, "noid"), None);
+        assert_eq!(launch_tool_use_id_in(&base, session_id, "../../etc"), None);
+        assert_eq!(launch_tool_use_id_in(&base, "other-session", "a68e26aa615c9f436"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Build a fake `<config>/projects/<slug>/<session_id>/` artifact tree and read
     /// each artifact back through the public (config-dir-injected) readers.

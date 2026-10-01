@@ -55,6 +55,7 @@ function sessionEntry(opts: {
     openBubble: {},
     subThreads: {},
     bgAgentIds: [],
+    wakes: {},
     todos: [],
     turnSeen: opts.turnSeen ?? true,
   } as unknown as SessionEntry;

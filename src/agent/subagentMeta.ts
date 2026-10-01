@@ -69,6 +69,25 @@ export function isBackgroundAgentInput(input: JsonValue): boolean {
   return isRunInBackground(input);
 }
 
+/**
+ * Is this Claude sub-agent task DETACHED background work (AgentBar, background counts) rather
+ * than a foreground agent rendering inline in its turn? Either its launching `Agent` tool_use
+ * is one of the conversation's detached launches (`bgIds`, from the store's `bgAgentIds`), or
+ * its current run was started by a main-thread `SendMessage` wake (`woken_by`) — a woken agent
+ * always runs detached, whatever its launch, and may even carry the SendMessage's id, which
+ * `bgIds` never holds. Not for Codex, which has no detached/foreground split.
+ */
+export function isDetachedAgentTask(t: BackgroundTask, bgIds: ReadonlySet<string>): boolean {
+  return t.woken_by != null || (t.tool_use_id != null && bgIds.has(t.tool_use_id));
+}
+
+/** Is this sub-agent in a run started by a `SendMessage` wake right now? Such a run is
+ *  listed in the AgentBar ({@link isDetachedAgentTask}), so the inline card of a
+ *  foreground-launched agent steps aside meanwhile — the same agent never shows twice. */
+export function isWokenRunLive(t: BackgroundTask | null | undefined): boolean {
+  return !!t && t.woken_by != null && t.status === "running";
+}
+
 /** A background task's coarse lifecycle → the design's status-dot colour token. */
 export function taskStatusDot(s: BackgroundTaskStatus): StreamState {
   switch (s) {
@@ -104,13 +123,73 @@ export function resultText(content: unknown): string {
  * back-fills `BackgroundTask.agent_id`). Returns null when nothing matches.
  */
 export function agentIdFromResult(content: JsonValue | undefined): string | null {
-  const text = resultText(content);
+  const own = launchAgentId(content);
+  if (own) return own;
+  const text = blocksText(content);
   if (!text) return null;
-  const byLabel = text.match(/agent[_ ]?id["\s:]+([A-Za-z0-9_-]+)/i);
-  if (byLabel) return byLabel[1];
+  // A SendMessage answers with JSON (`"resumedAgentId":"<id>"`).
+  const json = text.match(/"(?:resumed)?agentId"\s*:\s*"([A-Za-z0-9_-]+)"/i);
+  if (json) return json[1];
+  // Any labelled id, the LAST one. The colon is required: the 2.1.286 launch ack opens with
+  // "…including the agentId below, into a user-facing reply" — a separator-only pattern read
+  // "below".
+  const labelled = [...text.matchAll(/agent[_ ]?id"?\s*:\s*"?([A-Za-z0-9_-]+)/gi)];
+  if (labelled.length > 0) return labelled[labelled.length - 1][1];
   const byFile = text.match(/agent-([A-Za-z0-9_-]+)\.jsonl/);
   if (byFile) return byFile[1];
   return null;
+}
+
+/** Does a tool_result body say `{"success": false, …}`? That is how `SendMessage` reports a
+ *  failure (agent stopped by the user, could not be resumed, …): the CLI never sets
+ *  `is_error` on it. Mirrors the socle's `send_message_reports_failure`. */
+export function reportsFailure(content: JsonValue | undefined): boolean {
+  const failed = (text: string) => {
+    if (!text.includes('"success"')) return false;
+    try {
+      const v = JSON.parse(text) as { success?: unknown } | null;
+      return v !== null && typeof v === "object" && v.success === false;
+    } catch {
+      return false; // not JSON: prose from an older binary — no evidence of failure
+    }
+  };
+  if (typeof content === "string") return failed(content);
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (b) => !!b && typeof b === "object" && "text" in b && typeof b.text === "string" && failed(b.text),
+  );
+}
+
+/** A tool_result's text blocks joined by NEWLINES (not {@link resultText}'s spaces), so a
+ *  line the CLI puts in its own block still starts a line. */
+function blocksText(content: JsonValue | undefined): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((b) => (b && typeof b === "object" && "text" in b ? String((b as { text: unknown }).text) : ""))
+    .join("\n");
+}
+
+const launchIds = new WeakMap<object, string | null>();
+
+/**
+ * The id an `Agent`/`Task` LAUNCH result gives its own sub-agent — only the line the CLI
+ * writes itself, `agentId: <id>` at the start of a line: the background launch ack, or the
+ * trailer appended to a foreground agent's report (`agentId: <id> (use SendMessage…)`). The
+ * LAST such line: a report is free prose and may quote such a line before the trailer; no id
+ * mentioned anywhere else (prose, paths, JSON) counts — that would tie a card to an agent it
+ * merely talks about. Memoised per content object (store contents are stable references), so
+ * selectors may call it on every update.
+ */
+export function launchAgentId(content: JsonValue | undefined): string | null {
+  if (content !== null && typeof content === "object") {
+    const hit = launchIds.get(content);
+    if (hit !== undefined) return hit;
+  }
+  const lines = [...blocksText(content).matchAll(/^agentId:\s*([A-Za-z0-9_-]+)/gm)];
+  const id = lines.length > 0 ? lines[lines.length - 1][1] : null;
+  if (content !== null && typeof content === "object") launchIds.set(content, id);
+  return id;
 }
 
 /**

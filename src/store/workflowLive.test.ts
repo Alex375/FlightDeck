@@ -18,6 +18,7 @@ function wfTask(over: Partial<BackgroundTask> & { task_id: string }): Background
     duration_ms: null,
     summary: null,
     output_file: null,
+    woken_by: null,
     ...over,
   };
 }

@@ -59,6 +59,36 @@ pub struct Assembler {
     /// scan was pure waste on every one. Kept in lock-step with each task's `tool_use_id`
     /// via [`Assembler::link_tool_use`].
     tasks_by_tool_use: HashMap<String, String>,
+    /// Ids of the MAIN-THREAD `SendMessage` tool_uses seen this session. A
+    /// `SendMessage{to:<agentId>}` WAKES a finished sub-agent, and since CLI 2.1.283 that
+    /// wake emits a real `task_started` whose `tool_use_id` is the SENDMESSAGE's, not the
+    /// original `Agent`'s — this set is how [`Assembler::ingest_task_started`] tells a wake
+    /// from a launch. Load-bearing when the registry is COLD (conversation reloaded /
+    /// session re-spawned between launch and wake): the task is then unknown and the
+    /// wake's `task_started` creates it. Main thread only, like the front's `bgAgentIds`:
+    /// a sub-agent waking ITS OWN agent (nesting) must not surface that grandchild as the
+    /// conversation's background work. Deliberately NOT folded into `tool_names`:
+    /// `classify_task` would read the unknown name as `Other` and `record_tool` would
+    /// re-classify the woken task with it.
+    send_message_ids: HashSet<String>,
+    /// Every `SendMessage` tool_use (any thread) → its target (`to`) and whether the MAIN
+    /// thread sent it, waiting for its tool_result. A SUCCESSFUL result revives the target
+    /// sub-agent ([`Assembler::wake_on_send_message_result`]) — the only wake signal of a
+    /// pre-2.1.283 binary, which emits no `task_started`. Nothing is revived on the
+    /// tool_use alone: a SendMessage that then fails (interrupted, refused,
+    /// `success:false`) never woke anything, and an inferred flip would have had to be
+    /// undone — reading to the front, the phone and the voice agent as a run that finished.
+    send_message_targets: HashMap<String, (String, bool)>,
+    /// Finds the `Agent` tool_use that launched a sub-agent, from the session's on-disk
+    /// sidecar (see [`super::subagents::launch_tool_use_id`]). Consulted ONCE per cold wake
+    /// to re-key the woken task onto the id its own messages stream under. `None` = no disk
+    /// to read (a session hosted on another machine, unit tests): the task then stays keyed
+    /// on the SendMessage id and the front resolves the launch from its rehydrated ack.
+    launch_resolver: Option<LaunchResolver>,
+    /// Sub-agent `parent_tool_use_id`s whose model could not be tied to a task, already
+    /// logged — a woken agent we could not re-key streams dozens of messages, one log each
+    /// would bury the signal.
+    uncorrelated_model_parents: HashSet<String>,
     /// Uuids of user turns WE wrote to stdin (see [`Assembler::note_sent_user_message`]).
     /// `--replay-user-messages` echoes every user turn back on stdout with its uuid;
     /// an echo whose uuid is in here is OUR own message (already shown optimistically)
@@ -94,6 +124,9 @@ pub struct Assembler {
     /// left the picker one click behind. See [`Assembler::begin_model_switch`].
     model_switches_in_flight: u32,
 }
+
+/// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
+pub type LaunchResolver = fn(&str, &str) -> Option<String>;
 
 /// The last-announced friendly labels for the three controls (see [`Assembler`]).
 #[derive(Debug, Default)]
@@ -131,6 +164,12 @@ impl Assembler {
     /// known before its first `result`, whose model time is then reported as unknown.
     pub fn mark_fresh_session(&mut self) {
         self.api_ms_baseline = Some(0);
+    }
+
+    /// Let a cold wake look up its launching `Agent` on disk (see `launch_resolver`). Set
+    /// only for a session whose artifacts live on THIS machine.
+    pub fn set_launch_resolver(&mut self, resolver: LaunchResolver) {
+        self.launch_resolver = Some(resolver);
     }
 
     /// The model time spent since the previous `result` — this turn's share of the CLI's
@@ -537,6 +576,19 @@ impl Assembler {
         let tool_command = tool.and_then(|t| t.command.clone());
         let tool_output_file = tool.and_then(|t| t.output_file.clone());
         let kind = classify_task(t.task_type.as_deref(), tool_name.as_deref());
+        // A sub-agent started by a `SendMessage` is a WAKE of an existing agent (its
+        // task_id is that agent's id), not a launch — see `send_message_ids`.
+        let wake = kind == BackgroundTaskKind::Agent && self.is_send_message(t.tool_use_id.as_deref());
+        // A COLD wake (this process never saw the launch) would key the task on the
+        // SendMessage's id, while the woken agent's own messages stream under its LAUNCH
+        // id: re-key it onto the launch, so its model, its live drill-in and the front's
+        // `bgAgentIds` all line up as on a warm wake.
+        let launch = if wake && !self.background_tasks.contains_key(&t.task_id) {
+            self.resolve_launch(&t.task_id)
+        } else {
+            None
+        };
+        self.link_tool_use(launch.as_deref(), &t.task_id);
         // The label is the NAME the agent gave the task (`description`, e.g. "build the
         // app") — the meaningful pinned line. The raw command lives in its own field; the
         // command and the output path arrive on their own schedule (assistant message /
@@ -553,7 +605,7 @@ impl Assembler {
             .or_insert_with(|| BackgroundTask {
                 task_id: t.task_id.clone(),
                 kind,
-                tool_use_id: t.tool_use_id.clone(),
+                tool_use_id: launch.clone().or_else(|| t.tool_use_id.clone()),
                 label: label.clone(),
                 command: tool_command.clone(),
                 subagent_type: t.subagent_type.clone(),
@@ -566,7 +618,24 @@ impl Assembler {
                 duration_ms: None,
                 summary: None,
                 output_file: tool_output_file.clone(),
+                woken_by: None,
             });
+        // A `task_started` for a sub-agent we hold as FINISHED is the CLI running it again
+        // (a wake re-uses the task_id). Unlike the inferred revivals (the SendMessage result
+        // of an old binary, the progress backstop), this is the wire's own word, so it
+        // revives a Stopped or Failed agent too — the user's Stop already took effect; this
+        // is a NEW run.
+        if task.kind == BackgroundTaskKind::Agent && task.status != BackgroundTaskStatus::Running {
+            restart_agent_run(task);
+        }
+        // Cold or warm, a main-thread wake marks the run as detached background work: a
+        // woken agent is never awaited by its caller, whatever its launch was. Cold and
+        // un-re-keyed, the entry carries the SendMessage's tool_use_id, which the front's
+        // `bgAgentIds` never holds — without this mark the woken agent read as FOREGROUND
+        // and the AgentBar hid it.
+        if let (true, Some(send)) = (wake, t.tool_use_id.as_deref()) {
+            mark_woken(task, send);
+        }
         if task.tool_use_id.is_none() {
             task.tool_use_id = t.tool_use_id.clone();
         }
@@ -591,15 +660,25 @@ impl Assembler {
     /// A live progress tick. Stash the latest `description` (a `Workflow` emits
     /// `"<phase>: <label>"`) and re-emit. Tolerates a tick for an unseen task.
     fn ingest_task_progress(&mut self, t: &TaskProgressMsg, out: &mut Vec<SessionEvent>) {
+        let main_wake = t
+            .tool_use_id
+            .clone()
+            .filter(|id| self.is_send_message(Some(id)));
         let task = self.task_entry(&t.task_id, t.tool_use_id.as_deref());
-        // A progress tick on a COMPLETED sub-agent means a resumed agent came back to life
-        // (the wire never re-emits `task_started` on a `SendMessage` wake). This is the
-        // backstop for a resume we didn't observe as a local `SendMessage` tool_use — e.g.
-        // one issued from the phone via Remote Control; [`Self::resume_agent_via_send_message`]
-        // handles the local case eagerly. Only a tool-using woken agent emits progress,
-        // hence both signals. The helper resets stale roll-up (incl. `progress`), so set
-        // THIS tick's description AFTER it, or the fresh label would be wiped.
-        reactivate_completed_agent(task);
+        // A progress tick on a COMPLETED sub-agent means a resumed agent came back to life.
+        // Since CLI 2.1.283 a wake emits its own `task_started` (which revives the task
+        // first), so this is a backstop: for an older binary that did not and whose
+        // SendMessage result has not landed yet, and for a resume whose `task_started` we
+        // missed. The new run counts as a conversation-level wake (`woken_by`) only when the
+        // tick names a MAIN-THREAD SendMessage: a bare tick can't say which thread woke the
+        // agent (a sub-agent may wake its own). The helper resets stale roll-up (incl.
+        // `progress`), so set THIS tick's description AFTER it, or the fresh label would be
+        // wiped.
+        if reactivate_completed_agent(task) {
+            if let Some(send) = main_wake.as_deref() {
+                mark_woken(task, send);
+            }
+        }
         if t.description.is_some() {
             task.progress = t.description.clone();
         }
@@ -678,25 +757,75 @@ impl Assembler {
         out.push(SessionEvent::Task(task.clone()));
     }
 
-    /// A `SendMessage` tool_use whose `to` names an existing COMPLETED background sub-agent
-    /// RESUMES it. For a sub-agent the wire's `to` IS the agentId, which IS the task_id — so
-    /// a direct `background_tasks` lookup is exact. The resume re-activates the agent under
-    /// the SAME task_id and NEVER re-emits `task_started`, so we flip it back to Running via
-    /// [`reactivate_completed_agent`] (which keeps the ORIGINAL `Agent` `tool_use_id` — still
-    /// in the front's `bgAgentIds` — and resets the prior run's roll-up). A `to` that is a
-    /// live-teammate NAME or the literal `"main"` (neither an agentId) simply won't match any
-    /// task_id and is a safe no-op; likewise a `to` that matches a task of another kind, or a
-    /// task that is Stopped/Failed rather than a natural finish, is left untouched by the
-    /// helper's scoping. Idempotent: an already-Running task is not re-emitted.
-    fn resume_agent_via_send_message(&mut self, input: &Value, out: &mut Vec<SessionEvent>) {
-        let Some(target) = input.get("to").and_then(Value::as_str) else {
+    /// Remember a `SendMessage` tool_use's target until its result lands (see
+    /// `send_message_targets`). Re-recording the same id is harmless (stream + assembled).
+    /// Only a target FINISHED at send time can be woken by it: a SendMessage to a running
+    /// agent merely queues a message ("Message queued for delivery…"), starting no run.
+    fn note_send_message(&mut self, id: &str, input: &Value, main_thread: bool) {
+        if id.is_empty() {
+            return;
+        }
+        if main_thread {
+            self.send_message_ids.insert(id.to_string());
+        }
+        if let Some(to) = input.get("to").and_then(Value::as_str) {
+            let finished = self.background_tasks.get(to).is_some_and(|t| {
+                t.kind == BackgroundTaskKind::Agent && t.status == BackgroundTaskStatus::Completed
+            });
+            if finished {
+                self.send_message_targets.insert(id.to_string(), (to.to_string(), main_thread));
+            }
+        }
+    }
+
+    /// A `SendMessage`'s tool_result: the wake signal of a pre-2.1.283 binary, which emits no
+    /// `task_started` for it. A SUCCESSFUL result whose `to` named a sub-agent FINISHED at
+    /// send time means that agent RESUMED: the wire's `to` IS the agentId, which IS the
+    /// task_id, so the lookup is exact. Revived via [`reactivate_completed_agent`] — the
+    /// ORIGINAL `Agent` `tool_use_id` kept, the prior run's roll-up reset — and marked woken
+    /// only for a MAIN-THREAD sender: a sub-agent waking its own agent keeps it out of the
+    /// conversation-level surfaces, like its launch was.
+    ///
+    /// Not inferred when the wire already spoke for this SendMessage (any task event under
+    /// its id): it then reported the run itself — 2.1.283+ always does, with a `task_started`
+    /// BEFORE this result — and the run may even be over already (a BLOCKING resume — e.g.
+    /// background tasks disabled — answers only once the woken run ended): reviving here
+    /// would leave a finished agent Running for good. A FAILED result (interrupted, refused,
+    /// `success:false`) woke nothing.
+    fn wake_on_send_message_result(&mut self, tool_use_id: &str, content: &Value, is_error: bool, out: &mut Vec<SessionEvent>) {
+        let Some((target, main_thread)) = self.send_message_targets.remove(tool_use_id) else {
             return;
         };
-        if let Some(task) = self.background_tasks.get_mut(target) {
+        if is_error || send_message_reports_failure(content) || self.tasks_by_tool_use.contains_key(tool_use_id) {
+            return;
+        }
+        if let Some(task) = self.background_tasks.get_mut(&target) {
             if reactivate_completed_agent(task) {
+                if main_thread {
+                    mark_woken(task, tool_use_id);
+                }
                 out.push(SessionEvent::Task(task.clone()));
             }
         }
+    }
+
+    /// The `Agent` tool_use that launched sub-agent `agent_id`, looked up on disk (see
+    /// `launch_resolver`). `None` without a resolver or a known session id, or when the
+    /// sidecar has no answer — logged, since the woken agent then stays keyed on the
+    /// SendMessage id (no model, live drill-in only through the front's fallback).
+    fn resolve_launch(&self, agent_id: &str) -> Option<String> {
+        let resolver = self.launch_resolver?;
+        let launch = self
+            .state
+            .session_id
+            .as_deref()
+            .and_then(|session| resolver(session, agent_id));
+        if launch.is_none() {
+            eprintln!(
+                "[assembler] woken sub-agent {agent_id}: launching Agent not found on disk; keeping the SendMessage id"
+            );
+        }
+        launch
     }
 
     /// Get (or lazily create) the tracked task for `task_id`. A `task_updated` /
@@ -708,12 +837,27 @@ impl Assembler {
         let tool_name = tool_use_id
             .and_then(|id| self.tool_names.get(id))
             .map(|t| t.name.clone());
-        self.background_tasks
+        // Seen for the first time under a `SendMessage` id: the only task a SendMessage
+        // produces is a woken sub-agent, whose `task_started` we missed — re-keyed onto its
+        // launch like a cold wake's (see `ingest_task_started`).
+        let wake = self.is_send_message(tool_use_id);
+        let launch = if wake && !self.background_tasks.contains_key(task_id) {
+            self.resolve_launch(task_id)
+        } else {
+            None
+        };
+        self.link_tool_use(launch.as_deref(), task_id);
+        let task = self
+            .background_tasks
             .entry(task_id.to_string())
             .or_insert_with(|| BackgroundTask {
                 task_id: task_id.to_string(),
-                kind: classify_task(None, tool_name.as_deref()),
-                tool_use_id: tool_use_id.map(str::to_string),
+                kind: if wake {
+                    BackgroundTaskKind::Agent
+                } else {
+                    classify_task(None, tool_name.as_deref())
+                },
+                tool_use_id: launch.or_else(|| tool_use_id.map(str::to_string)),
                 label: None,
                 command: None,
                 subagent_type: None,
@@ -726,7 +870,17 @@ impl Assembler {
                 duration_ms: None,
                 summary: None,
                 output_file: None,
-            })
+                woken_by: None,
+            });
+        if let (true, true, Some(send)) = (wake, task.kind == BackgroundTaskKind::Agent, tool_use_id) {
+            mark_woken(task, send);
+        }
+        task
+    }
+
+    /// Is `tool_use_id` a main-thread `SendMessage` tool_use (see `send_message_ids`)?
+    fn is_send_message(&self, tool_use_id: Option<&str>) -> bool {
+        tool_use_id.is_some_and(|id| self.send_message_ids.contains(id))
     }
 
     fn ingest_stream_event(&mut self, se: &StreamEventMsg, out: &mut Vec<SessionEvent>) {
@@ -819,6 +973,12 @@ impl Assembler {
                         // `is_bg_capable_tool` — that would reclassify it as a background task).
                         if name == "Skill" {
                             self.skill_invocation_pending = true;
+                        }
+                        // Same reason: a SendMessage is known before its wake's
+                        // `task_started` can land (its `to` comes with the assembled message).
+                        if name == "SendMessage" {
+                            let input = cb.get("input").unwrap_or(&Value::Null);
+                            self.note_send_message(id, input, se.parent_tool_use_id.is_none());
                         }
                         // Input is empty at content_block_start (it streams later); the
                         // command is captured from the assembled assistant message.
@@ -945,10 +1105,11 @@ impl Assembler {
         for b in &blocks {
             if let NormalizedBlock::ToolUse { id, name, input } = b {
                 self.record_tool(id, name, Some(input), out);
-                // A `SendMessage` that targets an existing background agent RESUMES it:
-                // flip that agent's task back to Running eagerly (before any progress tick).
+                // A `SendMessage` may WAKE a finished sub-agent: remember its target; the
+                // wake itself is confirmed by the wire (its `task_started`, or the
+                // SendMessage's successful result — see `wake_on_send_message_result`).
                 if name == "SendMessage" {
-                    self.resume_agent_via_send_message(input, out);
+                    self.note_send_message(id, input, a.parent_tool_use_id.is_none());
                 }
                 // A model-invoked skill: the CLI will inject the SKILL.md body as a bare
                 // `user` text line that — LIVE — lacks the `isMeta` flag we'd normally drop
@@ -986,12 +1147,16 @@ impl Assembler {
                     }
                     // The sub-agent's model is data that exists ONLY here on the wire, so a
                     // failed correlation (e.g. its `assistant` arrived before `task_started`
-                    // seeded the task) silently loses it. That must never be silent — log it
-                    // (same policy as the rest of this module). Rare: `task_started` normally
-                    // precedes any sub-agent output.
-                    None => eprintln!(
-                        "[assembler] sub-agent model {model:?} not correlated: no background task with tool_use_id {parent:?}"
-                    ),
+                    // seeded the task, or a cold wake we could not re-key) silently loses it.
+                    // That must never be silent — log it (same policy as the rest of this
+                    // module), ONCE per parent: such an agent streams dozens of messages.
+                    None => {
+                        if self.uncorrelated_model_parents.insert(parent.to_string()) {
+                            eprintln!(
+                                "[assembler] sub-agent model {model:?} not correlated: no background task with tool_use_id {parent:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1050,10 +1215,13 @@ impl Assembler {
                             if let Some(path) = output_file_from_tool_result(&content) {
                                 self.set_task_output_file(&tool_use_id, path, out);
                             }
+                            let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                            // A SendMessage's result: on success, its target sub-agent resumed.
+                            self.wake_on_send_message_result(&tool_use_id, &content, is_error, out);
                             out.push(SessionEvent::Item(ConversationItem::ToolResult {
                                 tool_use_id,
                                 content,
-                                is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                                is_error,
                                 parent_tool_use_id: u.parent_tool_use_id.clone(),
                             }));
                         }
@@ -1313,34 +1481,76 @@ fn classify_task(task_type: Option<&str>, tool_name: Option<&str>) -> Background
     }
 }
 
-/// Re-activate a background sub-agent task we'd already marked terminal. A detached
-/// sub-agent RESUMED via `SendMessage` re-uses its task_id (== its agentId) and NEVER
-/// re-emits `task_started` (captured by the `live_capture_subagent_wake` probe), so the
-/// socle has to flip it back to Running itself — the running-gated AgentBar / FlightDeck
-/// would otherwise never re-surface a woken agent.
+/// Re-activate a background sub-agent task we'd already marked terminal, on an INFERRED
+/// wake: the successful result of a `SendMessage` to it (a pre-2.1.283 binary's only wake
+/// signal) or a progress tick after its finish. A sub-agent RESUMED via `SendMessage` re-uses
+/// its task_id (== its agentId); the running-gated AgentBar / FlightDeck would never
+/// re-surface it unless the socle flips it back to Running. (The wake's own `task_started`,
+/// 2.1.283+, revives it first — see [`Assembler::ingest_task_started`].)
 ///
-/// SCOPED to exactly what the capture proves — a naturally-FINISHED (`Completed`) sub-agent
-/// (`kind == Agent`): we deliberately do NOT revive a `Stopped` task (a user's Stop must
-/// win, absent a real new `task_started`) nor a `Failed` one, and never touch a
-/// Bash/Monitor/Workflow task (whose ids can't be a `SendMessage` target anyway). This
-/// keeps a Stop from silently un-doing itself and avoids resurrecting a task the CLI won't
-/// actually re-run (which, lacking a fresh terminal event, would linger Running until the
-/// whole session ends).
+/// SCOPED to a naturally-FINISHED (`Completed`) sub-agent (`kind == Agent`): an inference
+/// does NOT revive a `Stopped` task (a user's Stop must win, absent a real new
+/// `task_started`) nor a `Failed` one, and never touches a Bash/Monitor/Workflow task (whose
+/// ids can't be a `SendMessage` target anyway). This keeps a Stop from silently un-doing
+/// itself and avoids resurrecting a task the CLI won't actually re-run (which, lacking a
+/// fresh terminal event, would linger Running until the whole session ends).
 ///
-/// On the flip it also RESETS the previous run's usage roll-up (tokens / tool_uses /
-/// duration_ms / summary / progress) so the re-running row shows live-blank stats, not the
-/// last run's numbers. Returns whether it flipped (so the caller re-emits the task).
+/// Returns whether it flipped (so the caller re-emits the task).
 fn reactivate_completed_agent(task: &mut BackgroundTask) -> bool {
     if task.kind != BackgroundTaskKind::Agent || task.status != BackgroundTaskStatus::Completed {
         return false;
     }
+    restart_agent_run(task);
+    true
+}
+
+/// Start a NEW run of a sub-agent task: back to Running, the previous run's usage roll-up
+/// (tokens / tool_uses / duration_ms / summary / progress) cleared so the re-running row
+/// shows live-blank stats, not the last run's numbers. Whether the run counts as a WAKE the
+/// conversation should surface is the caller's call ([`mark_woken`]): only a main-thread
+/// `SendMessage` proves that.
+fn restart_agent_run(task: &mut BackgroundTask) {
     task.status = BackgroundTaskStatus::Running;
     task.tokens = None;
     task.tool_uses = None;
     task.duration_ms = None;
     task.summary = None;
     task.progress = None;
-    true
+    // Per RUN: a past main-thread wake says nothing about this one (a sub-agent may be the
+    // one waking it now).
+    task.woken_by = None;
+}
+
+/// Does a `SendMessage` tool_result report a failure in its body? Since 2.1.283 the result
+/// is JSON (`{"success":true,"message":"Resuming agent …",…}`), a plain string or a list of
+/// text blocks; only an explicit `"success": false` counts — anything else (prose from an
+/// older binary, unparseable text) is not evidence of failure.
+fn send_message_reports_failure(content: &Value) -> bool {
+    let failed = |text: &str| {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| v.get("success").and_then(Value::as_bool))
+            == Some(false)
+    };
+    match content {
+        Value::String(s) => failed(s),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .any(failed),
+        _ => false,
+    }
+}
+
+/// Record that main-thread SendMessage `send_message_id` started the current run (see
+/// [`BackgroundTask::woken_by`]) and fill the sub-agent's `agent_id`: its task_id IS its
+/// agentId, so the drill-in can read its transcript even when `tool_use_id` names the waking
+/// `SendMessage` (whose result carries no launch ack).
+fn mark_woken(task: &mut BackgroundTask, send_message_id: &str) {
+    task.woken_by = Some(send_message_id.to_string());
+    if task.agent_id.is_none() {
+        task.agent_id = Some(task.task_id.clone());
+    }
 }
 
 /// Map a wire status string onto our coarse [`BackgroundTaskStatus`]. Anything we do
@@ -3196,6 +3406,28 @@ mod tests {
     }
 
     // --- Shared helpers for the SendMessage-wake tests -----------------------------------
+    /// Ingest the result of SendMessage `toolu_s` (see [`ingest_send`]) and return any `Task`
+    /// events it emits.
+    fn ingest_send_result(asm: &mut Assembler, is_error: bool, text: &str) -> Vec<BackgroundTask> {
+        let m: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "user", "session_id": "s", "uuid": "r",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s", "is_error": is_error,
+                 "content": [{"type": "text", "text": text}]}
+            ]}
+        }))
+        .unwrap();
+        asm.ingest(&m)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+    /// A successful SendMessage result, as 2.1.283+ words it.
+    const SEND_OK: &str = r#"{"success":true,"message":"Resuming agent x"}"#;
+
     /// Ingest a main-loop `SendMessage{to}` tool_use and return any `Task` events it emits.
     fn ingest_send(asm: &mut Assembler, to: &str) -> Vec<BackgroundTask> {
         let m: CliMessage = serde_json::from_value(serde_json::json!({
@@ -3233,61 +3465,95 @@ mod tests {
         asm.ingest(&done);
     }
 
-    /// REGRESSION (task f267b721): a detached background sub-agent RESUMED via `SendMessage`
-    /// must re-surface as Running. The wire re-uses the agent's task_id (== its agentId) and
-    /// NEVER re-emits `task_started`, so the socle flips the tracked task back to Running off
-    /// the `SendMessage{to}` tool_use. Drives the FULL captured wire fixture — including the
-    /// post-wake `task_notification` whose `tool_use_id` is the SendMessage id (line 11), the
-    /// one place the identity the AgentBar keys on could be clobbered.
-    #[test]
-    fn send_message_wake_reactivates_a_completed_background_agent() {
-        const WAKE: &str = include_str!("fixtures/capture_subagent_wake.jsonl");
-        const TASK: &str = "a5704a9056e4e1a0c"; // task_id == agentId (stable across the wake)
-        let lines: Vec<&str> = WAKE.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 11, "fixture shape: launch (1..=6) + wake (7..=11)");
+    /// The captured SendMessage-wake wire (CLI 2.1.286): launch + first run (lines 1..=7),
+    /// then the wake (8..=14) — whose `task_started` (line 9) and terminal events carry the
+    /// SENDMESSAGE's tool_use_id, while the woken agent's own messages still name the
+    /// ORIGINAL `Agent` as parent.
+    const WAKE_FIXTURE: &str = include_str!("fixtures/capture_subagent_wake.jsonl");
+    const WAKE_TASK: &str = "a68e26aa615c9f436"; // task_id == agentId (stable across the wake)
+    /// Index of the `SendMessage` line — where the wake half of the fixture starts.
+    const WAKE_SEND_LINE: usize = 7;
 
-        let mut asm = Assembler::new();
+    fn wake_fixture_lines() -> Vec<&'static str> {
+        let lines: Vec<&str> = WAKE_FIXTURE.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 14, "fixture shape: launch (1..=7) + wake (8..=14)");
+        lines
+    }
+
+    /// Feed `lines` and return the `WAKE_TASK` snapshot after each one (`None` until the task
+    /// first appears).
+    fn wake_snapshots(asm: &mut Assembler, lines: &[&str]) -> Vec<Option<BackgroundTask>> {
         let mut last: Option<BackgroundTask> = None;
-        let mut after_first_completion: Option<BackgroundTask> = None;
-        let mut after_wake: Option<BackgroundTask> = None;
-        for (i, line) in lines.iter().enumerate() {
-            let msg: CliMessage = serde_json::from_str(line).unwrap();
-            for ev in asm.ingest(&msg) {
-                if let SessionEvent::Task(t) = ev {
-                    if t.task_id == TASK {
-                        last = Some(t);
+        lines
+            .iter()
+            .map(|line| {
+                let msg: CliMessage = serde_json::from_str(line).unwrap();
+                for ev in asm.ingest(&msg) {
+                    if let SessionEvent::Task(t) = ev {
+                        if t.task_id == WAKE_TASK {
+                            last = Some(t);
+                        }
                     }
                 }
-            }
-            match i {
-                5 => after_first_completion = last.clone(), // line 6: first task_notification
-                6 => after_wake = last.clone(),             // line 7: the SendMessage wake
-                _ => {}
-            }
-        }
+                last.clone()
+            })
+            .collect()
+    }
 
-        // First run finished: Completed, Agent, with its usage roll-up folded in.
-        let done = after_first_completion.expect("the launched agent should have a tracked task");
+    /// First `Task` event an ingest emits.
+    fn first_task(asm: &mut Assembler, msg: serde_json::Value) -> Option<BackgroundTask> {
+        let msg: CliMessage = serde_json::from_value(msg).unwrap();
+        asm.ingest(&msg).into_iter().find_map(|e| match e {
+            SessionEvent::Task(t) => Some(t),
+            _ => None,
+        })
+    }
+
+    /// REGRESSION (task f267b721): a detached background sub-agent RESUMED via `SendMessage`
+    /// must re-surface as Running, in the SAME process that launched it (warm registry). The
+    /// wire re-uses the agent's task_id (== its agentId); the wake's own `task_started` flips
+    /// the tracked task back to Running, and neither it nor the run's terminal events (all
+    /// under the SendMessage's tool_use_id) may clobber the identity the AgentBar keys on.
+    #[test]
+    fn send_message_wake_reactivates_a_completed_background_agent() {
+        let lines = wake_fixture_lines();
+        let mut asm = Assembler::new();
+        let snaps = wake_snapshots(&mut asm, &lines);
+
+        // First run finished: Completed, Agent, with its usage roll-up and model folded in.
+        let done = snaps[WAKE_SEND_LINE - 1].clone().expect("the launched agent should have a tracked task");
         assert_eq!(done.status, BackgroundTaskStatus::Completed, "the agent finished its first run");
         assert_eq!(done.kind, BackgroundTaskKind::Agent);
         assert_eq!(done.tool_use_id.as_deref(), Some("toolu_agent"));
         assert_eq!(done.tokens, Some(1234));
         assert_eq!(done.tool_uses, Some(1));
+        assert_eq!(done.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(done.woken_by.is_none(), "a plain launch is not a wake");
 
-        // The SendMessage wake flips it back to Running, KEEPS the original Agent tool_use_id
-        // (the AgentBar keys on it via bgAgentIds), and RESETS the prior run's stale roll-up.
-        let woke = after_wake.expect("the SendMessage wake must re-emit the agent's task");
+        // The SendMessage alone changes nothing: it may still fail.
+        let sent = snaps[WAKE_SEND_LINE].clone().unwrap();
+        assert_eq!(sent.status, BackgroundTaskStatus::Completed, "no flip on the tool_use alone");
+
+        // The wake's own `task_started` flips it back to Running, KEEPS the original Agent
+        // tool_use_id, RESETS the prior run's stale roll-up and flags the wake.
+        let woke = snaps[WAKE_SEND_LINE + 1].clone().expect("the wake must re-emit the agent's task");
         assert_eq!(woke.status, BackgroundTaskStatus::Running, "the resumed agent is Running again");
         assert_eq!(woke.tool_use_id.as_deref(), Some("toolu_agent"));
         assert_eq!(woke.kind, BackgroundTaskKind::Agent);
         assert_eq!(woke.tokens, None, "the prior run's token count must not show on the running row");
         assert_eq!(woke.tool_uses, None);
         assert_eq!(woke.duration_ms, None);
+        assert_eq!(woke.woken_by.as_deref(), Some("toolu_send"), "the SendMessage that started this run");
+        assert_eq!(woke.agent_id.as_deref(), Some(WAKE_TASK));
+
+        // The SendMessage's successful result, after it, is a no-op on the running entry.
+        let acked = snaps[WAKE_SEND_LINE + 2].clone().unwrap();
+        assert_eq!(acked, woke, "the result re-emits nothing new");
 
         // After the full wake — incl. the terminal `task_notification` whose tool_use_id is the
-        // SendMessage id (fixture line 11) — the task settles Completed but its identity must be
-        // UNCLOBBERED (still the Agent tool_use_id), now carrying run #2's roll-up.
-        let end = last.expect("a final snapshot");
+        // SendMessage id — the task settles Completed but its identity must be UNCLOBBERED
+        // (still the Agent tool_use_id), now carrying run #2's roll-up.
+        let end = snaps.last().cloned().flatten().expect("a final snapshot");
         assert_eq!(end.status, BackgroundTaskStatus::Completed);
         assert_eq!(
             end.tool_use_id.as_deref(),
@@ -3297,6 +3563,351 @@ mod tests {
         assert_eq!(end.kind, BackgroundTaskKind::Agent);
         assert_eq!(end.tokens, Some(2345), "the second run's usage roll-up");
         assert_eq!(end.duration_ms, Some(8100));
+    }
+
+    /// REGRESSION (task 9ab0edf7): the wake on a COLD registry — the conversation was reloaded
+    /// (or its session re-spawned) between the launch and the wake, so this assembler never saw
+    /// the agent. The wake's `task_started` CREATES the entry under the SendMessage's
+    /// tool_use_id, which the front's `bgAgentIds` (original `Agent` ids, rehydrated from the
+    /// transcript) never holds: without the `woken_by` mark the woken agent read as FOREGROUND
+    /// and the AgentBar hid it. Its `agent_id` must be known too, or the drill-in has nothing
+    /// to read (the SendMessage's result carries no launch ack).
+    #[test]
+    fn send_message_wake_on_a_cold_registry_is_a_background_agent() {
+        let lines = wake_fixture_lines();
+        let mut asm = Assembler::new();
+        let snaps = wake_snapshots(&mut asm, &lines[WAKE_SEND_LINE..]);
+
+        assert!(snaps[0].is_none(), "the SendMessage alone matches no task on a cold registry");
+        let woke = snaps[1].clone().expect("the wake's task_started creates the task");
+        assert_eq!(woke.kind, BackgroundTaskKind::Agent);
+        assert_eq!(woke.status, BackgroundTaskStatus::Running);
+        assert_eq!(woke.tool_use_id.as_deref(), Some("toolu_send"), "the only id the wake carries");
+        assert!(woke.woken_by.is_some(), "a woken agent is background work whatever its tool_use_id");
+        assert_eq!(woke.agent_id.as_deref(), Some(WAKE_TASK), "task_id == agentId → drillable");
+        assert_eq!(woke.label.as_deref(), Some("Sleep then reply BANANA"), "the ORIGINAL description");
+        assert_eq!(woke.subagent_type.as_deref(), Some("general-purpose"));
+
+        let end = snaps.last().cloned().flatten().expect("a final snapshot");
+        assert_eq!(end.status, BackgroundTaskStatus::Completed);
+        assert!(end.woken_by.is_some());
+        assert_eq!(end.tokens, Some(2345));
+        // No launch to find (no resolver — e.g. a session hosted on another machine): the
+        // woken agent's messages name a parent no task carries, so its model is lost here and
+        // the front resolves the launch from the rehydrated ack instead.
+        assert_eq!(end.model, None);
+    }
+
+    /// The init line that gives the assembler its session id (what the launch resolver reads).
+    fn ingest_init(asm: &mut Assembler, session_id: &str) {
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": session_id, "uuid": "u", "cwd": "/x",
+            "model": "claude-opus-5-5", "permissionMode": "default",
+            "tools": [], "slash_commands": []
+        }))
+        .unwrap();
+        asm.ingest(&init);
+    }
+
+    /// The sidecar as the wake fixture's session would hold it: the woken agent was launched
+    /// by `toolu_agent` in session `s`.
+    fn fixture_launch_resolver(session_id: &str, agent_id: &str) -> Option<String> {
+        (session_id == "s" && agent_id == WAKE_TASK).then(|| "toolu_agent".to_string())
+    }
+
+    /// Task 9ab0edf7 (review): a COLD wake whose launch is on disk is RE-KEYED onto the
+    /// launching `Agent` id — the id its own messages stream under — so it behaves exactly
+    /// like a warm wake: the model is captured, the live drill-in finds its sub-thread, and
+    /// the front's rehydrated `bgAgentIds` holds its id.
+    #[test]
+    fn a_cold_wake_is_rekeyed_onto_its_launching_agent() {
+        let lines = wake_fixture_lines();
+        let mut asm = Assembler::new();
+        asm.set_launch_resolver(fixture_launch_resolver);
+        ingest_init(&mut asm, "s");
+        let snaps = wake_snapshots(&mut asm, &lines[WAKE_SEND_LINE..]);
+
+        let woke = snaps[1].clone().expect("the wake's task_started creates the task");
+        assert_eq!(woke.tool_use_id.as_deref(), Some("toolu_agent"), "re-keyed onto the launch");
+        assert!(woke.woken_by.is_some());
+        assert_eq!(woke.agent_id.as_deref(), Some(WAKE_TASK));
+        let end = snaps.last().cloned().flatten().expect("a final snapshot");
+        assert_eq!(end.model.as_deref(), Some("claude-opus-5-5"), "the woken agent's messages now correlate");
+        assert_eq!(end.tool_use_id.as_deref(), Some("toolu_agent"), "the SendMessage-keyed events never clobber it");
+        assert_eq!(end.status, BackgroundTaskStatus::Completed);
+        assert_eq!(end.tokens, Some(2345));
+    }
+
+    /// The real wire announces the SendMessage on the STREAM (`content_block_start`) before
+    /// the wake's `task_started`, and the assembled message can land after it: the stream
+    /// registration alone must be enough to recognise the wake.
+    #[test]
+    fn a_streamed_send_message_is_known_before_its_wake_task_started() {
+        let mut asm = Assembler::new();
+        first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "stream_event", "session_id": "s", "uuid": "u",
+                "event": {"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "tool_use", "id": "toolu_send", "name": "SendMessage", "input": {}}}
+            }),
+        );
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "agentQ",
+                "tool_use_id": "toolu_send", "description": "x", "task_type": "local_agent"
+            }),
+        )
+        .expect("task_started emits the task");
+        assert_eq!(t.kind, BackgroundTaskKind::Agent);
+        assert!(t.woken_by.is_some(), "recognised as a wake from the streamed announcement alone");
+        assert_eq!(t.agent_id.as_deref(), Some("agentQ"));
+    }
+
+    /// A sub-agent's SendMessage (streamed AND assembled under its parent) and the wake's
+    /// `task_started` under its id: the target revives, but never as a conversation-level wake.
+    fn nested_wake(asm: &mut Assembler, target: &str) -> BackgroundTask {
+        first_task(
+            asm,
+            serde_json::json!({
+                "type": "stream_event", "session_id": "s", "uuid": "u", "parent_tool_use_id": "toolu_child",
+                "event": {"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "tool_use", "id": "toolu_nested_send", "name": "SendMessage", "input": {}}}
+            }),
+        );
+        first_task(
+            asm,
+            serde_json::json!({
+                "type": "assistant", "parent_tool_use_id": "toolu_child", "session_id": "s", "uuid": "u2",
+                "message": {"id": "m", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_nested_send", "name": "SendMessage",
+                     "input": {"to": target, "message": "go", "summary": "go"}}
+                ]}
+            }),
+        );
+        first_task(
+            asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": target,
+                "tool_use_id": "toolu_nested_send", "description": "x", "task_type": "local_agent"
+            }),
+        )
+        .expect("the nested wake's task_started re-emits the task")
+    }
+
+    /// NESTING: a SUB-AGENT waking its own agent (SendMessage under a parent) revives it, but
+    /// never flags it as a conversation-level wake — the front keeps a grandchild out of the
+    /// AgentBar exactly as it kept its launch out.
+    #[test]
+    fn a_sub_agent_waking_its_own_agent_is_not_a_conversation_wake() {
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "grandchild", "toolu_gc_launch", "local_agent");
+        let started = nested_wake(&mut asm, "grandchild");
+        assert_eq!(started.status, BackgroundTaskStatus::Running, "the nested wake still revives it");
+        assert!(started.woken_by.is_none(), "a nested wake is not the conversation's");
+        assert_eq!(started.tool_use_id.as_deref(), Some("toolu_gc_launch"));
+    }
+
+    /// `woken_by` is per RUN: an agent the main thread once woke, then later woken by a
+    /// sub-agent, is not a conversation-level wake for that later run.
+    #[test]
+    fn woken_by_is_per_run() {
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        ingest_send(&mut asm, "t1");
+        let main = first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "t1",
+                "tool_use_id": "toolu_s", "description": "x", "task_type": "local_agent"
+            }),
+        )
+        .unwrap();
+        assert!(main.woken_by.is_some());
+        first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_notification", "task_id": "t1",
+                "tool_use_id": "toolu_s", "status": "completed"
+            }),
+        );
+        let nested = nested_wake(&mut asm, "t1");
+        assert_eq!(nested.status, BackgroundTaskStatus::Running);
+        assert!(nested.woken_by.is_none(), "the earlier main-thread wake does not carry over");
+    }
+
+    /// Nothing revives on the SendMessage tool_use alone. A pre-2.1.283 binary (no wake
+    /// `task_started`) revives the target on the SendMessage's SUCCESSFUL result; a FAILED one
+    /// (error result — interrupted, refused — or `success:false`) leaves it as it was, with no
+    /// event at all — no Running to undo, no false "finished" for the front to announce.
+    #[test]
+    fn a_send_message_wakes_only_on_success() {
+        // Old binary: the successful result is the wake.
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        assert!(ingest_send(&mut asm, "t1").is_empty(), "no flip on the tool_use alone");
+        let woke = ingest_send_result(&mut asm, false, SEND_OK);
+        assert_eq!(woke.len(), 1);
+        assert_eq!(woke[0].status, BackgroundTaskStatus::Running);
+        assert!(woke[0].woken_by.is_some());
+        assert_eq!(woke[0].tool_use_id.as_deref(), Some("toolu_agent"));
+        assert_eq!(woke[0].tokens, None, "the prior run's roll-up is cleared");
+
+        // An error result: nothing happens.
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        ingest_send(&mut asm, "t1");
+        assert!(ingest_send_result(&mut asm, true, "[Request interrupted by user for tool use]").is_empty());
+
+        // `success:false` in the body: nothing happens either.
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        ingest_send(&mut asm, "t1");
+        assert!(ingest_send_result(&mut asm, false, r#"{"success":false,"message":"No agent named t1"}"#).is_empty());
+        let still = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "t1", "patch": {}}),
+        )
+        .unwrap();
+        assert_eq!(still.status, BackgroundTaskStatus::Completed);
+        assert_eq!(still.tokens, Some(999), "the first run's roll-up is untouched");
+    }
+
+    /// Task 9ab0edf7 (review round 3): the SendMessage result is no wake signal once the wire
+    /// reported the run itself. A BLOCKING resume (background tasks disabled, the built-in
+    /// `web-fetch` agent) answers only after the woken run ENDED — reviving on that result
+    /// left a finished agent Running for good.
+    #[test]
+    fn a_send_message_result_after_the_reported_run_does_not_revive_it() {
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        ingest_send(&mut asm, "t1");
+        for line in [
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "t1",
+                               "tool_use_id": "toolu_s", "description": "x", "task_type": "local_agent"}),
+            serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "t1",
+                               "tool_use_id": "toolu_s", "description": "Running Read"}),
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "t1",
+                               "patch": {"status": "completed"}}),
+            serde_json::json!({"type": "system", "subtype": "task_notification", "task_id": "t1",
+                               "tool_use_id": "toolu_s", "status": "completed",
+                               "usage": {"total_tokens": 42}}),
+        ] {
+            first_task(&mut asm, line);
+        }
+        assert!(
+            ingest_send_result(&mut asm, false, r#"{"success":true,"message":"t1 replied: done"}"#).is_empty(),
+            "the finished woken run stays finished"
+        );
+        let end = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "t1", "patch": {}}),
+        )
+        .unwrap();
+        assert_eq!(end.status, BackgroundTaskStatus::Completed);
+        assert_eq!(end.tokens, Some(42), "its roll-up is kept");
+    }
+
+    /// A SendMessage to a RUNNING agent only queues a message ("Message queued for delivery…")
+    /// — no new run. Its result must not revive the agent if that run finished meanwhile.
+    #[test]
+    fn a_send_message_to_a_running_agent_is_no_wake() {
+        let mut asm = Assembler::new();
+        first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "t1",
+                               "tool_use_id": "toolu_agent", "description": "x", "task_type": "local_agent"}),
+        );
+        ingest_send(&mut asm, "t1");
+        first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_notification", "task_id": "t1",
+                               "tool_use_id": "toolu_agent", "status": "completed"}),
+        );
+        assert!(
+            ingest_send_result(
+                &mut asm,
+                false,
+                r#"{"success":true,"message":"Message queued for delivery to t1 at its next tool round."}"#
+            )
+            .is_empty(),
+            "a queued message woke nothing"
+        );
+    }
+
+    /// The wake's `task_started` is the wire's OWN word that the agent runs again — unlike the
+    /// inferred flips, it revives a STOPPED agent too (the Stop already took effect; this is a
+    /// new run). Without it the woken agent would sit Stopped while it works.
+    #[test]
+    fn a_wake_task_started_revives_a_stopped_agent() {
+        let mut asm = Assembler::new();
+        seed_completed(&mut asm, "t1", "toolu_agent", "local_agent");
+        first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_updated", "task_id": "t1",
+                "patch": {"status": "stopped"}
+            }),
+        );
+        ingest_send(&mut asm, "t1");
+        assert!(
+            ingest_send_result(&mut asm, false, SEND_OK).is_empty(),
+            "the inference alone (an acked SendMessage) leaves it Stopped"
+        );
+
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "t1",
+                "tool_use_id": "toolu_s", "description": "x", "task_type": "local_agent"
+            }),
+        )
+        .expect("task_started re-emits the task");
+        assert_eq!(t.status, BackgroundTaskStatus::Running);
+        assert_eq!(t.tool_use_id.as_deref(), Some("toolu_agent"), "identity preserved");
+        assert_eq!(t.tokens, None, "the stopped run's roll-up is cleared");
+        assert!(t.woken_by.is_some());
+    }
+
+    /// Backstop: an event for an UNSEEN task under a `SendMessage` id (its `task_started` was
+    /// missed — e.g. the stream was joined mid-wake) is still a woken sub-agent, not an
+    /// unclassifiable `Other` task the AgentBar would never list.
+    #[test]
+    fn an_unseen_task_under_a_send_message_id_is_a_woken_agent() {
+        let mut asm = Assembler::new();
+        ingest_send(&mut asm, "agentZ");
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_progress", "task_id": "agentZ",
+                "tool_use_id": "toolu_s", "description": "Running Read"
+            }),
+        )
+        .expect("the tick creates the task");
+        assert_eq!(t.kind, BackgroundTaskKind::Agent);
+        assert_eq!(t.status, BackgroundTaskStatus::Running);
+        assert!(t.woken_by.is_some());
+        assert_eq!(t.agent_id.as_deref(), Some("agentZ"));
+    }
+
+    /// A launch whose tool_use is NOT a SendMessage is never flagged as a wake — the flag would
+    /// otherwise pull a FOREGROUND sub-agent into the AgentBar.
+    #[test]
+    fn a_launch_is_never_flagged_as_a_wake() {
+        let mut asm = Assembler::new();
+        ingest_send(&mut asm, "someone"); // a SendMessage exists, under another id
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "fg1",
+                "tool_use_id": "toolu_fg", "description": "x", "task_type": "local_agent"
+            }),
+        )
+        .unwrap();
+        assert!(t.woken_by.is_none());
+        assert_eq!(t.agent_id, None);
     }
 
     /// The progress-tick backstop: a `task_progress` on a COMPLETED sub-agent flips it back to
@@ -3325,6 +3936,10 @@ mod tests {
         assert_eq!(t.tokens, None, "the prior run's roll-up is cleared on reactivation");
         assert_eq!(t.tool_uses, None);
         assert_eq!(t.tool_use_id.as_deref(), Some("toolu_agent"), "identity preserved");
+        // A bare tick can't tell which thread woke the agent (a sub-agent may wake its own),
+        // so it never flags the run as a conversation-level wake.
+        assert!(t.woken_by.is_none(), "the backstop revives without claiming a main-thread wake");
+        assert_eq!(t.agent_id, None);
     }
 
     /// SCOPING (hardening from the adversarial review): reactivation is NOT unconditional. A
@@ -3348,10 +3963,11 @@ mod tests {
         .unwrap();
         asm.ingest(&stopped);
 
-        // A later SendMessage to it emits nothing (the helper's scoping refuses a non-Completed
-        // task)…
+        // A later SendMessage to it, even acked, emits nothing (the helper's scoping refuses a
+        // non-Completed task)…
+        ingest_send(&mut asm, "t1");
         assert!(
-            ingest_send(&mut asm, "t1").is_empty(),
+            ingest_send_result(&mut asm, false, SEND_OK).is_empty(),
             "SendMessage must not resurrect a stopped agent"
         );
         // …and a trailing progress tick still shows it Stopped, proving the store wasn't flipped.
@@ -3370,22 +3986,27 @@ mod tests {
         assert_eq!(t.status, BackgroundTaskStatus::Stopped, "a stopped agent stays stopped");
     }
 
-    /// SELECTIVITY (hardening from the adversarial review): against a POPULATED store,
-    /// `resume_agent_via_send_message` flips ONLY a matching Completed AGENT. A teammate NAME
-    /// matches no task_id; a `to` matching a non-agent (Bash) task is scoped out by kind.
+    /// SELECTIVITY (hardening from the adversarial review): against a POPULATED store, an
+    /// acked SendMessage (`wake_on_send_message_result`) flips ONLY a matching Completed
+    /// AGENT. A teammate NAME matches no task_id; a `to` matching a non-agent (Bash) task is
+    /// scoped out by kind.
     #[test]
     fn send_message_resume_is_selective() {
         let mut asm = Assembler::new();
         seed_completed(&mut asm, "agentX", "toolu_agent", "local_agent");
         seed_completed(&mut asm, "bashY", "toolu_bash", "local_bash");
+        let send_acked = |asm: &mut Assembler, to: &str| {
+            ingest_send(asm, to);
+            ingest_send_result(asm, false, SEND_OK)
+        };
 
         // A teammate NAME / "main" matches no task_id → no flip at all.
-        assert!(ingest_send(&mut asm, "researcher").is_empty(), "a teammate name matches no task");
-        assert!(ingest_send(&mut asm, "main").is_empty(), "\"main\" matches no task");
+        assert!(send_acked(&mut asm, "researcher").is_empty(), "a teammate name matches no task");
+        assert!(send_acked(&mut asm, "main").is_empty(), "\"main\" matches no task");
         // A `to` matching a non-agent (Bash) task → scoped out by the kind guard → no flip.
-        assert!(ingest_send(&mut asm, "bashY").is_empty(), "a Bash task must not be resurrected");
+        assert!(send_acked(&mut asm, "bashY").is_empty(), "a Bash task must not be resurrected");
         // A `to` matching the completed agent → flips exactly that one to Running.
-        let flipped = ingest_send(&mut asm, "agentX");
+        let flipped = send_acked(&mut asm, "agentX");
         assert_eq!(flipped.len(), 1, "exactly the matching agent flips");
         assert_eq!(flipped[0].task_id, "agentX");
         assert_eq!(flipped[0].status, BackgroundTaskStatus::Running);

@@ -20,6 +20,7 @@ const task = (over: Partial<BackgroundTask> = {}): BackgroundTask => ({
   duration_ms: null,
   summary: null,
   output_file: null,
+  woken_by: null,
   ...over,
 });
 

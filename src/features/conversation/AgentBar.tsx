@@ -1,19 +1,21 @@
 // Discreet, pinned list of the conversation's DETACHED sub-agents (the `Agent` tool
-// launched with run_in_background). Deliberately subtle — one slim line per agent,
-// echoing the inline sub-agent look — so several running at once never crowd the
-// view. A running agent shows the bouncing "thinking" dots (same as the main
+// launched with run_in_background, or any sub-agent while a run started by a main-thread
+// SendMessage wake is live — `isDetachedAgentTask`). Deliberately subtle — one slim line
+// per agent, echoing the inline sub-agent look — so several running at once never crowd
+// the view. A running agent shows the bouncing "thinking" dots (same as the main
 // composer's working indicator); a finished one shows a small status dot. Clicking a
 // line opens its full transcript in a floating <TranscriptPopover>.
 //
-// Detached sub-agents are kept OUT of the message thread (the inline card suppresses
-// itself for them) and surfaced here instead.
+// Detached sub-agents are kept OUT of the message thread and surfaced here instead: the
+// inline card of a background launch never renders, and that of a foreground launch steps
+// aside while its woken run is live (`isWokenRunLive`), coming back once it settles.
 
 import { useMemo, useState } from "react";
-import { useBackgroundAgentIds, useToolResult } from "../../store/conversationStore";
+import { useAgentStreamKey, useBackgroundAgentIds, useToolResult } from "../../store/conversationStore";
 import { useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
-import { fmtDuration, resolveAgentId, shortModel } from "../../agent/subagentMeta";
+import { fmtDuration, isDetachedAgentTask, resolveAgentId, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import type { BackgroundTask } from "../../ipc/client";
 import { Ico, RunDots } from "../../ui/kit";
@@ -36,9 +38,9 @@ export function AgentBar({ session }: { session: string }) {
 
   // Only sub-agents still RUNNING in the background — a finished one drops out (its
   // result is already back in the conversation). Resuming one via SendMessage RE-USES its
-  // task_id (== its agentId) and keeps the original Agent tool_use_id, so the socle just
-  // flips it back to Running (assembler `resume_agent_via_send_message` / the task_progress
-  // backstop) and it reappears here on the SAME row.
+  // task_id (== its agentId), so the socle flips it back to Running and marks it `woken_by`
+  // — it reappears here on the SAME row, even when a reload between launch and wake left
+  // it carrying the SendMessage's tool_use_id instead of the launch's.
   const rows = useMemo(() => {
     const ids = new Set(bgIds);
     return Object.values(tasks)
@@ -48,7 +50,7 @@ export function AgentBar({ session }: { session: string }) {
           t.status === "running" &&
           // Claude: only DETACHED sub-agents (foreground ones render inline). Codex: every
           // running sub-agent (there is no detached/foreground split, no ACK to key on).
-          (isCodex || (t.tool_use_id != null && ids.has(t.tool_use_id))),
+          (isCodex || isDetachedAgentTask(t, ids)),
       )
       .sort((a, b) => a.task_id.localeCompare(b.task_id));
   }, [bgIds, tasks, isCodex]);
@@ -58,6 +60,9 @@ export function AgentBar({ session }: { session: string }) {
   // immediate tool_result ack → drillable during the run.
   const openedResult = useToolResult(session, opened?.tool_use_id ?? "");
   const openedAgentId = opened ? resolveAgentId(opened, openedResult?.content) : null;
+  // Where its live messages stream — not always `tool_use_id` for an agent woken after a
+  // reload (see agentStreamKey).
+  const openedStreamKey = useAgentStreamKey(session, opened);
 
   if (rows.length === 0 && !opened) return null;
 
@@ -128,7 +133,8 @@ export function AgentBar({ session }: { session: string }) {
         sessionId={claudeSessionId}
         agentId={openedAgentId}
         liveSession={session}
-        toolUseId={opened?.tool_use_id ?? null}
+        toolUseId={openedStreamKey}
+        wokenBy={opened?.woken_by ?? null}
         running={opened?.status === "running"}
         label={opened?.label ?? "Sub-agent"}
         subtitle={
