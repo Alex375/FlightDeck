@@ -162,16 +162,51 @@ export function sessionOverridesForConv(convId: string, repoId: string | null): 
   return isEmptyOverrides(o) ? null : o;
 }
 
+/** The policy changes in flight, chained: each one starts from the state the previous
+ *  one left. Two changes made while a session round trip is pending (a plugin Clear and a
+ *  server toggle, say) would otherwise both start from the same snapshot, and the second
+ *  to persist would silently undo the first. */
+let policyWrites: Promise<unknown> = Promise.resolve();
+
+/** Bumped by a full reset: a change that was waiting when everything was wiped must not
+ *  bring its level back. */
+let policyEpoch = 0;
+
 /**
  * Change one level, then push the result to every running Claude conversation it reaches.
  * A conversation's own change is only kept once its running session accepted it (the panel
  * never shows a setting the live conversation isn't under). A Global / Repository change is
  * kept either way — it applies at the next spawn — and every session that refused it is
- * named in the error.
+ * named in the error. Changes run one at a time, in the order they were made.
  */
-export async function applyPolicyChange(target: PolicyTarget, changes: PolicyChanges): Promise<void> {
+export function applyPolicyChange(target: PolicyTarget, changes: PolicyChanges): Promise<void> {
+  // Stamped when MADE: a reset that lands while it waits in the queue voids it too.
+  const epoch = policyEpoch;
+  const run = policyWrites.then(() => applyPolicyChangeNow(target, changes, epoch));
+  policyWrites = run.catch(() => {});
+  return run;
+}
+
+async function applyPolicyChangeNow(target: PolicyTarget, changes: PolicyChanges, epoch: number): Promise<void> {
+  // Everything was reset since this change was made: it is moot — neither pushed nor kept.
+  if (epoch !== policyEpoch) return;
   const before = useMcpPolicy.getState();
   const after = withLevel(before, target, withChanges(levelOf(before, target), changes));
+  // Re-applied on the state as it is when kept: a writer outside this chain (the tool
+  // cache a live session refreshes) may have moved it during the round trip. Not kept at
+  // all when what it was for is gone — everything reset, or its conversation removed —
+  // or it would bring back a level the removal just cleared.
+  const keep = () => {
+    if (epoch !== policyEpoch) return;
+    if (
+      target.scope === "conversation" &&
+      !useConversationsStore.getState().conversations.some((c) => c.id === target.key)
+    ) {
+      return;
+    }
+    const cur = useMcpPolicy.getState();
+    persist(withLevel(cur, target, withChanges(levelOf(cur, target), changes)));
+  };
   const convs = useConversationsStore
     .getState()
     .conversations.filter(
@@ -193,10 +228,10 @@ export async function applyPolicyChange(target: PolicyTarget, changes: PolicyCha
       );
       if (res.status === "error") throw new Error(`The running conversation refused the change: ${res.error}`);
     }
-    persist(after);
+    keep();
     return;
   }
-  persist(after);
+  keep();
   const refused: string[] = [];
   await Promise.all(
     convs.map(async (c) => {
@@ -232,5 +267,6 @@ export function clearConvPolicy(convId: string): void {
 }
 
 export function clearAllPolicy(): void {
+  policyEpoch++;
   persist(EMPTY);
 }

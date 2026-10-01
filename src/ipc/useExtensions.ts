@@ -257,9 +257,10 @@ export const mcpPermissionRulesKey = (repoPath: string | null) => ["mcp-permissi
  * for the per-tool rows. Polled like the live status while the manager is open: the same
  * rules can change under us from the CLI's own `/permissions` dialog or a hand edit.
  */
-export function useMcpPermissionRules(repoPath: string | null) {
+export function useMcpPermissionRules(repoPath: string | null, enabled = true) {
   return useQuery<PermissionRulesView>({
     queryKey: mcpPermissionRulesKey(repoPath),
+    enabled,
     queryFn: () => unwrap(commands.mcpPermissionRules(repoPath)),
     staleTime: 2_000,
     refetchInterval: 4_000,

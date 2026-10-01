@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::model::{
-    LiveModel, LoadedPlugin, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState,
-    RewindFilesResult, SessionOverrides, SlashCommand,
+    LiveModel, LoadedAgent, LoadedPlugin, McpAuthResult, McpServerLive, McpToolInfo,
+    RemoteControlState, RewindFilesResult, SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -187,6 +187,58 @@ pub fn loaded_plugins_from_array(arr: &[Value]) -> Vec<LoadedPlugin> {
 pub fn parse_reload_plugins_plugins(line: &Value) -> Option<Vec<LoadedPlugin>> {
     let arr = line.get("response")?.get("response")?.get("plugins")?.as_array()?;
     Some(loaded_plugins_from_array(arr))
+}
+
+/// Map `system/init.skills` (bare strings) to skill names. Tolerates `{name}` objects
+/// should the wire grow one; entries without a usable name are skipped.
+pub fn loaded_skills_from_array(arr: &[Value]) -> Vec<String> {
+    arr.iter()
+        .filter_map(|s| match s {
+            Value::String(n) => Some(n.clone()),
+            other => other.get("name")?.as_str().map(str::to_string),
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Map an `agents` array to sub-agents. Both wire shapes are real: `{name, description}`
+/// objects (the `initialize` and `reload_plugins` responses — verified on claude 2.1.286)
+/// and bare name strings (`system/init`). Entries without a name are skipped.
+pub fn loaded_agents_from_array(arr: &[Value]) -> Vec<LoadedAgent> {
+    arr.iter()
+        .filter_map(|a| match a {
+            Value::String(n) => Some(LoadedAgent { name: n.clone(), description: None }),
+            other => Some(LoadedAgent {
+                name: other.get("name")?.as_str()?.to_string(),
+                description: other.get("description").and_then(Value::as_str).map(str::to_string),
+            }),
+        })
+        .filter(|a| !a.name.is_empty())
+        .collect()
+}
+
+/// The sub-agents an `initialize` or `reload_plugins` response carries at
+/// `response.response.agents`, descriptions included. `None` without such an array.
+pub fn parse_response_agents(line: &Value) -> Option<Vec<LoadedAgent>> {
+    let arr = line.get("response")?.get("response")?.get("agents")?.as_array()?;
+    Some(loaded_agents_from_array(arr))
+}
+
+/// Re-list `system/init`'s agent NAMES against the last known list: the names are the
+/// truth (an agent gone is dropped, a new one added), but `system/init` carries no
+/// description — keep the one an earlier response gave for a name still present.
+pub fn merge_agent_names(known: Option<&[LoadedAgent]>, names: Vec<LoadedAgent>) -> Vec<LoadedAgent> {
+    names
+        .into_iter()
+        .map(|mut a| {
+            if a.description.is_none() {
+                a.description = known
+                    .and_then(|k| k.iter().find(|p| p.name == a.name))
+                    .and_then(|p| p.description.clone());
+            }
+            a
+        })
+        .collect()
 }
 
 /// Map a raw `commands` array to [`SlashCommand`]s. Shared by the three surfaces
@@ -1016,6 +1068,54 @@ mod tests {
         );
         // An ack without the array (an older CLI) is not "no plugins".
         assert_eq!(parse_reload_plugins_plugins(&json!({"response": {"response": {}}})), None);
+    }
+
+    /// The `initialize` / `reload_plugins` responses list sub-agents as `{name, description}`
+    /// (captured from claude 2.1.286); `system/init` as bare names. Both parse; nameless skip.
+    #[test]
+    fn agents_parse_from_both_wire_shapes() {
+        let resp = json!({ "response": { "subtype": "success", "request_id": "i", "response": {
+            "agents": [
+                {"name": "Explore", "description": "Read-only search agent"},
+                {"name": "tosse-workflow:tosse-manager"},
+                {"description": "no name"}
+            ]
+        }}});
+        assert_eq!(
+            parse_response_agents(&resp),
+            Some(vec![
+                LoadedAgent { name: "Explore".into(), description: Some("Read-only search agent".into()) },
+                LoadedAgent { name: "tosse-workflow:tosse-manager".into(), description: None },
+            ])
+        );
+        assert_eq!(parse_response_agents(&json!({"response": {"response": {}}})), None);
+        let names = loaded_agents_from_array(&[json!("Plan"), json!(""), json!(3)]);
+        assert_eq!(names, vec![LoadedAgent { name: "Plan".into(), description: None }]);
+    }
+
+    /// `system/init` skill names: bare and `plugin:skill`, tolerant of `{name}` objects.
+    #[test]
+    fn skills_parse_from_init_names() {
+        let arr = [json!("deep-research"), json!("tosse-workflow:pickup"), json!({"name": "x"}), json!(""), json!(1)];
+        assert_eq!(loaded_skills_from_array(&arr), ["deep-research", "tosse-workflow:pickup", "x"]);
+    }
+
+    /// `system/init` re-lists agent NAMES: they rule membership, but a description an
+    /// earlier response gave is kept for a name still present.
+    #[test]
+    fn init_agent_names_keep_known_descriptions() {
+        let known = vec![
+            LoadedAgent { name: "Explore".into(), description: Some("search".into()) },
+            LoadedAgent { name: "gone".into(), description: Some("removed since".into()) },
+        ];
+        let names = loaded_agents_from_array(&[json!("Explore"), json!("new-one")]);
+        assert_eq!(
+            merge_agent_names(Some(&known), names),
+            vec![
+                LoadedAgent { name: "Explore".into(), description: Some("search".into()) },
+                LoadedAgent { name: "new-one".into(), description: None },
+            ]
+        );
     }
 
     /// A REAL `list_models` response, captured from claude 2.1.224 driven with the

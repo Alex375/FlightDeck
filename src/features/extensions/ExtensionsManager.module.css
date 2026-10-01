@@ -390,7 +390,26 @@
   display: inline-flex;
   margin-left: 4px;
 }
-/* A remote repository's plugins: says WHERE the list comes from (the server, not this Mac). */
+/* A remote repository: says WHERE its extensions come from (the server, not this Mac). */
+.remoteBanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 10px;
+  background: var(--wf-panel-2);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--wf-tx);
+}
+.remoteBanner svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--wf-tx-lo);
+}
+/* A note under a remote section's header. */
 .remoteNote {
   display: flex;
   align-items: flex-start;

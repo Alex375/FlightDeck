@@ -143,6 +143,20 @@ export function serverInherited(cascade: Cascade, scope: PermissionScope, server
 
 // ---- Claude Code's own files (external rules) ---------------------------------------------
 
+/**
+ * What a scope knows of Claude Code's own rules. Read from this Mac's files: the rules, or
+ * `undefined` while they load. Not readable here (a repository on a paired server): `[]`
+ * and `rulesUnknown` — NEVER `undefined`, which the panel reads as "still loading" and
+ * would show forever, its per-tool controls unreachable.
+ */
+export function externalRules(
+  readFiles: boolean,
+  rules: PermissionRule[] | undefined,
+): { external: PermissionRule[] | undefined; rulesUnknown: boolean } {
+  return readFiles ? { external: rules, rulesUnknown: false } : { external: [], rulesUnknown: true };
+}
+
+
 const globToRegExp = (glob: string) =>
   new RegExp(`^${glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
 

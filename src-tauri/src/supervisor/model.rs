@@ -105,6 +105,25 @@ pub struct SessionStatePayload {
     /// `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
     #[serde(default)]
     pub loaded_plugins: Option<Vec<LoadedPlugin>>,
+    /// The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
+    /// or `plugin:skill`. `None` until the first turn (no control response carries them),
+    /// and again after a `reload_plugins`, which may have changed them.
+    /// Same purpose as `loaded_plugins` (the truthful list for a remote session).
+    #[serde(default)]
+    pub loaded_skills: Option<Vec<String>>,
+    /// The sub-agents the running binary knows, built-ins included. Known from SPAWN: the
+    /// `initialize` response carries them with their description (so does `reload_plugins`);
+    /// `system/init` re-lists their names each turn.
+    #[serde(default)]
+    pub loaded_agents: Option<Vec<LoadedAgent>>,
+}
+
+/// One sub-agent as the live session reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct LoadedAgent {
+    pub name: String,
+    /// From the `initialize` / `reload_plugins` responses; `system/init` gives names only.
+    pub description: Option<String>,
 }
 
 /// One plugin as the live session reports it (`{name, path, source, version}` on the

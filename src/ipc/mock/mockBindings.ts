@@ -63,6 +63,7 @@ import type {
   RewindFilesResult,
   PluginContents,
   PluginInfo,
+  LoadedAgent,
   LoadedPlugin,
   PermissionDecision,
   PermissionMode,
@@ -157,6 +158,21 @@ const MOCK_MAC_PLUGINS: PluginInfo[] = ["tosse-workflow@tosse-plugins", "railway
 /** …and the one the paired server's session reports it loaded. */
 const MOCK_SERVER_PLUGINS: LoadedPlugin[] = [
   { name: "cowork-plugin-management", id: "cowork-plugin-management@knowledge-work-plugins", version: "0.39" },
+];
+/** …its sub-agents (from `initialize`, at spawn — built-ins included)… */
+const MOCK_SERVER_AGENTS: LoadedAgent[] = [
+  { name: "claude", description: "Catch-all for any task that doesn't fit a more specific agent." },
+  { name: "Explore", description: "Read-only search agent for broad fan-out searches." },
+  { name: "general-purpose", description: "General-purpose agent for multi-step tasks." },
+  { name: "Plan", description: "Software architect agent for designing implementation plans." },
+];
+/** …and its skills (from `system/init`, at its first turn — names only). */
+const MOCK_SERVER_SKILLS: string[] = [
+  "deep-research",
+  "code-review",
+  "simplify",
+  "cowork-plugin-management:create-cowork-plugin",
+  "cowork-plugin-management:cowork-plugin-customizer",
 ];
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
@@ -312,8 +328,16 @@ function getRecord(session: string): SessionRecord {
     let lastState = idleState();
     const driver = new ScenarioDriver({
       state: (s) => {
-        rec!.lastState = s;
-        sessionStateEvent.emit({ session, state: s });
+        // Like the real assembler, what the session reported persists across emits.
+        const prev = rec!.lastState;
+        const next: SessionStatePayload = {
+          ...s,
+          loaded_plugins: s.loaded_plugins ?? prev.loaded_plugins,
+          loaded_skills: s.loaded_skills ?? prev.loaded_skills,
+          loaded_agents: s.loaded_agents ?? prev.loaded_agents,
+        };
+        rec!.lastState = next;
+        sessionStateEvent.emit({ session, state: next });
       },
       item: (item) => {
         sessionMessageEvent.emit({ session, item });
@@ -1661,6 +1685,10 @@ export const mockCommands = {
         effort: effort ?? base.effort,
         ultracode,
         permission_mode: permissionMode ?? base.permission_mode,
+        // The first send can land before this tick: keep what its turn already reported.
+        loaded_plugins: rec.lastState.loaded_plugins,
+        loaded_skills: rec.lastState.loaded_skills,
+        ...(isRemoteDemo() ? { loaded_agents: MOCK_SERVER_AGENTS } : {}),
       };
       sessionStateEvent.emit({ session, state: rec.lastState });
       sessionCommandsEvent.emit({ session, commands: MOCK_COMMANDS });
@@ -1681,7 +1709,12 @@ export const mockCommands = {
       typeof location !== "undefined"
         ? new URLSearchParams(location.search).get("demo")
         : null;
-    const driver = getRecord(session).driver;
+    const rec = getRecord(session);
+    if (demo === "remote") {
+      rec.lastState = { ...rec.lastState, loaded_skills: MOCK_SERVER_SKILLS, loaded_plugins: MOCK_SERVER_PLUGINS };
+      sessionStateEvent.emit({ session, state: rec.lastState });
+    }
+    const driver = rec.driver;
     if (demo === "question") driver.startQuestion();
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
@@ -3268,7 +3301,7 @@ export const mockCommands = {
     // Like the real response: the session's fresh plugin list lands on its state.
     setTimeout(() => {
       const rec = getRecord(session);
-      rec.lastState = { ...rec.lastState, loaded_plugins: MOCK_SERVER_PLUGINS };
+      rec.lastState = { ...rec.lastState, loaded_plugins: MOCK_SERVER_PLUGINS, loaded_agents: MOCK_SERVER_AGENTS };
       sessionStateEvent.emit({ session, state: rec.lastState });
     }, 400);
     return ok(null);
@@ -3285,7 +3318,8 @@ export const mockCommands = {
       name, scope, status, tools: [], tool_count: 0, transport: null, command: null, url: null,
     });
     return ok([
-      server("playwright", "project", "connected"),
+      // With tools: its per-tool permission editor must open on a remote session too.
+      { ...server("playwright", "project", "connected"), tools: ["browser_click", "browser_navigate"], tool_count: 2 },
       server("sentry", "project", "disabled"),
       server("claude.ai TOSSE", "claudeai", "connected"),
       server("claude.ai Gmail", "claudeai", "disabled"),
