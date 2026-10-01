@@ -20,7 +20,7 @@ export interface RuleAccess {
 }
 
 export const GLOBAL_FROM_REMOTE =
-  "Global also reaches this Mac's conversations, which follow this Mac's own rules — rules this remote conversation's rows don't show. Change Global in Settings → Extensions, or from a conversation on this Mac.";
+  "Global is read-only here: it also reaches this Mac's conversations, judged against this Mac's own rules, which this remote conversation doesn't show. To cover every conversation of this repository, use “This repository”. A server this Mac also has can be set globally in Settings → Claude Code → Extensions.";
 
 /**
  * Rules access for a conversation's scope. On this Mac: its files. On a server, the rows are
@@ -28,7 +28,9 @@ export const GLOBAL_FROM_REMOTE =
  * — and this Mac's rules don't govern them, so they must not lock or explain them either.
  * Global is then read-only: it also reaches this Mac's conversations, whose baseline
  * (managed policy included) this panel doesn't show — writing it blind could offer an
- * "Allow" that policy forbids. Settings → Extensions shows that baseline.
+ * "Allow" that policy forbids. "This repository" covers every conversation of the remote
+ * repository; Settings → Claude Code → Extensions shows this Mac's baseline (for the
+ * servers this Mac has — one that exists only on the server has no Global control).
  */
 export function ruleAccess(remote: boolean, scope: PermissionScope, path: string): RuleAccess {
   if (!remote) return { repoPath: path, readFiles: true, readOnlyReason: null };

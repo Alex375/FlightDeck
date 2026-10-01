@@ -493,6 +493,7 @@ export function ExtensionsManager() {
   // when the body shows it (a conversation's own lens, or a live Codex conversation's).
   const liveShown =
     handle != null && (body === "conversation" || (body === "codex" && liveBackend === "codex"));
+  const codexMissing = codexDetected === false && !(liveBackend === "codex" && handle != null);
   const tabFetching = body === "codex" ? codexExt.isFetching : ext.isFetching;
   const liveFetching = liveShown && live.isFetching;
 
@@ -576,13 +577,15 @@ export function ExtensionsManager() {
           </div>
         ) : body === "codex" ? (
           <CodexExtensionsBody
-            locked={codexDetected === false}
+            // The probe's answer is kept for the app's run: a LIVE Codex session proves the
+            // binary is there, whatever an earlier "no" said.
+            locked={codexMissing}
             notice={
-              codexDetected === false ? (
+              codexMissing ? (
                 <RemoteBanner>
                   Codex isn&apos;t detected on this Mac: what needs it (its plugins, hooks and live servers)
                   can&apos;t be read, and the switches below can&apos;t change anything. Its configuration files
-                  are still listed.
+                  are still listed. Installed it since Flight Deck started? Relaunch the app.
                 </RemoteBanner>
               ) : null
             }

@@ -27,6 +27,9 @@ describe("ruleAccess", () => {
 
   it("leaves Global read-only from a remote conversation, and says why", () => {
     expect(ruleAccess(true, "global", "/srv").readOnlyReason).toBe(GLOBAL_FROM_REMOTE);
+    // A remedy that works for a server only the remote host has, and the real Settings path.
+    expect(GLOBAL_FROM_REMOTE).toContain("This repository");
+    expect(GLOBAL_FROM_REMOTE).toContain("Settings → Claude Code → Extensions");
     expect(ruleAccess(true, "conversation", "/srv").readOnlyReason).toBeNull();
     expect(ruleAccess(true, "repository", "/srv").readOnlyReason).toBeNull();
   });
